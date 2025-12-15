@@ -230,19 +230,34 @@ class OpenAIClient:
                 f"(e.g., 'http://localhost:1234/v1') and you can use a placeholder API key by setting OPENAI_API_KEY='{LOCAL_SERVER_API_KEY_PLACEHOLDER}'"
             )
         
-        # Initialize synchronous client (lazy loading for async)
-        self._sync_client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        # Initialize clients lazily
+        self._sync_client = None
         self._async_client = None
         
         # Set up logging
         self.logger = logging.getLogger(__name__)
         
-        # Initialize console for display
-        self.console = Console()
+        # Initialize console lazily
+        self._console = None
+        
+        # Cache for formatted tools and fixed schemas
+        self._formatted_tools_cache = {}
+        self._fixed_schema_cache = {}
+        self._max_cache_size = 100
+    
+    @property
+    def console(self):
+        """Lazily initialize Rich Console only when needed."""
+        if self._console is None:
+            from rich.console import Console
+            self._console = Console()
+        return self._console
     
     @property
     def sync_client(self) -> OpenAI:
-        """Get the synchronous OpenAI client."""
+        """Get the synchronous OpenAI client (lazy initialization)."""
+        if self._sync_client is None:
+            self._sync_client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         return self._sync_client
     
     @property
@@ -350,6 +365,35 @@ class OpenAIClient:
             
         return fixed_schema
     
+    def _get_tools_cache_key(self, tools: List[Any]) -> str:
+        """Generate a cache key for tools."""
+        parts = []
+        for tool in tools:
+            if isinstance(tool, dict):
+                # For dict tools, use sorted JSON representation
+                parts.append(json.dumps(tool, sort_keys=True))
+            elif callable(tool):
+                # For functions, use module.name
+                parts.append(f"{tool.__module__}.{tool.__name__}")
+            elif isinstance(tool, str):
+                # For string tools, use as-is
+                parts.append(tool)
+            elif isinstance(tool, list):
+                # For lists, recursively process
+                subparts = []
+                for subtool in tool:
+                    if isinstance(subtool, dict):
+                        subparts.append(json.dumps(subtool, sort_keys=True))
+                    elif callable(subtool):
+                        subparts.append(f"{subtool.__module__}.{subtool.__name__}")
+                    else:
+                        subparts.append(str(subtool))
+                parts.append(f"[{','.join(subparts)}]")
+            else:
+                # For other types, use string representation
+                parts.append(str(tool))
+        return "|".join(parts)
+    
     def format_tools(self, tools: Optional[List[Any]]) -> Optional[List[Dict]]:
         """
         Format tools for OpenAI API.
@@ -370,6 +414,11 @@ class OpenAIClient:
         """
         if not tools:
             return None
+        
+        # Check cache first
+        cache_key = self._get_tools_cache_key(tools)
+        if cache_key in self._formatted_tools_cache:
+            return self._formatted_tools_cache[cache_key]
             
         formatted_tools = []
         for tool in tools:
@@ -424,8 +473,13 @@ class OpenAIClient:
             except (TypeError, ValueError) as e:
                 logging.error(f"Tools are not JSON serializable: {e}")
                 return None
+        
+        # Cache the result
+        result = formatted_tools if formatted_tools else None
+        if result is not None and len(self._formatted_tools_cache) < self._max_cache_size:
+            self._formatted_tools_cache[cache_key] = result
                 
-        return formatted_tools if formatted_tools else None
+        return result
     
     def _generate_tool_definition(self, func: Callable) -> Optional[Dict]:
         """Generate a tool definition from a callable function."""
@@ -513,7 +567,7 @@ class OpenAIClient:
         self,
         messages: List[Dict],
         model: str,
-        temperature: float = 0.7,
+        temperature: float = 1.0,
         tools: Optional[List[Dict]] = None,
         start_time: Optional[float] = None,
         console: Optional[Console] = None,
@@ -546,7 +600,7 @@ class OpenAIClient:
                 console = self.console
             
             # Create the response stream
-            response_stream = self._sync_client.chat.completions.create(
+            response_stream = self.sync_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature,
@@ -600,7 +654,7 @@ class OpenAIClient:
         self,
         messages: List[Dict],
         model: str,
-        temperature: float = 0.7,
+        temperature: float = 1.0,
         tools: Optional[List[Dict]] = None,
         start_time: Optional[float] = None,
         console: Optional[Console] = None,
@@ -686,8 +740,8 @@ class OpenAIClient:
     def create_completion(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-4o",
-        temperature: float = 0.7,
+        model: str = "gpt-5-nano",
+        temperature: float = 1.0,
         stream: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
@@ -723,7 +777,7 @@ class OpenAIClient:
                 params["tool_choice"] = tool_choice
         
         try:
-            return self._sync_client.chat.completions.create(**params)
+            return self.sync_client.chat.completions.create(**params)
         except Exception as e:
             self.logger.error(f"Error creating completion: {e}")
             raise
@@ -731,8 +785,8 @@ class OpenAIClient:
     async def acreate_completion(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-4o",
-        temperature: float = 0.7,
+        model: str = "gpt-5-nano",
+        temperature: float = 1.0,
         stream: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
@@ -776,8 +830,8 @@ class OpenAIClient:
     def chat_completion_with_tools(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-4o",
-        temperature: float = 0.7,
+        model: str = "gpt-5-nano",
+        temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         execute_tool_fn: Optional[Callable] = None,
         stream: bool = True,
@@ -838,14 +892,55 @@ class OpenAIClient:
                 )
             else:
                 # Process as regular non-streaming response
-                final_response = self.create_completion(
-                    messages=messages,
-                    model=model,
-                    temperature=temperature,
-                    tools=formatted_tools,
-                    stream=False,
-                    **kwargs
-                )
+                if display_fn and console:
+                    # When verbose (display_fn provided), use streaming for better UX
+                    try:
+                        with Live(display_fn("", start_time), console=console, refresh_per_second=4, transient=True) as live:
+                            # Use streaming when display_fn is provided for progressive display
+                            response_stream = self.create_completion(
+                                messages=messages,
+                                model=model,
+                                temperature=temperature,
+                                tools=formatted_tools,
+                                stream=True,  # Always stream when verbose/display_fn
+                                **kwargs
+                            )
+                            
+                            full_response_text = ""
+                            chunks = []
+                            
+                            # Process streaming response
+                            for chunk in response_stream:
+                                chunks.append(chunk)
+                                if chunk.choices[0].delta.content:
+                                    full_response_text += chunk.choices[0].delta.content
+                                    live.update(display_fn(full_response_text, start_time))
+                            
+                            # Process final response from chunks
+                            final_response = process_stream_chunks(chunks)
+                        
+                        # Clear the last generating display with a blank line
+                        console.print()
+                    except Exception as e:
+                        self.logger.error(f"Error in Live display for non-streaming: {e}")
+                        # Fallback to regular completion without display
+                        final_response = self.create_completion(
+                            messages=messages,
+                            model=model,
+                            temperature=temperature,
+                            tools=formatted_tools,
+                            stream=False,
+                            **kwargs
+                        )
+                else:
+                    final_response = self.create_completion(
+                        messages=messages,
+                        model=model,
+                        temperature=temperature,
+                        tools=formatted_tools,
+                        stream=False,
+                        **kwargs
+                    )
             
             if not final_response:
                 return None
@@ -913,8 +1008,8 @@ class OpenAIClient:
     async def achat_completion_with_tools(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-4o",
-        temperature: float = 0.7,
+        model: str = "gpt-5-nano",
+        temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         execute_tool_fn: Optional[Callable] = None,
         stream: bool = True,
@@ -969,14 +1064,55 @@ class OpenAIClient:
                 )
             else:
                 # Process as regular non-streaming response
-                final_response = await self.acreate_completion(
-                    messages=messages,
-                    model=model,
-                    temperature=temperature,
-                    tools=formatted_tools,
-                    stream=False,
-                    **kwargs
-                )
+                if display_fn and console:
+                    # When verbose (display_fn provided), use streaming for better UX
+                    try:
+                        with Live(display_fn("", start_time), console=console, refresh_per_second=4, transient=True) as live:
+                            # Use streaming when display_fn is provided for progressive display
+                            response_stream = await self.acreate_completion(
+                                messages=messages,
+                                model=model,
+                                temperature=temperature,
+                                tools=formatted_tools,
+                                stream=True,  # Always stream when verbose/display_fn
+                                **kwargs
+                            )
+                            
+                            full_response_text = ""
+                            chunks = []
+                            
+                            # Process streaming response
+                            async for chunk in response_stream:
+                                chunks.append(chunk)
+                                if chunk.choices[0].delta.content:
+                                    full_response_text += chunk.choices[0].delta.content
+                                    live.update(display_fn(full_response_text, start_time))
+                            
+                            # Process final response from chunks
+                            final_response = process_stream_chunks(chunks)
+                        
+                        # Clear the last generating display with a blank line
+                        console.print()
+                    except Exception as e:
+                        self.logger.error(f"Error in Live display for async non-streaming: {e}")
+                        # Fallback to regular completion without display
+                        final_response = await self.acreate_completion(
+                            messages=messages,
+                            model=model,
+                            temperature=temperature,
+                            tools=formatted_tools,
+                            stream=False,
+                            **kwargs
+                        )
+                else:
+                    final_response = await self.acreate_completion(
+                        messages=messages,
+                        model=model,
+                        temperature=temperature,
+                        tools=formatted_tools,
+                        stream=False,
+                        **kwargs
+                    )
             
             if not final_response:
                 return None
@@ -1049,13 +1185,157 @@ class OpenAIClient:
                 break
         
         return final_response
+        
+    def chat_completion_with_tools_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str = "gpt-5-nano",
+        temperature: float = 1.0,
+        tools: Optional[List[Any]] = None,
+        execute_tool_fn: Optional[Callable] = None,
+        reasoning_steps: bool = False,
+        verbose: bool = True,
+        max_iterations: int = 10,
+        **kwargs
+    ):
+        """
+        Create a streaming chat completion with tool support.
+        
+        This method yields chunks of the response as they are generated,
+        enabling real-time streaming to the user.
+        
+        Args:
+            messages: List of message dictionaries
+            model: Model to use
+            temperature: Temperature for generation
+            tools: List of tools (can be callables, dicts, or strings)
+            execute_tool_fn: Function to execute tools
+            reasoning_steps: Whether to show reasoning
+            verbose: Whether to show verbose output
+            max_iterations: Maximum tool calling iterations
+            **kwargs: Additional API parameters
+            
+        Yields:
+            String chunks of the response as they are generated
+        """
+        # Format tools for OpenAI API
+        formatted_tools = self.format_tools(tools)
+        
+        # Continue tool execution loop until no more tool calls are needed
+        iteration_count = 0
+        
+        while iteration_count < max_iterations:
+            try:
+                # Create streaming response
+                response_stream = self.sync_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    tools=formatted_tools if formatted_tools else None,
+                    stream=True,
+                    **kwargs
+                )
+                
+                full_response_text = ""
+                reasoning_content = ""
+                chunks = []
+                
+                # Stream the response chunk by chunk
+                for chunk in response_stream:
+                    chunks.append(chunk)
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        full_response_text += content
+                        yield content
+                    
+                    # Handle reasoning content if enabled
+                    if reasoning_steps and chunk.choices and hasattr(chunk.choices[0].delta, "reasoning_content"):
+                        rc = chunk.choices[0].delta.reasoning_content
+                        if rc:
+                            reasoning_content += rc
+                            yield f"[Reasoning: {rc}]"
+                
+                # Process the complete response to check for tool calls
+                final_response = process_stream_chunks(chunks)
+                
+                if not final_response:
+                    return
+                
+                # Check for tool calls
+                tool_calls = getattr(final_response.choices[0].message, 'tool_calls', None)
+                
+                if tool_calls and execute_tool_fn:
+                    # Convert ToolCall dataclass objects to dict for JSON serialization
+                    serializable_tool_calls = []
+                    for tc in tool_calls:
+                        if isinstance(tc, ToolCall):
+                            # Convert dataclass to dict
+                            serializable_tool_calls.append({
+                                "id": tc.id,
+                                "type": tc.type,
+                                "function": tc.function
+                            })
+                        else:
+                            # Already an OpenAI object, keep as is
+                            serializable_tool_calls.append(tc)
+                    
+                    messages.append({
+                        "role": "assistant", 
+                        "content": final_response.choices[0].message.content,
+                        "tool_calls": serializable_tool_calls
+                    })
+                    
+                    for tool_call in tool_calls:
+                        # Handle both ToolCall dataclass and OpenAI object
+                        try:
+                            if isinstance(tool_call, ToolCall):
+                                function_name = tool_call.function["name"]
+                                arguments = json.loads(tool_call.function["arguments"])
+                            else:
+                                function_name = tool_call.function.name
+                                arguments = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError as e:
+                            if verbose:
+                                yield f"\n[Error parsing arguments for {function_name if 'function_name' in locals() else 'unknown function'}: {str(e)}]"
+                            continue
+                        
+                        if verbose:
+                            yield f"\n[Calling function: {function_name}]"
+                        
+                        # Execute the tool with error handling
+                        try:
+                            tool_result = execute_tool_fn(function_name, arguments)
+                            results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
+                        except Exception as e:
+                            results_str = f"Error executing function: {str(e)}"
+                            if verbose:
+                                yield f"\n[Function error: {str(e)}]"
+                        
+                        if verbose:
+                            yield f"\n[Function result: {results_str}]"
+                        
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id if hasattr(tool_call, 'id') else tool_call['id'],
+                            "content": results_str
+                        })
+                    
+                    # Continue the loop to allow more tool calls
+                    iteration_count += 1
+                else:
+                    # No tool calls, we're done
+                    break
+                    
+            except Exception as e:
+                yield f"Error: {str(e)}"
+                break
     
     def parse_structured_output(
         self,
         messages: List[Dict[str, Any]],
         response_format: BaseModel,
-        model: str = "gpt-4o",
-        temperature: float = 0.7,
+        model: str = "gpt-5-nano",
+        temperature: float = 1.0,
         **kwargs
     ) -> Any:
         """
@@ -1072,7 +1352,7 @@ class OpenAIClient:
             Parsed response according to the response_format
         """
         try:
-            response = self._sync_client.beta.chat.completions.parse(
+            response = self.sync_client.beta.chat.completions.parse(
                 model=model,
                 messages=messages,
                 temperature=temperature,
@@ -1088,8 +1368,8 @@ class OpenAIClient:
         self,
         messages: List[Dict[str, Any]],
         response_format: BaseModel,
-        model: str = "gpt-4o",
-        temperature: float = 0.7,
+        model: str = "gpt-5-nano",
+        temperature: float = 1.0,
         **kwargs
     ) -> Any:
         """
@@ -1120,14 +1400,14 @@ class OpenAIClient:
     
     def close(self):
         """Close the OpenAI clients."""
-        if hasattr(self._sync_client, 'close'):
+        if self._sync_client and hasattr(self._sync_client, 'close'):
             self._sync_client.close()
         if self._async_client and hasattr(self._async_client, 'close'):
             self._async_client.close()
     
     async def aclose(self):
         """Asynchronously close the OpenAI clients."""
-        if hasattr(self._sync_client, 'close'):
+        if self._sync_client and hasattr(self._sync_client, 'close'):
             await asyncio.to_thread(self._sync_client.close)
         if self._async_client and hasattr(self._async_client, 'aclose'):
             await self._async_client.aclose()
@@ -1135,6 +1415,7 @@ class OpenAIClient:
 
 # Global client instance (similar to main.py pattern)
 _global_client = None
+_global_client_params = None
 
 def get_openai_client(api_key: Optional[str] = None, base_url: Optional[str] = None) -> OpenAIClient:
     """
@@ -1147,9 +1428,16 @@ def get_openai_client(api_key: Optional[str] = None, base_url: Optional[str] = N
     Returns:
         OpenAIClient instance
     """
-    global _global_client
+    global _global_client, _global_client_params
     
-    if _global_client is None:
+    # Normalize parameters for comparison
+    normalized_api_key = api_key or os.getenv("OPENAI_API_KEY")
+    normalized_base_url = base_url
+    current_params = (normalized_api_key, normalized_base_url)
+    
+    # Only create new client if parameters changed or first time
+    if _global_client is None or _global_client_params != current_params:
         _global_client = OpenAIClient(api_key=api_key, base_url=base_url)
+        _global_client_params = current_params
     
     return _global_client

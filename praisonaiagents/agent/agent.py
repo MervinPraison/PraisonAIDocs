@@ -4,7 +4,7 @@ import json
 import copy
 import logging
 import asyncio
-from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Tuple
+from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Tuple, Generator
 from rich.console import Console
 from rich.live import Live
 from ..llm import (
@@ -46,6 +46,21 @@ if TYPE_CHECKING:
     from ..handoff import Handoff
 
 class Agent:
+    @classmethod
+    def _configure_logging(cls):
+        """Configure logging settings once for all agent instances."""
+        # Configure logging to suppress unwanted outputs
+        logging.getLogger("litellm").setLevel(logging.WARNING)
+        
+        # Allow httpx logging when LOGLEVEL=debug, otherwise suppress it
+        loglevel = os.environ.get('LOGLEVEL', 'INFO').upper()
+        if loglevel == 'DEBUG':
+            logging.getLogger("httpx").setLevel(logging.INFO)
+            logging.getLogger("httpcore").setLevel(logging.INFO)
+        else:
+            logging.getLogger("httpx").setLevel(logging.WARNING)
+            logging.getLogger("httpcore").setLevel(logging.WARNING)
+    
     def _generate_tool_definition(self, function_name):
         """
         Generate a tool definition from a function name by inspecting the function.
@@ -206,7 +221,8 @@ class Agent:
         knowledge_config: Optional[Dict[str, Any]] = None,
         use_system_prompt: Optional[bool] = True,
         markdown: bool = True,
-        stream: bool = True,
+        stream: bool = False,
+        metrics: bool = False,
         self_reflect: bool = False,
         max_reflect: int = 3,
         min_reflect: int = 1,
@@ -218,7 +234,15 @@ class Agent:
         max_guardrail_retries: int = 3,
         handoffs: Optional[List[Union['Agent', 'Handoff']]] = None,
         base_url: Optional[str] = None,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        web_search: Optional[Union[bool, Dict[str, Any]]] = None,
+        web_fetch: Optional[Union[bool, Dict[str, Any]]] = None,
+        prompt_caching: Optional[bool] = None,
+        claude_memory: Optional[Union[bool, Any]] = None,
+        plan_mode: bool = False,
+        planning: bool = False,
+        planning_tools: Optional[List[Any]] = None,
+        planning_reasoning: bool = False
     ):
         """Initialize an Agent instance.
 
@@ -234,8 +258,8 @@ class Agent:
             instructions (Optional[str], optional): Direct instructions that override role, goal,
                 and backstory when provided. Used for simple, task-specific agents. Defaults to None.
             llm (Optional[Union[str, Any]], optional): Language model configuration. Can be a model
-                name string (e.g., "gpt-4o", "anthropic/claude-3-sonnet") or a configured LLM object.
-                Defaults to environment variable OPENAI_MODEL_NAME or "gpt-4o".
+                name string (e.g., "gpt-5-nano", "anthropic/claude-3-sonnet") or a configured LLM object.
+                Defaults to environment variable OPENAI_MODEL_NAME or "gpt-5-nano".
             tools (Optional[List[Any]], optional): List of tools, functions, or capabilities
                 available to the agent for task execution. Can include callables, tool objects,
                 or MCP instances. Defaults to None.
@@ -281,8 +305,10 @@ class Agent:
                 conversations to establish agent behavior and context. Defaults to True.
             markdown (bool, optional): Enable markdown formatting in agent responses for better
                 readability and structure. Defaults to True.
-            stream (bool, optional): Enable streaming responses from the language model. Set to False
-                for LLM providers that don't support streaming. Defaults to True.
+            stream (bool, optional): Enable streaming responses from the language model for real-time
+                output when using Agent.start() method. Defaults to False for backward compatibility.
+            metrics (bool, optional): Enable automatic token usage tracking and display summary
+                when tasks complete. Simplifies token monitoring for cost optimization. Defaults to False.
             self_reflect (bool, optional): Enable self-reflection capabilities where the agent
                 evaluates and improves its own responses. Defaults to False.
             max_reflect (int, optional): Maximum number of self-reflection iterations to prevent
@@ -329,10 +355,10 @@ class Agent:
         if all(x is None for x in [name, role, goal, backstory, instructions]):
             raise ValueError("At least one of name, role, goal, backstory, or instructions must be provided")
 
-        # Configure logging to suppress unwanted outputs
-        logging.getLogger("litellm").setLevel(logging.WARNING)
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        # Configure logging only once at the class level
+        if not hasattr(Agent, '_logging_configured'):
+            Agent._configure_logging()
+            Agent._logging_configured = True
 
         # If instructions are provided, use them to set role, goal, and backstory
         if instructions:
@@ -354,6 +380,8 @@ class Agent:
         self.instructions = instructions
         # Check for model name in environment variable if not provided
         self._using_custom_llm = False
+        # Flag to track if final result has been displayed to prevent duplicates
+        self._final_display_shown = False
         
         # Store OpenAI client parameters for lazy initialization
         self._openai_api_key = api_key
@@ -371,14 +399,20 @@ class Agent:
                     llm_config['base_url'] = base_url
                     if api_key:
                         llm_config['api_key'] = api_key
+                    llm_config['metrics'] = metrics
                     self.llm_instance = LLM(**llm_config)
                 else:
                     # Create LLM with model string and base_url
-                    model_name = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o')
+                    model_name = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
                     self.llm_instance = LLM(
                         model=model_name,
                         base_url=base_url,
-                        api_key=api_key
+                        api_key=api_key,
+                        metrics=metrics,
+                        web_search=web_search,
+                        web_fetch=web_fetch,
+                        prompt_caching=prompt_caching,
+                        claude_memory=claude_memory
                     )
                 self._using_custom_llm = True
             except ImportError as e:
@@ -394,6 +428,9 @@ class Agent:
                 if api_key and 'api_key' not in llm:
                     llm = llm.copy()
                     llm['api_key'] = api_key
+                # Add metrics parameter
+                llm = llm.copy()
+                llm['metrics'] = metrics
                 self.llm_instance = LLM(**llm)  # Pass all dict items as kwargs
                 self._using_custom_llm = True
             except ImportError as e:
@@ -409,6 +446,11 @@ class Agent:
                 llm_params = {'model': llm}
                 if api_key:
                     llm_params['api_key'] = api_key
+                llm_params['metrics'] = metrics
+                llm_params['web_search'] = web_search
+                llm_params['web_fetch'] = web_fetch
+                llm_params['prompt_caching'] = prompt_caching
+                llm_params['claude_memory'] = claude_memory
                 self.llm_instance = LLM(**llm_params)
                 self._using_custom_llm = True
                 
@@ -424,11 +466,20 @@ class Agent:
                 ) from e
         # Otherwise, fall back to OpenAI environment/name
         else:
-            self.llm = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o')
+            self.llm = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
         # Handle tools parameter - ensure it's always a list
         if callable(tools):
             # If a single function/callable is passed, wrap it in a list
             self.tools = [tools]
+        elif isinstance(tools, str):
+            # Single tool name string - resolve from registry
+            self.tools = self._resolve_tool_names([tools])
+        elif isinstance(tools, (list, tuple)):
+            # Check if list contains strings (tool names) that need resolution
+            if tools and all(isinstance(t, str) for t in tools):
+                self.tools = self._resolve_tool_names(tools)
+            else:
+                self.tools = list(tools)
         else:
             # Handle all falsy values (None, False, 0, "", etc.) by defaulting to empty list
             self.tools = tools or []
@@ -436,7 +487,8 @@ class Agent:
         self.max_iter = max_iter
         self.max_rpm = max_rpm
         self.max_execution_time = max_execution_time
-        self.memory = memory
+        self._memory_instance = None
+        self._init_memory(memory, user_id)
         self.verbose = verbose
         self.allow_delegation = allow_delegation
         self.step_callback = step_callback
@@ -456,12 +508,13 @@ class Agent:
         self.chat_history = []
         self.markdown = markdown
         self.stream = stream
+        self.metrics = metrics
         self.max_reflect = max_reflect
         self.min_reflect = min_reflect
         self.reflect_prompt = reflect_prompt
         # Use the same model selection logic for reflect_llm
-        self.reflect_llm = reflect_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o')
-        self.console = Console()  # Create a single console instance for the agent
+        self.reflect_llm = reflect_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+        self._console = None  # Lazy load console when needed
         
         # Initialize system prompt
         self.system_prompt = f"""{self.backstory}\n
@@ -469,18 +522,52 @@ Your Role: {self.role}\n
 Your Goal: {self.goal}
         """
 
-        # Generate unique IDs
-        self.agent_id = str(uuid.uuid4())
+        # Lazy generate unique ID when needed
+        self._agent_id = None
 
         # Store user_id
         self.user_id = user_id or "praison"
         self.reasoning_steps = reasoning_steps
+        self.plan_mode = plan_mode  # Read-only mode for planning
+        self.planning = planning  # Enable planning mode
+        self.planning_tools = planning_tools  # Tools for planning phase
+        self.planning_reasoning = planning_reasoning  # Enable reasoning during planning
+        self._planning_agent = None  # Lazy loaded PlanningAgent
+        self.web_search = web_search
+        self.web_fetch = web_fetch
+        self.prompt_caching = prompt_caching
+        self.claude_memory = claude_memory
+        
+        # Initialize rules manager for persistent context (like Cursor/Windsurf)
+        self._rules_manager = None
+        self._init_rules_manager()
+        
+        # Handle web_search fallback: inject DuckDuckGo tool for unsupported models
+        if web_search and not self._model_supports_web_search():
+            from ..tools.duckduckgo_tools import internet_search
+            # Check if internet_search is not already in tools
+            tool_names = [getattr(t, '__name__', str(t)) for t in self.tools]
+            if 'internet_search' not in tool_names and 'duckduckgo' not in tool_names:
+                self.tools.append(internet_search)
+                logging.info("Model does not support native web search. Added DuckDuckGo fallback tool.")
+        
+        # Log warning if web_fetch is enabled but model doesn't support it
+        if web_fetch and not self._model_supports_web_fetch():
+            logging.warning(f"Model '{self.llm}' does not support native web fetch. Web fetch will be ignored.")
         
         # Initialize guardrail settings
         self.guardrail = guardrail
         self.max_guardrail_retries = max_guardrail_retries
         self._guardrail_fn = None
         self._setup_guardrail()
+        
+        # Cache for system prompts and formatted tools
+        # Note: In single-threaded usage (common case), these are safe
+        # For multi-threaded usage, consider using threading.Lock
+        self._system_prompt_cache = {}
+        self._formatted_tools_cache = {}
+        # Limit cache size to prevent unbounded growth
+        self._max_cache_size = 100
 
         # Process handoffs and convert them to tools
         self.handoffs = handoffs if handoffs else []
@@ -489,16 +576,23 @@ Your Goal: {self.goal}
         # Check if knowledge parameter has any values
         if not knowledge:
             self.knowledge = None
+            self._knowledge_sources = None
+            self._knowledge_processed = True  # No knowledge to process
         else:
-            # Initialize Knowledge with provided or default config
-            from praisonaiagents.knowledge import Knowledge
-            self.knowledge = Knowledge(knowledge_config or None)
-            
-            # Handle knowledge
-            if knowledge:
-                for source in knowledge:
-                    self._process_knowledge(source)
+            # Store knowledge sources for lazy processing
+            self._knowledge_sources = knowledge
+            self._knowledge_processed = False
+            self._knowledge_config = knowledge_config
+            self.knowledge = None  # Will be initialized on first use
 
+    @property
+    def console(self):
+        """Lazily initialize Rich Console only when needed."""
+        if self._console is None:
+            from rich.console import Console
+            self._console = Console()
+        return self._console
+    
     @property
     def _openai_client(self):
         """Lazily initialize OpenAI client only when needed."""
@@ -518,12 +612,308 @@ Your Goal: {self.goal}
         return self.__openai_client
 
     @property
+    def agent_id(self):
+        """Lazily generate agent ID when first accessed."""
+        if self._agent_id is None:
+            import uuid
+            self._agent_id = str(uuid.uuid4())
+        return self._agent_id
+    
+    def get_available_tools(self) -> List[Any]:
+        """
+        Get tools available to this agent, filtered by plan_mode if enabled.
+        
+        In plan_mode, only read-only tools are available to prevent
+        modifications during the planning phase.
+        
+        Returns:
+            List of available tools
+        """
+        if not self.plan_mode:
+            return self.tools
+            
+        # Filter to read-only tools only
+        from ..planning import READ_ONLY_TOOLS, RESTRICTED_TOOLS
+        
+        filtered_tools = []
+        for tool in self.tools:
+            tool_name = getattr(tool, '__name__', str(tool)).lower()
+            
+            # Check if tool is in restricted list
+            is_restricted = any(
+                restricted.lower() in tool_name 
+                for restricted in RESTRICTED_TOOLS
+            )
+            
+            if not is_restricted:
+                filtered_tools.append(tool)
+                
+        return filtered_tools
+    
+    def _model_supports_web_search(self) -> bool:
+        """
+        Check if the agent's model supports native web search via LiteLLM.
+        
+        Returns:
+            bool: True if the model supports native web search, False otherwise
+        """
+        from ..llm.model_capabilities import supports_web_search
+        
+        # Get the model name
+        if hasattr(self, 'llm_instance') and self.llm_instance:
+            model_name = self.llm_instance.model
+        elif hasattr(self, 'llm') and self.llm:
+            model_name = self.llm
+        else:
+            model_name = "gpt-5-nano"
+        
+        return supports_web_search(model_name)
+    
+    def _model_supports_web_fetch(self) -> bool:
+        """
+        Check if the agent's model supports web fetch via LiteLLM.
+        
+        Web fetch allows the model to retrieve full content from specific URLs.
+        Currently only supported by Anthropic Claude models.
+        
+        Returns:
+            bool: True if the model supports web fetch, False otherwise
+        """
+        from ..llm.model_capabilities import supports_web_fetch
+        
+        # Get the model name
+        if hasattr(self, 'llm_instance') and self.llm_instance:
+            model_name = self.llm_instance.model
+        elif hasattr(self, 'llm') and self.llm:
+            model_name = self.llm
+        else:
+            model_name = "gpt-5-nano"
+        
+        return supports_web_fetch(model_name)
+    
+    def _model_supports_prompt_caching(self) -> bool:
+        """
+        Check if the agent's model supports prompt caching via LiteLLM.
+        
+        Prompt caching allows caching parts of prompts to reduce costs and latency.
+        Supported by OpenAI, Anthropic, Bedrock, and Deepseek.
+        
+        Returns:
+            bool: True if the model supports prompt caching, False otherwise
+        """
+        from ..llm.model_capabilities import supports_prompt_caching
+        
+        # Get the model name
+        if hasattr(self, 'llm_instance') and self.llm_instance:
+            model_name = self.llm_instance.model
+        elif hasattr(self, 'llm') and self.llm:
+            model_name = self.llm
+        else:
+            model_name = "gpt-4o-mini"
+        
+        return supports_prompt_caching(model_name)
+    
+    def _init_rules_manager(self):
+        """
+        Initialize RulesManager for persistent rules/instructions.
+        
+        Automatically discovers rules from:
+        - ~/.praison/rules/ (global)
+        - .praison/rules/ (workspace)
+        - Subdirectory rules
+        """
+        try:
+            from ..memory.rules_manager import RulesManager
+            import os
+            
+            # Get workspace path (current working directory)
+            workspace_path = os.getcwd()
+            
+            self._rules_manager = RulesManager(
+                workspace_path=workspace_path,
+                verbose=1 if self.verbose else 0
+            )
+            
+            # Log discovered rules
+            stats = self._rules_manager.get_stats()
+            if stats["total_rules"] > 0:
+                logging.debug(f"RulesManager: Discovered {stats['total_rules']} rules")
+        except ImportError:
+            logging.debug("RulesManager not available")
+            self._rules_manager = None
+        except Exception as e:
+            logging.debug(f"Could not initialize RulesManager: {e}")
+            self._rules_manager = None
+    
+    def get_rules_context(self, file_path: Optional[str] = None, include_manual: Optional[List[str]] = None) -> str:
+        """
+        Get rules context for the current conversation.
+        
+        Args:
+            file_path: Optional file path for glob-based rule matching
+            include_manual: Optional list of manual rule names to include (via @mention)
+            
+        Returns:
+            Formatted rules context string
+        """
+        if not self._rules_manager:
+            return ""
+        
+        return self._rules_manager.build_rules_context(
+            file_path=file_path,
+            include_manual=include_manual
+        )
+    
+    def _init_memory(self, memory, user_id: Optional[str] = None):
+        """
+        Initialize memory based on the memory parameter.
+        
+        Args:
+            memory: Can be:
+                - True: Use FileMemory with default settings
+                - False/None: No memory
+                - "file": Use FileMemory
+                - "sqlite": Use existing Memory class with SQLite
+                - dict: Configuration for memory
+                - Memory/FileMemory instance: Use directly
+            user_id: User identifier for memory isolation
+        """
+        self.memory = memory
+        
+        if memory is None or memory is False:
+            self._memory_instance = None
+            return
+        
+        # Determine user_id
+        mem_user_id = user_id or getattr(self, 'user_id', None) or "default"
+        
+        if memory is True or memory == "file":
+            # Use FileMemory (zero dependencies)
+            from ..memory.file_memory import FileMemory
+            self._memory_instance = FileMemory(
+                user_id=mem_user_id,
+                verbose=1 if getattr(self, 'verbose', False) else 0
+            )
+        elif isinstance(memory, str) and memory in ("sqlite", "chromadb", "mem0", "mongodb"):
+            # Use full Memory class with specific provider
+            try:
+                from ..memory.memory import Memory
+                config = {"provider": memory if memory != "sqlite" else "rag"}
+                self._memory_instance = Memory(config)
+            except ImportError:
+                logging.warning(f"Memory provider '{memory}' requires additional dependencies. Falling back to FileMemory.")
+                from ..memory.file_memory import FileMemory
+                self._memory_instance = FileMemory(user_id=mem_user_id)
+        elif isinstance(memory, dict):
+            # Configuration dict
+            provider = memory.get("provider", "file")
+            if provider == "file":
+                from ..memory.file_memory import FileMemory
+                self._memory_instance = FileMemory(
+                    user_id=memory.get("user_id", mem_user_id),
+                    config=memory
+                )
+            else:
+                try:
+                    from ..memory.memory import Memory
+                    self._memory_instance = Memory(memory)
+                except ImportError:
+                    logging.warning("Full Memory class requires additional dependencies. Falling back to FileMemory.")
+                    from ..memory.file_memory import FileMemory
+                    self._memory_instance = FileMemory(user_id=mem_user_id)
+        else:
+            # Assume it's already a memory instance
+            self._memory_instance = memory
+    
+    def get_memory_context(self, query: Optional[str] = None) -> str:
+        """
+        Get memory context for the current conversation.
+        
+        Args:
+            query: Optional query to focus the context
+            
+        Returns:
+            Formatted memory context string
+        """
+        if not self._memory_instance:
+            return ""
+        
+        if hasattr(self._memory_instance, 'get_context'):
+            return self._memory_instance.get_context(query=query)
+        
+        return ""
+    
+    def store_memory(self, content: str, memory_type: str = "short_term", **kwargs):
+        """
+        Store content in memory.
+        
+        Args:
+            content: Content to store
+            memory_type: Type of memory (short_term, long_term, entity, episodic)
+            **kwargs: Additional arguments for the memory method
+        """
+        if not self._memory_instance:
+            return
+        
+        if memory_type == "short_term" and hasattr(self._memory_instance, 'add_short_term'):
+            self._memory_instance.add_short_term(content, **kwargs)
+        elif memory_type == "long_term" and hasattr(self._memory_instance, 'add_long_term'):
+            self._memory_instance.add_long_term(content, **kwargs)
+        elif memory_type == "entity" and hasattr(self._memory_instance, 'add_entity'):
+            self._memory_instance.add_entity(content, **kwargs)
+        elif memory_type == "episodic" and hasattr(self._memory_instance, 'add_episodic'):
+            self._memory_instance.add_episodic(content, **kwargs)
+    
+    def _display_memory_info(self):
+        """Display memory information to user in a friendly format."""
+        if not self._memory_instance:
+            return
+        
+        # Only display once per chat session
+        if hasattr(self, '_memory_displayed') and self._memory_displayed:
+            return
+        self._memory_displayed = True
+        
+        stats = self._memory_instance.get_stats()
+        short_count = stats.get('short_term_count', 0)
+        long_count = stats.get('long_term_count', 0)
+        entity_count = stats.get('entity_count', 0)
+        storage_path = stats.get('storage_path', '')
+        
+        total_memories = short_count + long_count + entity_count
+        
+        if total_memories > 0:
+            from rich.panel import Panel
+            from rich.text import Text
+            
+            # Build memory info text
+            info_parts = []
+            if long_count > 0:
+                info_parts.append(f"💾 {long_count} long-term")
+            if short_count > 0:
+                info_parts.append(f"⚡ {short_count} short-term")
+            if entity_count > 0:
+                info_parts.append(f"👤 {entity_count} entities")
+            
+            memory_text = Text()
+            memory_text.append("🧠 Memory loaded: ", style="bold cyan")
+            memory_text.append(" | ".join(info_parts))
+            memory_text.append(f"\n📁 Storage: {storage_path}", style="dim")
+            
+            self.console.print(Panel(
+                memory_text,
+                title="[bold]Agent Memory[/bold]",
+                border_style="cyan",
+                expand=False
+            ))
+    
+    @property
     def llm_model(self):
         """Unified property to get the LLM model regardless of configuration type.
         
         Returns:
             The LLM model/instance being used by this agent.
-            - For standard models: returns the model string (e.g., "gpt-4o")
+            - For standard models: returns the model string (e.g., "gpt-5-nano")
             - For custom LLM instances: returns the LLM instance object
             - For provider models: returns the LLM instance object
         """
@@ -533,8 +923,21 @@ Your Goal: {self.goal}
             return self.llm
         else:
             # Default fallback
-            return "gpt-4o"
+            return "gpt-5-nano"
 
+    def _ensure_knowledge_processed(self):
+        """Ensure knowledge is initialized and processed when first accessed."""
+        if not self._knowledge_processed and self._knowledge_sources:
+            # Initialize Knowledge with provided or default config
+            from praisonaiagents.knowledge import Knowledge
+            self.knowledge = Knowledge(self._knowledge_config or None)
+            
+            # Process all knowledge sources
+            for source in self._knowledge_sources:
+                self._process_knowledge(source)
+            
+            self._knowledge_processed = True
+    
     def _process_knowledge(self, knowledge_item):
         """Process and store knowledge from a file path, URL, or string."""
         try:
@@ -653,7 +1056,7 @@ Your Goal: {self.goal}
                 error=f"Agent guardrail validation error: {str(e)}"
             )
 
-    def _apply_guardrail_with_retry(self, response_text, prompt, temperature=0.2, tools=None):
+    def _apply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None):
         """Apply guardrail validation with retry logic.
         
         Args:
@@ -707,7 +1110,7 @@ Your Goal: {self.goal}
             # Regenerate response for retry
             try:
                 retry_prompt = f"{prompt}\n\nNote: Previous response failed validation due to: {guardrail_result.error}. Please provide an improved response."
-                response = self._chat_completion([{"role": "user", "content": retry_prompt}], temperature, tools)
+                response = self._chat_completion([{"role": "user", "content": retry_prompt}], temperature, tools, task_name=task_name, task_description=task_description, task_id=task_id)
                 if response and response.choices:
                     current_response = response.choices[0].message.content.strip()
                 else:
@@ -721,6 +1124,23 @@ Your Goal: {self.goal}
         
         return current_response
     
+    def _get_tools_cache_key(self, tools):
+        """Generate a cache key for tools list."""
+        if tools is None:
+            return "none"
+        if not tools:
+            return "empty"
+        # Create a simple hash based on tool names
+        tool_names = []
+        for tool in tools:
+            if callable(tool) and hasattr(tool, '__name__'):
+                tool_names.append(tool.__name__)
+            elif isinstance(tool, dict) and 'function' in tool and 'name' in tool['function']:
+                tool_names.append(tool['function']['name'])
+            elif isinstance(tool, str):
+                tool_names.append(tool)
+        return "|".join(sorted(tool_names))
+    
     def _build_system_prompt(self, tools=None):
         """Build the system prompt with tool information.
         
@@ -732,10 +1152,35 @@ Your Goal: {self.goal}
         """
         if not self.use_system_prompt:
             return None
+        
+        # Check cache first (skip cache if memory is enabled since context is dynamic)
+        if not self._memory_instance:
+            tools_key = self._get_tools_cache_key(tools)
+            cache_key = f"{self.role}:{self.goal}:{tools_key}"
+            
+            if cache_key in self._system_prompt_cache:
+                return self._system_prompt_cache[cache_key]
+        else:
+            cache_key = None  # Don't cache when memory is enabled
             
         system_prompt = f"""{self.backstory}\n
 Your Role: {self.role}\n
 Your Goal: {self.goal}"""
+        
+        # Add rules context if rules manager is enabled
+        if self._rules_manager:
+            rules_context = self.get_rules_context()
+            if rules_context:
+                system_prompt += f"\n\n## Rules (Guidelines you must follow)\n{rules_context}"
+        
+        # Add memory context if memory is enabled
+        if self._memory_instance:
+            memory_context = self.get_memory_context()
+            if memory_context:
+                system_prompt += f"\n\n## Memory (Information you remember about the user)\n{memory_context}"
+                # Display memory info to user if verbose
+                if self.verbose:
+                    self._display_memory_info()
         
         # Add tool usage instructions if tools are available
         # Use provided tools or fall back to self.tools
@@ -766,9 +1211,13 @@ Your Goal: {self.goal}"""
             if tool_names:
                 system_prompt += f"\n\nYou have access to the following tools: {', '.join(tool_names)}. Use these tools when appropriate to help complete your tasks. Always use tools when they can help provide accurate information or perform actions."
         
+        # Cache the generated system prompt (only if cache_key is set, i.e., memory not enabled)
+        # Simple cache size limit to prevent unbounded growth
+        if cache_key and len(self._system_prompt_cache) < self._max_cache_size:
+            self._system_prompt_cache[cache_key] = system_prompt
         return system_prompt
 
-    def _build_messages(self, prompt, temperature=0.2, output_json=None, output_pydantic=None, tools=None):
+    def _build_messages(self, prompt, temperature=1.0, output_json=None, output_pydantic=None, tools=None):
         """Build messages list for chat completion.
         
         Args:
@@ -841,6 +1290,11 @@ Your Goal: {self.goal}"""
         
         if not tools:
             return []
+        
+        # Check cache first
+        tools_key = self._get_tools_cache_key(tools)
+        if tools_key in self._formatted_tools_cache:
+            return self._formatted_tools_cache[tools_key]
             
         formatted_tools = []
         for tool in tools:
@@ -890,7 +1344,11 @@ Your Goal: {self.goal}"""
             except (TypeError, ValueError) as e:
                 logging.error(f"Tools are not JSON serializable: {e}")
                 return []
-                
+        
+        # Cache the formatted tools
+        # Simple cache size limit to prevent unbounded growth
+        if len(self._formatted_tools_cache) < self._max_cache_size:
+            self._formatted_tools_cache[tools_key] = formatted_tools
         return formatted_tools
 
     def generate_task(self) -> 'Task':
@@ -907,6 +1365,31 @@ Your Goal: {self.goal}"""
             agent=self,
             tools=self.tools
         )
+
+    def _resolve_tool_names(self, tool_names):
+        """Resolve tool names to actual tool instances from registry.
+        
+        Args:
+            tool_names: List of tool name strings
+            
+        Returns:
+            List of resolved tool instances
+        """
+        resolved = []
+        try:
+            from ..tools.registry import get_registry
+            registry = get_registry()
+            
+            for name in tool_names:
+                tool = registry.get(name)
+                if tool is not None:
+                    resolved.append(tool)
+                else:
+                    logging.warning(f"Tool '{name}' not found in registry")
+        except ImportError:
+            logging.warning("Tool registry not available, cannot resolve tool names")
+        
+        return resolved
 
     def _cast_arguments(self, func, arguments):
         """Cast arguments to their expected types based on function signature."""
@@ -1005,13 +1488,31 @@ Your Goal: {self.goal}"""
         # Try to find the function in the agent's tools list first
         func = None
         for tool in self.tools if isinstance(self.tools, (list, tuple)) else []:
+            # Check for BaseTool instances (plugin system)
+            from ..tools.base import BaseTool
+            if isinstance(tool, BaseTool) and tool.name == function_name:
+                func = tool
+                break
+            # Check for FunctionTool (decorated functions)
+            if hasattr(tool, 'name') and getattr(tool, 'name', None) == function_name:
+                func = tool
+                break
             if (callable(tool) and getattr(tool, '__name__', '') == function_name) or \
                (inspect.isclass(tool) and tool.__name__ == function_name):
                 func = tool
                 break
         
         if func is None:
-            # If not found in tools, try globals and main
+            # Check the global tool registry for plugins
+            try:
+                from ..tools.registry import get_registry
+                registry = get_registry()
+                func = registry.get(function_name)
+            except ImportError:
+                pass
+        
+        if func is None:
+            # If not found in tools or registry, try globals and main
             func = globals().get(function_name)
             if not func:
                 import __main__
@@ -1019,6 +1520,12 @@ Your Goal: {self.goal}"""
 
         if func:
             try:
+                # BaseTool instances (plugin system) - call run() method
+                from ..tools.base import BaseTool
+                if isinstance(func, BaseTool):
+                    casted_arguments = self._cast_arguments(func.run, arguments)
+                    return func.run(**casted_arguments)
+                
                 # Langchain: If it's a class with run but not _run, instantiate and call run
                 if inspect.isclass(func) and hasattr(func, 'run') and not hasattr(func, '_run'):
                     instance = func()
@@ -1068,11 +1575,11 @@ Your Goal: {self.goal}"""
             tools=formatted_tools,
             start_time=start_time,
             console=self.console,
-            display_fn=display_generating,
+            display_fn=self.display_generating if self.verbose else None,
             reasoning_steps=reasoning_steps
         )
 
-    def _chat_completion(self, messages, temperature=0.2, tools=None, stream=True, reasoning_steps=False):
+    def _chat_completion(self, messages, temperature=1.0, tools=None, stream=True, reasoning_steps=False, task_name=None, task_description=None, task_id=None):
         start_time = time.time()
         logging.debug(f"{self.name} sending messages to LLM: {messages}")
 
@@ -1107,32 +1614,53 @@ Your Goal: {self.goal}"""
                         reasoning_steps=reasoning_steps
                     )
                 else:
-                    # Non-streaming with custom LLM
-                    final_response = self.llm_instance.get_response(
-                        prompt=messages[1:],
-                        system_prompt=messages[0]['content'] if messages and messages[0]['role'] == 'system' else None,
-                        temperature=temperature,
-                        tools=formatted_tools if formatted_tools else None,
-                        verbose=self.verbose,
-                        markdown=self.markdown,
-                        stream=stream,
-                        console=self.console,
-                        execute_tool_fn=self.execute_tool,
-                        agent_name=self.name,
-                        agent_role=self.role,
-                        agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
-                        task_name=task_name,
-                        task_description=task_description,
-                        task_id=task_id,
-                        reasoning_steps=reasoning_steps
-                    )
+                    # Non-streaming with custom LLM - don't show streaming-like behavior
+                    if False:  # Don't use display_generating when stream=False to avoid streaming-like behavior
+                        # This block is disabled to maintain consistency with the OpenAI path fix
+                        with Live(
+                            display_generating("", start_time),
+                            console=self.console,
+                            refresh_per_second=4,
+                        ) as live:
+                            final_response = self.llm_instance.get_response(
+                                prompt=messages[1:],
+                                system_prompt=messages[0]['content'] if messages and messages[0]['role'] == 'system' else None,
+                                temperature=temperature,
+                                tools=formatted_tools if formatted_tools else None,
+                                verbose=self.verbose,
+                                markdown=self.markdown,
+                                stream=stream,
+                                console=self.console,
+                                execute_tool_fn=self.execute_tool,
+                                agent_name=self.name,
+                                agent_role=self.role,
+                                agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
+                                task_name=task_name,
+                                task_description=task_description,
+                                task_id=task_id,
+                                reasoning_steps=reasoning_steps
+                            )
+                    else:
+                        final_response = self.llm_instance.get_response(
+                            prompt=messages[1:],
+                            system_prompt=messages[0]['content'] if messages and messages[0]['role'] == 'system' else None,
+                            temperature=temperature,
+                            tools=formatted_tools if formatted_tools else None,
+                            verbose=self.verbose,
+                            markdown=self.markdown,
+                            stream=stream,
+                            console=self.console,
+                            execute_tool_fn=self.execute_tool,
+                            agent_name=self.name,
+                            agent_role=self.role,
+                            agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
+                            task_name=task_name,
+                            task_description=task_description,
+                            task_id=task_id,
+                            reasoning_steps=reasoning_steps
+                        )
             else:
                 # Use the standard OpenAI client approach with tool support
-                def custom_display_fn(text, start_time):
-                    if self.verbose:
-                        return display_generating(text, start_time)
-                    return ""
-                
                 # Note: openai_client expects tools in various formats and will format them internally
                 # But since we already have formatted_tools, we can pass them directly
                 if self._openai_client is None:
@@ -1145,8 +1673,8 @@ Your Goal: {self.goal}"""
                     tools=formatted_tools,  # Already formatted for OpenAI
                     execute_tool_fn=self.execute_tool,
                     stream=stream,
-                    console=self.console if self.verbose else None,
-                    display_fn=display_generating if stream and self.verbose else None,
+                    console=self.console if (self.verbose or stream) else None,
+                    display_fn=self.display_generating if self.verbose else None,
                     reasoning_steps=reasoning_steps,
                     verbose=self.verbose,
                     max_iterations=10
@@ -1158,7 +1686,7 @@ Your Goal: {self.goal}"""
             display_error(f"Error in chat completion: {e}")
             return None
     
-    def _execute_callback_and_display(self, prompt: str, response: str, generation_time: float):
+    def _execute_callback_and_display(self, prompt: str, response: str, generation_time: float, task_name=None, task_description=None, task_id=None):
         """Helper method to execute callbacks and display interaction.
         
         This centralizes the logic for callback execution and display to avoid duplication.
@@ -1174,12 +1702,13 @@ Your Goal: {self.goal}"""
                 agent_name=self.name,
                 agent_role=self.role,
                 agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
-                task_name=None,  # Not available in this context
-                task_description=None,  # Not available in this context 
-                task_id=None  # Not available in this context
+                task_name=task_name,
+                task_description=task_description, 
+                task_id=task_id
             )
-        # Only display interaction if not using custom LLM (to avoid double output) and verbose is True
-        if self.verbose and not self._using_custom_llm:
+        # Always display final interaction when verbose is True to ensure consistent formatting
+        # This ensures both OpenAI and custom LLM providers (like Gemini) show formatted output
+        if self.verbose and not self._final_display_shown:
             display_interaction(prompt, response, markdown=self.markdown, 
                               generation_time=generation_time, console=self.console,
                               agent_name=self.name,
@@ -1188,8 +1717,36 @@ Your Goal: {self.goal}"""
                               task_name=None,  # Not available in this context
                               task_description=None,  # Not available in this context
                               task_id=None)  # Not available in this context
+            self._final_display_shown = True
+    
+    def display_generating(self, content: str, start_time: float):
+        """Display function for generating animation with agent info."""
+        from rich.panel import Panel
+        from rich.markdown import Markdown
+        elapsed = time.time() - start_time
+        
+        # Show content if provided (for both streaming and progressive display)
+        if content:
+            display_content = Markdown(content) if self.markdown else content
+            return Panel(
+                display_content,
+                title=f"[bold]{self.name}[/bold] - Generating... {elapsed:.1f}s",
+                border_style="green",
+                expand=False
+            )
+        # else:
+        #     # No content yet: show generating message
+        #     return Panel(
+        #         f"[bold cyan]Generating response...[/bold cyan]",
+        #         title=f"[bold]{self.name}[/bold] - {elapsed:.1f}s",
+        #         border_style="cyan",
+        #         expand=False
+        #     )
 
-    def chat(self, prompt, temperature=0.2, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=True, task_name=None, task_description=None, task_id=None):
+    def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None):
+        # Reset the final display flag for each new conversation
+        self._final_display_shown = False
+        
         # Log all parameter values when in debug mode
         if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
             param_info = {
@@ -1207,7 +1764,13 @@ Your Goal: {self.goal}"""
         
         start_time = time.time()
         reasoning_steps = reasoning_steps or self.reasoning_steps
+        # Use agent's stream setting if not explicitly provided
+        if stream is None:
+            stream = self.stream
         # Search for existing knowledge if any knowledge is provided
+        if self._knowledge_sources and not self._knowledge_processed:
+            self._ensure_knowledge_processed()
+        
         if self.knowledge:
             search_results = self.knowledge.search(prompt, agent_id=self.agent_id)
             if search_results:
@@ -1297,7 +1860,9 @@ Your Goal: {self.goal}"""
 
                     # Apply guardrail validation for custom LLM response
                     try:
-                        validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools)
+                        validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id)
+                        # Execute callback and display after validation
+                        self._execute_callback_and_display(prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                         return validated_response
                     except Exception as e:
                         logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
@@ -1357,7 +1922,7 @@ Your Goal: {self.goal}"""
                                     agent_tools=agent_tools
                                 )
 
-                        response = self._chat_completion(messages, temperature=temperature, tools=tools if tools else None, reasoning_steps=reasoning_steps, stream=self.stream)
+                        response = self._chat_completion(messages, temperature=temperature, tools=tools if tools else None, reasoning_steps=reasoning_steps, stream=stream, task_name=task_name, task_description=task_description, task_id=task_id)
                         if not response:
                             # Rollback chat history on response failure
                             self.chat_history = self.chat_history[:chat_history_length]
@@ -1372,9 +1937,9 @@ Your Goal: {self.goal}"""
                             self.chat_history.append({"role": "assistant", "content": response_text})
                             # Apply guardrail validation even for JSON output
                             try:
-                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools)
+                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                                 # Execute callback after validation
-                                self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time)
+                                self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return validated_response
                             except Exception as e:
                                 logging.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
@@ -1391,9 +1956,9 @@ Your Goal: {self.goal}"""
                             if reasoning_steps and hasattr(response.choices[0].message, 'reasoning_content'):
                                 # Apply guardrail to reasoning content
                                 try:
-                                    validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools)
+                                    validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id)
                                     # Execute callback after validation
-                                    self._execute_callback_and_display(original_prompt, validated_reasoning, time.time() - start_time)
+                                    self._execute_callback_and_display(original_prompt, validated_reasoning, time.time() - start_time, task_name, task_description, task_id)
                                     return validated_reasoning
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
@@ -1402,9 +1967,9 @@ Your Goal: {self.goal}"""
                                     return None
                             # Apply guardrail to regular response
                             try:
-                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools)
+                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                                 # Execute callback after validation
-                                self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time)
+                                self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return validated_response
                             except Exception as e:
                                 logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
@@ -1426,7 +1991,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             if self._using_custom_llm or self._openai_client is None:
                                 # For custom LLMs, we need to handle reflection differently
                                 # Use non-streaming to get complete JSON response
-                                reflection_response = self._chat_completion(messages, temperature=temperature, tools=None, stream=False, reasoning_steps=False)
+                                reflection_response = self._chat_completion(messages, temperature=temperature, tools=None, stream=False, reasoning_steps=False, task_name=task_name, task_description=task_description, task_id=task_id)
                                 
                                 if not reflection_response or not reflection_response.choices:
                                     raise Exception("No response from reflection request")
@@ -1470,9 +2035,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 self.chat_history.append({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after satisfactory reflection
                                 try:
-                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools)
+                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                                     # Execute callback after validation
-                                    self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time)
+                                    self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     return validated_response
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
@@ -1488,9 +2053,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 self.chat_history.append({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after max reflections
                                 try:
-                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools)
+                                    validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                                     # Execute callback after validation
-                                    self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time)
+                                    self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     return validated_response
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
@@ -1503,7 +2068,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             messages.append({"role": "user", "content": "Now regenerate your response using the reflection you made"})
                             # For custom LLMs during reflection, always use non-streaming to ensure complete responses
                             use_stream = self.stream if not self._using_custom_llm else False
-                            response = self._chat_completion(messages, temperature=temperature, tools=None, stream=use_stream)
+                            response = self._chat_completion(messages, temperature=temperature, tools=None, stream=use_stream, task_name=task_name, task_description=task_description, task_id=task_id)
                             response_text = response.choices[0].message.content.strip()
                             reflection_count += 1
                             continue  # Continue the loop for more reflections
@@ -1536,8 +2101,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             cleaned = cleaned[:-3].strip()
         return cleaned  
 
-    async def achat(self, prompt: str, temperature=0.2, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False):
+    async def achat(self, prompt: str, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None):
         """Async version of chat method with self-reflection support.""" 
+        # Reset the final display flag for each new conversation
+        self._final_display_shown = False
+        
         # Log all parameter values when in debug mode
         if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
             param_info = {
@@ -1561,6 +2129,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 tools = self.tools
 
             # Search for existing knowledge if any knowledge is provided
+            if self._knowledge_sources and not self._knowledge_processed:
+                self._ensure_knowledge_processed()
+            
             if self.knowledge:
                 search_results = self.knowledge.search(prompt, agent_id=self.agent_id)
                 if search_results:
@@ -1620,7 +2191,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Apply guardrail validation for custom LLM response
                     try:
-                        validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools)
+                        validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id)
+                        # Execute callback after validation
+                        self._execute_callback_and_display(normalized_content, validated_response, time.time() - start_time, task_name, task_description, task_id)
                         return validated_response
                     except Exception as e:
                         logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
@@ -1697,6 +2270,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
                             total_time = time.time() - start_time
                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
+                        # Execute callback after tool completion
+                        self._execute_callback_and_display(original_prompt, result, time.time() - start_time, task_name, task_description, task_id)
                         return result
                     elif output_json or output_pydantic:
                         response = await self._openai_client.async_client.chat.completions.create(
@@ -1705,11 +2280,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             temperature=temperature,
                             response_format={"type": "json_object"}
                         )
-                        # Return the raw response
+                        response_text = response.choices[0].message.content
                         if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
                             total_time = time.time() - start_time
                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
-                        return response.choices[0].message.content
+                        # Execute callback after JSON/Pydantic completion
+                        self._execute_callback_and_display(original_prompt, response_text, time.time() - start_time, task_name, task_description, task_id)
+                        return response_text
                     else:
                         response = await self._openai_client.async_client.chat.completions.create(
                             model=self.llm,
@@ -1804,7 +2381,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         # Apply guardrail validation for OpenAI client response
                         try:
-                            validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools)
+                            validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                            # Execute callback after validation
+                            self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                             return validated_response
                         except Exception as e:
                             logging.error(f"Agent {self.name}: Guardrail validation failed for OpenAI client: {e}")
@@ -1835,7 +2414,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             for tool_call in message.tool_calls:
                 try:
                     function_name = tool_call.function.name
-                    arguments = json.loads(tool_call.function.arguments)
+                    # Parse JSON arguments safely 
+                    try:
+                        arguments = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError as json_error:
+                        logging.error(f"Failed to parse tool arguments as JSON: {json_error}")
+                        arguments = {}
                     
                     # Find the matching tool
                     tool = next((t for t in tools if t.__name__ == function_name), None)
@@ -1869,7 +2453,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         final_response = await self._openai_client.async_client.chat.completions.create(
                             model=self.llm,
                             messages=messages,
-                            temperature=0.2,
+                            temperature=1.0,
                             stream=True
                         )
                         full_response_text = ""
@@ -1877,25 +2461,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         chunks = []
                         start_time = time.time()
                         
-                        with Live(
-                            display_generating("", start_time),
-                            console=self.console,
-                            refresh_per_second=4,
-                            transient=True,
-                            vertical_overflow="ellipsis",
-                            auto_refresh=True
-                        ) as live:
-                            async for chunk in final_response:
-                                chunks.append(chunk)
-                                if chunk.choices[0].delta.content:
-                                    full_response_text += chunk.choices[0].delta.content
-                                    live.update(display_generating(full_response_text, start_time))
-                                
-                                if reasoning_steps and hasattr(chunk.choices[0].delta, "reasoning_content"):
-                                    rc = chunk.choices[0].delta.reasoning_content
-                                    if rc:
-                                        reasoning_content += rc
-                                        live.update(display_generating(f"{full_response_text}\n[Reasoning: {reasoning_content}]", start_time))
+                        # Process stream without display_generating since streaming is active
+                        async for chunk in final_response:
+                            chunks.append(chunk)
+                            if chunk.choices[0].delta.content:
+                                full_response_text += chunk.choices[0].delta.content
+                            
+                            if reasoning_steps and hasattr(chunk.choices[0].delta, "reasoning_content"):
+                                rc = chunk.choices[0].delta.reasoning_content
+                                if rc:
+                                    reasoning_content += rc
                         
                         self.console.print()
                         
@@ -1914,17 +2489,366 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             display_error(f"Error in _achat_completion: {e}")
             return None
 
+    async def arun(self, prompt: str, **kwargs):
+        """Async alias for astart() method"""
+        return await self.astart(prompt, **kwargs)
+
     async def astart(self, prompt: str, **kwargs):
         """Async version of start method"""
         return await self.achat(prompt, **kwargs)
 
-    def run(self):
+    def run(self, prompt: str, **kwargs):
         """Alias for start() method"""
-        return self.start() 
+        return self.start(prompt, **kwargs)
+    
+    def _get_planning_agent(self):
+        """Lazy load PlanningAgent for planning mode."""
+        if self._planning_agent is None and self.planning:
+            from ..planning import PlanningAgent
+            self._planning_agent = PlanningAgent(
+                llm=self.llm if hasattr(self, 'llm') else (self.llm_instance.model if hasattr(self, 'llm_instance') else "gpt-4o-mini"),
+                tools=self.planning_tools,
+                reasoning=self.planning_reasoning,
+                verbose=1 if self.verbose else 0
+            )
+        return self._planning_agent
+    
+    def _start_with_planning(self, prompt: str, **kwargs):
+        """Execute with planning mode - creates plan then executes each step."""
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.markdown import Markdown
+        
+        console = Console()
+        
+        # Step 1: Create the plan
+        console.print("\n[bold blue]📋 PLANNING PHASE[/bold blue]")
+        console.print("[dim]Creating implementation plan...[/dim]\n")
+        
+        planner = self._get_planning_agent()
+        plan = planner.create_plan_sync(request=prompt, agents=[self])
+        
+        if not plan or not plan.steps:
+            console.print("[yellow]⚠️ Planning failed, falling back to direct execution[/yellow]")
+            return self.chat(prompt, **kwargs)
+        
+        # Display the plan
+        console.print(Panel(
+            Markdown(plan.to_markdown()),
+            title="[bold green]Generated Plan[/bold green]",
+            border_style="green"
+        ))
+        
+        # Step 2: Execute each step
+        console.print("\n[bold blue]🚀 EXECUTION PHASE[/bold blue]\n")
+        
+        results = []
+        context = ""
+        
+        for i, step in enumerate(plan.steps):
+            progress = (i + 1) / len(plan.steps)
+            bar_length = 30
+            filled = int(bar_length * progress)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            
+            console.print(f"[dim]Progress: [{bar}] {progress * 100:.0f}%[/dim]")
+            console.print(f"\n[bold]📌 Step {i + 1}/{len(plan.steps)}:[/bold] {step.description[:60]}...")
+            
+            # Build prompt with context from previous steps
+            step_prompt = step.description
+            if context:
+                step_prompt = f"{step.description}\n\nContext from previous steps:\n{context}"
+            
+            # Execute the step
+            result = self.chat(step_prompt, **kwargs)
+            results.append(result)
+            
+            # Update context for next step
+            context += f"\n\nStep {i + 1} result: {result[:500] if result else 'No result'}"
+            
+            console.print(f"   [green]✅ Completed[/green]")
+        
+        console.print(f"\n[bold green]🎉 EXECUTION COMPLETE[/bold green]")
+        console.print(f"[dim]Progress: [{'█' * bar_length}] 100%[/dim]")
+        console.print(f"Completed {len(plan.steps)}/{len(plan.steps)} steps!\n")
+        
+        # Return the final result
+        return results[-1] if results else None
 
     def start(self, prompt: str, **kwargs):
         """Start the agent with a prompt. This is a convenience method that wraps chat()."""
-        return self.chat(prompt, **kwargs) 
+        # Check if planning mode is enabled
+        if self.planning:
+            return self._start_with_planning(prompt, **kwargs)
+        
+        # Check if streaming is enabled (either from kwargs or agent's stream attribute)
+        stream_enabled = kwargs.get('stream', getattr(self, 'stream', False))
+        
+        if stream_enabled:
+            # Return a generator for streaming response
+            return self._start_stream(prompt, **kwargs)
+        else:
+            # Return regular chat response for backward compatibility
+            # Explicitly pass the resolved stream parameter to avoid chat() method default
+            kwargs['stream'] = stream_enabled
+            return self.chat(prompt, **kwargs)
+
+    def _start_stream(self, prompt: str, **kwargs) -> Generator[str, None, None]:
+        """Stream generator for real-time response chunks."""
+        try:
+            # Reset the final display flag for each new conversation
+            self._final_display_shown = False
+            
+            # Temporarily disable verbose mode to prevent console output conflicts during streaming
+            original_verbose = self.verbose
+            self.verbose = False
+            
+            # For custom LLM path, use the new get_response_stream generator
+            if self._using_custom_llm:
+                # Handle knowledge search
+                actual_prompt = prompt
+                if self._knowledge_sources and not self._knowledge_processed:
+                    self._ensure_knowledge_processed()
+                
+                if self.knowledge:
+                    search_results = self.knowledge.search(prompt, agent_id=self.agent_id)
+                    if search_results:
+                        if isinstance(search_results, dict) and 'results' in search_results:
+                            knowledge_content = "\n".join([result['memory'] for result in search_results['results']])
+                        else:
+                            knowledge_content = "\n".join(search_results)
+                        actual_prompt = f"{prompt}\n\nKnowledge: {knowledge_content}"
+                
+                # Handle tools properly
+                tools = kwargs.get('tools', self.tools)
+                if tools is None or (isinstance(tools, list) and len(tools) == 0):
+                    tool_param = self.tools
+                else:
+                    tool_param = tools
+                
+                # Convert MCP tools if needed
+                if tool_param is not None:
+                    from ..mcp.mcp import MCP
+                    if isinstance(tool_param, MCP) and hasattr(tool_param, 'to_openai_tool'):
+                        openai_tool = tool_param.to_openai_tool()
+                        if openai_tool:
+                            if isinstance(openai_tool, list):
+                                tool_param = openai_tool
+                            else:
+                                tool_param = [openai_tool]
+                
+                # Store chat history length for potential rollback
+                chat_history_length = len(self.chat_history)
+                
+                # Normalize prompt content for chat history
+                normalized_content = actual_prompt
+                if isinstance(actual_prompt, list):
+                    normalized_content = next((item["text"] for item in actual_prompt if item.get("type") == "text"), "")
+                
+                # Prevent duplicate messages in chat history
+                if not (self.chat_history and 
+                        self.chat_history[-1].get("role") == "user" and 
+                        self.chat_history[-1].get("content") == normalized_content):
+                    self.chat_history.append({"role": "user", "content": normalized_content})
+                
+                try:
+                    # Use the new streaming generator from LLM class
+                    response_content = ""
+                    for chunk in self.llm_instance.get_response_stream(
+                        prompt=actual_prompt,
+                        system_prompt=self._build_system_prompt(tool_param),
+                        chat_history=self.chat_history,
+                        temperature=kwargs.get('temperature', 1.0),
+                        tools=tool_param,
+                        output_json=kwargs.get('output_json'),
+                        output_pydantic=kwargs.get('output_pydantic'),
+                        verbose=False,  # Keep verbose false for streaming
+                        markdown=self.markdown,
+                        agent_name=self.name,
+                        agent_role=self.role,
+                        agent_tools=[t.__name__ if hasattr(t, '__name__') else str(t) for t in (tool_param or [])],
+                        task_name=kwargs.get('task_name'),
+                        task_description=kwargs.get('task_description'),
+                        task_id=kwargs.get('task_id'),
+                        execute_tool_fn=self.execute_tool
+                    ):
+                        response_content += chunk
+                        yield chunk
+                    
+                    # Add complete response to chat history
+                    if response_content:
+                        self.chat_history.append({"role": "assistant", "content": response_content})
+                        
+                except Exception as e:
+                    # Rollback chat history on error
+                    self.chat_history = self.chat_history[:chat_history_length]
+                    logging.error(f"Custom LLM streaming error: {e}")
+                    raise
+                    
+            else:
+                # For OpenAI-style models, implement proper streaming without display
+                # Handle knowledge search
+                actual_prompt = prompt
+                if self._knowledge_sources and not self._knowledge_processed:
+                    self._ensure_knowledge_processed()
+                
+                if self.knowledge:
+                    search_results = self.knowledge.search(prompt, agent_id=self.agent_id)
+                    if search_results:
+                        if isinstance(search_results, dict) and 'results' in search_results:
+                            knowledge_content = "\n".join([result['memory'] for result in search_results['results']])
+                        else:
+                            knowledge_content = "\n".join(search_results)
+                        actual_prompt = f"{prompt}\n\nKnowledge: {knowledge_content}"
+                
+                # Handle tools properly
+                tools = kwargs.get('tools', self.tools)
+                if tools is None or (isinstance(tools, list) and len(tools) == 0):
+                    tool_param = self.tools
+                else:
+                    tool_param = tools
+                
+                # Build messages using the helper method
+                messages, original_prompt = self._build_messages(actual_prompt, kwargs.get('temperature', 1.0), 
+                                                               kwargs.get('output_json'), kwargs.get('output_pydantic'))
+                
+                # Store chat history length for potential rollback
+                chat_history_length = len(self.chat_history)
+                
+                # Normalize original_prompt for consistent chat history storage
+                normalized_content = original_prompt
+                if isinstance(original_prompt, list):
+                    normalized_content = next((item["text"] for item in original_prompt if item.get("type") == "text"), "")
+                
+                # Prevent duplicate messages in chat history
+                if not (self.chat_history and 
+                        self.chat_history[-1].get("role") == "user" and 
+                        self.chat_history[-1].get("content") == normalized_content):
+                    self.chat_history.append({"role": "user", "content": normalized_content})
+                
+                try:
+                    # Check if OpenAI client is available
+                    if self._openai_client is None:
+                        raise ValueError("OpenAI client is not initialized. Please provide OPENAI_API_KEY or use a custom LLM provider.")
+                    
+                    # Format tools for OpenAI
+                    formatted_tools = self._format_tools_for_completion(tool_param)
+                    
+                    # Create streaming completion directly without display function
+                    completion_args = {
+                        "model": self.llm,
+                        "messages": messages,
+                        "temperature": kwargs.get('temperature', 1.0),
+                        "stream": True
+                    }
+                    if formatted_tools:
+                        completion_args["tools"] = formatted_tools
+                    
+                    completion = self._openai_client.sync_client.chat.completions.create(**completion_args)
+                    
+                    # Stream the response chunks without display
+                    response_text = ""
+                    tool_calls_data = []
+                    
+                    for chunk in completion:
+                        delta = chunk.choices[0].delta
+                        
+                        # Handle text content
+                        if delta.content is not None:
+                            chunk_content = delta.content
+                            response_text += chunk_content
+                            yield chunk_content
+                        
+                        # Handle tool calls (accumulate but don't yield as chunks)
+                        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                            for tool_call_delta in delta.tool_calls:
+                                # Extend tool_calls_data list to accommodate the tool call index
+                                while len(tool_calls_data) <= tool_call_delta.index:
+                                    tool_calls_data.append({'id': '', 'function': {'name': '', 'arguments': ''}})
+                                
+                                # Accumulate tool call data
+                                if tool_call_delta.id:
+                                    tool_calls_data[tool_call_delta.index]['id'] = tool_call_delta.id
+                                if tool_call_delta.function.name:
+                                    tool_calls_data[tool_call_delta.index]['function']['name'] = tool_call_delta.function.name
+                                if tool_call_delta.function.arguments:
+                                    tool_calls_data[tool_call_delta.index]['function']['arguments'] += tool_call_delta.function.arguments
+                    
+                    # Handle any tool calls that were accumulated
+                    if tool_calls_data:
+                        # Add assistant message with tool calls to chat history
+                        assistant_message = {"role": "assistant", "content": response_text}
+                        if tool_calls_data:
+                            assistant_message["tool_calls"] = [
+                                {
+                                    "id": tc['id'],
+                                    "type": "function", 
+                                    "function": tc['function']
+                                } for tc in tool_calls_data if tc['id']
+                            ]
+                        self.chat_history.append(assistant_message)
+                        
+                        # Execute tool calls and add results to chat history
+                        for tool_call in tool_calls_data:
+                            if tool_call['id'] and tool_call['function']['name']:
+                                try:
+                                    # Parse JSON arguments safely 
+                                    try:
+                                        parsed_args = json.loads(tool_call['function']['arguments']) if tool_call['function']['arguments'] else {}
+                                    except json.JSONDecodeError as json_error:
+                                        logging.error(f"Failed to parse tool arguments as JSON: {json_error}")
+                                        parsed_args = {}
+                                    
+                                    tool_result = self.execute_tool(
+                                        tool_call['function']['name'], 
+                                        parsed_args
+                                    )
+                                    # Add tool result to chat history
+                                    self.chat_history.append({
+                                        "role": "tool",
+                                        "tool_call_id": tool_call['id'],
+                                        "content": str(tool_result)
+                                    })
+                                except Exception as tool_error:
+                                    logging.error(f"Tool execution error in streaming: {tool_error}")
+                                    # Add error result to chat history
+                                    self.chat_history.append({
+                                        "role": "tool", 
+                                        "tool_call_id": tool_call['id'],
+                                        "content": f"Error: {str(tool_error)}"
+                                    })
+                    else:
+                        # Add complete response to chat history (text-only response)
+                        if response_text:
+                            self.chat_history.append({"role": "assistant", "content": response_text})
+                        
+                except Exception as e:
+                    # Rollback chat history on error
+                    self.chat_history = self.chat_history[:chat_history_length]
+                    logging.error(f"OpenAI streaming error: {e}")
+                    # Fall back to simulated streaming
+                    response = self.chat(prompt, **kwargs)
+                    if response:
+                        words = str(response).split()
+                        chunk_size = max(1, len(words) // 20)
+                        for i in range(0, len(words), chunk_size):
+                            chunk_words = words[i:i + chunk_size]
+                            chunk = ' '.join(chunk_words)
+                            if i + chunk_size < len(words):
+                                chunk += ' '
+                            yield chunk
+            
+            # Restore original verbose mode
+            self.verbose = original_verbose
+                    
+        except Exception as e:
+            # Restore verbose mode on any error
+            self.verbose = original_verbose
+            # Graceful fallback to non-streaming if streaming fails
+            logging.warning(f"Streaming failed, falling back to regular response: {e}")
+            response = self.chat(prompt, **kwargs)
+            if response:
+                yield response
 
     def execute(self, task, context=None):
         """Execute a task synchronously - backward compatibility method"""
@@ -1944,7 +2868,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             prompt = task
         else:
             prompt = str(task)
-        return await self.achat(prompt)
+        # Extract task info if available
+        task_name = getattr(task, 'name', None)
+        task_description = getattr(task, 'description', None)
+        task_id = getattr(task, 'id', None)
+        return await self.achat(prompt, task_name=task_name, task_description=task_description, task_id=task_id)
 
     async def execute_tool_async(self, function_name: str, arguments: Dict[str, Any]) -> Any:
         """Async version of execute_tool"""
@@ -2113,7 +3041,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 try:
                     # Use async version if available, otherwise use sync version
                     if asyncio.iscoroutinefunction(self.chat):
-                        response = await self.achat(query)
+                        response = await self.achat(query, task_name=None, task_description=None, task_id=None)
                     else:
                         # Run sync function in a thread to avoid blocking
                         loop = asyncio.get_event_loop()
@@ -2234,7 +3162,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 try:
                     # Ensure self.achat is used as it's the async version and pass its tools
                     if hasattr(self, 'achat') and asyncio.iscoroutinefunction(self.achat):
-                        response = await self.achat(prompt, tools=self.tools)
+                        response = await self.achat(prompt, tools=self.tools, task_name=None, task_description=None, task_id=None)
                     elif hasattr(self, 'chat'): # Fallback for synchronous chat
                         loop = asyncio.get_event_loop()
                         response = await loop.run_in_executor(None, lambda p=prompt: self.chat(p, tools=self.tools))

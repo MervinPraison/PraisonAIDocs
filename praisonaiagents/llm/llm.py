@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Union, Literal, Callable
 from pydantic import BaseModel
 import time
 import json
+import xml.etree.ElementTree as ET
 from ..main import (
     display_error,
     display_tool_call,
@@ -20,8 +21,14 @@ from ..main import (
 from rich.console import Console
 from rich.live import Live
 
-# Disable litellm telemetry before any imports
-os.environ["LITELLM_TELEMETRY"] = "False"
+# Import token tracking
+try:
+    from ..telemetry.token_collector import TokenMetrics, _token_collector
+except ImportError:
+    TokenMetrics = None
+    _token_collector = None
+
+# Logging is already configured in _logging.py via __init__.py
 
 # TODO: Include in-build tool calling in LLM class
 # TODO: Restructure so that duplicate calls are not made (Sync with agent.py)
@@ -47,12 +54,15 @@ class LLM:
     Anthropic, and others through LiteLLM.
     """
     
+    # Class-level flag for one-time logging configuration
+    _logging_configured = False
+    
     # Default window sizes for different models (75% of actual to be safe)
     MODEL_WINDOWS = {
         # OpenAI
         "gpt-4": 6144,                    # 8,192 actual
-        "gpt-4o": 96000,                  # 128,000 actual
-        "gpt-4o-mini": 96000,            # 128,000 actual
+        "gpt-5-nano": 96000,                  # 128,000 actual
+        "gpt-5-nano": 96000,            # 128,000 actual
         "gpt-4-turbo": 96000,            # 128,000 actual
         "o1-preview": 96000,             # 128,000 actual
         "o1-mini": 96000,                # 128,000 actual
@@ -93,6 +103,60 @@ class LLM:
     # Ollama-specific prompt constants
     OLLAMA_TOOL_USAGE_PROMPT = "Please analyze the request and use the available tools to help answer the question. Start by identifying what information you need."
     OLLAMA_FINAL_ANSWER_PROMPT = "Based on the tool results above, please provide the final answer to the original question."
+    
+    # Ollama iteration threshold for summary generation
+    OLLAMA_SUMMARY_ITERATION_THRESHOLD = 1
+
+    @classmethod
+    def _configure_logging(cls):
+        """Configure logging settings once for all LLM instances."""
+        try:
+            import litellm
+            # Disable telemetry
+            litellm.telemetry = False
+            
+            # Set litellm options globally
+            litellm.set_verbose = False
+            litellm.success_callback = []
+            litellm._async_success_callback = []
+            litellm.callbacks = []
+            
+            # Suppress all litellm debug info
+            litellm.suppress_debug_info = True
+            if hasattr(litellm, '_logging'):
+                litellm._logging._disable_debugging()
+            
+            # Always suppress litellm's internal debug messages
+            logging.getLogger("litellm.utils").setLevel(logging.WARNING)
+            logging.getLogger("litellm.main").setLevel(logging.WARNING)
+            logging.getLogger("litellm.litellm_logging").setLevel(logging.WARNING)
+            logging.getLogger("litellm.transformation").setLevel(logging.WARNING)
+            
+            # Allow httpx logging when LOGLEVEL=debug, otherwise suppress it
+            loglevel = os.environ.get('LOGLEVEL', 'INFO').upper()
+            if loglevel == 'DEBUG':
+                logging.getLogger("litellm.llms.custom_httpx.http_handler").setLevel(logging.INFO)
+            else:
+                logging.getLogger("litellm.llms.custom_httpx.http_handler").setLevel(logging.WARNING)
+            
+            # Keep asyncio at WARNING unless explicitly in high debug mode
+            logging.getLogger("asyncio").setLevel(logging.WARNING)
+            logging.getLogger("selector_events").setLevel(logging.WARNING)
+            
+            # Enable error dropping for cleaner output
+            litellm.drop_params = True
+            # Enable parameter modification for providers like Anthropic
+            litellm.modify_params = True
+            
+            if hasattr(litellm, '_logging'):
+                litellm._logging._disable_debugging()
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            
+            cls._logging_configured = True
+            
+        except ImportError:
+            # If litellm not installed, we'll handle it in __init__
+            pass
 
     def _log_llm_config(self, method_name: str, **config):
         """Centralized debug logging for LLM configuration and parameters.
@@ -175,40 +239,19 @@ class LLM:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         events: List[Any] = [],
+        web_search: Optional[Union[bool, Dict[str, Any]]] = None,
+        web_fetch: Optional[Union[bool, Dict[str, Any]]] = None,
+        prompt_caching: Optional[bool] = None,
+        claude_memory: Optional[Union[bool, Any]] = None,
         **extra_settings
     ):
+        # Configure logging only once at the class level
+        if not LLM._logging_configured:
+            LLM._configure_logging()
+            
+        # Import litellm after logging is configured
         try:
             import litellm
-            # Disable telemetry
-            litellm.telemetry = False
-            
-            # Set litellm options globally
-            litellm.set_verbose = False
-            litellm.success_callback = []
-            litellm._async_success_callback = []
-            litellm.callbacks = []
-            
-            verbose = extra_settings.get('verbose', True)
-            
-            # Only suppress logs if not in debug mode
-            if not isinstance(verbose, bool) and verbose >= 10:
-                # Enable detailed debug logging
-                logging.getLogger("asyncio").setLevel(logging.DEBUG)
-                logging.getLogger("selector_events").setLevel(logging.DEBUG)
-                logging.getLogger("litellm.utils").setLevel(logging.DEBUG)
-                logging.getLogger("litellm.main").setLevel(logging.DEBUG)
-                litellm.suppress_debug_messages = False
-                litellm.set_verbose = True
-            else:
-                # Suppress debug logging for normal operation
-                logging.getLogger("asyncio").setLevel(logging.WARNING)
-                logging.getLogger("selector_events").setLevel(logging.WARNING)
-                logging.getLogger("litellm.utils").setLevel(logging.WARNING)
-                logging.getLogger("litellm.main").setLevel(logging.WARNING)
-                litellm.suppress_debug_messages = True
-                litellm._logging._disable_debugging()
-                warnings.filterwarnings("ignore", category=RuntimeWarning)
-            
         except ImportError:
             raise ImportError(
                 "LiteLLM is required but not installed. "
@@ -234,16 +277,34 @@ class LLM:
         self.base_url = base_url
         self.events = events
         self.extra_settings = extra_settings
-        self.console = Console()
+        self.web_search = web_search
+        self.web_fetch = web_fetch
+        self.prompt_caching = prompt_caching
+        self.claude_memory = claude_memory
+        self._claude_memory_tool = None  # Lazy initialized
+        self._console = None  # Lazy load console when needed
         self.chat_history = []
-        self.verbose = verbose
+        self.verbose = extra_settings.get('verbose', True)
         self.markdown = extra_settings.get('markdown', True)
         self.self_reflect = extra_settings.get('self_reflect', False)
         self.max_reflect = extra_settings.get('max_reflect', 3)
         self.min_reflect = extra_settings.get('min_reflect', 1)
         self.reasoning_steps = extra_settings.get('reasoning_steps', False)
+        self.metrics = extra_settings.get('metrics', False)
+        # Auto-detect XML tool format for known models, or allow manual override
+        self.xml_tool_format = extra_settings.get('xml_tool_format', 'auto')
+        
+        # Token tracking
+        self.last_token_metrics: Optional[TokenMetrics] = None
+        self.session_token_metrics: Optional[TokenMetrics] = None
+        self.current_agent_name: Optional[str] = None
+        
+        # Cache for formatted tools and messages
+        self._formatted_tools_cache = {}
+        self._max_cache_size = 100
         
         # Enable error dropping for cleaner output
+        import litellm
         litellm.drop_params = True
         # Enable parameter modification for providers like Anthropic
         litellm.modify_params = True
@@ -277,6 +338,14 @@ class LLM:
             reasoning_steps=self.reasoning_steps,
             extra_settings=self.extra_settings
         )
+    
+    @property
+    def console(self):
+        """Lazily initialize Rich Console only when needed."""
+        if self._console is None:
+            from rich.console import Console
+            self._console = Console()
+        return self._console
 
     def _is_ollama_provider(self) -> bool:
         """Detect if this is an Ollama provider regardless of naming convention"""
@@ -301,6 +370,194 @@ class LLM:
             return True
         
         return False
+
+    def _is_qwen_provider(self) -> bool:
+        """Detect if this is a Qwen provider"""
+        if not self.model:
+            return False
+        
+        # Check for Qwen patterns in model name
+        model_lower = self.model.lower()
+        return any(pattern in model_lower for pattern in ["qwen", "qwen2", "qwen2.5"])
+
+    def _supports_xml_tool_format(self) -> bool:
+        """Check if the model should use XML tool format"""
+        if self.xml_tool_format == 'auto':
+            # Auto-detect based on known models that use XML format
+            return self._is_qwen_provider()
+        elif self.xml_tool_format in [True, 'true', 'True']:
+            return True
+        else:
+            return False
+
+    def _supports_web_search(self) -> bool:
+        """
+        Check if the current model supports native web search via LiteLLM.
+        
+        Native web search allows the model to search the web in real-time
+        without requiring external tools like DuckDuckGo.
+        
+        Returns:
+            bool: True if the model supports native web search, False otherwise
+        """
+        from .model_capabilities import supports_web_search
+        return supports_web_search(self.model)
+
+    def _supports_web_fetch(self) -> bool:
+        """
+        Check if the current model supports web fetch via LiteLLM.
+        
+        Web fetch allows the model to retrieve full content from specific URLs
+        (web pages and PDF documents). Currently only supported by Anthropic Claude models.
+        
+        Returns:
+            bool: True if the model supports web fetch, False otherwise
+        """
+        from .model_capabilities import supports_web_fetch
+        return supports_web_fetch(self.model)
+
+    def _supports_prompt_caching(self) -> bool:
+        """
+        Check if the current model supports prompt caching via LiteLLM.
+        
+        Prompt caching allows caching parts of prompts to reduce costs and latency.
+        Supported by OpenAI, Anthropic, Bedrock, and Deepseek.
+        
+        Returns:
+            bool: True if the model supports prompt caching, False otherwise
+        """
+        from .model_capabilities import supports_prompt_caching
+        return supports_prompt_caching(self.model)
+
+    def _get_claude_memory_tool(self):
+        """
+        Get or initialize the Claude Memory Tool instance.
+        
+        Returns:
+            ClaudeMemoryTool instance if claude_memory is enabled, None otherwise
+        """
+        if not self.claude_memory:
+            return None
+        
+        if self._claude_memory_tool is None:
+            from ..tools.claude_memory_tool import ClaudeMemoryTool
+            
+            if isinstance(self.claude_memory, bool):
+                # Create default memory tool
+                self._claude_memory_tool = ClaudeMemoryTool()
+            else:
+                # Use provided memory tool instance
+                self._claude_memory_tool = self.claude_memory
+        
+        return self._claude_memory_tool
+
+    def _supports_claude_memory(self) -> bool:
+        """
+        Check if the current model supports Claude Memory Tool.
+        
+        Claude Memory Tool is only supported by Anthropic Claude models.
+        
+        Returns:
+            bool: True if the model supports Claude Memory Tool
+        """
+        if not self.claude_memory:
+            return False
+        
+        return self._is_anthropic_model()
+
+    def _is_memory_tool_call(self, function_name: str) -> bool:
+        """
+        Check if a tool call is for the Claude Memory Tool.
+        
+        Args:
+            function_name: Name of the function being called
+            
+        Returns:
+            bool: True if this is a memory tool call
+        """
+        return function_name == "memory" and self._supports_claude_memory()
+
+    def _execute_memory_tool_call(self, arguments: Dict[str, Any]) -> str:
+        """
+        Execute a Claude Memory Tool call.
+        
+        Args:
+            arguments: The arguments from Claude's tool call
+            
+        Returns:
+            Result string from the memory operation
+        """
+        memory_tool = self._get_claude_memory_tool()
+        if not memory_tool:
+            return "Error: Memory tool not initialized"
+        
+        return memory_tool.process_tool_call(arguments)
+
+    def _generate_ollama_tool_summary(self, tool_results: List[Any], response_text: str) -> Optional[str]:
+        """
+        Generate a summary from tool results for Ollama to prevent infinite loops.
+        
+        This prevents infinite loops where Ollama provides an empty response after a
+        tool call, expecting the user to prompt for a summary.
+
+        Args:
+            tool_results: The list of results from tool execution.
+            response_text: The text response from the LLM.
+
+        Returns:
+            A summary string if conditions are met, otherwise None.
+        """
+        # Constant for minimal response length check
+        OLLAMA_MIN_RESPONSE_LENGTH = 10
+        
+        # Only generate summary for Ollama with tool results
+        if not (self._is_ollama_provider() and tool_results):
+            return None
+
+        # For Ollama, always generate summary when we have tool results
+        # This prevents infinite loops caused by empty/minimal responses
+            
+        # Filter out error results first
+        valid_results = []
+        for result in tool_results:
+            # Skip error responses
+            if isinstance(result, dict) and 'error' in result:
+                continue
+            valid_results.append(result)
+        
+        # If no valid results, return None to continue
+        if not valid_results:
+            return None
+        
+        # Generate a natural summary based on the tool results
+        if len(valid_results) == 1:
+            # Single tool result - create natural response
+            result = valid_results[0]
+            # For simple numeric results, create a more natural response
+            if isinstance(result, (int, float)):
+                return f"The result is {result}."
+            return str(result)
+        else:
+            # Multiple tool results - create coherent summary
+            summary_parts = []
+            
+            for result in valid_results:
+                result_str = str(result)
+                # Clean up the result string
+                result_str = result_str.strip()
+                
+                # If result is just a number, keep it simple
+                if isinstance(result, (int, float)):
+                    # Don't add extra context, let the LLM's response provide that
+                    pass
+                # Ensure string results end with proper punctuation
+                elif result_str and not result_str[-1] in '.!?':
+                    result_str += '.'
+                    
+                summary_parts.append(result_str)
+            
+            # Join the parts naturally
+            return " ".join(summary_parts)
 
     def _format_ollama_tool_result_message(self, function_name: str, tool_result: Any) -> Dict[str, str]:
         """
@@ -423,7 +680,22 @@ class LLM:
             
             for param_name, param_value in arguments.items():
                 if param_name in valid_params:
-                    filtered_args[param_name] = param_value
+                    # Cast parameter value to the expected type
+                    param = sig.parameters[param_name]
+                    if param.annotation != inspect.Parameter.empty:
+                        try:
+                            if param.annotation == int and isinstance(param_value, str):
+                                filtered_args[param_name] = int(param_value)
+                            elif param.annotation == float and isinstance(param_value, str):
+                                filtered_args[param_name] = float(param_value)
+                            elif param.annotation == bool and isinstance(param_value, str):
+                                filtered_args[param_name] = param_value.lower() in ('true', '1', 'yes')
+                            else:
+                                filtered_args[param_name] = param_value
+                        except (ValueError, TypeError):
+                            filtered_args[param_name] = param_value
+                    else:
+                        filtered_args[param_name] = param_value
                 else:
                     invalid_params.append(param_name)
                     
@@ -438,6 +710,40 @@ class LLM:
         except Exception as e:
             logging.debug(f"[OLLAMA_FIX] Error validating arguments for {function_name}: {e}")
             return arguments
+
+    def _handle_ollama_sequential_logic(self, iteration_count: int, accumulated_tool_results: List[Any], 
+                                      response_text: str, messages: List[Dict]) -> tuple:
+        """
+        Handle Ollama sequential tool execution logic to prevent premature tool summary generation.
+        
+        This method implements the two-step process:
+        1. After reaching threshold with tool results, add explicit final answer prompt
+        2. Only generate tool summary if LLM still doesn't respond after explicit prompt
+        
+        Args:
+            iteration_count: Current iteration count
+            accumulated_tool_results: List of tool results from all iterations
+            response_text: Current LLM response text
+            messages: Message history list to potentially modify
+            
+        Returns:
+            tuple: (should_break, final_response_text, iteration_count)
+                - should_break: Whether to break the iteration loop
+                - final_response_text: Text to use as final response (None if continuing)
+                - iteration_count: Updated iteration count
+        """
+        if not (self._is_ollama_provider() and iteration_count >= self.OLLAMA_SUMMARY_ITERATION_THRESHOLD):
+            return False, None, iteration_count
+            
+        # For Ollama: if we have meaningful tool results, generate summary immediately
+        # Don't wait for more iterations as Ollama tends to repeat tool calls
+        if accumulated_tool_results and iteration_count >= self.OLLAMA_SUMMARY_ITERATION_THRESHOLD:
+            # Generate summary from tool results
+            tool_summary = self._generate_ollama_tool_summary(accumulated_tool_results, response_text)
+            if tool_summary:
+                return True, tool_summary, iteration_count
+                
+        return False, None, iteration_count
 
     def _needs_system_message_skip(self) -> bool:
         """Check if this model requires skipping system messages"""
@@ -486,6 +792,10 @@ class LLM:
         if any(self.model.startswith(prefix) for prefix in ["gemini-", "gemini/"]):
             return True
         
+        # Models with XML tool format support streaming with tools
+        if self._supports_xml_tool_format():
+            return True
+        
         # For other providers, default to False to be safe
         # This ensures we make a single non-streaming call rather than risk
         # missing tool calls or making duplicate calls
@@ -526,7 +836,21 @@ class LLM:
             
             # Skip system messages for legacy o1 models as they don't support them
             if not self._needs_system_message_skip():
-                messages.append({"role": "system", "content": system_prompt})
+                # Apply prompt caching for Anthropic models if enabled
+                if self.prompt_caching and self._supports_prompt_caching() and self._is_anthropic_model():
+                    # Anthropic requires cache_control in content array format
+                    messages.append({
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": system_prompt,
+                                "cache_control": {"type": "ephemeral"}
+                            }
+                        ]
+                    })
+                else:
+                    messages.append({"role": "system", "content": system_prompt})
         
         # Add chat history if provided
         if chat_history:
@@ -594,6 +918,29 @@ class LLM:
             
         return fixed_schema
 
+    def _get_tools_cache_key(self, tools):
+        """Generate a cache key for tools list."""
+        if tools is None:
+            return "none"
+        if not tools:
+            return "empty"
+        # Create a simple hash based on tool names/content
+        tool_parts = []
+        for tool in tools:
+            if isinstance(tool, dict) and 'type' in tool and tool['type'] == 'function':
+                if 'function' in tool and isinstance(tool['function'], dict) and 'name' in tool['function']:
+                    tool_parts.append(f"openai:{tool['function']['name']}")
+            elif callable(tool) and hasattr(tool, '__name__'):
+                tool_parts.append(f"callable:{tool.__name__}")
+            elif isinstance(tool, str):
+                tool_parts.append(f"string:{tool}")
+            elif isinstance(tool, dict) and len(tool) == 1:
+                tool_name = next(iter(tool.keys()))
+                tool_parts.append(f"gemini:{tool_name}")
+            else:
+                tool_parts.append(f"other:{id(tool)}")
+        return "|".join(sorted(tool_parts))
+
     def _format_tools_for_litellm(self, tools: Optional[List[Any]]) -> Optional[List[Dict]]:
         """Format tools for LiteLLM - handles all tool formats.
         
@@ -612,6 +959,11 @@ class LLM:
         """
         if not tools:
             return None
+        
+        # Check cache first
+        tools_key = self._get_tools_cache_key(tools)
+        if tools_key in self._formatted_tools_cache:
+            return self._formatted_tools_cache[tools_key]
             
         formatted_tools = []
         for tool in tools:
@@ -669,15 +1021,19 @@ class LLM:
             except (TypeError, ValueError) as e:
                 logging.error(f"Tools are not JSON serializable: {e}")
                 return None
-                
-        return formatted_tools if formatted_tools else None
+        
+        # Cache the formatted tools
+        result = formatted_tools if formatted_tools else None
+        if len(self._formatted_tools_cache) < self._max_cache_size:
+            self._formatted_tools_cache[tools_key] = result
+        return result
 
     def get_response(
         self,
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
         chat_history: Optional[List[Dict]] = None,
-        temperature: float = 0.2,
+        temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         output_json: Optional[BaseModel] = None,
         output_pydantic: Optional[BaseModel] = None,
@@ -780,7 +1136,7 @@ class LLM:
                 if display_text and str(display_text).strip():
                     display_instruction(
                         f"Agent {agent_name} is processing prompt: {display_text}",
-                        console=console,
+                        console=self.console,
                         agent_name=agent_name,
                         agent_role=agent_role,
                         agent_tools=agent_tools
@@ -791,6 +1147,7 @@ class LLM:
             iteration_count = 0
             final_response_text = ""
             stored_reasoning_content = None  # Store reasoning content from tool execution
+            accumulated_tool_results = []  # Store all tool results across iterations
 
             while iteration_count < max_iterations:
                 try:
@@ -814,6 +1171,10 @@ class LLM:
                         response_text = resp["choices"][0]["message"]["content"]
                         final_response = resp
                         
+                        # Track token usage
+                        if self.metrics:
+                            self._track_token_usage(final_response, self.model)
+                        
                         # Execute callbacks and display based on verbose setting
                         generation_time_val = time.time() - current_time
                         response_content = f"Reasoning:\n{reasoning_content}\n\nAnswer:\n{response_text}" if reasoning_content else response_text
@@ -825,7 +1186,7 @@ class LLM:
                                 f"Reasoning:\n{reasoning_content}\n\nAnswer:\n{response_text}",
                                 markdown=markdown,
                                 generation_time=generation_time_val,
-                                console=console,
+                                console=self.console,
                                 agent_name=agent_name,
                                 agent_role=agent_role,
                                 agent_tools=agent_tools,
@@ -841,7 +1202,7 @@ class LLM:
                                 response_text,
                                 markdown=markdown,
                                 generation_time=generation_time_val,
-                                console=console,
+                                console=self.console,
                                 agent_name=agent_name,
                                 agent_role=agent_role,
                                 agent_tools=agent_tools,
@@ -858,7 +1219,13 @@ class LLM:
                                 message=original_prompt,
                                 response=response_content,
                                 markdown=markdown,
-                                generation_time=generation_time_val
+                                generation_time=generation_time_val,
+                                agent_name=agent_name,
+                                agent_role=agent_role,
+                                agent_tools=agent_tools,
+                                task_name=task_name,
+                                task_description=task_description,
+                                task_id=task_id
                             )
                             callback_executed = True
                     
@@ -870,13 +1237,44 @@ class LLM:
                             # Provider doesn't support streaming with tools, use non-streaming
                             use_streaming = False
                         
+                        # Gemini has issues with streaming + tools, disable streaming for Gemini when tools are present
+                        if use_streaming and formatted_tools and self._is_gemini_model():
+                            logging.debug("Disabling streaming for Gemini model with tools due to JSON parsing issues")
+                            use_streaming = False
+                        
+                        # Track whether fallback was successful to avoid duplicate API calls
+                        fallback_completed = False
+                        
                         if use_streaming:
                             # Streaming approach (with or without tools)
                             tool_calls = []
                             response_text = ""
+                            streaming_success = False
                             
-                            if verbose:
-                                with Live(display_generating("", current_time), console=console, refresh_per_second=4) as live:
+                            # Wrap streaming with error handling for LiteLLM JSON parsing errors
+                            try:
+                                if verbose:
+                                    # Verbose streaming: show display_generating during streaming
+                                    with Live(display_generating("", current_time), console=self.console, refresh_per_second=4) as live:
+                                        for chunk in litellm.completion(
+                                            **self._build_completion_params(
+                                                messages=messages,
+                                                tools=formatted_tools,
+                                                temperature=temperature,
+                                                stream=True,
+                                                output_json=output_json,
+                                                output_pydantic=output_pydantic,
+                                                **kwargs
+                                            )
+                                        ):
+                                            if chunk and chunk.choices and chunk.choices[0].delta:
+                                                delta = chunk.choices[0].delta
+                                                response_text, tool_calls = self._process_stream_delta(
+                                                    delta, response_text, tool_calls, formatted_tools
+                                                )
+                                                live.update(display_generating(response_text, current_time))
+                                else:
+                                    # Non-verbose streaming: no display_generating during streaming
                                     for chunk in litellm.completion(
                                         **self._build_completion_params(
                                             messages=messages,
@@ -893,68 +1291,221 @@ class LLM:
                                             response_text, tool_calls = self._process_stream_delta(
                                                 delta, response_text, tool_calls, formatted_tools
                                             )
-                                            if delta.content:
-                                                live.update(display_generating(response_text, current_time))
+                                streaming_success = True
+                            except Exception as streaming_error:
+                                # Handle streaming errors with recovery logic
+                                if self._is_streaming_error_recoverable(streaming_error):
+                                    if verbose:
+                                        logging.warning(f"Streaming error (recoverable): {streaming_error}")
+                                        logging.warning("Falling back to non-streaming mode")
+                                    # Immediately perform non-streaming fallback with actual API call
+                                    try:
+                                        if verbose:
+                                            # When verbose=True, always use streaming for better UX
+                                            with Live(display_generating("", current_time), console=self.console, refresh_per_second=4, transient=True) as live:
+                                                response_text = ""
+                                                tool_calls = []
+                                                # Use streaming when verbose for progressive display
+                                                for chunk in litellm.completion(
+                                                    **self._build_completion_params(
+                                                        messages=messages,
+                                                        tools=formatted_tools,
+                                                        temperature=temperature,
+                                                        stream=True,  # Always stream when verbose=True
+                                                        output_json=output_json,
+                                                        output_pydantic=output_pydantic,
+                                                        **kwargs
+                                                    )
+                                                ):
+                                                    if chunk and chunk.choices and chunk.choices[0].delta:
+                                                        delta = chunk.choices[0].delta
+                                                        response_text, tool_calls = self._process_stream_delta(
+                                                            delta, response_text, tool_calls, formatted_tools
+                                                        )
+                                                        live.update(display_generating(response_text, current_time))
+                                            
+                                            # Clear the live display after completion
+                                            self.console.print()
+                                            
+                                            # Create final response structure
+                                            final_response = {
+                                                "choices": [{
+                                                    "message": {
+                                                        "content": response_text,
+                                                        "tool_calls": tool_calls if tool_calls else None
+                                                    }
+                                                }]
+                                            }
+                                        else:
+                                            # For non-streaming + non-verbose: no display_generating (per user requirements)
+                                            final_response = litellm.completion(
+                                                **self._build_completion_params(
+                                                    messages=messages,
+                                                    tools=formatted_tools,
+                                                    temperature=temperature,
+                                                    stream=False,
+                                                    output_json=output_json,
+                                                    output_pydantic=output_pydantic,
+                                                    **kwargs
+                                                )
+                                            )
+                                            # Handle None content from Gemini
+                                            response_content = final_response["choices"][0]["message"].get("content")
+                                            response_text = response_content if response_content is not None else ""
+                                            
+                                            # Track token usage
+                                            if self.metrics:
+                                                self._track_token_usage(final_response, self.model)
+                                        
+                                        # Execute callbacks and display based on verbose setting
+                                        if verbose and not interaction_displayed:
+                                            # Display the complete response at once (this will trigger callbacks internally)
+                                            display_interaction(
+                                                original_prompt,
+                                                response_text,
+                                                markdown=markdown,
+                                                generation_time=time.time() - current_time,
+                                                console=self.console,
+                                                agent_name=agent_name,
+                                                agent_role=agent_role,
+                                                agent_tools=agent_tools,
+                                                task_name=task_name,
+                                                task_description=task_description,
+                                                task_id=task_id
+                                            )
+                                            interaction_displayed = True
+                                            callback_executed = True
+                                        elif not callback_executed:
+                                            # Only execute callback if display_interaction hasn't been called
+                                            execute_sync_callback(
+                                                'interaction',
+                                                message=original_prompt,
+                                                response=response_text,
+                                                markdown=markdown,
+                                                generation_time=time.time() - current_time,
+                                                agent_name=agent_name,
+                                                agent_role=agent_role,
+                                                agent_tools=agent_tools,
+                                                task_name=task_name,
+                                                task_description=task_description,
+                                                task_id=task_id
+                                            )
+                                            callback_executed = True
+                                        
+                                        # Mark that fallback completed successfully
+                                        fallback_completed = True
+                                        streaming_success = False
+                                        
+                                    except Exception as fallback_error:
+                                        # If non-streaming also fails, create a graceful fallback with partial streaming data
+                                        logging.warning(f"Non-streaming fallback also failed: {fallback_error}")
+                                        logging.warning("Using partial streaming response data")
+                                        response_text = response_text or ""
+                                        # Create a mock response with whatever partial data we have
+                                        final_response = {
+                                            "choices": [{
+                                                "message": {
+                                                    "content": response_text,
+                                                    "tool_calls": tool_calls if tool_calls else None
+                                                }
+                                            }]
+                                        }
+                                        fallback_completed = True
+                                        streaming_success = False
+                                else:
+                                    # For non-recoverable errors, re-raise immediately
+                                    logging.error(f"Non-recoverable streaming error: {streaming_error}")
+                                    raise streaming_error
+                            
+                            if streaming_success:
+                                response_text = response_text.strip() if response_text else ""
+                                
+                                # Execute callbacks after streaming completes (only if not verbose, since verbose will call display_interaction later)
+                                if not verbose and not callback_executed:
+                                    execute_sync_callback(
+                                        'interaction',
+                                        message=original_prompt,
+                                        response=response_text,
+                                        markdown=markdown,
+                                        generation_time=time.time() - current_time,
+                                        agent_name=agent_name,
+                                        agent_role=agent_role,
+                                        agent_tools=agent_tools,
+                                        task_name=task_name,
+                                        task_description=task_description,
+                                        task_id=task_id
+                                    )
+                                    callback_executed = True
 
+                                # Create a mock final_response with the captured data
+                                final_response = {
+                                    "choices": [{
+                                        "message": {
+                                            "content": response_text,
+                                            "tool_calls": tool_calls if tool_calls else None
+                                        }
+                                    }]
+                                }
+                        
+                        # Only execute non-streaming if we haven't used streaming AND fallback hasn't completed
+                        if not use_streaming and not fallback_completed:
+                            # Non-streaming approach (when tools require it, streaming is disabled, or streaming fallback)
+                            if verbose:
+                                # When verbose=True, always use streaming for better UX
+                                with Live(display_generating("", current_time), console=self.console, refresh_per_second=4, transient=True) as live:
+                                    response_text = ""
+                                    tool_calls = []
+                                    # Use streaming when verbose for progressive display
+                                    for chunk in litellm.completion(
+                                        **self._build_completion_params(
+                                            messages=messages,
+                                            tools=formatted_tools,
+                                            temperature=temperature,
+                                            stream=True,  # Always stream when verbose=True
+                                            output_json=output_json,
+                                            output_pydantic=output_pydantic,
+                                            **kwargs
+                                        )
+                                    ):
+                                        if chunk and chunk.choices and chunk.choices[0].delta:
+                                            delta = chunk.choices[0].delta
+                                            response_text, tool_calls = self._process_stream_delta(
+                                                delta, response_text, tool_calls, formatted_tools
+                                            )
+                                            live.update(display_generating(response_text, current_time))
+                                
+                                # Clear the live display after completion
+                                self.console.print()
+                                
+                                # Create final response structure
+                                final_response = {
+                                    "choices": [{
+                                        "message": {
+                                            "content": response_text,
+                                            "tool_calls": tool_calls if tool_calls else None
+                                        }
+                                    }]
+                                }
                             else:
-                                # Non-verbose streaming
-                                for chunk in litellm.completion(
+                                # For non-streaming + non-verbose: no display_generating (per user requirements)
+                                final_response = litellm.completion(
                                     **self._build_completion_params(
                                         messages=messages,
                                         tools=formatted_tools,
                                         temperature=temperature,
-                                        stream=True,
+                                        stream=False,
                                         output_json=output_json,
                                         output_pydantic=output_pydantic,
                                         **kwargs
                                     )
-                                ):
-                                    if chunk and chunk.choices and chunk.choices[0].delta:
-                                        delta = chunk.choices[0].delta
-                                        if delta.content:
-                                            response_text += delta.content
-                                        
-                                        # Capture tool calls from streaming chunks if provider supports it
-                                        if formatted_tools and self._supports_streaming_tools():
-                                            tool_calls = self._process_tool_calls_from_stream(delta, tool_calls)
-                            
-                            response_text = response_text.strip() if response_text else ""
-                            
-                            # Execute callbacks after streaming completes (only if not verbose, since verbose will call display_interaction later)
-                            if not verbose and not callback_executed:
-                                execute_sync_callback(
-                                    'interaction',
-                                    message=original_prompt,
-                                    response=response_text,
-                                    markdown=markdown,
-                                    generation_time=time.time() - current_time
                                 )
-                                callback_executed = True
-
-                            
-                            # Create a mock final_response with the captured data
-                            final_response = {
-                                "choices": [{
-                                    "message": {
-                                        "content": response_text,
-                                        "tool_calls": tool_calls if tool_calls else None
-                                    }
-                                }]
-                            }
-                        else:
-                            # Non-streaming approach (when tools require it or streaming is disabled)
-                            final_response = litellm.completion(
-                                **self._build_completion_params(
-                                    messages=messages,
-                                    tools=formatted_tools,
-                                    temperature=temperature,
-                                    stream=False,
-                                    output_json=output_json,
-                                    output_pydantic=output_pydantic,
-                                    **kwargs
-                                )
-                            )
-                            response_text = final_response["choices"][0]["message"]["content"]
+                                # Handle None content from Gemini
+                                response_content = final_response["choices"][0]["message"].get("content")
+                                response_text = response_content if response_content is not None else ""
+                                
+                                # Track token usage
+                                if self.metrics:
+                                    self._track_token_usage(final_response, self.model)
                             
                             # Execute callbacks and display based on verbose setting
                             if verbose and not interaction_displayed:
@@ -964,7 +1515,7 @@ class LLM:
                                     response_text,
                                     markdown=markdown,
                                     generation_time=time.time() - current_time,
-                                    console=console,
+                                    console=self.console,
                                     agent_name=agent_name,
                                     agent_role=agent_role,
                                     agent_tools=agent_tools,
@@ -981,11 +1532,110 @@ class LLM:
                                     message=original_prompt,
                                     response=response_text,
                                     markdown=markdown,
-                                    generation_time=time.time() - current_time
+                                    generation_time=time.time() - current_time,
+                                    agent_name=agent_name,
+                                    agent_role=agent_role,
+                                    agent_tools=agent_tools,
+                                    task_name=task_name,
+                                    task_description=task_description,
+                                    task_id=task_id
                                 )
                                 callback_executed = True
                     
                     tool_calls = final_response["choices"][0]["message"].get("tool_calls")
+                    
+                    
+                    # For Ollama, parse tool calls from response text if not in tool_calls field
+                    if self._is_ollama_provider() and not tool_calls and response_text and formatted_tools:
+                        # Try to parse JSON tool call from response text
+                        try:
+                            response_json = json.loads(response_text.strip())
+                            if isinstance(response_json, dict) and "name" in response_json:
+                                # Convert Ollama format to standard tool_calls format
+                                tool_calls = [{
+                                    "id": f"tool_{iteration_count}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": response_json["name"],
+                                        "arguments": json.dumps(response_json.get("arguments", {}))
+                                    }
+                                }]
+                                logging.debug(f"Parsed Ollama tool call from response: {tool_calls}")
+                            elif isinstance(response_json, list):
+                                # Handle multiple tool calls
+                                tool_calls = []
+                                for idx, tool_json in enumerate(response_json):
+                                    if isinstance(tool_json, dict) and "name" in tool_json:
+                                        tool_calls.append({
+                                            "id": f"tool_{iteration_count}_{idx}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": tool_json["name"],
+                                                "arguments": json.dumps(tool_json.get("arguments", {}))
+                                            }
+                                        })
+                                if tool_calls:
+                                    logging.debug(f"Parsed multiple Ollama tool calls from response: {tool_calls}")
+                        except (json.JSONDecodeError, KeyError) as e:
+                            logging.debug(f"Could not parse Ollama tool call from response: {e}")
+                    
+                    # Parse tool calls from XML format in response text 
+                    # Try for known XML models first, or fallback for any model that might output XML
+                    if not tool_calls and response_text and formatted_tools:
+                        # Check if this model is known to use XML format, or try as fallback
+                        should_try_xml = (self._supports_xml_tool_format() or 
+                                        # Fallback: try XML if response contains XML-like tool call tags
+                                        '<tool_call>' in response_text)
+                        
+                        if should_try_xml:
+                            tool_calls = []
+                            
+                            # Try proper XML parsing first
+                            try:
+                                # Wrap in root element if multiple tool_call tags exist
+                                xml_content = f"<root>{response_text}</root>"
+                                root = ET.fromstring(xml_content)
+                                tool_call_elements = root.findall('.//tool_call')
+                                
+                                for idx, element in enumerate(tool_call_elements):
+                                    if element.text:
+                                        try:
+                                            tool_json = json.loads(element.text.strip())
+                                            if isinstance(tool_json, dict) and "name" in tool_json:
+                                                tool_calls.append({
+                                                    "id": f"tool_{iteration_count}_{idx}",
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": tool_json["name"],
+                                                        "arguments": json.dumps(tool_json.get("arguments", {}))
+                                                    }
+                                                })
+                                        except (json.JSONDecodeError, KeyError) as e:
+                                            logging.debug(f"Could not parse tool call JSON: {e}")
+                                            continue
+                            except ET.ParseError:
+                                # Fallback to regex if XML parsing fails
+                                tool_call_pattern = r'<tool_call>\s*(\{(?:[^{}]|{[^{}]*})*\})\s*</tool_call>'
+                                matches = re.findall(tool_call_pattern, response_text, re.DOTALL)
+                                
+                                for idx, match in enumerate(matches):
+                                    try:
+                                        tool_json = json.loads(match.strip())
+                                        if isinstance(tool_json, dict) and "name" in tool_json:
+                                            tool_calls.append({
+                                                "id": f"tool_{iteration_count}_{idx}",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": tool_json["name"],
+                                                    "arguments": json.dumps(tool_json.get("arguments", {}))
+                                                }
+                                            })
+                                    except (json.JSONDecodeError, KeyError) as e:
+                                        logging.debug(f"Could not parse XML tool call: {e}")
+                                        continue
+                            
+                            if tool_calls:
+                                logging.debug(f"Parsed {len(tool_calls)} tool call(s) from XML format")
                     
                     # For Ollama, if response is empty but we have tools, prompt for tool usage
                     if self._is_ollama_provider() and (not response_text or response_text.strip() == "") and formatted_tools and iteration_count == 0:
@@ -1016,7 +1666,9 @@ class LLM:
                             })
                         
                         should_continue = False
-                        tool_results = []  # Store all tool results
+                        tool_results = []  # Store current iteration tool results
+                        tool_result_mapping = {}  # Store function results by name for Ollama chaining
+                        
                         for tool_call in tool_calls:
                             # Handle both object and dict access patterns
                             is_ollama = self._is_ollama_provider()
@@ -1024,12 +1676,35 @@ class LLM:
 
                             # Validate and filter arguments for Ollama provider
                             if is_ollama and tools:
+                                # First check if any argument references a previous tool result
+                                if is_ollama and tool_result_mapping:
+                                    # Replace function names with their results in arguments
+                                    for arg_name, arg_value in list(arguments.items()):
+                                        if isinstance(arg_value, str) and arg_value in tool_result_mapping:
+                                            # Replace function name with its result
+                                            arguments[arg_name] = tool_result_mapping[arg_value]
+                                            logging.debug(f"[OLLAMA_FIX] Replaced {arg_value} with {tool_result_mapping[arg_value]} in {function_name} arguments")
+                                
                                 arguments = self._validate_and_filter_ollama_arguments(function_name, arguments, tools)
 
                             logging.debug(f"[TOOL_EXEC_DEBUG] About to execute tool {function_name} with args: {arguments}")
                             tool_result = execute_tool_fn(function_name, arguments)
                             logging.debug(f"[TOOL_EXEC_DEBUG] Tool execution result: {tool_result}")
                             tool_results.append(tool_result)  # Store the result
+                            accumulated_tool_results.append(tool_result)  # Accumulate across iterations
+                            
+                            # For Ollama, store the result for potential chaining
+                            if is_ollama:
+                                # Extract numeric value from result if it contains one
+                                if isinstance(tool_result, (int, float)):
+                                    tool_result_mapping[function_name] = tool_result
+                                elif isinstance(tool_result, str):
+                                    import re
+                                    match = re.search(r'\b(\d+)\b', tool_result)
+                                    if match:
+                                        tool_result_mapping[function_name] = int(match.group(1))
+                                    else:
+                                        tool_result_mapping[function_name] = tool_result
 
                             if verbose:
                                 display_message = f"Agent {agent_name} called function '{function_name}' with arguments: {arguments}\n"
@@ -1041,7 +1716,7 @@ class LLM:
                                     logging.debug("[TOOL_EXEC_DEBUG] Tool returned no output")
                                 
                                 logging.debug(f"[TOOL_EXEC_DEBUG] About to display tool call with message: {display_message}")
-                                display_tool_call(display_message, console=console)
+                                display_tool_call(display_message, console=self.console)
                                 
                             # Check if this is Ollama provider
                             if self._is_ollama_provider():
@@ -1065,21 +1740,64 @@ class LLM:
                             iteration_count += 1
                             continue
 
-                        # Check if the LLM provided a final answer alongside the tool calls
-                        # If response_text contains substantive content, treat it as the final answer
-                        if response_text and response_text.strip() and len(response_text.strip()) > 10:
-                            # LLM provided a final answer after tool execution, don't continue
+                        # For most providers (including Gemini), we need to continue the loop
+                        # to get a final response that incorporates the tool results
+                        # Only break if the response explicitly indicates completion
+                        if response_text and len(response_text.strip()) > 50 and "final answer" in response_text.lower():
+                            # LLM provided an explicit final answer, don't continue
                             final_response_text = response_text.strip()
                             break
                         
-                        # Otherwise, continue the loop to check if more tools are needed
+                        
+                        # Special handling for Ollama to prevent infinite loops
+                        # Only generate summary after multiple iterations to allow sequential execution
+                        should_break, tool_summary_text, iteration_count = self._handle_ollama_sequential_logic(
+                            iteration_count, accumulated_tool_results, response_text, messages
+                        )
+                        if should_break:
+                            final_response_text = tool_summary_text
+                            # Reset interaction_displayed to ensure final summary is shown
+                            interaction_displayed = False
+                            break
+                        elif tool_summary_text is None and iteration_count > self.OLLAMA_SUMMARY_ITERATION_THRESHOLD:
+                            # Continue iteration after adding final answer prompt
+                            continue
+                        
+                        # Safety check: prevent infinite loops for any provider
+                        if iteration_count >= 5:
+                            if tool_results:
+                                final_response_text = "Task completed successfully based on tool execution results."
+                            else:
+                                final_response_text = response_text.strip() if response_text else "Task completed."
+                            break
+                        
+                        # Otherwise, continue the loop to get final response with tool results
                         iteration_count += 1
+                        # Clear response_text so we don't accidentally use the initial response
+                        response_text = ""
                         continue
                     else:
                         # No tool calls, we're done with this iteration
+                        
+                        # Special early stopping logic for Ollama when tool results are available
+                        # Ollama often provides empty responses after successful tool execution
+                        if (self._is_ollama_provider() and accumulated_tool_results and iteration_count >= 1 and 
+                            (not response_text or response_text.strip() == "")):
+                            # Generate coherent response from tool results
+                            tool_summary = self._generate_ollama_tool_summary(accumulated_tool_results, response_text)
+                            if tool_summary:
+                                final_response_text = tool_summary
+                                # Reset interaction_displayed to ensure final summary is shown
+                                interaction_displayed = False
+                                break
+                        
                         # If we've executed tools in previous iterations, this response contains the final answer
                         if iteration_count > 0:
                             final_response_text = response_text.strip() if response_text else ""
+                            break
+                        
+                        # First iteration with no tool calls - just return the response
+                        final_response_text = response_text.strip() if response_text else ""
                         break
                         
                 except Exception as e:
@@ -1088,6 +1806,40 @@ class LLM:
                     
             # End of while loop - return final response
             if final_response_text:
+                # Display the final response if verbose mode is enabled
+                if verbose and not interaction_displayed:
+                    generation_time_val = time.time() - start_time
+                    display_interaction(
+                        original_prompt,
+                        final_response_text,
+                        markdown=markdown,
+                        generation_time=generation_time_val,
+                        console=self.console,
+                        agent_name=agent_name,
+                        agent_role=agent_role,
+                        agent_tools=agent_tools,
+                        task_name=task_name,
+                        task_description=task_description,
+                        task_id=task_id
+                    )
+                    interaction_displayed = True
+                    callback_executed = True
+                elif not callback_executed:
+                    # Execute callback if not already done
+                    execute_sync_callback(
+                        'interaction',
+                        message=original_prompt,
+                        response=final_response_text,
+                        markdown=markdown,
+                        generation_time=time.time() - start_time,
+                        agent_name=agent_name,
+                        agent_role=agent_role,
+                        agent_tools=agent_tools,
+                        task_name=task_name,
+                        task_description=task_description,
+                        task_id=task_id
+                    )
+                    callback_executed = True
                 return final_response_text
             
             # No tool calls were made in this iteration, return the response
@@ -1102,7 +1854,7 @@ class LLM:
                         f"Reasoning:\n{stored_reasoning_content}\n\nAnswer:\n{response_text}",
                         markdown=markdown,
                         generation_time=generation_time_val,
-                        console=console,
+                        console=self.console,
                         agent_name=agent_name,
                         agent_role=agent_role,
                         agent_tools=agent_tools,
@@ -1116,7 +1868,7 @@ class LLM:
                         response_text,
                         markdown=markdown,
                         generation_time=generation_time_val,
-                        console=console,
+                        console=self.console,
                         agent_name=agent_name,
                         agent_role=agent_role,
                         agent_tools=agent_tools,
@@ -1133,7 +1885,13 @@ class LLM:
                     message=original_prompt,
                     response=response_content,
                     markdown=markdown,
-                    generation_time=generation_time_val
+                    generation_time=generation_time_val,
+                    agent_name=agent_name,
+                    agent_role=agent_role,
+                    agent_tools=agent_tools,
+                    task_name=task_name,
+                    task_description=task_description,
+                    task_id=task_id
                 )
                 callback_executed = True
             
@@ -1150,7 +1908,7 @@ class LLM:
                 
                 if verbose and not interaction_displayed:
                     display_interaction(original_prompt, response_text, markdown=markdown,
-                                     generation_time=time.time() - start_time, console=console,
+                                     generation_time=time.time() - start_time, console=self.console,
                                      agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                      task_name=task_name, task_description=task_description, task_id=task_id)
                     interaction_displayed = True
@@ -1162,7 +1920,13 @@ class LLM:
                         message=original_prompt,
                         response=response_text,
                         markdown=markdown,
-                        generation_time=time.time() - start_time
+                        generation_time=time.time() - start_time,
+                        agent_name=agent_name,
+                        agent_role=agent_role,
+                        agent_tools=agent_tools,
+                        task_name=task_name,
+                        task_description=task_description,
+                        task_id=task_id
                     )
                     callback_executed = True
                 return response_text
@@ -1170,7 +1934,7 @@ class LLM:
             if not self_reflect:
                 if verbose and not interaction_displayed:
                     display_interaction(original_prompt, response_text, markdown=markdown,
-                                     generation_time=time.time() - start_time, console=console,
+                                     generation_time=time.time() - start_time, console=self.console,
                                      agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                      task_name=task_name, task_description=task_description, task_id=task_id)
                     interaction_displayed = True
@@ -1182,7 +1946,13 @@ class LLM:
                         message=original_prompt,
                         response=response_text,
                         markdown=markdown,
-                        generation_time=time.time() - start_time
+                        generation_time=time.time() - start_time,
+                        agent_name=agent_name,
+                        agent_role=agent_role,
+                        agent_tools=agent_tools,
+                        task_name=task_name,
+                        task_description=task_description,
+                        task_id=task_id
                     )
                     callback_executed = True
                 
@@ -1230,7 +2000,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             f"{reasoning_content}\n\nReflection result:\n{reflection_text}",
                             markdown=markdown,
                             generation_time=time.time() - start_time,
-                            console=console,
+                            console=self.console,
                             agent_name=agent_name,
                             agent_role=agent_role,
                             agent_tools=agent_tools,
@@ -1244,7 +2014,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             reflection_text,
                             markdown=markdown,
                             generation_time=time.time() - start_time,
-                            console=console,
+                            console=self.console,
                             agent_name=agent_name,
                             agent_role=agent_role,
                             agent_tools=agent_tools,
@@ -1255,7 +2025,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 else:
                     # Existing streaming approach
                     if verbose:
-                        with Live(display_generating("", start_time), console=console, refresh_per_second=4) as live:
+                        with Live(display_generating("", start_time), console=self.console, refresh_per_second=4) as live:
                             reflection_text = ""
                             for chunk in litellm.completion(
                                 **self._build_completion_params(
@@ -1295,13 +2065,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if verbose:
                         display_self_reflection(
                             f"Agent {agent_name} self reflection: reflection='{reflection_data['reflection']}' satisfactory='{reflection_data['satisfactory']}'",
-                            console=console
+                            console=self.console
                         )
 
                     if satisfactory and reflection_count >= min_reflect - 1:
                         if verbose and not interaction_displayed:
                             display_interaction(prompt, response_text, markdown=markdown,
-                                             generation_time=time.time() - start_time, console=console,
+                                             generation_time=time.time() - start_time, console=self.console,
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
@@ -1310,7 +2080,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if reflection_count >= max_reflect - 1:
                         if verbose and not interaction_displayed:
                             display_interaction(prompt, response_text, markdown=markdown,
-                                             generation_time=time.time() - start_time, console=console,
+                                             generation_time=time.time() - start_time, console=self.console,
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
@@ -1326,7 +2096,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Get new response after reflection
                     if verbose:
-                        with Live(display_generating("", time.time()), console=console, refresh_per_second=4) as live:
+                        with Live(display_generating("", time.time()), console=self.console, refresh_per_second=4) as live:
                             response_text = ""
                             for chunk in litellm.completion(
                                 **self._build_completion_params(
@@ -1367,7 +2137,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if reflection_count >= max_reflect:
                         if verbose and not interaction_displayed:
                             display_interaction(prompt, response_text, markdown=markdown,
-                                             generation_time=time.time() - start_time, console=console,
+                                             generation_time=time.time() - start_time, console=self.console,
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
@@ -1380,7 +2150,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             # If we've exhausted reflection attempts
             if verbose and not interaction_displayed:
                 display_interaction(prompt, response_text, markdown=markdown,
-                                 generation_time=time.time() - start_time, console=console)
+                                 generation_time=time.time() - start_time, console=self.console)
                 interaction_displayed = True
             return response_text
 
@@ -1393,18 +2163,293 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             total_time = time.time() - start_time
             logging.debug(f"get_response completed in {total_time:.2f} seconds")
 
+    def get_response_stream(
+        self,
+        prompt: Union[str, List[Dict]],
+        system_prompt: Optional[str] = None,
+        chat_history: Optional[List[Dict]] = None,
+        temperature: float = 1.0,
+        tools: Optional[List[Any]] = None,
+        output_json: Optional[BaseModel] = None,
+        output_pydantic: Optional[BaseModel] = None,
+        verbose: bool = False,  # Default to non-verbose for streaming
+        markdown: bool = True,
+        agent_name: Optional[str] = None,
+        agent_role: Optional[str] = None,
+        agent_tools: Optional[List[str]] = None,
+        task_name: Optional[str] = None,
+        task_description: Optional[str] = None,
+        task_id: Optional[str] = None,
+        execute_tool_fn: Optional[Callable] = None,
+        **kwargs
+    ):
+        """Generator that yields real-time response chunks from the LLM.
+        
+        This method provides true streaming by yielding content chunks as they
+        are received from the underlying LLM, enabling real-time display of
+        responses without waiting for the complete response.
+        
+        Args:
+            prompt: The prompt to send to the LLM
+            system_prompt: Optional system prompt
+            chat_history: Optional chat history
+            temperature: Sampling temperature
+            tools: Optional list of tools for function calling
+            output_json: Optional JSON schema for structured output
+            output_pydantic: Optional Pydantic model for structured output
+            verbose: Whether to enable verbose logging (default False for streaming)
+            markdown: Whether to enable markdown processing
+            agent_name: Optional agent name for logging
+            agent_role: Optional agent role for logging
+            agent_tools: Optional list of agent tools for logging
+            task_name: Optional task name for logging
+            task_description: Optional task description for logging
+            task_id: Optional task ID for logging
+            execute_tool_fn: Optional function for executing tools
+            **kwargs: Additional parameters
+            
+        Yields:
+            str: Individual content chunks as they are received from the LLM
+            
+        Raises:
+            Exception: If streaming fails or LLM call encounters an error
+        """
+        try:
+            import litellm
+            
+            # Build messages using existing logic
+            messages, original_prompt = self._build_messages(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                chat_history=chat_history,
+                output_json=output_json,
+                output_pydantic=output_pydantic
+            )
+            
+            # Format tools for litellm
+            formatted_tools = self._format_tools_for_litellm(tools)
+            
+            # Determine if we should use streaming based on tool support
+            use_streaming = True
+            if formatted_tools and not self._supports_streaming_tools():
+                # Provider doesn't support streaming with tools, fall back to non-streaming
+                use_streaming = False
+                
+            if use_streaming:
+                # Real-time streaming approach with tool call support
+                try:
+                    tool_calls = []
+                    response_text = ""
+                    consecutive_errors = 0
+                    max_consecutive_errors = 3  # Fallback to non-streaming after 3 consecutive errors
+                    
+                    stream_iterator = litellm.completion(
+                        **self._build_completion_params(
+                            messages=messages,
+                            tools=formatted_tools,
+                            temperature=temperature,
+                            stream=True,
+                            output_json=output_json,
+                            output_pydantic=output_pydantic,
+                            **kwargs
+                        )
+                    )
+                    
+                    # Wrap the iteration with additional error handling for LiteLLM JSON parsing errors
+                    try:
+                        for chunk in stream_iterator:
+                            try:
+                                if chunk and chunk.choices and chunk.choices[0].delta:
+                                    delta = chunk.choices[0].delta
+                                    
+                                    # Process both content and tool calls using existing helper
+                                    response_text, tool_calls = self._process_stream_delta(
+                                        delta, response_text, tool_calls, formatted_tools
+                                    )
+                                    
+                                    # Yield content chunks in real-time as they arrive
+                                    if delta.content:
+                                        yield delta.content
+                                
+                                # Reset consecutive error counter only after successful chunk processing
+                                consecutive_errors = 0
+                                        
+                            except Exception as chunk_error:
+                                consecutive_errors += 1
+                                
+                                # Log the specific error for debugging
+                                if verbose:
+                                    logging.warning(f"Chunk processing error ({consecutive_errors}/{max_consecutive_errors}): {chunk_error}")
+                                
+                                # Check if this error is recoverable using our helper method
+                                if self._is_streaming_error_recoverable(chunk_error):
+                                    if verbose:
+                                        logging.warning("Recoverable streaming error detected, skipping malformed chunk and continuing")
+                                    
+                                    # Skip this malformed chunk and continue if we haven't hit the limit
+                                    if consecutive_errors < max_consecutive_errors:
+                                        continue
+                                    else:
+                                        # Too many recoverable errors, fallback to non-streaming
+                                        logging.warning(f"Too many consecutive streaming errors ({consecutive_errors}), falling back to non-streaming mode")
+                                        raise Exception(f"Streaming failed with {consecutive_errors} consecutive errors") from chunk_error
+                                else:
+                                    # For non-recoverable errors, re-raise immediately
+                                    logging.error(f"Non-recoverable streaming error: {chunk_error}")
+                                    raise chunk_error
+                    
+                    except Exception as iterator_error:
+                        # Handle errors that occur during stream iteration itself (e.g., JSON parsing in LiteLLM)
+                        error_msg = str(iterator_error).lower()
+                        
+                        # Check if this is a recoverable streaming error (including JSON parsing errors)
+                        if self._is_streaming_error_recoverable(iterator_error):
+                            if verbose:
+                                logging.warning(f"Stream iterator error detected (recoverable): {iterator_error}")
+                                logging.warning("Falling back to non-streaming mode due to stream iteration failure")
+                            
+                            # Force fallback to non-streaming for iterator-level errors
+                            raise Exception("Stream iteration failed with recoverable error, falling back to non-streaming") from iterator_error
+                        else:
+                            # For non-recoverable errors, re-raise immediately
+                            logging.error(f"Non-recoverable stream iterator error: {iterator_error}")
+                            raise iterator_error
+                    
+                    # After streaming completes, handle tool calls if present
+                    if tool_calls and execute_tool_fn:
+                        # Add assistant message with tool calls to conversation
+                        if self._is_ollama_provider():
+                            messages.append({
+                                "role": "assistant",
+                                "content": response_text
+                            })
+                        else:
+                            serializable_tool_calls = self._serialize_tool_calls(tool_calls)
+                            messages.append({
+                                "role": "assistant",
+                                "content": response_text,
+                                "tool_calls": serializable_tool_calls
+                            })
+                        
+                        # Execute tool calls and add results to conversation
+                        for tool_call in tool_calls:
+                            is_ollama = self._is_ollama_provider()
+                            function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call, is_ollama)
+                            
+                            try:
+                                # Execute the tool
+                                tool_result = execute_tool_fn(function_name, arguments)
+                                
+                                # Add tool result to messages
+                                tool_message = self._create_tool_message(function_name, tool_result, tool_call_id, is_ollama)
+                                messages.append(tool_message)
+                                
+                            except Exception as e:
+                                logging.error(f"Tool execution error for {function_name}: {e}")
+                                # Add error message to conversation
+                                error_message = self._create_tool_message(
+                                    function_name, f"Error executing tool: {e}", tool_call_id, is_ollama
+                                )
+                                messages.append(error_message)
+                        
+                        # Continue conversation after tool execution - get follow-up response
+                        try:
+                            follow_up_response = litellm.completion(
+                                **self._build_completion_params(
+                                    messages=messages,
+                                    tools=formatted_tools,
+                                    temperature=temperature,
+                                    stream=False,
+                                    **kwargs
+                                )
+                            )
+                            
+                            if follow_up_response and follow_up_response.choices:
+                                follow_up_content = follow_up_response.choices[0].message.content
+                                if follow_up_content:
+                                    # Yield the follow-up response after tool execution
+                                    yield follow_up_content
+                        except Exception as e:
+                            logging.error(f"Follow-up response failed: {e}")
+                            
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    
+                    # Provide more specific error messages based on the error type
+                    if any(keyword in error_msg for keyword in ['json', 'expecting property name', 'parse', 'decode']):
+                        logging.warning(f"Streaming failed due to JSON parsing errors (likely malformed chunks from provider): {e}")
+                    elif 'connection' in error_msg or 'timeout' in error_msg:
+                        logging.warning(f"Streaming failed due to connection issues: {e}")
+                    else:
+                        logging.error(f"Streaming failed with unexpected error: {e}")
+                    
+                    # Fall back to non-streaming if streaming fails
+                    use_streaming = False
+            
+            if not use_streaming:
+                # Fall back to non-streaming and yield the complete response
+                try:
+                    response = litellm.completion(
+                        **self._build_completion_params(
+                            messages=messages,
+                            tools=formatted_tools,
+                            temperature=temperature,
+                            stream=False,
+                            output_json=output_json,
+                            output_pydantic=output_pydantic,
+                            **kwargs
+                        )
+                    )
+                    
+                    if response and response.choices:
+                        content = response.choices[0].message.content
+                        if content:
+                            # Yield the complete response as a single chunk
+                            yield content
+                            
+                except Exception as e:
+                    logging.error(f"Non-streaming fallback failed: {e}")
+                    raise
+                    
+        except Exception as e:
+            logging.error(f"Error in get_response_stream: {e}")
+            raise
+
     def _is_gemini_model(self) -> bool:
         """Check if the model is a Gemini model."""
         if not self.model:
             return False
         return any(prefix in self.model.lower() for prefix in ['gemini', 'gemini/', 'google/gemini'])
+    
+    def _is_anthropic_model(self) -> bool:
+        """Check if the model is an Anthropic Claude model."""
+        if not self.model:
+            return False
+        return any(prefix in self.model.lower() for prefix in ['claude', 'anthropic/', 'anthropic/claude'])
+    
+    def _is_streaming_error_recoverable(self, error: Exception) -> bool:
+        """Check if a streaming error is recoverable (e.g., malformed chunk vs connection error)."""
+        error_msg = str(error).lower()
+        
+        # JSON parsing errors are often recoverable (skip malformed chunk and continue)
+        json_error_keywords = ['json', 'expecting property name', 'parse', 'decode', 'invalid json']
+        if any(keyword in error_msg for keyword in json_error_keywords):
+            return True
+            
+        # Connection errors might be temporary but are less recoverable in streaming context
+        connection_error_keywords = ['connection', 'timeout', 'network', 'http']
+        if any(keyword in error_msg for keyword in connection_error_keywords):
+            return False
+            
+        # Other errors are generally not recoverable
+        return False
 
     async def get_response_async(
         self,
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
         chat_history: Optional[List[Dict]] = None,
-        temperature: float = 0.2,
+        temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         output_json: Optional[BaseModel] = None,
         output_pydantic: Optional[BaseModel] = None,
@@ -1501,6 +2546,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             iteration_count = 0
             final_response_text = ""
             stored_reasoning_content = None  # Store reasoning content from tool execution
+            accumulated_tool_results = []  # Store all tool results across iterations
 
             while iteration_count < max_iterations:
                 response_text = ""
@@ -1528,7 +2574,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             f"Reasoning:\n{reasoning_content}\n\nAnswer:\n{response_text}",
                             markdown=markdown,
                             generation_time=time.time() - start_time,
-                            console=console,
+                            console=self.console,
                             agent_name=agent_name,
                             agent_role=agent_role,
                             agent_tools=agent_tools,
@@ -1543,7 +2589,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             response_text,
                             markdown=markdown,
                             generation_time=time.time() - start_time,
-                            console=console,
+                            console=self.console,
                             agent_name=agent_name,
                             agent_role=agent_role,
                             agent_tools=agent_tools,
@@ -1623,8 +2669,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                             )
                         )
-                        response_text = tool_response.choices[0].message.get("content", "")
+                        # Handle None content from Gemini
+                        response_content = tool_response.choices[0].message.get("content")
+                        response_text = response_content if response_content is not None else ""
                         tool_calls = tool_response.choices[0].message.get("tool_calls", [])
+                        
+                        # Debug logging for Gemini responses
+                        if self._is_gemini_model():
+                            logging.debug(f"Gemini response content: {response_content} -> {response_text}")
+                            logging.debug(f"Gemini tool calls: {tool_calls}")
                         
                         if verbose and not interaction_displayed:
                             # Display the complete response at once
@@ -1633,7 +2686,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 response_text,
                                 markdown=markdown,
                                 generation_time=time.time() - start_time,
-                                console=console,
+                                console=self.console,
                                 agent_name=agent_name,
                                 agent_role=agent_role,
                                 agent_tools=agent_tools,
@@ -1671,7 +2724,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             "tool_calls": serializable_tool_calls
                         })
                     
-                    tool_results = []  # Store all tool results
+                    tool_results = []  # Store current iteration tool results
                     for tool_call in tool_calls:
                         # Handle both object and dict access patterns
                         is_ollama = self._is_ollama_provider()
@@ -1683,6 +2736,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
                         tool_result = await execute_tool_fn(function_name, arguments)
                         tool_results.append(tool_result)  # Store the result
+                        accumulated_tool_results.append(tool_result)  # Accumulate across iterations
 
                         if verbose:
                             display_message = f"Agent {agent_name} called function '{function_name}' with arguments: {arguments}\n"
@@ -1690,7 +2744,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 display_message += f"Function returned: {tool_result}"
                             else:
                                 display_message += "Function returned no output"
-                            display_tool_call(display_message, console=console)
+                            display_tool_call(display_message, console=self.console)
                         # Check if it's Ollama provider
                         if self._is_ollama_provider():
                             # For Ollama, use user role and format as natural language
@@ -1737,7 +2791,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 f"Reasoning:\n{reasoning_content}\n\nAnswer:\n{response_text}",
                                 markdown=markdown,
                                 generation_time=time.time() - start_time,
-                                console=console,
+                                console=self.console,
                                 agent_name=agent_name,
                                 agent_role=agent_role,
                                 agent_tools=agent_tools,
@@ -1752,7 +2806,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 response_text,
                                 markdown=markdown,
                                 generation_time=time.time() - start_time,
-                                console=console,
+                                console=self.console,
                                 agent_name=agent_name,
                                 agent_role=agent_role,
                                 agent_tools=agent_tools,
@@ -1810,9 +2864,32 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Check if the LLM provided a final answer alongside the tool calls
                     # If response_text contains substantive content, treat it as the final answer
-                    if response_text and response_text.strip() and len(response_text.strip()) > 10:
+                    if response_text and len(response_text.strip()) > 10:
                         # LLM provided a final answer after tool execution, don't continue
                         final_response_text = response_text.strip()
+                        break
+                    
+                    
+                    # Special handling for Ollama to prevent infinite loops
+                    # Only generate summary after multiple iterations to allow sequential execution
+                    should_break, tool_summary_text, iteration_count = self._handle_ollama_sequential_logic(
+                        iteration_count, accumulated_tool_results, response_text, messages
+                    )
+                    if should_break:
+                        final_response_text = tool_summary_text
+                        # Reset interaction_displayed to ensure final summary is shown
+                        interaction_displayed = False
+                        break
+                    elif tool_summary_text is None and iteration_count > self.OLLAMA_SUMMARY_ITERATION_THRESHOLD:
+                        # Continue iteration after adding final answer prompt
+                        continue
+                    
+                    # Safety check: prevent infinite loops for any provider
+                    if iteration_count >= 5:
+                        if tool_results:
+                            final_response_text = "Task completed successfully based on tool execution results."
+                        else:
+                            final_response_text = response_text.strip() if response_text else "Task completed."
                         break
                     
                     # Continue the loop to check if more tools are needed
@@ -1820,8 +2897,21 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     continue
                 else:
                     # No tool calls, we're done with this iteration
+                    
+                    # Special early stopping logic for Ollama when tool results are available
+                    # Ollama often provides empty responses after successful tool execution
+                    if (self._is_ollama_provider() and accumulated_tool_results and iteration_count >= 1 and 
+                        (not response_text or response_text.strip() == "")):
+                        # Generate coherent response from tool results
+                        tool_summary = self._generate_ollama_tool_summary(accumulated_tool_results, response_text)
+                        if tool_summary:
+                            final_response_text = tool_summary
+                            # Reset interaction_displayed to ensure final summary is shown
+                            interaction_displayed = False
+                            break
+                    
                     # If we've executed tools in previous iterations, this response contains the final answer
-                    if iteration_count > 0:
+                    if iteration_count > 0 and not final_response_text:
                         final_response_text = response_text.strip()
                     break
 
@@ -1831,7 +2921,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 self.chat_history.append({"role": "assistant", "content": response_text})
                 if verbose and not interaction_displayed:
                     display_interaction(original_prompt, response_text, markdown=markdown,
-                                     generation_time=time.time() - start_time, console=console,
+                                     generation_time=time.time() - start_time, console=self.console,
                                      agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                      task_name=task_name, task_description=task_description, task_id=task_id)
                     interaction_displayed = True
@@ -1849,7 +2939,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             f"Reasoning:\n{stored_reasoning_content}\n\nAnswer:\n{display_text}",
                             markdown=markdown,
                             generation_time=time.time() - start_time,
-                            console=console,
+                            console=self.console,
                             agent_name=agent_name,
                             agent_role=agent_role,
                             agent_tools=agent_tools,
@@ -1859,7 +2949,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         )
                     else:
                         display_interaction(original_prompt, display_text, markdown=markdown,
-                                         generation_time=time.time() - start_time, console=console,
+                                         generation_time=time.time() - start_time, console=self.console,
                                          agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                          task_name=task_name, task_description=task_description, task_id=task_id)
                     interaction_displayed = True
@@ -1906,7 +2996,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         f"{reasoning_content}\n\nReflection result:\n{reflection_text}",
                         markdown=markdown,
                         generation_time=time.time() - start_time,
-                        console=console,
+                        console=self.console,
                         agent_name=agent_name,
                         agent_role=agent_role,
                         agent_tools=agent_tools,
@@ -1920,7 +3010,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         reflection_text,
                         markdown=markdown,
                         generation_time=time.time() - start_time,
-                        console=console,
+                        console=self.console,
                         agent_name=agent_name,
                         agent_role=agent_role,
                         agent_tools=agent_tools,
@@ -1931,7 +3021,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             else:
                 # Existing streaming approach
                 if verbose:
-                    with Live(display_generating("", start_time), console=console, refresh_per_second=4) as live:
+                    with Live(display_generating("", start_time), console=self.console, refresh_per_second=4) as live:
                         reflection_text = ""
                         async for chunk in await litellm.acompletion(
                             **self._build_completion_params(
@@ -1972,13 +3062,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if verbose:
                         display_self_reflection(
                             f"Agent {agent_name} self reflection: reflection='{reflection_data['reflection']}' satisfactory='{reflection_data['satisfactory']}'",
-                            console=console
+                            console=self.console
                         )
 
                     if satisfactory and reflection_count >= min_reflect - 1:
                         if verbose and not interaction_displayed:
                             display_interaction(prompt, response_text, markdown=markdown,
-                                             generation_time=time.time() - start_time, console=console,
+                                             generation_time=time.time() - start_time, console=self.console,
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
@@ -1987,7 +3077,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if reflection_count >= max_reflect - 1:
                         if verbose and not interaction_displayed:
                             display_interaction(prompt, response_text, markdown=markdown,
-                                             generation_time=time.time() - start_time, console=console,
+                                             generation_time=time.time() - start_time, console=self.console,
                                              agent_name=agent_name, agent_role=agent_role, agent_tools=agent_tools,
                                              task_name=task_name, task_description=task_description, task_id=task_id)
                             interaction_displayed = True
@@ -2077,6 +3167,58 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 
         litellm.callbacks = events
 
+    def _track_token_usage(self, response: Dict[str, Any], model: str) -> Optional[TokenMetrics]:
+        """Extract and track token usage from LLM response."""
+        if not TokenMetrics or not _token_collector:
+            return None
+        
+        # Note: metrics check moved to call sites for performance
+        # This method should only be called when self.metrics=True
+        
+        try:
+            usage = response.get("usage", {})
+            if not usage:
+                return None
+            
+            # Extract token counts
+            metrics = TokenMetrics(
+                input_tokens=usage.get("prompt_tokens", 0),
+                output_tokens=usage.get("completion_tokens", 0),
+                cached_tokens=usage.get("cached_tokens", 0),
+                reasoning_tokens=usage.get("reasoning_tokens", 0),
+                audio_input_tokens=usage.get("audio_input_tokens", 0),
+                audio_output_tokens=usage.get("audio_output_tokens", 0)
+            )
+            
+            # Store metrics
+            self.last_token_metrics = metrics
+            
+            # Update session metrics
+            if not self.session_token_metrics:
+                self.session_token_metrics = TokenMetrics()
+            self.session_token_metrics = self.session_token_metrics + metrics
+            
+            # Track in global collector
+            _token_collector.track_tokens(
+                model=model,
+                agent=self.current_agent_name,
+                metrics=metrics,
+                metadata={
+                    "provider": self.provider,
+                    "stream": False
+                }
+            )
+            
+            return metrics
+            
+        except Exception as e:
+            if self.verbose:
+                logging.warning(f"Failed to track token usage: {e}")
+            return None
+    
+    def set_current_agent(self, agent_name: Optional[str]):
+        """Set the current agent name for token tracking."""
+        self.current_agent_name = agent_name
 
     def _build_completion_params(self, **override_params) -> Dict[str, Any]:
         """Build parameters for litellm completion calls with all necessary config"""
@@ -2116,7 +3258,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         
         # Add extra settings for provider-specific parameters (e.g., num_ctx for Ollama)
         if self.extra_settings:
-            params.update(self.extra_settings)
+            # Filter out internal parameters that shouldn't be passed to the API
+            filtered_extra_settings = {k: v for k, v in self.extra_settings.items() if k != 'metrics'}
+            params.update(filtered_extra_settings)
         
         # Override with any provided parameters
         params.update(override_params)
@@ -2158,6 +3302,79 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # If check fails, still set tool_choice for known Gemini models
                     logging.debug(f"Could not verify function calling support: {e}. Setting tool_choice anyway.")
                     params['tool_choice'] = 'auto'
+        
+        # Add web_search_options if web_search is enabled and model supports it
+        if self.web_search and self._supports_web_search():
+            if isinstance(self.web_search, dict):
+                # Use custom web_search_options provided by user
+                params['web_search_options'] = self.web_search
+            else:
+                # Use default web_search_options
+                params['web_search_options'] = {"search_context_size": "medium"}
+            logging.debug(f"Web search enabled with options: {params['web_search_options']}")
+            
+            # Some web search models (like gpt-4o-search-preview) don't support certain parameters
+            # Remove incompatible parameters to avoid BadRequestError
+            incompatible_params = ['temperature', 'top_p', 'presence_penalty', 'frequency_penalty', 'logit_bias']
+            for param in incompatible_params:
+                if param in params:
+                    del params[param]
+                    logging.debug(f"Removed incompatible parameter '{param}' for web search model")
+        
+        # Add web_fetch tool if web_fetch is enabled and model supports it
+        # Web fetch is passed as a tool (unlike web_search which uses web_search_options)
+        if self.web_fetch and self._supports_web_fetch():
+            # Build the web_fetch tool definition
+            web_fetch_tool = {
+                "type": "web_fetch_20250910",
+                "name": "web_fetch",
+            }
+            
+            # Add optional parameters from web_fetch dict if provided
+            if isinstance(self.web_fetch, dict):
+                if 'max_uses' in self.web_fetch:
+                    web_fetch_tool['max_uses'] = self.web_fetch['max_uses']
+                if 'allowed_domains' in self.web_fetch:
+                    web_fetch_tool['allowed_domains'] = self.web_fetch['allowed_domains']
+                if 'blocked_domains' in self.web_fetch:
+                    web_fetch_tool['blocked_domains'] = self.web_fetch['blocked_domains']
+                if 'citations' in self.web_fetch:
+                    web_fetch_tool['citations'] = self.web_fetch['citations']
+                if 'max_content_tokens' in self.web_fetch:
+                    web_fetch_tool['max_content_tokens'] = self.web_fetch['max_content_tokens']
+            else:
+                # Default max_uses if web_fetch=True
+                web_fetch_tool['max_uses'] = 5
+            
+            # Add web_fetch tool to existing tools or create tools list
+            if 'tools' in params and params['tools']:
+                params['tools'].append(web_fetch_tool)
+            else:
+                params['tools'] = [web_fetch_tool]
+            
+            logging.debug(f"Web fetch enabled with tool: {web_fetch_tool}")
+        
+        # Add Claude Memory Tool if enabled and model supports it
+        if self._supports_claude_memory():
+            memory_tool = self._get_claude_memory_tool()
+            if memory_tool:
+                # Add the memory tool definition
+                memory_tool_def = memory_tool.get_tool_definition()
+                
+                # Add memory tool to existing tools or create tools list
+                if 'tools' in params and params['tools']:
+                    params['tools'].append(memory_tool_def)
+                else:
+                    params['tools'] = [memory_tool_def]
+                
+                # Add the beta header for Anthropic
+                beta_header = memory_tool.get_beta_header()
+                if 'extra_headers' in params:
+                    params['extra_headers']['anthropic-beta'] = beta_header
+                else:
+                    params['extra_headers'] = {'anthropic-beta': beta_header}
+                
+                logging.debug(f"Claude memory tool enabled with beta header: {beta_header}")
         
         return params
 
@@ -2250,7 +3467,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         self,
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
-        temperature: float = 0.2,
+        temperature: float = 1.0,
         stream: bool = True,
         verbose: bool = True,
         markdown: bool = True,
@@ -2307,16 +3524,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             )
             
             if stream:
-                if verbose:
-                    with Live(display_generating("", start_time), console=console or self.console, refresh_per_second=4) as live:
-                        for chunk in litellm.completion(**completion_params):
-                            content = self._process_streaming_chunk(chunk)
-                            if content:
-                                response_text += content
-                                live.update(display_generating(response_text, start_time))
-                else:
+                with Live(display_generating("", start_time), console=console or self.console, refresh_per_second=4) as live:
                     for chunk in litellm.completion(**completion_params):
                         content = self._process_streaming_chunk(chunk)
+                        if content:
+                            response_text += content
+                            live.update(display_generating(response_text, start_time))
                         if content:
                             response_text += content
             else:
@@ -2349,7 +3562,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         self,
         prompt: Union[str, List[Dict]],
         system_prompt: Optional[str] = None,
-        temperature: float = 0.2,
+        temperature: float = 1.0,
         stream: bool = True,
         verbose: bool = True,
         markdown: bool = True,
@@ -2407,16 +3620,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             )
             
             if stream:
-                if verbose:
-                    with Live(display_generating("", start_time), console=console or self.console, refresh_per_second=4) as live:
-                        async for chunk in await litellm.acompletion(**completion_params):
-                            content = self._process_streaming_chunk(chunk)
-                            if content:
-                                response_text += content
-                                live.update(display_generating(response_text, start_time))
-                else:
+                with Live(display_generating("", start_time), console=console or self.console, refresh_per_second=4) as live:
                     async for chunk in await litellm.acompletion(**completion_params):
                         content = self._process_streaming_chunk(chunk)
+                        if content:
+                            response_text += content
+                            live.update(display_generating(response_text, start_time))
                         if content:
                             response_text += content
             else:

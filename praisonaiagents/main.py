@@ -12,11 +12,13 @@ from rich.markdown import Markdown
 from rich.live import Live
 import asyncio
 
-# Logging is already configured in __init__.py, just clean up handlers for litellm
-logging.getLogger("litellm").handlers = []
-logging.getLogger("litellm.utils").handlers = []
-logging.getLogger("litellm").propagate = False
-logging.getLogger("litellm.utils").propagate = False
+# Import token metrics if available
+try:
+    from .telemetry.token_collector import TokenMetrics
+except ImportError:
+    TokenMetrics = None
+
+# Logging is already configured in _logging.py via __init__.py
 
 # Global list to store error logs
 error_logs = []
@@ -158,6 +160,10 @@ def display_interaction(message, response, markdown=True, generation_time=None, 
 
     message = _clean_display_content(str(message))
     response = _clean_display_content(str(response))
+    
+    # Skip display if response is empty (common with Gemini tool calls)
+    if not response or not response.strip():
+        return
 
     # Execute synchronous callbacks
     execute_sync_callback(
@@ -415,6 +421,7 @@ class TaskOutput(BaseModel):
     json_dict: Optional[Dict[str, Any]] = None
     agent: str
     output_format: Literal["RAW", "JSON", "Pydantic"] = "RAW"
+    token_metrics: Optional['TokenMetrics'] = None  # Add token metrics field
 
     def json(self) -> Optional[str]:
         if self.output_format == "JSON" and self.json_dict:

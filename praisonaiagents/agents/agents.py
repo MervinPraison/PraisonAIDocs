@@ -15,6 +15,12 @@ import asyncio
 import uuid
 from enum import Enum
 
+# Import token tracking
+try:
+    from ..telemetry.token_collector import _token_collector
+except ImportError:
+    _token_collector = None
+
 # Task status constants
 class TaskStatus(Enum):
     """Enumeration for task status values to ensure consistency"""
@@ -81,16 +87,19 @@ def process_task_context(context_item, verbose=0, user_id=None):
         task_name = context_item.name if context_item.name else context_item.description
         
         if context_item.result and task_status == TaskStatus.COMPLETED.value:
-            return f"Result of previous task {task_name}:\n{context_item.result.raw}"
+            # Log detailed result for debugging
+            logger.debug(f"Previous task '{task_name}' result: {context_item.result.raw}")
+            # Return actual result content without verbose label (essential for task chaining)
+            return context_item.result.raw
         elif task_status == TaskStatus.COMPLETED.value and not context_item.result:
-            return f"Previous task {task_name} completed but produced no result."
+            return ""  # No result to include
         else:
-            return f"Previous task {task_name} is not yet completed (status: {task_status or TaskStatus.UNKNOWN.value})."
-    elif isinstance(context_item, dict) and "vector_store" in context_item:
+            return ""  # Task not completed, no context to include
+    elif isinstance(context_item, dict) and ("vector_store" in context_item or "embedding_db_config" in context_item):
         from ..knowledge.knowledge import Knowledge
         try:
-            # Handle both string and dict configs
-            cfg = context_item["vector_store"]
+            # Handle both string and dict configs - support both vector_store and embedding_db_config keys for backward compatibility
+            cfg = context_item.get("vector_store") or context_item.get("embedding_db_config")
             if isinstance(cfg, str):
                 cfg = json.loads(cfg)
             
@@ -101,14 +110,24 @@ def process_task_context(context_item, verbose=0, user_id=None):
                 context_item.get("query", ""),  # Use query from context if available
                 user_id=user_id if user_id else None
             )
-            return f"[DB Context]: {str(db_results)}"
+            
+            # Log knowledge results for debugging (always available for troubleshooting)
+            logger.debug(f"Knowledge search results ({len(db_results)} items): {str(db_results)}")
+            
+            # Return actual content without verbose "[DB Context]:" prefix
+            return str(db_results)
         except Exception as e:
-            return f"[Vector DB Error]: {e}"
+            # Log error for debugging (always available for troubleshooting)
+            logger.debug(f"Vector DB Error: {e}")
+            
+            # Return empty string to avoid exposing error details in AI prompts
+            # Error details are preserved in debug logs for troubleshooting
+            return ""
     else:
         return str(context_item)  # Fallback for unknown types
 
 class PraisonAIAgents:
-    def __init__(self, agents, tasks=None, verbose=0, completion_checker=None, max_retries=5, process="sequential", manager_llm=None, memory=False, memory_config=None, embedder=None, user_id=None, max_iter=10, stream=True, name: Optional[str] = None):
+    def __init__(self, agents, tasks=None, verbose=0, completion_checker=None, max_retries=5, process="sequential", manager_llm=None, memory=False, memory_config=None, embedder=None, user_id=None, max_iter=10, stream=True, name: Optional[str] = None, planning: bool = False, planning_llm: Optional[str] = None, auto_approve_plan: bool = False, planning_tools: Optional[List] = None, planning_reasoning: bool = False):
         # Add check at the start if memory is requested
         if memory:
             try:
@@ -144,11 +163,13 @@ class PraisonAIAgents:
         self.name = name  # Store the name for the Agents collection
         
         # Check for manager_llm in environment variable if not provided
-        self.manager_llm = manager_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o')
+        self.manager_llm = manager_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
         
         # Set logger level based on verbose
         if verbose >= 5:
-            logger.setLevel(logging.INFO)
+            logger.setLevel(logging.INFO)      # keep everything ≥INFO
+        elif verbose >= 3:
+            logger.setLevel(logging.DEBUG)     # surface DEBUG when user asks for it
         else:
             logger.setLevel(logging.WARNING)
             
@@ -191,6 +212,16 @@ class PraisonAIAgents:
             logger.info("Set up sequential flow with automatic context passing")
         
         self._state = {}  # Add state storage at PraisonAIAgents level
+        
+        # Initialize planning mode
+        self.planning = planning
+        self.planning_llm = planning_llm or "gpt-4o-mini"
+        self.auto_approve_plan = auto_approve_plan
+        self.planning_tools = planning_tools
+        self.planning_reasoning = planning_reasoning
+        self._current_plan = None
+        self._todo_list = None
+        self._planning_agent = None
         
         # Initialize memory system
         self.shared_memory = None
@@ -290,6 +321,11 @@ class PraisonAIAgents:
             task.status = "in progress"
 
         executor_agent = task.agent
+        
+        # Set current agent for token tracking
+        llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
+        if llm and hasattr(llm, 'set_current_agent'):
+            llm.set_current_agent(executor_agent.name)
 
         # Ensure tools are available from both task and agent
         tools = task.tools or []
@@ -312,7 +348,7 @@ Expected Output: {task.expected_output}.
             if self.verbose >= 3:
                 logger.info(f"Task {task_id} context items: {len(unique_contexts)}")
                 for i, ctx in enumerate(unique_contexts):
-                    logger.info(f"Context {i+1}: {ctx[:100]}...")
+                    logger.debug(f"Context {i+1}: {ctx[:100]}...")
             context_separator = '\n\n'
             task_prompt += f"""
 Context:
@@ -362,14 +398,20 @@ Context:
                 _get_multimodal_message(task_prompt, task.images),
                 tools=tools,
                 output_json=task.output_json,
-                output_pydantic=task.output_pydantic
+                output_pydantic=task.output_pydantic,
+                task_name=task.name,
+                task_description=task.description,
+                task_id=task.id
             )
         else:
             agent_output = await executor_agent.achat(
                 task_prompt,
                 tools=tools,
                 output_json=task.output_json,
-                output_pydantic=task.output_pydantic
+                output_pydantic=task.output_pydantic,
+                task_name=task.name,
+                task_description=task.description,
+                task_id=task.id
             )
 
         if agent_output:
@@ -380,6 +422,12 @@ Context:
                 agent=executor_agent.name,
                 output_format="RAW"
             )
+            
+            # Add token metrics if available
+            if llm and hasattr(llm, 'last_token_metrics'):
+                token_metrics = llm.last_token_metrics
+                if token_metrics:
+                    task_output.token_metrics = token_metrics
 
             if task.output_json:
                 cleaned = self.clean_json_output(agent_output)
@@ -612,6 +660,11 @@ Context:
             task.status = "in progress"
 
         executor_agent = task.agent
+        
+        # Set current agent for token tracking
+        llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
+        if llm and hasattr(llm, 'set_current_agent'):
+            llm.set_current_agent(executor_agent.name)
 
         task_prompt = f"""
 You need to do the following task: {task.description}.
@@ -629,7 +682,7 @@ Expected Output: {task.expected_output}.
             if self.verbose >= 3:
                 logger.info(f"Task {task_id} context items: {len(unique_contexts)}")
                 for i, ctx in enumerate(unique_contexts):
-                    logger.info(f"Context {i+1}: {ctx[:100]}...")
+                    logger.debug(f"Context {i+1}: {ctx[:100]}...")
             context_separator = '\n\n'
             task_prompt += f"""
 Context:
@@ -642,7 +695,10 @@ Context:
             try:
                 memory_context = task.memory.build_context_for_task(task.description)
                 if memory_context:
-                    task_prompt += f"\n\nRelevant memory context:\n{memory_context}"
+                    # Log detailed memory context for debugging
+                    logger.debug(f"Memory context for task '{task.description}': {memory_context}")
+                    # Include actual memory content without verbose headers (essential for AI agent functionality)
+                    task_prompt += f"\n\n{memory_context}"
             except Exception as e:
                 logger.error(f"Error getting memory context: {e}")
 
@@ -725,6 +781,12 @@ Context:
                 agent=executor_agent.name,
                 output_format="RAW"
             )
+            
+            # Add token metrics if available
+            if llm and hasattr(llm, 'last_token_metrics'):
+                token_metrics = llm.last_token_metrics
+                if token_metrics:
+                    task_output.token_metrics = token_metrics
 
             if task.output_json:
                 cleaned = self.clean_json_output(agent_output)
@@ -877,9 +939,25 @@ Context:
                         task.context = []
                     # Add content to context
                     task.context.append(content)
-                
-        # Run tasks as before
-        self.run_all_tasks()
+        
+        # Planning Mode: Create plan and todo list before execution
+        if self.planning:
+            self._run_with_planning()
+        else:
+            # Run tasks as before
+            self.run_all_tasks()
+        
+        # Auto-display token metrics if any agent has metrics=True
+        metrics_enabled = any(getattr(agent, 'metrics', False) for agent in self.agents)
+        if metrics_enabled:
+            try:
+                self.display_token_usage()
+            except (ImportError, AttributeError) as e:
+                # Token tracking not available or not properly configured
+                logging.debug(f"Could not auto-display token usage: {e}")
+            except Exception as e:
+                # Log unexpected errors for debugging
+                logging.debug(f"Unexpected error in token metrics display: {e}")
         
         # Get results
         results = {
@@ -899,6 +977,10 @@ Context:
                     
         # Return full results dict if return_dict is True or if no final result was found
         return results
+
+    def run(self, content=None, return_dict=False, **kwargs):
+        """Alias for start() method to provide consistent API with Agent class"""
+        return self.start(content=content, return_dict=return_dict, **kwargs)
 
     def set_state(self, key: str, value: Any) -> None:
         """Set a state value"""
@@ -1014,6 +1096,77 @@ Context:
                     return True
         
         return False
+
+    def get_token_usage_summary(self) -> Dict[str, Any]:
+        """Get a summary of token usage across all agents and tasks."""
+        if not _token_collector:
+            return {"error": "Token tracking not available"}
+        
+        return _token_collector.get_session_summary()
+    
+    def get_detailed_token_report(self) -> Dict[str, Any]:
+        """Get a detailed token usage report."""
+        if not _token_collector:
+            return {"error": "Token tracking not available"}
+        
+        summary = _token_collector.get_session_summary()
+        recent = _token_collector.get_recent_interactions(limit=20)
+        
+        # Calculate cost estimates (example rates)
+        cost_per_1k_input = 0.0005  # $0.0005 per 1K input tokens
+        cost_per_1k_output = 0.0015  # $0.0015 per 1K output tokens
+        
+        total_metrics = summary.get("total_metrics", {})
+        input_cost = (total_metrics.get("input_tokens", 0) / 1000) * cost_per_1k_input
+        output_cost = (total_metrics.get("output_tokens", 0) / 1000) * cost_per_1k_output
+        total_cost = input_cost + output_cost
+        
+        return {
+            "summary": summary,
+            "recent_interactions": recent,
+            "cost_estimate": {
+                "input_cost": f"${input_cost:.4f}",
+                "output_cost": f"${output_cost:.4f}",
+                "total_cost": f"${total_cost:.4f}",
+                "note": "Cost estimates based on example rates"
+            }
+        }
+    
+    def display_token_usage(self):
+        """Display token usage in a formatted table."""
+        if not _token_collector:
+            print("Token tracking not available")
+            return
+        
+        summary = _token_collector.get_session_summary()
+        
+        print("\n" + "="*50)
+        print("TOKEN USAGE SUMMARY")
+        print("="*50)
+        
+        total_metrics = summary.get("total_metrics", {})
+        print(f"\nTotal Interactions: {summary.get('total_interactions', 0)}")
+        print(f"Total Tokens: {total_metrics.get('total_tokens', 0):,}")
+        print(f"  - Input Tokens: {total_metrics.get('input_tokens', 0):,}")
+        print(f"  - Output Tokens: {total_metrics.get('output_tokens', 0):,}")
+        print(f"  - Cached Tokens: {total_metrics.get('cached_tokens', 0):,}")
+        print(f"  - Reasoning Tokens: {total_metrics.get('reasoning_tokens', 0):,}")
+        
+        # By model
+        by_model = summary.get("by_model", {})
+        if by_model:
+            print("\nUsage by Model:")
+            for model, metrics in by_model.items():
+                print(f"  {model}: {metrics.get('total_tokens', 0):,} tokens")
+        
+        # By agent
+        by_agent = summary.get("by_agent", {})
+        if by_agent:
+            print("\nUsage by Agent:")
+            for agent, metrics in by_agent.items():
+                print(f"  {agent}: {metrics.get('total_tokens', 0):,} tokens")
+        
+        print("="*50 + "\n")
         
     def launch(self, path: str = '/agents', port: int = 8000, host: str = '0.0.0.0', debug: bool = False, protocol: str = "http"):
         """
@@ -1138,7 +1291,7 @@ Context:
                         try:
                             # Use async version if available, otherwise use sync version
                             if asyncio.iscoroutinefunction(agent_instance.chat):
-                                response = await agent_instance.achat(current_input)
+                                response = await agent_instance.achat(current_input, task_name=None, task_description=None, task_id=None)
                             else:
                                 # Run sync function in a thread to avoid blocking
                                 loop = asyncio.get_running_loop()
@@ -1294,7 +1447,7 @@ Context:
                     try:
                         logging.debug(f"Processing with agent: {agent_instance.name}")
                         if hasattr(agent_instance, 'achat') and asyncio.iscoroutinefunction(agent_instance.achat):
-                            response = await agent_instance.achat(current_input, tools=agent_instance.tools)
+                            response = await agent_instance.achat(current_input, tools=agent_instance.tools, task_name=None, task_description=None, task_id=None)
                         elif hasattr(agent_instance, 'chat'): # Fallback to sync chat if achat not suitable
                             loop = asyncio.get_running_loop()
                             response = await loop.run_in_executor(None, lambda ci=current_input: agent_instance.chat(ci, tools=agent_instance.tools))
@@ -1392,4 +1545,355 @@ Context:
             return None
         else:
             display_error(f"Invalid protocol: {protocol}. Choose 'http' or 'mcp'.")
-            return None 
+            return None
+
+    # =========================================================================
+    # Planning Mode Properties and Methods
+    # =========================================================================
+    
+    @property
+    def current_plan(self):
+        """Get the current plan."""
+        return self._current_plan
+    
+    @property
+    def todo_list(self):
+        """Get the current todo list."""
+        return self._todo_list
+    
+    def _get_planning_agent(self):
+        """Lazy load PlanningAgent."""
+        if self._planning_agent is None and self.planning:
+            from ..planning import PlanningAgent
+            self._planning_agent = PlanningAgent(
+                llm=self.planning_llm,
+                read_only=True,
+                verbose=self.verbose,
+                tools=self.planning_tools,
+                reasoning=self.planning_reasoning
+            )
+        return self._planning_agent
+    
+    async def _create_plan(self, request: str = None, context: str = None):
+        """
+        Create an implementation plan.
+        
+        Args:
+            request: The request/goal to plan for
+            context: Optional additional context
+            
+        Returns:
+            Plan instance
+        """
+        planner = self._get_planning_agent()
+        if planner is None:
+            return None
+            
+        # Use first task description as request if not provided
+        if request is None and self.tasks:
+            first_task = list(self.tasks.values())[0]
+            request = first_task.description
+            
+        plan = await planner.create_plan(
+            request=request,
+            agents=self.agents,
+            tasks=list(self.tasks.values()),
+            context=context
+        )
+        
+        self._current_plan = plan
+        
+        # Create todo list from plan
+        from ..planning import TodoList
+        self._todo_list = TodoList.from_plan(plan)
+        
+        return plan
+    
+    def _create_plan_sync(self, request: str = None, context: str = None):
+        """
+        Synchronous version of _create_plan.
+        
+        Args:
+            request: The request/goal to plan for
+            context: Optional additional context
+            
+        Returns:
+            Plan instance
+        """
+        planner = self._get_planning_agent()
+        if planner is None:
+            return None
+            
+        # Use first task description as request if not provided
+        if request is None and self.tasks:
+            first_task = list(self.tasks.values())[0]
+            request = first_task.description
+            
+        plan = planner.create_plan_sync(
+            request=request,
+            agents=self.agents,
+            tasks=list(self.tasks.values()),
+            context=context
+        )
+        
+        self._current_plan = plan
+        
+        # Create todo list from plan
+        from ..planning import TodoList
+        self._todo_list = TodoList.from_plan(plan)
+        
+        return plan
+    
+    async def _request_approval(self, plan):
+        """
+        Request approval for a plan.
+        
+        Args:
+            plan: Plan to approve
+            
+        Returns:
+            True if approved, False if rejected
+        """
+        if self.auto_approve_plan:
+            plan.approve()
+            return True
+            
+        from ..planning import ApprovalCallback
+        callback = ApprovalCallback(auto_approve=self.auto_approve_plan)
+        return await callback.async_call(plan)
+    
+    def _request_approval_sync(self, plan):
+        """
+        Synchronous version of _request_approval.
+        
+        Args:
+            plan: Plan to approve
+            
+        Returns:
+            True if approved, False if rejected
+        """
+        if self.auto_approve_plan:
+            plan.approve()
+            return True
+            
+        from ..planning import ApprovalCallback
+        callback = ApprovalCallback(auto_approve=self.auto_approve_plan)
+        return callback(plan)
+    
+    def get_plan_markdown(self) -> str:
+        """
+        Get the current plan as markdown.
+        
+        Returns:
+            Markdown string or empty string if no plan
+        """
+        if self._current_plan:
+            return self._current_plan.to_markdown()
+        return ""
+    
+    def get_todo_markdown(self) -> str:
+        """
+        Get the current todo list as markdown.
+        
+        Returns:
+            Markdown string or empty string if no todo list
+        """
+        if self._todo_list:
+            return self._todo_list.to_markdown()
+        return ""
+    
+    def update_plan_step_status(self, step_id: str, status: str) -> bool:
+        """
+        Update the status of a plan step.
+        
+        Args:
+            step_id: ID of the step to update
+            status: New status
+            
+        Returns:
+            True if updated, False if not found
+        """
+        if self._current_plan:
+            result = self._current_plan.update_step_status(step_id, status)
+            # Sync todo list
+            if self._todo_list:
+                self._todo_list.sync_with_plan(self._current_plan)
+            return result
+        return False
+    
+    def _run_with_planning(self):
+        """
+        Run tasks with planning mode enabled.
+        
+        This method:
+        1. Creates a plan using PlanningAgent
+        2. Generates a todo list from the plan
+        3. Creates proper Task objects from plan steps
+        4. Executes each task using the full Task execution system
+           (with memory, callbacks, guardrails, structured output, etc.)
+        5. Tracks progress as items are completed
+        """
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.markdown import Markdown
+        from ..task import Task
+        
+        console = Console()
+        
+        # Step 1: Create the plan
+        console.print("\n[bold blue]📋 PLANNING PHASE[/bold blue]")
+        console.print("[dim]Creating implementation plan...[/dim]\n")
+        
+        # Build request from tasks
+        task_descriptions = [task.description for task in self.tasks.values()]
+        request = " AND ".join(task_descriptions)
+        
+        plan = self._create_plan_sync(request=request)
+        
+        if not plan:
+            console.print("[yellow]⚠️ Planning failed, falling back to normal execution[/yellow]")
+            self.run_all_tasks()
+            return
+        
+        # Display the plan
+        console.print(Panel(
+            Markdown(plan.to_markdown()),
+            title="[bold green]Generated Plan[/bold green]",
+            border_style="green"
+        ))
+        
+        # Step 2: Request approval if not auto-approve
+        if not self.auto_approve_plan:
+            approved = self._request_approval_sync(plan)
+            if not approved:
+                console.print("[red]❌ Plan rejected. Aborting execution.[/red]")
+                return
+        else:
+            plan.approve()
+            console.print("[green]✅ Plan auto-approved[/green]")
+        
+        # Step 3: Create todo list for tracking
+        from ..planning import TodoList
+        self._todo_list = TodoList.from_plan(plan)
+        
+        console.print("\n[bold blue]📝 TODO LIST[/bold blue]")
+        console.print(Panel(
+            Markdown(self._todo_list.to_markdown()),
+            title="[bold cyan]Tasks to Complete[/bold cyan]",
+            border_style="cyan"
+        ))
+        
+        # Step 4: Create proper Task objects from plan steps
+        console.print("\n[bold blue]🚀 EXECUTION PHASE[/bold blue]\n")
+        
+        # Map agent names to agent instances
+        agent_map = {agent.name: agent for agent in self.agents}
+        
+        # Store original tasks and create new tasks from plan
+        original_tasks = self.tasks.copy()
+        self.tasks = {}
+        self.task_id_counter = 0
+        
+        # Create Task objects from plan steps
+        plan_tasks = []
+        step_to_task = {}  # Map step_id to task for context chaining
+        
+        for i, step in enumerate(plan.steps):
+            # Get the appropriate agent
+            agent = agent_map.get(step.agent, self.agents[0] if self.agents else None)
+            
+            if not agent:
+                console.print(f"[yellow]⚠️ No agent found for '{step.agent}', using first available[/yellow]")
+                agent = self.agents[0] if self.agents else None
+            
+            if not agent:
+                console.print(f"[red]❌ No agents available for step: {step.description}[/red]")
+                continue
+            
+            # Build context from dependencies (previous task results)
+            context = []
+            for dep_id in step.dependencies:
+                # Convert step_X format to actual step index
+                if dep_id.startswith("step_"):
+                    try:
+                        dep_index = int(dep_id.split("_")[1])
+                        if dep_index < len(plan_tasks):
+                            context.append(plan_tasks[dep_index])
+                    except (ValueError, IndexError):
+                        pass
+                elif dep_id in step_to_task:
+                    context.append(step_to_task[dep_id])
+            
+            # Find matching original task for additional config (memory, callbacks, etc.)
+            original_task = None
+            for orig_task in original_tasks.values():
+                if orig_task.agent and orig_task.agent.name == agent.name:
+                    original_task = orig_task
+                    break
+            
+            # Create Task with full features from original task if available
+            task = Task(
+                description=step.description,
+                expected_output=f"Complete: {step.description}",
+                agent=agent,
+                name=f"Plan Step {i + 1}",
+                tools=agent.tools if agent.tools else [],
+                context=context if context else None,
+                # Inherit from original task if available
+                memory=original_task.memory if original_task else None,
+                callback=original_task.callback if original_task else None,
+                guardrail=original_task.guardrail if original_task else None,
+                max_retries=original_task.max_retries if original_task else 3,
+                output_json=original_task.output_json if original_task else None,
+                output_pydantic=original_task.output_pydantic if original_task else None,
+                config=original_task.config if original_task else {}
+            )
+            
+            # Add task to our task list
+            task_id = self.add_task(task)
+            plan_tasks.append(task)
+            step_to_task[step.id] = task
+        
+        # Step 5: Execute tasks using the proper Task execution system
+        for i, (task_id, task) in enumerate(self.tasks.items()):
+            # Update todo list progress
+            if i < len(self._todo_list.items):
+                item = self._todo_list.items[i]
+                
+                # Display progress bar
+                progress = self._todo_list.progress
+                bar_length = 30
+                filled = int(bar_length * progress)
+                bar = "█" * filled + "░" * (bar_length - filled)
+                console.print(f"[dim]Progress: [{bar}] {progress * 100:.0f}%[/dim]")
+                
+                console.print(f"\n[bold]📌 Step {i + 1}/{len(self.tasks)}:[/bold] {task.description[:60]}...")
+                console.print(f"[dim]   Agent: {task.agent.name if task.agent else 'Unknown'}[/dim]")
+                
+                # Mark as in progress
+                self._todo_list.start(item.id)
+            
+            # Execute using the full Task execution system
+            # This includes: memory, callbacks, guardrails, structured output, retry logic
+            try:
+                self.run_task(task_id)
+                
+                if task.status == "completed":
+                    if i < len(self._todo_list.items):
+                        self._todo_list.complete(self._todo_list.items[i].id)
+                    console.print("[green]   ✅ Completed[/green]")
+                else:
+                    console.print(f"[yellow]   ⚠️ Task status: {task.status}[/yellow]")
+            except Exception as e:
+                console.print(f"[red]   ❌ Error: {e}[/red]")
+                logger.error(f"Error executing plan task {task_id}: {e}")
+        
+        # Final progress
+        completed_count = len([t for t in self.tasks.values() if t.status == "completed"])
+        console.print(f"\n[bold green]🎉 EXECUTION COMPLETE[/bold green]")
+        console.print(f"[dim]Progress: [{'█' * 30}] 100%[/dim]")
+        console.print(f"[green]Completed {completed_count}/{len(self.tasks)} tasks![/green]\n")
+        
+        # Restore original tasks reference for result retrieval
+        self._plan_tasks = self.tasks.copy()
+        # Keep plan tasks for results but note original tasks are preserved in _plan_tasks
