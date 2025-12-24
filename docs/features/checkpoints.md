@@ -1,0 +1,287 @@
+# Shadow Git Checkpointing
+
+The Checkpoints feature provides file-level undo/restore capabilities using a shadow git repository. This enables automatic checkpointing before file modifications, allowing you to rewind to any previous state.
+
+## Overview
+
+Checkpoints allow you to:
+
+- **Save** snapshots of your workspace before changes
+- **Restore** files to any previous checkpoint
+- **Diff** between checkpoints to see what changed
+- **Track** all file modifications made by agents
+
+## Quick Start
+
+```python
+from praisonaiagents.checkpoints import CheckpointService
+
+# Create checkpoint service
+service = CheckpointService(
+    workspace_dir="/path/to/project",
+    storage_dir="~/.praison/checkpoints"  # Optional
+)
+
+# Initialize
+await service.initialize()
+
+# Save a checkpoint
+result = await service.save("Before refactoring")
+print(f"Saved: {result.checkpoint.short_id}")
+
+# Make changes...
+
+# Restore if needed
+await service.restore(result.checkpoint.id)
+```
+
+## How It Works
+
+The checkpoint service creates a **shadow git repository** separate from your project's git:
+
+1. **Isolated Storage**: Checkpoints are stored in `~/.praison/checkpoints/<hash>/`
+2. **No Interference**: Doesn't affect your project's `.git` directory
+3. **Automatic Tracking**: Tracks all files in the workspace
+4. **Exclude Patterns**: Respects `.gitignore`-style patterns
+
+## CLI Commands
+
+```bash
+# Save a checkpoint
+praisonai checkpoint save "Before major changes"
+
+# List all checkpoints
+praisonai checkpoint list
+
+# Show diff from last checkpoint
+praisonai checkpoint diff
+
+# Show diff between specific checkpoints
+praisonai checkpoint diff abc123 def456
+
+# Restore to a checkpoint
+praisonai checkpoint restore abc123
+
+# Delete all checkpoints
+praisonai checkpoint delete
+```
+
+## Python API
+
+### CheckpointService
+
+```python
+from praisonaiagents.checkpoints import CheckpointService
+
+service = CheckpointService(
+    workspace_dir="/path/to/project",
+    storage_dir="~/.praison/checkpoints",
+    enabled=True,
+    auto_checkpoint=True,
+    max_checkpoints=100
+)
+```
+
+**Parameters:**
+- `workspace_dir`: Directory to track
+- `storage_dir`: Where to store checkpoint data (default: `~/.praison/checkpoints`)
+- `enabled`: Enable/disable checkpoints
+- `auto_checkpoint`: Auto-checkpoint before file modifications
+- `max_checkpoints`: Maximum checkpoints to keep
+
+### Methods
+
+#### initialize()
+
+Initialize the checkpoint service:
+
+```python
+success = await service.initialize()
+```
+
+#### save(message, allow_empty=False)
+
+Save a checkpoint:
+
+```python
+result = await service.save("Checkpoint message")
+
+if result.success:
+    print(f"Saved: {result.checkpoint.short_id}")
+else:
+    print(f"Error: {result.error}")
+```
+
+#### restore(checkpoint_id)
+
+Restore to a checkpoint:
+
+```python
+result = await service.restore("abc123")
+
+if result.success:
+    print("Restored successfully")
+```
+
+#### diff(from_id=None, to_id=None)
+
+Get diff between checkpoints:
+
+```python
+# Diff from last checkpoint to current
+diff = await service.diff()
+
+# Diff between specific checkpoints
+diff = await service.diff("abc123", "def456")
+
+for file in diff.files:
+    print(f"{file.status}: {file.path} (+{file.additions}/-{file.deletions})")
+```
+
+#### list_checkpoints(limit=50)
+
+List all checkpoints:
+
+```python
+checkpoints = await service.list_checkpoints(limit=20)
+
+for cp in checkpoints:
+    print(f"{cp.short_id} - {cp.message} ({cp.timestamp})")
+```
+
+## Event Handlers
+
+Subscribe to checkpoint events:
+
+```python
+from praisonaiagents.checkpoints import CheckpointEvent
+
+def on_checkpoint(checkpoint):
+    print(f"Checkpoint created: {checkpoint.short_id}")
+
+service.on(CheckpointEvent.CHECKPOINT_CREATED, on_checkpoint)
+service.on(CheckpointEvent.CHECKPOINT_RESTORED, lambda cp: print(f"Restored: {cp.short_id}"))
+service.on(CheckpointEvent.ERROR, lambda e: print(f"Error: {e['error']}"))
+```
+
+## Data Types
+
+### Checkpoint
+
+```python
+@dataclass
+class Checkpoint:
+    id: str           # Full commit hash
+    short_id: str     # Short hash (8 chars)
+    message: str      # Checkpoint message
+    timestamp: datetime
+    files_changed: int
+    insertions: int
+    deletions: int
+```
+
+### CheckpointDiff
+
+```python
+@dataclass
+class CheckpointDiff:
+    from_checkpoint: str
+    to_checkpoint: Optional[str]  # None = working directory
+    files: List[FileDiff]
+    total_additions: int
+    total_deletions: int
+```
+
+### FileDiff
+
+```python
+@dataclass
+class FileDiff:
+    path: str
+    absolute_path: str
+    status: str  # "added", "modified", "deleted"
+    additions: int
+    deletions: int
+```
+
+## Configuration
+
+### Exclude Patterns
+
+By default, these patterns are excluded:
+
+- `.git`
+- `.praison`
+- `__pycache__`
+- `*.pyc`
+- `.env`
+- `node_modules`
+- `.venv`, `venv`
+- `*.log`
+
+### Protected Paths
+
+The service refuses to checkpoint these paths for safety:
+
+- Home directory (`~`)
+- `~/Desktop`, `~/Documents`, `~/Downloads`
+- System directories (`/`, `/tmp`, `/var`, `/etc`)
+
+## Complete Example
+
+```python
+import asyncio
+from praisonaiagents.checkpoints import CheckpointService, CheckpointEvent
+
+async def main():
+    # Create service
+    service = CheckpointService(workspace_dir="./my_project")
+    
+    # Register event handlers
+    service.on(CheckpointEvent.CHECKPOINT_CREATED, 
+               lambda cp: print(f"✓ Saved: {cp.short_id}"))
+    
+    # Initialize
+    await service.initialize()
+    
+    # Save initial checkpoint
+    await service.save("Initial state")
+    
+    # Make some changes to files...
+    with open("./my_project/test.py", "w") as f:
+        f.write("print('Hello')")
+    
+    # Save checkpoint
+    result = await service.save("Added test.py")
+    
+    # View diff
+    diff = await service.diff()
+    print(f"Changes: +{diff.total_additions}/-{diff.total_deletions}")
+    
+    # List checkpoints
+    checkpoints = await service.list_checkpoints()
+    for cp in checkpoints:
+        print(f"  {cp.short_id}: {cp.message}")
+    
+    # Restore if needed
+    # await service.restore(checkpoints[-1].id)
+
+asyncio.run(main())
+```
+
+## Best Practices
+
+1. **Checkpoint before major changes** - Save before refactoring or large edits
+2. **Use descriptive messages** - Makes it easier to find the right checkpoint
+3. **Don't checkpoint too frequently** - Balance between safety and storage
+4. **Clean up old checkpoints** - Use `delete` when no longer needed
+5. **Check diff before restore** - Verify you're restoring to the right state
+
+## Performance
+
+The checkpoint system is designed for minimal overhead:
+
+- **Lazy loading**: All imports via `__getattr__`
+- **Async operations**: Non-blocking git operations
+- **Incremental commits**: Only changed files are tracked
+- **Configurable limits**: Control max checkpoints to manage storage
