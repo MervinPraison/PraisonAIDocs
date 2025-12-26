@@ -2,7 +2,7 @@ import os
 import time
 import json
 import logging
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Callable
 from pydantic import BaseModel
 from rich.text import Text
 from rich.panel import Panel
@@ -127,7 +127,7 @@ def process_task_context(context_item, verbose=0, user_id=None):
         return str(context_item)  # Fallback for unknown types
 
 class PraisonAIAgents:
-    def __init__(self, agents, tasks=None, verbose=0, completion_checker=None, max_retries=5, process="sequential", manager_llm=None, memory=False, memory_config=None, embedder=None, user_id=None, max_iter=10, stream=True, name: Optional[str] = None, planning: bool = False, planning_llm: Optional[str] = None, auto_approve_plan: bool = False, planning_tools: Optional[List] = None, planning_reasoning: bool = False):
+    def __init__(self, agents, tasks=None, verbose=0, completion_checker=None, max_retries=5, process="sequential", manager_llm=None, memory=False, memory_config=None, embedder=None, user_id=None, max_iter=10, stream=True, name: Optional[str] = None, planning: bool = False, planning_llm: Optional[str] = None, auto_approve_plan: bool = False, planning_tools: Optional[List] = None, planning_reasoning: bool = False, on_task_start: Optional[Callable] = None, on_task_complete: Optional[Callable] = None, variables: Optional[Dict[str, Any]] = None):
         # Add check at the start if memory is requested
         if memory:
             try:
@@ -161,6 +161,11 @@ class PraisonAIAgents:
         self.process = process
         self.stream = stream
         self.name = name  # Store the name for the Agents collection
+        
+        # Callbacks for workflow execution
+        self.on_task_start = on_task_start  # Called before each task
+        self.on_task_complete = on_task_complete  # Called after each task
+        self.variables = variables if variables else {}  # Global variables for substitution
         
         # Check for manager_llm in environment variable if not provided
         self.manager_llm = manager_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
@@ -661,13 +666,24 @@ Context:
 
         executor_agent = task.agent
         
+        # Create agent from agent_config if provided and no agent assigned
+        if executor_agent is None and getattr(task, 'agent_config', None):
+            executor_agent = self._create_agent_from_config(task.agent_config)
+            task.agent = executor_agent
+        
         # Set current agent for token tracking
         llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
         if llm and hasattr(llm, 'set_current_agent'):
             llm.set_current_agent(executor_agent.name)
 
+        # Substitute variables in task description if provided
+        task_description = task.description
+        if getattr(task, 'variables', None):
+            for key, value in task.variables.items():
+                task_description = task_description.replace(f"{{{{{key}}}}}", str(value))
+
         task_prompt = f"""
-You need to do the following task: {task.description}.
+You need to do the following task: {task_description}.
 Expected Output: {task.expected_output}.
 """
         if task.context:
@@ -825,6 +841,17 @@ Context:
             logger.info(f"Task with ID {task_id} is already completed")
             return
 
+        # Call on_task_start callback if provided
+        if self.on_task_start:
+            try:
+                self.on_task_start(task, task_id)
+            except Exception as e:
+                logger.error(f"Error in on_task_start callback: {e}")
+        
+        # Apply global variables to task if not already set
+        if self.variables and not getattr(task, 'variables', None):
+            task.variables = self.variables
+        
         retries = 0
         while task.status != "completed" and retries < self.max_retries:
             logger.debug(f"Attempt {retries+1} for task {task_id}")
@@ -857,6 +884,14 @@ Context:
                             logger.exception(e)
                             
                     self.save_output_to_file(task, task_output)
+                    
+                    # Call on_task_complete callback if provided
+                    if self.on_task_complete:
+                        try:
+                            self.on_task_complete(task, task_output)
+                        except Exception as e:
+                            logger.error(f"Error in on_task_complete callback: {e}")
+                    
                     if self.verbose >= 1:
                         logger.info(f"Task {task_id} completed successfully.")
                 else:
@@ -1335,6 +1370,61 @@ Context:
             agent_names = ", ".join([agent.name for agent in self.agents])
             print(f"📊 Available agents for this endpoint ({len(self.agents)}): {agent_names}")
             
+            # Create per-agent endpoints for individual agent access
+            # This allows n8n and other tools to call specific agents
+            agents_dict = {agent.name.lower().replace(' ', '_'): agent for agent in self.agents}
+            
+            # Add GET endpoint to list available agents
+            @_agents_shared_apps[port].get(f"{path}/list")
+            async def list_agents():
+                return {
+                    "agents": [
+                        {"name": agent.name, "id": agent.name.lower().replace(' ', '_')}
+                        for agent in self.agents
+                    ]
+                }
+            
+            # Add per-agent POST endpoints
+            for agent_id, agent_instance in agents_dict.items():
+                agent_path = f"{path}/{agent_id}"
+                
+                # Create a closure to capture the agent instance
+                def create_agent_handler(agent):
+                    async def handle_single_agent(request: Request):
+                        try:
+                            request_data = await request.json()
+                            query = request_data.get("query", "")
+                            if not query:
+                                raise HTTPException(status_code=400, detail="Missing 'query' field")
+                        except:
+                            raise HTTPException(status_code=400, detail="Invalid JSON body")
+                        
+                        try:
+                            if asyncio.iscoroutinefunction(agent.chat):
+                                response = await agent.achat(query)
+                            else:
+                                loop = asyncio.get_running_loop()
+                                response = await loop.run_in_executor(None, lambda q=query: agent.chat(q))
+                            
+                            return {
+                                "agent": agent.name,
+                                "query": query,
+                                "response": response
+                            }
+                        except Exception as e:
+                            logging.error(f"Error with agent {agent.name}: {str(e)}", exc_info=True)
+                            return JSONResponse(
+                                status_code=500,
+                                content={"error": f"Agent error: {str(e)}"}
+                            )
+                    return handle_single_agent
+                
+                # Register the endpoint
+                _agents_shared_apps[port].post(agent_path)(create_agent_handler(agent_instance))
+                _agents_registered_endpoints[port][agent_path] = f"{endpoint_id}_{agent_id}"
+            
+            print(f"🔗 Per-agent endpoints: {', '.join([f'{path}/{aid}' for aid in agents_dict.keys()])}")
+            
             # Start the server if it's not already running for this port
             if not _agents_server_started.get(port, False):
                 # Mark the server as started first to prevent duplicate starts
@@ -1560,6 +1650,29 @@ Context:
     def todo_list(self):
         """Get the current todo list."""
         return self._todo_list
+    
+    def _create_agent_from_config(self, agent_config: dict) -> 'Agent':
+        """
+        Create an Agent from a configuration dictionary.
+        
+        Args:
+            agent_config: Dict with keys like 'name', 'role', 'goal', 'backstory', 'llm', 'tools'
+            
+        Returns:
+            Agent instance
+        """
+        from ..agent.agent import Agent
+        
+        return Agent(
+            name=agent_config.get('name', 'TaskAgent'),
+            role=agent_config.get('role'),
+            goal=agent_config.get('goal'),
+            backstory=agent_config.get('backstory'),
+            llm=agent_config.get('llm'),
+            tools=agent_config.get('tools'),
+            verbose=self.verbose >= 1,
+            memory=self.memory
+        )
     
     def _get_planning_agent(self):
         """Lazy load PlanningAgent."""
