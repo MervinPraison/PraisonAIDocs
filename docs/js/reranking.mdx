@@ -1,199 +1,227 @@
 ---
 title: "Reranking"
-description: "Improve search relevance with reranking models"
+description: "Improve Agent retrieval accuracy with reranking"
 icon: "arrow-up-right-dots"
 ---
 
-# Reranking
+# Reranking for Agents
 
-Reranking improves search results by re-scoring documents based on their relevance to the query.
+Reranking helps your Agents find the most relevant information by re-scoring search results. This dramatically improves RAG accuracy - your Agent gets better context and gives better answers.
+
+## Agent with Reranking
+
+```typescript
+import { Agent, createCohereReranker, createPineconeStore } from 'praisonai';
+
+const vectorStore = createPineconeStore({ apiKey: process.env.PINECONE_API_KEY! });
+const reranker = createCohereReranker({ apiKey: process.env.COHERE_API_KEY! });
+
+// Agent with reranking-enhanced knowledge
+const agent = new Agent({
+  name: 'Research Assistant',
+  instructions: 'Answer questions accurately using the knowledge base.',
+  knowledge: {
+    vectorStore,
+    indexName: 'documents',
+    reranker,  // Rerank results before using as context
+    topK: 5
+  }
+});
+
+// Agent gets better context = better answers
+const response = await agent.chat('What is our return policy for electronics?');
+```
+
+## Agent with Reranking Tool
+
+Give your Agent explicit control over reranking:
+
+```typescript
+import { Agent, createTool, createCohereReranker, createPineconeStore } from 'praisonai';
+
+const vectorStore = createPineconeStore({ apiKey: process.env.PINECONE_API_KEY! });
+const reranker = createCohereReranker({ apiKey: process.env.COHERE_API_KEY! });
+
+// Tool that searches and reranks
+const searchWithReranking = createTool({
+  name: 'search_documents',
+  description: 'Search documents and return the most relevant results',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Search query' },
+      count: { type: 'number', description: 'Number of results (default: 5)' }
+    },
+    required: ['query']
+  },
+  execute: async ({ query, count = 5 }) => {
+    // 1. Broad initial search
+    const initialResults = await vectorStore.query({
+      indexName: 'documents',
+      vector: await getEmbedding(query),
+      topK: 20  // Get more than needed
+    });
+    
+    // 2. Rerank for precision
+    const reranked = await reranker.rerank(query, initialResults, { topK: count });
+    
+    // 3. Return best results to Agent
+    return reranked.map(r => `[Score: ${r.score.toFixed(2)}] ${r.content}`).join('\n\n');
+  }
+});
+
+const agent = new Agent({
+  name: 'Smart Researcher',
+  instructions: 'Search for information and provide accurate answers based on the most relevant documents.',
+  tools: [searchWithReranking]
+});
+
+const response = await agent.chat('Find the most relevant information about pricing tiers');
+```
+
+## Multi-Agent RAG with Reranking
+
+```typescript
+import { Agent, PraisonAIAgents, createCohereReranker, createPineconeStore } from 'praisonai';
+
+const vectorStore = createPineconeStore({ apiKey: process.env.PINECONE_API_KEY! });
+const reranker = createCohereReranker({ apiKey: process.env.COHERE_API_KEY! });
+
+// Agent 1: Retrieves documents
+const retriever = new Agent({
+  name: 'Retriever',
+  instructions: 'Search the knowledge base and retrieve relevant documents.',
+  knowledge: { vectorStore, indexName: 'docs' }
+});
+
+// Agent 2: Reranks and filters
+const ranker = new Agent({
+  name: 'Ranker',
+  instructions: 'Evaluate document relevance and select the best ones.',
+  tools: [createTool({
+    name: 'rerank_documents',
+    description: 'Rerank documents by relevance',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        documents: { type: 'array', items: { type: 'object' } }
+      },
+      required: ['query', 'documents']
+    },
+    execute: async ({ query, documents }) => {
+      const reranked = await reranker.rerank(query, documents, { topK: 3 });
+      return reranked;
+    }
+  })]
+});
+
+// Agent 3: Answers based on reranked results
+const answerer = new Agent({
+  name: 'Answerer',
+  instructions: 'Provide accurate answers based on the provided documents.'
+});
+
+const agents = new PraisonAIAgents({
+  agents: [retriever, ranker, answerer],
+  tasks: [
+    { agent: retriever, description: 'Retrieve documents for: {query}' },
+    { agent: ranker, description: 'Rerank the retrieved documents' },
+    { agent: answerer, description: 'Answer the question using the top documents' }
+  ]
+});
+
+await agents.start({ query: 'What are the system requirements?' });
+```
+
+## LLM-Based Reranking Agent
+
+Use an Agent itself to judge document relevance:
+
+```typescript
+import { Agent, createLLMReranker } from 'praisonai';
+
+// Scoring Agent
+const scorerAgent = new Agent({
+  name: 'Relevance Scorer',
+  instructions: `Score how relevant a document is to a query.
+Return only a number from 0 to 1, where 1 is perfectly relevant.`
+});
+
+// Create reranker powered by the Agent
+const agentReranker = createLLMReranker({
+  generateFn: async (prompt) => await scorerAgent.chat(prompt)
+});
+
+// Main Agent with Agent-powered reranking
+const mainAgent = new Agent({
+  name: 'Research Assistant',
+  instructions: 'Answer questions using the knowledge base.',
+  knowledge: {
+    vectorStore,
+    reranker: agentReranker
+  }
+});
+```
 
 ## Supported Rerankers
 
-| Reranker | Description | API Required |
-|----------|-------------|--------------|
-| **Cohere** | Production-grade reranking | Yes |
-| **CrossEncoder** | Embedding-based | No |
-| **LLM** | LLM-as-judge | Yes |
+| Reranker | Best For | API Required |
+|----------|----------|--------------|
+| **Cohere** | Production Agents | Yes |
+| **CrossEncoder** | Self-hosted Agents | No |
+| **LLM** | Custom scoring logic | Yes |
 
-## Quick Start
-
-```typescript
-import { 
-  createCohereReranker,
-  createCrossEncoderReranker,
-  createLLMReranker
-} from 'praisonai';
-
-// Cohere Reranker (recommended for production)
-const cohere = createCohereReranker({
-  apiKey: process.env.COHERE_API_KEY
-});
-
-// Cross-Encoder Reranker (with custom embeddings)
-const crossEncoder = createCrossEncoderReranker({
-  embedFn: async (texts) => {
-    // Your embedding function
-    return await getEmbeddings(texts);
-  }
-});
-
-// LLM Reranker (uses LLM to score relevance)
-const llmReranker = createLLMReranker({
-  generateFn: async (prompt) => {
-    // Your LLM function
-    return await generateText(prompt);
-  }
-});
-```
-
-## Basic Usage
-
-```typescript
-const documents = [
-  { id: 'doc-1', content: 'TypeScript is a typed superset of JavaScript' },
-  { id: 'doc-2', content: 'Python is a popular programming language' },
-  { id: 'doc-3', content: 'JavaScript runs in the browser' }
-];
-
-const results = await reranker.rerank(
-  'What is TypeScript?',
-  documents,
-  { topK: 2, threshold: 0.5 }
-);
-
-for (const result of results) {
-  console.log(`${result.newRank}. [${result.score.toFixed(2)}] ${result.content}`);
-}
-// Output:
-// 1. [0.95] TypeScript is a typed superset of JavaScript
-// 2. [0.72] JavaScript runs in the browser
-```
-
-## Cohere Reranker
-
-Best for production use with high accuracy:
+### Cohere (Recommended for Production)
 
 ```typescript
 import { createCohereReranker } from 'praisonai';
 
 const reranker = createCohereReranker({
-  apiKey: process.env.COHERE_API_KEY,
-  model: 'rerank-english-v3.0'  // or 'rerank-multilingual-v3.0'
-});
-
-const results = await reranker.rerank(query, documents, {
-  topK: 5,
-  threshold: 0.3
+  apiKey: process.env.COHERE_API_KEY!,
+  model: 'rerank-english-v3.0'
 });
 ```
 
-## Cross-Encoder Reranker
-
-Uses embeddings for similarity scoring:
+### Cross-Encoder (No External API)
 
 ```typescript
 import { createCrossEncoderReranker } from 'praisonai';
 
 const reranker = createCrossEncoderReranker({
-  embedFn: async (texts: string[]) => {
-    // Batch embed all texts
-    const embeddings = await Promise.all(
-      texts.map(text => getEmbedding(text))
-    );
-    return embeddings;
-  }
+  embedFn: async (texts) => await getEmbeddings(texts)
 });
-
-// Falls back to keyword matching if no embedFn provided
-const simpleReranker = createCrossEncoderReranker();
 ```
 
-## LLM Reranker
-
-Uses an LLM to score relevance (slower but flexible):
+### LLM Reranker (Flexible)
 
 ```typescript
-import { createLLMReranker } from 'praisonai';
-import { Agent } from 'praisonai';
+import { createLLMReranker, Agent } from 'praisonai';
 
-const agent = new Agent({ name: 'Scorer' });
-
+const scorer = new Agent({ name: 'Scorer' });
 const reranker = createLLMReranker({
-  generateFn: async (prompt) => {
-    return await agent.chat(prompt);
-  }
+  generateFn: async (prompt) => await scorer.chat(prompt)
 });
-
-const results = await reranker.rerank(query, documents);
 ```
 
-## With RAG Pipeline
+## Why Reranking Matters for Agents
 
-```typescript
-import { KnowledgeBase, createCohereReranker } from 'praisonai';
-
-const kb = new KnowledgeBase({ /* config */ });
-const reranker = createCohereReranker({ apiKey: process.env.COHERE_API_KEY });
-
-async function ragWithReranking(query: string) {
-  // 1. Initial retrieval (fast, broad)
-  const initialResults = await kb.search(query, { topK: 20 });
-  
-  // 2. Rerank for precision
-  const reranked = await reranker.rerank(
-    query,
-    initialResults.map(r => ({ id: r.id, content: r.content, metadata: r.metadata })),
-    { topK: 5 }
-  );
-  
-  // 3. Use top results for context
-  const context = reranked.map(r => r.content).join('\n\n');
-  return context;
-}
-```
-
-## Configuration Options
-
-```typescript
-interface RerankConfig {
-  topK?: number;      // Max results to return
-  threshold?: number; // Min score threshold (0-1)
-  model?: string;     // Model name (Cohere only)
-}
-```
-
-## Result Structure
-
-```typescript
-interface RerankResult {
-  id: string;           // Document ID
-  score: number;        // Relevance score (0-1)
-  content: string;      // Document content
-  metadata?: object;    // Original metadata
-  originalRank: number; // Position before reranking
-  newRank: number;      // Position after reranking
-}
-```
-
-## CLI Usage
-
-```bash
-# Rerank search results
-npx praisonai rerank "query" --documents docs.json --topK 5
-
-# With specific reranker
-npx praisonai rerank "query" --reranker cohere --model rerank-english-v3.0
-```
+| Without Reranking | With Reranking |
+|-------------------|----------------|
+| Agent gets 5 "similar" docs | Agent gets 5 "most relevant" docs |
+| May include tangential info | Focused on the actual question |
+| Lower answer accuracy | Higher answer accuracy |
+| More hallucination risk | Grounded in best sources |
 
 ## Environment Variables
 
 ```bash
-COHERE_API_KEY=your-cohere-api-key
+COHERE_API_KEY=your-cohere-key
+OPENAI_API_KEY=your-openai-key  # For embeddings
 ```
 
 ## Related
 
-- [Knowledge Base](/docs/js/knowledge-base) - RAG implementation
-- [Vector Stores](/docs/js/vector-stores) - Vector database integrations
-- [Graph RAG](/docs/js/graph-rag) - Graph-based retrieval
+- [Vector Stores](/docs/js/vector-stores) - Agent knowledge storage
+- [Graph RAG](/docs/js/graph-rag) - Relationship-aware retrieval
+- [Knowledge Base](/docs/js/knowledge-base) - Complete RAG for Agents
