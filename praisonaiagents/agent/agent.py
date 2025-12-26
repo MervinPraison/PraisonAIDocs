@@ -242,7 +242,22 @@ class Agent:
         plan_mode: bool = False,
         planning: bool = False,
         planning_tools: Optional[List[Any]] = None,
-        planning_reasoning: bool = False
+        planning_reasoning: bool = False,
+        fast_context: bool = False,
+        fast_context_path: Optional[str] = None,
+        fast_context_model: str = "gpt-4o-mini",
+        fast_context_max_turns: int = 4,
+        fast_context_parallelism: int = 8,
+        fast_context_timeout: float = 30.0,
+        history_in_context: Optional[int] = None,
+        auto_save: Optional[str] = None,
+        skills: Optional[List[str]] = None,
+        skills_dirs: Optional[List[str]] = None,
+        db: Optional[Any] = None,
+        session_id: Optional[str] = None,
+        hooks: Optional[List[Any]] = None,
+        llm_config: Optional[Dict[str, Any]] = None,
+        rate_limiter: Optional[Any] = None
     ):
         """Initialize an Agent instance.
 
@@ -382,6 +397,17 @@ class Agent:
         self._using_custom_llm = False
         # Flag to track if final result has been displayed to prevent duplicates
         self._final_display_shown = False
+        
+        # Store hooks for middleware system (zero overhead when empty)
+        self._hooks = hooks or []
+        self._middleware_manager = None  # Lazy init
+        
+        # Store llm_config for configurable model switching
+        self._llm_config = llm_config or {}
+        self._llm_configurable = self._llm_config.get('configurable', False)
+        
+        # Store rate limiter (optional, zero overhead when None)
+        self._rate_limiter = rate_limiter
         
         # Store OpenAI client parameters for lazy initialization
         self._openai_api_key = api_key
@@ -538,9 +564,14 @@ Your Goal: {self.goal}
         self.prompt_caching = prompt_caching
         self.claude_memory = claude_memory
         
+        # Session management
+        self.history_in_context = history_in_context  # Number of past sessions to include
+        self.auto_save = auto_save  # Session name for auto-saving
+        
         # Initialize rules manager for persistent context (like Cursor/Windsurf)
+        # NOTE: Lazy initialization - rules are loaded only when accessed (performance optimization)
         self._rules_manager = None
-        self._init_rules_manager()
+        self._rules_manager_initialized = False
         
         # Handle web_search fallback: inject DuckDuckGo tool for unsupported models
         if web_search and not self._model_supports_web_search():
@@ -585,6 +616,26 @@ Your Goal: {self.goal}
             self._knowledge_config = knowledge_config
             self.knowledge = None  # Will be initialized on first use
 
+        # Fast Context configuration (lazy loaded)
+        self.fast_context_enabled = fast_context
+        self._fast_context_path = fast_context_path  # Store raw, resolve lazily
+        self.fast_context_model = fast_context_model
+        self.fast_context_max_turns = fast_context_max_turns
+        self.fast_context_parallelism = fast_context_parallelism
+        self.fast_context_timeout = fast_context_timeout
+        self._fast_context_instance = None  # Lazy loaded
+
+        # Agent Skills configuration (lazy loaded for zero performance impact)
+        self._skills = skills
+        self._skills_dirs = skills_dirs
+        self._skill_manager = None  # Lazy loaded
+        self._skills_initialized = False
+
+        # Database persistence (lazy - no imports until used)
+        self._db = db
+        self._session_id = session_id
+        self._db_initialized = False
+
     @property
     def console(self):
         """Lazily initialize Rich Console only when needed."""
@@ -592,6 +643,83 @@ Your Goal: {self.goal}
             from rich.console import Console
             self._console = Console()
         return self._console
+    
+    @property
+    def fast_context_path(self):
+        """Lazily resolve fast_context_path - avoids os.getcwd() on every init."""
+        if self._fast_context_path is None:
+            self._fast_context_path = os.getcwd()
+        return self._fast_context_path
+    
+    @fast_context_path.setter
+    def fast_context_path(self, value):
+        self._fast_context_path = value
+    
+    @property
+    def skill_manager(self):
+        """Lazily initialize SkillManager only when skills are accessed."""
+        if self._skill_manager is None and (self._skills or self._skills_dirs):
+            from ..skills import SkillManager
+            self._skill_manager = SkillManager()
+            
+            # Add explicit skill paths
+            if self._skills:
+                for skill_path in self._skills:
+                    self._skill_manager.add_skill(skill_path)
+            
+            # Discover skills from directories
+            if self._skills_dirs:
+                self._skill_manager.discover(self._skills_dirs, include_defaults=False)
+            
+            self._skills_initialized = True
+            
+            # Auto-add skill execution tools if not already present
+            self._add_skill_tools()
+        return self._skill_manager
+    
+    def _add_skill_tools(self):
+        """Add tools required for skill execution (read_file, run_skill_script).
+        
+        Uses lazy imports from praisonaiagents.tools to avoid performance impact
+        when skills are not used.
+        """
+        # Check if tools already include required capabilities
+        tool_names = set()
+        for tool in self.tools:
+            if callable(tool) and hasattr(tool, '__name__'):
+                tool_names.add(tool.__name__)
+            elif hasattr(tool, 'name'):
+                tool_names.add(tool.name)
+        
+        # Add read_file if not present
+        if 'read_file' not in tool_names:
+            try:
+                from ..tools import read_file
+                self.tools.append(read_file)
+                logging.debug("Added read_file tool for skill support")
+            except ImportError:
+                logging.warning("Could not import read_file tool for skills")
+        
+        # Add run_skill_script from skill_tools module
+        if 'run_skill_script' not in tool_names:
+            try:
+                from ..tools.skill_tools import create_skill_tools
+                # Create skill tools with current working directory
+                skill_tools = create_skill_tools()
+                self.tools.append(skill_tools.run_skill_script)
+                logging.debug("Added run_skill_script tool for skill support")
+            except ImportError as e:
+                logging.warning(f"Could not import skill_tools: {e}")
+    
+    def get_skills_prompt(self) -> str:
+        """Get the XML prompt for available skills.
+        
+        Returns:
+            XML string with <available_skills> block, or empty string if no skills
+        """
+        if self.skill_manager is None:
+            return ""
+        return self.skill_manager.to_prompt()
     
     @property
     def _openai_client(self):
@@ -713,6 +841,72 @@ Your Goal: {self.goal}
         
         return supports_prompt_caching(model_name)
     
+    @property
+    def fast_context(self):
+        """Lazily initialize FastContext instance when needed.
+        
+        Returns:
+            FastContext instance or None if not enabled
+        """
+        if not self.fast_context_enabled:
+            return None
+        
+        if self._fast_context_instance is None:
+            try:
+                from ..context.fast import FastContext
+                self._fast_context_instance = FastContext(
+                    workspace_path=self.fast_context_path,
+                    model=self.fast_context_model,
+                    max_turns=self.fast_context_max_turns,
+                    max_parallel=self.fast_context_parallelism,
+                    timeout=self.fast_context_timeout,
+                    verbose=self.verbose
+                )
+            except ImportError:
+                logging.warning("FastContext not available")
+                return None
+        
+        return self._fast_context_instance
+    
+    def delegate_to_fast_context(self, query: str) -> Optional[str]:
+        """Delegate a code search query to FastContext subagent.
+        
+        This method uses the FastContext subagent to rapidly search
+        the codebase and return relevant context.
+        
+        Args:
+            query: Natural language search query
+            
+        Returns:
+            Formatted context string or None if FastContext not available
+        """
+        if not self.fast_context_enabled or self.fast_context is None:
+            return None
+        
+        try:
+            result = self.fast_context.search(query)
+            if result.total_files > 0:
+                return self.fast_context.get_context_for_agent(query)
+            return None
+        except Exception as e:
+            logging.warning(f"FastContext search failed: {e}")
+            return None
+    
+    @property
+    def rules_manager(self):
+        """
+        Lazy-initialized RulesManager for persistent rules/instructions.
+        
+        This property initializes the RulesManager only when first accessed,
+        avoiding expensive filesystem operations during agent instantiation.
+        
+        Returns:
+            RulesManager instance or None if not available
+        """
+        if not self._rules_manager_initialized:
+            self._init_rules_manager()
+        return self._rules_manager
+    
     def _init_rules_manager(self):
         """
         Initialize RulesManager for persistent rules/instructions.
@@ -721,7 +915,10 @@ Your Goal: {self.goal}
         - ~/.praison/rules/ (global)
         - .praison/rules/ (workspace)
         - Subdirectory rules
+        
+        NOTE: This is called lazily via the rules_manager property for performance.
         """
+        self._rules_manager_initialized = True
         try:
             from ..memory.rules_manager import RulesManager
             import os
@@ -756,10 +953,10 @@ Your Goal: {self.goal}
         Returns:
             Formatted rules context string
         """
-        if not self._rules_manager:
+        if not self.rules_manager:
             return ""
         
-        return self._rules_manager.build_rules_context(
+        return self.rules_manager.build_rules_context(
             file_path=file_path,
             include_manual=include_manual
         )
@@ -1167,8 +1364,8 @@ Your Goal: {self.goal}
 Your Role: {self.role}\n
 Your Goal: {self.goal}"""
         
-        # Add rules context if rules manager is enabled
-        if self._rules_manager:
+        # Add rules context if rules manager is enabled (lazy initialization)
+        if self._rules_manager_initialized and self._rules_manager:
             rules_context = self.get_rules_context()
             if rules_context:
                 system_prompt += f"\n\n## Rules (Guidelines you must follow)\n{rules_context}"
@@ -1181,6 +1378,13 @@ Your Goal: {self.goal}"""
                 # Display memory info to user if verbose
                 if self.verbose:
                     self._display_memory_info()
+        
+        # Add skills prompt if skills are configured
+        if self._skills or self._skills_dirs:
+            skills_prompt = self.get_skills_prompt()
+            if skills_prompt:
+                system_prompt += f"\n\n## Available Skills\n{skills_prompt}"
+                system_prompt += "\n\nWhen a skill is relevant to the task, read its SKILL.md file to get detailed instructions. If the skill has scripts in its scripts/ directory, you can execute them using the execute_code or run_script tool."
         
         # Add tool usage instructions if tools are available
         # Use provided tools or fall back to self.tools
@@ -1432,17 +1636,41 @@ Your Goal: {self.goal}"""
     def execute_tool(self, function_name, arguments):
         """
         Execute a tool dynamically based on the function name and arguments.
+        Injects agent state for tools with Injected[T] parameters.
         """
         logging.debug(f"{self.name} executing tool {function_name} with arguments: {arguments}")
+        
+        # Set up injection context for tools with Injected parameters
+        from ..tools.injected import AgentState, with_injection_context
+        state = AgentState(
+            agent_id=self.name,
+            run_id=getattr(self, '_current_run_id', 'unknown'),
+            session_id=getattr(self, '_session_id', None) or 'default',
+            last_user_message=self.chat_history[-1].get('content') if self.chat_history else None,
+            metadata={'agent_name': self.name}
+        )
+        
+        # Execute within injection context
+        return self._execute_tool_with_context(function_name, arguments, state)
+    
+    def _execute_tool_with_context(self, function_name, arguments, state):
+        """Execute tool within injection context."""
+        from ..tools.injected import with_injection_context
+        
+        with with_injection_context(state):
+            return self._execute_tool_impl(function_name, arguments)
+    
+    def _execute_tool_impl(self, function_name, arguments):
+        """Internal tool execution implementation."""
 
         # Check if approval is required for this tool
-        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, ApprovalDecision
+        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, ApprovalDecision, get_approval_callback
         if is_approval_required(function_name):
             risk_level = get_risk_level(function_name)
-            logging.info(f"Tool {function_name} requires approval (risk level: {risk_level})")
+            logging.debug(f"Tool {function_name} requires approval (risk level: {risk_level})")
             
             # Use global approval callback or default console callback
-            callback = approval_callback or console_approval_callback
+            callback = get_approval_callback() or console_approval_callback
             
             try:
                 decision = callback(function_name, arguments, risk_level)
@@ -1467,23 +1695,54 @@ Your Goal: {self.goal}"""
         # Special handling for MCP tools
         # Check if tools is an MCP instance with the requested function name
         from ..mcp.mcp import MCP
+        
+        # Helper function to execute MCP tool
+        def _execute_mcp_tool(mcp_instance, func_name, args):
+            """Execute a tool from an MCP instance."""
+            # Handle SSE MCP client
+            if hasattr(mcp_instance, 'is_sse') and mcp_instance.is_sse:
+                if hasattr(mcp_instance, 'sse_client'):
+                    for tool in mcp_instance.sse_client.tools:
+                        if tool.name == func_name:
+                            logging.debug(f"Found matching SSE MCP tool: {func_name}")
+                            return True, tool(**args)
+            # Handle HTTP Stream MCP client
+            if hasattr(mcp_instance, 'is_http_stream') and mcp_instance.is_http_stream:
+                if hasattr(mcp_instance, 'http_stream_client'):
+                    for tool in mcp_instance.http_stream_client.tools:
+                        if tool.name == func_name:
+                            logging.debug(f"Found matching HTTP Stream MCP tool: {func_name}")
+                            return True, tool(**args)
+            # Handle WebSocket MCP client
+            if hasattr(mcp_instance, 'is_websocket') and mcp_instance.is_websocket:
+                if hasattr(mcp_instance, 'websocket_client'):
+                    for tool in mcp_instance.websocket_client.tools:
+                        if tool.name == func_name:
+                            logging.debug(f"Found matching WebSocket MCP tool: {func_name}")
+                            return True, tool(**args)
+            # Handle stdio MCP client
+            if hasattr(mcp_instance, 'runner'):
+                for mcp_tool in mcp_instance.runner.tools:
+                    if hasattr(mcp_tool, 'name') and mcp_tool.name == func_name:
+                        logging.debug(f"Found matching MCP tool: {func_name}")
+                        return True, mcp_instance.runner.call_tool(func_name, args)
+            return False, None
+        
+        # Check if tools is a single MCP instance
         if isinstance(self.tools, MCP):
             logging.debug(f"Looking for MCP tool {function_name}")
-            
-            # Handle SSE MCP client
-            if hasattr(self.tools, 'is_sse') and self.tools.is_sse:
-                if hasattr(self.tools, 'sse_client'):
-                    for tool in self.tools.sse_client.tools:
-                        if tool.name == function_name:
-                            logging.debug(f"Found matching SSE MCP tool: {function_name}")
-                            return tool(**arguments)
-            # Handle stdio MCP client
-            elif hasattr(self.tools, 'runner'):
-                # Check if any of the MCP tools match the function name
-                for mcp_tool in self.tools.runner.tools:
-                    if hasattr(mcp_tool, 'name') and mcp_tool.name == function_name:
-                        logging.debug(f"Found matching MCP tool: {function_name}")
-                        return self.tools.runner.call_tool(function_name, arguments)
+            found, result = _execute_mcp_tool(self.tools, function_name, arguments)
+            if found:
+                return result
+        
+        # Check if tools is a list that may contain MCP instances
+        if isinstance(self.tools, (list, tuple)):
+            for tool in self.tools:
+                if isinstance(tool, MCP):
+                    logging.debug(f"Looking for MCP tool {function_name} in MCP instance")
+                    found, result = _execute_mcp_tool(tool, function_name, arguments)
+                    if found:
+                        return result
 
         # Try to find the function in the agent's tools list first
         func = None
@@ -1743,7 +2002,112 @@ Your Goal: {self.goal}"""
         #         expand=False
         #     )
 
-    def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None):
+    def _init_db_session(self):
+        """Initialize DB session if db adapter is provided (lazy, first chat only)."""
+        if self._db is None or self._db_initialized:
+            return
+        
+        # Generate session_id if not provided: default to per-hour ID (YYYYMMDDHH-agentname)
+        if self._session_id is None:
+            import hashlib
+            from datetime import datetime, timezone
+            # Per-hour session ID: YYYYMMDDHH (UTC) + agent name hash for uniqueness
+            hour_str = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+            agent_hash = hashlib.md5(self.name.encode()).hexdigest()[:6]
+            self._session_id = f"{hour_str}-{agent_hash}"
+        
+        # Call db adapter's on_agent_start to get previous messages
+        try:
+            history = self._db.on_agent_start(
+                agent_name=self.name,
+                session_id=self._session_id,
+                user_id=self.user_id,
+                metadata={"role": self.role, "goal": self.goal}
+            )
+            
+            # Restore chat history from previous session
+            if history:
+                for msg in history:
+                    self.chat_history.append({
+                        "role": msg.role,
+                        "content": msg.content
+                    })
+                logging.info(f"Resumed session {self._session_id} with {len(history)} messages")
+        except Exception as e:
+            logging.warning(f"Failed to initialize DB session: {e}")
+        
+        self._db_initialized = True
+        self._current_run_id = None  # Track current run
+
+    def _start_run(self, input_content: str):
+        """Start a new run (turn) for persistence tracking."""
+        if self._db is None:
+            return
+        
+        import uuid
+        self._current_run_id = f"run-{uuid.uuid4().hex[:12]}"
+        
+        try:
+            if hasattr(self._db, 'on_run_start'):
+                self._db.on_run_start(
+                    session_id=self._session_id,
+                    run_id=self._current_run_id,
+                    input_content=input_content,
+                    metadata={"agent_name": self.name}
+                )
+        except Exception as e:
+            logging.warning(f"Failed to start run: {e}")
+
+    def _end_run(self, output_content: str, status: str = "completed", metrics: dict = None):
+        """End the current run (turn)."""
+        if self._db is None or self._current_run_id is None:
+            return
+        
+        try:
+            if hasattr(self._db, 'on_run_end'):
+                self._db.on_run_end(
+                    session_id=self._session_id,
+                    run_id=self._current_run_id,
+                    output_content=output_content,
+                    status=status,
+                    metrics=metrics or {},
+                    metadata={"agent_name": self.name}
+                )
+        except Exception as e:
+            logging.warning(f"Failed to end run: {e}")
+        
+        self._current_run_id = None
+
+    def _persist_message(self, role: str, content: str):
+        """Persist a message to the DB if adapter is provided."""
+        if self._db is None:
+            return
+        
+        try:
+            if role == "user":
+                self._db.on_user_message(self._session_id, content)
+            elif role == "assistant":
+                self._db.on_agent_message(self._session_id, content)
+        except Exception as e:
+            logging.warning(f"Failed to persist message: {e}")
+
+    @property
+    def session_id(self) -> Optional[str]:
+        """Get the current session ID."""
+        return self._session_id
+
+    def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None, config=None):
+        # Apply rate limiter if configured (before any LLM call)
+        if self._rate_limiter is not None:
+            self._rate_limiter.acquire()
+        
+        # Initialize DB session on first chat (lazy)
+        self._init_db_session()
+        
+        # Start a new run for this chat turn
+        prompt_str = prompt if isinstance(prompt, str) else str(prompt)
+        self._start_run(prompt_str)
+        
         # Reset the final display flag for each new conversation
         self._final_display_shown = False
         
@@ -1798,7 +2162,8 @@ Your Goal: {self.goal}"""
                 if tool_param is not None:
                     from ..mcp.mcp import MCP
                     if isinstance(tool_param, MCP) and hasattr(tool_param, 'to_openai_tool'):
-                        logging.debug("Converting MCP tool to OpenAI format")
+                        # Single MCP instance
+                        logging.debug("Converting single MCP tool to OpenAI format")
                         openai_tool = tool_param.to_openai_tool()
                         if openai_tool:
                             # Handle both single tool and list of tools
@@ -1807,6 +2172,22 @@ Your Goal: {self.goal}"""
                             else:
                                 tool_param = [openai_tool]
                             logging.debug(f"Converted MCP tool: {tool_param}")
+                    elif isinstance(tool_param, (list, tuple)):
+                        # List that may contain MCP instances - convert each MCP to OpenAI format
+                        converted_tools = []
+                        for t in tool_param:
+                            if isinstance(t, MCP) and hasattr(t, 'to_openai_tool'):
+                                logging.debug("Converting MCP instance in list to OpenAI format")
+                                openai_tools = t.to_openai_tool()
+                                if isinstance(openai_tools, list):
+                                    converted_tools.extend(openai_tools)
+                                elif openai_tools:
+                                    converted_tools.append(openai_tools)
+                            else:
+                                # Keep non-MCP tools as-is
+                                converted_tools.append(t)
+                        tool_param = converted_tools
+                        logging.debug(f"Converted {len(converted_tools)} tools from list")
                 
                 # Store chat history length for potential rollback
                 chat_history_length = len(self.chat_history)
@@ -1823,6 +2204,8 @@ Your Goal: {self.goal}"""
                         self.chat_history[-1].get("content") == normalized_content):
                     # Add user message to chat history BEFORE LLM call so handoffs can access it
                     self.chat_history.append({"role": "user", "content": normalized_content})
+                    # Persist user message to DB
+                    self._persist_message("user", normalized_content)
                 
                 try:
                     # Pass everything to LLM class
@@ -1852,6 +2235,8 @@ Your Goal: {self.goal}"""
                     )
 
                     self.chat_history.append({"role": "assistant", "content": response_text})
+                    # Persist assistant message to DB
+                    self._persist_message("assistant", response_text)
 
                     # Log completion time if in debug mode
                     if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
@@ -1896,6 +2281,8 @@ Your Goal: {self.goal}"""
                     self.chat_history[-1].get("content") == normalized_content):
                 # Add user message to chat history BEFORE LLM call so handoffs can access it
                 self.chat_history.append({"role": "user", "content": normalized_content})
+                # Persist user message to DB (OpenAI path)
+                self._persist_message("user", normalized_content)
 
             reflection_count = 0
             start_time = time.time()
@@ -1935,6 +2322,8 @@ Your Goal: {self.goal}"""
                             # Add to chat history and return raw response
                             # User message already added before LLM call via _build_messages
                             self.chat_history.append({"role": "assistant", "content": response_text})
+                            # Persist assistant message to DB
+                            self._persist_message("assistant", response_text)
                             # Apply guardrail validation even for JSON output
                             try:
                                 validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
@@ -1950,6 +2339,8 @@ Your Goal: {self.goal}"""
                         if not self.self_reflect:
                             # User message already added before LLM call via _build_messages
                             self.chat_history.append({"role": "assistant", "content": response_text})
+                            # Persist assistant message to DB (non-reflect path)
+                            self._persist_message("assistant", response_text)
                             if self.verbose:
                                 logging.debug(f"Agent {self.name} final response: {response_text}")
                             # Return only reasoning content if reasoning_steps is True
@@ -2038,11 +2429,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
+                                    self._end_run(validated_response, "completed", {"duration_ms": (time.time() - start_time) * 1000})
                                     return validated_response
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
                                     # Rollback chat history on guardrail failure
                                     self.chat_history = self.chat_history[:chat_history_length]
+                                    self._end_run(None, "error", {"error": str(e)})
                                     return None
 
                             # Check if we've hit max reflections
@@ -2561,10 +2954,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             
             # Execute the step
             result = self.chat(step_prompt, **kwargs)
-            results.append(result)
+            results.append({"step": i + 1, "description": step.description, "result": result})
             
-            # Update context for next step
-            context += f"\n\nStep {i + 1} result: {result[:500] if result else 'No result'}"
+            # Update context for next step (use full result, not truncated)
+            context += f"\n\nStep {i + 1} result: {result if result else 'No result'}"
             
             console.print(f"   [green]✅ Completed[/green]")
         
@@ -2572,26 +2965,116 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         console.print(f"[dim]Progress: [{'█' * bar_length}] 100%[/dim]")
         console.print(f"Completed {len(plan.steps)}/{len(plan.steps)} steps!\n")
         
-        # Return the final result
-        return results[-1] if results else None
+        # Compile all results into a comprehensive final output
+        if len(results) > 1:
+            # Create a compilation prompt
+            all_results_text = "\n\n".join([
+                f"## Step {r['step']}: {r['description']}\n\n{r['result']}" 
+                for r in results
+            ])
+            
+            compilation_prompt = f"""You are tasked with compiling a comprehensive, detailed report from the following research steps.
+
+IMPORTANT: Write a DETAILED and COMPREHENSIVE report. Do NOT summarize or compress the information. 
+Include ALL relevant details, data, statistics, and findings from each step.
+Organize the information logically with clear sections and subsections.
+
+## Research Results to Compile:
+
+{all_results_text}
+
+## Instructions:
+1. Combine all the information into a single, well-organized document
+2. Preserve ALL details, numbers, statistics, and specific findings
+3. Use clear headings and subheadings
+4. Do not omit any important information
+5. Make it comprehensive and detailed
+
+Write the complete compiled report:"""
+            
+            console.print("\n[bold blue]📝 COMPILING FINAL REPORT[/bold blue]")
+            console.print("[dim]Creating comprehensive output from all steps...[/dim]\n")
+            
+            final_result = self.chat(compilation_prompt, **kwargs)
+            return final_result
+        
+        # Return the single result if only one step
+        return results[0]["result"] if results else None
 
     def start(self, prompt: str, **kwargs):
         """Start the agent with a prompt. This is a convenience method that wraps chat()."""
+        # Load history from past sessions if history_in_context is set
+        self._load_history_context()
+        
         # Check if planning mode is enabled
         if self.planning:
-            return self._start_with_planning(prompt, **kwargs)
-        
-        # Check if streaming is enabled (either from kwargs or agent's stream attribute)
-        stream_enabled = kwargs.get('stream', getattr(self, 'stream', False))
-        
-        if stream_enabled:
+            result = self._start_with_planning(prompt, **kwargs)
+        elif kwargs.get('stream', getattr(self, 'stream', False)):
             # Return a generator for streaming response
-            return self._start_stream(prompt, **kwargs)
+            result = self._start_stream(prompt, **kwargs)
         else:
             # Return regular chat response for backward compatibility
-            # Explicitly pass the resolved stream parameter to avoid chat() method default
-            kwargs['stream'] = stream_enabled
-            return self.chat(prompt, **kwargs)
+            kwargs['stream'] = False
+            result = self.chat(prompt, **kwargs)
+        
+        # Auto-save session if enabled
+        self._auto_save_session()
+        
+        return result
+    
+    def _load_history_context(self):
+        """Load history from past sessions into context if history_in_context is set."""
+        if not self.history_in_context or not self._memory_instance:
+            return
+        
+        try:
+            sessions = self._memory_instance.list_sessions()
+            if not sessions:
+                return
+            
+            # Get the last N sessions
+            sessions_to_load = sessions[:self.history_in_context]
+            
+            for session_info in reversed(sessions_to_load):
+                try:
+                    session_data = self._memory_instance.resume_session(session_info["name"])
+                    history = session_data.get("conversation_history", [])
+                    
+                    # Add history to chat_history with a marker
+                    for msg in history:
+                        if msg not in self.chat_history:
+                            # Mark as from history to avoid duplication
+                            msg_copy = msg.copy()
+                            msg_copy["_from_history"] = True
+                            self.chat_history.append(msg_copy)
+                except Exception:
+                    continue
+                    
+            if sessions_to_load:
+                logging.debug(f"Loaded history from {len(sessions_to_load)} past session(s)")
+        except Exception as e:
+            logging.debug(f"Error loading history context: {e}")
+    
+    def _auto_save_session(self):
+        """Auto-save session if auto_save is enabled."""
+        if not self.auto_save or not self._memory_instance:
+            return
+        
+        try:
+            # Filter out history markers before saving
+            clean_history = [
+                {k: v for k, v in msg.items() if k != "_from_history"}
+                for msg in self.chat_history
+            ]
+            
+            self._memory_instance.save_session(
+                name=self.auto_save,
+                conversation_history=clean_history,
+                metadata={"agent_name": self.name, "user_id": self.user_id}
+            )
+            logging.debug(f"Auto-saved session: {self.auto_save}")
+        except Exception as e:
+            logging.debug(f"Error auto-saving session: {e}")
 
     def _start_stream(self, prompt: str, **kwargs) -> Generator[str, None, None]:
         """Stream generator for real-time response chunks."""

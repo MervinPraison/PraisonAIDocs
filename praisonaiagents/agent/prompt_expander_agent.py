@@ -258,11 +258,24 @@ Expanded prompt:"""
         prompt_lower = prompt.lower().strip()
         return any(prompt_lower.startswith(verb) for verb in task_verbs)
     
+    def _is_technical_task(self, prompt: str) -> bool:
+        """Check if prompt is a technical/coding task."""
+        technical_indicators = [
+            "python", "javascript", "java", "code", "function", "class",
+            "api", "database", "sql", "html", "css", "react", "node",
+            "algorithm", "debug", "fix", "error", "bug", "test",
+            "deploy", "server", "docker", "kubernetes", "aws", "azure",
+            "typescript", "rust", "go", "c++", "c#", "ruby", "php",
+            "script", "bash", "shell", "terminal", "command", "cli"
+        ]
+        prompt_lower = prompt.lower()
+        return any(ind in prompt_lower for ind in technical_indicators)
+    
     def _is_creative_task(self, prompt: str) -> bool:
-        """Check if prompt is a creative task."""
+        """Check if prompt is a creative task (non-technical)."""
         creative_indicators = [
-            "poem", "story", "script", "song", "art", "creative",
-            "fiction", "novel", "essay", "blog", "article", "write"
+            "poem", "story", "song", "art", "creative",
+            "fiction", "novel", "essay", "blog", "article"
         ]
         prompt_lower = prompt.lower()
         return any(ind in prompt_lower for ind in creative_indicators)
@@ -272,6 +285,10 @@ Expanded prompt:"""
         # Very short prompts need detailed expansion
         if self._is_short_prompt(prompt, threshold=5):
             return ExpandStrategy.DETAILED
+        
+        # Technical/coding tasks get structured expansion (check before creative)
+        if self._is_technical_task(prompt):
+            return ExpandStrategy.STRUCTURED
         
         # Creative tasks benefit from creative expansion
         if self._is_creative_task(prompt):
@@ -329,6 +346,37 @@ Expanded prompt:"""
             context=context or "",
             current_date=current_date
         )
+        
+        # Add tool usage instructions if tools are available
+        if self.tools:
+            # Build dynamic tool descriptions from docstrings
+            tool_descriptions = []
+            for tool in self.tools:
+                tool_name = getattr(tool, '__name__', str(tool))
+                tool_doc = getattr(tool, '__doc__', '')
+                # Get first line of docstring as description
+                if tool_doc:
+                    first_line = tool_doc.strip().split('\n')[0].strip()
+                    tool_descriptions.append(f"- {tool_name}: {first_line}")
+                else:
+                    tool_descriptions.append(f"- {tool_name}")
+            
+            tools_list = '\n'.join(tool_descriptions)
+            
+            tool_instruction = f"""
+
+IMPORTANT: You have the following tools available:
+{tools_list}
+
+Before expanding this prompt, FIRST use the available tools to gather relevant current information about the topic. This will help you create a more informed and accurate expanded prompt.
+
+Steps:
+1. Use the appropriate tool(s) to gather relevant information about the topic
+2. Use the gathered information to inform your expansion
+3. Create an expanded prompt that incorporates the latest context
+
+"""
+            expansion_prompt = tool_instruction + expansion_prompt
         
         # Call the agent
         expanded = self._call_agent(expansion_prompt).strip()

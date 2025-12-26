@@ -3,7 +3,7 @@ Praison AI Agents - A package for hierarchical AI agent task execution
 """
 
 # Apply warning patch BEFORE any imports to intercept warnings at the source
-from . import _warning_patch
+from . import _warning_patch  # noqa: F401
 
 # Import centralized logging configuration FIRST
 from . import _logging
@@ -43,8 +43,7 @@ from .tools.base import BaseTool, ToolResult, ToolValidationError, validate_tool
 from .tools.decorator import tool, FunctionTool
 from .tools.registry import get_registry, register_tool, get_tool, ToolRegistry
 from .agents.autoagents import AutoAgents
-from .knowledge.knowledge import Knowledge
-from .knowledge.chunking import Chunking
+# Knowledge is lazy-loaded to avoid importing heavy deps (chromadb, mem0) at startup
 # MCP support (optional)
 try:
     from .mcp.mcp import MCP
@@ -53,8 +52,59 @@ except ImportError:
     _mcp_available = False
     MCP = None
 from .session import Session
-from .memory.memory import Memory
+# Memory is lazy-loaded to avoid importing chromadb at startup
+from .db import db
+from .obs import obs
+# Workflows - import from dedicated workflows module
+from .workflows import (
+    Workflow, WorkflowStep, WorkflowContext, StepResult,
+    Route, Parallel, Loop, Repeat,
+    route, parallel, loop, repeat,
+    Pipeline  # Alias for Workflow
+)
 from .guardrails import GuardrailResult, LLMGuardrail
+
+# Fast Context support (lazy loaded to avoid performance impact)
+def __getattr__(name):
+    """Lazy load heavy modules to avoid impacting package load time."""
+    # Knowledge module (imports chromadb, mem0)
+    if name == "Knowledge":
+        from praisonaiagents.knowledge.knowledge import Knowledge
+        return Knowledge
+    elif name == "Chunking":
+        from praisonaiagents.knowledge.chunking import Chunking
+        return Chunking
+    # FastContext support
+    elif name == "FastContext":
+        from praisonaiagents.context.fast import FastContext
+        return FastContext
+    elif name == "FastContextResult":
+        from praisonaiagents.context.fast import FastContextResult
+        return FastContextResult
+    elif name == "FileMatch":
+        from praisonaiagents.context.fast import FileMatch
+        return FileMatch
+    elif name == "LineRange":
+        from praisonaiagents.context.fast import LineRange
+        return LineRange
+    # Agent Skills support (lazy loaded for zero performance impact)
+    elif name == "SkillManager":
+        from praisonaiagents.skills import SkillManager
+        return SkillManager
+    elif name == "SkillProperties":
+        from praisonaiagents.skills import SkillProperties
+        return SkillProperties
+    elif name == "SkillMetadata":
+        from praisonaiagents.skills import SkillMetadata
+        return SkillMetadata
+    elif name == "SkillLoader":
+        from praisonaiagents.skills import SkillLoader
+        return SkillLoader
+    # Memory module (imports chromadb)
+    elif name == "Memory":
+        from praisonaiagents.memory.memory import Memory
+        return Memory
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Planning mode support
 try:
@@ -220,6 +270,8 @@ __all__ = [
     'AutoAgents',
     'Session',
     'Memory',
+    'db',
+    'obs',
     'display_interaction',
     'display_self_reflection',
     'display_instruction',
@@ -265,6 +317,23 @@ __all__ = [
     'ExpandResult'
 ]
 
+# Add workflow exports
+__all__.extend([
+    'Workflow',
+    'WorkflowStep', 
+    'WorkflowContext',
+    'StepResult',
+    'Route',
+    'Parallel',
+    'Loop',
+    'Repeat',
+    'route',
+    'parallel',
+    'loop',
+    'repeat',
+    'Pipeline'
+])
+
 # Add MCP to __all__ if available
 if _mcp_available:
     __all__.append('MCP')
@@ -272,4 +341,38 @@ if _mcp_available:
 # Add flow display if available
 if FlowDisplay is not None:
     __all__.extend(['FlowDisplay', 'track_workflow'])
+
+# Add FastContext exports (lazy loaded)
+__all__.extend([
+    'FastContext',
+    'FastContextResult',
+    'FileMatch',
+    'LineRange'
+])
+
+# Add Agent Skills exports (lazy loaded)
+__all__.extend([
+    'SkillManager',
+    'SkillProperties',
+    'SkillMetadata',
+    'SkillLoader'
+])
+
+# AG-UI support (optional, lazy loaded)
+try:
+    from praisonaiagents.ui.agui import AGUI
+    __all__.append('AGUI')
+    _agui_available = True
+except ImportError:
+    _agui_available = False
+    AGUI = None
+
+# A2A support (optional, lazy loaded)
+try:
+    from praisonaiagents.ui.a2a import A2A
+    __all__.append('A2A')
+    _a2a_available = True
+except ImportError:
+    _a2a_available = False
+    A2A = None
 

@@ -5,7 +5,7 @@ Expose a PraisonAI Agent as an A2A (Agent2Agent) Server.
 This enables other AI agents to discover and communicate with your agent.
 
 Run:
-    uvicorn a2a_server:app --reload
+    uvicorn a2a-server:app --reload
 
 Endpoints:
     GET /.well-known/agent.json  - Agent Card for discovery
