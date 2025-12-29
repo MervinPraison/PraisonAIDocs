@@ -4,6 +4,7 @@ import json
 import copy
 import logging
 import asyncio
+import threading
 from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Tuple, Generator
 from rich.console import Console
 from rich.live import Live
@@ -580,9 +581,9 @@ class Agent:
         self.embedder_config = embedder_config
         self.knowledge = knowledge
         self.use_system_prompt = use_system_prompt
-        # NOTE: chat_history is not thread-safe. If concurrent access is needed,
-        # consider using threading.Lock or other synchronization mechanisms
+        # Thread-safe chat_history with lock for concurrent access
         self.chat_history = []
+        self._history_lock = threading.Lock()
         self.markdown = markdown
         self.stream = stream
         self.metrics = metrics
@@ -643,11 +644,11 @@ Your Goal: {self.goal}
         self._guardrail_fn = None
         self._setup_guardrail()
         
-        # Cache for system prompts and formatted tools
-        # Note: In single-threaded usage (common case), these are safe
-        # For multi-threaded usage, consider using threading.Lock
+        # Cache for system prompts and formatted tools with thread-safe lock
+        # RLock allows re-entrant access from the same thread
         self._system_prompt_cache = {}
         self._formatted_tools_cache = {}
+        self._cache_lock = threading.RLock()
         # Limit cache size to prevent unbounded growth
         self._max_cache_size = 100
 
@@ -1745,7 +1746,11 @@ Your Goal: {self.goal}"""
 
         # Special handling for MCP tools
         # Check if tools is an MCP instance with the requested function name
-        from ..mcp.mcp import MCP
+        MCP = None
+        try:
+            from ..mcp.mcp import MCP
+        except ImportError:
+            pass  # MCP not available
         
         # Helper function to execute MCP tool
         def _execute_mcp_tool(mcp_instance, func_name, args):
@@ -1780,7 +1785,7 @@ Your Goal: {self.goal}"""
             return False, None
         
         # Check if tools is a single MCP instance
-        if isinstance(self.tools, MCP):
+        if MCP is not None and isinstance(self.tools, MCP):
             logging.debug(f"Looking for MCP tool {function_name}")
             found, result = _execute_mcp_tool(self.tools, function_name, arguments)
             if found:
@@ -1789,7 +1794,7 @@ Your Goal: {self.goal}"""
         # Check if tools is a list that may contain MCP instances
         if isinstance(self.tools, (list, tuple)):
             for tool in self.tools:
-                if isinstance(tool, MCP):
+                if MCP is not None and isinstance(tool, MCP):
                     logging.debug(f"Looking for MCP tool {function_name} in MCP instance")
                     found, result = _execute_mcp_tool(tool, function_name, arguments)
                     if found:
@@ -2211,8 +2216,12 @@ Your Goal: {self.goal}"""
                 
                 # Convert MCP tool objects to OpenAI format if needed
                 if tool_param is not None:
-                    from ..mcp.mcp import MCP
-                    if isinstance(tool_param, MCP) and hasattr(tool_param, 'to_openai_tool'):
+                    MCP = None
+                    try:
+                        from ..mcp.mcp import MCP
+                    except ImportError:
+                        pass
+                    if MCP is not None and isinstance(tool_param, MCP) and hasattr(tool_param, 'to_openai_tool'):
                         # Single MCP instance
                         logging.debug("Converting single MCP tool to OpenAI format")
                         openai_tool = tool_param.to_openai_tool()
@@ -2227,7 +2236,7 @@ Your Goal: {self.goal}"""
                         # List that may contain MCP instances - convert each MCP to OpenAI format
                         converted_tools = []
                         for t in tool_param:
-                            if isinstance(t, MCP) and hasattr(t, 'to_openai_tool'):
+                            if MCP is not None and isinstance(t, MCP) and hasattr(t, 'to_openai_tool'):
                                 logging.debug("Converting MCP instance in list to OpenAI format")
                                 openai_tools = t.to_openai_tool()
                                 if isinstance(openai_tools, list):
@@ -3162,8 +3171,12 @@ Write the complete compiled report:"""
                 
                 # Convert MCP tools if needed
                 if tool_param is not None:
-                    from ..mcp.mcp import MCP
-                    if isinstance(tool_param, MCP) and hasattr(tool_param, 'to_openai_tool'):
+                    MCP = None
+                    try:
+                        from ..mcp.mcp import MCP
+                    except ImportError:
+                        pass
+                    if MCP is not None and isinstance(tool_param, MCP) and hasattr(tool_param, 'to_openai_tool'):
                         openai_tool = tool_param.to_openai_tool()
                         if openai_tool:
                             if isinstance(openai_tool, list):
