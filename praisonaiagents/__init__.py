@@ -189,7 +189,21 @@ def __getattr__(name):
         _lazy_cache[name] = AutoAgents
         return AutoAgents
     
-    # Session (imports requests)
+    # AutoRagAgent (auto RAG retrieval decision)
+    elif name == "AutoRagAgent":
+        from .agents.auto_rag_agent import AutoRagAgent
+        _lazy_cache[name] = AutoRagAgent
+        return AutoRagAgent
+    elif name == "AutoRagConfig":
+        from .agents.auto_rag_agent import AutoRagConfig
+        _lazy_cache[name] = AutoRagConfig
+        return AutoRagConfig
+    elif name == "RagRetrievalPolicy":
+        from .agents.auto_rag_agent import RetrievalPolicy
+        _lazy_cache[name] = RetrievalPolicy
+        return RetrievalPolicy
+    
+    # Session (imports requests lazily via session/api.py)
     elif name == "Session":
         from .session import Session
         _lazy_cache[name] = Session
@@ -233,6 +247,48 @@ def __getattr__(name):
         from praisonaiagents.context.fast import LineRange
         _lazy_cache[name] = LineRange
         return LineRange
+    
+    # Retrieval configuration (Agent-first unified config)
+    elif name == "RetrievalConfig":
+        from praisonaiagents.rag.retrieval_config import RetrievalConfig
+        _lazy_cache[name] = RetrievalConfig
+        return RetrievalConfig
+    elif name == "RetrievalPolicy":
+        from praisonaiagents.rag.retrieval_config import RetrievalPolicy
+        _lazy_cache[name] = RetrievalPolicy
+        return RetrievalPolicy
+    elif name == "CitationsMode":
+        from praisonaiagents.rag.retrieval_config import CitationsMode
+        _lazy_cache[name] = CitationsMode
+        return CitationsMode
+    
+    # RAG models (used by Agent.query() and Agent.retrieve())
+    elif name == "ContextPack":
+        from praisonaiagents.rag.models import ContextPack
+        _lazy_cache[name] = ContextPack
+        return ContextPack
+    elif name == "RAGResult":
+        from praisonaiagents.rag import RAGResult
+        _lazy_cache[name] = RAGResult
+        return RAGResult
+    elif name == "Citation":
+        from praisonaiagents.rag import Citation
+        _lazy_cache[name] = Citation
+        return Citation
+    
+    # RAG internals (advanced use - prefer Agent.query() for normal usage)
+    elif name == "RAG":
+        from praisonaiagents.rag import RAG
+        _lazy_cache[name] = RAG
+        return RAG
+    elif name == "RAGConfig":
+        from praisonaiagents.rag import RAGConfig
+        _lazy_cache[name] = RAGConfig
+        return RAGConfig
+    elif name == "RAGCitation":
+        from praisonaiagents.rag import Citation
+        _lazy_cache[name] = Citation
+        return Citation
     
     # Agent Skills support (lazy loaded for zero performance impact)
     elif name == "SkillManager":
@@ -374,6 +430,9 @@ __all__ = [
     'TaskOutput',
     'ReflectionOutput',
     'AutoAgents',
+    'AutoRagAgent',
+    'AutoRagConfig',
+    'RagRetrievalPolicy',
     'Session',
     'Memory',
     'db',
@@ -463,4 +522,9 @@ __all__ = [
     # UI
     'AGUI',
     'A2A',
+    # RAG
+    'RAG',
+    'RAGConfig',
+    'RAGResult',
+    'RAGCitation',
 ]
