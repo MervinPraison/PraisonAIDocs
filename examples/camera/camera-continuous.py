@@ -18,7 +18,7 @@ import cv2
 import time
 import os
 from datetime import datetime
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 
 class ContinuousCameraMonitor:
@@ -42,7 +42,7 @@ class ContinuousCameraMonitor:
             role="Security Camera Analyst",
             goal="Monitor camera feeds for activities and security events",
             backstory="Expert security analyst with computer vision skills specialized in real-time monitoring",
-            llm="gpt-5-nano"
+            llm="gpt-4o-mini"
         )
     
     def capture_frame(self, cap):
@@ -71,7 +71,7 @@ class ContinuousCameraMonitor:
             images=[image_path]
         )
         
-        agents = PraisonAIAgents(
+        agents = Agents(
             agents=[self.vision_agent],
             tasks=[task],
             process="sequential",

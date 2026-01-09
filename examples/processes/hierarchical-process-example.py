@@ -12,7 +12,7 @@ Features demonstrated:
 - Process-level orchestration
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import duckduckgo
 
 # Create Manager Agent
@@ -83,11 +83,11 @@ coordination_task = Task(
 )
 
 # Create Hierarchical Process
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[manager, researcher, data_analyst, writer],
     tasks=[research_task, analysis_task, writing_task, coordination_task],
     process="hierarchical",  # Hierarchical process type
-    verbose=True
+    output="verbose"
 )
 
 # Execute Hierarchical Process

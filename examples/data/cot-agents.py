@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import cot_save, cot_upload_to_huggingface
 from pydantic import BaseModel
 import os
@@ -29,7 +29,7 @@ qa_generator = Agent(
     role="Question Creator",
     goal="Create challenging math and logic questions",
     backstory="Expert in educational content creation",
-    llm="gpt-5-nano",
+    llm="gpt-4o-mini",
     tools=[write_csv, count_questions]
 )
 
@@ -38,9 +38,8 @@ total_questions_evaluator = Agent(
     role="Total Questions Evaluator",
     goal="Evaluate the total number of questions in qa_pairs.csv file",
     backstory="Expert in evaluating the total number of questions in a file",
-    llm="gpt-5-nano",
-    tools=[count_questions],
-    verbose=False
+    llm="gpt-4o-mini",
+    tools=[count_questions], output="minimal"
 )
 
 cot_generator = Agent(
@@ -49,8 +48,7 @@ cot_generator = Agent(
     goal="Generate and manage chain of thought solutions for Q&A pairs",
     backstory="Expert in breaking down problems and generating detailed solution steps",
     tools=[cot_save],
-    llm="gpt-5-nano",
-    verbose=False
+    llm="gpt-4o-mini", output="minimal"
 )
 
 upload_to_huggingface = Agent(
@@ -59,8 +57,7 @@ upload_to_huggingface = Agent(
     goal="Upload the generated chain of thought solutions to a Huggingface dataset",
     backstory="Expert in saving data to Huggingface",
     tools=[cot_upload_to_huggingface],
-    llm="gpt-5-nano",
-    verbose=False
+    llm="gpt-4o-mini", output="minimal"
 )
 
 # Define tasks with workflow improvements
@@ -131,12 +128,11 @@ upload_to_huggingface_task = Task(
 )
 
 # Initialize workflow
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[qa_generator, total_questions_evaluator, cot_generator, upload_to_huggingface],
     tasks=[generate_task, evaluate_total_questions_task, generate_cot_task, upload_to_huggingface_task],
     process="workflow",
-    max_iter=30,
-    verbose=False
+    max_iter=30, output="minimal"
 )
 
 agents.start()

@@ -6,14 +6,14 @@ to create flexible agent configurations that can be pre-configured via environme
 """
 
 import os
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 # Set via environment or use default
 default_topic = os.getenv("RESEARCH_TOPIC", "AI trends")
 user_topic = input(f"Topic to research [{default_topic}]: ") or default_topic
 
 # Get other configuration from environment
-llm_model = os.getenv("LLM_MODEL", "gpt-5-nano")
+llm_model = os.getenv("LLM_MODEL", "gpt-4o-mini")
 temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 max_retries = int(os.getenv("MAX_RETRIES", "3"))
 
@@ -46,7 +46,7 @@ print(f"  - Max Retries: {max_retries}")
 print("\n" + "="*50 + "\n")
 
 # Run agents
-agents = PraisonAIAgents(agents=[agent], tasks=[task])
+agents = Agents(agents=[agent], tasks=[task])
 result = agents.start()
 
 # Save to environment-specified location if provided

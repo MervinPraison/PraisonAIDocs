@@ -246,75 +246,46 @@ class Agent:
 
     def __init__(
         self,
+        # Core identity
         name: Optional[str] = None,
         role: Optional[str] = None,
         goal: Optional[str] = None,
         backstory: Optional[str] = None,
         instructions: Optional[str] = None,
+        # LLM configuration
         llm: Optional[Union[str, Any]] = None,
-        tools: Optional[List[Any]] = None,
         function_calling_llm: Optional[Any] = None,
-        max_iter: int = 20,
-        max_rpm: Optional[int] = None,
-        max_execution_time: Optional[int] = None,
-        memory: Optional[Any] = None,
-        verbose: bool = True,
-        allow_delegation: bool = False,
-        step_callback: Optional[Any] = None,
-        cache: bool = True,
-        system_template: Optional[str] = None,
-        prompt_template: Optional[str] = None,
-        response_template: Optional[str] = None,
-        allow_code_execution: Optional[bool] = False,
-        max_retry_limit: int = 2,
-        respect_context_window: bool = True,
-        code_execution_mode: Literal["safe", "unsafe"] = "safe",
-        embedder_config: Optional[Dict[str, Any]] = None,
-        knowledge: Optional[Union[List[str], Any]] = None,
-        retrieval_config: Optional[Union[Dict[str, Any], Any]] = None,
-        knowledge_config: Optional[Dict[str, Any]] = None,
-        rag_config: Optional[Dict[str, Any]] = None,
-        use_system_prompt: Optional[bool] = True,
-        markdown: bool = True,
-        stream: bool = False,
-        metrics: bool = False,
-        self_reflect: bool = False,
-        max_reflect: int = 3,
-        min_reflect: int = 1,
-        reflect_llm: Optional[str] = None,
-        reflect_prompt: Optional[str] = None,
-        user_id: Optional[str] = None,
-        reasoning_steps: bool = False,
-        guardrail: Optional[Union[Callable[['TaskOutput'], Tuple[bool, Any]], str]] = None,
-        max_guardrail_retries: int = 3,
-        handoffs: Optional[List[Union['Agent', 'Handoff']]] = None,
+        llm_config: Optional[Dict[str, Any]] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        web_search: Optional[Union[bool, Dict[str, Any]]] = None,
-        web_fetch: Optional[Union[bool, Dict[str, Any]]] = None,
-        prompt_caching: Optional[bool] = None,
-        claude_memory: Optional[Union[bool, Any]] = None,
-        plan_mode: bool = False,
-        planning: bool = False,
-        planning_tools: Optional[List[Any]] = None,
-        planning_reasoning: bool = False,
-        fast_context: bool = False,
-        fast_context_path: Optional[str] = None,
-        fast_context_model: str = "gpt-4o-mini",
-        fast_context_max_turns: int = 4,
-        fast_context_parallelism: int = 8,
-        fast_context_timeout: float = 30.0,
-        history_in_context: Optional[int] = None,
+        # Tools
+        tools: Optional[List[Any]] = None,
+        allow_delegation: bool = False,
+        allow_code_execution: Optional[bool] = False,
+        code_execution_mode: Literal["safe", "unsafe"] = "safe",
+        handoffs: Optional[List[Union['Agent', 'Handoff']]] = None,
+        # Session management
         auto_save: Optional[str] = None,
-        skills: Optional[List[str]] = None,
-        skills_dirs: Optional[List[str]] = None,
-        db: Optional[Any] = None,
-        session_id: Optional[str] = None,
-        hooks: Optional[List[Any]] = None,
-        llm_config: Optional[Dict[str, Any]] = None,
         rate_limiter: Optional[Any] = None,
-        auto_summarize: bool = False,
-        summarize_threshold: float = 0.8
+        # ============================================================
+        # CONSOLIDATED FEATURE PARAMS (agent-centric API)
+        # Each follows: False=disabled, True=defaults, Config=custom
+        # ============================================================
+        memory: Optional[Any] = None,  # Union[bool, MemoryConfig, MemoryManager]
+        knowledge: Optional[Union[bool, List[str], Any]] = None,  # Union[bool, list, KnowledgeConfig, Knowledge]
+        planning: Optional[Union[bool, Any]] = False,  # Union[bool, PlanningConfig]
+        reflection: Optional[Union[bool, Any]] = None,  # Union[bool, ReflectionConfig]
+        guardrails: Optional[Union[bool, Callable, Any]] = None,  # Union[bool, Callable, GuardrailConfig]
+        web: Optional[Union[bool, Any]] = None,  # Union[bool, WebConfig]
+        context: Optional[Union[bool, Any]] = False,  # Union[bool, ManagerConfig, ContextManager]
+        autonomy: Optional[Union[bool, Dict[str, Any], Any]] = None,  # Union[bool, dict, AutonomyConfig]
+        verification_hooks: Optional[List[Any]] = None,  # List of VerificationHook instances
+        output: Optional[Union[str, Any]] = None,  # Union[str preset, OutputConfig]
+        execution: Optional[Union[str, Any]] = None,  # Union[str preset, ExecutionConfig]
+        templates: Optional[Any] = None,  # TemplateConfig
+        caching: Optional[Union[bool, Any]] = None,  # Union[bool, CachingConfig]
+        hooks: Optional[Union[List[Any], Any]] = None,  # Union[list, HooksConfig]
+        skills: Optional[Union[List[str], Any]] = None,  # Union[list, SkillsConfig]
     ):
         """Initialize an Agent instance.
 
@@ -363,8 +334,6 @@ class Agent:
                 snippets during task completion. Use with caution for security. Defaults to False.
             max_retry_limit (int, optional): Maximum number of retry attempts for failed operations
                 before giving up. Helps handle transient errors. Defaults to 2.
-            respect_context_window (bool, optional): Automatically manage context window size
-                to prevent token limit errors with large conversations. Defaults to True.
             code_execution_mode (Literal["safe", "unsafe"], optional): Safety mode for code execution.
                 "safe" restricts dangerous operations, "unsafe" allows full code execution. Defaults to "safe".
             embedder_config (Optional[Dict[str, Any]], optional): Configuration dictionary for
@@ -432,6 +401,352 @@ class Agent:
             Agent._configure_logging()
             Agent._logging_configured = True
 
+        # ============================================================
+        # CONSOLIDATED PARAMS EXTRACTION (agent-centric API)
+        # New consolidated params take precedence over individual params
+        # Initialize removed params with defaults before extraction
+        # ============================================================
+        
+        # Initialize removed params with defaults (these were removed from signature)
+        user_id = None
+        session_id = None
+        db = None
+        auto_memory = None
+        claude_memory = None
+        self_reflect = False
+        max_reflect = 3
+        min_reflect = 1
+        reflect_llm = None
+        reflect_prompt = None
+        guardrail = None
+        max_guardrail_retries = 3
+        web_search = None
+        web_fetch = None
+        plan_mode = False
+        planning_tools = None
+        planning_reasoning = False
+        # Note: retrieval_config, embedder_config, knowledge_config, rag_config
+        # are now passed as params for backward compat, so don't reset them here
+        policy = None
+        background = None
+        checkpoints = None
+        output_style = None
+        thinking_budget = None
+        skills_dirs = None
+        
+        # Extract output settings from consolidated 'output' param
+        # output can be: None, str preset, or OutputConfig
+        # Initialize with defaults (legacy params removed from signature)
+        _verbose = True
+        _markdown = True
+        _stream = False
+        _metrics = False
+        _reasoning_steps = False
+        
+        if output is not None:
+            if isinstance(output, str):
+                # It's a preset name
+                if output == "minimal":
+                    _verbose = False
+                    _markdown = False
+                    _stream = False
+                    _metrics = False
+                elif output == "verbose":
+                    _verbose = True
+                    _markdown = True
+                    _stream = False
+                    _metrics = True
+                    _reasoning_steps = True
+                elif output == "debug":
+                    _verbose = True
+                    _markdown = True
+                    _stream = False
+                    _metrics = True
+                    _reasoning_steps = True
+                elif output == "silent":
+                    _verbose = False
+                    _markdown = False
+                    _stream = False
+                    _metrics = False
+                # "normal" uses defaults
+            elif hasattr(output, 'verbose'):
+                # It's an OutputConfig
+                _verbose = output.verbose
+                _markdown = output.markdown
+                _stream = output.stream
+                _metrics = output.metrics
+                _reasoning_steps = output.reasoning_steps
+                output_style = output.style
+        
+        # Apply final output values
+        verbose = _verbose
+        markdown = _markdown
+        stream = _stream
+        metrics = _metrics
+        reasoning_steps = _reasoning_steps
+        
+        # Extract execution settings from consolidated 'execution' param
+        # execution can be: None, str preset, or ExecutionConfig
+        # Initialize with defaults (legacy params removed from signature)
+        _max_iter = 20
+        _max_rpm = None
+        _max_execution_time = None
+        _max_retry_limit = 2
+        
+        if execution is not None:
+            if isinstance(execution, str):
+                # It's a preset name
+                if execution == "fast":
+                    _max_iter = 10
+                    _max_retry_limit = 1
+                elif execution == "thorough":
+                    _max_iter = 50
+                    _max_retry_limit = 5
+                elif execution == "unlimited":
+                    _max_iter = 1000
+                    _max_retry_limit = 10
+                # "balanced" uses defaults
+            elif hasattr(execution, 'max_iter'):
+                # It's an ExecutionConfig
+                _max_iter = execution.max_iter
+                _max_rpm = execution.max_rpm
+                _max_execution_time = execution.max_execution_time
+                _max_retry_limit = execution.max_retry_limit
+        
+        # Apply final execution values
+        max_iter = _max_iter
+        max_rpm = _max_rpm
+        max_execution_time = _max_execution_time
+        max_retry_limit = _max_retry_limit
+        
+        # Extract template settings from consolidated 'templates' param
+        # Initialize with defaults (legacy params removed from signature)
+        _system_template = None
+        _prompt_template = None
+        _response_template = None
+        _use_system_prompt = True
+        
+        if templates is not None:
+            if hasattr(templates, 'system'):
+                # It's a TemplateConfig
+                _system_template = templates.system
+                _prompt_template = templates.prompt
+                _response_template = templates.response
+                _use_system_prompt = templates.use_system_prompt
+        
+        # Apply final template values
+        system_template = _system_template
+        prompt_template = _prompt_template
+        response_template = _response_template
+        use_system_prompt = _use_system_prompt
+        
+        # Extract caching settings from consolidated 'caching' param
+        # Initialize with defaults (legacy params removed from signature)
+        _cache = True
+        _prompt_caching = None
+        
+        if caching is not None:
+            if caching is True:
+                _cache = True
+            elif caching is False:
+                _cache = False
+            elif hasattr(caching, 'enabled'):
+                # It's a CachingConfig
+                _cache = caching.enabled
+                _prompt_caching = caching.prompt_caching
+        
+        # Apply final caching values
+        cache = _cache
+        prompt_caching = _prompt_caching
+        
+        # Extract hooks settings from consolidated 'hooks' param
+        # Initialize with defaults (legacy params removed from signature)
+        _step_callback = None
+        _hooks_list = []
+        
+        if hooks is not None:
+            if isinstance(hooks, list):
+                _hooks_list = hooks
+            elif hasattr(hooks, 'on_step'):
+                # It's a HooksConfig
+                _step_callback = hooks.on_step
+                _hooks_list = hooks.middleware
+        
+        # Apply final hooks values
+        step_callback = _step_callback
+        
+        # Extract skills settings from consolidated 'skills' param
+        # Initialize with defaults (legacy params removed from signature)
+        _skills = None
+        _skills_dirs = None
+        
+        if skills is not None:
+            if isinstance(skills, list):
+                _skills = skills
+            elif hasattr(skills, 'paths'):
+                # It's a SkillsConfig
+                _skills = skills.paths
+                _skills_dirs = skills.dirs
+        
+        # Apply final skills values
+        skills_dirs = _skills_dirs
+        
+        # Extract memory settings from consolidated 'memory' param
+        # memory can be: False, True, MemoryConfig, or MemoryManager instance
+        # Initialize with defaults (legacy params removed from signature)
+        _memory_user_id = None
+        _memory_session_id = None
+        _memory_db = None
+        _memory_auto_memory = None
+        _memory_claude_memory = None
+        
+        if memory is not None and memory is not False:
+            if hasattr(memory, 'user_id') and hasattr(memory, 'backend'):
+                # It's a MemoryConfig
+                if memory.user_id:
+                    _memory_user_id = memory.user_id
+                if memory.session_id:
+                    _memory_session_id = memory.session_id
+                if memory.db:
+                    _memory_db = memory.db
+                _memory_auto_memory = memory.auto_memory
+                _memory_claude_memory = memory.claude_memory
+                # Convert MemoryConfig to appropriate memory init value
+                if memory.backend == "file" or (hasattr(memory.backend, 'value') and memory.backend.value == "file"):
+                    memory = True  # Use FileMemory
+                elif memory.config:
+                    memory = memory.config  # Use config dict
+                else:
+                    backend_val = memory.backend.value if hasattr(memory.backend, 'value') else memory.backend
+                    memory = backend_val  # Use backend string
+        
+        # Apply extracted memory values
+        user_id = _memory_user_id
+        session_id = _memory_session_id
+        db = _memory_db
+        auto_memory = _memory_auto_memory
+        claude_memory = _memory_claude_memory
+        
+        # Extract knowledge settings from consolidated 'knowledge' param
+        # knowledge can be: False, True, List[str], KnowledgeConfig, or KnowledgeBase instance
+        # Initialize with defaults (legacy params removed from signature)
+        _knowledge_sources = None
+        _knowledge_retrieval_config = None
+        _knowledge_embedder_config = None
+        
+        if knowledge is not None and knowledge is not False:
+            if isinstance(knowledge, list):
+                # It's a list of sources - use directly
+                _knowledge_sources = knowledge
+            elif hasattr(knowledge, 'search') and hasattr(knowledge, 'add'):
+                # It's a Knowledge/KnowledgeBase instance - pass through unchanged
+                # Don't modify knowledge, let the existing logic handle it
+                pass
+            elif hasattr(knowledge, 'sources') and hasattr(knowledge, 'embedder'):
+                # It's a KnowledgeConfig (has sources list and embedder string)
+                _knowledge_sources = knowledge.sources
+                _knowledge_embedder_config = knowledge.embedder_config
+                # Build retrieval config from KnowledgeConfig
+                if knowledge.config:
+                    _knowledge_retrieval_config = knowledge.config
+                else:
+                    _knowledge_retrieval_config = {
+                        'top_k': knowledge.retrieval_k,
+                        'threshold': knowledge.retrieval_threshold,
+                        'rerank': knowledge.rerank,
+                        'rerank_model': knowledge.rerank_model,
+                    }
+                # Update knowledge to be the sources list for internal processing
+                knowledge = _knowledge_sources if _knowledge_sources else None
+            elif knowledge is True:
+                # Enable knowledge but no sources provided yet
+                knowledge = None
+        
+        # Apply extracted knowledge values
+        retrieval_config = _knowledge_retrieval_config
+        embedder_config = _knowledge_embedder_config
+        
+        # Extract planning settings from consolidated 'planning' param
+        # planning can be: False, True, or PlanningConfig
+        _planning_enabled = planning
+        _plan_mode = plan_mode
+        _planning_tools = planning_tools
+        _planning_reasoning = planning_reasoning
+        
+        if planning is not None:
+            if planning is True:
+                _planning_enabled = True
+            elif planning is False:
+                _planning_enabled = False
+            elif hasattr(planning, 'reasoning'):
+                # It's a PlanningConfig
+                _planning_enabled = True
+                _planning_tools = planning.tools
+                _planning_reasoning = planning.reasoning
+                _plan_mode = planning.read_only
+                # planning param becomes True for internal use
+                planning = True
+        
+        # Apply extracted planning values
+        plan_mode = _plan_mode
+        planning_tools = _planning_tools
+        planning_reasoning = _planning_reasoning
+        
+        # Extract reflection settings from consolidated 'reflection' param
+        if reflection is not None:
+            if reflection is True:
+                # Enable with defaults
+                self_reflect = True
+            elif reflection is False:
+                self_reflect = False
+            elif hasattr(reflection, 'min_iterations'):
+                # It's a ReflectionConfig
+                self_reflect = True
+                min_reflect = reflection.min_iterations
+                max_reflect = reflection.max_iterations
+                reflect_llm = reflection.llm
+                reflect_prompt = reflection.prompt
+        
+        # Extract guardrail settings from consolidated 'guardrails' param
+        if guardrails is not None:
+            if guardrails is True:
+                # Enable with defaults (no-op, user must provide validator)
+                pass
+            elif guardrails is False:
+                guardrail = None
+            elif callable(guardrails):
+                # Direct validator function
+                guardrail = guardrails
+            elif hasattr(guardrails, 'validator'):
+                # It's a GuardrailConfig
+                if guardrails.validator:
+                    guardrail = guardrails.validator
+                elif guardrails.llm_validator:
+                    guardrail = guardrails.llm_validator
+                max_guardrail_retries = guardrails.max_retries
+        
+        # Extract web settings from consolidated 'web' param
+        if web is not None:
+            if web is True:
+                # Enable both search and fetch with defaults
+                web_search = True
+                web_fetch = True
+            elif web is False:
+                web_search = False
+                web_fetch = False
+            elif hasattr(web, 'search'):
+                # It's a WebConfig
+                web_search = web.search
+                web_fetch = web.fetch
+                # Could also extract search_config, fetch_config if needed
+        
+        # ============================================================
+        # END CONSOLIDATED PARAMS EXTRACTION
+        # ============================================================
+        
+        # Initialize autonomy features (agent-centric escalation/doom-loop)
+        self._init_autonomy(autonomy, verification_hooks=verification_hooks)
+
         # If instructions are provided, use them to set role, goal, and backstory
         if instructions:
             self.name = name or "Agent"
@@ -456,7 +771,7 @@ class Agent:
         self._final_display_shown = False
         
         # Store hooks for middleware system (zero overhead when empty)
-        self._hooks = hooks or []
+        self._hooks = _hooks_list if _hooks_list else []
         self._middleware_manager = None  # Lazy init
         
         # Store llm_config for configurable model switching
@@ -465,12 +780,6 @@ class Agent:
         
         # Store rate limiter (optional, zero overhead when None)
         self._rate_limiter = rate_limiter
-        
-        # Auto-summarization configuration
-        if auto_summarize and not (0.0 < summarize_threshold <= 1.0):
-            raise ValueError("summarize_threshold must be between 0.0 and 1.0")
-        self.auto_summarize = auto_summarize
-        self.summarize_threshold = summarize_threshold
         
         # Store OpenAI client parameters for lazy initialization
         self._openai_api_key = api_key
@@ -587,7 +896,6 @@ class Agent:
         self.response_template = response_template
         self.allow_code_execution = allow_code_execution
         self.max_retry_limit = max_retry_limit
-        self.respect_context_window = respect_context_window
         self.code_execution_mode = code_execution_mode
         self.embedder_config = embedder_config
         self.knowledge = knowledge
@@ -628,7 +936,6 @@ Your Goal: {self.goal}
         self.claude_memory = claude_memory
         
         # Session management
-        self.history_in_context = history_in_context  # Number of past sessions to include
         self.auto_save = auto_save  # Session name for auto-saving
         
         # Initialize rules manager for persistent context (like Cursor/Windsurf)
@@ -668,21 +975,14 @@ Your Goal: {self.goal}
         self._process_handoffs()
 
         # Initialize unified retrieval configuration
-        # retrieval_config is the SINGLE configuration surface (replaces knowledge_config + rag_config)
+        # retrieval_config is the SINGLE configuration surface (extracted from knowledge= param)
         self._retrieval_config = None
         if retrieval_config is not None:
-            from ..rag.retrieval_config import RetrievalConfig, create_retrieval_config
+            from ..rag.retrieval_config import RetrievalConfig
             if isinstance(retrieval_config, RetrievalConfig):
                 self._retrieval_config = retrieval_config
             elif isinstance(retrieval_config, dict):
                 self._retrieval_config = RetrievalConfig.from_dict(retrieval_config)
-        elif knowledge_config is not None or rag_config is not None:
-            # Legacy support: merge old configs into unified config
-            from ..rag.retrieval_config import create_retrieval_config
-            self._retrieval_config = create_retrieval_config(
-                knowledge_config=knowledge_config,
-                rag_config=rag_config,
-            )
         
         # Check if knowledge parameter has any values
         if not knowledge:
@@ -709,17 +1009,8 @@ Your Goal: {self.goal}
                 from ..rag.retrieval_config import RetrievalConfig
                 self._retrieval_config = RetrievalConfig()
 
-        # Fast Context configuration (lazy loaded)
-        self.fast_context_enabled = fast_context
-        self._fast_context_path = fast_context_path  # Store raw, resolve lazily
-        self.fast_context_model = fast_context_model
-        self.fast_context_max_turns = fast_context_max_turns
-        self.fast_context_parallelism = fast_context_parallelism
-        self.fast_context_timeout = fast_context_timeout
-        self._fast_context_instance = None  # Lazy loaded
-
         # Agent Skills configuration (lazy loaded for zero performance impact)
-        self._skills = skills
+        self._skills = _skills
         self._skills_dirs = skills_dirs
         self._skill_manager = None  # Lazy loaded
         self._skills_initialized = False
@@ -734,6 +1025,135 @@ Your Goal: {self.goal}
         self._session_store = None
         self._session_store_initialized = False
 
+        # Agent-centric feature instances (lazy loaded for zero performance impact)
+        self._auto_memory = auto_memory
+        self._policy = policy
+        self._background = background
+        self._checkpoints = checkpoints
+        self._output_style = output_style
+        self._thinking_budget = thinking_budget
+        
+        # Context management (lazy loaded for zero overhead when disabled)
+        self._context_param = context  # Store raw param for lazy init
+        self._context_manager = None  # Lazy initialized on first use
+        self._context_manager_initialized = False
+
+    @property
+    def auto_memory(self):
+        """AutoMemory instance for automatic memory extraction."""
+        return self._auto_memory
+    
+    @auto_memory.setter
+    def auto_memory(self, value):
+        self._auto_memory = value
+
+    @property
+    def policy(self):
+        """PolicyEngine instance for execution control."""
+        return self._policy
+    
+    @policy.setter
+    def policy(self, value):
+        self._policy = value
+
+    @property
+    def background(self):
+        """BackgroundRunner instance for async task execution."""
+        return self._background
+    
+    @background.setter
+    def background(self, value):
+        self._background = value
+
+    @property
+    def checkpoints(self):
+        """CheckpointService instance for file-level undo/restore."""
+        return self._checkpoints
+    
+    @checkpoints.setter
+    def checkpoints(self, value):
+        self._checkpoints = value
+
+    @property
+    def output_style(self):
+        """OutputStyle instance for response formatting."""
+        return self._output_style
+    
+    @output_style.setter
+    def output_style(self, value):
+        self._output_style = value
+
+    @property
+    def thinking_budget(self):
+        """ThinkingBudget instance for extended thinking control."""
+        return self._thinking_budget
+    
+    @thinking_budget.setter
+    def thinking_budget(self, value):
+        self._thinking_budget = value
+
+    @property
+    def context_manager(self):
+        """
+        ContextManager instance for unified context management.
+        
+        Lazy initialized on first access when context=True or context=ManagerConfig.
+        Returns None when context=False (zero overhead).
+        
+        Example:
+            agent = Agent(instructions="...", context=True)
+            # Access manager for advanced operations
+            if agent.context_manager:
+                stats = agent.context_manager.get_stats()
+        """
+        if self._context_manager_initialized:
+            return self._context_manager
+        
+        # Initialize based on context param type
+        if self._context_param is False or self._context_param is None:
+            # Zero overhead - no context management
+            self._context_manager = None
+            self._context_manager_initialized = True
+            return None
+        
+        # Lazy import to avoid overhead when not used
+        try:
+            from ..context import ContextManager, ManagerConfig
+        except ImportError:
+            # Context module not available
+            self._context_manager = None
+            self._context_manager_initialized = True
+            return None
+        
+        if self._context_param is True:
+            # Enable with safe defaults
+            self._context_manager = ContextManager(
+                model=self.llm if isinstance(self.llm, str) else "gpt-4o-mini",
+                agent_name=self.name or "Agent",
+            )
+        elif isinstance(self._context_param, ManagerConfig):
+            # Use provided config
+            self._context_manager = ContextManager(
+                model=self.llm if isinstance(self.llm, str) else "gpt-4o-mini",
+                config=self._context_param,
+                agent_name=self.name or "Agent",
+            )
+        elif hasattr(self._context_param, 'process'):
+            # Already a ContextManager instance
+            self._context_manager = self._context_param
+        else:
+            # Unknown type, disable
+            self._context_manager = None
+        
+        self._context_manager_initialized = True
+        return self._context_manager
+    
+    @context_manager.setter
+    def context_manager(self, value):
+        """Set context manager directly."""
+        self._context_manager = value
+        self._context_manager_initialized = True
+
     @property
     def console(self):
         """Lazily initialize Rich Console only when needed."""
@@ -741,17 +1161,6 @@ Your Goal: {self.goal}
             from rich.console import Console
             self._console = Console()
         return self._console
-    
-    @property
-    def fast_context_path(self):
-        """Lazily resolve fast_context_path - avoids os.getcwd() on every init."""
-        if self._fast_context_path is None:
-            self._fast_context_path = os.getcwd()
-        return self._fast_context_path
-    
-    @fast_context_path.setter
-    def fast_context_path(self, value):
-        self._fast_context_path = value
     
     @property
     def skill_manager(self):
@@ -845,6 +1254,398 @@ Your Goal: {self.goal}
             self._agent_id = str(uuid.uuid4())
         return self._agent_id
     
+    def _init_autonomy(self, autonomy: Any, verification_hooks: Optional[List[Any]] = None) -> None:
+        """Initialize autonomy features (agent-centric escalation/doom-loop).
+        
+        Args:
+            autonomy: True, False, dict config, or AutonomyConfig
+            verification_hooks: Optional list of verification hooks
+        """
+        # Initialize verification hooks (always available, even without autonomy)
+        self._verification_hooks = verification_hooks or []
+        
+        if autonomy is None or autonomy is False:
+            self.autonomy_enabled = False
+            self.autonomy_config = {}
+            self._autonomy_trigger = None
+            self._doom_loop_tracker = None
+            return
+        
+        self.autonomy_enabled = True
+        
+        # Lazy import to avoid overhead when not used
+        from .autonomy import AutonomyConfig, AutonomyTrigger, DoomLoopTracker
+        
+        if autonomy is True:
+            self.autonomy_config = {}
+            config = AutonomyConfig()
+        elif isinstance(autonomy, dict):
+            self.autonomy_config = autonomy.copy()
+            config = AutonomyConfig.from_dict(autonomy)
+            # Extract verification_hooks from dict if provided
+            if "verification_hooks" in autonomy and not verification_hooks:
+                self._verification_hooks = autonomy.get("verification_hooks", [])
+        elif isinstance(autonomy, AutonomyConfig):
+            self.autonomy_config = {
+                "max_iterations": autonomy.max_iterations,
+                "doom_loop_threshold": autonomy.doom_loop_threshold,
+                "auto_escalate": autonomy.auto_escalate,
+            }
+            config = autonomy
+        else:
+            self.autonomy_enabled = False
+            self.autonomy_config = {}
+            self._autonomy_trigger = None
+            self._doom_loop_tracker = None
+            return
+        
+        self._autonomy_trigger = AutonomyTrigger()
+        self._doom_loop_tracker = DoomLoopTracker(threshold=config.doom_loop_threshold)
+    
+    def analyze_prompt(self, prompt: str) -> set:
+        """Analyze prompt for autonomy signals.
+        
+        Args:
+            prompt: The user prompt
+            
+        Returns:
+            Set of detected signal names
+        """
+        if not self.autonomy_enabled or self._autonomy_trigger is None:
+            return set()
+        return self._autonomy_trigger.analyze(prompt)
+    
+    def get_recommended_stage(self, prompt: str) -> str:
+        """Get recommended execution stage for prompt.
+        
+        Args:
+            prompt: The user prompt
+            
+        Returns:
+            Stage name as string (direct, heuristic, planned, autonomous)
+        """
+        if not self.autonomy_enabled or self._autonomy_trigger is None:
+            return "direct"
+        
+        signals = self._autonomy_trigger.analyze(prompt)
+        stage = self._autonomy_trigger.recommend_stage(signals)
+        return stage.value
+    
+    def _record_action(self, action_type: str, args: dict, result: Any, success: bool) -> None:
+        """Record an action for doom loop tracking.
+        
+        Args:
+            action_type: Type of action
+            args: Action arguments
+            result: Action result
+            success: Whether action succeeded
+        """
+        if self._doom_loop_tracker is not None:
+            self._doom_loop_tracker.record(action_type, args, result, success)
+    
+    def _is_doom_loop(self) -> bool:
+        """Check if we're in a doom loop.
+        
+        Returns:
+            True if doom loop detected
+        """
+        if self._doom_loop_tracker is None:
+            return False
+        return self._doom_loop_tracker.is_doom_loop()
+    
+    def _reset_doom_loop(self) -> None:
+        """Reset doom loop tracking."""
+        if self._doom_loop_tracker is not None:
+            self._doom_loop_tracker.reset()
+    
+    def run_autonomous(
+        self,
+        prompt: str,
+        max_iterations: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
+    ):
+        """Run an autonomous task execution loop.
+        
+        This method executes a task autonomously, using the agent's tools
+        and capabilities to complete the task. It handles:
+        - Progressive escalation based on task complexity
+        - Doom loop detection and recovery
+        - Iteration limits and timeouts
+        - Completion detection
+        
+        Args:
+            prompt: The task to execute
+            max_iterations: Override max iterations (default from config)
+            timeout_seconds: Timeout in seconds (default: no timeout)
+            
+        Returns:
+            AutonomyResult with success status, output, and metadata
+            
+        Raises:
+            ValueError: If autonomy is not enabled
+            
+        Example:
+            agent = Agent(instructions="...", autonomy=True)
+            result = agent.run_autonomous("Refactor the auth module")
+            if result.success:
+                print(result.output)
+        """
+        from .autonomy import AutonomyResult
+        import time as time_module
+        
+        if not self.autonomy_enabled:
+            raise ValueError(
+                "Autonomy must be enabled to use run_autonomous(). "
+                "Create agent with autonomy=True or autonomy={...}"
+            )
+        
+        start_time = time_module.time()
+        iterations = 0
+        actions_taken = []
+        
+        # Get config values
+        config_max_iter = self.autonomy_config.get("max_iterations", 20)
+        effective_max_iter = max_iterations if max_iterations is not None else config_max_iter
+        
+        # Analyze prompt and get recommended stage
+        stage = self.get_recommended_stage(prompt)
+        
+        # Reset doom loop tracker for new task
+        self._reset_doom_loop()
+        
+        try:
+            # Execute the autonomous loop
+            while iterations < effective_max_iter:
+                iterations += 1
+                
+                # Check timeout
+                if timeout_seconds and (time_module.time() - start_time) > timeout_seconds:
+                    return AutonomyResult(
+                        success=False,
+                        output="Task timed out",
+                        completion_reason="timeout",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                    )
+                
+                # Check doom loop
+                if self._is_doom_loop():
+                    return AutonomyResult(
+                        success=False,
+                        output="Task stopped due to repeated actions (doom loop)",
+                        completion_reason="doom_loop",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                    )
+                
+                # Execute one turn using the agent's chat method
+                try:
+                    response = self.chat(prompt if iterations == 1 else "Continue with the task")
+                except Exception as e:
+                    return AutonomyResult(
+                        success=False,
+                        output=str(e),
+                        completion_reason="error",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        error=str(e),
+                    )
+                
+                # Record the action
+                actions_taken.append({
+                    "iteration": iterations,
+                    "response": str(response)[:500],
+                })
+                
+                # Check for completion signals in response
+                response_lower = str(response).lower()
+                completion_signals = [
+                    "task completed", "task complete", "done",
+                    "finished", "completed successfully",
+                ]
+                
+                if any(signal in response_lower for signal in completion_signals):
+                    return AutonomyResult(
+                        success=True,
+                        output=str(response),
+                        completion_reason="goal",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                    )
+                
+                # For DIRECT stage, complete after first response
+                if stage == "direct":
+                    return AutonomyResult(
+                        success=True,
+                        output=str(response),
+                        completion_reason="goal",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                    )
+            
+            # Max iterations reached
+            return AutonomyResult(
+                success=False,
+                output="Max iterations reached",
+                completion_reason="max_iterations",
+                iterations=iterations,
+                stage=stage,
+                actions=actions_taken,
+                duration_seconds=time_module.time() - start_time,
+            )
+            
+        except Exception as e:
+            return AutonomyResult(
+                success=False,
+                output=str(e),
+                completion_reason="error",
+                iterations=iterations,
+                stage=stage,
+                actions=actions_taken,
+                duration_seconds=time_module.time() - start_time,
+                error=str(e),
+            )
+    
+    def handoff_to(
+        self,
+        target_agent: 'Agent',
+        prompt: str,
+        context: Optional[Dict[str, Any]] = None,
+        config: Optional['HandoffConfig'] = None,
+    ) -> 'HandoffResult':
+        """
+        Programmatically hand off a task to another agent.
+        
+        This is the unified programmatic handoff API that replaces delegate().
+        It uses the same Handoff mechanism as LLM-driven handoffs but can be
+        called directly from code.
+        
+        Args:
+            target_agent: The agent to hand off to
+            prompt: The task/prompt to pass to target agent
+            context: Optional additional context dictionary
+            config: Optional HandoffConfig for advanced settings
+            
+        Returns:
+            HandoffResult with response or error
+            
+        Example:
+            ```python
+            result = agent_a.handoff_to(agent_b, "Complete this analysis")
+            if result.success:
+                print(result.response)
+            ```
+        """
+        from .handoff import Handoff, HandoffConfig, HandoffResult
+        
+        handoff_obj = Handoff(
+            agent=target_agent,
+            config=config or HandoffConfig(),
+        )
+        return handoff_obj.execute_programmatic(self, prompt, context)
+    
+    async def handoff_to_async(
+        self,
+        target_agent: 'Agent',
+        prompt: str,
+        context: Optional[Dict[str, Any]] = None,
+        config: Optional['HandoffConfig'] = None,
+    ) -> 'HandoffResult':
+        """
+        Asynchronously hand off a task to another agent.
+        
+        This is the async version of handoff_to() with concurrency control
+        and timeout support.
+        
+        Args:
+            target_agent: The agent to hand off to
+            prompt: The task/prompt to pass to target agent
+            context: Optional additional context dictionary
+            config: Optional HandoffConfig for advanced settings
+            
+        Returns:
+            HandoffResult with response or error
+            
+        Example:
+            ```python
+            result = await agent_a.handoff_to_async(agent_b, "Complete this analysis")
+            if result.success:
+                print(result.response)
+            ```
+        """
+        from .handoff import Handoff, HandoffConfig, HandoffResult
+        
+        handoff_obj = Handoff(
+            agent=target_agent,
+            config=config or HandoffConfig(),
+        )
+        return await handoff_obj.execute_async(self, prompt, context)
+    
+    def _create_subagent(
+        self,
+        profile: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> 'Agent':
+        """Create a subagent with the specified profile.
+        
+        Args:
+            profile: Agent profile name
+            context: Additional context
+            
+        Returns:
+            Configured Agent instance
+        """
+        from ..agents.profiles import get_profile, BUILTIN_PROFILES
+        
+        # Get profile config
+        profile_config = get_profile(profile) if profile in BUILTIN_PROFILES else None
+        
+        if profile_config:
+            return Agent(
+                name=f"subagent_{profile}",
+                instructions=profile_config.system_prompt,
+            )
+        else:
+            # Default subagent
+            return Agent(
+                name=f"subagent_{profile}",
+                instructions=f"You are a {profile} assistant.",
+            )
+    
+    def _run_verification_hooks(self) -> List[Dict[str, Any]]:
+        """Run all registered verification hooks.
+        
+        Returns:
+            List of verification results
+        """
+        results = []
+        if hasattr(self, '_verification_hooks') and self._verification_hooks:
+            for hook in self._verification_hooks:
+                try:
+                    result = hook.run()
+                    results.append({
+                        "hook": hook.name,
+                        "success": result.get("success", False) if isinstance(result, dict) else getattr(result, 'success', False),
+                        "output": result.get("output", "") if isinstance(result, dict) else getattr(result, 'output', ""),
+                    })
+                except Exception as e:
+                    results.append({
+                        "hook": getattr(hook, 'name', 'unknown'),
+                        "success": False,
+                        "error": str(e),
+                    })
+        return results
+
     def get_available_tools(self) -> List[Any]:
         """
         Get tools available to this agent, filtered by plan_mode if enabled.
@@ -938,57 +1739,6 @@ Your Goal: {self.goal}
             model_name = "gpt-4o-mini"
         
         return supports_prompt_caching(model_name)
-    
-    @property
-    def fast_context(self):
-        """Lazily initialize FastContext instance when needed.
-        
-        Returns:
-            FastContext instance or None if not enabled
-        """
-        if not self.fast_context_enabled:
-            return None
-        
-        if self._fast_context_instance is None:
-            try:
-                from ..context.fast import FastContext
-                self._fast_context_instance = FastContext(
-                    workspace_path=self.fast_context_path,
-                    model=self.fast_context_model,
-                    max_turns=self.fast_context_max_turns,
-                    max_parallel=self.fast_context_parallelism,
-                    timeout=self.fast_context_timeout,
-                    verbose=self.verbose
-                )
-            except ImportError:
-                logging.warning("FastContext not available")
-                return None
-        
-        return self._fast_context_instance
-    
-    def delegate_to_fast_context(self, query: str) -> Optional[str]:
-        """Delegate a code search query to FastContext subagent.
-        
-        This method uses the FastContext subagent to rapidly search
-        the codebase and return relevant context.
-        
-        Args:
-            query: Natural language search query
-            
-        Returns:
-            Formatted context string or None if FastContext not available
-        """
-        if not self.fast_context_enabled or self.fast_context is None:
-            return None
-        
-        try:
-            result = self.fast_context.search(query)
-            if result.total_files > 0:
-                return self.fast_context.get_context_for_agent(query)
-            return None
-        except Exception as e:
-            logging.warning(f"FastContext search failed: {e}")
-            return None
     
     @property
     def rules_manager(self):
@@ -1358,7 +2108,14 @@ Your Goal: {self.goal}
                 return "", None
             
             if isinstance(search_results, dict) and 'results' in search_results:
-                knowledge_content = "\n".join([result['memory'] for result in search_results['results']])
+                # CRITICAL: Handle None results and get 'memory' field safely
+                parts = []
+                for result in search_results['results']:
+                    if result is not None:
+                        memory = result.get('memory', '') or ''
+                        if memory:
+                            parts.append(memory)
+                knowledge_content = "\n".join(parts)
             else:
                 knowledge_content = "\n".join(search_results) if isinstance(search_results, list) else str(search_results)
             
@@ -2398,6 +3155,77 @@ Your Goal: {self.goal}"""
         #         expand=False
         #     )
 
+    def _apply_context_management(
+        self,
+        messages: list,
+        system_prompt: str = "",
+        tools: list = None,
+    ) -> tuple:
+        """
+        Apply context management before LLM call.
+        
+        Handles auto-compaction when context exceeds threshold.
+        Zero overhead when context=False.
+        
+        Args:
+            messages: Current chat history
+            system_prompt: System prompt content
+            tools: Tool schemas
+            
+        Returns:
+            Tuple of (processed_messages, context_result_dict)
+            context_result_dict contains optimization metadata if applied
+        """
+        # Fast path: no context management
+        if not self.context_manager:
+            return messages, None
+        
+        try:
+            # Process through context manager
+            result = self.context_manager.process(
+                messages=messages,
+                system_prompt=system_prompt,
+                tools=tools or [],
+                trigger="turn",
+            )
+            
+            # Log if optimization occurred
+            if result.get("optimized"):
+                logging.debug(
+                    f"[{self.name}] Context optimized: "
+                    f"{result.get('tokens_before', 0)} -> {result.get('tokens_after', 0)} tokens "
+                    f"(saved {result.get('tokens_saved', 0)})"
+                )
+            
+            return result.get("messages", messages), result
+            
+        except Exception as e:
+            # Context management should never break the chat flow
+            logging.warning(f"Context management error (continuing without): {e}")
+            return messages, None
+
+    def _truncate_tool_output(self, tool_name: str, output: str) -> str:
+        """
+        Truncate tool output according to configured budget.
+        
+        Zero overhead when context=False.
+        
+        Args:
+            tool_name: Name of the tool
+            output: Raw tool output
+            
+        Returns:
+            Truncated output if over budget, otherwise original
+        """
+        if not self.context_manager:
+            return output
+        
+        try:
+            return self.context_manager.truncate_tool_output(tool_name, output)
+        except Exception as e:
+            logging.warning(f"Tool output truncation error: {e}")
+            return output
+
     def _init_db_session(self):
         """Initialize DB session if db adapter is provided (lazy, first chat only)."""
         if self._db is None or self._db_initialized:
@@ -2684,11 +3512,20 @@ Your Goal: {self.goal}"""
                     self._persist_message("user", normalized_content)
                 
                 try:
+                    # Apply context management before LLM call (auto-compaction)
+                    # Zero overhead when context=False
+                    system_prompt_for_llm = self._build_system_prompt(tools)
+                    processed_history, context_result = self._apply_context_management(
+                        messages=self.chat_history,
+                        system_prompt=system_prompt_for_llm,
+                        tools=tool_param,
+                    )
+                    
                     # Pass everything to LLM class
                     response_text = self.llm_instance.get_response(
                     prompt=prompt,
-                    system_prompt=self._build_system_prompt(tools),
-                    chat_history=self.chat_history,
+                    system_prompt=system_prompt_for_llm,
+                    chat_history=processed_history,
                     temperature=temperature,
                     tools=tool_param,
                     output_json=output_json,
@@ -2762,6 +3599,17 @@ Your Goal: {self.goal}"""
 
             reflection_count = 0
             start_time = time.time()
+            
+            # Apply context management before LLM call (auto-compaction)
+            # Zero overhead when context=False
+            system_prompt_content = messages[0].get("content", "") if messages and messages[0].get("role") == "system" else ""
+            processed_messages, context_result = self._apply_context_management(
+                messages=messages,
+                system_prompt=system_prompt_content,
+                tools=tools,
+            )
+            # Use processed messages for the LLM call
+            messages = processed_messages
             
             # Wrap entire while loop in try-except for rollback on any failure
             try:
@@ -3504,7 +4352,7 @@ Write the complete compiled report:"""
 
     def start(self, prompt: str, **kwargs):
         """Start the agent with a prompt. This is a convenience method that wraps chat()."""
-        # Load history from past sessions if history_in_context is set
+        # Load history from past sessions (now handled via context= param)
         self._load_history_context()
         
         # Check if planning mode is enabled
@@ -3524,37 +4372,13 @@ Write the complete compiled report:"""
         return result
     
     def _load_history_context(self):
-        """Load history from past sessions into context if history_in_context is set."""
-        if not self.history_in_context or not self._memory_instance:
-            return
+        """Load history from past sessions into context.
         
-        try:
-            sessions = self._memory_instance.list_sessions()
-            if not sessions:
-                return
-            
-            # Get the last N sessions
-            sessions_to_load = sessions[:self.history_in_context]
-            
-            for session_info in reversed(sessions_to_load):
-                try:
-                    session_data = self._memory_instance.resume_session(session_info["name"])
-                    history = session_data.get("conversation_history", [])
-                    
-                    # Add history to chat_history with a marker
-                    for msg in history:
-                        if msg not in self.chat_history:
-                            # Mark as from history to avoid duplication
-                            msg_copy = msg.copy()
-                            msg_copy["_from_history"] = True
-                            self.chat_history.append(msg_copy)
-                except Exception:
-                    continue
-                    
-            if sessions_to_load:
-                logging.debug(f"Loaded history from {len(sessions_to_load)} past session(s)")
-        except Exception as e:
-            logging.debug(f"Error loading history context: {e}")
+        Note: This functionality is now handled via context= param with ManagerConfig.
+        This method is kept for backward compatibility but is a no-op.
+        Use context=ManagerConfig(history_sessions=N) to load past sessions.
+        """
+        pass
     
     def _auto_save_session(self):
         """Auto-save session if auto_save is enabled."""

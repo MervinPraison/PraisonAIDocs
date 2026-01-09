@@ -12,7 +12,7 @@ pip install trafilatura newspaper3k requests beautifulsoup4
 """
 
 import asyncio
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from custom_trafilatura_tools import TrafilaturaTools, create_trafilatura_tools
 
 # Create tools instance (global for reuse across examples)
@@ -113,7 +113,7 @@ async def agent_example():
         goal="Extract and analyze content from web pages using custom tools",
         backstory="You are an expert at extracting and analyzing web content using custom Trafilatura tools",
         tools=[extract_content_tool, extract_metadata_tool],
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create a task for content analysis
@@ -131,7 +131,7 @@ async def agent_example():
     )
     
     # Run the analysis
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[research_agent],
         tasks=[analysis_task]
     )

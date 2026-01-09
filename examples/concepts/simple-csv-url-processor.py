@@ -9,7 +9,7 @@ This is the simplest possible implementation for processing URLs from a CSV file
 Author: Generated for GitHub Issue #23
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import write_csv
 
 def create_url_csv():
@@ -46,7 +46,7 @@ def main():
         goal="Analyze each URL from the CSV list",
         backstory="Expert at analyzing websites and URLs",
         instructions="Analyze each URL and provide insights about the website",
-        llm="gpt-5-nano"  # You can change this to any supported model
+        llm="gpt-4o-mini"  # You can change this to any supported model
     )
     
     # Step 3: Create a task that will loop through the CSV
@@ -59,7 +59,7 @@ def main():
     )
     
     # Step 4: Run the agents
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[url_agent],
         tasks=[url_task],
         process="workflow",

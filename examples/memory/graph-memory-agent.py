@@ -16,7 +16,7 @@ Setup:
 """
 
 import os
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 def main():
     # Example with Neo4j (uncomment and configure as needed)
@@ -41,7 +41,7 @@ def main():
             "llm": {
                 "provider": "openai",
                 "config": {
-                    "model": "gpt-5-nano"
+                    "model": "gpt-4o-mini"
                 }
             }
         }
@@ -69,7 +69,7 @@ def main():
             "llm": {
                 "provider": "openai",
                 "config": {
-                    "model": "gpt-5-nano"
+                    "model": "gpt-4o-mini"
                 }
             }
         }
@@ -102,7 +102,6 @@ def main():
         backstory="""You are an expert at identifying relationships between concepts, 
         people, technologies, and ideas. You excel at creating structured knowledge 
         that captures complex interconnections.""",
-        verbose=True,
         memory=True
     )
     
@@ -150,7 +149,7 @@ def main():
     )
     
     # Run the multi-agent system with graph memory
-    agents_system = PraisonAIAgents(
+    agents_system = Agents(
         agents=[researcher],
         tasks=[build_knowledge_task, query_knowledge_task, expand_knowledge_task],
         verbose=1,

@@ -16,7 +16,7 @@ Environment Variables:
 
 import cv2
 import os
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 
 def capture_and_analyze():
@@ -28,7 +28,7 @@ def capture_and_analyze():
         role="Camera Feed Analyzer",
         goal="Analyze camera captures in real-time",
         backstory="Expert in real-time visual analysis with computer vision skills",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Initialize camera (0 for default camera)
@@ -58,7 +58,7 @@ def capture_and_analyze():
             )
             
             # Run analysis
-            agents = PraisonAIAgents(
+            agents = Agents(
                 agents=[vision_agent],
                 tasks=[task],
                 process="sequential",

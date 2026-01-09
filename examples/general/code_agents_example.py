@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import json
 from e2b_code_interpreter import Sandbox
 
@@ -23,15 +23,15 @@ def code_interpreter(code: str):
 
 code_agent = Agent(
     name="code_agent",
-    llm="gpt-5-nano",
+    llm="gpt-4o-mini",
     backstory="Expert in writing Python scripts",
-    self_reflect=False
+    reflection=False
 )
 execution_agent = Agent(
     name="execution_agent",
-    llm="gpt-5-nano",
+    llm="gpt-4o-mini",
     backstory="Expert in executing Python scripts",
-    self_reflect=False,
+    reflection=False,
     tools=[code_interpreter]
 )
 
@@ -46,5 +46,5 @@ execution_agent_task = Task(
     agent=execution_agent
 )
 
-agents = PraisonAIAgents(agents=[code_agent, execution_agent], tasks=[code_agent_task, execution_agent_task])
+agents = Agents(agents=[code_agent, execution_agent], tasks=[code_agent_task, execution_agent_task])
 agents.start()

@@ -34,8 +34,13 @@ from .workflows import (
 )
 from .guardrails import GuardrailResult, LLMGuardrail
 
-# Handoff - lightweight
-from .agent.handoff import Handoff, handoff, handoff_filters, RECOMMENDED_PROMPT_PREFIX, prompt_with_handoff_instructions
+# Handoff - lightweight (unified agent-to-agent transfer)
+from .agent.handoff import (
+    Handoff, handoff, handoff_filters, 
+    RECOMMENDED_PROMPT_PREFIX, prompt_with_handoff_instructions,
+    HandoffConfig, HandoffResult, HandoffInputData,
+    ContextPolicy, HandoffError, HandoffCycleError, HandoffDepthError, HandoffTimeoutError,
+)
 
 # Flow display (optional)
 try:
@@ -165,17 +170,17 @@ def __getattr__(name):
         _lazy_cache[name] = ExpandResult
         return ExpandResult
     
-    # PraisonAIAgents and Agents alias
-    elif name == "PraisonAIAgents":
-        from .agents.agents import PraisonAIAgents
-        _lazy_cache[name] = PraisonAIAgents
-        _lazy_cache["Agents"] = PraisonAIAgents  # Also cache alias
-        return PraisonAIAgents
+    # Agents (canonical) and PraisonAIAgents (backward-compatible alias)
     elif name == "Agents":
-        from .agents.agents import PraisonAIAgents
-        _lazy_cache["PraisonAIAgents"] = PraisonAIAgents
-        _lazy_cache[name] = PraisonAIAgents
-        return PraisonAIAgents
+        from .agents.agents import Agents
+        _lazy_cache[name] = Agents
+        _lazy_cache["PraisonAIAgents"] = Agents  # Also cache alias
+        return Agents
+    elif name == "PraisonAIAgents":
+        from .agents.agents import Agents
+        _lazy_cache["Agents"] = Agents
+        _lazy_cache[name] = Agents
+        return Agents
     
     # Task
     elif name == "Task":
@@ -372,6 +377,32 @@ def __getattr__(name):
         except ImportError:
             return None
     
+    # Feature Config classes (agent-centric API)
+    elif name in ("MemoryConfig", "KnowledgeConfig", "PlanningConfig", 
+                  "ReflectionConfig", "GuardrailConfig", "WebConfig",
+                  "OutputConfig", "ExecutionConfig", "TemplateConfig",
+                  "CachingConfig", "HooksConfig", "SkillsConfig", "AutonomyConfig",
+                  "MemoryBackend", "ChunkingStrategy", "GuardrailAction", 
+                  "WebSearchProvider", "OutputPreset", "ExecutionPreset", "AutonomyLevel",
+                  # Multi-Agent config classes
+                  "MultiAgentHooksConfig", "MultiAgentOutputConfig", 
+                  "MultiAgentExecutionConfig", "MultiAgentPlanningConfig",
+                  "MultiAgentMemoryConfig"):
+        from .config import feature_configs
+        result = getattr(feature_configs, name)
+        _lazy_cache[name] = result
+        return result
+    
+    # Context management config (already exists)
+    elif name == "ManagerConfig":
+        from .context.manager import ManagerConfig
+        _lazy_cache[name] = ManagerConfig
+        return ManagerConfig
+    elif name == "ContextManager":
+        from .context.manager import ContextManager
+        _lazy_cache[name] = ContextManager
+        return ContextManager
+    
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -457,6 +488,14 @@ __all__ = [
     'handoff_filters',
     'RECOMMENDED_PROMPT_PREFIX',
     'prompt_with_handoff_instructions',
+    'HandoffConfig',
+    'HandoffResult',
+    'HandoffInputData',
+    'ContextPolicy',
+    'HandoffError',
+    'HandoffCycleError',
+    'HandoffDepthError',
+    'HandoffTimeoutError',
     'get_telemetry',
     'enable_telemetry',
     'disable_telemetry',
@@ -527,4 +566,34 @@ __all__ = [
     'RAGConfig',
     'RAGResult',
     'RAGCitation',
+    # Feature Configs (agent-centric API)
+    'MemoryConfig',
+    'KnowledgeConfig',
+    'PlanningConfig',
+    'ReflectionConfig',
+    'GuardrailConfig',
+    'WebConfig',
+    'OutputConfig',
+    'ExecutionConfig',
+    'TemplateConfig',
+    'CachingConfig',
+    'HooksConfig',
+    'SkillsConfig',
+    'AutonomyConfig',
+    'MemoryBackend',
+    'ChunkingStrategy',
+    'GuardrailAction',
+    'WebSearchProvider',
+    'OutputPreset',
+    'ExecutionPreset',
+    'AutonomyLevel',
+    # Multi-Agent Feature Configs
+    'MultiAgentHooksConfig',
+    'MultiAgentOutputConfig',
+    'MultiAgentExecutionConfig',
+    'MultiAgentPlanningConfig',
+    'MultiAgentMemoryConfig',
+    # Context Management
+    'ManagerConfig',
+    'ContextManager',
 ]

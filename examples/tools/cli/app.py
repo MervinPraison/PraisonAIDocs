@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import subprocess
 import os
 
@@ -34,10 +34,9 @@ system_ops_agent = Agent(
     backstory="""You are an expert system administrator with deep knowledge of Unix/Linux systems.
     You excel at running complex system commands, managing processes, and handling system operations.
     You always validate commands before execution and ensure they are safe to run.""",
-    min_reflect=6,
-    max_reflect=10,
+    reflection=True,
     tools=[run_terminal_command, save_to_file],
-    llm="gpt-5-nano"
+    llm="gpt-4o-mini"
 )
 
 # Create a complex task that tests various system operations
@@ -58,7 +57,7 @@ task = Task(
     agent=system_ops_agent,
 )
 
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[system_ops_agent],
     tasks=[task],
     process="sequential"

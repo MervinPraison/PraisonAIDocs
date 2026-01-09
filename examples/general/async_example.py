@@ -1,7 +1,7 @@
 import asyncio
 import time
 from typing import List, Dict
-from praisonaiagents import Agent, Task, PraisonAIAgents, TaskOutput
+from praisonaiagents import Agent, Task, Agents, TaskOutput
 from praisonaiagents.main import (
     display_error,
     display_interaction,
@@ -98,8 +98,7 @@ sync_agent = Agent(
     goal="Perform synchronous searches and return structured results",
     backstory="Expert in sync operations and data organization",
     tools=[sync_search_tool],
-    self_reflect=False,
-    verbose=True,
+    reflection=False,
     markdown=True
 )
 
@@ -109,8 +108,7 @@ async_agent = Agent(
     goal="Perform asynchronous searches and return structured results",
     backstory="Expert in async operations and data organization",
     tools=[async_search_tool],
-    self_reflect=False,
-    verbose=True,
+    reflection=False,
     markdown=True
 )
 
@@ -160,7 +158,7 @@ workflow_async_task = Task(
 def run_sync_example():
     """Run synchronous example"""
     display_instruction("\nRunning Synchronous Example...", console)
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[sync_agent],
         tasks=[sync_task],
         verbose=1,
@@ -172,7 +170,7 @@ def run_sync_example():
 async def run_async_example():
     """Run asynchronous example"""
     display_instruction("\nRunning Asynchronous Example...", console)
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[async_agent],
         tasks=[async_task],
         verbose=1,
@@ -184,7 +182,7 @@ async def run_async_example():
 async def run_mixed_example():
     """Run mixed sync/async example"""
     display_instruction("\nRunning Mixed Sync/Async Example...", console)
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[sync_agent, async_agent],
         tasks=[sync_task, async_task],
         verbose=1,
@@ -196,7 +194,7 @@ async def run_mixed_example():
 async def run_workflow_example():
     """Run workflow example with both sync and async tasks"""
     display_instruction("\nRunning Workflow Example...", console)
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[sync_agent, async_agent],
         tasks=[workflow_sync_task, workflow_async_task],
         verbose=1,

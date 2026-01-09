@@ -5,7 +5,7 @@ This example demonstrates callback systems using PraisonAI's built-in
 callback functionality for monitoring agent interactions and tool usage.
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.display_callback import register_display_callback
 from praisonaiagents.tools import internet_search
 
@@ -39,9 +39,7 @@ research_agent = Agent(
     role="Information Researcher",
     goal="Research topics and demonstrate callback monitoring",
     backstory="Expert researcher that demonstrates callback functionality",
-    tools=[internet_search],
-    verbose=True
-)
+    tools=[internet_search])
 
 # Create a simple task
 research_task = Task(

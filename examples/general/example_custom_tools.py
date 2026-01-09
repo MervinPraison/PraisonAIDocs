@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from typing import List, Dict, Union
 from duckduckgo_search import DDGS
 from langchain_community.tools import YouTubeSearchTool
@@ -112,7 +112,7 @@ data_agent = Agent(
     goal="Perform internet searches to collect relevant information.",
     backstory="Expert in finding and organizing internet data from multiple sources.",
     tools=[internet_search_tool, youtube_search_tool, wikipedia_search_tool],
-    self_reflect=False
+    reflection=False
 )
 
 # 3. Tasks
@@ -141,7 +141,7 @@ validate_task = Task(
 )
 
 # 4. Workflow
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[data_agent],
     tasks=[collect_task, validate_task],
     verbose=1,

@@ -18,7 +18,7 @@ import cv2
 import os
 import time
 from datetime import datetime
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 
 class CameraVideoAnalyzer:
@@ -39,7 +39,7 @@ class CameraVideoAnalyzer:
             role="Video Content Analyzer",
             goal="Analyze video content for activities, objects, and events",
             backstory="Expert in video analysis and temporal event detection with computer vision expertise",
-            llm="gpt-5-nano"
+            llm="gpt-4o-mini"
         )
     
     def record_video_segment(self, duration_seconds=10):
@@ -131,7 +131,7 @@ class CameraVideoAnalyzer:
             images=[video_path]  # PraisonAI supports video files in images parameter
         )
         
-        agents = PraisonAIAgents(
+        agents = Agents(
             agents=[self.video_agent],
             tasks=[task],
             process="sequential",

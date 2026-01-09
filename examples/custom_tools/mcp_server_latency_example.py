@@ -5,7 +5,7 @@ This shows how to add latency tracking to an MCP server
 without modifying PraisonAI core files.
 """
 
-from praisonaiagents import Agent, PraisonAIAgents
+from praisonaiagents import Agent, Agents
 from hosted_server import HostedMCPServer  # Import from local file
 from latency_tracker_tool import tracker, get_latency_metrics
 import json
@@ -56,7 +56,7 @@ def create_mcp_agent_with_tracking(request_id: str = "mcp_request"):
         name="MCPAssistant",
         role="MCP Request Handler",
         goal="Handle MCP requests with latency tracking",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     return agent

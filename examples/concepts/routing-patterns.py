@@ -8,7 +8,7 @@ This example demonstrates various routing patterns in PraisonAI including:
 - Dynamic task selection
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from typing import Dict, Any
 import random
 
@@ -77,11 +77,10 @@ def conditional_routing_example():
         agent=processor_agent
     )
     
-    workflow = PraisonAIAgents(
+    workflow = Agents(
         agents=[analyzer_agent, processor_agent],
         tasks=[analysis_task, premium_task, standard_task, basic_task],
-        process="workflow",
-        verbose=True
+        process="workflow", output="verbose"
     )
     
     return workflow.start()
@@ -110,11 +109,10 @@ def loop_pattern_example():
         agent=validator_agent
     )
     
-    workflow = PraisonAIAgents(
+    workflow = Agents(
         agents=[processor_agent, validator_agent],
         tasks=[process_task, finalize_task],
-        process="workflow",
-        verbose=True
+        process="workflow", output="verbose"
     )
     
     return workflow.start()
@@ -185,11 +183,10 @@ def decision_tree_example():
     
     all_tasks = [categorize_task, technical_task, business_task] + terminal_tasks
     
-    workflow = PraisonAIAgents(
+    workflow = Agents(
         agents=[analyzer_agent, processor_agent],
         tasks=all_tasks,
-        process="workflow",
-        verbose=True
+        process="workflow", output="verbose"
     )
     
     return workflow.start()
@@ -208,7 +205,7 @@ dynamic_router = Agent(
 5. Current system load
 
 Provide clear routing decisions with reasoning.""",
-    self_reflect=True
+    reflection=True
 )
 
 def dynamic_routing_example():
@@ -272,11 +269,10 @@ def dynamic_routing_example():
         agent=processor_agent
     )
     
-    workflow = PraisonAIAgents(
+    workflow = Agents(
         agents=[dynamic_router, processor_agent],
         tasks=[route_task, escalate_task, automate_task, review_task, standard_task],
-        process="workflow",
-        verbose=True
+        process="workflow", output="verbose"
     )
     
     return workflow.start()

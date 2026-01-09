@@ -12,7 +12,7 @@ Features demonstrated:
 - State-based workflow management
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import duckduckgo
 import random
 
@@ -203,7 +203,7 @@ for request in sample_requests:
     )
     
     # Execute the workflow with conditional routing
-    workflow_agents = PraisonAIAgents(
+    workflow_agents = Agents(
         agents=[
             intake_agent, specialist_agent, review_agent, 
             coordinator_agent
@@ -215,7 +215,7 @@ for request in sample_requests:
             finalization_task
         ],
         process="workflow",  # Use workflow process for conditional execution
-        verbose=True
+        output="verbose"
     )
     
     print(f"Executing advanced workflow for {request['id']}...")

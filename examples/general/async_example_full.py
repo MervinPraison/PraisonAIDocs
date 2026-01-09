@@ -1,7 +1,7 @@
 import asyncio
 import time
 from typing import List, Dict
-from praisonaiagents import Agent, Task, PraisonAIAgents, TaskOutput
+from praisonaiagents import Agent, Task, Agents, TaskOutput
 from duckduckgo_search import DDGS
 from pydantic import BaseModel
 
@@ -53,8 +53,7 @@ async_agent = Agent(
     goal="Perform fast parallel searches with structured results",
     backstory="Expert in efficient data retrieval and parallel search operations",
     tools=[async_search_tool],
-    self_reflect=False,
-    verbose=True,
+    reflection=False,
     markdown=True
 )
 
@@ -63,8 +62,7 @@ summary_agent = Agent(
     role="Research Synthesizer",
     goal="Create concise summaries from multiple search results",
     backstory="Expert in analyzing and synthesizing information from multiple sources",
-    self_reflect=True,
-    verbose=True,
+    reflection=True,
     markdown=True
 )
 
@@ -114,8 +112,8 @@ async def run_parallel_tasks():
         context=parallel_tasks
     )
     
-    # Create a single PraisonAIAgents instance with both agents
-    agents = PraisonAIAgents(
+    # Create a single Agents instance with both agents
+    agents = Agents(
         agents=[async_agent, summary_agent],
         tasks=parallel_tasks + [summary_task],
         verbose=1,

@@ -24,7 +24,7 @@ import sys
 # Add the local development path to use the current implementation
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'src', 'praisonai-agents'))
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import python_tools, file_tools, shell_tools
 from praisonaiagents.main import register_approval_callback
 from praisonaiagents.approval import (
@@ -82,9 +82,7 @@ def main():
         name="Security Demo Agent",
         role="System Administrator",
         goal="Demonstrate human approval for dangerous operations",
-        tools=[python_tools, file_tools, shell_tools],
-        verbose=True
-    )
+        tools=[python_tools, file_tools, shell_tools])
     
     # Define tasks that will trigger approval prompts
     tasks = [
@@ -111,10 +109,9 @@ def main():
     ]
     
     # Create and run process
-    process = PraisonAIAgents(
+    process = Agents(
         agents=[agent],
-        tasks=tasks,
-        verbose=True
+        tasks=tasks, output="verbose"
     )
     
     print("\n🚀 Starting process with approval-required operations...")
@@ -160,9 +157,7 @@ async def async_demo():
         name="Async Demo Agent",
         role="Async Operations Specialist", 
         goal="Demonstrate async approval workflow",
-        tools=[python_tools],
-        verbose=True
-    )
+        tools=[python_tools])
     
     # This would trigger approval in async context
     task = Task(
@@ -171,10 +166,9 @@ async def async_demo():
         expected_output="Async execution result"
     )
     
-    process = PraisonAIAgents(
+    process = Agents(
         agents=[agent],
-        tasks=[task],
-        verbose=True
+        tasks=[task], output="verbose"
     )
     
     try:

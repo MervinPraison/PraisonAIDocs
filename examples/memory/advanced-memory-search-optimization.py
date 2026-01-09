@@ -5,7 +5,7 @@ This example demonstrates memory search optimization using PraisonAI's
 built-in memory capabilities with semantic search and quality filtering.
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import internet_search
 
 print("=== Advanced Memory Search and Optimization Example ===\n")
@@ -30,9 +30,7 @@ research_agent = Agent(
     goal="Research and demonstrate optimized memory search patterns",
     backstory="Expert at storing and retrieving information efficiently with memory optimization",
     tools=[internet_search],
-    memory=True,
-    verbose=True
-)
+    memory=True)
 
 # Task to build searchable memory
 build_memory_task = Task(
@@ -60,12 +58,11 @@ search_task = Task(
 )
 
 # Run with memory optimization
-agents_system = PraisonAIAgents(
+agents_system = Agents(
     agents=[research_agent],
     tasks=[build_memory_task, search_task],
     memory=True,
-    memory_config=memory_config,
-    verbose=True
+    memory_config=memory_config, output="verbose"
 )
 
 print("Starting memory search optimization demonstration...")

@@ -41,7 +41,32 @@ Usage:
     monitor.snapshot(ledger=result.ledger, budget=budget, messages=result.messages)
 """
 
+def format_percent(value: float) -> str:
+    """
+    Smart percentage formatting for context utilization display.
+    
+    - For values < 0.1%: shows "<0.1%"
+    - For values < 1%: shows 2 decimal places (e.g., "0.02%")
+    - For values >= 1%: shows 1 decimal place (e.g., "5.3%")
+    
+    Args:
+        value: A ratio (0.0 to 1.0+), NOT already multiplied by 100
+        
+    Returns:
+        Formatted percentage string
+    """
+    pct = value * 100
+    if pct < 0.1 and pct > 0:
+        return "<0.1%"
+    elif pct < 1.0:
+        return f"{pct:.2f}%"
+    else:
+        return f"{pct:.1f}%"
+
+
 __all__ = [
+    # Utilities
+    "format_percent",
     # Models
     "ContextSegment",
     "ContextLedger",
@@ -83,6 +108,50 @@ __all__ = [
     "redact_sensitive",
     "format_human_snapshot",
     "format_json_snapshot",
+    "validate_monitor_path",
+    "should_include_content",
+    "load_ignore_patterns",
+    # Manager Facade (NEW)
+    "ContextManager",
+    "MultiAgentContextManager",
+    "create_context_manager",
+    "ManagerConfig",
+    "ContextPolicy",
+    "EstimationMode",
+    "ContextShareMode",
+    "ToolShareMode",
+    "OptimizationEvent",
+    "OptimizationEventType",
+    "EstimationMetrics",
+    "PerToolBudget",
+    "SnapshotHookData",
+    # Protocols (NEW)
+    "ContextView",
+    "ContextMutator",
+    "ContextMessage",
+    "MessageMetadata",
+    "MessageRole",
+    "validate_message_schema",
+    "get_effective_history",
+    "cleanup_orphaned_parents",
+    # Store (NEW)
+    "ContextStoreImpl",
+    "ContextViewImpl",
+    "ContextMutatorImpl",
+    "AgentBudget",
+    "get_global_store",
+    "reset_global_store",
+    # Instrumentation (NEW)
+    "ContextMetrics",
+    "get_metrics",
+    "reset_metrics",
+    "context_operation",
+    "timed_section",
+    "log_context_size",
+    "log_optimization_event",
+    "run_benchmark",
+    "BenchmarkResult",
+    "format_benchmark_results",
     # Fast Context (legacy)
     "FastContext",
     "FastContextResult",
@@ -124,15 +193,50 @@ def __getattr__(name: str):
     # Optimization
     if name in ("BaseOptimizer", "TruncateOptimizer", "SlidingWindowOptimizer",
                 "PruneToolsOptimizer", "NonDestructiveOptimizer", "SummarizeOptimizer",
-                "SmartOptimizer", "get_optimizer", "get_effective_history"):
+                "SmartOptimizer", "get_optimizer"):
         from . import optimizer
         return getattr(optimizer, name)
     
     # Monitoring
     if name in ("ContextMonitor", "MultiAgentMonitor", "redact_sensitive",
-                "format_human_snapshot", "format_json_snapshot"):
+                "format_human_snapshot", "format_json_snapshot",
+                "validate_monitor_path", "should_include_content", "load_ignore_patterns"):
         from . import monitor
         return getattr(monitor, name)
+    
+    # Manager Facade
+    if name in ("ContextManager", "MultiAgentContextManager", "create_context_manager",
+                "ManagerConfig", "ContextPolicy", "EstimationMode", "ContextShareMode",
+                "ToolShareMode", "OptimizationEvent", "OptimizationEventType",
+                "EstimationMetrics", "PerToolBudget", "SnapshotHookData"):
+        from . import manager
+        return getattr(manager, name)
+    
+    # Protocols
+    if name in ("ContextView", "ContextMutator", "ContextMessage",
+                "MessageMetadata", "MessageRole", "validate_message_schema",
+                "cleanup_orphaned_parents"):
+        from . import protocols
+        return getattr(protocols, name)
+    
+    # get_effective_history from protocols (not optimizer)
+    if name == "get_effective_history":
+        from .protocols import get_effective_history
+        return get_effective_history
+    
+    # Store
+    if name in ("ContextStoreImpl", "ContextViewImpl", "ContextMutatorImpl",
+                "AgentBudget", "get_global_store", "reset_global_store"):
+        from . import store
+        return getattr(store, name)
+    
+    # Instrumentation
+    if name in ("ContextMetrics", "get_metrics", "reset_metrics",
+                "context_operation", "timed_section", "log_context_size",
+                "log_optimization_event", "run_benchmark", "BenchmarkResult",
+                "format_benchmark_results"):
+        from . import instrumentation
+        return getattr(instrumentation, name)
     
     # Fast Context (legacy)
     if name == "FastContext":

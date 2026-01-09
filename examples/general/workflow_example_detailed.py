@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import random
 from typing import List, Dict, Union
 import json
@@ -158,7 +158,7 @@ data_agent = Agent(
     goal="Collect and validate data about individuals",
     backstory="Expert in gathering and validating demographic data",
     tools=[random_data_of_individuals],
-    self_reflect=False
+    reflection=False
 )
 
 process_agent = Agent(
@@ -167,7 +167,7 @@ process_agent = Agent(
     goal="Process and categorize individual data",
     backstory="Expert in data analysis and categorization",
     tools=[process_data_of_individuals],
-    self_reflect=False
+    reflection=False
 )
 
 # Modify tasks to use Pydantic models
@@ -224,8 +224,8 @@ process_task = Task(
     output_json=ProcessedPerson
 )
 
-# Create PraisonAIAgents instance with workflow process
-workflow = PraisonAIAgents(
+# Create Agents instance with workflow process
+workflow = Agents(
     agents=[data_agent, process_agent],
     tasks=[collect_task, validate_task, process_task],
     verbose=1,

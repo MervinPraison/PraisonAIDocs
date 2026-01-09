@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from pydantic import BaseModel
 from typing import List, Dict
 from gitingest import ingest
@@ -29,9 +29,7 @@ code_analyzer = Agent(
     role="Code Analysis Expert",
     goal="Provide comprehensive code evaluation and recommendations",
     backstory="""Expert code analyst specializing in architecture review, 
-    best practices, and technical debt assessment.""",
-    verbose=True
-)
+    best practices, and technical debt assessment.""")
 
 code_analysis_task = Task(
     description="""Analyze code repository and provide structured evaluation:
@@ -83,7 +81,7 @@ def analyze_code(code_source: str) -> CodeAnalysisReport:
     """
     
     # Initialize and run analysis
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[code_analyzer],
         tasks=[code_analysis_task]
     )

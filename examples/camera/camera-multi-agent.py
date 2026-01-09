@@ -17,7 +17,7 @@ Environment Variables:
 import cv2
 import os
 from datetime import datetime
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 
 def capture_camera_frame(camera_id=0):
@@ -57,7 +57,7 @@ def analyze_with_multiple_agents():
         role="Security Specialist",
         goal="Identify security threats and suspicious activities",
         backstory="Expert security analyst with years of experience in surveillance and threat detection",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     object_detector = Agent(
@@ -65,7 +65,7 @@ def analyze_with_multiple_agents():
         role="Object Recognition Specialist", 
         goal="Identify and catalog all objects in the scene",
         backstory="Computer vision expert specializing in object detection and classification",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     scene_analyst = Agent(
@@ -73,7 +73,7 @@ def analyze_with_multiple_agents():
         role="Scene Understanding Expert",
         goal="Provide comprehensive scene analysis and context",
         backstory="Environmental analyst expert in understanding spatial relationships and scene context",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create specialized tasks
@@ -114,7 +114,7 @@ def analyze_with_multiple_agents():
     )
     
     # Run multi-agent analysis
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[security_agent, object_detector, scene_analyst],
         tasks=[security_task, object_task, scene_task],
         process="parallel",  # Run all analyses in parallel
