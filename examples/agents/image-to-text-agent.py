@@ -4,7 +4,7 @@ from praisonaiagents.tools import duckduckgo
 agent = Agent(instructions="You are a Image Analysis Agent", tools=[duckduckgo])
 agent.start("I want to go London next week, find me a good hotel and flight")
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 # Create Image Analysis Agent
 image_agent = Agent(
@@ -13,8 +13,8 @@ image_agent = Agent(
     goal="Analyze images and videos to extract meaningful information",
     backstory="""You are an expert in computer vision and image analysis.
     You excel at describing images, detecting objects, and understanding visual content.""",
-    llm="gpt-5-nano",
-    self_reflect=False
+    llm="gpt-4o-mini",
+    reflection=False
 )
 
 # 1. Task with Image URL
@@ -35,8 +35,8 @@ task2 = Task(
     images=["image.jpg"] 
 )
 
-# Create PraisonAIAgents instance
-agents = PraisonAIAgents(
+# Create Agents instance
+agents = Agents(
     agents=[image_agent],
     tasks=[task1, task2],
     process="sequential",

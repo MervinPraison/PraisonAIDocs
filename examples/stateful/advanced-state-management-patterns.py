@@ -5,7 +5,7 @@ This example demonstrates state management using PraisonAI agents
 with session-based state tracking and persistence.
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import internet_search
 
 print("=== Advanced State Management Patterns Example ===\n")
@@ -23,9 +23,7 @@ state_agent = Agent(
     goal="Demonstrate advanced state management patterns",
     backstory="Expert at managing task state and workflow progression with memory",
     tools=[internet_search],
-    memory=True,
-    verbose=True
-)
+    memory=True)
 
 # Task 1: Initialize state and perform research
 init_task = Task(
@@ -65,11 +63,10 @@ finalize_task = Task(
 )
 
 # Run with state management
-agents_system = PraisonAIAgents(
+agents_system = Agents(
     agents=[state_agent],
     tasks=[init_task, continue_task, finalize_task],
-    memory=True,
-    verbose=True
+    memory=True, output="verbose"
 )
 
 print("Starting state management demonstration...")

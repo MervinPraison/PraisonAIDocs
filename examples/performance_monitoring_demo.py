@@ -21,7 +21,7 @@ Features Demonstrated:
 
 import time
 import random
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import duckduckgo
 from praisonaiagents.telemetry import (
     monitor_function, track_api_call, performance_monitor,
@@ -200,7 +200,7 @@ research_agent = Agent(
     goal="Research and analyze performance topics quickly",
     backstory="You are an expert at researching performance optimization topics.",
     tools=[duckduckgo],
-    verbose=False  # Reduce output for cleaner demo
+    output="minimal"  # Reduce output for cleaner demo
 )
 
 # Monitor agent operations
@@ -213,10 +213,9 @@ def execute_monitored_task(agent, task_description):
         agent=agent
     )
     
-    agents_workflow = PraisonAIAgents(
+    agents_workflow = Agents(
         agents=[agent],
-        tasks=[task],
-        verbose=False
+        tasks=[task], output="minimal"
     )
     
     # Simulate API calls during agent execution

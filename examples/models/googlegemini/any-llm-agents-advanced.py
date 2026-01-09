@@ -32,11 +32,9 @@ agent = Agent(
     instructions="You are a helpful Assistant specialized in scientific explanations. "
                 "Provide clear, accurate, and engaging responses.",
     llm=llm_config,                  # Pass the detailed configuration
-    verbose=True,                    # Enable detailed output
+    # Enable detailed output
     markdown=True,                   # Format responses in markdown
-    self_reflect=True,              # Enable self-reflection
-    max_reflect=3,                  # Maximum reflection iterations
-    min_reflect=1                   # Minimum reflection iterations
+    reflection=True               # Enable self-reflection
 )
 
 # Test the agent

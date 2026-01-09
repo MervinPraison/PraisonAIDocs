@@ -19,7 +19,7 @@ Features demonstrated:
 """
 
 import os
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 # Ensure OpenAI API key is set
 if not os.environ.get("OPENAI_API_KEY"):
@@ -58,8 +58,7 @@ def main():
         knowledge_config=mongodb_knowledge_config,
         knowledge=[os.path.join(os.path.dirname(__file__), "llms.md")],
         memory=True,
-        verbose=True,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create a research assistant agent
@@ -72,8 +71,7 @@ def main():
         knowledge base. You ensure information is accurate, well-structured, 
         and properly categorized.""",
         memory=True,
-        verbose=True,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create tasks for knowledge management
@@ -124,11 +122,10 @@ def main():
     print("🚀 Starting MongoDB Knowledge Management System...")
     print("=" * 60)
     
-    knowledge_system = PraisonAIAgents(
+    knowledge_system = Agents(
         agents=[research_agent, knowledge_agent],
         tasks=knowledge_tasks,
-        memory=True,
-        verbose=True
+        memory=True, output="verbose"
     )
     
     # Execute the knowledge management pipeline

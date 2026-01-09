@@ -1,4 +1,4 @@
-from praisonaiagents.agents.agents import Agent, Task, PraisonAIAgents
+from praisonaiagents.agents.agents import Agent, Task, Agents
 from praisonaiagents.tools import duckduckgo
 
 # Test facts
@@ -9,19 +9,19 @@ fact3 = "The year the first Josinga was released is 2007"
 fact_agent = Agent(
     name="Fact Agent",
     instructions="You are a fact agent, you store and retrieve facts in memory",
-    llm="gpt-5-nano"
+    llm="gpt-4o-mini"
 )
 
 research_agent = Agent(
     name="Research Agent",
     instructions="You are a research analyst, you research and document key points about topics",
-    llm="gpt-5-nano"
+    llm="gpt-4o-mini"
 )
 
 blog_agent = Agent(
     name="Blog Agent",
     instructions="You are a blog writer, you write a blog post about the research",
-    llm="gpt-5-nano"
+    llm="gpt-4o-mini"
 )
 
 fact_task = Task(
@@ -54,7 +54,7 @@ blog_task = Task(
     agent=blog_agent
 )
 
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[fact_agent, research_agent, blog_agent],
     tasks=[fact_task, research_task, research_task2, research_task3, research_task4, blog_task],
     memory=True

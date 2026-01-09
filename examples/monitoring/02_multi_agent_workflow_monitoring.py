@@ -10,7 +10,7 @@ Demonstrates performance monitoring in a multi-agent workflow:
 Shows how to monitor complex multi-agent systems.
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.telemetry import (
     monitor_function, track_api_call, get_function_stats, 
     analyze_function_flow, generate_comprehensive_report
@@ -54,7 +54,7 @@ def create_agents():
         goal="Gather comprehensive information on renewable energy",
         backstory="Expert researcher with deep knowledge of energy sector",
         instructions="You are a thorough researcher. Provide detailed, fact-based information.",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     analyst = Agent(
@@ -63,7 +63,7 @@ def create_agents():
         goal="Analyze trends and patterns in renewable energy data",
         backstory="Experienced data analyst specializing in energy markets",
         instructions="You are an analytical thinker. Focus on trends, patterns, and insights.",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     writer = Agent(
@@ -72,7 +72,7 @@ def create_agents():
         goal="Create clear, compelling reports",
         backstory="Professional technical writer with expertise in energy sector",
         instructions="You are a skilled writer. Create clear, well-structured reports.",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     return researcher, analyst, writer
@@ -101,11 +101,10 @@ def main():
     with track_api_call("multi_agent_workflow"):
         print("\n🚀 Starting multi-agent workflow...")
         
-        workflow = PraisonAIAgents(
+        workflow = Agents(
             agents=[researcher, analyst, writer],
             tasks=[research_task, analysis_task, report_task], 
-            process="sequential",
-            verbose=True
+            process="sequential", output="verbose"
         )
         
         result = workflow.start()

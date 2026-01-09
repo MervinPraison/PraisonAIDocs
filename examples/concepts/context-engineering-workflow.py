@@ -24,7 +24,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent.parent / "src" / "praisonai-agents"
 sys.path.insert(0, str(project_root))
 
-from praisonaiagents import Agent, Task, PraisonAIAgents, create_context_agent
+from praisonaiagents import Agent, Task, Agents, create_context_agent
 
 class ContextEngineeringWorkflow:
     """
@@ -34,7 +34,7 @@ class ContextEngineeringWorkflow:
     to achieve higher success rates in AI-driven development tasks.
     """
     
-    def __init__(self, project_path: str, llm: str = "gpt-5-nano"):
+    def __init__(self, project_path: str, llm: str = "gpt-4o-mini"):
         self.project_path = project_path
         self.llm = llm
         self.context_data = {}
@@ -59,16 +59,12 @@ class ContextEngineeringWorkflow:
             4. Define success metrics
             5. Specify technical constraints
             """,
-            llm=self.llm,
-            verbose=True
-        )
+            llm=self.llm)
         
         # 2. Context Engineering Agent - Generates comprehensive context
         self.context_engineer = create_context_agent(
             llm=self.llm,
-            name="Context Engineering Specialist",
-            verbose=True
-        )
+            name="Context Engineering Specialist")
         
         # 3. Software Architect Agent - Designs implementation using context
         self.architect = Agent(
@@ -87,9 +83,7 @@ class ContextEngineeringWorkflow:
             4. Consider security and performance implications
             5. Document architectural decisions and rationale
             """,
-            llm=self.llm,
-            verbose=True
-        )
+            llm=self.llm)
         
         # 4. Senior Developer Agent - Implements using context-enhanced guidance
         self.developer = Agent(
@@ -107,9 +101,7 @@ class ContextEngineeringWorkflow:
             4. Write clean, maintainable code
             5. Follow the implementation blueprint exactly
             """,
-            llm=self.llm,
-            verbose=True
-        )
+            llm=self.llm)
         
         # 5. QA Engineer Agent - Validates using context-generated criteria
         self.qa_engineer = Agent(
@@ -127,9 +119,7 @@ class ContextEngineeringWorkflow:
             4. Check for security vulnerabilities
             5. Validate performance requirements
             """,
-            llm=self.llm,
-            verbose=True
-        )
+            llm=self.llm)
     
     def run_context_engineering_workflow(self, feature_request: str):
         """
@@ -312,7 +302,7 @@ class ContextEngineeringWorkflow:
         print("\n⚙️ Executing Context Engineering Workflow")
         print("-" * 50)
         
-        agents_workflow = PraisonAIAgents(
+        agents_workflow = Agents(
             agents=[
                 self.product_manager,
                 self.architect, 
@@ -325,8 +315,7 @@ class ContextEngineeringWorkflow:
                 implementation_task,
                 qa_task
             ],
-            process="sequential",
-            verbose=True
+            process="sequential", output="verbose"
         )
         
         # Execute workflow
@@ -382,7 +371,7 @@ def run_example_workflow():
     project_path = str(project_root)
     workflow = ContextEngineeringWorkflow(
         project_path=project_path,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Example feature request
@@ -446,7 +435,7 @@ if __name__ == "__main__":
     print("(Note: Full execution requires complete environment setup)")
     
     project_path = str(project_root)
-    workflow = ContextEngineeringWorkflow(project_path, "gpt-5-nano")
+    workflow = ContextEngineeringWorkflow(project_path, "gpt-4o-mini")
     
     print(f"\n✅ Workflow Setup Complete:")
     print(f"   • Project path: {project_path}")

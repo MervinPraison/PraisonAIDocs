@@ -10,7 +10,7 @@ Run this example:
     python 05_loop_control_with_state.py
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import time
 import random
 from datetime import datetime
@@ -265,9 +265,7 @@ batch_processor = Agent(
     goal="Process all batches successfully with retry logic",
     backstory="A batch processing expert",
     tools=[process_batch, process_retry_batch],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 data_collector = Agent(
     name="DataCollector",
@@ -275,9 +273,7 @@ data_collector = Agent(
     goal="Collect all data from paginated source",
     backstory="A data collection specialist",
     tools=[collect_paginated_data],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 validator = Agent(
     name="Validator",
@@ -285,9 +281,7 @@ validator = Agent(
     goal="Validate all collected items in batches",
     backstory="A data validation expert",
     tools=[validate_collected_items],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 reporter = Agent(
     name="Reporter",
@@ -295,9 +289,7 @@ reporter = Agent(
     goal="Create comprehensive reports on loop operations",
     backstory="A reporting specialist",
     tools=[generate_loop_report],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 # Create loop tasks
 batch_loop_task = Task(
@@ -363,10 +355,9 @@ report_task = Task(
 )
 
 # Create workflow
-workflow = PraisonAIAgents(
+workflow = Agents(
     agents=[batch_processor, data_collector, validator, reporter],
     tasks=[batch_loop_task, retry_loop_task, pagination_loop_task, validation_loop_task, report_task],
-    verbose=True,
     process="sequential"
 )
 

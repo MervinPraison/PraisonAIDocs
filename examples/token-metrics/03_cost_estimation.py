@@ -4,7 +4,7 @@ This example demonstrates automatic token metrics and cost tracking
 using just Agent(metrics=True). All tracking and display is automatic!
 For custom cost calculations, you can still access the detailed reports.
 """
-from praisonaiagents import PraisonAIAgents, Agent, Task
+from praisonaiagents import Agents, Agent, Task
 
 def main():
     # Create agents with metrics=True for automatic cost tracking
@@ -13,8 +13,7 @@ def main():
         role="Senior Market Research Analyst", 
         goal="Conduct comprehensive market research",
         backstory="You are a seasoned market researcher with 10+ years of experience.",
-        verbose=True,
-        llm="gpt-5-nano",
+        llm="gpt-4o-mini",
         metrics=True  # 🎯 Enable automatic metrics tracking
     )
     
@@ -23,8 +22,7 @@ def main():
         role="Strategic Business Consultant",
         goal="Develop actionable business strategies",
         backstory="You are a strategic consultant who translates research into business plans.",
-        verbose=True,
-        llm="gpt-5-nano",
+        llm="gpt-4o-mini",
         metrics=True  # 🎯 Enable automatic metrics tracking
     )
     
@@ -58,10 +56,9 @@ def main():
     )
     
     # Initialize and run
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[research_agent, strategy_agent],
-        tasks=[research_task, strategy_task],
-        verbose=True
+        tasks=[research_task, strategy_task], output="verbose"
     )
     
     print("🚀 Running cost analysis workflow...")

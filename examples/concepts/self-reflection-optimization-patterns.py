@@ -5,7 +5,7 @@ This example demonstrates self-reflection capabilities using PraisonAI's
 built-in reflection features for iterative improvement and quality optimization.
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import internet_search
 
 print("=== Self-Reflection Optimization Patterns Example ===\n")
@@ -17,12 +17,7 @@ reflection_agent = Agent(
     goal="Demonstrate self-reflection and iterative improvement patterns",
     backstory="Expert researcher with strong self-reflection and continuous improvement capabilities",
     tools=[internet_search],
-    self_reflect=True,
-    min_reflect=2,
-    max_reflect=4,
-    reflect_llm="gpt-5-nano",
-    verbose=True
-)
+    reflection=True)
 
 # Create task that benefits from self-reflection
 reflection_task = Task(

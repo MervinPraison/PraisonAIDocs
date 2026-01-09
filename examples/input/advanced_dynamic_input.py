@@ -5,7 +5,7 @@ This example demonstrates an advanced system that dynamically creates agents and
 based on user inputs, including conditional logic, custom configurations, and file output.
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import duckduckgo
 import os
 from typing import Dict, List
@@ -16,7 +16,7 @@ class DynamicAgentSystem:
     def __init__(self):
         self.user_preferences = {}
         self.llm_config = {
-            "model": os.getenv("LLM_MODEL", "gpt-5-nano"),
+            "model": os.getenv("LLM_MODEL", "gpt-4o-mini"),
             "temperature": 0.7
         }
     
@@ -40,7 +40,7 @@ class DynamicAgentSystem:
             goal=f"Conduct {inputs['depth']} research on {inputs['topic']} in {inputs['language']}",
             backstory=f"Multilingual expert specializing in {inputs['depth']} analysis",
             tools=[duckduckgo],
-            self_reflect=inputs['depth'] == 'detailed',
+            reflection=inputs['depth'] == 'detailed',
             llm=self.llm_config
         )
         agents.append(research_agent)
@@ -137,7 +137,7 @@ class DynamicAgentSystem:
         
         # Run the system
         print(f"\n🚀 Starting {process} analysis for '{inputs['topic']}'...")
-        praison_agents = PraisonAIAgents(
+        praison_agents = Agents(
             agents=agents,
             tasks=tasks,
             process=process,

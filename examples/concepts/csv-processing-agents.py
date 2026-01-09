@@ -11,7 +11,7 @@ Author: Generated for GitHub Issue #23
 """
 
 import os
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import read_csv, write_csv
 
 def create_sample_urls_csv():
@@ -68,7 +68,7 @@ def method_1_simple_loop():
         goal="Process each task from the CSV file efficiently",
         backstory="Expert at handling repetitive tasks from CSV data",
         instructions="Process each task thoroughly and provide detailed output",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create a loop task that will automatically process each CSV row
@@ -81,7 +81,7 @@ def method_1_simple_loop():
     )
     
     # Initialize the agents system
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[loop_agent],
         tasks=[loop_task],
         process="workflow",
@@ -127,7 +127,7 @@ def method_2_manual_csv():
         4. Create a summary of the processing results
         5. Save results to a new CSV file if needed
         """,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create a task for manual CSV processing
@@ -145,7 +145,7 @@ def method_2_manual_csv():
     )
     
     # Initialize and run
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[csv_agent],
         tasks=[csv_task],
         process="sequential"
@@ -187,7 +187,7 @@ def method_3_url_processing():
         4. Create a detailed analysis report
         5. Save results with analysis data
         """,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create the URL processing task
@@ -211,7 +211,7 @@ def method_3_url_processing():
     )
     
     # Initialize and run
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[url_agent],
         tasks=[url_task],
         process="sequential"
@@ -264,7 +264,7 @@ def method_4_advanced_processing():
         4. Create separate files for valid and invalid data
         5. Provide detailed validation reports
         """,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create a processing agent
@@ -281,7 +281,7 @@ def method_4_advanced_processing():
         3. Generate comprehensive results
         4. Create detailed output reports
         """,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create validation task
@@ -319,7 +319,7 @@ def method_4_advanced_processing():
     )
     
     # Initialize and run with sequential processing
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[validator_agent, processor_agent],
         tasks=[validation_task, processing_task],
         process="sequential"  # Validation must complete before processing

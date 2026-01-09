@@ -10,7 +10,7 @@ Run this example:
     python 03_conditional_task_execution.py
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import json
 from typing import Dict, Any
 
@@ -239,9 +239,7 @@ finance_agent = Agent(
     goal="Ensure project stays within budget constraints",
     backstory="A financial expert who makes budget decisions",
     tools=[check_budget_status],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 cost_manager = Agent(
     name="CostManager",
@@ -249,9 +247,7 @@ cost_manager = Agent(
     goal="Reduce costs when budget is tight",
     backstory="A cost optimization specialist",
     tools=[reduce_costs],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 development_agent = Agent(
     name="DevelopmentAgent",
@@ -259,9 +255,7 @@ development_agent = Agent(
     goal="Develop features based on budget availability",
     backstory="A development manager who adapts to budget constraints",
     tools=[continue_development, expand_features],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 performance_agent = Agent(
     name="PerformanceAgent",
@@ -269,9 +263,7 @@ performance_agent = Agent(
     goal="Ensure optimal system performance",
     backstory="A performance engineer",
     tools=[check_performance, optimize_performance, scale_infrastructure, maintain_current_setup],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 report_agent = Agent(
     name="ReportAgent",
@@ -279,9 +271,7 @@ report_agent = Agent(
     goal="Document all decisions and actions taken",
     backstory="A reporting specialist",
     tools=[generate_decision_report],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 # Create conditional tasks
 budget_decision_task = Task(
@@ -376,7 +366,7 @@ report_task = Task(
 )
 
 # Create workflow
-workflow = PraisonAIAgents(
+workflow = Agents(
     agents=[finance_agent, cost_manager, development_agent, performance_agent, report_agent],
     tasks=[
         budget_decision_task,
@@ -389,7 +379,6 @@ workflow = PraisonAIAgents(
         maintain_setup_task,
         report_task
     ],
-    verbose=True,
     process="sequential"
 )
 

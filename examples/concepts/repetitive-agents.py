@@ -1,8 +1,8 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 agent = Agent(
     instructions="You are a loop agent that creating a loop of tasks.",
-    llm="gpt-5-nano"
+    llm="gpt-4o-mini"
 )
 
 task = Task(
@@ -12,7 +12,7 @@ task = Task(
     input_file="tasks.csv"
 )
 
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[agent],
     tasks=[task],
     process="workflow",

@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from typing import List, Dict
 from duckduckgo_search import DDGS
 
@@ -35,7 +35,7 @@ data_agent = Agent(
     goal="Perform internet searches to collect relevant information.",
     backstory="Expert in finding and organising internet data.",
     tools=[internet_search_tool],
-    self_reflect=False
+    reflection=False
 )
 
 # 3. Tasks
@@ -64,7 +64,7 @@ validate_task = Task(
 )
 
 # 4. AI Agents Workflow
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[data_agent],
     tasks=[collect_task, validate_task],
     verbose=1,

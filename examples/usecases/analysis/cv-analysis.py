@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from pydantic import BaseModel
 from typing import List, Dict
 
@@ -29,25 +29,19 @@ skill_analyst = Agent(
     role="Skills Analysis Expert",
     goal="Analyze technical and soft skills in CV",
     backstory="""You are an experienced skills analyst with deep knowledge of industry requirements 
-    and current market trends. You excel at identifying valuable skills and potential skill gaps.""",
-    verbose=True
-)
+    and current market trends. You excel at identifying valuable skills and potential skill gaps.""")
 
 experience_analyst = Agent(
     role="Experience Analysis Expert",
     goal="Analyze professional experience and achievements",
     backstory="""You are an expert in evaluating professional experience and achievements. 
-    You can identify impactful contributions and quantifiable results.""",
-    verbose=True
-)
+    You can identify impactful contributions and quantifiable results.""")
 
 cv_evaluator = Agent(
     role="Senior CV Evaluator",
     goal="Provide comprehensive CV evaluation and recommendations",
     backstory="""You are a senior CV evaluation expert with years of experience in talent assessment. 
-    You provide detailed analysis and actionable recommendations for CV improvement.""",
-    verbose=True
-)
+    You provide detailed analysis and actionable recommendations for CV improvement.""")
 
 # Create tasks with structured outputs
 skills_analysis_task = Task(
@@ -77,11 +71,10 @@ final_evaluation_task = Task(
 )
 
 # Create and run the agents
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[skill_analyst, experience_analyst, cv_evaluator],
     tasks=[skills_analysis_task, experience_analysis_task, final_evaluation_task],
-    process="sequential",
-    verbose=True
+    process="sequential", output="verbose"
 )
 
 # Start the analysis

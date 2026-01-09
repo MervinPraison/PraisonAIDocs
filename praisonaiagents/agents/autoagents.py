@@ -5,7 +5,7 @@ This class provides a simplified interface for creating and running AI agents wi
 It automatically handles agent creation, task setup, and execution flow.
 """
 
-from .agents import PraisonAIAgents
+from .agents import Agents
 from ..agent.agent import Agent
 from ..task.task import Task
 from typing import List, Any, Optional, Dict, Tuple
@@ -38,7 +38,7 @@ class AutoAgentsConfig(BaseModel):
     process_type: str
     agents: List[AgentConfig]
 
-class AutoAgents(PraisonAIAgents):
+class AutoAgents(Agents):
     def __init__(
         self,
         instructions: str,
@@ -56,7 +56,6 @@ class AutoAgents(PraisonAIAgents):
         min_reflect: int = 1,
         llm: Optional[str] = None,
         function_calling_llm: Optional[str] = None,
-        respect_context_window: bool = True,
         code_execution_mode: str = "safe",
         embedder_config: Optional[Dict[str, Any]] = None,
         knowledge_sources: Optional[List[Any]] = None,
@@ -73,7 +72,8 @@ class AutoAgents(PraisonAIAgents):
         reflect_llm: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-        max_agents: int = 3  # New parameter for maximum number of agents
+        max_agents: int = 3,  # Maximum number of agents
+        autonomy: Optional[Any] = None,  # Union[bool, dict, AutonomyConfig] - Enable autonomy for all agents
     ):
         """Initialize AutoAgents with configuration for automatic agent and task creation."""
         if max_agents < 1:
@@ -94,7 +94,6 @@ class AutoAgents(PraisonAIAgents):
         self.min_reflect = min_reflect
         self.llm = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
         self.function_calling_llm = function_calling_llm
-        self.respect_context_window = respect_context_window
         self.code_execution_mode = code_execution_mode
         self.embedder_config = embedder_config
         self.knowledge_sources = knowledge_sources
@@ -111,6 +110,7 @@ class AutoAgents(PraisonAIAgents):
         self.reflect_llm = reflect_llm
         self.base_url = base_url
         self.api_key = api_key
+        self.autonomy = autonomy  # Store autonomy config for agents
         
         # Display initial instruction
         if self.verbose:
@@ -446,7 +446,6 @@ DO NOT use strings for tasks. Each task MUST be a complete object with all four 
                 min_reflect=self.min_reflect,
                 llm=self.llm,
                 function_calling_llm=self.function_calling_llm,
-                respect_context_window=self.respect_context_window,
                 code_execution_mode=self.code_execution_mode,
                 embedder_config=self.embedder_config,
                 knowledge=self.knowledge_sources,
@@ -462,7 +461,8 @@ DO NOT use strings for tasks. Each task MUST be a complete object with all four 
                 max_iter=self.max_iter,
                 reflect_llm=self.reflect_llm,
                 base_url=self.base_url,
-                api_key=self.api_key
+                api_key=self.api_key,
+                autonomy=self.autonomy  # Pass autonomy config to agents
             )
             agents.append(agent)
             

@@ -20,7 +20,7 @@ Prerequisites:
 """
 
 import os
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 def main():
     """Demonstrate Gemini embedding usage"""
@@ -39,7 +39,7 @@ def main():
         role="Information Researcher",
         goal="Research and store important information about topics",
         backstory="Expert at analyzing and documenting information with semantic understanding",
-        llm="gpt-5-nano"  # Using GPT for chat, Gemini for embeddings
+        llm="gpt-4o-mini"  # Using GPT for chat, Gemini for embeddings
     )
     
     retriever = Agent(
@@ -47,7 +47,7 @@ def main():
         role="Information Retriever",
         goal="Retrieve relevant information from memory using semantic search",
         backstory="Specialist in finding and presenting stored information",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Task 1: Store information with semantic meaning
@@ -82,10 +82,9 @@ def main():
     
     # Configure with Gemini embeddings
     # Option 1: Using stable text-embedding-004
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[researcher, retriever],
         tasks=[store_task, retrieve_task],
-        verbose=True,
         memory=True,
         embedder={
             "provider": "gemini",
@@ -98,10 +97,10 @@ def main():
     )
     
     # Alternative: Using experimental model with advanced features
-    # agents = PraisonAIAgents(
+    # agents = Agents(
     #     agents=[researcher, retriever],
     #     tasks=[store_task, retrieve_task],
-    #     verbose=True,
+    #
     #     memory=True,
     #     embedder={
     #         "provider": "gemini",

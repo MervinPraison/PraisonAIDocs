@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import logging
 import os
 
@@ -24,9 +24,7 @@ knowledge_agent = Agent(
     goal="Store and retrieve knowledge efficiently",
     backstory="Expert in managing and utilizing stored knowledge",
     knowledge=["sample.pdf"],
-    knowledge_config=config,
-    verbose=True
-)
+    knowledge_config=config)
 
 # Define a task for the agent
 knowledge_task = Task(
@@ -37,7 +35,7 @@ knowledge_task = Task(
 )
 
 # Create and start the agents
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[knowledge_agent],
     tasks=[knowledge_task],
     process="sequential",

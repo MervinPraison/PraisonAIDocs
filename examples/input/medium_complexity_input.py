@@ -5,7 +5,7 @@ This example shows how to use multiple user inputs to create a more sophisticate
 agent system with tools, multiple agents, and context passing between tasks.
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import duckduckgo
 
 # Get multiple inputs
@@ -19,7 +19,7 @@ search_agent = Agent(
     goal=f"Find {num_results} relevant results about {topic}",
     backstory="Expert in internet research and data collection",
     tools=[duckduckgo],
-    self_reflect=False
+    reflection=False
 )
 
 # Create analysis agent
@@ -47,7 +47,7 @@ analyze_task = Task(
 )
 
 # Run sequential process
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[search_agent, analysis_agent],
     tasks=[search_task, analyze_task],
     process="sequential"

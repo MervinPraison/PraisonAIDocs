@@ -5,7 +5,7 @@ This example demonstrates graph memory capabilities with PraisonAI agents
 for knowledge graph construction and relationship-aware memory retrieval.
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import internet_search
 
 print("=== Advanced Graph Memory Integration Example ===\n")
@@ -30,9 +30,7 @@ knowledge_agent = Agent(
     goal="Build and retrieve from knowledge graphs",
     backstory="Expert at creating structured knowledge and finding relationships",
     tools=[internet_search],
-    memory=True,
-    verbose=True
-)
+    memory=True)
 
 # Task to build knowledge graph about AI companies
 build_task = Task(
@@ -59,12 +57,11 @@ query_task = Task(
 )
 
 # Run with graph memory integration
-agents_system = PraisonAIAgents(
+agents_system = Agents(
     agents=[knowledge_agent],
     tasks=[build_task, query_task],
     memory=True,
-    memory_config=memory_config,
-    verbose=True
+    memory_config=memory_config, output="verbose"
 )
 
 print("Starting graph memory demonstration...")

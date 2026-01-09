@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 # Define the configuration for the Knowledge instance
 config = {
@@ -16,7 +16,7 @@ rag_agent = Agent(
     name="RAG Agent",
     role="Information Specialist",
     goal="Retrieve knowledge efficiently",
-    llm="gpt-5-nano"
+    llm="gpt-4o-mini"
 )
 
 # Define a task for the agent
@@ -29,7 +29,7 @@ rag_task = Task(
 )
 
 # Build Agents
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[rag_agent],
     tasks=[rag_task],
     user_id="user1"

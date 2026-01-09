@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import logging
 import os
 
@@ -25,7 +25,7 @@ def main():
     # else:
     #     logger.info("Creating new memory database")
     
-    # Create task config (without memory config since it's moved to PraisonAIAgents)
+    # Create task config (without memory config since it's moved to Agents)
     task_config = {}
 
     # Create agents with different roles
@@ -33,14 +33,14 @@ def main():
         role="Research Analyst",
         goal="Research and document key information about topics",
         backstory="Expert at analyzing and storing information in memory",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     retriever = Agent(
         role="Information Retriever",
         goal="Retrieve and verify stored information from memory",
         backstory="Specialist in searching and validating information from memory",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
 
     # Task 1: Process the facts
@@ -100,11 +100,10 @@ def main():
         agent=retriever
     )
 
-    # Initialize PraisonAIAgents with memory configuration
-    agents = PraisonAIAgents(
+    # Initialize Agents with memory configuration
+    agents = Agents(
         agents=[researcher, retriever],
-        tasks=[store_task, verify_task, query_task, query_both_task],
-        verbose=True,  # Use same verbose level as memory
+        tasks=[store_task, verify_task, query_task, query_both_task],  # Use same verbose level as memory
         memory=True,
         embedder={
             "provider": "openai",
@@ -114,10 +113,10 @@ def main():
         }
     )
 
-    # agents = PraisonAIAgents(
+    # agents = Agents(
     #     agents=[researcher, retriever],
     #     tasks=[store_task, verify_task, query_task, query_both_task],
-    #     verbose=True,  # Use same verbose level as memory
+    #     # Use same verbose level as memory
     #     memory=True
     # )
     

@@ -19,7 +19,7 @@ Features demonstrated:
 """
 
 import os
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import mongodb_tools
 
 # Ensure OpenAI API key is set
@@ -37,8 +37,7 @@ def main():
         collections, and analyze data patterns. You excel at using MongoDB tools 
         for data management and retrieval.""",
         tools=[mongodb_tools],
-        verbose=True,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create a Data Analysis Agent
@@ -50,8 +49,7 @@ def main():
         from MongoDB databases. You can query data, perform aggregations, and 
         identify patterns and trends in the stored information.""",
         tools=[mongodb_tools],
-        verbose=True,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create tasks for MongoDB operations
@@ -113,10 +111,9 @@ def main():
     print("🚀 Starting MongoDB Tools Demo System...")
     print("=" * 60)
     
-    mongodb_system = PraisonAIAgents(
+    mongodb_system = Agents(
         agents=[db_agent, analysis_agent],
-        tasks=mongodb_tasks,
-        verbose=True
+        tasks=mongodb_tasks, output="verbose"
     )
     
     # Execute the MongoDB operations pipeline

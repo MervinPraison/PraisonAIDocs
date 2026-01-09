@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import time
 from typing import Dict, List
 
@@ -157,13 +157,12 @@ feedback_task = Task(
 )
 
 # Create workflow
-workflow = PraisonAIAgents(
+workflow = Agents(
     agents=[utility_monitor, pattern_analyzer, resource_optimizer, 
             implementation_agent, feedback_monitor],
     tasks=[monitoring_task, pattern_task, optimization_task, 
            implementation_task, feedback_task],
-    process="workflow",
-    verbose=True
+    process="workflow", output="verbose"
 )
 
 def main():

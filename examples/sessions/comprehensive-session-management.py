@@ -12,7 +12,7 @@ Features demonstrated:
 - Session-specific memory and knowledge
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.session import Session
 from praisonaiagents.tools import duckduckgo
 import tempfile
@@ -62,11 +62,10 @@ research_task1 = Task(
 )
 
 # Create agents with session
-agents_session1 = PraisonAIAgents(
+agents_session1 = Agents(
     agents=[research_agent],
     tasks=[research_task1],
-    session=session1,
-    verbose=True
+    session=session1, output="verbose"
 )
 
 # Execute first session
@@ -102,11 +101,10 @@ analysis_task = Task(
     context_variables={"previous_research": str(result1)}
 )
 
-agents_session2 = PraisonAIAgents(
+agents_session2 = Agents(
     agents=[analysis_agent],
     tasks=[analysis_task], 
-    session=session2,
-    verbose=True
+    session=session2, output="verbose"
 )
 
 print("Starting analysis session with previous context...")
@@ -153,11 +151,10 @@ synthesis_task = Task(
     }
 )
 
-agents_recovery = PraisonAIAgents(
+agents_recovery = Agents(
     agents=[synthesis_agent],
     tasks=[synthesis_task],
-    session=recovery_session,
-    verbose=True
+    session=recovery_session, output="verbose"
 )
 
 print("Starting recovery session with full context from previous sessions...")
@@ -204,11 +201,10 @@ review_task = Task(
     }
 )
 
-agents_reviewer = PraisonAIAgents(
+agents_reviewer = Agents(
     agents=[review_agent],
     tasks=[review_task],
-    session=reviewer_session,
-    verbose=True
+    session=reviewer_session, output="verbose"
 )
 
 print("Starting peer review session by different user...")

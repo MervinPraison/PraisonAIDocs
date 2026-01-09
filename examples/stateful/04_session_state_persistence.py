@@ -10,7 +10,7 @@ Run this example:
     python 04_session_state_persistence.py
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents, Session
+from praisonaiagents import Agent, Task, Agents, Session
 import json
 import time
 from datetime import datetime
@@ -155,9 +155,7 @@ data_processor = Agent(
     goal="Process all customer data efficiently",
     backstory="A data processing specialist",
     tools=[process_customer_data],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 status_monitor = Agent(
     name="StatusMonitor",
@@ -165,9 +163,7 @@ status_monitor = Agent(
     goal="Track and report processing progress",
     backstory="A monitoring specialist",
     tools=[check_processing_status, save_checkpoint],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 task_runner = Agent(
     name="TaskRunner",
@@ -175,9 +171,7 @@ task_runner = Agent(
     goal="Execute tasks that may span multiple sessions",
     backstory="A task execution specialist",
     tools=[simulate_long_task],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 report_generator = Agent(
     name="ReportGenerator",
@@ -185,9 +179,7 @@ report_generator = Agent(
     goal="Create comprehensive session reports",
     backstory="A reporting specialist",
     tools=[generate_session_report],
-    llm="gpt-5-nano",
-    verbose=True
-)
+    llm="gpt-4o-mini")
 
 # Create tasks for initial session
 initial_tasks = [
@@ -236,10 +228,9 @@ initial_tasks = [
 ]
 
 # Create workflow with memory enabled
-workflow = PraisonAIAgents(
+workflow = Agents(
     agents=[data_processor, status_monitor, task_runner, report_generator],
     tasks=initial_tasks,
-    verbose=True,
     process="sequential",
     memory=True  # Enable memory for persistence
 )
@@ -309,10 +300,9 @@ resumed_tasks = [
 ]
 
 # Create new workflow instance for resumed session
-resumed_workflow = PraisonAIAgents(
+resumed_workflow = Agents(
     agents=[data_processor, status_monitor, task_runner, report_generator],
     tasks=resumed_tasks,
-    verbose=True,
     process="sequential",
     memory=True
 )

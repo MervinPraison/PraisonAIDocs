@@ -8,7 +8,7 @@ This example demonstrates how to extract and utilize reasoning patterns in Prais
 - Decision rationale extraction
 """
 
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from typing import Dict, List, Tuple
 from pydantic import BaseModel
 import json
@@ -49,9 +49,9 @@ cot_agent = Agent(
 6. Assess your confidence level
 
 Always make your thinking process explicit and transparent.""",
-    self_reflect=True,
-    min_reflect=2,
-    max_reflect=3
+    reflection=True,
+    
+    
 )
 
 # Example 2: Reasoning Extractor Agent
@@ -100,11 +100,10 @@ def demonstrate_reasoning_extraction():
         context=[problem_task]
     )
     
-    workflow = PraisonAIAgents(
+    workflow = Agents(
         agents=[cot_agent, reasoning_extractor],
         tasks=[problem_task, extract_task],
-        process="sequential",
-        verbose=True
+        process="sequential", output="verbose"
     )
     
     return workflow.start()
@@ -184,11 +183,10 @@ def advanced_reasoning_patterns():
         context=[deductive_task, inductive_task, abductive_task]
     )
     
-    workflow = PraisonAIAgents(
+    workflow = Agents(
         agents=[cot_agent, reasoning_validator],
         tasks=[deductive_task, inductive_task, abductive_task, validation_task],
-        process="sequential",
-        verbose=True
+        process="sequential", output="verbose"
     )
     
     return workflow.start()
@@ -224,7 +222,7 @@ pattern_reasoning_agent = Agent(
 3. Counterfactual: Explore what-if scenarios
 4. Systems thinking: Consider interconnections
 5. Probabilistic: Assess likelihoods""",
-    self_reflect=True
+    reflection=True
 )
 
 # Example 8: Interactive Reasoning Extraction

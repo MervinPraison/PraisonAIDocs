@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents, error_logs
+from praisonaiagents import Agent, Task, Agents, error_logs
 from duckduckgo_search import DDGS
 
 def my_callback(output):
@@ -36,14 +36,13 @@ researcher = Agent(
     goal="Uncover cutting-edge developments in AI and data science",
     backstory="""You are an expert at a technology research group, 
     skilled in identifying trends and analyzing complex data.""",
-    verbose=True,
     allow_delegation=False,
     tools=[internet_search_tool],
-    llm="gpt-5-nano",
+    llm="gpt-4o-mini",
     markdown=True,
-    reflect_llm="gpt-5-nano",
-    min_reflect=2,
-    max_reflect=4
+    
+    
+    
 )
 writer = Agent(
     name="Writer",
@@ -51,9 +50,8 @@ writer = Agent(
     goal="Craft compelling content on tech advancements",
     backstory="""You are a content strategist known for 
     making complex tech topics interesting and easy to understand.""",
-    verbose=True,
     allow_delegation=True,
-    llm="gpt-5-nano",
+    llm="gpt-4o-mini",
     tools=[],
     markdown=True
 )
@@ -99,12 +97,12 @@ task4 = Task(
 )
 
 # Create and run agents manager
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[researcher, writer],
     tasks=[task1, task2, task3, task4],
-    verbose=False,
+    output="minimal",
     process="sequential",  # "sequential" or "hierarchical"
-    manager_llm="gpt-5-nano"
+    manager_llm="gpt-4o-mini"
 )
 
 result = agents.start()

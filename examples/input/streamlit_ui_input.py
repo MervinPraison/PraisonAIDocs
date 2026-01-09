@@ -10,7 +10,7 @@ To run this example:
 """
 
 import streamlit as st
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 from praisonaiagents.tools import duckduckgo
 
 # Set page configuration
@@ -30,7 +30,7 @@ with st.sidebar:
     # Model selection
     model = st.selectbox(
         "Select Model",
-        ["gpt-5-nano", "gpt-5-nano", "gpt-3.5-turbo", "claude-3-opus"],
+        ["gpt-4o-mini", "gpt-4o-mini", "gpt-3.5-turbo", "claude-3-opus"],
         index=0
     )
     
@@ -125,7 +125,7 @@ if st.button("🚀 Submit", type="primary", use_container_width=True):
                     )
                     
                     # Run agents
-                    agents = PraisonAIAgents(
+                    agents = Agents(
                         agents=[agent],
                         tasks=[task],
                         process=process_type

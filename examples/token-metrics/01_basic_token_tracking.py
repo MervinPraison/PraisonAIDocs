@@ -4,7 +4,7 @@ This example demonstrates the simplest way to enable token metrics
 tracking using just Agent(metrics=True). The token usage summary 
 will be automatically displayed when tasks complete!
 """
-from praisonaiagents import PraisonAIAgents, Agent, Task
+from praisonaiagents import Agents, Agent, Task
 
 def main():
     # Create a simple agent with metrics=True - that's it!
@@ -13,8 +13,7 @@ def main():
         role="Research Specialist", 
         goal="Find information about a topic",
         backstory="You are an expert researcher who finds comprehensive information.",
-        verbose=True,
-        llm="gpt-5-nano",  # Use a cost-effective model for examples
+        llm="gpt-4o-mini",  # Use a cost-effective model for examples
         metrics=True  # 🎯 SIMPLIFIED: Just add this parameter!
     )
     
@@ -26,10 +25,9 @@ def main():
     )
     
     # Initialize the agents system
-    agents = PraisonAIAgents(
+    agents = Agents(
         agents=[research_agent],
-        tasks=[research_task],
-        verbose=True
+        tasks=[research_task], output="verbose"
     )
     
     print("🚀 Running agent task...")

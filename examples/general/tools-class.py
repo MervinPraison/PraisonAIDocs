@@ -1,4 +1,4 @@
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 import os
 import requests
 from typing import Any, Dict, List, Optional
@@ -94,7 +94,7 @@ agent = Agent(
     goal="Search for information about 'AI Agents Framework'",
     backstory="I am an AI assistant that can search GitHub.",
     tools=[EXASearchTool],
-    self_reflect=False
+    reflection=False
 )
 
 # Create tasks to demonstrate both tools
@@ -106,10 +106,9 @@ task = Task(
 )
 
 # Create and start the workflow
-agents = PraisonAIAgents(
+agents = Agents(
     agents=[agent],
-    tasks=[task],
-    verbose=True
+    tasks=[task], output="verbose"
 )
 
 agents.start()
