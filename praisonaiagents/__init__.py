@@ -476,6 +476,62 @@ def _init_telemetry():
 _init_telemetry()
 
 
+def warmup(include_litellm: bool = False, include_openai: bool = True) -> dict:
+    """
+    Pre-import heavy dependencies to reduce first-call latency.
+    
+    NOTE: For default OpenAI usage (llm="gpt-4o-mini"), warmup is NOT needed.
+    The default path uses the native OpenAI SDK which is fast (~100ms import).
+    
+    Warmup is only beneficial when using LiteLLM backend, which is triggered by:
+    - Using "/" in model name (e.g., llm="openai/gpt-4o-mini")
+    - Passing a dict config (e.g., llm={"model": "gpt-4o-mini"})
+    - Using base_url parameter
+    
+    Args:
+        include_litellm: Pre-import LiteLLM (~2-3s). Only needed for multi-provider support.
+        include_openai: Pre-import OpenAI SDK (~100ms). Default path, usually fast.
+    
+    Returns:
+        dict: Timing information for each component warmed up
+    
+    Example:
+        # For LiteLLM multi-provider usage:
+        from praisonaiagents import warmup
+        warmup(include_litellm=True)  # Pre-load LiteLLM
+        
+        agent = Agent(llm="anthropic/claude-3-sonnet")  # Now faster
+        
+        # For default OpenAI usage, no warmup needed:
+        agent = Agent(llm="gpt-4o-mini")  # Already fast!
+    """
+    import time
+    timings = {}
+    
+    if include_openai:
+        start = time.perf_counter()
+        try:
+            import openai
+            timings['openai'] = (time.perf_counter() - start) * 1000
+        except ImportError:
+            timings['openai'] = -1  # Not available
+    
+    if include_litellm:
+        start = time.perf_counter()
+        try:
+            import litellm
+            # Also configure litellm to avoid first-call overhead
+            litellm.telemetry = False
+            litellm.set_verbose = False
+            litellm.drop_params = True
+            litellm.modify_params = True
+            timings['litellm'] = (time.perf_counter() - start) * 1000
+        except ImportError:
+            timings['litellm'] = -1  # Not available
+    
+    return timings
+
+
 __all__ = [
     # Core classes (lazy loaded)
     'Agent',
@@ -646,4 +702,6 @@ __all__ = [
     # Parse Utilities
     'is_policy_string',
     'parse_policy_string',
+    # Performance utilities
+    'warmup',
 ]

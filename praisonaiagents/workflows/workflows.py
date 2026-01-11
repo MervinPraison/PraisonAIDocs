@@ -243,12 +243,21 @@ class WorkflowStep:
     
     # ============================================================
     # CONSOLIDATED FEATURE PARAMS (workflow-centric API)
-    # Precedence: Instance > Config > String > Bool > Default
+    # Precedence: Instance > Config > Array > Dict > String > Bool > Default
     # ============================================================
     context: Optional[Any] = None  # Union[bool, List[str], WorkflowStepContextConfig] - context handling
     output: Optional[Any] = None  # Union[str, WorkflowStepOutputConfig] - output handling
     execution: Optional[Any] = None  # Union[str, WorkflowStepExecutionConfig] - execution control
     routing: Optional[Any] = None  # Union[List[str], WorkflowStepRoutingConfig] - branching
+    # NEW: Agent-like consolidated params for feature parity
+    autonomy: Optional[Any] = None  # Union[bool, AutonomyConfig] - agent autonomy
+    knowledge: Optional[Any] = None  # Union[bool, List[str], KnowledgeConfig] - RAG
+    web: Optional[Any] = None  # Union[bool, WebConfig] - web search/fetch
+    reflection: Optional[Any] = None  # Union[bool, ReflectionConfig] - self-reflection
+    memory: Optional[Any] = None  # Union[bool, MemoryConfig] - step-level memory
+    planning: Optional[Any] = None  # Union[bool, PlanningConfig] - step-level planning
+    hooks: Optional[Any] = None  # Union[List, HooksConfig] - step lifecycle hooks
+    caching: Optional[Any] = None  # Union[bool, CachingConfig] - step-level caching
     
     # Status tracking
     status: str = "pending"  # pending, running, completed, failed, skipped
@@ -268,6 +277,15 @@ class WorkflowStep:
     _on_error: str = field(default="stop", repr=False)
     _next_steps: Optional[List[str]] = field(default=None, repr=False)
     _branch_condition: Optional[Dict[str, List[str]]] = field(default=None, repr=False)
+    # NEW: Resolved configs for agent-like params
+    _autonomy_config: Optional[Any] = field(default=None, repr=False)
+    _knowledge_config: Optional[Any] = field(default=None, repr=False)
+    _web_config: Optional[Any] = field(default=None, repr=False)
+    _reflection_config: Optional[Any] = field(default=None, repr=False)
+    _memory_config: Optional[Any] = field(default=None, repr=False)
+    _planning_config: Optional[Any] = field(default=None, repr=False)
+    _hooks_config: Optional[Any] = field(default=None, repr=False)
+    _caching_config: Optional[Any] = field(default=None, repr=False)
     
     def __post_init__(self):
         """Resolve consolidated params to internal values."""
@@ -316,6 +334,106 @@ class WorkflowStep:
         if route_cfg:
             self._next_steps = route_cfg.next_steps
             self._branch_condition = route_cfg.branches
+        
+        # Resolve NEW agent-like params using canonical resolver
+        from ..config.param_resolver import resolve, ArrayMode
+        from ..config.presets import (
+            WEB_PRESETS, REFLECTION_PRESETS, AUTONOMY_PRESETS, KNOWLEDGE_PRESETS,
+        )
+        try:
+            from ..config.feature_configs import (
+                AutonomyConfig, KnowledgeConfig, WebConfig, ReflectionConfig,
+            )
+        except ImportError:
+            AutonomyConfig = KnowledgeConfig = WebConfig = ReflectionConfig = None
+        
+        # Resolve autonomy
+        if AutonomyConfig and self.autonomy is not None:
+            self._autonomy_config = resolve(
+                value=self.autonomy, param_name="autonomy",
+                config_class=AutonomyConfig, presets=AUTONOMY_PRESETS,
+                default=None,
+            )
+        
+        # Resolve knowledge
+        if KnowledgeConfig and self.knowledge is not None:
+            self._knowledge_config = resolve(
+                value=self.knowledge, param_name="knowledge",
+                config_class=KnowledgeConfig, presets=KNOWLEDGE_PRESETS,
+                array_mode=ArrayMode.SOURCES, default=None,
+            )
+        
+        # Resolve web
+        if WebConfig and self.web is not None:
+            self._web_config = resolve(
+                value=self.web, param_name="web",
+                config_class=WebConfig, presets=WEB_PRESETS,
+                default=None,
+            )
+        
+        # Resolve reflection
+        if ReflectionConfig and self.reflection is not None:
+            self._reflection_config = resolve(
+                value=self.reflection, param_name="reflection",
+                config_class=ReflectionConfig, presets=REFLECTION_PRESETS,
+                default=None,
+            )
+        
+        # Resolve memory (NEW for feature parity)
+        try:
+            from ..config.feature_configs import MemoryConfig
+            from ..config.presets import MEMORY_PRESETS
+        except ImportError:
+            MemoryConfig = None
+            MEMORY_PRESETS = {}
+        if MemoryConfig and self.memory is not None:
+            self._memory_config = resolve(
+                value=self.memory, param_name="memory",
+                config_class=MemoryConfig, presets=MEMORY_PRESETS,
+                default=None,
+            )
+        
+        # Resolve planning (NEW for feature parity)
+        try:
+            from ..config.feature_configs import PlanningConfig
+            from ..config.presets import PLANNING_PRESETS
+        except ImportError:
+            PlanningConfig = None
+            PLANNING_PRESETS = {}
+        if PlanningConfig and self.planning is not None:
+            self._planning_config = resolve(
+                value=self.planning, param_name="planning",
+                config_class=PlanningConfig, presets=PLANNING_PRESETS,
+                default=None,
+            )
+        
+        # Resolve hooks (NEW for feature parity)
+        try:
+            from ..config.feature_configs import HooksConfig
+        except ImportError:
+            HooksConfig = None
+        if HooksConfig and self.hooks is not None:
+            # Hooks don't have presets, just config class
+            if isinstance(self.hooks, list):
+                self._hooks_config = HooksConfig(callbacks=self.hooks)
+            elif hasattr(self.hooks, 'callbacks'):
+                self._hooks_config = self.hooks
+            else:
+                self._hooks_config = self.hooks
+        
+        # Resolve caching (NEW for feature parity)
+        try:
+            from ..config.feature_configs import CachingConfig
+            from ..config.presets import CACHING_PRESETS
+        except ImportError:
+            CachingConfig = None
+            CACHING_PRESETS = {}
+        if CachingConfig and self.caching is not None:
+            self._caching_config = resolve(
+                value=self.caching, param_name="caching",
+                config_class=CachingConfig, presets=CACHING_PRESETS,
+                default=None,
+            )
     
     # Property accessors for backward compatibility
     @property
@@ -439,13 +557,22 @@ class Workflow:
     
     # ============================================================
     # CONSOLIDATED FEATURE PARAMS (workflow-centric API)
-    # Precedence: Instance > Config > String > Bool > Default
+    # Precedence: Instance > Config > Array > Dict > String > Bool > Default
+    # Workflow is "Agents in an organised way" - supports same params as Agents
     # ============================================================
     output: Optional[Any] = None  # Union[str, WorkflowOutputConfig] - verbose/stream
     planning: Optional[Any] = False  # Union[bool, str, WorkflowPlanningConfig] - planning mode
     memory: Optional[Any] = None  # Union[bool, WorkflowMemoryConfig, instance] - memory
     hooks: Optional[Any] = None  # WorkflowHooksConfig - lifecycle callbacks
     context: Optional[Any] = False  # Union[bool, ManagerConfig, ContextManager] - context management
+    # NEW: Agent-like consolidated params for feature parity
+    autonomy: Optional[Any] = None  # Union[bool, AutonomyConfig] - agent autonomy
+    knowledge: Optional[Any] = None  # Union[bool, List[str], KnowledgeConfig] - RAG
+    guardrails: Optional[Any] = None  # Union[bool, Callable, GuardrailConfig] - validation
+    web: Optional[Any] = None  # Union[bool, WebConfig] - web search/fetch
+    reflection: Optional[Any] = None  # Union[bool, ReflectionConfig] - self-reflection
+    execution: Optional[Any] = None  # Union[str, ExecutionConfig] - execution control
+    caching: Optional[Any] = None  # Union[bool, CachingConfig] - caching
     
     # Status tracking
     status: str = "not_started"  # not_started, running, completed, failed
@@ -461,6 +588,12 @@ class Workflow:
     _hooks_config: Optional[Any] = field(default=None, repr=False)
     _context_manager: Optional[Any] = field(default=None, repr=False)
     _context_manager_initialized: bool = field(default=False, repr=False)
+    # NEW: Resolved configs for agent-like params (for propagation to steps/agents)
+    _autonomy_config: Optional[Any] = field(default=None, repr=False)
+    _knowledge_config: Optional[Any] = field(default=None, repr=False)
+    _guardrails_config: Optional[Any] = field(default=None, repr=False)
+    _web_config: Optional[Any] = field(default=None, repr=False)
+    _reflection_config: Optional[Any] = field(default=None, repr=False)
     
     def __post_init__(self):
         """Resolve consolidated params to internal values."""
@@ -490,6 +623,62 @@ class Workflow:
         
         # Resolve hooks param
         self._hooks_config = resolve_hooks_config(self.hooks)
+        
+        # Resolve NEW agent-like params using canonical resolver
+        # These are stored for propagation to steps/agents
+        from ..config.param_resolver import resolve, ArrayMode
+        from ..config.presets import (
+            WEB_PRESETS, REFLECTION_PRESETS, GUARDRAIL_PRESETS,
+            AUTONOMY_PRESETS, KNOWLEDGE_PRESETS,
+        )
+        try:
+            from ..config.feature_configs import (
+                AutonomyConfig, KnowledgeConfig, GuardrailConfig,
+                WebConfig, ReflectionConfig,
+            )
+        except ImportError:
+            AutonomyConfig = KnowledgeConfig = GuardrailConfig = None
+            WebConfig = ReflectionConfig = None
+        
+        # Resolve autonomy
+        if AutonomyConfig and self.autonomy is not None:
+            self._autonomy_config = resolve(
+                value=self.autonomy, param_name="autonomy",
+                config_class=AutonomyConfig, presets=AUTONOMY_PRESETS,
+                default=None,
+            )
+        
+        # Resolve knowledge
+        if KnowledgeConfig and self.knowledge is not None:
+            self._knowledge_config = resolve(
+                value=self.knowledge, param_name="knowledge",
+                config_class=KnowledgeConfig, presets=KNOWLEDGE_PRESETS,
+                array_mode=ArrayMode.SOURCES, default=None,
+            )
+        
+        # Resolve guardrails
+        if GuardrailConfig and self.guardrails is not None:
+            self._guardrails_config = resolve(
+                value=self.guardrails, param_name="guardrails",
+                config_class=GuardrailConfig, presets=GUARDRAIL_PRESETS,
+                default=None,
+            )
+        
+        # Resolve web
+        if WebConfig and self.web is not None:
+            self._web_config = resolve(
+                value=self.web, param_name="web",
+                config_class=WebConfig, presets=WEB_PRESETS,
+                default=None,
+            )
+        
+        # Resolve reflection
+        if ReflectionConfig and self.reflection is not None:
+            self._reflection_config = resolve(
+                value=self.reflection, param_name="reflection",
+                config_class=ReflectionConfig, presets=REFLECTION_PRESETS,
+                default=None,
+            )
     
     def to_dict(self) -> Dict[str, Any]:
         return {
