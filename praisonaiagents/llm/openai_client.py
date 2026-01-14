@@ -739,7 +739,8 @@ class OpenAIClient:
                                 content=content
                             ))
                             first_token_emitted = True
-                        else:
+                        elif _emit:
+                            # Emit DELTA_TEXT for subsequent tokens
                             stream_callback(StreamEvent(
                                 type=StreamEventType.DELTA_TEXT,
                                 timestamp=last_content_time,
@@ -988,7 +989,7 @@ class OpenAIClient:
     def create_completion(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         stream: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
@@ -1033,7 +1034,7 @@ class OpenAIClient:
     async def acreate_completion(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         stream: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
@@ -1078,7 +1079,7 @@ class OpenAIClient:
     def chat_completion_with_tools(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         execute_tool_fn: Optional[Callable] = None,
@@ -1125,6 +1126,10 @@ class OpenAIClient:
         iteration_count = 0
         
         while iteration_count < max_iterations:
+            # Trigger LLM callback for status/trace output
+            from ..main import execute_sync_callback
+            execute_sync_callback('llm_start', model=model, agent_name=None)
+            
             if stream:
                 # Process as streaming response with formatted tools
                 final_response = self.process_stream_response(
@@ -1200,6 +1205,35 @@ class OpenAIClient:
             if not final_response:
                 return None
             
+            # Trigger llm_end callback with metrics for debug output
+            llm_end_time = time.perf_counter()
+            llm_latency_ms = (llm_end_time - start_time) * 1000
+            
+            # Extract usage info if available
+            usage = getattr(final_response, 'usage', None)
+            tokens_in = getattr(usage, 'prompt_tokens', 0) if usage else 0
+            tokens_out = getattr(usage, 'completion_tokens', 0) if usage else 0
+            
+            # Calculate cost if litellm available
+            cost = None
+            try:
+                import litellm
+                if hasattr(final_response, 'model_dump'):
+                    cost = litellm.completion_cost(completion_response=final_response.model_dump())
+                elif isinstance(final_response, dict):
+                    cost = litellm.completion_cost(completion_response=final_response)
+            except Exception:
+                pass  # Cost calculation is optional
+            
+            execute_sync_callback(
+                'llm_end',
+                model=model,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost=cost,
+                latency_ms=llm_latency_ms
+            )
+            
             # Check for tool calls
             tool_calls = getattr(final_response.choices[0].message, 'tool_calls', None)
             
@@ -1235,17 +1269,19 @@ class OpenAIClient:
                     
                     # Always trigger callback for tool call tracking (even when verbose=False)
                     display_tool_call_fn = _get_display_tool_call()
-                    display_tool_call_fn(f"Calling function: {function_name}", console=console if verbose else None)
-                    
-                    if verbose and console:
-                        console.print(f"[dim]Arguments:[/dim] {arguments}")
                     
                     # Execute the tool
                     tool_result = execute_tool_fn(function_name, arguments)
                     results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
                     
-                    # Trigger callback with result
-                    display_tool_call_fn(f"Function {function_name} returned: {results_str[:200]}{'...' if len(results_str) > 200 else ''}", console=console if verbose else None)
+                    # Trigger callback with structured parameters for status output
+                    display_tool_call_fn(
+                        f"Calling function: {function_name}",
+                        console=console if verbose else None,
+                        tool_name=function_name,
+                        tool_input=arguments,
+                        tool_output=results_str[:200] if results_str else None
+                    )
                     
                     messages.append({
                         "role": "tool",
@@ -1266,7 +1302,7 @@ class OpenAIClient:
     async def achat_completion_with_tools(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         execute_tool_fn: Optional[Callable] = None,
@@ -1450,7 +1486,7 @@ class OpenAIClient:
     def chat_completion_with_tools_stream(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         execute_tool_fn: Optional[Callable] = None,
@@ -1602,7 +1638,7 @@ class OpenAIClient:
         self,
         messages: List[Dict[str, Any]],
         response_format: BaseModel,
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         **kwargs
     ) -> Any:
@@ -1636,7 +1672,7 @@ class OpenAIClient:
         self,
         messages: List[Dict[str, Any]],
         response_format: BaseModel,
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         **kwargs
     ) -> Any:

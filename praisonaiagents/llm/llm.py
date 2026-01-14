@@ -68,8 +68,8 @@ class LLM:
     MODEL_WINDOWS = {
         # OpenAI
         "gpt-4": 6144,                    # 8,192 actual
-        "gpt-5-nano": 96000,                  # 128,000 actual
-        "gpt-5-nano": 96000,            # 128,000 actual
+        "gpt-4o-mini": 96000,                  # 128,000 actual
+        "gpt-4o-mini": 96000,            # 128,000 actual
         "gpt-4-turbo": 96000,            # 128,000 actual
         "o1-preview": 96000,             # 128,000 actual
         "o1-mini": 96000,                # 128,000 actual
@@ -1540,6 +1540,7 @@ Now provide your final answer using this result."""
             max_iterations = 10  # Prevent infinite loops
             iteration_count = 0
             final_response_text = ""
+            response_text = ""  # Initialize to prevent UnboundLocalError on API errors
             stored_reasoning_content = None  # Store reasoning content from tool execution
             accumulated_tool_results = []  # Store all tool results across iterations
 
@@ -1547,6 +1548,10 @@ Now provide your final answer using this result."""
                 try:
                     # Get response from LiteLLM
                     current_time = time.time()
+                    
+                    # Trigger LLM callback for subsequent iterations (after tool calls)
+                    # Initial callback is in agent._chat_completion, so this triggers for all loop iterations
+                    execute_sync_callback('llm_start', model=self.model, agent_name=agent_name)
 
                     # If reasoning_steps is True, do a single non-streaming call
                     if reasoning_steps:
@@ -1568,6 +1573,39 @@ Now provide your final answer using this result."""
                         # Track token usage
                         if self.metrics:
                             self._track_token_usage(final_response, self.model)
+                        
+                        # Trigger llm_end callback with metrics for debug output
+                        llm_latency_ms = (time.time() - current_time) * 1000
+                        
+                        # Extract usage - handle both dict and ModelResponse object
+                        tokens_in = 0
+                        tokens_out = 0
+                        if isinstance(final_response, dict):
+                            usage = final_response.get("usage", {})
+                            tokens_in = usage.get("prompt_tokens", 0)
+                            tokens_out = usage.get("completion_tokens", 0)
+                        else:
+                            # ModelResponse object
+                            usage = getattr(final_response, 'usage', None)
+                            if usage:
+                                tokens_in = getattr(usage, 'prompt_tokens', 0) or 0
+                                tokens_out = getattr(usage, 'completion_tokens', 0) or 0
+                        
+                        # Calculate cost if available
+                        llm_cost = None
+                        try:
+                            llm_cost = litellm.completion_cost(completion_response=final_response)
+                        except Exception:
+                            pass
+                        
+                        execute_sync_callback(
+                            'llm_end',
+                            model=self.model,
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                            cost=llm_cost,
+                            latency_ms=llm_latency_ms
+                        )
                         
                         # Execute callbacks and display based on verbose setting
                         generation_time_val = time.time() - current_time
@@ -2154,6 +2192,16 @@ Now provide your final answer using this result."""
                                 
                                 logging.debug(f"[TOOL_EXEC_DEBUG] About to display tool call with message: {display_message}")
                                 display_tool_call(display_message, console=self.console)
+                            
+                            # Always trigger callback for status output (even when verbose=False)
+                            result_str = json.dumps(tool_result) if tool_result else "empty"
+                            execute_sync_callback(
+                                'tool_call',
+                                message=f"Calling function: {function_name}",
+                                tool_name=function_name,
+                                tool_input=arguments,
+                                tool_output=result_str[:200] if result_str else None
+                            )
                                 
                             # Check if this is Ollama provider
                             if self._is_ollama_provider():
@@ -3636,12 +3684,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             self.session_token_metrics = self.session_token_metrics + metrics
             
             # Track in global collector
+            # Extract provider from model string (e.g., 'openai' from 'openai/gpt-4o-mini')
+            provider = model.split('/')[0] if '/' in model else 'litellm'
             _token_collector.track_tokens(
                 model=model,
                 agent=self.current_agent_name,
                 metrics=metrics,
                 metadata={
-                    "provider": self.provider,
+                    "provider": provider,
                     "stream": False
                 }
             )

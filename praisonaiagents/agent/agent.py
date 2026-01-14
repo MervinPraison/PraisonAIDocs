@@ -297,7 +297,7 @@ class Agent:
             backstory: Background context shaping personality and decisions.
             instructions: Direct instructions (overrides role/goal/backstory). Recommended for simple agents.
             llm: Model name string ("gpt-4o", "anthropic/claude-3-sonnet") or LLM object.
-                Defaults to OPENAI_MODEL_NAME env var or "gpt-5-nano".
+                Defaults to OPENAI_MODEL_NAME env var or "gpt-4o-mini".
             model: Alias for llm parameter.
             function_calling_llm: Dedicated LLM for function calling. Deprecated: use llm=.
             llm_config: LLM configuration dict. Deprecated: use llm=.
@@ -449,8 +449,12 @@ class Agent:
             output = env_output
         
         # Use default output mode if not specified
+        # Track if user explicitly configured output (for respecting in start())
         if output is None:
             output = DEFAULT_OUTPUT_MODE
+            _has_explicit_output = False
+        else:
+            _has_explicit_output = True
         
         _output_config = resolve(
             value=output,
@@ -469,22 +473,43 @@ class Agent:
             output_style = getattr(_output_config, 'style', None)
             actions_trace = getattr(_output_config, 'actions_trace', False)  # Default False (silent)
             json_output = getattr(_output_config, 'json_output', False)
+            status_trace = getattr(_output_config, 'status_trace', False)  # New: clean inline status
+            simple_output = getattr(_output_config, 'simple_output', False)  # status preset: no timestamps
         else:
             # Fallback defaults match silent mode (zero overhead)
             verbose, markdown, stream, metrics, reasoning_steps = False, False, False, False, False
             actions_trace = False  # No callbacks by default
             json_output = False
+            status_trace = False
+            simple_output = False
         
-        # Enable actions output mode if configured
-        # This registers callbacks to capture tool calls and final output
-        if actions_trace:
+        # Enable trace output mode if configured (takes priority)
+        # This provides timestamped inline status with duration
+        if status_trace:
             try:
-                from ..output.actions import enable_actions_mode, is_actions_mode_enabled
-                if not is_actions_mode_enabled():
-                    output_format = "jsonl" if json_output else "text"
-                    enable_actions_mode(redact=True, use_color=True, format=output_format)
+                from ..output.trace import enable_trace_output, is_trace_output_enabled
+                if not is_trace_output_enabled():
+                    enable_trace_output(use_color=True, show_timestamps=True)
             except ImportError:
-                pass  # Actions module not available
+                pass  # Trace module not available
+        # Enable status output mode if configured (simple progress, no timestamps)
+        # This registers callbacks to capture tool calls and final output
+        elif actions_trace:
+            try:
+                from ..output.status import enable_status_output, is_status_output_enabled
+                if not is_status_output_enabled():
+                    output_format = "jsonl" if json_output else "text"
+                    # simple_output=True means status preset (no timestamps)
+                    # metrics=True means debug preset (show token/cost info)
+                    enable_status_output(
+                        redact=True,
+                        use_color=True,
+                        format=output_format,
+                        show_timestamps=not simple_output,
+                        show_metrics=metrics
+                    )
+            except ImportError:
+                pass  # Status module not available
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve EXECUTION param using unified resolver
@@ -775,7 +800,15 @@ class Agent:
 
         # If instructions are provided, use them to set role, goal, and backstory
         if instructions:
-            self.name = name or "Agent"
+            # Only use explicitly provided name, don't auto-generate from instructions
+            # Auto-generation was producing confusing names like "You Are Agent" from
+            # instructions like "You are a helpful assistant"
+            if name:
+                self.name = name
+            else:
+                # Don't auto-generate - None signals "no explicit name provided"
+                # Display logic will skip Agent Info panel when name is None
+                self.name = None
             self.role = role or "Assistant"
             self.goal = goal or instructions
             self.backstory = backstory or instructions
@@ -844,7 +877,7 @@ class Agent:
                     self.llm_instance = LLM(**llm_config)
                 else:
                     # Create LLM with model string and base_url
-                    model_name = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+                    model_name = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o-mini')
                     self.llm_instance = LLM(
                         model=model_name,
                         base_url=base_url,
@@ -907,7 +940,7 @@ class Agent:
                 ) from e
         # Otherwise, fall back to OpenAI environment/name
         else:
-            self.llm = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+            self.llm = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o-mini')
         # Handle tools parameter - ensure it's always a list
         if callable(tools):
             # If a single function/callable is passed, wrap it in a list
@@ -931,6 +964,7 @@ class Agent:
         self._memory_instance = None
         self._init_memory(memory, user_id)
         self.verbose = verbose
+        self._has_explicit_output_config = _has_explicit_output  # Track if user set output mode
         self.allow_delegation = allow_delegation
         self.step_callback = step_callback
         self.cache = cache
@@ -953,7 +987,7 @@ class Agent:
         self.min_reflect = min_reflect
         self.reflect_prompt = reflect_prompt
         # Use the same model selection logic for reflect_llm
-        self.reflect_llm = reflect_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+        self.reflect_llm = reflect_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o-mini')
         self._console = None  # Lazy load console when needed
         
         # Initialize system prompt
@@ -1089,6 +1123,13 @@ Your Goal: {self.goal}
         # Action trace mode - handled via display callbacks, not separate emitter
         self._actions_trace = actions_trace
 
+        # Telemetry
+        try:
+            from ..telemetry import get_telemetry
+            self._telemetry = get_telemetry()
+        except (ImportError, AttributeError):
+            self._telemetry = None
+
     @property
     def auto_memory(self):
         """AutoMemory instance for automatic memory extraction."""
@@ -1207,7 +1248,11 @@ Your Goal: {self.goal}
 
     @property
     def console(self):
-        """Lazily initialize Rich Console only when needed."""
+        """Lazily initialize Rich Console only when needed AND verbose is True."""
+        # Only return console if verbose mode is enabled
+        # This prevents panels from being shown in status/silent modes
+        if not self.verbose:
+            return None
         if self._console is None:
             from rich.console import Console
             self._console = Console()
@@ -1743,7 +1788,7 @@ Your Goal: {self.goal}
         elif hasattr(self, 'llm') and self.llm:
             model_name = self.llm
         else:
-            model_name = "gpt-5-nano"
+            model_name = "gpt-4o-mini"
         
         return supports_web_search(model_name)
     
@@ -1765,7 +1810,7 @@ Your Goal: {self.goal}
         elif hasattr(self, 'llm') and self.llm:
             model_name = self.llm
         else:
-            model_name = "gpt-5-nano"
+            model_name = "gpt-4o-mini"
         
         return supports_web_fetch(model_name)
     
@@ -2009,7 +2054,7 @@ Your Goal: {self.goal}
         
         Returns:
             The LLM model/instance being used by this agent.
-            - For standard models: returns the model string (e.g., "gpt-5-nano")
+            - For standard models: returns the model string (e.g., "gpt-4o-mini")
             - For custom LLM instances: returns the LLM instance object
             - For provider models: returns the LLM instance object
         """
@@ -2019,7 +2064,7 @@ Your Goal: {self.goal}
             return self.llm
         else:
             # Default fallback
-            return "gpt-5-nano"
+            return "gpt-4o-mini"
 
     def _ensure_knowledge_processed(self):
         """Ensure knowledge is initialized and processed when first accessed."""
@@ -2840,6 +2885,9 @@ Your Goal: {self.goal}"""
         """
         logging.debug(f"{self.name} executing tool {function_name} with arguments: {arguments}")
         
+        # NOTE: tool_call callback is triggered by display_tool_call in openai_client.py
+        # Do NOT call it here to avoid duplicate output
+        
         # Set up injection context for tools with Injected parameters
         from ..tools.injected import AgentState, with_injection_context
         state = AgentState(
@@ -3154,21 +3202,20 @@ Your Goal: {self.goal}"""
         
         This centralizes the logic for callback execution and display to avoid duplication.
         """
-        # Always execute callbacks regardless of verbose setting (only when not using custom LLM)
-        if not self._using_custom_llm:
-            execute_sync_callback(
-                'interaction',
-                message=prompt,
-                response=response,
-                markdown=self.markdown,
-                generation_time=generation_time,
-                agent_name=self.name,
-                agent_role=self.role,
-                agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
-                task_name=task_name,
-                task_description=task_description, 
-                task_id=task_id
-            )
+        # Always execute callbacks for status/trace output (regardless of LLM backend)
+        execute_sync_callback(
+            'interaction',
+            message=prompt,
+            response=response,
+            markdown=self.markdown,
+            generation_time=generation_time,
+            agent_name=self.name,
+            agent_role=self.role,
+            agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
+            task_name=task_name,
+            task_description=task_description, 
+            task_id=task_id
+        )
         # Always display final interaction when verbose is True to ensure consistent formatting
         # This ensures both OpenAI and custom LLM providers (like Gemini) show formatted output
         if self.verbose and not self._final_display_shown:
@@ -3719,7 +3766,7 @@ Your Goal: {self.goal}"""
                             if self.verbose:
                                 logging.debug(f"Agent {self.name} final response: {response_text}")
                             # Return only reasoning content if reasoning_steps is True
-                            if reasoning_steps and hasattr(response.choices[0].message, 'reasoning_content'):
+                            if reasoning_steps and hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                                 # Apply guardrail to reasoning content
                                 try:
                                     validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id)
@@ -3871,6 +3918,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
     async def achat(self, prompt: str, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None):
         """Async version of chat method with self-reflection support.""" 
+        # Track execution via telemetry
+        if hasattr(self, '_telemetry') and self._telemetry:
+            self._telemetry.track_agent_execution(self.name, success=True)
+            
         # Reset the final display flag for each new conversation
         self._final_display_shown = False
         
@@ -4244,7 +4295,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         final_response = process_stream_chunks(chunks)
                         # Return only reasoning content if reasoning_steps is True
-                        if reasoning_steps and hasattr(final_response.choices[0].message, 'reasoning_content'):
+                        if reasoning_steps and hasattr(final_response.choices[0].message, 'reasoning_content') and final_response.choices[0].message.reasoning_content:
                             return final_response.choices[0].message.reasoning_content
                         return final_response.choices[0].message.content if final_response else full_response_text
 
@@ -4269,8 +4320,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         Returns:
             The agent's response as a string
         """
-        # Force non-streaming, non-display for production use
-        kwargs['stream'] = False
+        # Remove stream from kwargs since achat() doesn't accept it
+        kwargs.pop('stream', None)
         return await self.achat(prompt, **kwargs)
 
     async def astart(self, prompt: str, **kwargs):
@@ -4301,15 +4352,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
     def run(self, prompt: str, **kwargs):
         """Execute agent silently and return structured result.
         
-        Production-friendly execution. Does not stream or display output by default.
-        Use this for programmatic/scripted usage where you want the result only.
+        Production-friendly execution. Always uses silent mode with no streaming
+        or verbose display, regardless of TTY status. Use this for programmatic,
+        scripted, or automated usage where you want just the result.
         
         Args:
             prompt: The input prompt to process
             **kwargs: Additional arguments:
                 - stream (bool): Force streaming if True. Default: False
-                - display (bool): Force terminal display if True. Default: False
-                - output (str): Output preset override
+                - output (str): Output preset override (rarely needed)
                 
         Returns:
             The agent's response as a string
@@ -4320,6 +4371,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             result = agent.run("What is 2+2?")  # Silent, returns "4"
             print(result)
             ```
+            
+        Note:
+            Unlike .start() which enables verbose output in TTY for interactive
+            use, .run() is always silent. This makes it suitable for:
+            - Production pipelines
+            - Automated scripts
+            - Background processing
+            - API endpoints
         """
         # Production defaults: no streaming, no display
         if 'stream' not in kwargs:
@@ -4471,18 +4530,20 @@ Write the complete compiled report:"""
         
         # Chat history is preserved in self.chat_history (no action needed)
 
-    def start(self, prompt: str, **kwargs):
-        """Start the agent interactively with streaming output.
+    def start(self, prompt: str = None, **kwargs):
+        """Start the agent interactively with verbose output.
         
-        Beginner-friendly execution. Streams output by default when running in a TTY.
-        Use this for interactive/terminal usage where you want to see output in real-time.
+        Beginner-friendly execution. Defaults to verbose output with streaming
+        when running in a TTY. Use this for interactive/terminal usage where 
+        you want to see output in real-time with rich formatting.
         
         Args:
-            prompt: The input prompt to process
+            prompt: The input prompt to process. If not provided, uses the 
+                    agent's instructions as the task (useful when instructions
+                    already describe what the agent should do).
             **kwargs: Additional arguments:
                 - stream (bool | None): Override streaming. None = auto-detect TTY
-                - display (bool | None): Override display. None = auto (True if streaming)
-                - output (str): Output preset override
+                - output (str): Output preset override (e.g., "silent", "verbose")
                 
         Returns:
             - If streaming: Generator yielding response chunks
@@ -4490,20 +4551,31 @@ Write the complete compiled report:"""
             
         Example:
             ```python
-            agent = Agent(instructions="You are helpful")
+            # Minimal usage - instructions IS the task
+            agent = Agent(instructions="Research AI trends and summarize")
+            result = agent.start()  # Uses instructions as task
             
-            # Interactive use - streams by default in terminal
-            for chunk in agent.start("Tell me a story"):
-                print(chunk, end="", flush=True)
-            
-            # Or let it handle display automatically
-            result = agent.start("What is 2+2?")  # Streams if TTY
+            # With explicit prompt (overrides/adds to instructions)
+            agent = Agent(instructions="You are a helpful assistant")
+            result = agent.start("What is 2+2?")  # Uses prompt as task
             ```
+            
+        Note:
+            Unlike .run() which is always silent (production use), .start()
+            enables verbose output by default when in a TTY for beginner-friendly
+            interactive use. Use .run() for programmatic/scripted usage.
         """
         import sys
         
+        # If no prompt provided, use instructions as the task
+        if prompt is None:
+            prompt = self.instructions or "Hello"
+        
         # Load history from past sessions
         self._load_history_context()
+        
+        # Determine if we're in an interactive TTY
+        is_tty = sys.stdout.isatty()
         
         # Determine streaming behavior
         # Priority: explicit kwarg > agent's stream attribute > TTY detection
@@ -4514,24 +4586,197 @@ Write the complete compiled report:"""
                 stream_requested = self.stream
             else:
                 # Auto-detect: stream if stdout is a TTY (interactive terminal)
-                stream_requested = sys.stdout.isatty()
+                stream_requested = is_tty
         
-        # Check if planning mode is enabled
-        if self.planning:
-            result = self._start_with_planning(prompt, **kwargs)
-        elif stream_requested:
-            # Return a generator for streaming response
-            kwargs['stream'] = True
-            result = self._start_stream(prompt, **kwargs)
-        else:
-            # Return regular chat response
-            kwargs['stream'] = False
-            result = self.chat(prompt, **kwargs)
+        # ─────────────────────────────────────────────────────────────────────
+        # Enable verbose output in TTY for beginner-friendly interactive use
+        # Priority: agent's explicit output config > start() override > TTY auto
+        # ─────────────────────────────────────────────────────────────────────
+        original_verbose = self.verbose
+        original_markdown = self.markdown
+        output_override = kwargs.pop('output', None)  # Pop to prevent passing to chat()
         
-        # Auto-save session if enabled
-        self._auto_save_session()
+        # Check if agent was configured with explicit output mode (not default)
+        # If so, respect it and don't auto-enable verbose for TTY
+        has_explicit_output = getattr(self, '_has_explicit_output_config', False)
         
-        return result
+        try:
+            # Apply output override from start() call if provided
+            if output_override:
+                # Apply explicit output preset for this call
+                from ..config.presets import OUTPUT_PRESETS
+                if output_override in OUTPUT_PRESETS:
+                    preset = OUTPUT_PRESETS[output_override]
+                    self.verbose = preset.get('verbose', False)
+                    self.markdown = preset.get('markdown', False)
+            # Only auto-enable verbose for TTY if NO explicit output was configured
+            elif is_tty and not has_explicit_output:
+                self.verbose = True
+                self.markdown = True
+            
+            # Check if planning mode is enabled
+            if self.planning:
+                result = self._start_with_planning(prompt, **kwargs)
+            elif stream_requested:
+                # Return a generator for streaming response
+                kwargs['stream'] = True
+                result = self._start_stream(prompt, **kwargs)
+            else:
+                # Return regular chat response with animated working status
+                kwargs['stream'] = False
+                
+                # Show animated status during LLM call if verbose
+                if self.verbose and is_tty:
+                    from rich.live import Live
+                    from rich.console import Group
+                    from rich.status import Status
+                    from ..main import PRAISON_COLORS, sync_display_callbacks
+                    import threading
+                    import time as time_module
+                    
+                    console = Console()
+                    start_time = time_module.time()
+                    
+                    # ─────────────────────────────────────────────────────────────
+                    # Shared state for dynamic status messages (thread-safe)
+                    # Updated by callbacks during tool execution
+                    # ─────────────────────────────────────────────────────────────
+                    current_status = ["Analyzing query..."]
+                    tools_called = []
+                    
+                    # Register a temporary callback to track tool calls
+                    def status_tool_callback(**kwargs):
+                        tool_name = kwargs.get('tool_name', '')
+                        if tool_name:
+                            tools_called.append(tool_name)
+                            current_status[0] = f"Calling tool: {tool_name}..."
+                    
+                    # Store original callback and register ours
+                    original_tool_callback = sync_display_callbacks.get('tool_call')
+                    sync_display_callbacks['tool_call'] = status_tool_callback
+                    
+                    # Animation state
+                    result_holder = [None]
+                    error_holder = [None]
+                    
+                    # Temporarily disable verbose in chat to prevent duplicate output
+                    original_verbose_chat = self.verbose
+                    
+                    def run_chat():
+                        try:
+                            # Suppress verbose during animation - we'll display result ourselves
+                            self.verbose = False
+                            current_status[0] = "Sending to LLM..."
+                            result_holder[0] = self.chat(prompt, **kwargs)
+                            current_status[0] = "Finalizing response..."
+                        except Exception as e:
+                            error_holder[0] = e
+                        finally:
+                            self.verbose = original_verbose_chat
+                            # Restore original callback
+                            if original_tool_callback:
+                                sync_display_callbacks['tool_call'] = original_tool_callback
+                            elif 'tool_call' in sync_display_callbacks:
+                                del sync_display_callbacks['tool_call']
+                    
+                    # Start chat in background thread
+                    chat_thread = threading.Thread(target=run_chat)
+                    chat_thread.start()
+                    
+                    from rich.panel import Panel
+                    from rich.text import Text
+                    from rich.markdown import Markdown
+                    
+                    # ─────────────────────────────────────────────────────────────
+                    # Smart Agent Info: Only show if user provided meaningful info
+                    # Skip if using defaults ("Agent"/"Assistant") with single agent
+                    # ─────────────────────────────────────────────────────────────
+                    has_custom_name = self.name and self.name not in ("Agent", "agent", None, "")
+                    has_custom_role = self.role and self.role not in ("Assistant", "AI Assistant", "assistant", None, "")
+                    has_tools = bool(self.tools)
+                    
+                    show_agent_info = has_custom_name or has_custom_role or has_tools
+                    
+                    agent_panel = None
+                    if show_agent_info:
+                        agent_info_parts = []
+                        if has_custom_name:
+                            agent_info_parts.append(f"[bold {PRAISON_COLORS['task']}]👤 Agent:[/] [{PRAISON_COLORS['agent_text']}]{self.name}[/]")
+                        if has_custom_role:
+                            agent_info_parts.append(f"[bold {PRAISON_COLORS['metrics']}]Role:[/] [{PRAISON_COLORS['agent_text']}]{self.role}[/]")
+                        if has_tools:
+                            tools_list = [t.__name__ if hasattr(t, '__name__') else str(t) for t in self.tools][:5]
+                            tools_str = ", ".join(f"[italic {PRAISON_COLORS['response']}]{tool}[/]" for tool in tools_list)
+                            agent_info_parts.append(f"[bold {PRAISON_COLORS['agent']}]Tools:[/] {tools_str}")
+                        
+                        agent_panel = Panel(
+                            "\n".join(agent_info_parts), 
+                            border_style=PRAISON_COLORS["agent"], 
+                            title="[bold]Agent Info[/]", 
+                            title_align="left", 
+                            padding=(1, 2)
+                        )
+                    
+                    # Create task panel
+                    task_panel = Panel.fit(
+                        Markdown(prompt) if self.markdown else Text(prompt),
+                        title="Task",
+                        border_style=PRAISON_COLORS["task"]
+                    )
+                    
+                    # Show initial panels (agent info if applicable, then task)
+                    if agent_panel:
+                        console.print(agent_panel)
+                    console.print(task_panel)
+                    
+                    # ─────────────────────────────────────────────────────────────
+                    # Animate with Rich.Status showing DYNAMIC status from callbacks
+                    # ─────────────────────────────────────────────────────────────
+                    with console.status(
+                        f"[bold yellow]Working...[/]  {current_status[0]}", 
+                        spinner="dots",
+                        spinner_style="yellow"
+                    ) as status:
+                        last_status = current_status[0]
+                        while chat_thread.is_alive():
+                            time_module.sleep(0.15)  # More responsive updates
+                            # Only update if status changed (reduces flicker)
+                            if current_status[0] != last_status:
+                                last_status = current_status[0]
+                            status.update(f"[bold yellow]Working...[/]  {current_status[0]}")
+                    
+                    # Calculate elapsed time
+                    elapsed = time_module.time() - start_time
+                    
+                    # Re-raise any error from chat
+                    if error_holder[0]:
+                        raise error_holder[0]
+                    
+                    result = result_holder[0]
+                    
+                    # Display response panel
+                    response_panel = Panel.fit(
+                        Markdown(str(result)) if self.markdown else Text(str(result)),
+                        title=f"Response ({elapsed:.1f}s)",
+                        border_style=PRAISON_COLORS["response"]
+                    )
+                    console.print(response_panel)
+                    
+                    # Show tool activity summary if tools were called
+                    if tools_called:
+                        tools_summary = ", ".join(tools_called)
+                        console.print(f"[dim]🔧 Tools used: {tools_summary}[/dim]")
+                else:
+                    result = self.chat(prompt, **kwargs)
+            
+            # Auto-save session if enabled
+            self._auto_save_session()
+            
+            return result
+        finally:
+            # Restore original output settings
+            self.verbose = original_verbose
+            self.markdown = original_markdown
     
     def iter_stream(self, prompt: str, **kwargs):
         """Stream agent response as an iterator of chunks.

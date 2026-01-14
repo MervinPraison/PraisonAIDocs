@@ -39,6 +39,16 @@ MEMORY_URL_SCHEMES: Dict[str, str] = {
 # =============================================================================
 # Output Presets
 # =============================================================================
+# 
+# Preset Hierarchy (from least to most output):
+#   silent  → Nothing (default for SDK, max performance)
+#   text    → Response only, simple format
+#   verbose → Task + Tools inline + Response panel
+#   debug   → verbose + metrics footer (tokens, cost, model)
+#   stream  → Real-time token streaming
+#   json    → Machine-readable JSONL events
+#
+# =============================================================================
 
 OUTPUT_PRESETS: Dict[str, Dict[str, Any]] = {
     # Silent preset - DEFAULT for SDK
@@ -52,53 +62,51 @@ OUTPUT_PRESETS: Dict[str, Dict[str, Any]] = {
         "reasoning_steps": False,
         "actions_trace": False,
     },
-    # Actions preset - opt-in observability
-    # Shows action trace (tool calls, agent lifecycle) + final output
-    # Registers callbacks, outputs to stderr
-    "actions": {
+    # Status preset - Shows tool calls and response without timestamps
+    # Simple progress indicator: ▸ tool → result ✓
+    "status": {
         "verbose": False,
         "markdown": False,
         "stream": False,
         "metrics": False,
         "reasoning_steps": False,
-        "actions_trace": True,  # Special flag for action trace mode
+        "actions_trace": True,
+        "simple_output": True,  # Simple format without timestamps
     },
-    # Plain preset - final output only, no action trace
-    "plain": {
+    # Trace preset - Full execution trace with timestamps
+    # Shows: [HH:MM:SS] ▸ tool → result [0.2s] ✓
+    # Ideal for debugging and monitoring
+    "trace": {
         "verbose": False,
         "markdown": False,
         "stream": False,
         "metrics": False,
         "reasoning_steps": False,
-        "actions_trace": False,
+        "actions_trace": True,
+        "status_trace": True,  # Enable timestamped status output
     },
-    "minimal": {
-        "verbose": False,
-        "markdown": False,
-        "stream": False,
-        "metrics": False,
-        "reasoning_steps": False,
-    },
-    "normal": {
-        "verbose": True,
-        "markdown": True,
-        "stream": False,
-        "metrics": False,
-        "reasoning_steps": False,
-    },
+    # Verbose preset - Full interactive output with panels
+    # Shows: Task prompt, Tool calls (inline), Response panel
+    # Best for interactive terminal use
     "verbose": {
         "verbose": True,
         "markdown": True,
         "stream": False,
-        "metrics": True,
-        "reasoning_steps": True,
+        "metrics": False,
+        "reasoning_steps": False,
     },
+    # Debug preset - trace + metrics (NO boxes)
+    # Shows: [timestamp] tool calls, metrics footer, reasoning steps
+    # Best for developers debugging agent behavior
     "debug": {
-        "verbose": True,
-        "markdown": True,
+        "verbose": False,  # No boxes
+        "markdown": False,
         "stream": False,
-        "metrics": True,
+        "metrics": True,  # Shows metrics footer
         "reasoning_steps": True,
+        "actions_trace": True,
+        "status_trace": True,  # Timestamps like trace
+        "show_parameters": True,
     },
     # Streaming preset - enables streaming by default
     "stream": {
@@ -108,7 +116,7 @@ OUTPUT_PRESETS: Dict[str, Dict[str, Any]] = {
         "metrics": False,
         "reasoning_steps": False,
     },
-    # JSON preset - JSONL output for piping
+    # JSON preset - JSONL output for piping/scripting
     "json": {
         "verbose": False,
         "markdown": False,
@@ -118,11 +126,61 @@ OUTPUT_PRESETS: Dict[str, Dict[str, Any]] = {
         "actions_trace": True,
         "json_output": True,  # Output as JSONL
     },
+    
+    # ==========================================================================
+    # ALIASES (for backward compatibility)
+    # ==========================================================================
+    # plain → silent (identical behavior)
+    "plain": {
+        "verbose": False,
+        "markdown": False,
+        "stream": False,
+        "metrics": False,
+        "reasoning_steps": False,
+        "actions_trace": False,
+    },
+    # minimal → silent (identical behavior)
+    "minimal": {
+        "verbose": False,
+        "markdown": False,
+        "stream": False,
+        "metrics": False,
+        "reasoning_steps": False,
+    },
+    # normal → verbose (consolidated)
+    "normal": {
+        "verbose": True,
+        "markdown": True,
+        "stream": False,
+        "metrics": False,
+        "reasoning_steps": False,
+    },
+    # actions → status (renamed for clarity)
+    "actions": {
+        "verbose": False,
+        "markdown": False,
+        "stream": False,
+        "metrics": False,
+        "reasoning_steps": False,
+        "actions_trace": True,
+        "simple_output": True,
+    },
+    # text → status (old name, kept for backward compat)
+    "text": {
+        "verbose": False,
+        "markdown": False,
+        "stream": False,
+        "metrics": False,
+        "reasoning_steps": False,
+        "actions_trace": True,
+        "simple_output": True,
+    },
 }
 
 # Default output mode - can be overridden by PRAISONAI_OUTPUT env var
 # "silent" = zero overhead, fastest performance (DEFAULT)
-# "actions" = tool call trace + final output (opt-in observability)
+# "verbose" = full interactive display
+# "debug" = verbose + metrics
 DEFAULT_OUTPUT_MODE = "silent"
 
 

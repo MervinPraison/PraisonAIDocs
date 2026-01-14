@@ -363,7 +363,7 @@ class Agents:
         self.variables = variables if variables else {}
         
         # Check for manager_llm in environment variable if not provided
-        self.manager_llm = manager_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+        self.manager_llm = manager_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o-mini')
         
         # Set logger level based on verbose
         if _verbose >= 5:
@@ -466,9 +466,15 @@ class Agents:
         
         if self.shared_memory:
             for task in tasks:
-                if not task.memory:
                     task.memory = self.shared_memory
                     logger.info(f"Assigned shared memory to task {task.id}")
+
+        # Telemetry
+        try:
+            from ..telemetry import get_telemetry
+            self._telemetry = get_telemetry()
+        except (ImportError, AttributeError):
+            self._telemetry = None
 
     def add_task(self, task):
         task_id = self.task_id_counter
@@ -821,13 +827,17 @@ Context:
                     await loop.run_in_executor(None, self.run_task, task_id)
 
     async def astart(self, content=None, return_dict=False, **kwargs):
-        """Async version of start method
+        """Async version of start method.
         
         Args:
             content: Optional content to add to all tasks' context
             return_dict: If True, returns the full results dictionary instead of only the final response
             **kwargs: Additional arguments
         """
+        # Track execution via telemetry
+        if hasattr(self, '_telemetry') and self._telemetry:
+            self._telemetry.track_agent_execution(self.name, success=True, async_mode=True)
+            
         if content:
             # Add content to context of all tasks
             for task in self.tasks.values():
@@ -1193,30 +1203,147 @@ Context:
             return str(agent[0])
         return None
 
-    def start(self, content=None, return_dict=False, **kwargs):
-        """Start agent execution with optional content and config
+    def start(self, content=None, return_dict=False, output=None, **kwargs):
+        """Start agent execution with verbose output (beginner-friendly).
+        
+        Shows Rich panels with workflow progress when in TTY. Use .run() for
+        silent execution in production/scripts.
         
         Args:
             content: Optional content to add to all tasks' context
-            return_dict: If True, returns the full results dictionary instead of only the final response
+            return_dict: If True, returns the full results dictionary
+            output: Output preset - "silent", "verbose", "normal", etc.
+                    Default in TTY: "verbose" (shows progress)
+                    Default non-TTY: "silent"
             **kwargs: Additional arguments
+            
+        Example:
+            ```python
+            # Interactive - shows Rich panels
+            agents = Agents(agents=[agent1, agent2])
+            result = agents.start()  # Verbose output by default
+            
+            # Force silent mode
+            result = agents.start(output="silent")
+            ```
         """
+        # Track execution via telemetry
+        if hasattr(self, '_telemetry') and self._telemetry:
+            self._telemetry.track_agent_execution(self.name, success=True)
+        import sys
+        from ..main import PRAISON_COLORS
+        
+        # Determine if we're in an interactive TTY
+        is_tty = sys.stdout.isatty()
+        
+        # Resolve output mode (TTY-aware)
+        if output is None:
+            # Default: verbose in TTY (beginner-friendly), silent otherwise
+            # Note: Don't check self.verbose here - start() is for interactive use
+            show_verbose = is_tty
+        elif output == "silent":
+            show_verbose = False
+        elif output in ("verbose", "debug", "normal"):
+            show_verbose = True
+        else:
+            show_verbose = is_tty
+        
+        # Add content to context if provided
         if content:
-            # Add content to context of all tasks
             for task in self.tasks.values():
                 if isinstance(content, (str, list)):
-                    # If context is empty, initialize it
                     if not task.context:
                         task.context = []
-                    # Add content to context
                     task.context.append(content)
         
-        # Planning Mode: Create plan and todo list before execution
-        if self.planning:
-            self._run_with_planning()
+        # ─────────────────────────────────────────────────────────────
+        # Verbose Mode: Show Rich panels for multi-agent workflow
+        # ─────────────────────────────────────────────────────────────
+        if show_verbose and is_tty:
+            from rich.panel import Panel
+            from rich.text import Text
+            console = Console()
+            import time as time_module
+            
+            # Show workflow overview panel
+            agent_names = " → ".join([a.name for a in self.agents])
+            workflow_info = f"[bold {PRAISON_COLORS['metrics']}]Process:[/] {self.process}\n"
+            workflow_info += f"[bold {PRAISON_COLORS['metrics']}]Agents:[/] {agent_names}"
+            
+            console.print(Panel(
+                workflow_info,
+                title="[bold]Multi-Agent Workflow[/]",
+                border_style=PRAISON_COLORS["agent"],
+                padding=(1, 2)
+            ))
+            console.print()
+            
+            # Execute tasks with verbose output
+            total_agents = len(self.agents)
+            workflow_start_time = time_module.time()
+            
+            for idx, (task_id, task) in enumerate(self.tasks.items(), 1):
+                agent = task.agent
+                agent_name = agent.name if agent else "Unknown"
+                agent_model = getattr(agent, 'llm', 'gpt-4o-mini') if agent else "unknown"
+                
+                # Show agent task panel with model info
+                task_desc = task.description[:100] + "..." if len(task.description) > 100 else task.description
+                panel_content = f"[bold {PRAISON_COLORS['task_text']}]📋 Task:[/] {task_desc}\n"
+                panel_content += f"[dim]🤖 Model: {agent_model}[/dim]"
+                console.print(Panel.fit(
+                    panel_content,
+                    title=f"[bold]Agent [{idx}/{total_agents}]: {agent_name}[/]",
+                    border_style=PRAISON_COLORS["task"]
+                ))
+                
+                # Execute with timing and status
+                start_time = time_module.time()
+                
+                # Show working spinner
+                with console.status(
+                    f"[bold yellow]Working...[/]  {agent_name} generating response...",
+                    spinner="dots",
+                    spinner_style="yellow"
+                ):
+                    # Run the task
+                    if self.planning:
+                        self._run_with_planning()
+                        break  # Planning mode handles all tasks
+                    else:
+                        self.run_task(task_id)
+                
+                elapsed = time_module.time() - start_time
+                
+                # Show response panel - FULL response, no truncation
+                result = self.get_task_result(task_id)
+                if result:
+                    response_text = str(result.raw)
+                    # No truncation - show full response in verbose mode
+                    from rich.markdown import Markdown
+                    console.print(Panel(
+                        Markdown(response_text),
+                        title=f"[bold]Agent [{idx}/{total_agents}] Complete ({elapsed:.1f}s)[/]",
+                        border_style=PRAISON_COLORS["response"],
+                        padding=(1, 2)
+                    ))
+                console.print()
+            
+            # Workflow summary panel
+            total_elapsed = time_module.time() - workflow_start_time
+            console.print(Panel.fit(
+                f"[bold green]Total Time:[/] {total_elapsed:.1f}s\n"
+                f"[bold green]Agents Run:[/] {total_agents}/{total_agents}",
+                title="[bold]✅ Workflow Complete[/]",
+                border_style="green"
+            ))
+            console.print()
         else:
-            # Run tasks as before
-            self.run_all_tasks()
+            # Silent mode: Run tasks without display
+            if self.planning:
+                self._run_with_planning()
+            else:
+                self.run_all_tasks()
         
         # Auto-display token metrics if any agent has metrics=True
         metrics_enabled = any(getattr(agent, 'metrics', False) for agent in self.agents)
@@ -1224,10 +1351,8 @@ Context:
             try:
                 self.display_token_usage()
             except (ImportError, AttributeError) as e:
-                # Token tracking not available or not properly configured
                 logging.debug(f"Could not auto-display token usage: {e}")
             except Exception as e:
-                # Log unexpected errors for debugging
                 logging.debug(f"Unexpected error in token metrics display: {e}")
         
         # Get results
@@ -1238,7 +1363,6 @@ Context:
         
         # By default, return only the final agent's response
         if not return_dict:
-            # Get the last task (assuming sequential processing)
             task_ids = list(self.tasks.keys())
             if task_ids:
                 last_task_id = task_ids[-1]
@@ -1246,12 +1370,21 @@ Context:
                 if last_result:
                     return last_result.raw
                     
-        # Return full results dict if return_dict is True or if no final result was found
         return results
 
     def run(self, content=None, return_dict=False, **kwargs):
-        """Alias for start() method to provide consistent API with Agent class"""
-        return self.start(content=content, return_dict=return_dict, **kwargs)
+        """Run agents silently (production use).
+        
+        Unlike .start() which shows verbose output, .run() executes silently
+        for programmatic/production use.
+        
+        Args:
+            content: Optional content to add to all tasks' context
+            return_dict: If True, returns the full results dictionary
+            **kwargs: Additional arguments
+        """
+        # Always run silently - no verbose output
+        return self.start(content=content, return_dict=return_dict, output="silent", **kwargs)
 
     def set_state(self, key: str, value: Any) -> None:
         """Set a state value"""
