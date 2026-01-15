@@ -1,0 +1,211 @@
+---
+title: "Architecture Patterns"
+description: "How to add new features using Protocols and ABCs"
+---
+
+## Core Principle
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  CORE SDK (praisonaiagents)                                 │
+│  • Lightweight, protocol-first                              │
+│  • Protocol interfaces + zero-dep defaults                  │
+│  • NO heavy dependencies                                    │
+└─────────────────────────────────────────────────────────────┘
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  WRAPPER (praisonai)                                        │
+│  • Heavy implementations (Redis, Postgres, Mongo)           │
+│  • Optional deps, lazy imports                              │
+│  • ABC base classes (internal use)                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Protocol vs ABC
+
+| Aspect | Protocol | ABC |
+|--------|----------|-----|
+| **Location** | Core SDK | Wrapper |
+| **Purpose** | Minimal interface for mocking | Full implementation contract |
+| **Inheritance** | Not required (duck typing) | Required |
+| **Use when** | Users might mock/test | Internal implementations |
+
+---
+
+## Adding a New Feature
+
+### Step 1: Core SDK - Protocol + Default
+
+```python
+# praisonaiagents/cache/protocols.py
+from typing import Protocol, Any, Optional
+
+class CacheProtocol(Protocol):
+    """Minimal interface - users can mock this for testing."""
+    
+    def get(self, key: str) -> Optional[Any]:
+        """Get value by key."""
+        ...
+    
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
+        """Set value with optional TTL."""
+        ...
+```
+
+```python
+# praisonaiagents/cache/file_cache.py
+import json
+import os
+
+class FileCache:
+    """Zero-dependency default implementation."""
+    
+    def __init__(self, path: str = ".cache"):
+        self.path = path
+        os.makedirs(path, exist_ok=True)
+    
+    def get(self, key: str):
+        try:
+            with open(f"{self.path}/{key}.json") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+    
+    def set(self, key: str, value, ttl=None):
+        with open(f"{self.path}/{key}.json", "w") as f:
+            json.dump(value, f)
+```
+
+### Step 2: Wrapper - Heavy Implementations
+
+```python
+# praisonai/cache/redis_cache.py
+from praisonaiagents.cache.protocols import CacheProtocol
+
+class RedisCache:  # Implements CacheProtocol via duck typing
+    """Redis implementation - lives in wrapper, NOT core."""
+    
+    def __init__(self, url: str):
+        import redis  # Lazy import - only when used
+        self.client = redis.from_url(url)
+    
+    def get(self, key: str):
+        value = self.client.get(key)
+        if value:
+            import json
+            return json.loads(value)
+        return None
+    
+    def set(self, key: str, value, ttl=None):
+        import json
+        if ttl:
+            self.client.setex(key, ttl, json.dumps(value))
+        else:
+            self.client.set(key, json.dumps(value))
+```
+
+### Step 3: Export from Core
+
+```python
+# praisonaiagents/cache/__init__.py
+from .protocols import CacheProtocol
+from .file_cache import FileCache
+
+__all__ = ["CacheProtocol", "FileCache"]
+```
+
+---
+
+## Usage
+
+### Production
+
+```python
+from praisonai.cache import RedisCache
+from praisonaiagents import Agent
+
+cache = RedisCache("redis://localhost:6379")
+agent = Agent(name="CachedAgent", cache=cache)
+```
+
+### Testing (Mock)
+
+```python
+from praisonaiagents.cache.protocols import CacheProtocol
+
+class MockCache:
+    """Mock for tests - no Redis needed."""
+    def __init__(self):
+        self.data = {}
+    
+    def get(self, key):
+        return self.data.get(key)
+    
+    def set(self, key, value, ttl=None):
+        self.data[key] = value
+
+def test_agent_with_cache():
+    cache = MockCache()
+    agent = Agent(cache=cache)  # Fast, free, deterministic
+```
+
+---
+
+## Decision Tree
+
+```
+Adding new feature?
+│
+├─ Is it agent-facing (users will interact)?
+│   └─ YES → Protocol in CORE + implementations in WRAPPER
+│
+├─ Is it internal-only?
+│   └─ YES → ABC in WRAPPER only
+│
+└─ Does it need heavy deps (redis, postgres)?
+    └─ YES → Always in WRAPPER, never core
+```
+
+---
+
+## File Structure
+
+```
+praisonaiagents/           # Core SDK
+├── cache/
+│   ├── __init__.py        # Exports
+│   ├── protocols.py       # CacheProtocol (minimal)
+│   └── file_cache.py      # FileCache (zero-dep default)
+
+praisonai/                 # Wrapper
+├── cache/
+│   ├── __init__.py
+│   ├── redis_cache.py     # RedisCache (heavy)
+│   ├── memcached.py       # MemcachedCache (heavy)
+│   └── base.py            # ABC (optional, internal)
+```
+
+---
+
+## Benefits
+
+| Benefit | Explanation |
+|---------|-------------|
+| **Testable** | Mock via Protocol, no LLM/DB costs |
+| **Fast imports** | Heavy deps only loaded when used |
+| **Optional deps** | `pip install praisonai[redis]` |
+| **Clean separation** | Core = interfaces, Wrapper = implementations |
+| **Community extensions** | Anyone can implement Protocol |
+
+---
+
+## Existing Examples
+
+| Feature | Core Protocol | Wrapper Implementations |
+|---------|--------------|-------------------------|
+| Agent | `AgentProtocol` | N/A (Agent is in core) |
+| Memory | `MemoryProtocol` | Future: RedisMemory, MongoMemory |
+| Tool | `ToolProtocol` | Custom tools in praisonai-tools |
+| State | N/A (wrapper only) | RedisStateStore, MemoryStateStore |
