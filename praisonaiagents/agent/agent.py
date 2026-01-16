@@ -3630,7 +3630,7 @@ Your Goal: {self.goal}"""
                     output_pydantic=output_pydantic,
                     verbose=self.verbose,
                     markdown=self.markdown,
-                    self_reflect=self.self_reflect,
+                    reflection=self.self_reflect,
                     max_reflect=self.max_reflect,
                     min_reflect=self.min_reflect,
                     console=self.console,
@@ -3988,7 +3988,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         output_pydantic=output_pydantic,
                         verbose=self.verbose,
                         markdown=self.markdown,
-                        self_reflect=self.self_reflect,
+                        reflection=self.self_reflect,
                         max_reflect=self.max_reflect,
                         min_reflect=self.min_reflect,
                         console=self.console,
@@ -4762,9 +4762,11 @@ Write the complete compiled report:"""
                     )
                     console.print(response_panel)
                     
-                    # Show tool activity summary if tools were called
+                    # Show tool activity summary if tools were called (deduplicated)
                     if tools_called:
-                        tools_summary = ", ".join(tools_called)
+                        # Use dict.fromkeys to preserve order while removing duplicates
+                        unique_tools = list(dict.fromkeys(tools_called))
+                        tools_summary = ", ".join(unique_tools)
                         console.print(f"[dim]🔧 Tools used: {tools_summary}[/dim]")
                 else:
                     result = self.chat(prompt, **kwargs)
