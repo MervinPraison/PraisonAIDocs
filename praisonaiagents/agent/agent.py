@@ -1,38 +1,28 @@
 import os
 import time
 import json
-import copy
 import logging
 import asyncio
 import threading
-from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Tuple, Generator
+import contextlib
+from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Generator
 from rich.console import Console
 from rich.live import Live
 from ..llm import (
     get_openai_client,
-    ChatCompletionMessage,
-    Choice,
-    CompletionTokensDetails,
-    PromptTokensDetails,
-    CompletionUsage,
-    ChatCompletion,
-    ToolCall,
     process_stream_chunks
 )
 from ..main import (
     display_error,
-    display_tool_call,
     display_instruction,
     display_interaction,
     display_generating,
     display_self_reflection,
     ReflectionOutput,
     adisplay_instruction,
-    approval_callback,
     execute_sync_callback
 )
 import inspect
-import uuid
 
 # Global variables for API server
 _server_started = {}  # Dict of port -> started boolean
@@ -43,11 +33,13 @@ _shared_apps = {}  # Dict of port -> FastAPI app
 
 if TYPE_CHECKING:
     from ..task.task import Task
-    from ..main import TaskOutput
     from .handoff import Handoff, HandoffConfig, HandoffResult
     from ..rag.models import RAGResult, ContextPack
 
 class Agent:
+    # Class-level counter for generating unique display names for nameless agents
+    _agent_counter = 0
+    
     @classmethod
     def _configure_logging(cls):
         """Configure logging settings once for all agent instances."""
@@ -376,8 +368,8 @@ class Agent:
         # Add check at start if memory is requested
         if memory is not None:
             try:
-                from ..memory.memory import Memory
-                MEMORY_AVAILABLE = True
+                from ..memory.memory import Memory  # noqa: F401
+                _ = Memory  # Silence unused import warning - we just check availability
             except ImportError:
                 raise ImportError(
                     "Memory features requested in Agent but memory dependencies not installed. "
@@ -805,10 +797,14 @@ class Agent:
             # instructions like "You are a helpful assistant"
             if name:
                 self.name = name
+                self._agent_index = None  # Named agents don't need an index
             else:
                 # Don't auto-generate - None signals "no explicit name provided"
                 # Display logic will skip Agent Info panel when name is None
                 self.name = None
+                # Assign unique index for display_name
+                Agent._agent_counter += 1
+                self._agent_index = Agent._agent_counter
             self.role = role or "Assistant"
             self.goal = goal or instructions
             self.backstory = backstory or instructions
@@ -817,6 +813,7 @@ class Agent:
         else:
             # Use provided values or defaults
             self.name = name or "Agent"
+            self._agent_index = None  # Named agents don't need an index
             self.role = role or "Assistant"
             self.goal = goal or "Help the user with their tasks"
             self.backstory = backstory or "I am an AI assistant"
@@ -841,7 +838,6 @@ class Agent:
         # LLM CONSOLIDATION: Handle model= alias and deprecation warnings
         # Precedence: llm= > model= > default
         # ============================================================
-        import warnings
         
         # Handle model= alias for llm= (NO warnings - both are valid)
         if llm is None and model is not None:
@@ -1350,6 +1346,20 @@ Your Goal: {self.goal}
             self._agent_id = str(uuid.uuid4())
         return self._agent_id
     
+    @property
+    def display_name(self) -> str:
+        """Safe display name that never returns None.
+        
+        Returns the agent's name if set, otherwise returns 'Agent N' where N is a unique index.
+        Use this for UI display, logging, and string operations where None would cause errors.
+        """
+        if self.name:
+            return self.name
+        # Use unique index for nameless agents
+        if hasattr(self, '_agent_index') and self._agent_index is not None:
+            return f"Agent {self._agent_index}"
+        return "Agent"
+    
     def _init_autonomy(self, autonomy: Any, verification_hooks: Optional[List[Any]] = None) -> None:
         """Initialize autonomy features (agent-centric escalation/doom-loop).
         
@@ -1642,7 +1652,7 @@ Your Goal: {self.goal}
                 print(result.response)
             ```
         """
-        from .handoff import Handoff, HandoffConfig, HandoffResult
+        from .handoff import Handoff, HandoffConfig
         
         handoff_obj = Handoff(
             agent=target_agent,
@@ -1679,7 +1689,7 @@ Your Goal: {self.goal}
                 print(result.response)
             ```
         """
-        from .handoff import Handoff, HandoffConfig, HandoffResult
+        from .handoff import Handoff, HandoffConfig
         
         handoff_obj = Handoff(
             agent=target_agent,
@@ -1756,7 +1766,7 @@ Your Goal: {self.goal}
             return self.tools
             
         # Filter to read-only tools only
-        from ..planning import READ_ONLY_TOOLS, RESTRICTED_TOOLS
+        from ..planning import RESTRICTED_TOOLS
         
         filtered_tools = []
         for tool in self.tools:
@@ -2889,7 +2899,7 @@ Your Goal: {self.goal}"""
         # Do NOT call it here to avoid duplicate output
         
         # Set up injection context for tools with Injected parameters
-        from ..tools.injected import AgentState, with_injection_context
+        from ..tools.injected import AgentState
         state = AgentState(
             agent_id=self.name,
             run_id=getattr(self, '_current_run_id', 'unknown'),
@@ -2912,7 +2922,7 @@ Your Goal: {self.goal}"""
         """Internal tool execution implementation."""
 
         # Check if approval is required for this tool
-        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, ApprovalDecision, get_approval_callback
+        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, get_approval_callback
         if is_approval_required(function_name):
             risk_level = get_risk_level(function_name)
             logging.debug(f"Tool {function_name} requires approval (risk level: {risk_level})")
@@ -3070,6 +3080,160 @@ Your Goal: {self.goal}"""
 
     def clear_history(self):
         self.chat_history = []
+
+    # -------------------------------------------------------------------------
+    #                       History Management Methods
+    # -------------------------------------------------------------------------
+    
+    def prune_history(self, keep_last: int = 5) -> int:
+        """
+        Prune chat history to keep only the last N messages.
+        
+        Useful for cleaning up large history after image analysis sessions
+        to prevent context window saturation.
+        
+        Args:
+            keep_last: Number of recent messages to keep
+            
+        Returns:
+            Number of messages deleted
+        """
+        with self._history_lock:
+            if len(self.chat_history) <= keep_last:
+                return 0
+            
+            deleted_count = len(self.chat_history) - keep_last
+            self.chat_history = self.chat_history[-keep_last:]
+            return deleted_count
+    
+    def delete_history(self, index: int) -> bool:
+        """
+        Delete a specific message from chat history by index.
+        
+        Supports negative indexing (-1 for last message, etc.).
+        
+        Args:
+            index: Message index (0-based, supports negative indexing)
+            
+        Returns:
+            True if deleted, False if index out of range
+        """
+        with self._history_lock:
+            try:
+                del self.chat_history[index]
+                return True
+            except IndexError:
+                return False
+    
+    def delete_history_matching(self, pattern: str) -> int:
+        """
+        Delete all messages matching a pattern.
+        
+        Useful for removing all image-related messages after processing.
+        
+        Args:
+            pattern: Substring to match in message content
+            
+        Returns:
+            Number of messages deleted
+        """
+        with self._history_lock:
+            original_len = len(self.chat_history)
+            self.chat_history = [
+                msg for msg in self.chat_history
+                if pattern.lower() not in msg.get("content", "").lower()
+            ]
+            return original_len - len(self.chat_history)
+    
+    def get_history_size(self) -> int:
+        """Get the current number of messages in chat history."""
+        return len(self.chat_history)
+    
+    @contextlib.contextmanager
+    def ephemeral(self):
+        """
+        Context manager for ephemeral conversations.
+        
+        Messages within this block are NOT permanently stored in chat_history.
+        History is restored to pre-block state after exiting.
+        
+        Example:
+            with agent.ephemeral():
+                response = agent.chat("[IMAGE] Analyze this")
+                # After block, history is restored - image NOT persisted
+        """
+        # Save current history state
+        with self._history_lock:
+            saved_history = self.chat_history.copy()
+        
+        try:
+            yield
+        finally:
+            # Restore history to pre-block state
+            with self._history_lock:
+                self.chat_history = saved_history
+    
+    def _build_multimodal_prompt(
+        self, 
+        prompt: str, 
+        attachments: Optional[List[str]] = None
+    ) -> Union[str, List[Dict[str, Any]]]:
+        """
+        Build a multimodal prompt from text and attachments.
+        
+        This is a DRY helper used by chat/achat/run/arun/start/astart.
+        Attachments are ephemeral - only text is stored in history.
+        
+        Args:
+            prompt: Text query (ALWAYS stored in chat_history)
+            attachments: Image/file paths for THIS turn only (NEVER stored)
+            
+        Returns:
+            Either a string (no attachments) or multimodal message list
+        """
+        if not attachments:
+            return prompt
+        
+        # Build multimodal content list
+        content = [{"type": "text", "text": prompt}]
+        
+        for attachment in attachments:
+            # Handle image files
+            if isinstance(attachment, str):
+                import os
+                import base64
+                
+                if os.path.isfile(attachment):
+                    # File path - read and encode
+                    ext = os.path.splitext(attachment)[1].lower()
+                    if ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp'):
+                        try:
+                            with open(attachment, 'rb') as f:
+                                data = base64.b64encode(f.read()).decode('utf-8')
+                            media_type = {
+                                '.jpg': 'image/jpeg',
+                                '.jpeg': 'image/jpeg',
+                                '.png': 'image/png',
+                                '.gif': 'image/gif',
+                                '.webp': 'image/webp',
+                            }.get(ext, 'image/jpeg')
+                            content.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{media_type};base64,{data}"}
+                            })
+                        except Exception as e:
+                            logging.warning(f"Failed to load attachment {attachment}: {e}")
+                elif attachment.startswith(('http://', 'https://', 'data:')):
+                    # URL or data URI
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": attachment}
+                    })
+            elif isinstance(attachment, dict):
+                # Already structured content
+                content.append(attachment)
+        
+        return content
 
     def __str__(self):
         return f"Agent(name='{self.name}', role='{self.role}', goal='{self.goal}')"
@@ -3471,10 +3635,24 @@ Your Goal: {self.goal}"""
         """Get the current session ID."""
         return self._session_id
 
-    def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None, config=None, force_retrieval=False, skip_retrieval=False):
+    def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None, config=None, force_retrieval=False, skip_retrieval=False, attachments=None):
+        """
+        Chat with the agent.
+        
+        Args:
+            prompt: Text query that WILL be stored in chat_history
+            attachments: Optional list of image/file paths that are ephemeral
+                        (used for THIS turn only, NEVER stored in history).
+                        Supports: file paths, URLs, or data URIs.
+            ...other args...
+        """
         # Apply rate limiter if configured (before any LLM call)
         if self._rate_limiter is not None:
             self._rate_limiter.acquire()
+        
+        # Process ephemeral attachments (DRY - builds multimodal prompt)
+        # IMPORTANT: Original text 'prompt' is stored in history, attachments are NOT
+        llm_prompt = self._build_multimodal_prompt(prompt, attachments) if attachments else prompt
         
         # Initialize DB session on first chat (lazy)
         self._init_db_session()
@@ -3916,8 +4094,18 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             cleaned = cleaned[:-3].strip()
         return cleaned  
 
-    async def achat(self, prompt: str, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None):
-        """Async version of chat method with self-reflection support.""" 
+    async def achat(self, prompt: str, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, attachments=None):
+        """Async version of chat method with self-reflection support.
+        
+        Args:
+            prompt: Text query that WILL be stored in chat_history
+            attachments: Optional list of image/file paths that are ephemeral
+                        (used for THIS turn only, NEVER stored in history).
+        """ 
+        # Process ephemeral attachments (DRY - builds multimodal prompt)
+        # IMPORTANT: Original text 'prompt' is stored in history, attachments are NOT
+        llm_prompt = self._build_multimodal_prompt(prompt, attachments) if attachments else prompt
+        
         # Track execution via telemetry
         if hasattr(self, '_telemetry') and self._telemetry:
             self._telemetry.track_agent_execution(self.name, success=True)
@@ -4627,9 +4815,6 @@ Write the complete compiled report:"""
                 
                 # Show animated status during LLM call if verbose
                 if self.verbose and is_tty:
-                    from rich.live import Live
-                    from rich.console import Group
-                    from rich.status import Status
                     from ..main import PRAISON_COLORS, sync_display_callbacks
                     import threading
                     import time as time_module
@@ -5291,7 +5476,7 @@ Write the complete compiled report:"""
                         if "query" not in request_data:
                             raise HTTPException(status_code=400, detail="Missing 'query' field in request")
                         query = request_data["query"]
-                    except:
+                    except Exception:
                         # Fallback to form data or query params
                         form_data = await request.form()
                         if "query" in form_data:
@@ -5395,7 +5580,7 @@ Write the complete compiled report:"""
                 from starlette.applications import Starlette
                 from starlette.requests import Request
                 from starlette.routing import Mount, Route
-                from mcp.server import Server as MCPServer # Alias to avoid conflict
+                from mcp.server import Server as MCPServer  # noqa: F401 - imported for availability check
                 import threading
                 import time
                 import inspect
