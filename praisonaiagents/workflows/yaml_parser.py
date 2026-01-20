@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from pathlib import Path
 
 from ..agent.agent import Agent
-from .workflows import Workflow, WorkflowStep, route, parallel, loop, repeat
+from .workflows import Workflow, WorkflowStep, route, parallel, loop, repeat, Include, include
 
 
 class YAMLWorkflowParser:
@@ -150,6 +150,19 @@ class YAMLWorkflowParser:
             if 'steps' not in normalized:
                 normalized['steps'] = self._extract_steps_from_roles(normalized['roles'])
         
+        # 3.5. Handle 'includes:' section - append include steps after role-based steps
+        # This allows agents.yaml files to include other recipes as final steps
+        if 'includes' in normalized:
+            if 'steps' not in normalized:
+                normalized['steps'] = []
+            for include_item in normalized['includes']:
+                if isinstance(include_item, str):
+                    # Simple include: just recipe name
+                    normalized['steps'].append({'include': include_item})
+                elif isinstance(include_item, dict):
+                    # Include with configuration
+                    normalized['steps'].append({'include': include_item})
+        
         # 4. Normalize agent fields: backstory -> instructions (for agents section)
         if 'agents' in normalized:
             for agent_id, agent_config in normalized['agents'].items():
@@ -236,6 +249,7 @@ class YAMLWorkflowParser:
         reasoning = workflow_config.get('reasoning', False)
         verbose = workflow_config.get('verbose', False)
         memory_config = workflow_config.get('memory_config')
+        output_mode = workflow_config.get('output')  # NEW: parse output mode from YAML
         
         # Parse variables
         variables = data.get('variables', {})
@@ -262,12 +276,18 @@ class YAMLWorkflowParser:
             from .workflow_configs import WorkflowPlanningConfig
             planning_value = WorkflowPlanningConfig(enabled=bool(planning), llm=planning_llm, reasoning=reasoning)
         
+        # Determine output mode: explicit output > verbose flag > default
+        workflow_output = output_mode
+        if workflow_output is None and verbose:
+            workflow_output = "verbose"
+        
         workflow = Workflow(
             name=name,
             steps=steps,
             variables=variables,
             planning=planning_value,
             default_llm=default_llm,
+            output=workflow_output,  # Pass output mode to Workflow
         )
         
         # Store additional attributes for feature parity with agents.yaml
@@ -278,7 +298,14 @@ class YAMLWorkflowParser:
         
         # Store workflow input (from 'input' or 'topic' field)
         # This is the default input passed to workflow.start() if no input is provided
-        workflow.default_input = data.get('input', data.get('topic', ''))
+        default_input = data.get('input', data.get('topic', ''))
+        
+        # Substitute dynamic variables ({{today}}, {{now}}, etc.) in default_input
+        if default_input and "{{" in default_input:
+            from praisonaiagents.utils.variables import substitute_variables
+            default_input = substitute_variables(default_input, {})
+        
+        workflow.default_input = default_input
         
         return workflow
     
@@ -500,6 +527,8 @@ class YAMLWorkflowParser:
             return self._parse_loop_step(step_data)
         elif 'repeat' in step_data:
             return self._parse_repeat_step(step_data)
+        elif 'include' in step_data:
+            return self._parse_include_step(step_data)
         elif 'agent' in step_data:
             return self._parse_agent_step(step_data)
         else:
@@ -585,6 +614,38 @@ class YAMLWorkflowParser:
             return agent
         else:
             raise ValueError(f"Agent '{agent_id}' not defined in agents section")
+    
+    def _parse_include_step(self, step_data: Dict) -> Include:
+        """
+        Parse an include pattern step.
+        
+        Args:
+            step_data: Step definition with 'include' key
+            
+        Returns:
+            Include pattern object
+            
+        YAML syntax:
+            # Simple include
+            - include: wordpress-publisher
+            
+            # Include with configuration
+            - include:
+                recipe: wordpress-publisher
+                input: "{{previous_output}}"
+        """
+        include_config = step_data['include']
+        
+        if isinstance(include_config, str):
+            # Simple form: include: recipe-name
+            recipe_name = include_config
+            input_template = None
+        else:
+            # Config form: include: {recipe: ..., input: ...}
+            recipe_name = include_config.get('recipe', '')
+            input_template = include_config.get('input')
+        
+        return Include(recipe=recipe_name, input=input_template)
     
     def _parse_route_step(self, step_data: Dict) -> Dict:
         """

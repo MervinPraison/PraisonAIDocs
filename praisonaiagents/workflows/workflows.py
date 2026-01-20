@@ -27,9 +27,8 @@ from typing import Any, Dict, List, Optional, Callable, Tuple, Union
 from dataclasses import dataclass, field
 
 from .workflow_configs import (
-    WorkflowOutputConfig, WorkflowPlanningConfig, WorkflowMemoryConfig, WorkflowHooksConfig,
+    WorkflowPlanningConfig, WorkflowMemoryConfig,
     WorkflowStepContextConfig, WorkflowStepOutputConfig, WorkflowStepExecutionConfig, WorkflowStepRoutingConfig,
-    WorkflowOutputPreset, WorkflowStepExecutionPreset
 )
 
 logger = logging.getLogger(__name__)
@@ -180,10 +179,47 @@ def loop(step: Any, over: Optional[str] = None, from_csv: Optional[str] = None,
     """Loop over items executing step for each."""
     return Loop(step=step, over=over, from_csv=from_csv, from_file=from_file, var_name=var_name)
 
+
 def repeat(step: Any, until: Optional[Callable[[WorkflowContext], bool]] = None,
            max_iterations: int = 10) -> Repeat:
     """Repeat step until condition is met."""
     return Repeat(step=step, until=until, max_iterations=max_iterations)
+
+
+@dataclass
+class Include:
+    """
+    Include another recipe as a workflow step.
+    
+    Enables modular recipe composition - recipes can include other recipes.
+    
+    Usage:
+        workflow = Workflow(steps=[
+            content_writer,
+            include("wordpress-publisher"),  # Include another recipe
+        ])
+        
+    YAML syntax:
+        steps:
+          - agent: content_writer
+          - include: wordpress-publisher
+          
+        # Or with configuration:
+          - include:
+              recipe: wordpress-publisher
+              input: "{{previous_output}}"
+    """
+    recipe: str = ""  # Recipe name or path
+    input: Optional[str] = None  # Input override (default: previous_output)
+    
+    def __init__(self, recipe: str, input: Optional[str] = None):
+        self.recipe = recipe
+        self.input = input
+
+
+def include(recipe: str, input: Optional[str] = None) -> Include:
+    """Include another recipe as a workflow step."""
+    return Include(recipe=recipe, input=input)
 
 
 @dataclass
@@ -581,6 +617,7 @@ class Workflow:
     # Private resolved fields (set in __post_init__)
     _verbose: bool = field(default=False, repr=False)
     _stream: bool = field(default=True, repr=False)
+    _output_config: Optional[Any] = field(default=None, repr=False)  # Full OutputConfig for propagation
     _planning_enabled: bool = field(default=False, repr=False)
     _planning_llm: Optional[str] = field(default=None, repr=False)
     _reasoning: bool = field(default=False, repr=False)
@@ -602,10 +639,41 @@ class Workflow:
             resolve_memory_config, resolve_hooks_config,
         )
         
-        # Resolve output param
+        # Resolve output param - now uses OUTPUT_PRESETS (same as Agent)
         output_cfg = resolve_output_config(self.output)
-        self._verbose = output_cfg.verbose if output_cfg else False
-        self._stream = output_cfg.stream if output_cfg else True
+        self._output_config = output_cfg  # Store full config for propagation
+        self._verbose = getattr(output_cfg, 'verbose', False) if output_cfg else False
+        self._stream = getattr(output_cfg, 'stream', True) if output_cfg else True
+        
+        # Enable status/trace output if configured (same as Agent)
+        if output_cfg:
+            status_trace = getattr(output_cfg, 'status_trace', False)
+            actions_trace = getattr(output_cfg, 'actions_trace', False)
+            json_output = getattr(output_cfg, 'json_output', False)
+            simple_output = getattr(output_cfg, 'simple_output', False)
+            metrics = getattr(output_cfg, 'metrics', False)
+            
+            if status_trace:
+                try:
+                    from ..output.trace import enable_trace_output, is_trace_output_enabled
+                    if not is_trace_output_enabled():
+                        enable_trace_output(use_color=True, show_timestamps=True)
+                except ImportError:
+                    pass
+            elif actions_trace:
+                try:
+                    from ..output.status import enable_status_output, is_status_output_enabled
+                    if not is_status_output_enabled():
+                        output_format = "jsonl" if json_output else "text"
+                        enable_status_output(
+                            redact=True,
+                            use_color=True,
+                            format=output_format,
+                            show_timestamps=not simple_output,
+                            show_metrics=metrics
+                        )
+                except ImportError:
+                    pass
         
         # Resolve planning param
         planning_cfg = resolve_planning_config(self.planning)
@@ -915,6 +983,17 @@ class Workflow:
                 all_variables.update(repeat_result.get("variables", {}))
                 i += 1
                 continue
+                
+            elif isinstance(step, Include):
+                # Include another recipe
+                include_result = self._execute_include(
+                    step, previous_output, input, all_variables, model, verbose, stream
+                )
+                results.extend(include_result["steps"])
+                previous_output = include_result["output"]
+                all_variables.update(include_result.get("variables", {}))
+                i += 1
+                continue
             
             # Normalize single step
             step = self._normalize_single_step(step, i)
@@ -1034,7 +1113,7 @@ class Workflow:
                             goal=config.get("goal", "Complete the task"),
                             llm=config.get("llm", model),
                             tools=step_tools if step_tools else None,
-                            # verbose parameter removed - Agent no longer accepts it
+                            output=self.output,  # Propagate output config to child agents
                             reasoning=self.reasoning,
                             stream=stream
                         )
@@ -1609,6 +1688,169 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         all_variables["repeat_iterations"] = iteration + 1
         return {"steps": results, "output": output, "variables": all_variables}
     
+    def _execute_include(
+        self,
+        include_step: Include,
+        previous_output: Optional[str],
+        input: str,
+        all_variables: Dict[str, Any],
+        model: str,
+        verbose: bool,
+        stream: bool = True,
+        visited_recipes: Optional[set] = None
+    ) -> Dict[str, Any]:
+        """Execute an included recipe as a workflow step.
+        
+        Args:
+            include_step: The Include step with recipe name
+            previous_output: Output from previous step
+            input: Original workflow input
+            all_variables: Current workflow variables
+            model: LLM model to use
+            verbose: Verbose output
+            stream: Enable streaming
+            visited_recipes: Set of already-visited recipe names (for cycle detection)
+            
+        Returns:
+            Dict with 'steps', 'output', and 'variables'
+        """
+        recipe_name = include_step.recipe
+        
+        # Cycle detection
+        if visited_recipes is None:
+            visited_recipes = set()
+        
+        if recipe_name in visited_recipes:
+            error_msg = f"Circular include detected: {recipe_name} was already included in this execution chain"
+            logger.error(error_msg)
+            return {
+                "steps": [{"step": f"include:{recipe_name}", "output": f"Error: {error_msg}"}],
+                "output": error_msg,
+                "variables": all_variables
+            }
+        
+        visited_recipes.add(recipe_name)
+        
+        if verbose:
+            print(f"📦 Including recipe: {recipe_name}")
+        
+        try:
+            # Try to resolve recipe path using agent_recipes if available
+            recipe_path = None
+            
+            try:
+                from agent_recipes import get_template_path
+                recipe_path = get_template_path(recipe_name)
+            except ImportError:
+                # agent_recipes not installed, try local path
+                from pathlib import Path
+                if Path(recipe_name).exists():
+                    recipe_path = Path(recipe_name)
+                else:
+                    # Try as relative path to current working directory
+                    import os
+                    cwd = Path(os.getcwd())
+                    potential_path = cwd / recipe_name
+                    if potential_path.exists():
+                        recipe_path = potential_path
+            
+            if not recipe_path:
+                error_msg = f"Recipe not found: {recipe_name}"
+                logger.error(error_msg)
+                return {
+                    "steps": [{"step": f"include:{recipe_name}", "output": f"Error: {error_msg}"}],
+                    "output": error_msg,
+                    "variables": all_variables
+                }
+            
+            # Find the YAML file (agents.yaml or workflow.yaml)
+            recipe_yaml = None
+            from pathlib import Path
+            recipe_path = Path(recipe_path)
+            
+            for yaml_name in ["agents.yaml", "workflow.yaml", "TEMPLATE.yaml"]:
+                yaml_path = recipe_path / yaml_name
+                if yaml_path.exists():
+                    recipe_yaml = yaml_path
+                    break
+            
+            if not recipe_yaml:
+                error_msg = f"No workflow YAML found in {recipe_path}"
+                logger.error(error_msg)
+                return {
+                    "steps": [{"step": f"include:{recipe_name}", "output": f"Error: {error_msg}"}],
+                    "output": error_msg,
+                    "variables": all_variables
+                }
+            
+            # Load tools from the recipe's tools.py if present
+            tool_registry = {}
+            tools_py = recipe_path / "tools.py"
+            if tools_py.exists():
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("recipe_tools", tools_py)
+                    recipe_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(recipe_module)
+                    
+                    # Extract callable tools
+                    for name in dir(recipe_module):
+                        if not name.startswith("_"):
+                            obj = getattr(recipe_module, name)
+                            if callable(obj):
+                                tool_registry[name] = obj
+                except Exception as e:
+                    logger.warning(f"Failed to load tools from {tools_py}: {e}")
+            
+            # Determine input for the included recipe
+            recipe_input = include_step.input or previous_output or input
+            
+            # Substitute variables in the input
+            if recipe_input:
+                for key, value in all_variables.items():
+                    recipe_input = recipe_input.replace(f"{{{{{key}}}}}", str(value))
+                if previous_output:
+                    recipe_input = recipe_input.replace("{{previous_output}}", str(previous_output))
+                recipe_input = recipe_input.replace("{{input}}", input)
+            
+            # Parse and execute the included workflow
+            from .yaml_parser import YAMLWorkflowParser
+            parser = YAMLWorkflowParser(tool_registry=tool_registry)
+            included_workflow = parser.parse_file(str(recipe_yaml))
+            
+            # Merge parent variables into included workflow
+            included_workflow.variables.update(all_variables)
+            included_workflow.variables["previous_output"] = previous_output
+            
+            # Execute the included workflow
+            result = included_workflow.run(
+                input=recipe_input or "",
+                llm=model,
+                verbose=verbose,
+                stream=stream
+            )
+            
+            if verbose:
+                print(f"✅ Included recipe {recipe_name} completed")
+            
+            # Return result in expected format
+            return {
+                "steps": result.get("steps", []),
+                "output": result.get("output", ""),
+                "variables": {**all_variables, **result.get("variables", {})}
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to execute included recipe {recipe_name}: {e}")
+            return {
+                "steps": [{"step": f"include:{recipe_name}", "output": f"Error: {e}"}],
+                "output": f"Error executing {recipe_name}: {e}",
+                "variables": all_variables
+            }
+        finally:
+            # Remove from visited after execution completes (allow re-use in different branches)
+            visited_recipes.discard(recipe_name)
+    
     def start(self, input: str = "", **kwargs) -> Dict[str, Any]:
         """Alias for run() for consistency with Agents."""
         return self.run(input, **kwargs)
@@ -2082,12 +2324,18 @@ class WorkflowManager:
         text: str,
         variables: Dict[str, Any]
     ) -> str:
-        """Substitute {{variable}} placeholders in text."""
-        def replace(match):
-            var_name = match.group(1).strip()
-            return str(variables.get(var_name, match.group(0)))
+        """
+        Substitute {{variable}} placeholders in text.
         
-        return re.sub(r'\{\{(\w+)\}\}', replace, text)
+        Delegates to shared substitute_variables() utility for DRY compliance.
+        
+        Resolution order:
+        1. Dynamic variable providers ({{now}}, {{today}}, {{uuid}}, etc.)
+        2. Static variables from workflow variables dict
+        3. Keep original placeholder if not found
+        """
+        from praisonaiagents.utils.variables import substitute_variables
+        return substitute_variables(text, variables)
     
     def _build_step_context(
         self,
