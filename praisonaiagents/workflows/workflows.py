@@ -104,7 +104,7 @@ class Loop:
     Iterate over a list or CSV file, executing step for each item.
     
     Usage:
-        # Loop over list variable
+        # Loop over list variable (sequential)
         workflow = Workflow(
             steps=[loop(processor, over="items")],
             variables={"items": ["a", "b", "c"]}
@@ -114,12 +114,27 @@ class Loop:
         workflow = Workflow(steps=[
             loop(processor, from_csv="data.csv")
         ])
+        
+        # Parallel loop over items (concurrent execution)
+        workflow = Workflow(
+            steps=[loop(processor, over="items", parallel=True)],
+            variables={"items": ["a", "b", "c"]}
+        )
+        
+        # Parallel with limited workers
+        workflow = Workflow(
+            steps=[loop(processor, over="items", parallel=True, max_workers=4)],
+            variables={"items": ["a", "b", "c"]}
+        )
     """
     step: Any = None
     over: Optional[str] = None  # Variable name containing list
     from_csv: Optional[str] = None  # CSV file path
     from_file: Optional[str] = None  # Text file path (one item per line)
     var_name: str = "item"  # Variable name for current item
+    parallel: bool = False  # Execute iterations in parallel
+    max_workers: Optional[int] = None  # Max parallel workers (None = unlimited)
+    output_variable: Optional[str] = None  # Store loop results in this variable name
     
     def __init__(
         self, 
@@ -127,13 +142,19 @@ class Loop:
         over: Optional[str] = None,
         from_csv: Optional[str] = None,
         from_file: Optional[str] = None,
-        var_name: str = "item"
+        var_name: str = "item",
+        parallel: bool = False,
+        max_workers: Optional[int] = None,
+        output_variable: Optional[str] = None
     ):
         self.step = step
         self.over = over
         self.from_csv = from_csv
         self.from_file = from_file
         self.var_name = var_name
+        self.parallel = parallel
+        self.max_workers = max_workers
+        self.output_variable = output_variable
 
 
 @dataclass
@@ -175,9 +196,27 @@ def parallel(steps: List) -> Parallel:
     return Parallel(steps=steps)
 
 def loop(step: Any, over: Optional[str] = None, from_csv: Optional[str] = None, 
-         from_file: Optional[str] = None, var_name: str = "item") -> Loop:
-    """Loop over items executing step for each."""
-    return Loop(step=step, over=over, from_csv=from_csv, from_file=from_file, var_name=var_name)
+         from_file: Optional[str] = None, var_name: str = "item",
+         parallel: bool = False, max_workers: Optional[int] = None,
+         output_variable: Optional[str] = None) -> Loop:
+    """Loop over items executing step for each.
+    
+    Args:
+        step: The step (agent/function) to execute for each item
+        over: Variable name containing the list to iterate over
+        from_csv: Path to CSV file to read items from
+        from_file: Path to text file with one item per line
+        var_name: Variable name for current item (default: "item")
+        parallel: If True, execute iterations in parallel (default: False)
+        max_workers: Max parallel workers when parallel=True (default: None = unlimited)
+        output_variable: Variable name to store all loop outputs (default: None = "loop_outputs")
+    
+    Returns:
+        Loop object configured for iteration
+    """
+    return Loop(step=step, over=over, from_csv=from_csv, from_file=from_file, 
+                var_name=var_name, parallel=parallel, max_workers=max_workers,
+                output_variable=output_variable)
 
 
 def repeat(step: Any, until: Optional[Callable[[WorkflowContext], bool]] = None,
@@ -769,6 +808,11 @@ class Workflow:
         """Get verbose setting from resolved output config."""
         return self._verbose
     
+    @verbose.setter
+    def verbose(self, value: bool):
+        """Set verbose setting."""
+        self._verbose = value
+    
     @property
     def stream(self) -> bool:
         """Get stream setting from resolved output config."""
@@ -787,8 +831,11 @@ class Workflow:
     @property
     def memory_config(self) -> Optional[Dict[str, Any]]:
         """Get memory config dict for backward compatibility."""
-        if self._memory_config and hasattr(self._memory_config, 'to_dict'):
-            return self._memory_config.to_dict()
+        if self._memory_config:
+            if hasattr(self._memory_config, 'to_dict'):
+                return self._memory_config.to_dict()
+            elif isinstance(self._memory_config, dict):
+                return self._memory_config
         return None
     
     @property
@@ -815,6 +862,53 @@ class Workflow:
     def on_step_error(self) -> Optional[Callable]:
         """Get on_step_error callback from hooks config."""
         return self._hooks_config.on_step_error if self._hooks_config else None
+    
+    def _resolve_pydantic_class(self, class_name: str) -> Optional[Any]:
+        """
+        Resolve a Pydantic class from string reference (Option B for structured output).
+        
+        Looks for the class in:
+        1. tools.py in the workflow's directory
+        2. The global namespace
+        
+        Args:
+            class_name: Name of the Pydantic class to resolve
+            
+        Returns:
+            The Pydantic class if found, None otherwise
+        """
+        import sys
+        
+        # Try to find the class in tools.py from the workflow's directory
+        if self.file_path:
+            from pathlib import Path
+            workflow_dir = Path(self.file_path).parent
+            tools_path = workflow_dir / "tools.py"
+            
+            if tools_path.exists():
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("tools", tools_path)
+                    if spec and spec.loader:
+                        tools_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(tools_module)
+                        
+                        if hasattr(tools_module, class_name):
+                            cls = getattr(tools_module, class_name)
+                            # Verify it's a Pydantic model
+                            if hasattr(cls, 'model_json_schema'):
+                                return cls
+                except Exception as e:
+                    logger.debug(f"Failed to load Pydantic class from tools.py: {e}")
+        
+        # Try to find in already-imported modules
+        for module_name, module in sys.modules.items():
+            if module and hasattr(module, class_name):
+                cls = getattr(module, class_name)
+                if hasattr(cls, 'model_json_schema'):
+                    return cls
+        
+        return None
     
     @classmethod
     def from_template(
@@ -1061,6 +1155,10 @@ class Workflow:
                             
                     elif step.agent:
                         # Direct agent with tools
+                        # Propagate context management to existing agent if workflow has it enabled
+                        if self.context and not step.agent._context_manager_initialized:
+                            step.agent._context_param = self.context
+                        
                         # Substitute variables in action
                         action = step.action or input
                         for key, value in all_variables.items():
@@ -1083,10 +1181,30 @@ class Workflow:
                         
                         # Handle images if present
                         step_images = getattr(step, 'images', None)
+                        # Get structured output options from step
+                        step_output_json = getattr(step, '_output_json', None)
+                        step_output_pydantic = getattr(step, '_output_pydantic', None)
+                        
+                        # Resolve Pydantic class from string reference (Option B)
+                        # If output_pydantic is a string, try to resolve it from tools.py
+                        if step_output_pydantic and isinstance(step_output_pydantic, str):
+                            resolved_class = self._resolve_pydantic_class(step_output_pydantic)
+                            if resolved_class:
+                                step_output_pydantic = resolved_class
+                            else:
+                                logger.warning(f"Could not resolve Pydantic class '{step_output_pydantic}' from tools.py")
+                                step_output_pydantic = None
+                        
+                        # Build chat kwargs
+                        chat_kwargs = {"stream": stream}
                         if step_images:
-                            output = step.agent.chat(action, images=step_images, stream=stream)
-                        else:
-                            output = step.agent.chat(action, stream=stream)
+                            chat_kwargs["images"] = step_images
+                        if step_output_json:
+                            chat_kwargs["output_json"] = step_output_json
+                        if step_output_pydantic:
+                            chat_kwargs["output_pydantic"] = step_output_pydantic
+                        
+                        output = step.agent.chat(action, **chat_kwargs)
                         
                         # Handle output_pydantic if present
                         output_pydantic = getattr(step, 'output_pydantic', None)
@@ -1115,7 +1233,8 @@ class Workflow:
                             tools=step_tools if step_tools else None,
                             output=self.output,  # Propagate output config to child agents
                             reasoning=self.reasoning,
-                            stream=stream
+                            stream=stream,
+                            context=self.context,  # Propagate context management to child agents
                         )
                         # Substitute variables in action
                         action = step.action
@@ -1382,14 +1501,33 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
             agent_tools = getattr(step, 'tools', None)
             # Check for _yaml_action from YAML parser (canonical: action, alias: description)
             yaml_action = getattr(step, '_yaml_action', None)
+            # Check for _yaml_output_variable from YAML parser
+            yaml_output_variable = getattr(step, '_yaml_output_variable', None)
+            # Check for _yaml_output_json from YAML parser (structured output - Option A)
+            yaml_output_json = getattr(step, '_yaml_output_json', None)
+            # Check for _yaml_output_pydantic from YAML parser (structured output - Option B)
+            yaml_output_pydantic = getattr(step, '_yaml_output_pydantic', None)
+            # Check for _yaml_step_name from YAML parser
+            yaml_step_name = getattr(step, '_yaml_step_name', None)
             # Use yaml_action if set, otherwise fall back to previous_output/input
             default_action = "{{previous_output}}" if index > 0 else "{{input}}"
             action = yaml_action if yaml_action else default_action
+            # Build output config with all structured output options
+            output_config = {}
+            if yaml_output_variable:
+                output_config["variable"] = yaml_output_variable
+            if yaml_output_json:
+                output_config["json_model"] = yaml_output_json
+            if yaml_output_pydantic:
+                output_config["pydantic_model"] = yaml_output_pydantic
+            # Only pass output_config if it has values
+            output_config = output_config if output_config else None
             return WorkflowStep(
-                name=getattr(step, 'name', f'agent_{index+1}'),
+                name=yaml_step_name or getattr(step, 'name', f'agent_{index+1}'),
                 agent=step,
                 tools=agent_tools,
-                action=action
+                action=action,
+                output=output_config
             )
         elif callable(step):
             return WorkflowStep(
@@ -1414,6 +1552,20 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         stream: bool = True
     ) -> Dict[str, Any]:
         """Execute a single step and return result."""
+        # Handle Include steps (for include inside loop)
+        if isinstance(step, Include):
+            include_result = self._execute_include(
+                step, previous_output, input, all_variables, model, verbose, stream
+            )
+            # Return in the expected format for single step
+            combined_output = include_result.get("output", "")
+            return {
+                "step": f"include:{step.recipe}",
+                "output": combined_output,
+                "stop": False,
+                "variables": include_result.get("variables", all_variables)
+            }
+        
         normalized = self._normalize_single_step(step, index)
         
         context = WorkflowContext(
@@ -1440,6 +1592,10 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                 output = f"Error: {e}"
         elif normalized.agent:
             try:
+                # Propagate context management to existing agent if workflow has it enabled
+                if self.context and not normalized.agent._context_manager_initialized:
+                    normalized.agent._context_param = self.context
+                
                 action = normalized.action or input
                 # Substitute variables
                 for key, value in all_variables.items():
@@ -1463,8 +1619,8 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                     role=config.get("role", "Assistant"),
                     goal=config.get("goal", "Complete the task"),
                     llm=config.get("llm", model),
-                    # verbose parameter removed - Agent no longer accepts it
-                    stream=stream
+                    stream=stream,
+                    context=self.context,  # Propagate context management to child agents
                 )
                 action = normalized.action
                 for key, value in all_variables.items():
@@ -1592,8 +1748,13 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         verbose: bool,
         stream: bool = True
     ) -> Dict[str, Any]:
-        """Execute step for each item in loop."""
+        """Execute step for each item in loop.
+        
+        When loop_step.parallel is True, executes iterations concurrently
+        using ThreadPoolExecutor for faster processing.
+        """
         import csv
+        import concurrent.futures
         
         results = []
         outputs = []
@@ -1603,7 +1764,8 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         if loop_step.over:
             items = all_variables.get(loop_step.over, [])
             if isinstance(items, str):
-                items = [items]
+                # Try to parse as JSON list first (handles agent output like '["a", "b", "c"]')
+                items = self._parse_list_from_string(items)
         elif loop_step.from_csv:
             try:
                 with open(loop_step.from_csv, 'r', encoding='utf-8') as f:
@@ -1620,26 +1782,134 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                 logger.error(f"Failed to read file {loop_step.from_file}: {e}")
                 items = []
         
-        if verbose:
-            print(f"🔁 Looping over {len(items)} items...")
+        num_items = len(items)
         
-        for idx, item in enumerate(items):
-            # Add current item to variables
-            loop_vars = all_variables.copy()
-            loop_vars[loop_step.var_name] = item
-            loop_vars["loop_index"] = idx
+        if loop_step.parallel and num_items > 1:
+            # Parallel execution
+            max_workers = loop_step.max_workers or num_items
+            if verbose:
+                print(f"⚡🔁 Parallel looping over {num_items} items (max_workers={max_workers})...")
             
-            step_result = self._execute_single_step_internal(
-                loop_step.step, previous_output, input, loop_vars, model, verbose, idx, stream=stream
-            )
-            results.append({"step": f"{step_result['step']}_{idx}", "output": step_result["output"]})
-            outputs.append(step_result["output"])
-            previous_output = step_result["output"]
-        
-        all_variables["loop_outputs"] = outputs
+            def execute_item(idx_item_tuple):
+                """Execute step for a single item in thread."""
+                idx, item = idx_item_tuple
+                loop_vars = all_variables.copy()
+                loop_vars[loop_step.var_name] = item
+                loop_vars["loop_index"] = idx
+                
+                # Execute step (verbose=False in parallel to avoid interleaved output)
+                step_result = self._execute_single_step_internal(
+                    loop_step.step, previous_output, input, loop_vars, model, False, idx, stream=False
+                )
+                return idx, step_result
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(execute_item, (idx, item)) for idx, item in enumerate(items)]
+                
+                # Collect results in order
+                indexed_results = []
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        idx, step_result = future.result()
+                        indexed_results.append((idx, step_result))
+                        if verbose:
+                            print(f"  ✓ Item {idx + 1}/{num_items} complete")
+                    except Exception as e:
+                        logger.error(f"Parallel loop iteration failed: {e}")
+                        indexed_results.append((idx, {"step": f"loop_{idx}", "output": f"Error: {e}"}))
+                
+                # Sort by index to maintain order
+                indexed_results.sort(key=lambda x: x[0])
+                
+                for idx, step_result in indexed_results:
+                    results.append({"step": f"{step_result['step']}_{idx}", "output": step_result["output"]})
+                    outputs.append(step_result["output"])
+            
+            if verbose:
+                print(f"✅ Parallel loop complete: {len(outputs)} results")
+        else:
+            # Sequential execution (original behavior)
+            if verbose:
+                print(f"🔁 Looping over {num_items} items...")
+            
+            for idx, item in enumerate(items):
+                # Add current item to variables
+                loop_vars = all_variables.copy()
+                loop_vars[loop_step.var_name] = item
+                loop_vars["loop_index"] = idx
+                
+                step_result = self._execute_single_step_internal(
+                    loop_step.step, previous_output, input, loop_vars, model, verbose, idx, stream=stream
+                )
+                results.append({"step": f"{step_result['step']}_{idx}", "output": step_result["output"]})
+                outputs.append(step_result["output"])
+                previous_output = step_result["output"]
+        # Store outputs in user-specified variable or default to loop_outputs
+        output_var_name = loop_step.output_variable or "loop_outputs"
+        all_variables[output_var_name] = outputs
+        all_variables["loop_outputs"] = outputs  # Also keep for backward compatibility
         combined_output = "\n".join(str(o) for o in outputs) if outputs else ""
         
+        # Debug logging for output_variable
+        if verbose:
+            print(f"📦 Loop stored {len(outputs)} results in variable: '{output_var_name}'")
+        
         return {"steps": results, "output": combined_output, "variables": all_variables}
+    
+    def _parse_list_from_string(self, text: str) -> List[Any]:
+        """
+        Parse a list from a string, handling multiple formats.
+        
+        Supports:
+        1. Pure JSON array: '["a", "b", "c"]'
+        2. JSON array embedded in text: 'Here are topics: ["a", "b", "c"]'
+        3. Newline-separated items (fallback)
+        
+        Args:
+            text: String that may contain a list
+            
+        Returns:
+            List of items, or [text] if no list found
+        """
+        import json
+        import re
+        
+        if not text or not text.strip():
+            return []
+        
+        text = text.strip()
+        
+        # 1. Try direct JSON parse (pure JSON array)
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        
+        # 2. Try to extract JSON array from text using regex
+        # Match JSON arrays like ["item1", "item2"] or ['item1', 'item2']
+        json_array_pattern = r'\[(?:[^\[\]]*(?:"[^"]*"|\'[^\']*\')?[^\[\]]*)*\]'
+        matches = re.findall(json_array_pattern, text)
+        
+        for match in matches:
+            try:
+                # Try parsing as JSON
+                parsed = json.loads(match)
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    return parsed
+            except json.JSONDecodeError:
+                # Try replacing single quotes with double quotes
+                try:
+                    fixed = match.replace("'", '"')
+                    parsed = json.loads(fixed)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+        
+        # 3. Fallback: wrap as single item
+        return [text]
     
     def _execute_repeat(
         self,
