@@ -21,6 +21,7 @@ Storage Structure:
 
 import os
 import re
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Tuple, Union
@@ -32,6 +33,108 @@ from .workflow_configs import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_json_output(output: Any, step_name: str = "step") -> Any:
+    """
+    Parse JSON from LLM output if it's a string.
+    
+    Handles:
+    - Direct JSON strings: '{"key": "value"}'
+    - Markdown code blocks: ```json\n{"key": "value"}\n```
+    - LLM echoing schema: {'type': 'array', 'items': [...]} -> extract items
+    
+    Returns:
+        Parsed dict/list if successful, original output otherwise
+    """
+    if not isinstance(output, str) or not output:
+        # Handle LLM echoing schema structure even for non-string outputs
+        if isinstance(output, dict):
+            return _extract_from_schema_echo(output)
+        return output
+    
+    # Try direct JSON parse first
+    try:
+        parsed = json.loads(output)
+        # Check if LLM echoed the schema structure
+        if isinstance(parsed, dict):
+            parsed = _extract_from_schema_echo(parsed)
+        return parsed
+    except json.JSONDecodeError:
+        pass
+    
+    # Try extracting from markdown code block
+    json_match = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?```', output)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(1).strip())
+            if isinstance(parsed, dict):
+                parsed = _extract_from_schema_echo(parsed)
+            return parsed
+        except json.JSONDecodeError:
+            pass
+    
+    # Try finding JSON object/array in text
+    # Look for {...} or [...]
+    for pattern in [r'(\{[^}]+\})', r'(\[[^\]]+\])']:
+        match = re.search(pattern, output)
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, dict):
+                    parsed = _extract_from_schema_echo(parsed)
+                return parsed
+            except json.JSONDecodeError:
+                continue
+    
+    # Return original if can't parse
+    logger.debug(f"Could not parse JSON from step '{step_name}' output")
+    return output
+
+
+def _extract_from_schema_echo(data: dict) -> Any:
+    """
+    Extract actual data when LLM echoes the JSON schema structure.
+    
+    Common patterns:
+    - {'type': 'array', 'items': [...]} -> return [...]
+    - {'type': 'object', 'properties': {...}, 'data': {...}} -> return data
+    - {'items': [...]} -> return [...] (native structured output wrapper)
+    - {'keywords': [...]} -> return as-is (normal output)
+    
+    Args:
+        data: Dict that might contain echoed schema
+        
+    Returns:
+        Extracted data or original dict
+    """
+    # Check if this looks like a schema echo with 'type' and actual data
+    if 'type' in data:
+        data_type = data.get('type')
+        
+        # Array schema echo: {'type': 'array', 'items': [...]}
+        if data_type == 'array' and 'items' in data:
+            items = data['items']
+            # If items is a list, that's our actual data
+            if isinstance(items, list):
+                logger.debug("Extracted items from schema-echoed array output")
+                return items
+        
+        # Object schema echo: {'type': 'object', 'properties': {...}, 'data': {...}}
+        if data_type == 'object':
+            # Check for actual data field
+            if 'data' in data and isinstance(data['data'], dict):
+                logger.debug("Extracted data from schema-echoed object output")
+                return data['data']
+    
+    # Handle native structured output wrapper: {'items': [...]}
+    # This is created by _build_response_format when wrapping arrays
+    if 'items' in data and len(data) == 1 and isinstance(data['items'], list):
+        logger.debug("Extracted items from native structured output array wrapper")
+        return data['items']
+    
+    # Not a schema echo, return as-is
+    return data
 
 
 @dataclass
@@ -101,10 +204,10 @@ class Parallel:
 @dataclass
 class Loop:
     """
-    Iterate over a list or CSV file, executing step for each item.
+    Iterate over a list or CSV file, executing step(s) for each item.
     
     Usage:
-        # Loop over list variable (sequential)
+        # Loop over list variable (sequential) - single step
         workflow = Workflow(
             steps=[loop(processor, over="items")],
             variables={"items": ["a", "b", "c"]}
@@ -126,8 +229,20 @@ class Loop:
             steps=[loop(processor, over="items", parallel=True, max_workers=4)],
             variables={"items": ["a", "b", "c"]}
         )
+        
+        # Multi-step loop (NEW) - execute multiple steps per iteration
+        workflow = Workflow(
+            steps=[loop(
+                steps=[researcher, writer, publisher],  # Multiple steps
+                over="topics",
+                parallel=True,
+                max_workers=4
+            )],
+            variables={"topics": [...]}
+        )
     """
-    step: Any = None
+    step: Any = None  # Single step (backward compat)
+    steps: Optional[List[Any]] = None  # Multiple steps (NEW)
     over: Optional[str] = None  # Variable name containing list
     from_csv: Optional[str] = None  # CSV file path
     from_file: Optional[str] = None  # Text file path (one item per line)
@@ -138,7 +253,8 @@ class Loop:
     
     def __init__(
         self, 
-        step: Any, 
+        step: Any = None,
+        steps: Optional[List[Any]] = None,
         over: Optional[str] = None,
         from_csv: Optional[str] = None,
         from_file: Optional[str] = None,
@@ -147,7 +263,18 @@ class Loop:
         max_workers: Optional[int] = None,
         output_variable: Optional[str] = None
     ):
+        # Validation: cannot have both step and steps
+        if step is not None and steps is not None:
+            raise ValueError("Cannot specify both 'step' and 'steps'")
+        # Validation: must have at least one
+        if step is None and steps is None:
+            raise ValueError("Loop requires 'step' or 'steps'")
+        # Validation: steps cannot be empty
+        if steps is not None and len(steps) == 0:
+            raise ValueError("Loop 'steps' cannot be empty")
+        
         self.step = step
+        self.steps = steps
         self.over = over
         self.from_csv = from_csv
         self.from_file = from_file
@@ -195,14 +322,16 @@ def parallel(steps: List) -> Parallel:
     """Execute steps in parallel."""
     return Parallel(steps=steps)
 
-def loop(step: Any, over: Optional[str] = None, from_csv: Optional[str] = None, 
+def loop(step: Any = None, steps: Optional[List[Any]] = None,
+         over: Optional[str] = None, from_csv: Optional[str] = None, 
          from_file: Optional[str] = None, var_name: str = "item",
          parallel: bool = False, max_workers: Optional[int] = None,
          output_variable: Optional[str] = None) -> Loop:
-    """Loop over items executing step for each.
+    """Loop over items executing step(s) for each.
     
     Args:
-        step: The step (agent/function) to execute for each item
+        step: Single step (agent/function) to execute for each item (backward compat)
+        steps: Multiple steps to execute sequentially for each item (NEW)
         over: Variable name containing the list to iterate over
         from_csv: Path to CSV file to read items from
         from_file: Path to text file with one item per line
@@ -214,7 +343,7 @@ def loop(step: Any, over: Optional[str] = None, from_csv: Optional[str] = None,
     Returns:
         Loop object configured for iteration
     """
-    return Loop(step=step, over=over, from_csv=from_csv, from_file=from_file, 
+    return Loop(step=step, steps=steps, over=over, from_csv=from_csv, from_file=from_file, 
                 var_name=var_name, parallel=parallel, max_workers=max_workers,
                 output_variable=output_variable)
 
@@ -1206,6 +1335,10 @@ class Workflow:
                         
                         output = step.agent.chat(action, **chat_kwargs)
                         
+                        # Parse JSON output if output_json was requested and output is a string
+                        if step_output_json and output and isinstance(output, str):
+                            output = _parse_json_output(output, step.name)
+                        
                         # Handle output_pydantic if present
                         output_pydantic = getattr(step, 'output_pydantic', None)
                         if output_pydantic and output:
@@ -1256,6 +1389,11 @@ class Workflow:
                             action = f"{action}\n\nPrevious attempt feedback: {validation_feedback}"
                         
                         output = temp_agent.chat(action, stream=stream)
+                        
+                        # Parse JSON output if output_json was requested
+                        step_output_json = getattr(step, '_output_json', None)
+                        if step_output_json and output and isinstance(output, str):
+                            output = _parse_json_output(output, step.name)
                         
                 except Exception as e:
                     step_error = e
@@ -1342,6 +1480,26 @@ class Workflow:
             var_name = step.output_variable or f"{step.name}_output"
             all_variables[var_name] = output
             
+            # Validate output and warn about issues
+            if output is None:
+                logger.warning(f"⚠️  Step '{step.name}': Output is None. Agent may not have returned expected format.")
+                if verbose:
+                    print(f"⚠️  WARNING: Step '{step.name}' output is None!")
+            else:
+                # Check type against output_json schema if defined
+                expected_schema = getattr(step, '_output_json', None)
+                if expected_schema and isinstance(expected_schema, dict):
+                    expected_type = expected_schema.get('type')
+                    actual_type = type(output).__name__
+                    if expected_type == 'object' and not isinstance(output, dict):
+                        logger.warning(f"⚠️  Step '{step.name}': Expected object/dict, got {actual_type}")
+                        if verbose:
+                            print(f"⚠️  Step '{step.name}': Expected 'object', received '{actual_type}'")
+                    elif expected_type == 'array' and not isinstance(output, list):
+                        logger.warning(f"⚠️  Step '{step.name}': Expected array/list, got {actual_type}")
+                        if verbose:
+                            print(f"⚠️  Step '{step.name}': Expected 'array', received '{actual_type}'")
+            
             i += 1
         
         # Update workflow status
@@ -1399,33 +1557,12 @@ class Workflow:
         return await self.astart(input, llm, verbose)
     
     def _normalize_steps(self) -> List['WorkflowStep']:
-        """Convert mixed steps (Agent, function, WorkflowStep) to WorkflowStep list."""
-        normalized = []
+        """Convert mixed steps (Agent, function, WorkflowStep) to WorkflowStep list.
         
-        for i, step in enumerate(self.steps):
-            if isinstance(step, WorkflowStep):
-                normalized.append(step)
-            elif callable(step):
-                # It's a function - wrap as handler
-                normalized.append(WorkflowStep(
-                    name=getattr(step, '__name__', f'step_{i+1}'),
-                    handler=step
-                ))
-            elif hasattr(step, 'chat'):
-                # It's an Agent - wrap with agent reference
-                normalized.append(WorkflowStep(
-                    name=getattr(step, 'name', f'agent_{i+1}'),
-                    agent=step,
-                    action="{{input}}"
-                ))
-            else:
-                # Unknown type - try to use as string action
-                normalized.append(WorkflowStep(
-                    name=f'step_{i+1}',
-                    action=str(step)
-                ))
-        
-        return normalized
+        This method uses _normalize_single_step to ensure consistent normalization
+        and avoid duplicated code paths (DRY principle).
+        """
+        return [self._normalize_single_step(step, i) for i, step in enumerate(self.steps)]
     
     def _create_plan(self, input: str, model: str, verbose: bool) -> Optional[str]:
         """Create an execution plan for the workflow using LLM.
@@ -1608,6 +1745,11 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                         action = f"{action}\n\nContext from previous step:\n{previous_output}"
                 action = action.replace("{{input}}", input)
                 output = normalized.agent.chat(action, stream=stream)
+                
+                # Parse JSON output if output_json was requested
+                step_output_json = getattr(normalized, '_output_json', None)
+                if step_output_json and output and isinstance(output, str):
+                    output = _parse_json_output(output, normalized.name)
             except Exception as e:
                 output = f"Error: {e}"
         elif normalized.action:
@@ -1633,6 +1775,11 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                         action = f"{action}\n\nContext from previous step:\n{previous_output}"
                 
                 output = temp_agent.chat(action, stream=stream)
+                
+                # Parse JSON output if output_json was requested
+                step_output_json = getattr(normalized, '_output_json', None)
+                if step_output_json and output and isinstance(output, str):
+                    output = _parse_json_output(output, normalized.name)
             except Exception as e:
                 output = f"Error: {e}"
         
@@ -1784,24 +1931,51 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         
         num_items = len(items)
         
+        # Determine steps to run (multi-step or single step)
+        steps_to_run = loop_step.steps if loop_step.steps else [loop_step.step]
+        is_multi_step = loop_step.steps is not None and len(loop_step.steps) > 1
+        
         if loop_step.parallel and num_items > 1:
             # Parallel execution
             max_workers = loop_step.max_workers or num_items
             if verbose:
-                print(f"⚡🔁 Parallel looping over {num_items} items (max_workers={max_workers})...")
+                step_info = f" ({len(steps_to_run)} steps each)" if is_multi_step else ""
+                print(f"⚡🔁 Parallel looping over {num_items} items{step_info} (max_workers={max_workers})...")
             
             def execute_item(idx_item_tuple):
-                """Execute step for a single item in thread."""
+                """Execute step(s) for a single item in thread."""
                 idx, item = idx_item_tuple
-                loop_vars = all_variables.copy()
+                # CRITICAL: Deep copy variables to ensure thread isolation
+                import copy
+                loop_vars = copy.deepcopy(all_variables)
                 loop_vars[loop_step.var_name] = item
                 loop_vars["loop_index"] = idx
                 
-                # Execute step (verbose=False in parallel to avoid interleaved output)
-                step_result = self._execute_single_step_internal(
-                    loop_step.step, previous_output, input, loop_vars, model, False, idx, stream=False
-                )
-                return idx, step_result
+                # Also expand nested item properties for template access (e.g., {{item.title}})
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        loop_vars[f"{loop_step.var_name}.{key}"] = value
+                
+                # Execute all steps sequentially within this iteration
+                iteration_output = previous_output
+                iteration_results = []
+                for step_idx, step in enumerate(steps_to_run):
+                    step_result = self._execute_single_step_internal(
+                        step, iteration_output, input, loop_vars, model, False, step_idx, stream=False
+                    )
+                    iteration_output = step_result.get("output")
+                    iteration_results.append(step_result)
+                    # Update variables if step set any
+                    if step_result.get("variables"):
+                        loop_vars.update(step_result["variables"])
+                
+                # Return final output (last step's output)
+                final_result = {
+                    "step": f"loop_{idx}",
+                    "output": iteration_output,
+                    "steps": iteration_results
+                }
+                return idx, final_result
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [executor.submit(execute_item, (idx, item)) for idx, item in enumerate(items)]
@@ -1830,25 +2004,66 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         else:
             # Sequential execution (original behavior)
             if verbose:
-                print(f"🔁 Looping over {num_items} items...")
+                step_info = f" ({len(steps_to_run)} steps each)" if is_multi_step else ""
+                print(f"🔁 Looping over {num_items} items{step_info}...")
             
             for idx, item in enumerate(items):
                 # Add current item to variables
-                loop_vars = all_variables.copy()
+                import copy
+                loop_vars = copy.deepcopy(all_variables)
                 loop_vars[loop_step.var_name] = item
                 loop_vars["loop_index"] = idx
                 
-                step_result = self._execute_single_step_internal(
-                    loop_step.step, previous_output, input, loop_vars, model, verbose, idx, stream=stream
-                )
-                results.append({"step": f"{step_result['step']}_{idx}", "output": step_result["output"]})
-                outputs.append(step_result["output"])
-                previous_output = step_result["output"]
+                # Also expand nested item properties for template access (e.g., {{item.title}})
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        loop_vars[f"{loop_step.var_name}.{key}"] = value
+                
+                # Execute all steps sequentially within this iteration
+                iteration_output = previous_output
+                for step_idx, step in enumerate(steps_to_run):
+                    step_result = self._execute_single_step_internal(
+                        step, iteration_output, input, loop_vars, model, verbose, step_idx, stream=stream
+                    )
+                    iteration_output = step_result.get("output")
+                    # Update variables if step set any
+                    if step_result.get("variables"):
+                        loop_vars.update(step_result["variables"])
+                
+                results.append({"step": f"loop_{idx}", "output": iteration_output})
+                outputs.append(iteration_output)
+                previous_output = iteration_output
         # Store outputs in user-specified variable or default to loop_outputs
         output_var_name = loop_step.output_variable or "loop_outputs"
         all_variables[output_var_name] = outputs
         all_variables["loop_outputs"] = outputs  # Also keep for backward compatibility
         combined_output = "\n".join(str(o) for o in outputs) if outputs else ""
+        
+        # Validate outputs and warn about issues
+        none_count = sum(1 for o in outputs if o is None)
+        if none_count > 0:
+            logger.warning(f"⚠️  Loop '{output_var_name}': {none_count}/{len(outputs)} outputs are None. "
+                          f"Check if agent returned expected format.")
+            if verbose:
+                print(f"⚠️  WARNING: {none_count}/{len(outputs)} loop outputs are None!")
+        
+        # Check for type consistency
+        if outputs and len(outputs) > 0:
+            expected_type = loop_step.step._output_json if hasattr(loop_step.step, '_output_json') else None
+            if expected_type:
+                expected_schema_type = expected_type.get('type') if isinstance(expected_type, dict) else None
+                for i, o in enumerate(outputs):
+                    if o is None:
+                        continue
+                    actual_type = type(o).__name__
+                    if expected_schema_type == 'object' and not isinstance(o, dict):
+                        logger.warning(f"⚠️  Loop output[{i}]: Expected object/dict, got {actual_type}")
+                        if verbose:
+                            print(f"⚠️  Loop output[{i}]: Expected 'object', received '{actual_type}'")
+                    elif expected_schema_type == 'array' and not isinstance(o, list):
+                        logger.warning(f"⚠️  Loop output[{i}]: Expected array/list, got {actual_type}")
+                        if verbose:
+                            print(f"⚠️  Loop output[{i}]: Expected 'array', received '{actual_type}'")
         
         # Debug logging for output_variable
         if verbose:
@@ -2075,12 +2290,17 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
             # Determine input for the included recipe
             recipe_input = include_step.input or previous_output or input
             
-            # Substitute variables in the input
-            if recipe_input:
+            # Convert non-string inputs to JSON string for variable substitution
+            if recipe_input and not isinstance(recipe_input, str):
+                recipe_input = json.dumps(recipe_input)
+            
+            # Substitute variables in the input (only if it's a string)
+            if recipe_input and isinstance(recipe_input, str):
                 for key, value in all_variables.items():
                     recipe_input = recipe_input.replace(f"{{{{{key}}}}}", str(value))
                 if previous_output:
-                    recipe_input = recipe_input.replace("{{previous_output}}", str(previous_output))
+                    prev_str = previous_output if isinstance(previous_output, str) else json.dumps(previous_output)
+                    recipe_input = recipe_input.replace("{{previous_output}}", prev_str)
                 recipe_input = recipe_input.replace("{{input}}", input)
             
             # Parse and execute the included workflow
