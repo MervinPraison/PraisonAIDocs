@@ -24,6 +24,11 @@ from ..main import (
 )
 import inspect
 
+# Default tool output limit (16000 chars ≈ 4000 tokens)
+# Increased to allow full page content from search tools while still preventing overflow
+# Applied even when context management is disabled to prevent runaway tool outputs
+DEFAULT_TOOL_OUTPUT_LIMIT = 16000
+
 # Global variables for API server
 _server_started = {}  # Dict of port -> started boolean
 _registered_agents = {}  # Dict of port -> Dict of path -> agent_id
@@ -1115,6 +1120,7 @@ Your Goal: {self.goal}
         self._context_param = context  # Store raw param for lazy init
         self._context_manager = None  # Lazy initialized on first use
         self._context_manager_initialized = False
+        self._session_dedup_cache = None  # Shared session cache from workflow
         
         # Action trace mode - handled via display callbacks, not separate emitter
         self._actions_trace = actions_trace
@@ -1218,6 +1224,7 @@ Your Goal: {self.goal}
             self._context_manager = ContextManager(
                 model=self.llm if isinstance(self.llm, str) else "gpt-4o-mini",
                 agent_name=self.name or "Agent",
+                session_cache=self._session_dedup_cache,  # Share session cache from workflow
             )
         elif isinstance(self._context_param, ManagerConfig):
             # Use provided ManagerConfig
@@ -1225,6 +1232,7 @@ Your Goal: {self.goal}
                 model=self.llm if isinstance(self.llm, str) else "gpt-4o-mini",
                 config=self._context_param,
                 agent_name=self.name or "Agent",
+                session_cache=self._session_dedup_cache,  # Share session cache from workflow
             )
         elif hasattr(self._context_param, 'auto_compact') and hasattr(self._context_param, 'tool_output_max'):
             # ContextConfig from YAML - convert to ManagerConfig
@@ -1246,6 +1254,7 @@ Your Goal: {self.goal}
                         model=self.llm if isinstance(self.llm, str) else "gpt-4o-mini",
                         config=manager_config,
                         agent_name=self.name or "Agent",
+                        session_cache=self._session_dedup_cache,  # Share session cache from workflow
                     )
                 else:
                     self._context_manager = None
@@ -2590,7 +2599,8 @@ Answer:"""
                 retry_prompt = f"{prompt}\n\nNote: Previous response failed validation due to: {guardrail_result.error}. Please provide an improved response."
                 response = self._chat_completion([{"role": "user", "content": retry_prompt}], temperature, tools, task_name=task_name, task_description=task_description, task_id=task_id)
                 if response and response.choices:
-                    current_response = response.choices[0].message.content.strip()
+                    content = response.choices[0].message.content
+                    current_response = content.strip() if content else ""
                 else:
                     raise Exception("Failed to generate retry response")
             except Exception as e:
@@ -3043,25 +3053,102 @@ Your Goal: {self.goal}"""
     def _execute_tool_with_context(self, function_name, arguments, state):
         """Execute tool within injection context, with optional output truncation."""
         from ..tools.injected import with_injection_context
+        from ..trace.context_events import get_context_emitter
+        import time as _time
         
-        with with_injection_context(state):
-            result = self._execute_tool_impl(function_name, arguments)
+        # Emit tool call start event (zero overhead when not set)
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.tool_call_start(self.name, function_name, arguments)
+        _tool_start_time = _time.time()
         
-        # Apply context-aware truncation if context management is enabled
-        # This prevents tool outputs (e.g., search results) from exploding the context
-        if self.context_manager and result:
-            try:
-                truncated = self._truncate_tool_output(function_name, str(result))
-                if len(truncated) < len(str(result)):
-                    logging.debug(f"Truncated {function_name} output from {len(str(result))} to {len(truncated)} chars")
-                    # Return truncated string if significantly shorter
-                    if isinstance(result, dict):
-                        # Keep dict structure but may have truncated string representation
-                        return result  # Let the string version be truncated at display time
-                    return truncated
-            except Exception as e:
-                logging.debug(f"Tool truncation skipped: {e}")
+        try:
+            with with_injection_context(state):
+                result = self._execute_tool_impl(function_name, arguments)
+            
+            # Apply tool output truncation to prevent context overflow
+            # Uses context manager budget if enabled, otherwise applies default limit
+            if result:
+                try:
+                    result_str = str(result)
+                    
+                    if self.context_manager:
+                        # Use context-aware truncation with configured budget
+                        truncated = self._truncate_tool_output(function_name, result_str)
+                    else:
+                        # Apply default limit even without context management
+                        # This prevents runaway tool outputs from causing overflow
+                        if len(result_str) > DEFAULT_TOOL_OUTPUT_LIMIT:
+                            truncated = result_str[:DEFAULT_TOOL_OUTPUT_LIMIT] + "...[output truncated]"
+                        else:
+                            truncated = result_str
+                    
+                    if len(truncated) < len(result_str):
+                        logging.debug(f"Truncated {function_name} output from {len(result_str)} to {len(truncated)} chars")
+                        # For dicts, truncate large string fields (e.g., raw_content from search)
+                        if isinstance(result, dict):
+                            max_field_chars = DEFAULT_TOOL_OUTPUT_LIMIT if not self.context_manager else None
+                            result = self._truncate_dict_fields(result, function_name, max_field_chars)
+                        else:
+                            result = truncated
+                except Exception as e:
+                    logging.debug(f"Tool truncation skipped: {e}")
+            
+            # Emit tool call end event (truncation handled by context_events.py)
+            _duration_ms = (_time.time() - _tool_start_time) * 1000
+            _trace_emitter.tool_call_end(self.name, function_name, str(result) if result else None, _duration_ms)
+            
+            return result
+        except Exception as e:
+            # Emit tool call end with error
+            _duration_ms = (_time.time() - _tool_start_time) * 1000
+            _trace_emitter.tool_call_end(self.name, function_name, None, _duration_ms, str(e))
+            raise
+    
+    def _calculate_llm_cost(self, prompt_tokens: int, completion_tokens: int, response: any = None) -> float:
+        """Calculate estimated cost for LLM call.
         
+        Uses litellm for accurate pricing (1000+ models) when available,
+        falls back to built-in pricing table otherwise.
+        
+        Args:
+            prompt_tokens: Number of tokens in the prompt
+            completion_tokens: Number of tokens in the completion
+            response: Optional LLM response object for more accurate cost calculation
+            
+        Returns:
+            Estimated cost in USD
+        """
+        from praisonaiagents.utils.cost_utils import calculate_llm_cost
+        return calculate_llm_cost(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            model=self.llm,
+            response=response,
+        )
+    
+    def _truncate_dict_fields(self, data: dict, tool_name: str, max_field_chars: int = None) -> dict:
+        """Truncate large string fields in a dict to prevent context overflow."""
+        if max_field_chars is None:
+            # Use tool budget from context manager (default 5000 tokens * 4 chars/token = 20000 chars)
+            max_tokens = self.context_manager.get_tool_budget(tool_name) if self.context_manager else 5000
+            max_field_chars = max_tokens * 4
+        
+        result = {}
+        for key, value in data.items():
+            if isinstance(value, str) and len(value) > max_field_chars:
+                # Truncate large string fields
+                result[key] = value[:max_field_chars] + "...[truncated]"
+                logging.debug(f"Truncated field '{key}' from {len(value)} to {max_field_chars} chars")
+            elif isinstance(value, dict):
+                result[key] = self._truncate_dict_fields(value, tool_name, max_field_chars)
+            elif isinstance(value, list):
+                result[key] = [
+                    self._truncate_dict_fields(item, tool_name, max_field_chars) if isinstance(item, dict)
+                    else (item[:max_field_chars] + "...[truncated]" if isinstance(item, str) and len(item) > max_field_chars else item)
+                    for item in value
+                ]
+            else:
+                result[key] = value
         return result
     
     def _execute_tool_impl(self, function_name, arguments):
@@ -3403,6 +3490,17 @@ Your Goal: {self.goal}"""
     def _chat_completion(self, messages, temperature=1.0, tools=None, stream=True, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None):
         start_time = time.time()
         logging.debug(f"{self.name} sending messages to LLM: {messages}")
+        
+        # Emit LLM request trace event (zero overhead when not set)
+        from ..trace.context_events import get_context_emitter
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.llm_request(
+            self.name,
+            messages_count=len(messages),
+            tokens_used=0,  # Estimated before call
+            model=self.llm if isinstance(self.llm, str) else None,
+            messages=messages,  # Include full messages for context replay
+        )
 
         # Use the new _format_tools_for_completion helper method
         formatted_tools = self._format_tools_for_completion(tools)
@@ -3506,9 +3604,81 @@ Your Goal: {self.goal}"""
                 
                 final_response = self._openai_client.chat_completion_with_tools(**chat_kwargs)
 
+            # Emit LLM response trace event with token usage
+            _duration_ms = (time.time() - start_time) * 1000
+            _prompt_tokens = 0
+            _completion_tokens = 0
+            _cost_usd = 0.0
+            
+            # Extract token usage from response if available
+            if final_response:
+                _usage = getattr(final_response, 'usage', None)
+                if _usage:
+                    _prompt_tokens = getattr(_usage, 'prompt_tokens', 0) or 0
+                    _completion_tokens = getattr(_usage, 'completion_tokens', 0) or 0
+                    # Calculate cost using litellm (if available) or fallback pricing
+                    _cost_usd = self._calculate_llm_cost(_prompt_tokens, _completion_tokens, response=final_response)
+            
+            _trace_emitter.llm_response(
+                self.name,
+                duration_ms=_duration_ms,
+                response_content=str(final_response) if final_response else None,
+                prompt_tokens=_prompt_tokens,
+                completion_tokens=_completion_tokens,
+                cost_usd=_cost_usd,
+            )
+            
             return final_response
 
         except Exception as e:
+            error_str = str(e).lower()
+            
+            # Check if this is a context overflow error
+            context_overflow_phrases = [
+                "maximum context length",
+                "context window is too long", 
+                "context length exceeded",
+                "context_length_exceeded",
+                "token limit",
+                "too many tokens"
+            ]
+            is_overflow = any(phrase in error_str for phrase in context_overflow_phrases)
+            
+            if is_overflow and self.context_manager:
+                # Attempt overflow recovery with emergency truncation
+                logging.warning(f"[{self.name}] Context overflow detected, attempting recovery...")
+                try:
+                    from ..context.budgeter import get_model_limit
+                    from ..context.tokens import estimate_messages_tokens
+                    
+                    model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
+                    model_limit = get_model_limit(model_name)
+                    target = int(model_limit * 0.7)  # Target 70% of limit for safety
+                    
+                    # Apply emergency truncation
+                    truncated_messages = self.context_manager.emergency_truncate(messages, target)
+                    
+                    logging.info(
+                        f"[{self.name}] Emergency truncation: {estimate_messages_tokens(messages)} -> "
+                        f"{estimate_messages_tokens(truncated_messages)} tokens"
+                    )
+                    
+                    # Retry with truncated messages (recursive call with truncated context)
+                    return self._chat_completion(
+                        truncated_messages, temperature, tools, stream, 
+                        reasoning_steps, task_name, task_description, task_id, response_format
+                    )
+                except Exception as recovery_error:
+                    logging.error(f"[{self.name}] Overflow recovery failed: {recovery_error}")
+            
+            # Emit LLM response trace event on error
+            _duration_ms = (time.time() - start_time) * 1000
+            _trace_emitter.llm_response(
+                self.name,
+                duration_ms=_duration_ms,
+                finish_reason="error",
+                response_content=str(e),  # Include error for context replay
+            )
             display_error(f"Error in chat completion: {e}")
             return None
     
@@ -3602,6 +3772,8 @@ Your Goal: {self.goal}"""
                 trigger="turn",
             )
             
+            optimized = result.get("messages", messages)
+            
             # Log if optimization occurred
             if result.get("optimized"):
                 logging.debug(
@@ -3610,7 +3782,29 @@ Your Goal: {self.goal}"""
                     f"(saved {result.get('tokens_saved', 0)})"
                 )
             
-            return result.get("messages", messages), result
+            # HARD LIMIT CHECK: If still over model limit, apply emergency truncation
+            try:
+                from ..context.budgeter import get_model_limit
+                from ..context.tokens import estimate_messages_tokens
+                
+                model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
+                model_limit = get_model_limit(model_name)
+                current_tokens = estimate_messages_tokens(optimized)
+                
+                # If over 95% of limit, apply emergency truncation
+                if current_tokens > model_limit * 0.95:
+                    logging.warning(
+                        f"[{self.name}] Context at {current_tokens} tokens (limit: {model_limit}), "
+                        f"applying emergency truncation"
+                    )
+                    target = int(model_limit * 0.8)  # Target 80% of limit
+                    optimized = self.context_manager.emergency_truncate(optimized, target)
+                    result["emergency_truncated"] = True
+                    result["tokens_after"] = estimate_messages_tokens(optimized)
+            except Exception as e:
+                logging.debug(f"Hard limit check skipped: {e}")
+            
+            return optimized, result
             
         except Exception as e:
             # Context management should never break the chat flow
@@ -3797,6 +3991,18 @@ Your Goal: {self.goal}"""
                         Supports: file paths, URLs, or data URIs.
             ...other args...
         """
+        # Emit context trace event (zero overhead when not set)
+        from ..trace.context_events import get_context_emitter
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.agent_start(self.name, {"role": self.role, "goal": self.goal})
+        
+        try:
+            return self._chat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter)
+        finally:
+            _trace_emitter.agent_end(self.name)
+    
+    def _chat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter):
+        """Internal chat implementation (extracted for trace wrapping)."""
         # Apply rate limiter if configured (before any LLM call)
         if self._rate_limiter is not None:
             self._rate_limiter.acquire()
@@ -4081,7 +4287,9 @@ Your Goal: {self.goal}"""
                             self.chat_history = self.chat_history[:chat_history_length]
                             return None
 
-                        response_text = response.choices[0].message.content.strip()
+                        # Handle None content (can happen with tool calls or empty responses)
+                        content = response.choices[0].message.content
+                        response_text = content.strip() if content else ""
 
                         # Handle output_json or output_pydantic if specified
                         if output_json or output_pydantic:
@@ -4153,7 +4361,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 if not reflection_response or not reflection_response.choices:
                                     raise Exception("No response from reflection request")
                                 
-                                reflection_text = reflection_response.choices[0].message.content.strip()
+                                reflection_content = reflection_response.choices[0].message.content
+                                reflection_text = reflection_content.strip() if reflection_content else ""
                                 
                                 # Clean the JSON output
                                 cleaned_json = self.clean_json_output(reflection_text)
@@ -4228,7 +4437,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             # For custom LLMs during reflection, always use non-streaming to ensure complete responses
                             use_stream = self.stream if not self._using_custom_llm else False
                             response = self._chat_completion(messages, temperature=temperature, tools=None, stream=use_stream, task_name=task_name, task_description=task_description, task_id=task_id)
-                            response_text = response.choices[0].message.content.strip()
+                            content = response.choices[0].message.content
+                            response_text = content.strip() if content else ""
                             reflection_count += 1
                             continue  # Continue the loop for more reflections
 
@@ -4267,7 +4477,19 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             prompt: Text query that WILL be stored in chat_history
             attachments: Optional list of image/file paths that are ephemeral
                         (used for THIS turn only, NEVER stored in history).
-        """ 
+        """
+        # Emit context trace event (zero overhead when not set)
+        from ..trace.context_events import get_context_emitter
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.agent_start(self.name, {"role": self.role, "goal": self.goal})
+        
+        try:
+            return await self._achat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, task_name, task_description, task_id, attachments, _trace_emitter)
+        finally:
+            _trace_emitter.agent_end(self.name)
+    
+    async def _achat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, task_name, task_description, task_id, attachments, _trace_emitter):
+        """Internal async chat implementation (extracted for trace wrapping)."""
         # Process ephemeral attachments (DRY - builds multimodal prompt)
         # IMPORTANT: Original text 'prompt' is stored in history, attachments are NOT
         llm_prompt = self._build_multimodal_prompt(prompt, attachments) if attachments else prompt
@@ -5788,8 +6010,10 @@ Write the complete compiled report:"""
                     if hasattr(self, 'achat') and asyncio.iscoroutinefunction(self.achat):
                         response = await self.achat(prompt, tools=self.tools, task_name=None, task_description=None, task_id=None)
                     elif hasattr(self, 'chat'): # Fallback for synchronous chat
+                        # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                        from ..trace.context_events import copy_context_to_callable
                         loop = asyncio.get_event_loop()
-                        response = await loop.run_in_executor(None, lambda p=prompt: self.chat(p, tools=self.tools))
+                        response = await loop.run_in_executor(None, copy_context_to_callable(lambda p=prompt: self.chat(p, tools=self.tools)))
                     else:
                         logging.error(f"Agent {self.name} has no suitable chat or achat method for MCP tool.")
                         return f"Error: Agent {self.name} misconfigured for MCP."

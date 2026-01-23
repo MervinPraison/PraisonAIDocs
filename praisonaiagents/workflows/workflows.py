@@ -768,7 +768,7 @@ class Workflow:
     planning: Optional[Any] = False  # Union[bool, str, WorkflowPlanningConfig] - planning mode
     memory: Optional[Any] = None  # Union[bool, WorkflowMemoryConfig, instance] - memory
     hooks: Optional[Any] = None  # WorkflowHooksConfig - lifecycle callbacks
-    context: Optional[Any] = False  # Union[bool, ManagerConfig, ContextManager] - context management
+    context: Optional[Any] = True  # Union[bool, ManagerConfig, ContextManager] - context management (enabled by default for workflows)
     # NEW: Agent-like consolidated params for feature parity
     autonomy: Optional[Any] = None  # Union[bool, AutonomyConfig] - agent autonomy
     knowledge: Optional[Any] = None  # Union[bool, List[str], KnowledgeConfig] - RAG
@@ -793,6 +793,7 @@ class Workflow:
     _hooks_config: Optional[Any] = field(default=None, repr=False)
     _context_manager: Optional[Any] = field(default=None, repr=False)
     _context_manager_initialized: bool = field(default=False, repr=False)
+    _session_dedup_cache: Optional[Any] = field(default=None, repr=False)  # Shared session deduplication cache
     # NEW: Resolved configs for agent-like params (for propagation to steps/agents)
     _autonomy_config: Optional[Any] = field(default=None, repr=False)
     _knowledge_config: Optional[Any] = field(default=None, repr=False)
@@ -915,6 +916,14 @@ class Workflow:
                 config_class=ReflectionConfig, presets=REFLECTION_PRESETS,
                 default=None,
             )
+        
+        # Initialize session deduplication cache for cross-agent deduplication
+        if self.context:
+            try:
+                from ..context.manager import SessionDeduplicationCache
+                self._session_dedup_cache = SessionDeduplicationCache()
+            except ImportError:
+                pass
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1285,8 +1294,15 @@ class Workflow:
                     elif step.agent:
                         # Direct agent with tools
                         # Propagate context management to existing agent if workflow has it enabled
-                        if self.context and not step.agent._context_manager_initialized:
-                            step.agent._context_param = self.context
+                        if self.context:
+                            if not step.agent._context_manager_initialized:
+                                step.agent._context_param = self.context
+                            # Share session deduplication cache for cross-agent deduplication
+                            if self._session_dedup_cache:
+                                step.agent._session_dedup_cache = self._session_dedup_cache
+                                # Also set on existing context manager if already initialized
+                                if step.agent._context_manager and hasattr(step.agent._context_manager, '_session_cache'):
+                                    step.agent._context_manager._session_cache = self._session_dedup_cache
                         
                         # Substitute variables in action
                         action = step.action or input
@@ -1540,10 +1556,12 @@ class Workflow:
         import asyncio
         
         # Run the synchronous version in a thread pool
+        # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+        from ..trace.context_events import copy_context_to_callable
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: self.run(input, llm, verbose)
+            copy_context_to_callable(lambda: self.run(input, llm, verbose))
         )
         return result
     
@@ -1730,8 +1748,15 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         elif normalized.agent:
             try:
                 # Propagate context management to existing agent if workflow has it enabled
-                if self.context and not normalized.agent._context_manager_initialized:
-                    normalized.agent._context_param = self.context
+                if self.context:
+                    if not normalized.agent._context_manager_initialized:
+                        normalized.agent._context_param = self.context
+                    # Share session deduplication cache for cross-agent deduplication
+                    if self._session_dedup_cache:
+                        normalized.agent._session_dedup_cache = self._session_dedup_cache
+                        # Also set on existing context manager if already initialized
+                        if normalized.agent._context_manager and hasattr(normalized.agent._context_manager, '_session_cache'):
+                            normalized.agent._context_manager._session_cache = self._session_dedup_cache
                 
                 action = normalized.action or input
                 # Substitute variables
@@ -1858,13 +1883,24 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
             print(f"⚡ Running {len(parallel_step.steps)} steps in parallel...")
         
         # Use ThreadPoolExecutor for parallel execution
+        # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+        from ..trace.context_events import copy_context_to_callable, get_context_emitter
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(parallel_step.steps)) as executor:
             futures = []
             for idx, step in enumerate(parallel_step.steps):
-                future = executor.submit(
-                    self._execute_single_step_internal,
-                    step, previous_output, input, all_variables.copy(), model, False, idx, stream
-                )
+                # Wrap execution to propagate context and set branch_id for parallel tracking
+                def execute_with_branch(step=step, idx=idx):
+                    emitter = get_context_emitter()
+                    emitter.set_branch(f"parallel_{idx}")
+                    try:
+                        return self._execute_single_step_internal(
+                            step, previous_output, input, all_variables.copy(), model, False, idx, stream
+                        )
+                    finally:
+                        emitter.clear_branch()
+                
+                future = executor.submit(copy_context_to_callable(execute_with_branch))
                 futures.append((idx, future))
             
             for idx, future in futures:
@@ -1942,43 +1978,57 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                 step_info = f" ({len(steps_to_run)} steps each)" if is_multi_step else ""
                 print(f"⚡🔁 Parallel looping over {num_items} items{step_info} (max_workers={max_workers})...")
             
+            # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+            from ..trace.context_events import copy_context_to_callable, get_context_emitter
+            
             def execute_item(idx_item_tuple):
                 """Execute step(s) for a single item in thread."""
                 idx, item = idx_item_tuple
-                # CRITICAL: Deep copy variables to ensure thread isolation
-                import copy
-                loop_vars = copy.deepcopy(all_variables)
-                loop_vars[loop_step.var_name] = item
-                loop_vars["loop_index"] = idx
                 
-                # Also expand nested item properties for template access (e.g., {{item.title}})
-                if isinstance(item, dict):
-                    for key, value in item.items():
-                        loop_vars[f"{loop_step.var_name}.{key}"] = value
+                # Set branch context for parallel tracking
+                emitter = get_context_emitter()
+                emitter.set_branch(f"loop_{idx}")
                 
-                # Execute all steps sequentially within this iteration
-                iteration_output = previous_output
-                iteration_results = []
-                for step_idx, step in enumerate(steps_to_run):
-                    step_result = self._execute_single_step_internal(
-                        step, iteration_output, input, loop_vars, model, False, step_idx, stream=False
-                    )
-                    iteration_output = step_result.get("output")
-                    iteration_results.append(step_result)
-                    # Update variables if step set any
-                    if step_result.get("variables"):
-                        loop_vars.update(step_result["variables"])
-                
-                # Return final output (last step's output)
-                final_result = {
-                    "step": f"loop_{idx}",
-                    "output": iteration_output,
-                    "steps": iteration_results
-                }
-                return idx, final_result
+                try:
+                    # CRITICAL: Deep copy variables to ensure thread isolation
+                    import copy
+                    loop_vars = copy.deepcopy(all_variables)
+                    loop_vars[loop_step.var_name] = item
+                    loop_vars["loop_index"] = idx
+                    
+                    # Also expand nested item properties for template access (e.g., {{item.title}})
+                    if isinstance(item, dict):
+                        for key, value in item.items():
+                            loop_vars[f"{loop_step.var_name}.{key}"] = value
+                    
+                    # Execute all steps sequentially within this iteration
+                    iteration_output = previous_output
+                    iteration_results = []
+                    for step_idx, step in enumerate(steps_to_run):
+                        step_result = self._execute_single_step_internal(
+                            step, iteration_output, input, loop_vars, model, False, step_idx, stream=False
+                        )
+                        iteration_output = step_result.get("output")
+                        iteration_results.append(step_result)
+                        # Update variables if step set any
+                        if step_result.get("variables"):
+                            loop_vars.update(step_result["variables"])
+                    
+                    # Return final output (last step's output)
+                    final_result = {
+                        "step": f"loop_{idx}",
+                        "output": iteration_output,
+                        "steps": iteration_results
+                    }
+                    return idx, final_result
+                finally:
+                    emitter.clear_branch()
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(execute_item, (idx, item)) for idx, item in enumerate(items)]
+                futures = [
+                    executor.submit(copy_context_to_callable(lambda pair=(idx, item): execute_item(pair)))
+                    for idx, item in enumerate(items)
+                ]
                 
                 # Collect results in order
                 indexed_results = []

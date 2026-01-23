@@ -12,6 +12,7 @@ Zero Performance Impact:
 Schema Version: 1.0
 """
 
+import contextvars
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -20,6 +21,92 @@ import json
 
 
 CONTEXT_SCHEMA_VERSION = "1.0"
+
+
+# =============================================================================
+# GLOBAL EMITTER REGISTRY
+# =============================================================================
+# Uses contextvars for async-safe, thread-safe global state.
+# Zero overhead when not set (returns disabled NoOp emitter).
+
+_context_emitter: contextvars.ContextVar["ContextTraceEmitter"] = contextvars.ContextVar(
+    'praisonai_context_emitter'
+)
+
+# Singleton disabled emitter for default case (zero allocation per call)
+_default_disabled_emitter: Optional["ContextTraceEmitter"] = None
+
+
+def get_context_emitter() -> "ContextTraceEmitter":
+    """
+    Get the current context trace emitter.
+    
+    Returns a disabled NoOp emitter if not set (zero overhead).
+    This function is safe to call from any async context or thread.
+    
+    Returns:
+        ContextTraceEmitter: The current emitter or a disabled default.
+    """
+    try:
+        return _context_emitter.get()
+    except LookupError:
+        global _default_disabled_emitter
+        if _default_disabled_emitter is None:
+            _default_disabled_emitter = ContextTraceEmitter(
+                sink=ContextNoOpSink(),
+                session_id="",
+                enabled=False
+            )
+        return _default_disabled_emitter
+
+
+def set_context_emitter(emitter: "ContextTraceEmitter") -> contextvars.Token:
+    """
+    Set the context trace emitter for the current async context.
+    
+    Args:
+        emitter: The emitter to set as current.
+        
+    Returns:
+        Token that can be used with reset_context_emitter() to restore previous state.
+    """
+    return _context_emitter.set(emitter)
+
+
+def reset_context_emitter(token: contextvars.Token) -> None:
+    """
+    Reset the context emitter to its previous state.
+    
+    Args:
+        token: Token returned by set_context_emitter().
+    """
+    _context_emitter.reset(token)
+
+
+def copy_context_to_callable(func):
+    """
+    Wrap a callable to copy the current context to the new thread/executor.
+    
+    This is needed because contextvars are NOT automatically propagated to
+    thread pool executors. Use this when calling run_in_executor().
+    
+    Usage:
+        # Instead of:
+        await loop.run_in_executor(None, lambda: agent.chat(prompt))
+        
+        # Use:
+        await loop.run_in_executor(None, copy_context_to_callable(lambda: agent.chat(prompt)))
+    
+    Args:
+        func: The callable to wrap.
+        
+    Returns:
+        A wrapped callable that copies the current context.
+    """
+    ctx = contextvars.copy_context()
+    def wrapper(*args, **kwargs):
+        return ctx.run(func, *args, **kwargs)
+    return wrapper
 
 
 class ContextEventType(str, Enum):
@@ -55,6 +142,11 @@ class ContextEvent:
         tokens_used: Tokens used in context at this point
         tokens_budget: Total token budget available
         data: Event-specific data (tool args, message content, etc.)
+        branch_id: Optional branch identifier for parallel execution tracking
+        prompt_tokens: Number of tokens in the prompt/request
+        completion_tokens: Number of tokens in the completion/response
+        cost_usd: Estimated cost in USD for this event
+        content_hash: SHA256 hash of content for duplicate detection
     """
     event_type: ContextEventType
     timestamp: float
@@ -65,10 +157,15 @@ class ContextEvent:
     tokens_used: int = 0
     tokens_budget: int = 0
     data: Dict[str, Any] = field(default_factory=dict)
+    branch_id: Optional[str] = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cost_usd: float = 0.0
+    content_hash: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
-        return {
+        result = {
             "schema_version": CONTEXT_SCHEMA_VERSION,
             "event_type": self.event_type.value if isinstance(self.event_type, ContextEventType) else self.event_type,
             "timestamp": self.timestamp,
@@ -79,7 +176,15 @@ class ContextEvent:
             "tokens_used": self.tokens_used,
             "tokens_budget": self.tokens_budget,
             "data": self.data,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "cost_usd": self.cost_usd,
         }
+        if self.branch_id is not None:
+            result["branch_id"] = self.branch_id
+        if self.content_hash is not None:
+            result["content_hash"] = self.content_hash
+        return result
     
     def to_json(self) -> str:
         """Convert to JSON string."""
@@ -107,6 +212,11 @@ class ContextEvent:
             tokens_used=data.get("tokens_used", 0),
             tokens_budget=data.get("tokens_budget", 0),
             data=data.get("data", {}),
+            branch_id=data.get("branch_id"),
+            prompt_tokens=data.get("prompt_tokens", 0),
+            completion_tokens=data.get("completion_tokens", 0),
+            cost_usd=data.get("cost_usd", 0.0),
+            content_hash=data.get("content_hash"),
         )
 
 
@@ -214,7 +324,7 @@ class ContextTraceEmitter:
         emitter.session_end()
     """
     
-    __slots__ = ("_sink", "_session_id", "_enabled", "_redact", "_sequence")
+    __slots__ = ("_sink", "_session_id", "_enabled", "_redact", "_sequence", "_branch_id")
     
     def __init__(
         self,
@@ -237,14 +347,30 @@ class ContextTraceEmitter:
         self._enabled = enabled
         self._redact = redact
         self._sequence = 0
+        self._branch_id: Optional[str] = None
     
     def _emit(self, event: ContextEvent) -> None:
         """Internal emit with enabled check and sequence assignment."""
         if not self._enabled:
             return
         event.sequence_num = self._sequence
+        event.branch_id = self._branch_id  # Include branch context
         self._sequence += 1
         self._sink.emit(event)
+    
+    def set_branch(self, branch_id: str) -> None:
+        """Set current branch context for parallel execution tracking.
+        
+        All subsequent events will include this branch_id until cleared.
+        
+        Args:
+            branch_id: Identifier for the parallel branch (e.g., 'parallel_0', 'loop_5')
+        """
+        self._branch_id = branch_id
+    
+    def clear_branch(self) -> None:
+        """Clear the current branch context."""
+        self._branch_id = None
     
     def _redact_dict(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Redact sensitive data from dictionary if enabled."""
@@ -352,18 +478,33 @@ class ContextTraceEmitter:
         result: Optional[str] = None,
         duration_ms: float = 0.0,
         error: Optional[str] = None,
+        cost_usd: float = 0.0,
     ) -> None:
-        """Emit tool call end event."""
-        # Truncate long results
+        """Emit tool call end event.
+        
+        Args:
+            agent_name: Name of the agent
+            tool_name: Name of the tool called
+            result: Tool result (will be truncated)
+            duration_ms: Duration in milliseconds
+            error: Error message if any
+            cost_usd: Cost in USD (e.g., 0.001 for internet search = 1 credit)
+        """
+        # Truncate long results (2000 chars allows full search results while keeping trace size reasonable)
         truncated_result = None
         if result:
-            truncated_result = result[:500] + "..." if len(result) > 500 else result
+            truncated_result = result[:2000] + "..." if len(result) > 2000 else result
+        
+        # Calculate tool cost if not provided (1 credit = $0.001 for search tools)
+        if cost_usd == 0.0:
+            cost_usd = self._get_tool_cost(tool_name)
         
         self._emit(ContextEvent(
             event_type=ContextEventType.TOOL_CALL_END,
             timestamp=time.time(),
             session_id=self._session_id,
             agent_name=agent_name,
+            cost_usd=cost_usd,
             data={
                 "tool_name": tool_name,
                 "result": truncated_result,
@@ -372,6 +513,29 @@ class ContextTraceEmitter:
             },
         ))
     
+    def _get_tool_cost(self, tool_name: str) -> float:
+        """Get cost for a tool call (1 credit = $0.001 for search tools).
+        
+        Args:
+            tool_name: Name of the tool
+            
+        Returns:
+            Cost in USD
+        """
+        # Tools that cost 1 credit ($0.001) per call
+        SEARCH_TOOLS = {
+            "tavily_search", "internet_search", "web_search", "search",
+            "tavily_extract", "web_extract", "scrape", "crawl",
+            "duckduckgo_search", "google_search", "bing_search",
+        }
+        
+        tool_lower = tool_name.lower()
+        for search_tool in SEARCH_TOOLS:
+            if search_tool in tool_lower:
+                return 0.001  # 1 credit = $0.001
+        
+        return 0.0  # Free for other tools
+    
     def llm_request(
         self,
         agent_name: str,
@@ -379,8 +543,22 @@ class ContextTraceEmitter:
         tokens_used: int,
         tokens_budget: int = 0,
         model: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Emit LLM request event."""
+        """Emit LLM request event.
+        
+        Args:
+            agent_name: Name of the agent making the request
+            messages_count: Number of messages in the request
+            tokens_used: Estimated tokens used
+            tokens_budget: Token budget available
+            model: Model being used
+            messages: Optional full messages array for context replay
+        """
+        data = {"model": model}
+        if messages is not None:
+            data["messages"] = messages
+        
         self._emit(ContextEvent(
             event_type=ContextEventType.LLM_REQUEST,
             timestamp=time.time(),
@@ -389,9 +567,7 @@ class ContextTraceEmitter:
             messages_count=messages_count,
             tokens_used=tokens_used,
             tokens_budget=tokens_budget,
-            data={
-                "model": model,
-            },
+            data=data,
         ))
     
     def llm_response(
@@ -400,18 +576,47 @@ class ContextTraceEmitter:
         response_tokens: int = 0,
         duration_ms: float = 0.0,
         finish_reason: Optional[str] = None,
+        response_content: Optional[str] = None,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost_usd: float = 0.0,
     ) -> None:
-        """Emit LLM response event."""
+        """Emit LLM response event.
+        
+        Args:
+            agent_name: Name of the agent receiving the response
+            response_tokens: Number of tokens in response (deprecated, use completion_tokens)
+            duration_ms: Response time in milliseconds
+            finish_reason: Reason for completion (stop, length, etc.)
+            response_content: Optional response content for context replay
+            prompt_tokens: Number of tokens in the prompt/request
+            completion_tokens: Number of tokens in the completion/response
+            cost_usd: Estimated cost in USD for this LLM call
+        """
+        # Use completion_tokens if provided, fallback to response_tokens for backward compat
+        actual_completion_tokens = completion_tokens if completion_tokens > 0 else response_tokens
+        
+        data = {
+            "response_tokens": actual_completion_tokens,
+            "duration_ms": duration_ms,
+            "finish_reason": finish_reason,
+        }
+        if response_content is not None:
+            # Truncate very long responses to prevent huge trace files
+            if len(response_content) > 5000:
+                data["response_content"] = response_content[:5000] + "... [truncated]"
+            else:
+                data["response_content"] = response_content
+        
         self._emit(ContextEvent(
             event_type=ContextEventType.LLM_RESPONSE,
             timestamp=time.time(),
             session_id=self._session_id,
             agent_name=agent_name,
-            data={
-                "response_tokens": response_tokens,
-                "duration_ms": duration_ms,
-                "finish_reason": finish_reason,
-            },
+            prompt_tokens=prompt_tokens,
+            completion_tokens=actual_completion_tokens,
+            cost_usd=cost_usd,
+            data=data,
         ))
     
     def context_snapshot(
