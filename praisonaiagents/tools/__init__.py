@@ -1,15 +1,18 @@
-"""Tools package for PraisonAI Agents"""
+"""Tools package for PraisonAI Agents - uses lazy loading for performance"""
 from importlib import import_module
 from typing import Any
 
-# Export Injected type for tool state injection
-from .injected import Injected
+# Lazy loading cache
+_tools_lazy_cache = {}
 
-# Export core tool items for organized imports
+# Export core tool items for organized imports (lightweight)
 from .base import BaseTool, ToolResult, ToolValidationError, validate_tool
 from .decorator import tool, FunctionTool
 from .registry import get_registry, register_tool, get_tool, ToolRegistry
 from .tools import Tools
+
+# Export Injected type directly for easy access
+from .injected import Injected, AgentState
 
 # Map of function names to their module and class (if any)
 TOOL_MAPPINGS = {
