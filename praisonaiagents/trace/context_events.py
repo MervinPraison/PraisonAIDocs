@@ -14,9 +14,10 @@ Schema Version: 1.0
 
 import contextvars
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, Generator, List, Optional, Protocol, runtime_checkable
 import json
 
 
@@ -83,6 +84,36 @@ def reset_context_emitter(token: contextvars.Token) -> None:
     _context_emitter.reset(token)
 
 
+@contextmanager
+def trace_context(emitter: "ContextTraceEmitter") -> Generator["ContextTraceEmitter", None, None]:
+    """
+    Context manager for trace emitter lifecycle.
+    
+    Automatically sets the emitter on entry and resets on exit,
+    even if an exception occurs. This is the recommended way to
+    use custom trace emitters.
+    
+    Args:
+        emitter: The emitter to use within the context.
+        
+    Yields:
+        The emitter for use within the context.
+        
+    Example:
+        sink = MyCustomSink()
+        emitter = ContextTraceEmitter(sink=sink, session_id="my-session", enabled=True)
+        
+        with trace_context(emitter) as ctx:
+            agent = Agent(...)
+            agent.chat("Hello")  # Events go to MyCustomSink
+    """
+    token = set_context_emitter(emitter)
+    try:
+        yield emitter
+    finally:
+        reset_context_emitter(token)
+
+
 def copy_context_to_callable(func):
     """
     Wrap a callable to copy the current context to the new thread/executor.
@@ -122,6 +153,12 @@ class ContextEventType(str, Enum):
     LLM_REQUEST = "llm_request"
     LLM_RESPONSE = "llm_response"
     CONTEXT_SNAPSHOT = "context_snapshot"
+    # Memory events for memory utilization tracking
+    MEMORY_STORE = "memory_store"
+    MEMORY_SEARCH = "memory_search"
+    # Knowledge events for knowledge utilization tracking
+    KNOWLEDGE_SEARCH = "knowledge_search"
+    KNOWLEDGE_ADD = "knowledge_add"
 
 
 @dataclass
@@ -324,7 +361,11 @@ class ContextTraceEmitter:
         emitter.session_end()
     """
     
-    __slots__ = ("_sink", "_session_id", "_enabled", "_redact", "_sequence", "_branch_id")
+    __slots__ = ("_sink", "_session_id", "_enabled", "_redact", "_sequence", "_branch_id", "_full_content")
+    
+    # Default limits for truncation (can be overridden with full_content=True)
+    DEFAULT_TOOL_RESULT_LIMIT = 10000  # Increased from 2000 to capture full search results
+    DEFAULT_LLM_RESPONSE_LIMIT = 10000  # Increased from 5000
     
     def __init__(
         self,
@@ -332,6 +373,7 @@ class ContextTraceEmitter:
         session_id: str = "",
         enabled: bool = True,
         redact: bool = True,
+        full_content: bool = False,
     ):
         """
         Initialize context trace emitter.
@@ -341,6 +383,7 @@ class ContextTraceEmitter:
             session_id: Session identifier for all events
             enabled: Whether tracing is enabled
             redact: Whether to redact sensitive data
+            full_content: If True, store full content without truncation (for --full flag)
         """
         self._sink = sink if sink is not None else ContextNoOpSink()
         self._session_id = session_id
@@ -348,15 +391,24 @@ class ContextTraceEmitter:
         self._redact = redact
         self._sequence = 0
         self._branch_id: Optional[str] = None
+        self._full_content = full_content
     
     def _emit(self, event: ContextEvent) -> None:
-        """Internal emit with enabled check and sequence assignment."""
+        """Internal emit with enabled check and sequence assignment.
+        
+        Exception-safe: sink errors are silently caught to prevent
+        tracing from crashing agent execution.
+        """
         if not self._enabled:
             return
         event.sequence_num = self._sequence
         event.branch_id = self._branch_id  # Include branch context
         self._sequence += 1
-        self._sink.emit(event)
+        try:
+            self._sink.emit(event)
+        except Exception:
+            # Tracing should never crash agent execution
+            pass
     
     def set_branch(self, branch_id: str) -> None:
         """Set current branch context for parallel execution tracking.
@@ -490,10 +542,14 @@ class ContextTraceEmitter:
             error: Error message if any
             cost_usd: Cost in USD (e.g., 0.001 for internet search = 1 credit)
         """
-        # Truncate long results (2000 chars allows full search results while keeping trace size reasonable)
+        # Truncate long results unless full_content is enabled
         truncated_result = None
         if result:
-            truncated_result = result[:2000] + "..." if len(result) > 2000 else result
+            if self._full_content:
+                truncated_result = result  # No truncation when full_content=True
+            else:
+                limit = self.DEFAULT_TOOL_RESULT_LIMIT
+                truncated_result = result[:limit] + "...[truncated]" if len(result) > limit else result
         
         # Calculate tool cost if not provided (1 credit = $0.001 for search tools)
         if cost_usd == 0.0:
@@ -602,9 +658,11 @@ class ContextTraceEmitter:
             "finish_reason": finish_reason,
         }
         if response_content is not None:
-            # Truncate very long responses to prevent huge trace files
-            if len(response_content) > 5000:
-                data["response_content"] = response_content[:5000] + "... [truncated]"
+            # Truncate very long responses unless full_content is enabled
+            if self._full_content:
+                data["response_content"] = response_content
+            elif len(response_content) > self.DEFAULT_LLM_RESPONSE_LIMIT:
+                data["response_content"] = response_content[:self.DEFAULT_LLM_RESPONSE_LIMIT] + "...[truncated]"
             else:
                 data["response_content"] = response_content
         
@@ -659,6 +717,120 @@ class ContextTraceEmitter:
                 "to_agent": to_agent,
                 "reason": reason,
                 "context_passed": context_passed or {},
+            },
+        ))
+    
+    def memory_store(
+        self,
+        agent_name: str,
+        memory_type: str,
+        content_length: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit memory store event for tracking memory writes.
+        
+        Args:
+            agent_name: Name of the agent storing memory
+            memory_type: Type of memory (short_term, long_term, entity, user)
+            content_length: Length of content being stored
+            metadata: Optional metadata about the storage
+        """
+        self._emit(ContextEvent(
+            event_type=ContextEventType.MEMORY_STORE,
+            timestamp=time.time(),
+            session_id=self._session_id,
+            agent_name=agent_name,
+            data={
+                "memory_type": memory_type,
+                "content_length": content_length,
+                "metadata": metadata or {},
+            },
+        ))
+    
+    def memory_search(
+        self,
+        agent_name: str,
+        query: str,
+        result_count: int,
+        memory_type: str,
+        top_score: Optional[float] = None,
+    ) -> None:
+        """Emit memory search event for tracking memory reads.
+        
+        Args:
+            agent_name: Name of the agent searching memory
+            query: Search query
+            result_count: Number of results returned
+            memory_type: Type of memory searched
+            top_score: Score of top result (if available)
+        """
+        self._emit(ContextEvent(
+            event_type=ContextEventType.MEMORY_SEARCH,
+            timestamp=time.time(),
+            session_id=self._session_id,
+            agent_name=agent_name,
+            data={
+                "query": query[:500] if query else "",
+                "result_count": result_count,
+                "memory_type": memory_type,
+                "top_score": top_score,
+            },
+        ))
+    
+    def knowledge_search(
+        self,
+        agent_name: str,
+        query: str,
+        result_count: int,
+        sources: Optional[List[str]] = None,
+        top_score: Optional[float] = None,
+    ) -> None:
+        """Emit knowledge search event for tracking knowledge retrieval.
+        
+        Args:
+            agent_name: Name of the agent searching knowledge
+            query: Search query
+            result_count: Number of results returned
+            sources: List of source documents/files
+            top_score: Score of top result (if available)
+        """
+        self._emit(ContextEvent(
+            event_type=ContextEventType.KNOWLEDGE_SEARCH,
+            timestamp=time.time(),
+            session_id=self._session_id,
+            agent_name=agent_name,
+            data={
+                "query": query[:500] if query else "",
+                "result_count": result_count,
+                "sources": (sources or [])[:10],
+                "top_score": top_score,
+            },
+        ))
+    
+    def knowledge_add(
+        self,
+        agent_name: str,
+        source: str,
+        chunk_count: int,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit knowledge add event for tracking knowledge indexing.
+        
+        Args:
+            agent_name: Name of the agent adding knowledge
+            source: Source file/URL being indexed
+            chunk_count: Number of chunks created
+            metadata: Optional metadata about the indexing
+        """
+        self._emit(ContextEvent(
+            event_type=ContextEventType.KNOWLEDGE_ADD,
+            timestamp=time.time(),
+            session_id=self._session_id,
+            agent_name=agent_name,
+            data={
+                "source": source,
+                "chunk_count": chunk_count,
+                "metadata": metadata or {},
             },
         ))
     

@@ -1294,7 +1294,7 @@ class Workflow:
                     elif step.agent:
                         # Direct agent with tools
                         # Propagate context management to existing agent if workflow has it enabled
-                        if self.context:
+                        if self.context and hasattr(step.agent, '_context_manager_initialized'):
                             if not step.agent._context_manager_initialized:
                                 step.agent._context_param = self.context
                             # Share session deduplication cache for cross-agent deduplication
@@ -1324,47 +1324,56 @@ class Workflow:
                         if validation_feedback:
                             action = f"{action}\n\nPrevious attempt feedback: {validation_feedback}"
                         
-                        # Handle images if present
-                        step_images = getattr(step, 'images', None)
-                        # Get structured output options from step
-                        step_output_json = getattr(step, '_output_json', None)
-                        step_output_pydantic = getattr(step, '_output_pydantic', None)
-                        
-                        # Resolve Pydantic class from string reference (Option B)
-                        # If output_pydantic is a string, try to resolve it from tools.py
-                        if step_output_pydantic and isinstance(step_output_pydantic, str):
-                            resolved_class = self._resolve_pydantic_class(step_output_pydantic)
-                            if resolved_class:
-                                step_output_pydantic = resolved_class
-                            else:
-                                logger.warning(f"Could not resolve Pydantic class '{step_output_pydantic}' from tools.py")
-                                step_output_pydantic = None
-                        
-                        # Build chat kwargs
-                        chat_kwargs = {"stream": stream}
-                        if step_images:
-                            chat_kwargs["images"] = step_images
-                        if step_output_json:
-                            chat_kwargs["output_json"] = step_output_json
-                        if step_output_pydantic:
-                            chat_kwargs["output_pydantic"] = step_output_pydantic
-                        
-                        output = step.agent.chat(action, **chat_kwargs)
-                        
-                        # Parse JSON output if output_json was requested and output is a string
-                        if step_output_json and output and isinstance(output, str):
-                            output = _parse_json_output(output, step.name)
-                        
-                        # Handle output_pydantic if present
-                        output_pydantic = getattr(step, 'output_pydantic', None)
-                        if output_pydantic and output:
-                            try:
-                                # Try to parse output as Pydantic model
-                                if hasattr(output_pydantic, 'model_validate_json'):
-                                    parsed = output_pydantic.model_validate_json(output)
-                                    output = parsed.model_dump_json()
-                            except Exception as e:
-                                logger.debug(f"Pydantic parsing failed: {e}")
+                        # Check if this is a specialized agent (AudioAgent, VideoAgent, ImageAgent, OCRAgent)
+                        agent_class_name = step.agent.__class__.__name__
+                        if agent_class_name in ('AudioAgent', 'VideoAgent', 'ImageAgent', 'OCRAgent', 'DeepResearchAgent'):
+                            # Use specialized agent dispatch
+                            output = self._execute_specialized_agent(
+                                step.agent, agent_class_name, action, step, all_variables, stream
+                            )
+                        else:
+                            # Standard Agent with chat() method
+                            # Handle images if present
+                            step_images = getattr(step, 'images', None)
+                            # Get structured output options from step
+                            step_output_json = getattr(step, '_output_json', None)
+                            step_output_pydantic = getattr(step, '_output_pydantic', None)
+                            
+                            # Resolve Pydantic class from string reference (Option B)
+                            # If output_pydantic is a string, try to resolve it from tools.py
+                            if step_output_pydantic and isinstance(step_output_pydantic, str):
+                                resolved_class = self._resolve_pydantic_class(step_output_pydantic)
+                                if resolved_class:
+                                    step_output_pydantic = resolved_class
+                                else:
+                                    logger.warning(f"Could not resolve Pydantic class '{step_output_pydantic}' from tools.py")
+                                    step_output_pydantic = None
+                            
+                            # Build chat kwargs
+                            chat_kwargs = {"stream": stream}
+                            if step_images:
+                                chat_kwargs["images"] = step_images
+                            if step_output_json:
+                                chat_kwargs["output_json"] = step_output_json
+                            if step_output_pydantic:
+                                chat_kwargs["output_pydantic"] = step_output_pydantic
+                            
+                            output = step.agent.chat(action, **chat_kwargs)
+                            
+                            # Parse JSON output if output_json was requested and output is a string
+                            if step_output_json and output and isinstance(output, str):
+                                output = _parse_json_output(output, step.name)
+                            
+                            # Handle output_pydantic if present
+                            output_pydantic = getattr(step, 'output_pydantic', None)
+                            if output_pydantic and output:
+                                try:
+                                    # Try to parse output as Pydantic model
+                                    if hasattr(output_pydantic, 'model_validate_json'):
+                                        parsed = output_pydantic.model_validate_json(output)
+                                        output = parsed.model_dump_json()
+                                except Exception as e:
+                                    logger.debug(f"Pydantic parsing failed: {e}")
                             
                     elif step.action:
                         # Action with agent_config - create temporary agent
@@ -1420,8 +1429,8 @@ class Workflow:
                         except Exception:
                             pass
                 
-                # Check guardrail if present
-                guardrail = getattr(step, 'guardrail', None)
+                # Check guardrail if present (guardrails is canonical, guardrail is deprecated)
+                guardrail = getattr(step, 'guardrails', None) or getattr(step, 'guardrail', None)
                 if guardrail and output and not step_error:
                     try:
                         is_valid, feedback = guardrail(StepResult(output=output))
@@ -1640,18 +1649,106 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
             logger.error(f"Planning failed: {e}")
             return None
     
+    def _execute_specialized_agent(
+        self,
+        agent: Any,
+        agent_class_name: str,
+        action: str,
+        step: 'WorkflowStep',
+        variables: Dict[str, Any],
+        stream: bool
+    ) -> Any:
+        """
+        Execute a specialized agent (AudioAgent, VideoAgent, ImageAgent, OCRAgent).
+        
+        Dispatches to the appropriate method based on agent type and action.
+        Falls back to chat() for standard Agent class.
+        
+        Args:
+            agent: The agent instance
+            agent_class_name: Name of the agent class
+            action: The action/prompt to execute
+            step: The workflow step containing additional config
+            variables: Current workflow variables
+            stream: Whether to stream output
+            
+        Returns:
+            Output from the agent execution
+        """
+        # Get yaml_action which specifies the method to call
+        yaml_action = getattr(agent, '_yaml_action', None) or action
+        
+        # AudioAgent - TTS (speech) or STT (transcribe)
+        if agent_class_name == 'AudioAgent':
+            if yaml_action == 'speech' or 'speech' in yaml_action.lower():
+                # Text-to-Speech
+                text = variables.get('text', action)
+                output_file = variables.get('output') or variables.get('audio_output') or 'output.mp3'
+                voice = variables.get('voice', 'alloy')
+                result = agent.speech(text, output=output_file, voice=voice)
+                # Store the output file path in variables for next step
+                variables['_last_audio_file'] = output_file
+                return result
+            elif yaml_action == 'transcribe' or 'transcribe' in yaml_action.lower():
+                # Speech-to-Text - check multiple variable names for input file
+                input_file = (
+                    variables.get('audio_file') or 
+                    variables.get('audio') or 
+                    variables.get('_last_audio_file') or  # From previous TTS step
+                    variables.get('input')
+                )
+                # If input is empty string or template, use default
+                if not input_file or input_file == '{{input}}' or 'Context from previous' in str(input_file):
+                    input_file = 'output.mp3'  # Default TTS output
+                language = variables.get('language', 'en')
+                return agent.transcribe(input_file, language=language)
+            else:
+                # Default to speech if action contains text
+                return agent.speech(action, output=variables.get('output', 'output.mp3'))
+        
+        # VideoAgent - generate
+        elif agent_class_name == 'VideoAgent':
+            prompt = variables.get('prompt', action)
+            output_file = variables.get('output', 'output.mp4')
+            return agent.generate(prompt, output=output_file)
+        
+        # ImageAgent - generate
+        elif agent_class_name == 'ImageAgent':
+            prompt = variables.get('prompt', action)
+            return agent.generate(prompt)
+        
+        # OCRAgent - extract
+        elif agent_class_name == 'OCRAgent':
+            source = variables.get('source', action)
+            return agent.extract(source)
+        
+        # DeepResearchAgent - research
+        elif agent_class_name == 'DeepResearchAgent':
+            query = variables.get('query', action)
+            return agent.research(query)
+        
+        # Default: standard Agent with chat() method
+        else:
+            return agent.chat(action, stream=stream)
+    
     def _normalize_single_step(self, step: Any, index: int) -> 'WorkflowStep':
         """Normalize a single step to WorkflowStep.
         
         Supports:
         - WorkflowStep objects (passed through)
         - Agent objects (wrapped with agent reference and tools)
+        - Specialized agents (AudioAgent, VideoAgent, ImageAgent, OCRAgent)
         - Callable functions (wrapped as handler)
         - Strings (used as action)
         """
         if isinstance(step, WorkflowStep):
             return step
-        elif hasattr(step, 'chat'):
+        
+        # Check for standard Agent (has chat method) or specialized agents
+        agent_class_name = step.__class__.__name__
+        is_specialized_agent = agent_class_name in ('AudioAgent', 'VideoAgent', 'ImageAgent', 'OCRAgent', 'DeepResearchAgent')
+        
+        if hasattr(step, 'chat') or is_specialized_agent:
             # It's an Agent - wrap with agent reference and preserve tools
             agent_tools = getattr(step, 'tools', None)
             # Check for _yaml_action from YAML parser (canonical: action, alias: description)
@@ -1748,7 +1845,7 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         elif normalized.agent:
             try:
                 # Propagate context management to existing agent if workflow has it enabled
-                if self.context:
+                if self.context and hasattr(normalized.agent, '_context_manager_initialized'):
                     if not normalized.agent._context_manager_initialized:
                         normalized.agent._context_param = self.context
                     # Share session deduplication cache for cross-agent deduplication
@@ -1769,7 +1866,12 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                         # Auto-append context if not explicitly referenced
                         action = f"{action}\n\nContext from previous step:\n{previous_output}"
                 action = action.replace("{{input}}", input)
-                output = normalized.agent.chat(action, stream=stream)
+                
+                # Check if this is a specialized agent (AudioAgent, VideoAgent, ImageAgent, OCRAgent)
+                agent_class_name = normalized.agent.__class__.__name__
+                output = self._execute_specialized_agent(
+                    normalized.agent, agent_class_name, action, normalized, all_variables, stream
+                )
                 
                 # Parse JSON output if output_json was requested
                 step_output_json = getattr(normalized, '_output_json', None)
@@ -1863,6 +1965,57 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         
         return {"steps": results, "output": output, "variables": all_variables}
     
+    def _llm_summarize_for_parallel(
+        self,
+        content: str,
+        num_branches: int,
+        model: str,
+        verbose: bool = False
+    ) -> str:
+        """
+        Use LLM to create a concise summary of content for parallel distribution.
+        
+        This reduces token usage when the same context is passed to multiple parallel branches.
+        """
+        from ..context.tokens import estimate_tokens_heuristic
+        
+        # Only summarize if content is large enough
+        tokens = estimate_tokens_heuristic(content)
+        if tokens < 1500:
+            return content
+        
+        # Target summary size: ~500 tokens to leave room for each branch's work
+        target_tokens = min(500, tokens // num_branches)
+        
+        try:
+            import litellm
+            
+            prompt = f"""Summarize the following content concisely, preserving all key information, data, and actionable items. 
+Keep the summary under {target_tokens * 4} characters. Focus on facts, numbers, and specific details.
+
+CONTENT:
+{content[:8000]}
+
+CONCISE SUMMARY:"""
+            
+            response = litellm.completion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=target_tokens,
+                temperature=0.1,
+            )
+            
+            summary = response.choices[0].message.content.strip()
+            
+            if verbose:
+                print(f"  🤖 LLM summarized context: {tokens:,} → {estimate_tokens_heuristic(summary):,} tokens")
+            
+            return summary
+            
+        except Exception as e:
+            logger.debug(f"LLM summarization failed, using truncation: {e}")
+            raise  # Let caller handle fallback
+    
     def _execute_parallel(
         self,
         parallel_step: Parallel,
@@ -1882,20 +2035,43 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         if verbose:
             print(f"⚡ Running {len(parallel_step.steps)} steps in parallel...")
         
+        # Optimize: Use LLM-based summarization before distributing to parallel branches
+        # This prevents rate limits and reduces token waste
+        optimized_previous = previous_output
+        num_branches = len(parallel_step.steps)
+        if previous_output and len(previous_output) > 3000:
+            from ..context.tokens import estimate_tokens_heuristic
+            tokens = estimate_tokens_heuristic(previous_output)
+            if tokens > 1000:
+                # Try LLM-based summarization first, fall back to truncation
+                try:
+                    optimized_previous = self._llm_summarize_for_parallel(previous_output, num_branches, model, verbose)
+                except Exception:
+                    # Fallback to truncation-based summarization
+                    max_chars = min(2500, len(previous_output) // max(num_branches, 2))
+                    if len(previous_output) > max_chars:
+                        optimized_previous = previous_output[:max_chars * 2 // 3] + "\n\n[... context summarized for parallel efficiency ...]\n\n" + previous_output[-max_chars // 3:]
+                
+                if verbose and optimized_previous != previous_output:
+                    new_tokens = estimate_tokens_heuristic(optimized_previous)
+                    saved = tokens - new_tokens
+                    print(f"  📦 Optimized context for {num_branches} parallel branches: {tokens:,} → {new_tokens:,} tokens (saved {saved:,} per branch)")
+        
         # Use ThreadPoolExecutor for parallel execution
-        # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+        # IMPORTANT: Limit max_workers to prevent rate limit issues (max 3 concurrent branches)
         from ..trace.context_events import copy_context_to_callable, get_context_emitter
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(parallel_step.steps)) as executor:
+        effective_workers = min(3, len(parallel_step.steps))  # Cap at 3 to prevent rate limits
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             futures = []
             for idx, step in enumerate(parallel_step.steps):
                 # Wrap execution to propagate context and set branch_id for parallel tracking
-                def execute_with_branch(step=step, idx=idx):
+                def execute_with_branch(step=step, idx=idx, opt_prev=optimized_previous):
                     emitter = get_context_emitter()
                     emitter.set_branch(f"parallel_{idx}")
                     try:
                         return self._execute_single_step_internal(
-                            step, previous_output, input, all_variables.copy(), model, False, idx, stream
+                            step, opt_prev, input, all_variables.copy(), model, False, idx, stream
                         )
                     finally:
                         emitter.clear_branch()
@@ -1972,16 +2148,33 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         is_multi_step = loop_step.steps is not None and len(loop_step.steps) > 1
         
         if loop_step.parallel and num_items > 1:
-            # Parallel execution
-            max_workers = loop_step.max_workers or num_items
+            # Parallel execution - cap workers to prevent rate limits
+            max_workers = min(loop_step.max_workers or num_items, 3)  # Cap at 3 to prevent rate limits
             if verbose:
                 step_info = f" ({len(steps_to_run)} steps each)" if is_multi_step else ""
                 print(f"⚡🔁 Parallel looping over {num_items} items{step_info} (max_workers={max_workers})...")
             
+            # Optimize: Aggressively summarize large previous_output before distributing to parallel branches
+            # This reduces token waste and prevents rate limit issues
+            optimized_previous = previous_output
+            if previous_output and len(previous_output) > 3000:
+                from ..context.tokens import estimate_tokens_heuristic
+                tokens = estimate_tokens_heuristic(previous_output)
+                # Target: max 800 tokens per branch to stay well under rate limits
+                if tokens > 1000:
+                    max_chars = min(2500, len(previous_output) // max(num_items, 2))
+                    if len(previous_output) > max_chars:
+                        # Extract key information: first part (context) + last part (recent output)
+                        optimized_previous = previous_output[:max_chars * 2 // 3] + "\n\n[... context summarized for parallel efficiency ...]\n\n" + previous_output[-max_chars // 3:]
+                        if verbose:
+                            new_tokens = estimate_tokens_heuristic(optimized_previous)
+                            saved = tokens - new_tokens
+                            print(f"  📦 Optimized context for {num_items} parallel branches: {tokens:,} → {new_tokens:,} tokens (saved {saved:,} per branch)")
+            
             # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
             from ..trace.context_events import copy_context_to_callable, get_context_emitter
             
-            def execute_item(idx_item_tuple):
+            def execute_item(idx_item_tuple, opt_prev=optimized_previous):
                 """Execute step(s) for a single item in thread."""
                 idx, item = idx_item_tuple
                 
@@ -1990,7 +2183,7 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                 emitter.set_branch(f"loop_{idx}")
                 
                 try:
-                    # CRITICAL: Deep copy variables to ensure thread isolation
+                    # CRITICAL: Deep copy variables to ensure thread isolation (per-branch context isolation)
                     import copy
                     loop_vars = copy.deepcopy(all_variables)
                     loop_vars[loop_step.var_name] = item
@@ -2002,7 +2195,7 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                             loop_vars[f"{loop_step.var_name}.{key}"] = value
                     
                     # Execute all steps sequentially within this iteration
-                    iteration_output = previous_output
+                    iteration_output = opt_prev
                     iteration_results = []
                     for step_idx, step in enumerate(steps_to_run):
                         step_result = self._execute_single_step_internal(
