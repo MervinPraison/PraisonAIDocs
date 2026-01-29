@@ -194,14 +194,13 @@ Every page MUST use:
 ### 4.2 Component Syntax
 
 **Steps (for Quick Start):**
-```mdx
+
+```
 <Steps>
 
 <Step title="Step Title">
 Description and code here.
-```python
-code_example()
-```
+(python code block here)
 </Step>
 
 <Step title="Next Step">
