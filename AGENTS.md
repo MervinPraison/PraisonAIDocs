@@ -193,74 +193,17 @@ Every page MUST use:
 
 ### 4.2 Component Syntax
 
-**Steps (for Quick Start):**
+**Steps:** Wrap content in `<Steps>` with `<Step title="...">` children.
 
-```
-<Steps>
+**AccordionGroup:** Wrap in `<AccordionGroup>` with `<Accordion title="...">` children.
 
-<Step title="Step Title">
-Description and code here.
-(python code block here)
-</Step>
+**CardGroup:** Use `<CardGroup cols={2}>` with `<Card title="..." icon="..." href="...">` children.
 
-<Step title="Next Step">
-More content.
-</Step>
-
-</Steps>
-```
-
-**AccordionGroup (for Best Practices):**
-```mdx
-<AccordionGroup>
-  <Accordion title="Best practice title">
-    Explanation of the best practice.
-  </Accordion>
-  
-  <Accordion title="Another best practice">
-    Another explanation.
-  </Accordion>
-</AccordionGroup>
-```
-
-**CardGroup (for Related):**
-```mdx
-<CardGroup cols={2}>
-  <Card title="Related Feature" icon="icon-name" href="/concepts/feature">
-    Brief description
-  </Card>
-  <Card title="Another Feature" icon="icon-name" href="/concepts/another">
-    Brief description
-  </Card>
-</CardGroup>
-```
-
-**Tabs (for multiple examples):**
-```mdx
-<Tabs>
-<Tab title="Simple">
-```python
-simple_example()
-```
-</Tab>
-<Tab title="Advanced">
-```python
-advanced_example()
-```
-</Tab>
-</Tabs>
-```
+**Tabs:** Wrap in `<Tabs>` with `<Tab title="...">` children containing code blocks.
 
 ### 4.3 Callouts
 
-Use sparingly:
-
-```mdx
-<Note>Important information the user should know.</Note>
-<Warning>Critical warning about potential issues.</Warning>
-<Tip>Helpful suggestion for better usage.</Tip>
-<Info>Additional context or background.</Info>
-```
+Use `<Note>`, `<Warning>`, `<Tip>`, or `<Info>` tags for callouts.
 
 ---
 
