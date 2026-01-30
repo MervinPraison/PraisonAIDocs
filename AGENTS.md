@@ -620,5 +620,6 @@ class PlanningConfig:
 3. **Show, don't tell** - Diagrams and code over paragraphs
 4. **Copy-paste success** - Every example must work
 5. **Consistency** - Follow these patterns exactly
+6. **Agents only recognize parameters** - When creating tools, expose all options as function parameters
 
 This file should be used by any AI agent to create documentation that matches the existing PraisonAI documentation style exactly.
