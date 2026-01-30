@@ -1844,6 +1844,8 @@ Summary:"""
         prompt: str,
         max_iterations: Optional[int] = None,
         timeout_seconds: Optional[float] = None,
+        completion_promise: Optional[str] = None,
+        clear_context: bool = False,
     ):
         """Run an autonomous task execution loop.
         
@@ -1852,12 +1854,17 @@ Summary:"""
         - Progressive escalation based on task complexity
         - Doom loop detection and recovery
         - Iteration limits and timeouts
-        - Completion detection
+        - Completion detection (keyword-based or promise-based)
+        - Optional context clearing between iterations
         
         Args:
             prompt: The task to execute
             max_iterations: Override max iterations (default from config)
             timeout_seconds: Timeout in seconds (default: no timeout)
+            completion_promise: Optional string that signals completion when 
+                wrapped in <promise>TEXT</promise> tags in the response
+            clear_context: Whether to clear chat history between iterations
+                (forces agent to rely on external state like files)
             
         Returns:
             AutonomyResult with success status, output, and metadata
@@ -1867,12 +1874,17 @@ Summary:"""
             
         Example:
             agent = Agent(instructions="...", autonomy=True)
-            result = agent.run_autonomous("Refactor the auth module")
+            result = agent.run_autonomous(
+                "Refactor the auth module",
+                completion_promise="DONE",
+                clear_context=True
+            )
             if result.success:
                 print(result.output)
         """
         from .autonomy import AutonomyResult
         import time as time_module
+        from datetime import datetime, timezone
         
         if not self.autonomy_enabled:
             raise ValueError(
@@ -1881,12 +1893,23 @@ Summary:"""
             )
         
         start_time = time_module.time()
+        started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         iterations = 0
         actions_taken = []
         
         # Get config values
         config_max_iter = self.autonomy_config.get("max_iterations", 20)
         effective_max_iter = max_iterations if max_iterations is not None else config_max_iter
+        
+        # Get completion_promise from config if not provided as param
+        effective_promise = completion_promise
+        if effective_promise is None:
+            effective_promise = self.autonomy_config.get("completion_promise")
+        
+        # Get clear_context from config if not explicitly set
+        effective_clear_context = clear_context
+        if not clear_context:
+            effective_clear_context = self.autonomy_config.get("clear_context", False)
         
         # Analyze prompt and get recommended stage
         stage = self.get_recommended_stage(prompt)
@@ -1909,6 +1932,7 @@ Summary:"""
                         stage=stage,
                         actions=actions_taken,
                         duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
                     )
                 
                 # Check doom loop
@@ -1921,11 +1945,13 @@ Summary:"""
                         stage=stage,
                         actions=actions_taken,
                         duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
                     )
                 
                 # Execute one turn using the agent's chat method
+                # Always use the original prompt (prompt re-injection)
                 try:
-                    response = self.chat(prompt if iterations == 1 else "Continue with the task")
+                    response = self.chat(prompt)
                 except Exception as e:
                     return AutonomyResult(
                         success=False,
@@ -1936,6 +1962,7 @@ Summary:"""
                         actions=actions_taken,
                         duration_seconds=time_module.time() - start_time,
                         error=str(e),
+                        started_at=started_at,
                     )
                 
                 # Record the action
@@ -1944,8 +1971,25 @@ Summary:"""
                     "response": str(response)[:500],
                 })
                 
-                # Check for completion signals in response
-                response_lower = str(response).lower()
+                response_str = str(response)
+                
+                # Check for completion promise FIRST (structured signal)
+                if effective_promise:
+                    promise_tag = f"<promise>{effective_promise}</promise>"
+                    if promise_tag in response_str:
+                        return AutonomyResult(
+                            success=True,
+                            output=response_str,
+                            completion_reason="promise",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                
+                # Check for keyword-based completion signals (fallback)
+                response_lower = response_str.lower()
                 completion_signals = [
                     "task completed", "task complete", "done",
                     "finished", "completed successfully",
@@ -1954,25 +1998,31 @@ Summary:"""
                 if any(signal in response_lower for signal in completion_signals):
                     return AutonomyResult(
                         success=True,
-                        output=str(response),
+                        output=response_str,
                         completion_reason="goal",
                         iterations=iterations,
                         stage=stage,
                         actions=actions_taken,
                         duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
                     )
                 
                 # For DIRECT stage, complete after first response
                 if stage == "direct":
                     return AutonomyResult(
                         success=True,
-                        output=str(response),
+                        output=response_str,
                         completion_reason="goal",
                         iterations=iterations,
                         stage=stage,
                         actions=actions_taken,
                         duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
                     )
+                
+                # Clear context between iterations if enabled
+                if effective_clear_context:
+                    self.clear_history()
             
             # Max iterations reached
             return AutonomyResult(
@@ -1983,6 +2033,7 @@ Summary:"""
                 stage=stage,
                 actions=actions_taken,
                 duration_seconds=time_module.time() - start_time,
+                started_at=started_at,
             )
             
         except Exception as e:
@@ -1995,6 +2046,226 @@ Summary:"""
                 actions=actions_taken,
                 duration_seconds=time_module.time() - start_time,
                 error=str(e),
+                started_at=started_at,
+            )
+    
+    async def run_autonomous_async(
+        self,
+        prompt: str,
+        max_iterations: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
+        completion_promise: Optional[str] = None,
+        clear_context: bool = False,
+    ):
+        """Async variant of run_autonomous() for concurrent agent execution.
+        
+        This method executes a task autonomously using async I/O, enabling
+        multiple agents to run concurrently without blocking. It handles:
+        - Progressive escalation based on task complexity
+        - Doom loop detection and recovery
+        - Iteration limits and timeouts
+        - Completion detection (keyword-based or promise-based)
+        - Optional context clearing between iterations
+        
+        Args:
+            prompt: The task to execute
+            max_iterations: Override max iterations (default from config)
+            timeout_seconds: Timeout in seconds (default: no timeout)
+            completion_promise: Optional string that signals completion when 
+                wrapped in <promise>TEXT</promise> tags in the response
+            clear_context: Whether to clear chat history between iterations
+                (forces agent to rely on external state like files)
+            
+        Returns:
+            AutonomyResult with success status, output, and metadata
+            
+        Raises:
+            ValueError: If autonomy is not enabled
+            
+        Example:
+            import asyncio
+            
+            async def main():
+                agent = Agent(instructions="...", autonomy=True)
+                result = await agent.run_autonomous_async(
+                    "Refactor the auth module",
+                    completion_promise="DONE",
+                    clear_context=True
+                )
+                if result.success:
+                    print(result.output)
+            
+            asyncio.run(main())
+        """
+        from .autonomy import AutonomyResult
+        import time as time_module
+        from datetime import datetime, timezone
+        import asyncio
+        
+        if not self.autonomy_enabled:
+            raise ValueError(
+                "Autonomy must be enabled to use run_autonomous_async(). "
+                "Create agent with autonomy=True or autonomy={...}"
+            )
+        
+        start_time = time_module.time()
+        started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        iterations = 0
+        actions_taken = []
+        
+        # Get config values
+        config_max_iter = self.autonomy_config.get("max_iterations", 20)
+        effective_max_iter = max_iterations if max_iterations is not None else config_max_iter
+        
+        # Get completion_promise from config if not provided as param
+        effective_promise = completion_promise
+        if effective_promise is None:
+            effective_promise = self.autonomy_config.get("completion_promise")
+        
+        # Get clear_context from config if not explicitly set
+        effective_clear_context = clear_context
+        if not clear_context:
+            effective_clear_context = self.autonomy_config.get("clear_context", False)
+        
+        # Analyze prompt and get recommended stage
+        stage = self.get_recommended_stage(prompt)
+        
+        # Reset doom loop tracker for new task
+        self._reset_doom_loop()
+        
+        try:
+            # Execute the autonomous loop
+            while iterations < effective_max_iter:
+                iterations += 1
+                
+                # Check timeout
+                if timeout_seconds and (time_module.time() - start_time) > timeout_seconds:
+                    return AutonomyResult(
+                        success=False,
+                        output="Task timed out",
+                        completion_reason="timeout",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
+                
+                # Check doom loop
+                if self._is_doom_loop():
+                    return AutonomyResult(
+                        success=False,
+                        output="Task stopped due to repeated actions (doom loop)",
+                        completion_reason="doom_loop",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
+                
+                # Execute one turn using the agent's async chat method
+                # Always use the original prompt (prompt re-injection)
+                try:
+                    response = await self.achat(prompt)
+                except Exception as e:
+                    return AutonomyResult(
+                        success=False,
+                        output=str(e),
+                        completion_reason="error",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        error=str(e),
+                        started_at=started_at,
+                    )
+                
+                # Record the action
+                actions_taken.append({
+                    "iteration": iterations,
+                    "response": str(response)[:500],
+                })
+                
+                response_str = str(response)
+                
+                # Check for completion promise FIRST (structured signal)
+                if effective_promise:
+                    promise_tag = f"<promise>{effective_promise}</promise>"
+                    if promise_tag in response_str:
+                        return AutonomyResult(
+                            success=True,
+                            output=response_str,
+                            completion_reason="promise",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                
+                # Check for keyword-based completion signals (fallback)
+                response_lower = response_str.lower()
+                completion_signals = [
+                    "task completed", "task complete", "done",
+                    "finished", "completed successfully",
+                ]
+                
+                if any(signal in response_lower for signal in completion_signals):
+                    return AutonomyResult(
+                        success=True,
+                        output=response_str,
+                        completion_reason="goal",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
+                
+                # For DIRECT stage, complete after first response
+                if stage == "direct":
+                    return AutonomyResult(
+                        success=True,
+                        output=response_str,
+                        completion_reason="goal",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
+                
+                # Clear context between iterations if enabled
+                if effective_clear_context:
+                    self.clear_history()
+                
+                # Yield control to allow other async tasks to run
+                await asyncio.sleep(0)
+            
+            # Max iterations reached
+            return AutonomyResult(
+                success=False,
+                output="Max iterations reached",
+                completion_reason="max_iterations",
+                iterations=iterations,
+                stage=stage,
+                actions=actions_taken,
+                duration_seconds=time_module.time() - start_time,
+                started_at=started_at,
+            )
+            
+        except Exception as e:
+            return AutonomyResult(
+                success=False,
+                output=str(e),
+                completion_reason="error",
+                iterations=iterations,
+                stage=stage,
+                actions=actions_taken,
+                duration_seconds=time_module.time() - start_time,
+                error=str(e),
+                started_at=started_at,
             )
     
     def handoff_to(
@@ -3570,33 +3841,38 @@ Your Goal: {self.goal}"""
         """Internal tool execution implementation."""
 
         # Check if approval is required for this tool
-        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, get_approval_callback
+        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, get_approval_callback, is_env_auto_approve, is_yaml_approved
         if is_approval_required(function_name):
-            risk_level = get_risk_level(function_name)
-            logging.debug(f"Tool {function_name} requires approval (risk level: {risk_level})")
-            
-            # Use global approval callback or default console callback
-            callback = get_approval_callback() or console_approval_callback
-            
-            try:
-                decision = callback(function_name, arguments, risk_level)
-                if not decision.approved:
-                    error_msg = f"Tool execution denied: {decision.reason}"
-                    logging.warning(error_msg)
-                    return {"error": error_msg, "approval_denied": True}
-                
-                # Mark as approved in context to prevent double approval in decorator
+            # Skip approval if auto-approve env var is set or tool is YAML-approved
+            if is_env_auto_approve() or is_yaml_approved(function_name):
+                logging.debug(f"Tool {function_name} auto-approved (env={is_env_auto_approve()}, yaml={is_yaml_approved(function_name)})")
                 mark_approved(function_name)
+            else:
+                risk_level = get_risk_level(function_name)
+                logging.debug(f"Tool {function_name} requires approval (risk level: {risk_level})")
                 
-                # Use modified arguments if provided
-                if decision.modified_args:
-                    arguments = decision.modified_args
-                    logging.info(f"Using modified arguments: {arguments}")
+                # Use global approval callback or default console callback
+                callback = get_approval_callback() or console_approval_callback
+                
+                try:
+                    decision = callback(function_name, arguments, risk_level)
+                    if not decision.approved:
+                        error_msg = f"Tool execution denied: {decision.reason}"
+                        logging.warning(error_msg)
+                        return {"error": error_msg, "approval_denied": True}
                     
-            except Exception as e:
-                error_msg = f"Error during approval process: {str(e)}"
-                logging.error(error_msg)
-                return {"error": error_msg, "approval_error": True}
+                    # Mark as approved in context to prevent double approval in decorator
+                    mark_approved(function_name)
+                    
+                    # Use modified arguments if provided
+                    if decision.modified_args:
+                        arguments = decision.modified_args
+                        logging.info(f"Using modified arguments: {arguments}")
+                        
+                except Exception as e:
+                    error_msg = f"Error during approval process: {str(e)}"
+                    logging.error(error_msg)
+                    return {"error": error_msg, "approval_error": True}
 
         # Special handling for MCP tools
         # Check if tools is an MCP instance with the requested function name
@@ -4027,7 +4303,7 @@ Your Goal: {self.goal}"""
                     "execute_tool_fn": self.execute_tool,
                     "stream": stream,
                     "console": self.console if (self.verbose or stream) else None,
-                    "display_fn": self.display_generating if self.verbose else None,
+                    "display_fn": self._display_generating if self.verbose else None,
                     "reasoning_steps": reasoning_steps,
                     "verbose": self.verbose,
                     "max_iterations": 10
@@ -6289,18 +6565,23 @@ Write the complete compiled report:"""
             logging.info(f"Executing async tool: {function_name} with arguments: {arguments}")
             
             # Check if approval is required for this tool
-            from ..approval import is_approval_required, request_approval
+            from ..approval import is_approval_required, request_approval, is_env_auto_approve, is_yaml_approved, mark_approved
             if is_approval_required(function_name):
-                decision = await request_approval(function_name, arguments)
-                if not decision.approved:
-                    error_msg = f"Tool execution denied: {decision.reason}"
-                    logging.warning(error_msg)
-                    return {"error": error_msg, "approval_denied": True}
-                
-                # Use modified arguments if provided
-                if decision.modified_args:
-                    arguments = decision.modified_args
-                    logging.info(f"Using modified arguments: {arguments}")
+                # Skip approval if auto-approve env var is set or tool is YAML-approved
+                if is_env_auto_approve() or is_yaml_approved(function_name):
+                    logging.debug(f"Tool {function_name} auto-approved (env={is_env_auto_approve()}, yaml={is_yaml_approved(function_name)})")
+                    mark_approved(function_name)
+                else:
+                    decision = await request_approval(function_name, arguments)
+                    if not decision.approved:
+                        error_msg = f"Tool execution denied: {decision.reason}"
+                        logging.warning(error_msg)
+                        return {"error": error_msg, "approval_denied": True}
+                    
+                    # Use modified arguments if provided
+                    if decision.modified_args:
+                        arguments = decision.modified_args
+                        logging.info(f"Using modified arguments: {arguments}")
             
             # Try to find the function in the agent's tools list first
             func = None
