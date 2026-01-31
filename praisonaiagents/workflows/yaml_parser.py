@@ -14,7 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from pathlib import Path
 
 from ..agent.agent import Agent
-from .workflows import Workflow, WorkflowStep, route, parallel, loop, repeat, Include, include
+from .workflows import Workflow, route, parallel, loop, repeat, Include, include
+from ..task.task import Task
 
 
 class YAMLWorkflowParser:
@@ -217,7 +218,8 @@ class YAMLWorkflowParser:
                     # Copy other task fields
                     for field in ['expected_output', 'context', 'output_file', 
                                   'output_json', 'create_directory', 'callback',
-                                  'async_execution', 'guardrail', 'max_retries']:
+                                  'async_execution', 'guardrail', 'max_retries',
+                                  'skip_on_failure', 'retry_delay']:
                         if field in task_config:
                             step[field] = task_config[field]
                     
@@ -343,6 +345,9 @@ class YAMLWorkflowParser:
         else:
             context_value = None
         
+        # Parse history flag for execution tracing (robustness feature)
+        history_enabled = data.get('history', False)
+        
         workflow = Workflow(
             name=name,
             steps=steps,
@@ -354,6 +359,7 @@ class YAMLWorkflowParser:
             output=workflow_output,  # Pass output mode to Workflow
             memory=memory_value,  # Pass memory config to Workflow
             context=context_value,  # Pass context management config to Workflow
+            history=history_enabled,  # Enable execution history tracking (robustness)
         )
         
         # Store additional attributes for feature parity with agents.yaml
@@ -493,7 +499,6 @@ class YAMLWorkflowParser:
         cache = config.get('cache', True)
         
         # Additional agents.yaml fields
-        function_calling_llm = config.get('function_calling_llm')
         max_rpm = config.get('max_rpm')
         max_execution_time = config.get('max_execution_time')
         reflect_llm = config.get('reflect_llm')
@@ -540,7 +545,6 @@ class YAMLWorkflowParser:
         agent._yaml_cache = cache
         
         # Store additional agents.yaml fields for feature parity
-        agent._yaml_function_calling_llm = function_calling_llm
         agent._yaml_max_rpm = max_rpm
         agent._yaml_max_execution_time = max_execution_time
         agent._yaml_reflect_llm = reflect_llm
@@ -723,7 +727,7 @@ class YAMLWorkflowParser:
             steps_data: List of step definitions
             
         Returns:
-            List of workflow steps (Agent, WorkflowStep, or pattern objects)
+            List of workflow steps (Agent, Task, or pattern objects)
         """
         steps = []
         
@@ -742,7 +746,7 @@ class YAMLWorkflowParser:
             step_data: Step definition dictionary
             
         Returns:
-            Step object (Agent, WorkflowStep, or pattern)
+            Step object (Agent, Task, or pattern)
         """
         # Check for pattern types
         if 'route' in step_data:
@@ -843,6 +847,16 @@ class YAMLWorkflowParser:
             output_variable = step_data.get('output_variable')
             if output_variable:
                 agent._yaml_output_variable = output_variable
+            
+            # Handle skip_on_failure (robustness: allow workflow to continue if step fails)
+            skip_on_failure = step_data.get('skip_on_failure')
+            if skip_on_failure is not None:
+                agent._yaml_skip_on_failure = skip_on_failure
+            
+            # Handle retry_delay (robustness: seconds between retries)
+            retry_delay = step_data.get('retry_delay')
+            if retry_delay is not None:
+                agent._yaml_retry_delay = retry_delay
             
             return agent
         else:
@@ -1172,7 +1186,7 @@ class YAMLWorkflowParser:
             return condition_str.lower() in result
         return condition
     
-    def _parse_generic_step(self, step_data: Dict) -> WorkflowStep:
+    def _parse_generic_step(self, step_data: Dict) -> Task:
         """
         Parse a generic workflow step.
         
@@ -1180,12 +1194,12 @@ class YAMLWorkflowParser:
             step_data: Step definition dictionary
             
         Returns:
-            WorkflowStep object
+            Task object
         """
         name = step_data.get('name', 'step')
         action = step_data.get('action', '')
         
-        return WorkflowStep(
+        return Task(
             name=name,
             action=action,
         )

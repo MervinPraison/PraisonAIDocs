@@ -8,7 +8,6 @@ from .workflows import (
     # Core classes
     Workflow,
     Pipeline,  # Alias for Workflow
-    WorkflowStep,
     WorkflowContext,
     StepResult,
     WorkflowManager,
@@ -27,6 +26,7 @@ from .workflows import (
     loop,
     repeat,
     include,
+    when,
     if_,
     
     # Constants
@@ -44,13 +44,13 @@ from .workflow_configs import (
     WorkflowMemoryConfig,
     WorkflowHooksConfig,
     # Step-level configs
-    WorkflowStepContextConfig,
-    WorkflowStepOutputConfig,
-    WorkflowStepExecutionConfig,
-    WorkflowStepRoutingConfig,
+    TaskContextConfig,
+    TaskOutputConfig,
+    TaskExecutionConfig,
+    TaskRoutingConfig,
     # Enums
     WorkflowOutputPreset,
-    WorkflowStepExecutionPreset,
+    TaskExecutionPreset,
     # Resolution helpers
     resolve_output_config,
     resolve_planning_config,
@@ -66,7 +66,7 @@ __all__ = [
     # Core
     "Workflow",
     "Pipeline",
-    "WorkflowStep",
+    "Task",
     "WorkflowContext",
     "StepResult",
     "WorkflowManager",
@@ -86,6 +86,7 @@ __all__ = [
     "loop",
     "repeat",
     "include",
+    "when",
     "if_",
     
     # Constants
@@ -98,14 +99,14 @@ __all__ = [
     "WorkflowHooksConfig",
     
     # Step Config Classes
-    "WorkflowStepContextConfig",
-    "WorkflowStepOutputConfig",
-    "WorkflowStepExecutionConfig",
-    "WorkflowStepRoutingConfig",
+    "TaskContextConfig",
+    "TaskOutputConfig",
+    "TaskExecutionConfig",
+    "TaskRoutingConfig",
     
     # Enums
     "WorkflowOutputPreset",
-    "WorkflowStepExecutionPreset",
+    "TaskExecutionPreset",
     
     # Resolution Helpers
     "resolve_output_config",
@@ -130,7 +131,12 @@ _LAZY_IMPORTS = {
 
 
 def __getattr__(name: str):
-    """Lazy import mechanism for heavy modules."""
+    """Lazy import mechanism for heavy modules and deprecation handling."""
+    # Re-export Task from the unified location for backward compatibility
+    if name == "Task":
+        from praisonaiagents.task import Task
+        return Task
+    
     if name in _LAZY_IMPORTS:
         module_name = _LAZY_IMPORTS[name]
         import importlib

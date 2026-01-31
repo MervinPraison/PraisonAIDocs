@@ -799,15 +799,26 @@ Respond with ONLY a valid JSON tool call in this format:
         # For Ollama, always generate summary when we have tool results
         # This prevents infinite loops caused by empty/minimal responses
             
-        # Filter out error results first
+        # Filter out error results and collect error messages
         valid_results = []
+        error_messages = []
         for result in tool_results:
-            # Skip error responses
+            # Check for error responses
             if isinstance(result, dict) and 'error' in result:
+                error_messages.append(result.get('error', 'Unknown error'))
                 continue
+            if isinstance(result, list) and len(result) > 0:
+                first_item = result[0]
+                if isinstance(first_item, dict) and 'error' in first_item:
+                    error_messages.append(first_item.get('error', 'Unknown error'))
+                    continue
             valid_results.append(result)
         
-        # If no valid results, return None to continue
+        # If no valid results but we have errors, return a friendly error message
+        if not valid_results and error_messages:
+            return "I'm sorry, but I wasn't able to complete the search. The service encountered some issues. Please try again later or try a different search query."
+        
+        # If no valid results at all, return None to let the loop continue
         if not valid_results:
             return None
         
@@ -818,6 +829,12 @@ Respond with ONLY a valid JSON tool call in this format:
             # For simple numeric results, create a more natural response
             if isinstance(result, (int, float)):
                 return f"The result is {result}."
+            # For search results (list of dicts with title/url/snippet), format nicely
+            elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], dict):
+                first_item = result[0]
+                # Check if this looks like search results
+                if 'title' in first_item or 'url' in first_item or 'snippet' in first_item:
+                    return self._format_search_results_summary(result)
             return str(result)
         else:
             # Multiple tool results - create coherent summary
@@ -840,21 +857,71 @@ Respond with ONLY a valid JSON tool call in this format:
             
             # Join the parts naturally
             return " ".join(summary_parts)
+    
+    def _format_search_results_summary(self, results: List[Dict]) -> str:
+        """Format search results into a natural language summary."""
+        if not results:
+            return "No search results found."
+        
+        lines = ["Here's what I found:\n"]
+        for i, item in enumerate(results[:5], 1):  # Limit to 5 results
+            title = item.get('title', 'Untitled')
+            url = item.get('url', '')
+            snippet = item.get('snippet', item.get('content', ''))
+            
+            lines.append(f"**{i}. {title}**")
+            if snippet:
+                # Truncate long snippets
+                if len(snippet) > 200:
+                    snippet = snippet[:200] + "..."
+                lines.append(f"   {snippet}")
+            if url:
+                lines.append(f"   Link: {url}")
+            lines.append("")  # Empty line between results
+        
+        return "\n".join(lines).strip()
 
     def _format_ollama_tool_result_message(self, function_name: str, tool_result: Any) -> Dict[str, str]:
         """
         Format tool result message for Ollama provider.
         Enhanced to instruct model to use the result for final answer.
+        Handles error results with specific instructions to provide user-friendly responses.
         """
-        tool_result_str = str(tool_result)
-        return {
-            "role": "user",
-            "content": f"""Tool execution complete.
+        # Check if the result is an error
+        is_error = False
+        error_message = None
+        
+        if isinstance(tool_result, dict) and 'error' in tool_result:
+            is_error = True
+            error_message = tool_result.get('error', 'Unknown error')
+        elif isinstance(tool_result, list) and len(tool_result) > 0:
+            first_item = tool_result[0]
+            if isinstance(first_item, dict) and 'error' in first_item:
+                is_error = True
+                error_message = first_item.get('error', 'Unknown error')
+        
+        if is_error:
+            # For errors, provide clear instructions to give a helpful response
+            return {
+                "role": "user",
+                "content": f"""The tool "{function_name}" encountered an error:
+{error_message}
+
+Please provide a helpful response to the user explaining that the operation could not be completed. 
+Be apologetic and suggest alternatives if possible. Do NOT repeat the raw error message.
+Give a natural, conversational response."""
+            }
+        else:
+            # For successful results, format normally
+            tool_result_str = str(tool_result)
+            return {
+                "role": "user",
+                "content": f"""Tool execution complete.
 Function: {function_name}
 Result: {tool_result_str}
 
-Now provide your final answer using this result."""
-        }
+Now provide your final answer using this result. Summarize the information naturally for the user."""
+            }
 
     def _get_tool_names_for_prompt(self, formatted_tools: Optional[List]) -> str:
         """Extract tool names from formatted tools for prompts."""
@@ -2254,10 +2321,19 @@ Now provide your final answer using this result."""
                                 messages.append(self._format_ollama_tool_result_message(function_name, tool_result))
                             else:
                                 # For other providers, use tool role with tool_call_id
+                                # Format error results more clearly
+                                if tool_result is None:
+                                    content = "Function returned an empty output"
+                                elif isinstance(tool_result, dict) and 'error' in tool_result:
+                                    content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
+                                elif isinstance(tool_result, list) and len(tool_result) > 0 and isinstance(tool_result[0], dict) and 'error' in tool_result[0]:
+                                    content = f"Error: {tool_result[0].get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
+                                else:
+                                    content = json.dumps(tool_result)
                                 messages.append({
                                     "role": "tool",
                                     "tool_call_id": tool_call_id,
-                                    "content": json.dumps(tool_result) if tool_result is not None else "Function returned an empty output"
+                                    "content": content
                                 })
 
                             # Check if we should continue (for tools like sequential thinking)
@@ -3281,10 +3357,19 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             messages.append(self._format_ollama_tool_result_message(function_name, tool_result))
                         else:
                             # For other providers, use tool role with tool_call_id
+                            # Format error results more clearly
+                            if tool_result is None:
+                                content = "Function returned an empty output"
+                            elif isinstance(tool_result, dict) and 'error' in tool_result:
+                                content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
+                            elif isinstance(tool_result, list) and len(tool_result) > 0 and isinstance(tool_result[0], dict) and 'error' in tool_result[0]:
+                                content = f"Error: {tool_result[0].get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
+                            else:
+                                content = json.dumps(tool_result)
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tool_call_id,
-                                "content": json.dumps(tool_result) if tool_result is not None else "Function returned an empty output"
+                                "content": content
                             })
 
                     # For Ollama, add explicit prompt if we need a final answer
