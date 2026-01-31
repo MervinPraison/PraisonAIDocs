@@ -5,11 +5,11 @@ Demonstrates iterating over a list of items in a workflow step.
 Each item is processed individually with the loop variable.
 """
 
-from praisonaiagents import Workflow, Task
+from praisonaiagents import AgentFlow, Task
 from praisonaiagents.workflows import WorkflowManager
 
 # Create a workflow with loop
-workflow = Workflow(
+workflow = AgentFlow(
     name="Process Items",
     description="Process a list of items using loop",
     variables={

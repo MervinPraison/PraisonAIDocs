@@ -19,7 +19,7 @@ Features:
 Usage:
     from praisonaiagents import Agent, Task, AgentManager
     
-    agents = AgentManager(
+    agents = AgentTeam(
         agents=[agent1, agent2],
         tasks=[task1, task2],
         planning=True,           # Enable planning mode

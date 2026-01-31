@@ -185,7 +185,7 @@ class AgentManager:
         task1 = Task(description="Research AI trends", agent=researcher)
         task2 = Task(description="Write article", agent=writer)
         
-        manager = AgentManager(
+        manager = AgentTeam(
             agents=[researcher, writer],
             tasks=[task1, task2],
             process="sequential"
@@ -1234,7 +1234,7 @@ Context:
         Example:
             ```python
             # Interactive - shows Rich panels
-            agents = AgentManager(agents=[agent1, agent2])
+            agents = AgentTeam(agents=[agent1, agent2])
             result = agents.start()  # Verbose output by default
             
             # Force silent mode

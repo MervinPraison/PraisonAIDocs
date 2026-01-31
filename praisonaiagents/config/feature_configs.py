@@ -773,7 +773,7 @@ class MultiAgentHooksConfig:
     Consolidates: completion_checker, on_task_start, on_task_complete
     
     Usage:
-        AgentManager(
+        AgentTeam(
             agents=[...],
             hooks=MultiAgentHooksConfig(
                 on_task_start=my_start_callback,
@@ -807,10 +807,10 @@ class MultiAgentOutputConfig:
     
     Usage:
         # Simple preset
-        AgentManager(agents=[...], output="verbose")
+        AgentTeam(agents=[...], output="verbose")
         
         # With config
-        AgentManager(
+        AgentTeam(
             agents=[...],
             output=MultiAgentOutputConfig(verbose=2, stream=True)
         )
@@ -837,7 +837,7 @@ class MultiAgentExecutionConfig:
     Consolidates: max_iter, max_retries
     
     Usage:
-        AgentManager(
+        AgentTeam(
             agents=[...],
             execution=MultiAgentExecutionConfig(max_iter=20, max_retries=5)
         )
@@ -865,10 +865,10 @@ class MultiAgentPlanningConfig:
     
     Usage:
         # Simple enable
-        AgentManager(agents=[...], planning=True)
+        AgentTeam(agents=[...], planning=True)
         
         # With config
-        AgentManager(
+        AgentTeam(
             agents=[...],
             planning=MultiAgentPlanningConfig(
                 llm="gpt-4o",
@@ -908,10 +908,10 @@ class MultiAgentMemoryConfig:
     
     Usage:
         # Simple enable
-        AgentManager(agents=[...], memory=True)
+        AgentTeam(agents=[...], memory=True)
         
         # With config
-        AgentManager(
+        AgentTeam(
             agents=[...],
             memory=MultiAgentMemoryConfig(
                 user_id="user123",

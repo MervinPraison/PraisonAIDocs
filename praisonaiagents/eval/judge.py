@@ -24,7 +24,7 @@ from .results import JudgeResult
 
 if TYPE_CHECKING:
     from ..agent.agent import Agent
-    from ..agents.agents import AgentManager
+    from ..agents.agents import AgentTeam
 
 logger = logging.getLogger(__name__)
 

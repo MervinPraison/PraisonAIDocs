@@ -5,7 +5,7 @@ This class provides a simplified interface for creating and running AI agents wi
 It automatically handles agent creation, task setup, and execution flow.
 """
 
-from .agents import AgentManager
+from .agents import AgentTeam
 from ..agent.agent import Agent
 from ..task.task import Task
 from typing import List, Any, Optional, Dict, Tuple

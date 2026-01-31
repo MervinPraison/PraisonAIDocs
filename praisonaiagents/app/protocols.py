@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Protocol, runtime_checkab
 
 if TYPE_CHECKING:
     from ..agent.agent import Agent
-    from ..agents.agents import AgentManager
+    from ..agents.agents import AgentTeam
     from ..workflows.workflows import Workflow
 
 

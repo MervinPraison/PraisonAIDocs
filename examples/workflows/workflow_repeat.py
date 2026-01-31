@@ -5,7 +5,7 @@ Demonstrates the evaluator-optimizer pattern where an agent
 generates content and another evaluates it, repeating until approved.
 """
 
-from praisonaiagents import Agent, Workflow
+from praisonaiagents import Agent, AgentFlow
 from praisonaiagents.workflows import repeat
 
 # Create generator agent
@@ -29,7 +29,7 @@ def is_approved(ctx) -> bool:
     return "approved" in ctx.previous_result.lower()
 
 # Create workflow with evaluator-optimizer pattern
-workflow = Workflow(
+workflow = AgentFlow(
     name="Evaluator-Optimizer Pipeline",
     steps=[
         generator,  # First, generate content

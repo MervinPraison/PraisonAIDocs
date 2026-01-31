@@ -24,7 +24,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent.parent / "src" / "praisonai-agents"
 sys.path.insert(0, str(project_root))
 
-from praisonaiagents import Agent, Task, Agents, create_context_agent
+from praisonaiagents import Agent, Task, AgentTeam, create_context_agent
 
 class ContextEngineeringWorkflow:
     """
@@ -302,7 +302,7 @@ class ContextEngineeringWorkflow:
         print("\n⚙️ Executing Context Engineering Workflow")
         print("-" * 50)
         
-        agents_workflow = AgentManager(
+        agents_workflow = AgentTeam(
             agents=[
                 self.product_manager,
                 self.architect, 
@@ -369,7 +369,7 @@ def run_example_workflow():
     
     # Setup workflow with current project
     project_path = str(project_root)
-    workflow = ContextEngineeringWorkflow(
+    workflow = ContextEngineeringAgentFlow(
         project_path=project_path,
         llm="gpt-4o-mini"
     )
@@ -435,7 +435,7 @@ if __name__ == "__main__":
     print("(Note: Full execution requires complete environment setup)")
     
     project_path = str(project_root)
-    workflow = ContextEngineeringWorkflow(project_path, "gpt-4o-mini")
+    workflow = ContextEngineeringAgentFlow(project_path, "gpt-4o-mini")
     
     print(f"\n✅ Workflow Setup Complete:")
     print(f"   • Project path: {project_path}")

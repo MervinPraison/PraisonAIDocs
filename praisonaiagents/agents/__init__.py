@@ -3,7 +3,7 @@
 AgentManager is the primary class for multi-agent coordination.
 Agents is a deprecated alias for backward compatibility.
 """
-from .agents import AgentManager, Agents, PraisonAIAgents
+from .agents import AgentTeam, Agents, PraisonAIAgents
 from .autoagents import AutoAgents
 from .auto_rag_agent import AutoRagAgent, AutoRagConfig, RetrievalPolicy
 from .protocols import MergeStrategyProtocol, FirstWinsMerge, ConcatMerge, DictMerge

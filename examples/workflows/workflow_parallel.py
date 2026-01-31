@@ -5,7 +5,7 @@ Demonstrates running multiple agents concurrently and
 combining their results with an aggregator agent.
 """
 
-from praisonaiagents import Agent, Workflow
+from praisonaiagents import Agent, AgentFlow
 from praisonaiagents.workflows import parallel
 
 # Create parallel research agents
@@ -39,7 +39,7 @@ aggregator = Agent(
 )
 
 # Create workflow with parallel execution
-workflow = Workflow(
+workflow = AgentFlow(
     name="Parallel Research Pipeline",
     steps=[
         parallel([market_researcher, competitor_researcher, customer_researcher]),
