@@ -290,6 +290,12 @@ Always document ALL options from the SDK:
 | **Active voice** | "Enable planning with `planning=True`" | "Planning can be enabled by setting the planning parameter to True" |
 | **Direct** | "Use `gpt-4o` for planning" | "It is recommended that you consider using gpt-4o for planning" |
 | **Specific** | "Set `timeout=60` for slow servers" | "Increase the timeout if needed" |
+All documents should focus on non-developers
+Less descriptive,
+After reading the code they should feel "is it this easy to use?"
+If there are different concepts in one page, then explain each concept using mermaid diagram. 
+Also include the flow diagram if that could be useful for the user.
+If multiple options in one page, people might be confused on what to choose, so create the mermaid diagram to choose what option at what instance. 
 
 ### 6.2 Section Introductions
 
