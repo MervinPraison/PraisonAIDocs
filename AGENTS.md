@@ -296,6 +296,7 @@ After reading the code they should feel "is it this easy to use?"
 If there are different concepts in one page, then explain each concept using mermaid diagram. 
 Also include the flow diagram if that could be useful for the user.
 If multiple options in one page, people might be confused on what to choose, so create the mermaid diagram to choose what option at what instance. 
+Our aim to use friendly import easy for users and non-programmers, so don't use complex imports like from praisonaiagents.workflows import when, parallel, loop, instead use the simple import from praisonaiagents import when, parallel, loop.
 
 ### 6.2 Section Introductions
 
