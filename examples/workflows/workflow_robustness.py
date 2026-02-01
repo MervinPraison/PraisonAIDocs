@@ -11,7 +11,7 @@ Run: python workflow_robustness.py
 """
 
 from praisonaiagents import Agent, Task
-from praisonaiagents.workflows import AgentFlow, when
+from praisonaiagents import AgentFlow, when
 
 
 def main():

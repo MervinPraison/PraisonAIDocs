@@ -6,7 +6,7 @@ Useful for long-running workflows that may be interrupted.
 """
 
 from praisonaiagents import AgentFlow, Task
-from praisonaiagents.workflows import WorkflowManager
+from praisonaiagents import AgentFlowManager
 
 # Create a multi-step workflow
 workflow = AgentFlow(

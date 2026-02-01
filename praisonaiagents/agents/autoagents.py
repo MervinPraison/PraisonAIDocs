@@ -5,7 +5,7 @@ This class provides a simplified interface for creating and running AI agents wi
 It automatically handles agent creation, task setup, and execution flow.
 """
 
-from .agents import AgentTeam
+from .agents import AgentManager
 from ..agent.agent import Agent
 from ..task.task import Task
 from typing import List, Any, Optional, Dict, Tuple
@@ -154,6 +154,7 @@ class AutoAgents(AgentManager):
             tasks=tasks,
             process=process,
             manager_llm=manager_llm or self.llm,
+            llm=self.llm,  # Pass llm to parent for API consistency
             output=self._output,  # Consolidated output param
             execution=self._execution,
             hooks=self._hooks,

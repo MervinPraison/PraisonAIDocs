@@ -369,7 +369,7 @@ def run_example_workflow():
     
     # Setup workflow with current project
     project_path = str(project_root)
-    workflow = ContextEngineeringAgentFlow(
+    workflow = ContextEngineeringWorkflow(
         project_path=project_path,
         llm="gpt-4o-mini"
     )
@@ -435,7 +435,7 @@ if __name__ == "__main__":
     print("(Note: Full execution requires complete environment setup)")
     
     project_path = str(project_root)
-    workflow = ContextEngineeringAgentFlow(project_path, "gpt-4o-mini")
+    workflow = ContextEngineeringWorkflow(project_path, "gpt-4o-mini")
     
     print(f"\n✅ Workflow Setup Complete:")
     print(f"   • Project path: {project_path}")

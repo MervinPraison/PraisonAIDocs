@@ -6,7 +6,7 @@ Each item is processed individually with the loop variable.
 """
 
 from praisonaiagents import AgentFlow, Task
-from praisonaiagents.workflows import WorkflowManager
+from praisonaiagents import AgentFlowManager
 
 # Create a workflow with loop
 workflow = AgentFlow(

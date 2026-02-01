@@ -1,6 +1,6 @@
 from praisonaiagents.agent import Agent
 from praisonaiagents.task import Task
-from praisonaiagents import AgentTeam
+from praisonaiagents.agents import Agents
 from typing import List, Dict
 import time
 

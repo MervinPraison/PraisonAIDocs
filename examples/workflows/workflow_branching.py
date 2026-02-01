@@ -6,7 +6,7 @@ to different next steps based on output content.
 """
 
 from praisonaiagents import AgentFlow, Task
-from praisonaiagents.workflows import WorkflowManager
+from praisonaiagents import AgentFlowManager
 
 # Create a workflow with branching
 workflow = AgentFlow(

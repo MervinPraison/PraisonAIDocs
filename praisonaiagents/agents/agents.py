@@ -169,15 +169,15 @@ def process_task_context(context_item, verbose=0, user_id=None):
     else:
         return str(context_item)  # Fallback for unknown types
 
-class AgentManager:
+class AgentTeam:
     """
     Multi-agent coordinator that manages and delegates work to multiple agents.
     
-    AgentManager orchestrates the execution of tasks across multiple Agent instances,
+    AgentTeam orchestrates the execution of tasks across multiple Agent instances,
     supporting sequential, parallel, and hierarchical execution patterns.
     
     Example:
-        from praisonaiagents import Agent, AgentManager, Task
+        from praisonaiagents import Agent, AgentTeam, Task
         
         researcher = Agent(role="Researcher", instructions="Research topics")
         writer = Agent(role="Writer", instructions="Write content")
@@ -185,16 +185,16 @@ class AgentManager:
         task1 = Task(description="Research AI trends", agent=researcher)
         task2 = Task(description="Write article", agent=writer)
         
-        manager = AgentTeam(
+        team = AgentTeam(
             agents=[researcher, writer],
             tasks=[task1, task2],
             process="sequential"
         )
-        result = manager.start()
+        result = team.start()
     
     Note:
-        The class was renamed from `Agents` to `AgentManager` in v0.14.16.
-        `Agents` remains as a deprecated alias for backward compatibility.
+        The class was renamed from `AgentManager` to `AgentTeam` in v1.0.
+        `AgentManager` and `Agents` remain as silent aliases for backward compatibility.
     """
     
     def __init__(
@@ -205,6 +205,7 @@ class AgentManager:
         manager_llm=None,
         name: Optional[str] = None,
         variables: Optional[Dict[str, Any]] = None,
+        llm: Optional[str] = None,  # Default LLM for all agents (API consistency)
         # Consolidated feature params (agent-centric API)
         memory: Optional[Any] = False,  # Union[bool, MultiAgentMemoryConfig]
         planning: Optional[Any] = False,  # Union[bool, MultiAgentPlanningConfig]
@@ -228,6 +229,7 @@ class AgentManager:
             tasks: Optional list of Task instances (auto-generated from agents if None)
             process: Execution process type ("sequential", "parallel", "hierarchical")
             manager_llm: LLM model for manager agent
+            llm: Default LLM model for all agents
             name: Name for this agent collection
             variables: Global variables for substitution
             memory: Memory configuration (bool | MultiAgentMemoryConfig)
@@ -243,6 +245,7 @@ class AgentManager:
             reflection: Self-reflection configuration (bool | ReflectionConfig)
         """
         # Store new params for propagation to agents
+        self.llm = llm  # Store default LLM for API consistency
         self._autonomy = autonomy
         self._knowledge = knowledge
         self._guardrails = guardrails
@@ -1234,7 +1237,7 @@ Context:
         Example:
             ```python
             # Interactive - shows Rich panels
-            agents = AgentTeam(agents=[agent1, agent2])
+            agents = AgentManager(agents=[agent1, agent2])
             result = agents.start()  # Verbose output by default
             
             # Force silent mode
@@ -2058,7 +2061,7 @@ Context:
             backstory=agent_config.get('backstory'),
             llm=agent_config.get('llm'),
             tools=agent_config.get('tools'),
-            verbose=self.verbose >= 1,
+            output='verbose' if self.verbose >= 1 else 'silent',
             memory=self.memory
         )
     
@@ -2400,7 +2403,9 @@ Context:
         # Keep plan tasks for results but note original tasks are preserved in _plan_tasks
 
 
-# Backward compatibility aliases
-# Agents is deprecated in favor of AgentManager (v0.14.16+)
-Agents = AgentManager
-PraisonAIAgents = AgentManager
+# Backward compatibility aliases (silent - no deprecation warnings)
+# AgentTeam is the primary name (v1.0+)
+# AgentManager, Agents, PraisonAIAgents are silent aliases
+AgentManager = AgentTeam
+Agents = AgentTeam
+PraisonAIAgents = AgentTeam
