@@ -623,10 +623,11 @@ class PlanningConfig:
 ## 14. Final Notes
 
 1. **SDK is the source of truth** - Never document what doesn't exist
-2. **Less is more** - Shorter docs are better docs
-3. **Show, don't tell** - Diagrams and code over paragraphs
-4. **Copy-paste success** - Every example must work
-5. **Consistency** - Follow these patterns exactly
-6. **Agents only recognize parameters** - When creating tools, expose all options as function parameters
+2. **Verify before documenting** - Always read SDK source code before writing any example
+3. **Less is more** - Shorter docs are better docs
+4. **Show, don't tell** - Diagrams and code over paragraphs
+5. **Copy-paste success** - Every example must work
+6. **Consistency** - Follow these patterns exactly
+7. **Agents only recognize parameters** - When creating tools, expose all options as function parameters
 
 This file should be used by any AI agent to create documentation that matches the existing PraisonAI documentation style exactly.
