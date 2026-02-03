@@ -18,21 +18,42 @@ class Process:
     DEFAULT_RETRY_LIMIT = 3  # Predefined retry limit in a common place
     VALIDATION_FAILURE_DECISIONS = ["invalid", "retry", "failed", "error", "unsuccessful", "fail", "errors", "reject", "rejected", "incomplete"]  # Decision strings that trigger validation feedback
 
-    def __init__(self, tasks: Dict[str, Task], agents: List[Agent], manager_llm: Optional[str] = None, verbose: bool = False, max_iter: int = 10):
+    def __init__(
+        self,
+        tasks: Dict[str, Task],
+        agents: List[Agent],
+        manager_llm: Optional[str] = None,
+        verbose: bool = False,
+        max_iter: int = 10,
+        output: Optional[str] = None,
+    ):
         logging.debug(f"=== Initializing Process ===")
         logging.debug(f"Number of tasks: {len(tasks)}")
         logging.debug(f"Number of agents: {len(agents)}")
         logging.debug(f"Manager LLM: {manager_llm}")
-        logging.debug(f"Verbose mode: {verbose}")
         logging.debug(f"Max iterations: {max_iter}")
 
         self.tasks = tasks
         self.agents = agents
         self.manager_llm = manager_llm
-        self.verbose = verbose
         self.max_iter = max_iter
         self.task_retry_counter: Dict[str, int] = {} # Initialize retry counter
         self.workflow_finished = False # ADDED: Workflow finished flag
+        
+        # Resolve verbose from output= param (takes precedence) or legacy verbose= param
+        if output is not None:
+            # output= takes precedence over verbose=
+            from ..config.presets import OUTPUT_PRESETS
+            preset = OUTPUT_PRESETS.get(output, {})
+            self._verbose = preset.get("verbose", False)
+        else:
+            # Backward compat: use legacy verbose= param
+            self._verbose = verbose
+        
+        # Keep self.verbose as alias for backward compat
+        self.verbose = self._verbose
+        
+        logging.debug(f"Verbose mode: {self._verbose}")
 
     def _create_llm_instance(self):
         """Create and return a configured LLM instance for manager tasks."""
@@ -95,7 +116,7 @@ class Process:
                             agent=loop_task.agent,
                             name=f"{loop_task.name}_{task_count}" if loop_task.name else task_desc,
                             expected_output=getattr(loop_task, 'expected_output', None),
-                            callback=loop_task.callback,  # Inherit callback from parent loop task
+                            on_task_complete=loop_task.callback,  # Inherit callback from parent loop task
                             is_start=(task_count == 1),
                             task_type="task"
                         )
@@ -121,7 +142,7 @@ class Process:
                             agent=loop_task.agent,
                             name=f"{loop_task.name}_{i+1}" if loop_task.name else line.strip(),
                             expected_output=getattr(loop_task, 'expected_output', None),
-                            callback=loop_task.callback,  # Inherit callback from parent loop task
+                            on_task_complete=loop_task.callback,  # Inherit callback from parent loop task
                             is_start=(i == 0),
                             task_type="task"
                         )
@@ -915,7 +936,7 @@ Provide a JSON with the structure:
                                 agent=start_task.agent,
                                 name=f"{start_task.name}_{task_count}" if start_task.name else task_desc,
                                 expected_output=getattr(start_task, 'expected_output', None),
-                                callback=start_task.callback,  # Inherit callback from parent loop task
+                                on_task_complete=start_task.callback,  # Inherit callback from parent loop task
                                 is_start=(task_count == 1),
                                 task_type="decision",  # Change to decision type
                                 next_tasks=inherited_next_tasks,  # Inherit parent's next tasks
@@ -949,7 +970,7 @@ Provide a JSON with the structure:
                                 agent=start_task.agent,
                                 name=f"{start_task.name}_{i+1}" if start_task.name else line.strip(),
                                 expected_output=getattr(start_task, 'expected_output', None),
-                                callback=start_task.callback,  # Inherit callback from parent loop task
+                                on_task_complete=start_task.callback,  # Inherit callback from parent loop task
                                 is_start=(i == 0),
                                 task_type="task",
                                 condition={
@@ -1033,7 +1054,7 @@ Tasks by type:
                                             agent=current_task.agent,
                                             name=f"{current_task.name}_{i+1}" if current_task.name else task_desc,
                                             expected_output=getattr(current_task, 'expected_output', None),
-                                            callback=current_task.callback,  # Inherit callback from parent loop task
+                                            on_task_complete=current_task.callback,  # Inherit callback from parent loop task
                                             is_start=(i == 0),
                                             task_type="task",
                                             condition={
@@ -1058,7 +1079,7 @@ Tasks by type:
                                         agent=current_task.agent,
                                         name=f"{current_task.name}_{i+1}" if current_task.name else line.strip(),
                                         expected_output=getattr(current_task, 'expected_output', None),
-                                        callback=current_task.callback,  # Inherit callback from parent loop task
+                                        on_task_complete=current_task.callback,  # Inherit callback from parent loop task
                                         is_start=(i == 0),
                                         task_type="task",
                                         condition={

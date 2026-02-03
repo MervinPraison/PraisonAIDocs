@@ -150,6 +150,7 @@ if TYPE_CHECKING:
     from ..task.task import Task
     from .handoff import Handoff, HandoffConfig, HandoffResult
     from ..rag.models import RAGResult, ContextPack
+    from ..eval.results import EvaluationLoopResult
 
 class Agent:
     # Class-level counter for generating unique display names for nameless agents
@@ -839,7 +840,10 @@ class Agent:
                 backend = _memory_config.backend
                 if hasattr(backend, 'value'):
                     backend = backend.value
-                if backend == "file":
+                # If learn is enabled, pass as dict to trigger full Memory class
+                if _memory_config.learn:
+                    memory = _memory_config.to_dict()
+                elif backend == "file":
                     memory = True
                 elif _memory_config.config:
                     memory = _memory_config.config
@@ -850,6 +854,24 @@ class Agent:
                 pass
         elif memory is False:
             memory = None
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # Resolve HISTORY from MemoryConfig - FAST PATH
+        # History is enabled via memory="history" preset or MemoryConfig(history=True)
+        # ─────────────────────────────────────────────────────────────────────
+        _history_enabled = False
+        _history_limit = 10
+        _history_session_id = None
+        
+        # Check if memory config has history settings
+        if _memory_config is not None and isinstance(_memory_config, MemoryConfig):
+            if _memory_config.history:
+                _history_enabled = True
+                _history_limit = _memory_config.history_limit
+        
+        # Use auto_save session if no explicit session and history is enabled
+        if _history_enabled and _history_session_id is None and auto_save:
+            _history_session_id = auto_save
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve KNOWLEDGE param - FAST PATH
@@ -1085,9 +1107,19 @@ class Agent:
         self.__stream_emitter = None  # Will be initialized on first access
         self._hooks_registry_param = hooks  # Store for lazy init
         
-        # Handle model= alias for llm= (NO warnings - both are valid)
-        if llm is None and model is not None:
-            llm = model  # model= is an alias for llm=
+        # Handle llm= deprecation: model= is the preferred parameter name
+        # llm= still works but shows deprecation warning
+        if llm is not None and model is None:
+            import warnings
+            warnings.warn(
+                "Parameter 'llm' is deprecated, use 'model' instead. "
+                "Example: Agent(model='gpt-4o-mini') instead of Agent(llm='gpt-4o-mini')",
+                DeprecationWarning,
+                stacklevel=2
+            )
+        # model= is the preferred parameter (no warning)
+        if model is not None:
+            llm = model  # model= takes precedence
         
         # Store rate limiter (optional, zero overhead when None)
         self._rate_limiter = rate_limiter
@@ -1343,6 +1375,11 @@ Your Goal: {self.goal}
         # Used when session_id is provided but no DB adapter
         self._session_store = None
         self._session_store_initialized = False
+        
+        # History injection settings (for auto-injecting session history into context)
+        self._history_enabled = _history_enabled
+        self._history_limit = _history_limit
+        self._history_session_id = _history_session_id
 
         # Agent-centric feature instances (lazy loaded for zero performance impact)
         self._auto_memory = auto_memory
@@ -2288,6 +2325,99 @@ Summary:"""
         )
         return handoff_obj.execute_programmatic(self, prompt, context)
     
+    def run_until(
+        self,
+        prompt: str,
+        criteria: str,
+        threshold: float = 8.0,
+        max_iterations: int = 5,
+        mode: str = "optimize",
+        on_iteration: Optional[Callable[[Any], None]] = None,
+        verbose: bool = False,
+    ) -> "EvaluationLoopResult":
+        """
+        Run agent iteratively until output meets quality criteria.
+        
+        This method implements the "Ralph Loop" pattern: run agent → judge output
+        → improve based on feedback → repeat until threshold met.
+        
+        Args:
+            prompt: The prompt to send to the agent
+            criteria: Evaluation criteria for the Judge (e.g., "Response is thorough")
+            threshold: Score threshold for success (default: 8.0, scale 1-10)
+            max_iterations: Maximum iterations before stopping (default: 5)
+            mode: "optimize" (stop on success) or "review" (run all iterations)
+            on_iteration: Optional callback called after each iteration
+            verbose: Enable verbose logging
+            
+        Returns:
+            EvaluationLoopResult with iteration history and final score
+            
+        Example:
+            ```python
+            agent = Agent(name="analyzer", instructions="Analyze systems")
+            result = agent.run_until(
+                "Analyze the auth flow",
+                criteria="Analysis is thorough and actionable",
+                threshold=8.0,
+            )
+            print(result.final_score)  # 8.5
+            print(result.success)      # True
+            ```
+        """
+        from ..eval.loop import EvaluationLoop
+        
+        loop = EvaluationLoop(
+            agent=self,
+            criteria=criteria,
+            threshold=threshold,
+            max_iterations=max_iterations,
+            mode=mode,
+            on_iteration=on_iteration,
+            verbose=verbose,
+        )
+        return loop.run(prompt)
+    
+    async def run_until_async(
+        self,
+        prompt: str,
+        criteria: str,
+        threshold: float = 8.0,
+        max_iterations: int = 5,
+        mode: str = "optimize",
+        on_iteration: Optional[Callable[[Any], None]] = None,
+        verbose: bool = False,
+    ) -> "EvaluationLoopResult":
+        """
+        Async version of run_until().
+        
+        Run agent iteratively until output meets quality criteria.
+        
+        Args:
+            prompt: The prompt to send to the agent
+            criteria: Evaluation criteria for the Judge
+            threshold: Score threshold for success (default: 8.0)
+            max_iterations: Maximum iterations before stopping (default: 5)
+            mode: "optimize" (stop on success) or "review" (run all iterations)
+            on_iteration: Optional callback called after each iteration
+            verbose: Enable verbose logging
+            
+        Returns:
+            EvaluationLoopResult with iteration history and final score
+        """
+        from ..eval.loop import EvaluationLoop
+        
+        loop = EvaluationLoop(
+            agent=self,
+            criteria=criteria,
+            threshold=threshold,
+            max_iterations=max_iterations,
+            mode=mode,
+            on_iteration=on_iteration,
+            verbose=verbose,
+        )
+        return await loop.run_async(prompt)
+    
     async def handoff_to_async(
         self,
         target_agent: 'Agent',
@@ -2494,8 +2624,8 @@ Summary:"""
         Initialize RulesManager for persistent rules/instructions.
         
         Automatically discovers rules from:
-        - ~/.praison/rules/ (global)
-        - .praison/rules/ (workspace)
+        - ~/.praisonai/rules/ (global)
+        - .praisonai/rules/ (workspace)
         - Subdirectory rules
         
         NOTE: This is called lazily via the rules_manager property for performance.
@@ -2585,8 +2715,19 @@ Summary:"""
                 self._memory_instance = FileMemory(user_id=mem_user_id)
         elif isinstance(memory, dict):
             # Configuration dict
-            provider = memory.get("provider", "file")
-            if provider == "file":
+            provider = memory.get("provider", memory.get("backend", "file"))
+            learn_enabled = memory.get("learn", False)
+            
+            # Use full Memory class if learn is enabled (requires LearnManager)
+            if learn_enabled:
+                try:
+                    from ..memory.memory import Memory
+                    self._memory_instance = Memory(memory)
+                except ImportError:
+                    logging.warning("Memory with learn requires additional dependencies. Falling back to FileMemory (learn disabled).")
+                    from ..memory.file_memory import FileMemory
+                    self._memory_instance = FileMemory(user_id=memory.get("user_id", mem_user_id))
+            elif provider == "file":
                 from ..memory.file_memory import FileMemory
                 self._memory_instance = FileMemory(
                     user_id=memory.get("user_id", mem_user_id),
@@ -2619,6 +2760,24 @@ Summary:"""
         
         if hasattr(self._memory_instance, 'get_context'):
             return self._memory_instance.get_context(query=query)
+        
+        return ""
+    
+    def get_learn_context(self) -> str:
+        """
+        Get learning context for injection into system prompt.
+        
+        Returns learned preferences, insights, and patterns when memory="learn"
+        is enabled. Returns empty string when learn is not enabled (zero overhead).
+        
+        Returns:
+            Formatted learning context string, or empty string if learn not enabled
+        """
+        if not self._memory_instance:
+            return ""
+        
+        if hasattr(self._memory_instance, 'get_learn_context'):
+            return self._memory_instance.get_learn_context()
         
         return ""
     
@@ -3262,6 +3421,11 @@ Your Goal: {self.goal}"""
                 # Display memory info to user if verbose
                 if self.verbose:
                     self._display_memory_info()
+            
+            # Add learn context if learn is enabled (auto-inject when memory="learn")
+            learn_context = self.get_learn_context()
+            if learn_context:
+                system_prompt += f"\n\n## Learned Context (Patterns and insights from past interactions)\n{learn_context}"
         
         # Add skills prompt if skills are configured
         if self._skills or self._skills_dirs:
@@ -3432,7 +3596,19 @@ Your Goal: {self.goal}"""
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             
-            # Add chat history
+            # Inject session history if enabled (from persistent storage)
+            if self._history_enabled and self._session_store is not None:
+                try:
+                    session_history = self._session_store.get_chat_history(
+                        self._history_session_id,
+                        max_messages=self._history_limit
+                    )
+                    if session_history:
+                        messages.extend(session_history)
+                except Exception as e:
+                    logging.debug(f"Failed to load session history: {e}")
+            
+            # Add in-memory chat history (current conversation)
             if self.chat_history:
                 messages.extend(self.chat_history)
             
