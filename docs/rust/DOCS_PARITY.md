@@ -1,6 +1,6 @@
 # Documentation Parity Tracker (Rust)
 
-> **Categories:** 68 | **Documented:** 19 | **Parity:** 27.9%
+> **Categories:** 68 | **Documented:** 50 | **Parity:** 73.5%
 
 This report compares **Rust SDK feature categories** against **Rust documentation** (docs/rust/).
 
@@ -9,33 +9,64 @@ This report compares **Rust SDK feature categories** against **Rust documentatio
 | Metric | Count |
 |--------|-------|
 | Feature Categories | 68 |
-| **Documented Categories** | **19** |
-| **Undocumented Categories** | **49** |
-| **Parity** | **27.9%** |
+| **Documented Categories** | **50** |
+| **Undocumented Categories** | **18** |
+| **Parity** | **73.5%** |
 
 ## Documented Categories
 
 | Category | Features | Docs | Lines |
 |----------|----------|------|-------|
+| ✅ AGUI | 6 | 1 | 108 |
 | ✅ Agent | 39 | 5 | 901 |
+| ✅ Agent-to-Agent (A2A) | 6 | 1 | 131 |
+| ✅ Approval | 2 | 1 | 102 |
+| ✅ Audio | 3 | 1 | 100 |
+| ✅ Autonomy | 4 | 1 | 108 |
+| ✅ Bots | 10 | 1 | 271 |
+| ✅ Budget | 2 | 1 | 90 |
+| ✅ Callbacks | 1 | 1 | 96 |
+| ✅ Code Execution | 5 | 1 | 147 |
+| ✅ Conditions | 1 | 1 | 243 |
 | ✅ Configuration | 2 | 1 | 301 |
 | ✅ Context Management | 21 | 1 | 284 |
+| ✅ Display | 12 | 1 | 282 |
 | ✅ Embeddings | 8 | 2 | 323 |
+| ✅ Evaluation | 5 | 1 | 311 |
+| ✅ Events | 3 | 1 | 117 |
+| ✅ Execution | 3 | 1 | 93 |
+| ✅ Failover | 3 | 1 | 279 |
+| ✅ Gateway | 8 | 1 | 293 |
 | ✅ Guardrails | 10 | 1 | 322 |
 | ✅ Handoffs | 13 | 1 | 311 |
 | ✅ Hooks | 12 | 1 | 297 |
+| ✅ Image | 4 | 1 | 139 |
 | ✅ Knowledge | 12 | 1 | 297 |
 | ✅ LLM | 10 | 1 | 237 |
+| ✅ Loops | 7 | 1 | 111 |
 | ✅ MCP | 11 | 1 | 359 |
 | ✅ Memory | 11 | 1 | 267 |
+| ✅ OCR | 5 | 1 | 130 |
+| ✅ Output | 3 | 1 | 99 |
+| ✅ Parallel Execution | 4 | 1 | 98 |
 | ✅ Planning | 10 | 1 | 305 |
 | ✅ Plugins | 11 | 1 | 337 |
+| ✅ RAG | 6 | 1 | 328 |
+| ✅ Realtime | 3 | 1 | 130 |
+| ✅ Reflection | 4 | 1 | 89 |
+| ✅ Routing | 1 | 1 | 129 |
 | ✅ Sandbox | 7 | 2 | 56 |
+| ✅ Security | 2 | 1 | 127 |
 | ✅ Sessions | 7 | 1 | 279 |
+| ✅ Skills | 5 | 1 | 224 |
 | ✅ Streaming | 6 | 1 | 332 |
 | ✅ Tasks | 8 | 1 | 269 |
 | ✅ Telemetry | 4 | 1 | 285 |
 | ✅ Tools | 16 | 1 | 281 |
+| ✅ Video | 5 | 1 | 133 |
+| ✅ Vision | 3 | 1 | 89 |
+| ✅ Web | 5 | 1 | 106 |
+| ✅ Workflows | 5 | 1 | 295 |
 
 ## Stub Documentation (Need Content)
 
@@ -43,59 +74,28 @@ These categories have documentation files but < 50 lines (stubs):
 
 | Category | Features | Docs | Lines |
 |----------|----------|------|-------|
-| ⚠️ Approval | 2 | 1 | 28 |
-| ⚠️ Audio | 3 | 1 | 28 |
 | ⚠️ Auto Generation | 5 | 1 | 28 |
-| ⚠️ Autonomy | 4 | 1 | 28 |
-| ⚠️ Bots | 10 | 1 | 28 |
-| ⚠️ Budget | 2 | 1 | 28 |
-| ⚠️ Callbacks | 1 | 1 | 28 |
 | ⚠️ Chunking | 3 | 1 | 28 |
 | ⚠️ Citations | 2 | 1 | 28 |
-| ⚠️ Code Execution | 5 | 1 | 28 |
-| ⚠️ Conditions | 1 | 1 | 28 |
 | ⚠️ Criteria | 4 | 1 | 28 |
 | ⚠️ Database | 2 | 1 | 28 |
-| ⚠️ Display | 12 | 1 | 28 |
 | ⚠️ Documents | 1 | 1 | 28 |
-| ⚠️ Evaluation | 5 | 1 | 28 |
-| ⚠️ Events | 3 | 1 | 28 |
-| ⚠️ Execution | 3 | 1 | 28 |
-| ⚠️ Failover | 3 | 1 | 28 |
 | ⚠️ Files | 3 | 1 | 28 |
 | ⚠️ Flow | 2 | 1 | 28 |
-| ⚠️ Gateway | 8 | 1 | 28 |
-| ⚠️ Image | 4 | 1 | 28 |
-| ⚠️ Loops | 7 | 1 | 28 |
-| ⚠️ OCR | 5 | 1 | 28 |
 | ⚠️ Optimizer | 1 | 1 | 28 |
-| ⚠️ Output | 3 | 1 | 28 |
-| ⚠️ Parallel Execution | 4 | 1 | 28 |
 | ⚠️ Process | 2 | 1 | 28 |
 | ⚠️ Prompts | 4 | 1 | 28 |
 | ⚠️ Providers | 3 | 1 | 28 |
 | ⚠️ Query | 5 | 1 | 28 |
-| ⚠️ RAG | 6 | 1 | 28 |
-| ⚠️ Realtime | 3 | 1 | 28 |
-| ⚠️ Reflection | 4 | 1 | 28 |
 | ⚠️ Retrieval | 4 | 1 | 28 |
-| ⚠️ Routing | 1 | 1 | 28 |
-| ⚠️ Security | 2 | 1 | 28 |
-| ⚠️ Skills | 5 | 1 | 28 |
 | ⚠️ Templates | 1 | 1 | 28 |
 | ⚠️ Token Management | 2 | 1 | 28 |
 | ⚠️ Vector Store | 2 | 1 | 28 |
-| ⚠️ Video | 5 | 1 | 28 |
-| ⚠️ Vision | 3 | 1 | 28 |
-| ⚠️ Web | 5 | 1 | 28 |
-| ⚠️ Workflows | 5 | 1 | 28 |
 
 ## Undocumented Categories (Need Documentation)
 
 | Category | Features |
 |----------|----------|
-| ❌ AGUI | 6 |
-| ❌ Agent-to-Agent (A2A) | 6 |
 | ❌ Tracing | 8 |
 
 ## Documentation Without Features

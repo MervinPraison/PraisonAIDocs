@@ -1,28 +1,279 @@
 ---
 title: "Failover"
-description: "Failover features in PraisonAI Rust SDK"
+sidebarTitle: "Failover"
+description: "LLM provider failover and redundancy in the PraisonAI Rust SDK"
+icon: "arrows-rotate"
 ---
 
 # Failover
 
-<Note>
-This documentation page is a stub. Please contribute by adding content.
-</Note>
+The Failover module provides automatic failover between LLM providers when rate limits or errors occur, ensuring high availability for agent operations.
 
-## Overview
-
-TODO: Add overview of Failover features.
-
-## Usage
+## Quick Start
 
 ```rust
-// TODO: Add usage examples
+use praisonai::failover::{AuthProfile, FailoverManager, FailoverConfig};
+
+// Create auth profiles
+let openai = AuthProfile::new("openai", "openai", "sk-...")
+    .model("gpt-4")
+    .priority(1);
+
+let anthropic = AuthProfile::new("anthropic", "anthropic", "sk-ant-...")
+    .model("claude-3-opus")
+    .priority(2);
+
+// Create manager with failover
+let mut manager = FailoverManager::new(FailoverConfig::default())
+    .add_profile(openai)
+    .add_profile(anthropic);
+
+// Get best available profile
+let profile = manager.get_available()?;
+println!("Using: {}", profile.name);
 ```
 
-## API Reference
+## ProviderStatus
 
-TODO: Add API reference.
+Status of an LLM provider:
+
+| Status | Description |
+|--------|-------------|
+| `Available` | Ready for use |
+| `RateLimited` | Temporarily limited |
+| `Error` | Encountered an error |
+| `Disabled` | Manually disabled |
+
+## AuthProfile
+
+Authentication profile for an LLM provider:
+
+```rust
+use praisonai::failover::AuthProfile;
+
+let profile = AuthProfile::new("primary-gpt4", "openai", "sk-...")
+    .base_url("https://api.openai.com/v1")
+    .model("gpt-4-turbo")
+    .priority(1)  // Lower = higher priority
+    .rate_limit_rpm(60)  // Requests per minute
+    .rate_limit_tpm(90000)  // Tokens per minute
+    .metadata("org", "my-org");
+
+// Check availability
+println!("Available: {}", profile.is_available());
+
+// Status after rate limit
+profile.mark_rate_limited(Duration::from_secs(60));
+println!("Status: {:?}", profile.status);  // RateLimited
+
+// Reset
+profile.reset();
+println!("Available: {}", profile.is_available());  // true
+```
+
+### AuthProfile Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | String | Profile name |
+| `provider` | String | Provider type |
+| `api_key` | String | API key |
+| `base_url` | Option | Custom API URL |
+| `model` | Option | Default model |
+| `priority` | i32 | Selection priority |
+| `status` | ProviderStatus | Current status |
+| `rate_limit_rpm` | Option | RPM limit |
+| `rate_limit_tpm` | Option | TPM limit |
+
+## FailoverConfig
+
+Configuration for failover behavior:
+
+```rust
+use praisonai::failover::FailoverConfig;
+
+let config = FailoverConfig::new()
+    .max_retries(3)
+    .retry_delay(1.0)  // seconds
+    .exponential_backoff(true)
+    .max_retry_delay(30.0)  // seconds
+    .cooldown_on_rate_limit(60.0)  // seconds
+    .cooldown_on_error(120.0);  // seconds
+
+println!("Max retries: {}", config.max_retries);
+println!("Backoff: {}", config.exponential_backoff);
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `max_retries` | u32 | 3 | Max retry attempts |
+| `retry_delay` | f64 | 1.0 | Initial delay (sec) |
+| `exponential_backoff` | bool | true | Enable backoff |
+| `max_retry_delay` | f64 | 60.0 | Max delay (sec) |
+| `cooldown_on_rate_limit` | f64 | 60.0 | Rate limit cooldown |
+| `cooldown_on_error` | f64 | 300.0 | Error cooldown |
+
+## FailoverManager
+
+Manage multiple providers with automatic failover:
+
+```rust
+use praisonai::failover::{FailoverManager, FailoverConfig, AuthProfile};
+
+let config = FailoverConfig::new().max_retries(5);
+let mut manager = FailoverManager::new(config);
+
+// Add profiles in priority order
+manager.add_profile(AuthProfile::new("primary", "openai", "sk-1")
+    .priority(1));
+manager.add_profile(AuthProfile::new("secondary", "anthropic", "sk-2")
+    .priority(2));
+manager.add_profile(AuthProfile::new("fallback", "openai", "sk-3")
+    .priority(3));
+
+// Get best available
+let profile = manager.get_available()?;
+println!("Using: {}", profile.name);
+
+// List all profiles
+for p in manager.profiles() {
+    println!("{}: {:?}", p.name, p.status);
+}
+
+// Get profile by name
+if let Some(p) = manager.get_profile("primary") {
+    println!("Primary status: {:?}", p.status);
+}
+```
+
+### Handling Failures
+
+```rust
+use praisonai::failover::{FailoverManager, ProviderStatus};
+use std::time::Duration;
+
+// Mark as rate limited
+manager.mark_rate_limited("primary", Duration::from_secs(60));
+
+// Mark as error
+manager.mark_error("primary", "Connection timeout", Duration::from_secs(120));
+
+// Check status
+let profile = manager.get_profile("primary").unwrap();
+assert_eq!(profile.status, ProviderStatus::RateLimited);
+
+// Reset
+manager.reset("primary");
+
+// Reset all
+manager.reset_all();
+```
+
+## FailoverExecutor
+
+Execute operations with automatic failover:
+
+```rust
+use praisonai::failover::{FailoverExecutor, FailoverManager, AuthProfile};
+
+let manager = FailoverManager::new_default()
+    .add_profile(AuthProfile::new("p1", "openai", "sk-1"))
+    .add_profile(AuthProfile::new("p2", "openai", "sk-2"));
+
+let executor = FailoverExecutor::new(manager);
+
+// Execute with failover
+let result = executor.execute(|profile| async {
+    // Try to make LLM call with this profile
+    let client = LlmClient::new(&profile.api_key);
+    client.complete("Hello").await
+}).await?;
+
+println!("Result: {}", result);
+println!("Attempts: {}", executor.last_attempt_count());
+println!("Final profile: {}", executor.last_used_profile());
+```
+
+## Example: Multi-Provider Setup
+
+```rust
+use praisonai::failover::{
+    FailoverManager, FailoverConfig, AuthProfile, ProviderStatus
+};
+use std::time::Duration;
+
+fn setup_providers() -> FailoverManager {
+    let config = FailoverConfig::new()
+        .max_retries(3)
+        .exponential_backoff(true)
+        .cooldown_on_rate_limit(60.0);
+    
+    let mut manager = FailoverManager::new(config);
+    
+    // Primary: OpenAI GPT-4
+    manager.add_profile(
+        AuthProfile::new("openai-primary", "openai", std::env::var("OPENAI_API_KEY").unwrap())
+            .model("gpt-4-turbo")
+            .priority(1)
+            .rate_limit_rpm(500)
+    );
+    
+    // Secondary: Anthropic Claude
+    manager.add_profile(
+        AuthProfile::new("anthropic", "anthropic", std::env::var("ANTHROPIC_API_KEY").unwrap())
+            .model("claude-3-sonnet")
+            .priority(2)
+            .rate_limit_rpm(1000)
+    );
+    
+    // Fallback: Azure OpenAI
+    manager.add_profile(
+        AuthProfile::new("azure", "azure", std::env::var("AZURE_API_KEY").unwrap())
+            .base_url("https://my-endpoint.openai.azure.com")
+            .model("gpt-4")
+            .priority(3)
+    );
+    
+    manager
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut manager = setup_providers();
+    
+    // Simulate rate limit on primary
+    manager.mark_rate_limited("openai-primary", Duration::from_secs(60));
+    
+    // Get next available (will be anthropic)
+    let profile = manager.get_available()?;
+    println!("Using: {} ({:?})", profile.name, profile.provider);
+    
+    // After cooldown, primary will be available again
+    std::thread::sleep(Duration::from_secs(60));
+    manager.check_cooldowns();  // Update statuses
+    
+    let profile = manager.get_available()?;
+    println!("Now using: {}", profile.name);  // openai-primary
+    
+    Ok(())
+}
+```
 
 ## Related
 
-- [Getting Started](/docs/rust/quickstart)
+<CardGroup cols={2}>
+  <Card title="LLM" icon="microchip" href="/docs/rust/llm">
+    LLM configuration
+  </Card>
+  <Card title="Configuration" icon="gear" href="/docs/rust/configuration">
+    SDK configuration
+  </Card>
+  <Card title="Error Handling" icon="triangle-exclamation" href="/docs/rust/error-handling">
+    Error patterns
+  </Card>
+  <Card title="Agent" icon="robot" href="/docs/rust/agent">
+    Agent API
+  </Card>
+</CardGroup>

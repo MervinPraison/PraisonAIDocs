@@ -15,6 +15,7 @@ Before creating any documentation page:
 3. **Find the dataclass/config class** - Look in `praisonaiagents/config/feature_configs.py`
 4. **Check for related existing docs** - Avoid duplication, ensure consistency
 5. **Verify imports** - Confirm exact import paths from the SDK
+6. The files you create are not SDK Focused. Its user focused. We have a dedicated auto Generated SDK Document section, so dont need to worry about detailed SDK Focused document. NEed it to be user friendly , non developers and beginners should understand
 
 ### 1.2 SDK-First Approach
 
