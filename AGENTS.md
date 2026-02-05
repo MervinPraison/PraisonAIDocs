@@ -21,10 +21,29 @@ Before creating any documentation page:
 9. Documentation need to be agent centric. Top of the document should always start with Agent Centric code example. Features are there, but how to implement from Agent perspective, that need to be addressed.
 10. Include user interaction flow - show how users will interact with the feature in real scenarios 
 
-### 1.2 SDK-First Approach
+### 1.2 SDK-First Documentation Cycle
 
 ```
-CRITICAL: Documentation MUST reflect SDK ground truth.
+CRITICAL: Follow this cycle for EVERY documentation page:
+
+┌─────────────────────────────────────────────────────────────┐
+│  1. READ SDK SOURCE → 2. UNDERSTAND → 3. DOCUMENT → REPEAT  │
+└─────────────────────────────────────────────────────────────┘
+
+For each feature/page:
+  1. READ:   Open and read the actual SDK source file
+  2. UNDERSTAND: Comprehend the implementation, APIs, and behavior
+  3. DOCUMENT: Write/update documentation based on SDK truth
+  4. REPEAT: Move to next feature and restart the cycle
+
+NEVER batch-update multiple pages without reading source for each.
+ALWAYS verify against source code before making any documentation change.
+```
+
+### 1.3 SDK Source Verification
+
+```
+Documentation MUST reflect SDK ground truth.
 
 1. Read the SDK file completely
 2. Extract ALL parameters with their:
@@ -36,7 +55,7 @@ CRITICAL: Documentation MUST reflect SDK ground truth.
 4. Never document features that don't exist in SDK
 ```
 
-### 1.3 File Locations
+### 1.4 File Locations
 
 | Content Type | SDK Location | Docs Location |
 |--------------|--------------|---------------|
@@ -47,7 +66,7 @@ CRITICAL: Documentation MUST reflect SDK ground truth.
 | Memory | `praisonaiagents/memory/` | `docs/concepts/memory.mdx` |
 | Knowledge | `praisonaiagents/knowledge/` | `docs/concepts/knowledge.mdx` |
 
-### 1.4 Multi-SDK Reference
+### 1.5 Multi-SDK Reference
 
 PraisonAI has three SDK implementations. Use these paths as source of truth:
 
