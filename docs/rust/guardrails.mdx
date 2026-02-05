@@ -1,0 +1,322 @@
+---
+title: "Guardrails"
+sidebarTitle: "Guardrails"
+description: "Validate and control agent outputs with guardrails in the PraisonAI Rust SDK"
+icon: "shield"
+---
+
+# Guardrails
+
+Guardrails validate agent outputs before they reach users. They can check content length, filter blocked keywords, enforce patterns, and chain multiple validations.
+
+## Quick Start
+
+```rust
+use praisonai::{Agent, guardrails::{LengthGuardrail, BlocklistGuardrail, GuardrailChain}};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let guardrails = GuardrailChain::new()
+        .add(LengthGuardrail::new().min(10).max(1000))
+        .add(BlocklistGuardrail::new(vec!["offensive".into()]));
+    
+    let agent = Agent::new("assistant")
+        .guardrails(guardrails)
+        .build()?;
+    
+    Ok(())
+}
+```
+
+## GuardrailResult
+
+All guardrails return a `GuardrailResult`:
+
+```rust
+use praisonai::guardrails::GuardrailResult;
+
+// Success - content passes validation
+let pass = GuardrailResult::pass();
+assert!(pass.is_success());
+
+// Success with modified content
+let modified = GuardrailResult::success("sanitized content");
+
+// Failure - content blocked
+let fail = GuardrailResult::failure("Content too short");
+assert!(fail.is_failure());
+println!("Error: {}", fail.error);
+
+// Add metadata
+let with_meta = GuardrailResult::pass()
+    .with_metadata("confidence", "0.95");
+```
+
+### GuardrailResult Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | `bool` | Whether validation passed |
+| `result` | `Option<String>` | Modified content (if any) |
+| `error` | `String` | Error message on failure |
+| `metadata` | `HashMap<String, String>` | Additional metadata |
+
+## Guardrail Trait
+
+Implement custom guardrails:
+
+```rust
+use praisonai::guardrails::{Guardrail, GuardrailResult};
+
+struct ProfanityFilter {
+    words: Vec<String>,
+}
+
+impl Guardrail for ProfanityFilter {
+    fn validate(&self, output: &str) -> GuardrailResult {
+        let lower = output.to_lowercase();
+        for word in &self.words {
+            if lower.contains(word) {
+                return GuardrailResult::failure(
+                    format!("Content contains prohibited word: {}", word)
+                );
+            }
+        }
+        GuardrailResult::pass()
+    }
+    
+    fn name(&self) -> &str {
+        "profanity_filter"
+    }
+    
+    fn description(&self) -> &str {
+        "Filters profane content"
+    }
+}
+```
+
+## Built-in Guardrails
+
+### LengthGuardrail
+
+Validate content length:
+
+```rust
+use praisonai::guardrails::LengthGuardrail;
+
+// Minimum length only
+let min_only = LengthGuardrail::new().min(10);
+
+// Maximum length only
+let max_only = LengthGuardrail::new().max(1000);
+
+// Both limits
+let length = LengthGuardrail::new().min(10).max(1000);
+
+let result = length.validate("Hello");  // Too short
+assert!(result.is_failure());
+assert!(result.error.contains("too short"));
+```
+
+### BlocklistGuardrail
+
+Block specific keywords:
+
+```rust
+use praisonai::guardrails::BlocklistGuardrail;
+
+let blocklist = BlocklistGuardrail::new(vec![
+    "password".into(),
+    "secret".into(),
+    "api_key".into(),
+]);
+
+// Case-insensitive by default
+let result = blocklist.validate("Here's the PASSWORD");
+assert!(result.is_failure());
+
+// Enable case-sensitivity
+let case_sensitive = BlocklistGuardrail::new(vec!["bad".into()])
+    .case_sensitive(true);
+
+case_sensitive.validate("This is BAD");  // Passes (case mismatch)
+case_sensitive.validate("This is bad");  // Fails
+```
+
+### PatternGuardrail  
+
+Enforce patterns in content:
+
+```rust
+use praisonai::guardrails::PatternGuardrail;
+
+let pattern = PatternGuardrail::new()
+    .must_match("##")           // Must contain markdown header
+    .must_not_match("TODO");    // Must not contain TODO
+
+let ok = pattern.validate("## Hello World");
+assert!(ok.is_success());
+
+let missing = pattern.validate("Hello World");  // Missing ##
+assert!(missing.is_failure());
+
+let forbidden = pattern.validate("## TODO: Fix this");  // Contains TODO
+assert!(forbidden.is_failure());
+```
+
+## GuardrailChain
+
+Chain multiple guardrails:
+
+```rust
+use praisonai::guardrails::{GuardrailChain, LengthGuardrail, BlocklistGuardrail, PatternGuardrail};
+
+let chain = GuardrailChain::new()
+    .add(LengthGuardrail::new().min(20).max(5000))
+    .add(BlocklistGuardrail::new(vec!["secret".into()]))
+    .add(PatternGuardrail::new().must_not_match("TODO"));
+
+// All guardrails run in sequence
+let result = chain.validate("Hello world!");
+assert!(result.is_failure());  // Too short
+
+let result = chain.validate("This is a longer message with secret info");
+assert!(result.is_failure());  // Contains "secret"
+
+println!("Guardrails: {}", chain.len());
+```
+
+## FunctionGuardrail
+
+Create guardrails from closures:
+
+```rust
+use praisonai::guardrails::{FunctionGuardrail, GuardrailResult};
+
+let custom = FunctionGuardrail::new("json_validator", |output: &str| {
+    match serde_json::from_str::<serde_json::Value>(output) {
+        Ok(_) => GuardrailResult::pass(),
+        Err(e) => GuardrailResult::failure(format!("Invalid JSON: {}", e)),
+    }
+}).description("Validates output is valid JSON");
+
+let valid = custom.validate(r#"{"key": "value"}"#);
+assert!(valid.is_success());
+
+let invalid = custom.validate("not json");
+assert!(invalid.is_failure());
+```
+
+## GuardrailConfig
+
+Configure guardrail behavior:
+
+```rust
+use praisonai::guardrails::{GuardrailConfig, GuardrailAction};
+
+let config = GuardrailConfig::new()
+    .on_failure(GuardrailAction::Retry)  // Retry on failure
+    .max_retries(3)                       // Up to 3 retries
+    .fallback_response("I cannot provide that information")
+    .log_results(true);
+```
+
+### GuardrailAction
+
+| Action | Description |
+|--------|-------------|
+| `Stop` | Stop execution, return error (default) |
+| `Retry` | Retry the task |
+| `Warn` | Continue with warning |
+| `Skip` | Skip and continue |
+| `Fallback` | Use fallback response |
+
+## AsyncGuardrail
+
+For guardrails needing async operations (e.g., API calls):
+
+```rust
+use praisonai::guardrails::{AsyncGuardrail, GuardrailResult};
+use async_trait::async_trait;
+
+struct ContentModerationApi {
+    api_key: String,
+}
+
+#[async_trait]
+impl AsyncGuardrail for ContentModerationApi {
+    async fn validate(&self, output: &str) -> GuardrailResult {
+        // Call external moderation API
+        let is_safe = check_content_api(output, &self.api_key).await;
+        
+        if is_safe {
+            GuardrailResult::pass()
+        } else {
+            GuardrailResult::failure("Content flagged by moderation API")
+        }
+    }
+    
+    fn name(&self) -> &str {
+        "content_moderation_api"
+    }
+}
+```
+
+## Example: Multi-Layer Validation
+
+```rust
+use praisonai::guardrails::{
+    GuardrailChain, LengthGuardrail, BlocklistGuardrail, 
+    PatternGuardrail, FunctionGuardrail, GuardrailResult
+};
+
+let chain = GuardrailChain::new()
+    // Layer 1: Basic length check
+    .add(LengthGuardrail::new().min(50).max(10000))
+    
+    // Layer 2: Content blocklist
+    .add(BlocklistGuardrail::new(vec![
+        "password".into(),
+        "api_key".into(),
+        "secret".into(),
+    ]))
+    
+    // Layer 3: Pattern requirements
+    .add(PatternGuardrail::new()
+        .must_not_match("TODO")
+        .must_not_match("FIXME"))
+    
+    // Layer 4: Custom validation
+    .add(FunctionGuardrail::new("no_code_blocks", |output| {
+        if output.contains("```") {
+            GuardrailResult::failure("Code blocks not allowed")
+        } else {
+            GuardrailResult::pass()
+        }
+    }));
+
+// Validate agent output
+let output = "Here is your detailed response with proper formatting...";
+let result = chain.validate(output);
+
+if result.is_failure() {
+    println!("Blocked: {}", result.error);
+}
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Hooks" icon="anchor" href="/docs/rust/hooks">
+    Hook system for interception
+  </Card>
+  <Card title="Agent" icon="robot" href="/docs/rust/agent">
+    Add guardrails to agents
+  </Card>
+  <Card title="Security" icon="lock" href="/docs/rust/security">
+    Security best practices
+  </Card>
+  <Card title="Policies" icon="scroll" href="/docs/rust/plugins">
+    Policy plugins
+  </Card>
+</CardGroup>

@@ -1,0 +1,311 @@
+---
+title: "Handoffs"
+sidebarTitle: "Handoffs"
+description: "Transfer tasks between agents with handoffs in the PraisonAI Rust SDK"
+icon: "arrow-right-arrow-left"
+---
+
+# Handoffs
+
+Handoffs enable agents to delegate tasks to specialized agents. The LLM can decide to transfer control based on the task requirements.
+
+## Quick Start
+
+```rust
+use praisonai::{Agent, Handoff, HandoffConfig, ContextPolicy};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create specialized agents
+    let billing_agent = Agent::new("billing_agent")
+        .instructions("Handle billing inquiries")
+        .build()?;
+    
+    let support_agent = Agent::new("support_agent")
+        .instructions("Handle technical support")
+        .build()?;
+    
+    // Create triage agent with handoffs
+    let triage = Agent::new("triage")
+        .instructions("Route customer inquiries to the right department")
+        .handoff(Handoff::new("billing_agent"))
+        .handoff(Handoff::new("support_agent"))
+        .build()?;
+    
+    Ok(())
+}
+```
+
+## Handoff
+
+Configure agent-to-agent transfers:
+
+```rust
+use praisonai::Handoff;
+
+let handoff = Handoff::new("billing_agent")
+    .tool_name("transfer_to_billing")         // Custom tool name
+    .tool_description("Transfer billing questions to billing team");
+
+// Default tool name is "transfer_to_{agent_name}"
+let default = Handoff::new("Support Team");
+assert_eq!(default.get_tool_name(), "transfer_to_support_team");
+```
+
+## HandoffConfig
+
+Configure handoff behavior:
+
+```rust
+use praisonai::{Handoff, HandoffConfig, ContextPolicy};
+
+let config = HandoffConfig::new()
+    .context_policy(ContextPolicy::Summary)  // How to share context
+    .max_context_tokens(4000)                // Token limit
+    .max_context_messages(10)                // Message limit
+    .preserve_system(true)                   // Keep system messages
+    .timeout_seconds(60.0)                   // Timeout
+    .max_concurrent(3)                       // Concurrent handoffs
+    .detect_cycles(true)                     // Prevent infinite loops
+    .max_depth(10);                          // Chain depth limit
+
+let handoff = Handoff::new("billing_agent").config(config);
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `context_policy` | `ContextPolicy` | `Summary` | How to share conversation context |
+| `max_context_tokens` | `usize` | `4000` | Maximum tokens in shared context |
+| `max_context_messages` | `usize` | `10` | Maximum messages to share |
+| `preserve_system` | `bool` | `true` | Keep system messages in context |
+| `timeout_seconds` | `f64` | `300.0` | Handoff timeout |
+| `max_concurrent` | `usize` | `3` | Maximum concurrent handoffs |
+| `detect_cycles` | `bool` | `true` | Enable cycle detection |
+| `max_depth` | `usize` | `10` | Maximum handoff chain depth |
+
+## ContextPolicy
+
+Control how conversation context is shared:
+
+```rust
+use praisonai::ContextPolicy;
+
+// Share full conversation history (use carefully)
+ContextPolicy::Full
+
+// Share summarized context (default - safe)
+ContextPolicy::Summary
+
+// Share last N messages
+ContextPolicy::LastN
+
+// No context sharing
+ContextPolicy::None
+```
+
+## HandoffResult
+
+Results from handoff operations:
+
+```rust
+use praisonai::handoff::HandoffResult;
+
+// Success
+let success = HandoffResult::success("Task completed")
+    .with_target("billing_agent")
+    .with_source("triage_agent")
+    .with_duration(1.5)
+    .with_depth(2);
+
+assert!(success.success);
+println!("Response: {:?}", success.response);
+
+// Failure
+let failure = HandoffResult::failure("Agent unavailable")
+    .with_target("billing_agent");
+
+println!("Error: {:?}", failure.error);
+```
+
+### HandoffResult Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | `bool` | Whether handoff succeeded |
+| `response` | `Option<String>` | Response from target agent |
+| `target_agent` | `Option<String>` | Target agent name |
+| `source_agent` | `Option<String>` | Source agent name |
+| `duration_seconds` | `f64` | Handoff duration |
+| `error` | `Option<String>` | Error message |
+| `handoff_depth` | `usize` | Chain depth at completion |
+
+## HandoffChain
+
+Track handoff chains for cycle detection:
+
+```rust
+use praisonai::handoff::HandoffChain;
+
+let chain = HandoffChain::new();
+
+chain.push("triage_agent");
+chain.push("billing_agent");
+
+// Check depth
+assert_eq!(chain.depth(), 2);
+
+// Check for cycles
+if chain.contains("billing_agent") {
+    println!("Cycle detected!");
+}
+
+// Get full chain
+let agents = chain.get();  // ["triage_agent", "billing_agent"]
+```
+
+## Safety Checks
+
+Built-in safety prevents infinite loops:
+
+```rust
+use praisonai::{Handoff, handoff::HandoffChain};
+
+let handoff = Handoff::new("billing_agent")
+    .config(HandoffConfig::new()
+        .detect_cycles(true)
+        .max_depth(5));
+
+let chain = HandoffChain::new();
+chain.push("triage_agent");
+chain.push("billing_agent");  // billing_agent is already in chain
+
+// This will fail with cycle detection error
+let result = handoff.check_safety("support_agent", &chain);
+assert!(result.is_err());
+```
+
+## HandoffInputData
+
+Context passed between agents:
+
+```rust
+use praisonai::handoff::HandoffInputData;
+use serde_json::json;
+
+let data = HandoffInputData::new()
+    .messages(vec![
+        json!({"role": "user", "content": "I have a billing question"}),
+    ])
+    .context("ticket_id", json!("12345"))
+    .source_agent("triage_agent");
+
+println!("From: {:?}", data.source_agent);
+println!("Depth: {}", data.handoff_depth);
+```
+
+## HandoffFilters
+
+Filter context before handoff:
+
+```rust
+use praisonai::handoff::{HandoffFilters, HandoffInputData};
+
+let data = HandoffInputData::new()
+    .messages(vec![/* many messages */]);
+
+// Remove tool calls from history
+let filtered = HandoffFilters::remove_all_tools(data);
+
+// Keep only last 5 messages
+let keep_last = HandoffFilters::keep_last_n(5);
+let filtered = keep_last(data);
+
+// Remove system messages
+let filtered = HandoffFilters::remove_system_messages(data);
+```
+
+## Example: Customer Support Router
+
+```rust
+use praisonai::{Agent, Handoff, HandoffConfig, ContextPolicy};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Specialized agents
+    let billing = Agent::new("billing")
+        .instructions("Handle billing, payments, and invoices")
+        .build()?;
+    
+    let tech_support = Agent::new("tech_support")
+        .instructions("Handle technical issues and troubleshooting")
+        .build()?;
+    
+    let sales = Agent::new("sales")
+        .instructions("Handle sales inquiries and upgrades")
+        .build()?;
+    
+    // Triage agent with handoffs
+    let config = HandoffConfig::new()
+        .context_policy(ContextPolicy::Summary)
+        .timeout_seconds(120.0);
+    
+    let triage = Agent::new("triage")
+        .instructions(r#"
+            You are a customer support triage agent.
+            - Billing questions → transfer to billing
+            - Technical issues → transfer to tech_support
+            - Sales/upgrades → transfer to sales
+        "#)
+        .handoff(Handoff::new("billing").config(config.clone()))
+        .handoff(Handoff::new("tech_support").config(config.clone()))
+        .handoff(Handoff::new("sales").config(config))
+        .build()?;
+    
+    // The LLM will automatically route to the right agent
+    let response = triage.run("I need help with my invoice").await?;
+    
+    Ok(())
+}
+```
+
+## Error Types
+
+### HandoffCycleError
+
+```rust
+// Occurs when agent A → B → A is detected
+// Error: "Handoff cycle detected: A -> B -> A"
+```
+
+### HandoffDepthError
+
+```rust
+// Occurs when chain exceeds max_depth
+// Error: "Max handoff depth exceeded: 11 > 10"
+```
+
+### HandoffTimeoutError
+
+```rust
+// Occurs when handoff takes too long
+// Error: "Handoff to billing_agent timed out after 60s"
+```
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Agent Team" icon="users" href="/docs/rust/agent-team">
+    Multi-agent coordination
+  </Card>
+  <Card title="Agent Flow" icon="diagram-project" href="/docs/rust/agent-flow">
+    Workflow orchestration
+  </Card>
+  <Card title="Sessions" icon="clock-rotate-left" href="/docs/rust/sessions">
+    Session management
+  </Card>
+  <Card title="Context Management" icon="layer-group" href="/docs/rust/context-management">
+    Context strategies
+  </Card>
+</CardGroup>
