@@ -42,6 +42,45 @@ CRITICAL: Documentation MUST reflect SDK ground truth.
 | Memory | `praisonaiagents/memory/` | `docs/concepts/memory.mdx` |
 | Knowledge | `praisonaiagents/knowledge/` | `docs/concepts/knowledge.mdx` |
 
+### 1.4 Multi-SDK Reference
+
+PraisonAI has three SDK implementations. Use these paths as source of truth:
+
+| SDK | Source Code Path | Documentation Path | Parity Tracker |
+|-----|------------------|-------------------|----------------|
+| **Python** | `praisonai-package/src/praisonai-agents/` | `docs/concepts/`, `docs/features/` | `docs/features/DOCS_PARITY.md` |
+| **TypeScript/JS** | `praisonai-package/src/praisonai-ts/src/` | `docs/js/` | `docs/js/DOCS_PARITY.md` |
+| **Rust** | `praisonai-package/src/praisonai-rust/src/` | `docs/rust/` | `docs/rust/DOCS_PARITY.md` |
+
+**Documentation Parity Trackers** show which features have documentation and which need docs:
+- ✅ Documented categories (real content)
+- ⚠️ Stub documentation (< 50 lines, needs content)
+- ❌ Undocumented categories (needs documentation)
+
+### 1.5 TypeScript SDK Structure
+
+```
+praisonai-ts/src/
+├── agents/           # Agent implementations
+├── tools/            # Tool definitions
+├── memory/           # Memory implementations  
+├── mcp/              # MCP protocol support
+├── observability/    # Tracing integrations
+└── index.ts          # Main exports
+```
+
+### 1.6 Rust SDK Structure
+
+```
+praisonai-rust/src/
+├── agent/            # Agent and config
+├── llm/              # LLM provider
+├── tools/            # Tool system
+├── memory/           # Memory stores
+├── mcp/              # MCP client
+└── lib.rs            # Main exports
+```
+
 ---
 
 ## 2. Page Structure Template
