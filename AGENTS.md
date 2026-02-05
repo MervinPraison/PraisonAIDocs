@@ -85,6 +85,31 @@ praisonai-rust/src/
 └── lib.rs            # Main exports
 ```
 
+### 1.7 Auto-Managed Documentation Sections
+
+> [!WARNING]
+> **DO NOT manually edit** the following sections in `docs.json`:
+> - TypeScript/JS "Features" group entries at `docs/js/`
+> - Rust "Advanced" group stub entries at `docs/rust/`
+> 
+> These pages are auto-generated and managed by the parity system.
+
+**To update documentation parity:**
+```bash
+cd praisonai-package
+python3 src/praisonai/scripts/generate_docs_parity.py --copy-docs
+```
+
+**Full command for agents:**
+```bash
+/usr/bin/python3 /Users/praison/praisonai-package/src/praisonai/scripts/generate_docs_parity.py --copy-docs
+```
+
+This command:
+1. Scans SDK features and docs for all three SDKs
+2. Generates `DOCS_PARITY.md` reports
+3. Copies reports to `docs/features/`, `docs/js/`, `docs/rust/`
+
 ---
 
 ## 2. Page Structure Template
