@@ -90,7 +90,7 @@ praisonai-rust/src/
 > [!WARNING]
 > **DO NOT manually edit** the following sections in `docs.json`:
 > - TypeScript/JS "Features" group entries at `docs/js/`
-> - Rust "Advanced" group stub entries at `docs/rust/`
+> - Rust "Features" group entries at `docs/rust/`
 > 
 > These pages are auto-generated and managed by the parity system.
 
