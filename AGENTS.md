@@ -153,9 +153,16 @@ icon: "icon-name"
 
 ## Configuration Options
 
-{/* Full config class example */}
+{/* Link to auto-generated SDK reference - DO NOT duplicate SDK parameters here */}
+{/* TypeScript: /docs/sdk/reference/typescript/{classes,modules,functions}/ */}
+{/* Rust: /docs/sdk/reference/rust/{structs,modules,functions}/ */}
 
-{/* Complete options table with ALL SDK parameters */}
+<Card title="[Feature] API Reference" icon="code" href="/docs/sdk/reference/typescript/classes/[FeatureConfig]">
+  TypeScript configuration options
+</Card>
+<Card title="[Feature] Rust Reference" icon="code" href="/docs/sdk/reference/rust/structs/[FeatureConfig]">
+  Rust configuration options
+</Card>
 
 ---
 

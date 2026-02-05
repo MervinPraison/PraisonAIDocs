@@ -25,51 +25,53 @@ graph TB
 ## Quick Start
 
 <Steps>
-<Step title="Create a Hook">
+<Step title="Create a Hook with HookRegistry">
 ```rust
-use praisonai::{Hook, HookEvent, HookInput, HookResult, async_trait};
+use praisonai::{HookRegistry, HookEvent, HookInput, HookResult};
 
-struct LoggingHook;
+let mut registry = HookRegistry::new();
 
-#[async_trait]
-impl Hook for LoggingHook {
-    fn name(&self) -> &str { "logging" }
-    
-    fn events(&self) -> Vec<HookEvent> {
-        vec![HookEvent::BeforeTool, HookEvent::AfterTool]
-    }
-    
-    async fn run(&self, input: &HookInput) -> HookResult {
-        println!("[{}] Event: {:?}", input.session_id, input.event);
-        HookResult::allow()
-    }
-}
+// Add a logging hook
+registry.add_hook(HookEvent::BeforeTool, |input: &HookInput| {
+    println!("[{}] Event: {:?}", input.session_id, input.event);
+    HookResult::allow()
+});
 ```
 </Step>
 
 <Step title="Block Tool Execution">
 ```rust
-use praisonai::{Hook, HookEvent, HookInput, HookResult, async_trait};
+use praisonai::{HookRegistry, HookEvent, HookInput, HookResult};
 
-struct DangerousToolBlocker;
+let mut registry = HookRegistry::new();
 
-#[async_trait]
-impl Hook for DangerousToolBlocker {
-    fn name(&self) -> &str { "tool_blocker" }
-    
-    fn events(&self) -> Vec<HookEvent> {
-        vec![HookEvent::BeforeTool]
-    }
-    
-    async fn run(&self, input: &HookInput) -> HookResult {
-        if let Some(tool) = &input.tool_name {
-            if tool == "delete_file" {
-                return HookResult::deny("Dangerous tool blocked");
-            }
+// Block dangerous tools
+registry.add_hook(HookEvent::BeforeTool, |input: &HookInput| {
+    if let Some(tool) = &input.tool_name {
+        if tool == "delete_file" {
+            return HookResult::deny("Dangerous tool blocked");
         }
+    }
+    HookResult::allow()
+});
+```
+</Step>
+
+<Step title="Hook with Matcher">
+```rust
+use praisonai::{HookRegistry, HookEvent, HookInput, HookResult};
+
+let mut registry = HookRegistry::new();
+
+// Only match file-related tools
+registry.add_hook_with_matcher(
+    HookEvent::BeforeTool,
+    "file_*",  // Glob pattern
+    |input: &HookInput| {
+        println!("File operation: {:?}", input.tool_name);
         HookResult::allow()
     }
-}
+);
 ```
 </Step>
 </Steps>
@@ -225,17 +227,54 @@ pub enum HookDecision {
 
 ---
 
-## Hook Trait
+## HookDefinition
+
+Define individual hooks with functions and metadata.
 
 ```rust
-#[async_trait]
-pub trait Hook: Send + Sync {
-    fn name(&self) -> &str;
-    fn events(&self) -> Vec<HookEvent>;
-    async fn run(&self, input: &HookInput) -> HookResult;
-    fn priority(&self) -> i32 { 0 }  // default
+pub struct HookDefinition {
+    pub id: String,
+    pub event: HookEvent,
+    pub matcher: Option<String>,
+    pub func: HookFn,
+    pub enabled: bool,
+    pub name: Option<String>,
 }
 ```
+
+### Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new(event, func)` | `fn new(HookEvent, impl Fn(&HookInput) -> HookResult) -> Self` | Create definition |
+| `with_matcher(pattern)` | `fn with_matcher(self, impl Into<String>) -> Self` | Set matcher pattern |
+| `with_name(name)` | `fn with_name(self, impl Into<String>) -> Self` | Set name |
+| `matches(target)` | `fn matches(&self, &str) -> bool` | Check if matches target |
+| `execute(input)` | `fn execute(&self, &HookInput) -> HookResult` | Execute hook |
+
+---
+
+## HookRegistry
+
+Manages a collection of hooks.
+
+```rust
+pub struct HookRegistry {
+    hooks: HashMap<HookEvent, Vec<HookDefinition>>,
+}
+```
+
+### Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new()` | `fn new() -> Self` | Create empty registry |
+| `add_hook(event, func)` | `fn add_hook(&mut self, HookEvent, impl Fn) -> &mut Self` | Add a hook |
+| `add_hook_with_matcher(event, matcher, func)` | `fn add_hook_with_matcher(&mut self, HookEvent, impl Into<String>, impl Fn) -> &mut Self` | Add hook with matcher |
+| `add_definition(hook)` | `fn add_definition(&mut self, HookDefinition) -> &mut Self` | Add hook definition |
+| `remove_hook(id)` | `fn remove_hook(&mut self, &str) -> bool` | Remove hook by ID |
+| `enable_hook(id)` | `fn enable_hook(&mut self, &str) -> bool` | Enable hook |
+| `disable_hook(id)` | `fn disable_hook(&mut self, &str) -> bool` | Disable hook |
 
 ---
 
@@ -244,31 +283,24 @@ pub trait Hook: Send + Sync {
 ### Rate Limiter Hook
 
 ```rust
-use praisonai::{Hook, HookEvent, HookInput, HookResult, async_trait};
+use praisonai::{HookRegistry, HookEvent, HookInput, HookResult};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-struct RateLimiter {
-    count: AtomicUsize,
-    max_calls: usize,
-}
+let counter = Arc::new(AtomicUsize::new(0));
+let max_calls = 100;
 
-#[async_trait]
-impl Hook for RateLimiter {
-    fn name(&self) -> &str { "rate_limiter" }
-    
-    fn events(&self) -> Vec<HookEvent> {
-        vec![HookEvent::BeforeTool]
+let mut registry = HookRegistry::new();
+
+let counter_clone = counter.clone();
+registry.add_hook(HookEvent::BeforeTool, move |_input: &HookInput| {
+    let count = counter_clone.fetch_add(1, Ordering::SeqCst);
+    if count >= max_calls {
+        HookResult::deny("Rate limit exceeded")
+    } else {
+        HookResult::allow()
     }
-    
-    async fn run(&self, _input: &HookInput) -> HookResult {
-        let count = self.count.fetch_add(1, Ordering::SeqCst);
-        if count >= self.max_calls {
-            HookResult::deny("Rate limit exceeded")
-        } else {
-            HookResult::allow()
-        }
-    }
-}
+});
 ```
 
 ---
