@@ -15,7 +15,10 @@ Before creating any documentation page:
 3. **Find the dataclass/config class** - Look in `praisonaiagents/config/feature_configs.py`
 4. **Check for related existing docs** - Avoid duplication, ensure consistency
 5. **Verify imports** - Confirm exact import paths from the SDK
-6. The files you create are not SDK Focused. Its user focused. We have a dedicated auto Generated SDK Document section, so dont need to worry about detailed SDK Focused document. NEed it to be user friendly , non developers and beginners should understand
+6. The files you create are not SDK Focused. Its user focused. We have a dedicated auto Generated SDK Document section, so dont need to worry about detailed SDK Focused document. Need it to be user friendly , non developers and beginners should understand
+7. Progressive discloure of Features
+8. People who go through the documentation should make them feel like only few lines of code and it can do the task
+9. Documentation need to be agent centric. Top of the document should always start with Agent Centric code example. Features are there, but how to implement from Agent perspective, that need to be addressed. 
 
 ### 1.2 SDK-First Approach
 
