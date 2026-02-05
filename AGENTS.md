@@ -18,7 +18,8 @@ Before creating any documentation page:
 6. The files you create are not SDK Focused. Its user focused. We have a dedicated auto Generated SDK Document section, so dont need to worry about detailed SDK Focused document. Need it to be user friendly , non developers and beginners should understand
 7. Progressive discloure of Features
 8. People who go through the documentation should make them feel like only few lines of code and it can do the task
-9. Documentation need to be agent centric. Top of the document should always start with Agent Centric code example. Features are there, but how to implement from Agent perspective, that need to be addressed. 
+9. Documentation need to be agent centric. Top of the document should always start with Agent Centric code example. Features are there, but how to implement from Agent perspective, that need to be addressed.
+10. Include user interaction flow - show how users will interact with the feature in real scenarios 
 
 ### 1.2 SDK-First Approach
 
@@ -391,20 +392,34 @@ Instead, just show the content directly.
 
 ## 7. Configuration Documentation Pattern
 
-### 7.1 Three-Tier Pattern
+### 7.1 Precedence Ladder Pattern
 
-Every feature supports three usage patterns. Document all three:
+Features support multiple configuration levels. Document each level based on the feature's supported options:
+
+**Precedence Ladder:** `Instance > Config > Array > Dict > String > Bool > Default`
 
 ```python
-# Tier 1: Boolean (simplest)
+# Level 1: Bool (simplest)
 agent = Agent(feature=True)
 
-# Tier 2: Dict (intermediate)
-agent = Agent(feature={"option": "value"})
+# Level 2: String
+agent = Agent(feature="option_name")
 
-# Tier 3: Config class (full control)
+# Level 3: Dict
+agent = Agent(feature={"option": "value", "enabled": True})
+
+# Level 4: Array
+agent = Agent(feature=["option1", "option2"])
+
+# Level 5: Config class
 agent = Agent(feature=FeatureConfig(option="value"))
+
+# Level 6: Instance (full control)
+feature_instance = Feature(option="value")
+agent = Agent(feature=feature_instance)
 ```
+
+Document each level the feature supports - not all features support all levels.
 
 ### 7.2 SDK Config Extraction
 
