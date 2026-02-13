@@ -283,6 +283,8 @@ config = BotConfig(
     allowed_channels=[],            # Allowed channel IDs
     reply_in_thread=False,          # Reply in threads (default: inline)
     thread_threshold=500,           # Auto-thread if response > N chars (0 = disabled)
+    group_policy="mention_only",    # Group chat policy: respond_all, mention_only, command_only
+    auto_approve_tools=False,       # Auto-approve tool executions (skip confirmation)
 )
 ```
 
@@ -299,12 +301,24 @@ config = BotConfig(
 | `timeout` | `int` | `30` | Request timeout |
 | `reply_in_thread` | `bool` | `False` | Always reply in threads |
 | `thread_threshold` | `int` | `500` | Auto-thread responses longer than N chars (0 = disabled) |
+| `group_policy` | `str` | `"mention_only"` | Group chat behavior: `respond_all`, `mention_only`, or `command_only` |
+| `default_tools` | `list` | `["execute_command", ...]` | Default tools enabled for all bots |
+| `auto_approve_tools` | `bool` | `False` | Skip tool execution confirmation (for trusted environments) |
+| `retry_attempts` | `int` | `3` | Number of retry attempts for failed operations |
+| `polling_interval` | `float` | `1.0` | Interval for polling mode (seconds) |
 
 <Note>
 **Reply behavior:**
 - **Default**: Inline replies in the channel
 - **Auto-thread**: Responses > 500 chars are automatically threaded
 - **Force thread**: Set `reply_in_thread=True` to always use threads
+</Note>
+
+<Note>
+**Group policy:**
+- `mention_only` — Bot only responds when @mentioned (default, safest)
+- `respond_all` — Bot responds to every message in the group
+- `command_only` — Bot only responds to `/commands`
 </Note>
 
 ---
@@ -722,16 +736,23 @@ Override with `--creds-dir` or `WHATSAPP_CREDS_DIR` environment variable.
 
 ## Bot Commands
 
-Built-in commands users can send:
+Built-in commands available on all platforms:
 
 | Command | Description |
 |---------|-------------|
-| `/help` | Show available commands |
-| `/status` | Check bot status |
-| `/reset` | Reset conversation |
-| `/model` | Show current model |
+| `/help` | Show available commands and agent info |
+| `/status` | Show agent name, model, platform, and uptime |
+| `/new` | Reset conversation session — starts a fresh chat |
 
-Custom commands are automatically created from agent tools.
+You can register custom commands programmatically:
+
+```python
+bot.register_command("ping", my_handler, description="Check latency")
+```
+
+<Tip>
+See [Bot Chat Commands](/features/bot-commands) for full details on custom command registration and platform-specific behavior.
+</Tip>
 
 ---
 
@@ -1282,9 +1303,334 @@ agents:
 
 ---
 
+## Inbound Message Debounce
+
+When users send multiple rapid messages (e.g. "hey" → "can you" → "search for AI news"), debounce coalesces them into a single agent call — saving tokens and preventing duplicate responses.
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User
+    participant D as ⏱️ Debouncer
+    participant A as 🧠 Agent
+
+    U->>D: "hey"
+    Note over D: Start 1500ms timer
+    U->>D: "can you"
+    Note over D: Reset timer
+    U->>D: "search for AI news"
+    Note over D: Reset timer
+    Note over D: Timer expires ✓
+    D->>A: "hey\ncan you\nsearch for AI news"
+    A->>U: 📰 Here are the latest AI news...
+```
+
+<Tabs>
+  <Tab title="Python">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.bots import BotConfig
+from praisonai.bots import Bot
+
+agent = Agent(name="assistant", instructions="Be helpful")
+config = BotConfig(debounce_ms=1500)  # 1.5s window
+
+bot = Bot("telegram", agent=agent, config=config)
+bot.run()
+```
+  </Tab>
+  <Tab title="YAML">
+```yaml
+agent:
+  name: assistant
+  instructions: Be helpful
+
+platforms:
+  telegram:
+    token: ${TELEGRAM_BOT_TOKEN}
+    debounce_ms: 1500
+```
+  </Tab>
+</Tabs>
+
+<Tip>
+  Set `debounce_ms: 0` (default) to disable debouncing for real-time response bots.
+  Recommended: **1000–2000ms** for conversational bots.
+</Tip>
+
+---
+
+## Smart Message Chunking
+
+Long agent responses are split at **paragraph boundaries** while preserving code fences — no more broken code blocks mid-message.
+
+```mermaid
+graph TD
+    R["🧠 Agent Response<br/>(8000 chars)"] --> C{Chunker}
+    C -->|"Paragraph 1"| M1["📨 Message 1<br/>Introduction"]
+    C -->|"Code Block"| M2["📨 Message 2<br/>```python...```"]
+    C -->|"Paragraph 3"| M3["📨 Message 3<br/>Conclusion"]
+
+    style R fill:#8B0000,color:#fff
+    style C fill:#189AB4,color:#fff
+    style M1 fill:#189AB4,color:#fff
+    style M2 fill:#189AB4,color:#fff
+    style M3 fill:#189AB4,color:#fff
+```
+
+<AccordionGroup>
+  <Accordion title="How splitting works">
+    <Steps>
+      <Step title="Paragraph boundaries">
+        Split at blank lines (`\n\n`) first — keeps ideas together.
+      </Step>
+      <Step title="Sentence boundaries">
+        If a paragraph is still too long, split at sentence endings (`. `).
+      </Step>
+      <Step title="Hard split">
+        Last resort: character-level split for very long single lines.
+      </Step>
+    </Steps>
+  </Accordion>
+  <Accordion title="Code fence protection">
+    Code blocks wrapped in triple backticks are **never split**, even if they exceed `max_message_length`. This ensures your users always see complete, copyable code.
+  </Accordion>
+</AccordionGroup>
+
+<Info>
+  Smart chunking is enabled **automatically** for all bot adapters. No configuration needed.
+  Override `max_message_length` in `BotConfig` to change the split threshold (default: 4096).
+</Info>
+
+---
+
+## Session History
+
+Bot agents automatically remember the last 20 messages per conversation — no extra dependencies required.
+
+```mermaid
+graph LR
+    U1["👤 User: What is Python?"] --> A1["🧠 Agent: Python is..."]
+    A1 --> U2["👤 User: Show me an example"]
+    U2 --> A2["🧠 Agent: Sure! Based on<br/>our Python discussion..."]
+
+    style U1 fill:#8B0000,color:#fff
+    style A1 fill:#189AB4,color:#fff
+    style U2 fill:#8B0000,color:#fff
+    style A2 fill:#189AB4,color:#fff
+```
+
+<Tabs>
+  <Tab title="Automatic (default)">
+```python
+from praisonaiagents import Agent
+from praisonai.bots import Bot
+
+# History is injected automatically — zero config needed
+agent = Agent(name="assistant", instructions="Be helpful")
+bot = Bot("telegram", agent=agent)
+bot.run()
+# Agent now remembers last 20 messages per session
+```
+  </Tab>
+  <Tab title="Custom memory">
+```python
+from praisonaiagents import Agent
+from praisonai.bots import Bot
+
+# Override with your own memory config
+agent = Agent(
+    name="assistant",
+    instructions="Be helpful",
+    memory={"history": True, "history_limit": 50}  # Remember more
+)
+bot = Bot("telegram", agent=agent)
+bot.run()
+```
+  </Tab>
+</Tabs>
+
+<Warning>
+  Setting `memory=True` (full memory with ChromaDB) requires `pip install praisonaiagents[memory]`.
+  The default `history=True` injection uses **zero extra dependencies**.
+</Warning>
+
+---
+
+## Ack Reactions
+
+Acknowledge inbound messages with an emoji reaction (e.g. ⏳) so users know the bot is processing, then swap to a done emoji (e.g. ✅) when the response is sent.
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User
+    participant B as 🤖 Bot
+    participant A as 🧠 Agent
+
+    U->>B: "Summarize this article"
+    B->>U: React ⏳
+    B->>A: Process message
+    A->>B: Response ready
+    B->>U: Send response
+    B->>U: Remove ⏳, React ✅
+```
+
+<Tabs>
+  <Tab title="Python">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.bots import BotConfig
+from praisonai.bots import Bot
+
+agent = Agent(name="assistant", instructions="Be helpful")
+config = BotConfig(ack_emoji="⏳", done_emoji="✅")
+
+bot = Bot("telegram", agent=agent, config=config)
+bot.run()
+```
+  </Tab>
+  <Tab title="YAML">
+```yaml
+agent:
+  name: assistant
+  instructions: Be helpful
+
+platforms:
+  telegram:
+    token: ${TELEGRAM_BOT_TOKEN}
+    ack_emoji: "⏳"
+    done_emoji: "✅"
+```
+  </Tab>
+</Tabs>
+
+<Tip>
+  Set `ack_emoji: ""` (default) to disable ack reactions.
+  Currently wired for Telegram (which supports native message reactions).
+</Tip>
+
+---
+
+## Session Reaper
+
+Automatically prune stale sessions to free memory on long-running bots. Sessions idle longer than `session_ttl` seconds are reaped.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.bots import BotConfig
+from praisonai.bots import Bot
+
+agent = Agent(name="assistant", instructions="Be helpful")
+config = BotConfig(session_ttl=86400)  # Reap sessions older than 24h
+
+bot = Bot("telegram", agent=agent, config=config)
+bot.run()
+```
+
+<Info>
+  Set `session_ttl: 0` (default) to disable automatic reaping.
+  You can also call `bot._session.reap_stale(max_age_seconds)` manually.
+</Info>
+
+---
+
+## YAML Configuration
+
+Deploy bots entirely from YAML — including agent memory, tools, roles, and multi-platform config.
+
+<Tabs>
+  <Tab title="Full YAML">
+```yaml
+agent:
+  name: Research Bot
+  role: AI Research Assistant
+  goal: Help users find and understand AI research
+  instructions: |
+    You are a research assistant that helps users
+    find and understand the latest AI research papers.
+  llm: gpt-4o-mini
+  memory:
+    history: true
+    history_limit: 30
+  tools:
+    - search_web
+
+platforms:
+  telegram:
+    token: ${TELEGRAM_BOT_TOKEN}
+    debounce_ms: 1500
+  discord:
+    token: ${DISCORD_BOT_TOKEN}
+  slack:
+    token: ${SLACK_BOT_TOKEN}
+```
+  </Tab>
+  <Tab title="Python loader">
+```python
+from praisonai.bots import BotOS
+
+botos = BotOS.from_config("bot.yaml")
+botos.run()  # Starts all platforms concurrently
+```
+  </Tab>
+</Tabs>
+
+<AccordionGroup>
+  <Accordion title="Supported agent fields">
+    | Field | Type | Description |
+    |-------|------|-------------|
+    | `name` | string | Agent display name |
+    | `role` | string | Role/job title |
+    | `goal` | string | Primary objective |
+    | `backstory` | string | Background context |
+    | `instructions` | string | Direct instructions |
+    | `llm` | string | Model name (`gpt-4o-mini`, `claude-3-sonnet`) |
+    | `memory` | bool/dict | Memory config (`true` or `{history: true}`) |
+    | `tools` | list | Tool names from `praisonaiagents.tools` |
+    | `knowledge` | list | Knowledge sources |
+    | `guardrail` | string | Output validation |
+  </Accordion>
+  <Accordion title="Environment variable syntax">
+    Use `${ENV_VAR}` in YAML values — resolved at load time.
+    ```yaml
+    platforms:
+      telegram:
+        token: ${TELEGRAM_BOT_TOKEN}
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Tool Approval via Messaging
+
+When your bot agent uses dangerous tools (e.g. `execute_command`), you can route approval requests to Slack:
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import Bot, SlackApproval
+
+agent = Agent(
+    name="assistant",
+    instructions="You are a helpful assistant.",
+    approval=SlackApproval(channel="#approvals")  # Approvals go to Slack
+)
+
+bot = Bot("telegram", agent=agent)  # Users talk via Telegram
+bot.run()
+```
+
+<Info>
+  See [Approval Protocol](/features/approval-protocol#slack-approval) for full configuration options.
+</Info>
+
+---
+
 ## Related
 
 <CardGroup cols={2}>
+  <Card title="Approval Protocol" icon="shield-check" href="/features/approval-protocol">
+    Tool execution approval system
+  </Card>
   <Card title="Gateway" icon="tower-broadcast" href="/features/gateway">
     Multi-agent coordination
   </Card>
