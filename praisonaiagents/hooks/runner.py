@@ -70,7 +70,7 @@ class HookRunner:
             default_timeout: Default timeout for hooks
             cwd: Working directory for command hooks
         """
-        self._registry = registry or HookRegistry()
+        self._registry = registry if registry is not None else HookRegistry()
         self._default_timeout = default_timeout
         self._cwd = cwd or os.getcwd()
     
@@ -142,12 +142,19 @@ class HookRunner:
         """
         try:
             loop = asyncio.get_running_loop()
-            # If we're in an async context, create a task
-            future = asyncio.ensure_future(self.execute(event, input_data, target))
-            return loop.run_until_complete(future)
         except RuntimeError:
-            # No event loop running, create one
-            return asyncio.run(self.execute(event, input_data, target))
+            loop = None
+
+        if loop is not None and loop.is_running():
+            # Already inside a running async loop — cannot use run_until_complete.
+            # Schedule as fire-and-forget task to avoid leaking unawaited coroutines.
+            # Callers that need results in async context should use
+            # ``await runner.execute(...)`` directly.
+            loop.create_task(self.execute(event, input_data, target))
+            return []
+
+        # No running loop — safe to create one
+        return asyncio.run(self.execute(event, input_data, target))
     
     async def _execute_parallel(
         self,

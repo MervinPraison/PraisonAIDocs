@@ -286,6 +286,76 @@ class BotChannelProtocol(Protocol):
         ...
 
 
+@dataclass
+class ProbeResult:
+    """Result of a channel connectivity probe.
+    
+    Attributes:
+        ok: Whether the probe succeeded
+        platform: Platform name
+        elapsed_ms: Time taken in milliseconds
+        bot_username: Bot's username (if available)
+        error: Error message (if probe failed)
+        details: Additional platform-specific details
+    """
+    
+    ok: bool
+    platform: str = ""
+    elapsed_ms: float = 0.0
+    bot_username: Optional[str] = None
+    error: Optional[str] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "ok": self.ok,
+            "platform": self.platform,
+            "elapsed_ms": self.elapsed_ms,
+            "bot_username": self.bot_username,
+            "error": self.error,
+            "details": self.details,
+        }
+
+
+@dataclass
+class HealthResult:
+    """Detailed health status of a bot.
+    
+    Attributes:
+        ok: Overall health status
+        platform: Platform name
+        is_running: Whether the bot is actively running
+        uptime_seconds: Seconds since bot started (None if not running)
+        probe: Latest probe result (None if not probed)
+        sessions: Number of active sessions
+        error: Error message (if unhealthy)
+        details: Additional platform-specific health details
+    """
+    
+    ok: bool
+    platform: str = ""
+    is_running: bool = False
+    uptime_seconds: Optional[float] = None
+    probe: Optional[ProbeResult] = None
+    sessions: int = 0
+    error: Optional[str] = None
+    details: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "ok": self.ok,
+            "platform": self.platform,
+            "is_running": self.is_running,
+            "uptime_seconds": self.uptime_seconds,
+            "probe": self.probe.to_dict() if self.probe else None,
+            "sessions": self.sessions,
+            "error": self.error,
+            "details": self.details,
+        }
+
+
 @runtime_checkable
 class BotProtocol(Protocol):
     """Protocol for messaging bot implementations.
@@ -451,6 +521,25 @@ class BotProtocol(Protocol):
             Channel information or None if not found
         """
         ...
+    
+    # Health & diagnostics
+    async def probe(self) -> ProbeResult:
+        """Test channel connectivity without starting the bot.
+        
+        Verifies the bot token is valid and the platform API is reachable.
+        
+        Returns:
+            ProbeResult with connectivity status and bot info.
+        """
+        ...
+    
+    async def health(self) -> HealthResult:
+        """Get detailed health status of the running bot.
+        
+        Returns:
+            HealthResult with running state, uptime, probe, and session count.
+        """
+        ...
 
 
 @dataclass
@@ -520,5 +609,79 @@ class ChatCommandProtocol(Protocol):
         
         Returns:
             List of ChatCommandInfo for all registered commands
+        """
+        ...
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BotOS Protocol — multi-platform bot orchestration
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+@runtime_checkable
+class BotOSProtocol(Protocol):
+    """Protocol for BotOS — multi-platform bot orchestrator.
+
+    BotOS manages multiple Bot instances across different messaging
+    platforms (Telegram, Discord, Slack, WhatsApp, etc.) with a single
+    unified lifecycle.
+
+    Hierarchy::
+
+        BotOS  (multi-platform orchestrator)
+        └── Bot  (single platform)
+            └── Agent / AgentTeam / AgentFlow  (AI brain)
+
+    Implementations live in the ``praisonai`` wrapper package.
+    """
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the orchestrator is currently running."""
+        ...
+
+    async def start(self) -> None:
+        """Start all registered bots concurrently."""
+        ...
+
+    async def stop(self) -> None:
+        """Gracefully stop all running bots."""
+        ...
+
+    def add_bot(self, bot: Any) -> None:
+        """Register a Bot instance for orchestration.
+
+        Args:
+            bot: A Bot instance (satisfies BotProtocol).
+        """
+        ...
+
+    def list_bots(self) -> List[str]:
+        """List platform names of all registered bots.
+
+        Returns:
+            List of platform name strings.
+        """
+        ...
+
+    def remove_bot(self, platform: str) -> bool:
+        """Remove a registered bot by platform name.
+
+        Args:
+            platform: Platform identifier to remove.
+
+        Returns:
+            True if removed, False if not found.
+        """
+        ...
+
+    def get_bot(self, platform: str) -> Optional[Any]:
+        """Get a registered bot by platform name.
+
+        Args:
+            platform: Platform identifier (e.g. "telegram").
+
+        Returns:
+            The Bot instance, or None if not found.
         """
         ...

@@ -411,13 +411,13 @@ class Agent:
         api_key: Optional[str] = None,  # Kept separate (connection/auth)
         # Tools
         tools: Optional[List[Any]] = None,
-        allow_delegation: bool = False,
-        allow_code_execution: Optional[bool] = False,
-        code_execution_mode: Literal["safe", "unsafe"] = "safe",
+        allow_delegation: bool = False,  # Deprecated: use handoffs= instead
+        allow_code_execution: Optional[bool] = False,  # Deprecated: use execution=ExecutionConfig(code_execution=True)
+        code_execution_mode: Literal["safe", "unsafe"] = "safe",  # Deprecated: use execution=ExecutionConfig(code_mode="safe")
         handoffs: Optional[List[Union['Agent', 'Handoff']]] = None,
-        # Session management
-        auto_save: Optional[str] = None,
-        rate_limiter: Optional[Any] = None,
+        # Session management (deprecated standalone params - use config objects)
+        auto_save: Optional[str] = None,  # Deprecated: use memory=MemoryConfig(auto_save="name")
+        rate_limiter: Optional[Any] = None,  # Deprecated: use execution=ExecutionConfig(rate_limiter=obj)
         # ============================================================
         # CONSOLIDATED FEATURE PARAMS (agent-centric API)
         # Each follows: False=disabled, True=defaults, Config=custom
@@ -430,13 +430,14 @@ class Agent:
         web: Optional[Union[bool, Any]] = None,  # Union[bool, WebConfig]
         context: Optional[Union[bool, Any]] = None,  # Union[bool, ManagerConfig, ContextManager] - None=smart default
         autonomy: Optional[Union[bool, Dict[str, Any], Any]] = None,  # Union[bool, dict, AutonomyConfig]
-        verification_hooks: Optional[List[Any]] = None,  # List of VerificationHook instances
+        verification_hooks: Optional[List[Any]] = None,  # Deprecated: use autonomy=AutonomyConfig(verification_hooks=[...])
         output: Optional[Union[str, Any]] = None,  # Union[str preset, OutputConfig]
         execution: Optional[Union[str, Any]] = None,  # Union[str preset, ExecutionConfig]
         templates: Optional[Any] = None,  # TemplateConfig
         caching: Optional[Union[bool, Any]] = None,  # Union[bool, CachingConfig]
         hooks: Optional[Union[List[Any], Any]] = None,  # Union[list, HooksConfig]
         skills: Optional[Union[List[str], Any]] = None,  # Union[list, SkillsConfig]
+        approval: Optional[Union[bool, Any]] = None,  # Union[bool, ApprovalProtocol backend]
     ):
         """Initialize an Agent instance.
 
@@ -452,12 +453,12 @@ class Agent:
             base_url: Custom LLM endpoint URL (e.g., for Ollama). Kept separate for auth.
             api_key: API key for LLM provider. Kept separate for auth.
             tools: List of tools, functions, callables, or MCP instances.
-            allow_delegation: Allow task delegation to other agents. Defaults to False.
-            allow_code_execution: Enable code execution during tasks. Defaults to False.
-            code_execution_mode: "safe" (restricted) or "unsafe" (full access). Defaults to "safe".
+            allow_delegation: **Deprecated** — use ``handoffs=`` instead.
+            allow_code_execution: **Deprecated** — use ``execution=ExecutionConfig(code_execution=True)``.
+            code_execution_mode: **Deprecated** — use ``execution=ExecutionConfig(code_mode="safe")``.
             handoffs: List of Agent or Handoff objects for agent-to-agent collaboration.
-            auto_save: Session name for automatic session saving.
-            rate_limiter: Rate limiter instance for API call throttling.
+            auto_save: **Deprecated** — use ``memory=MemoryConfig(auto_save="name")``.
+            rate_limiter: **Deprecated** — use ``execution=ExecutionConfig(rate_limiter=obj)``.
             memory: Memory system configuration. Accepts:
                 - bool: True enables defaults, False disables
                 - MemoryConfig: Custom configuration
@@ -486,7 +487,8 @@ class Agent:
                 - bool: True enables with defaults
                 - Dict: Configuration dict
                 - AutonomyConfig: Custom configuration
-            verification_hooks: List of VerificationHook instances for output verification.
+            verification_hooks: **Deprecated** — use ``autonomy=AutonomyConfig(verification_hooks=[...])``.
+                Still works for backward compatibility.
             output: Output configuration. Accepts:
                 - str: Preset name ("silent", "actions", "verbose", "json", "stream")
                 - OutputConfig: Custom configuration
@@ -520,6 +522,11 @@ class Agent:
             - system_template, prompt_template, response_template → templates=
             - cache, prompt_caching → caching=
             - web_search, web_fetch → web=
+            - allow_delegation → handoffs=
+            - allow_code_execution, code_execution_mode → execution=
+            - auto_save → memory=MemoryConfig(auto_save=)
+            - rate_limiter → execution=ExecutionConfig(rate_limiter=)
+            - verification_hooks → autonomy=AutonomyConfig(verification_hooks=)
         """
         # Add check at start if memory is requested
         if memory is not None:
@@ -583,6 +590,48 @@ class Agent:
         if autonomy is None:
             # AutonomyConfig is in agent/autonomy.py - use dict for config defaults
             autonomy = apply_config_defaults("autonomy", autonomy, None)
+
+        # ============================================================
+        # DEPRECATION WARNINGS for params consolidated into configs
+        # Old params still work but emit warnings pointing to new API
+        # ============================================================
+        import warnings as _warnings
+        
+        if allow_delegation:
+            _warnings.warn(
+                "Parameter 'allow_delegation' is deprecated. Use 'handoffs=[other_agent]' instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+        if allow_code_execution:
+            _warnings.warn(
+                "Parameter 'allow_code_execution' is deprecated. "
+                "Use 'execution=ExecutionConfig(code_execution=True)' instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+        if code_execution_mode != "safe":
+            _warnings.warn(
+                "Parameter 'code_execution_mode' is deprecated. "
+                "Use 'execution=ExecutionConfig(code_mode=\"unsafe\")' instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+        if auto_save is not None:
+            _warnings.warn(
+                "Parameter 'auto_save' is deprecated. "
+                "Use 'memory=MemoryConfig(auto_save=\"name\")' instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+        if rate_limiter is not None:
+            _warnings.warn(
+                "Parameter 'rate_limiter' is deprecated. "
+                "Use 'execution=ExecutionConfig(rate_limiter=obj)' instead.",
+                DeprecationWarning, stacklevel=2,
+            )
+        if verification_hooks is not None:
+            _warnings.warn(
+                "Parameter 'verification_hooks' is deprecated. "
+                "Use 'autonomy=AutonomyConfig(verification_hooks=[...])' instead.",
+                DeprecationWarning, stacklevel=2,
+            )
 
         # ============================================================
         # CONSOLIDATED PARAMS EXTRACTION (agent-centric API)
@@ -730,6 +779,13 @@ class Agent:
             max_rpm = _exec_config.max_rpm
             max_execution_time = _exec_config.max_execution_time
             max_retry_limit = _exec_config.max_retry_limit
+            # Extract consolidated fields (config takes precedence over deprecated standalone params)
+            if _exec_config.rate_limiter is not None:
+                rate_limiter = _exec_config.rate_limiter
+            if _exec_config.code_execution:
+                allow_code_execution = True
+            if _exec_config.code_mode != "safe":
+                code_execution_mode = _exec_config.code_mode
         else:
             max_iter, max_rpm, max_execution_time, max_retry_limit = 20, None, None, 2
         
@@ -879,6 +935,9 @@ class Agent:
                 db = _memory_config.db
                 auto_memory = _memory_config.auto_memory
                 claude_memory = _memory_config.claude_memory
+                # Extract auto_save from MemoryConfig (takes precedence over standalone param)
+                if _memory_config.auto_save is not None:
+                    auto_save = _memory_config.auto_save
                 # Convert to internal format
                 backend = _memory_config.backend
                 if hasattr(backend, 'value'):
@@ -911,10 +970,23 @@ class Agent:
             if _memory_config.history:
                 _history_enabled = True
                 _history_limit = _memory_config.history_limit
+                # Use explicit session_id from MemoryConfig if provided
+                if _memory_config.session_id:
+                    _history_session_id = _memory_config.session_id
         
         # Use auto_save session if no explicit session and history is enabled
         if _history_enabled and _history_session_id is None and auto_save:
             _history_session_id = auto_save
+        
+        # Auto-generate session_id when history=True but no session_id set
+        # This ensures _init_session_store() can create the store
+        if _history_enabled and session_id is None and _history_session_id is not None:
+            session_id = _history_session_id
+        elif _history_enabled and session_id is None and _history_session_id is None:
+            import hashlib as _hl
+            _agent_hash = _hl.md5(name.encode()).hexdigest()[:8]
+            session_id = f"history_{_agent_hash}"
+            _history_session_id = session_id
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve KNOWLEDGE param - FAST PATH
@@ -1356,6 +1428,16 @@ Your Goal: {self.goal}
         self.max_guardrail_retries = max_guardrail_retries
         self._guardrail_fn = None
         self._setup_guardrail()
+        
+        # Initialize approval backend (agent-centric approval)
+        # True = AutoApproveBackend, False/None = registry fallback, object = custom backend
+        if approval is True:
+            from ..approval.backends import AutoApproveBackend
+            self._approval_backend = AutoApproveBackend()
+        elif approval is False or approval is None:
+            self._approval_backend = None
+        else:
+            self._approval_backend = approval
         
         # Cache for system prompts and formatted tools with lazy thread-safe lock
         self._system_prompt_cache = {}
@@ -1835,6 +1917,9 @@ Summary:"""
                 "auto_escalate": autonomy.auto_escalate,
             }
             config = autonomy
+            # Extract verification_hooks from AutonomyConfig if provided
+            if autonomy.verification_hooks and not verification_hooks:
+                self._verification_hooks = autonomy.verification_hooks
         else:
             self.autonomy_enabled = False
             self.autonomy_config = {}
@@ -2746,7 +2831,7 @@ Summary:"""
                 user_id=mem_user_id,
                 verbose=1 if getattr(self, 'verbose', False) else 0
             )
-        elif isinstance(memory, str) and memory in ("sqlite", "chromadb", "mem0", "mongodb"):
+        elif isinstance(memory, str) and memory in ("sqlite", "chromadb", "mem0", "mongodb", "redis", "postgres"):
             # Use full Memory class with specific provider
             try:
                 from ..memory.memory import Memory
@@ -2784,6 +2869,11 @@ Summary:"""
                     logging.warning("Full Memory class requires additional dependencies. Falling back to FileMemory.")
                     from ..memory.file_memory import FileMemory
                     self._memory_instance = FileMemory(user_id=mem_user_id)
+        elif isinstance(memory, str):
+            # Unknown string backend - fall back to FileMemory with warning
+            logging.warning(f"Unknown memory backend '{memory}'. Falling back to FileMemory.")
+            from ..memory.file_memory import FileMemory
+            self._memory_instance = FileMemory(user_id=mem_user_id)
         else:
             # Assume it's already a memory instance
             self._memory_instance = memory
@@ -3974,6 +4064,12 @@ Your Goal: {self.goal}"""
             execution_time_ms=(time.time() - start_time) * 1000
         )
         self._hook_runner.execute_sync(HookEvent.AFTER_AGENT, after_agent_input)
+        
+        # Auto-memory extraction (opt-in via MemoryConfig(auto_memory=True))
+        if response:
+            prompt_str = prompt if isinstance(prompt, str) else str(prompt)
+            self._process_auto_memory(prompt_str, str(response))
+        
         return response
 
     
@@ -4041,39 +4137,46 @@ Your Goal: {self.goal}"""
     def _execute_tool_impl(self, function_name, arguments):
         """Internal tool execution implementation."""
 
-        # Check if approval is required for this tool
-        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, get_approval_callback, is_env_auto_approve, is_yaml_approved
-        if is_approval_required(function_name):
-            # Skip approval if auto-approve env var is set or tool is YAML-approved
-            if is_env_auto_approve() or is_yaml_approved(function_name):
-                logging.debug(f"Tool {function_name} auto-approved (env={is_env_auto_approve()}, yaml={is_yaml_approved(function_name)})")
-                mark_approved(function_name)
+        # Check if approval is required for this tool (protocol-driven)
+        # Priority: self._approval_backend (agent param) > registry (global/per-agent)
+        from ..approval import get_approval_registry
+        try:
+            backend = getattr(self, '_approval_backend', None)
+            if backend is not None:
+                # Agent-level approval backend — bypass registry, call directly
+                from ..approval.protocols import ApprovalRequest
+                from ..approval.registry import DEFAULT_DANGEROUS_TOOLS
+                if function_name in DEFAULT_DANGEROUS_TOOLS:
+                    request = ApprovalRequest(
+                        tool_name=function_name,
+                        arguments=arguments,
+                        risk_level=DEFAULT_DANGEROUS_TOOLS.get(function_name, "medium"),
+                        agent_name=getattr(self, 'name', None),
+                    )
+                    if hasattr(backend, 'request_approval_sync'):
+                        decision = backend.request_approval_sync(request)
+                    else:
+                        import asyncio
+                        decision = asyncio.run(backend.request_approval(request))
+                else:
+                    from ..approval.protocols import ApprovalDecision
+                    decision = ApprovalDecision(approved=True, reason="No approval required")
             else:
-                risk_level = get_risk_level(function_name)
-                logging.debug(f"Tool {function_name} requires approval (risk level: {risk_level})")
-                
-                # Use global approval callback or default console callback
-                callback = get_approval_callback() or console_approval_callback
-                
-                try:
-                    decision = callback(function_name, arguments, risk_level)
-                    if not decision.approved:
-                        error_msg = f"Tool execution denied: {decision.reason}"
-                        logging.warning(error_msg)
-                        return {"error": error_msg, "approval_denied": True}
-                    
-                    # Mark as approved in context to prevent double approval in decorator
-                    mark_approved(function_name)
-                    
-                    # Use modified arguments if provided
-                    if decision.modified_args:
-                        arguments = decision.modified_args
-                        logging.info(f"Using modified arguments: {arguments}")
-                        
-                except Exception as e:
-                    error_msg = f"Error during approval process: {str(e)}"
-                    logging.error(error_msg)
-                    return {"error": error_msg, "approval_error": True}
+                # Fallback to global registry
+                decision = get_approval_registry().approve_sync(
+                    getattr(self, 'name', None), function_name, arguments,
+                )
+            if not decision.approved:
+                error_msg = f"Tool execution denied: {decision.reason}"
+                logging.warning(error_msg)
+                return {"error": error_msg, "approval_denied": True}
+            if decision.modified_args:
+                arguments = decision.modified_args
+                logging.info(f"Using modified arguments: {arguments}")
+        except Exception as e:
+            error_msg = f"Error during approval process: {str(e)}"
+            logging.error(error_msg)
+            return {"error": error_msg, "approval_error": True}
 
         # Special handling for MCP tools
         # Check if tools is an MCP instance with the requested function name
@@ -6416,6 +6519,36 @@ Write the complete compiled report:"""
         """
         pass
     
+    def _process_auto_memory(self, user_message: str, assistant_response: str):
+        """Process auto-memory extraction after agent response.
+        
+        Called after each agent response when auto_memory=True in MemoryConfig.
+        Uses AutoMemory to extract and store memorable content (names, preferences,
+        facts) from the conversation. No-op when auto_memory is disabled.
+        
+        Args:
+            user_message: The user's input message
+            assistant_response: The agent's response
+        """
+        if not self._auto_memory or not self._memory_instance:
+            return
+        
+        try:
+            from ..memory.auto_memory import AutoMemory
+            # Lazy-create AutoMemory wrapper on first use
+            if not hasattr(self, '_auto_memory_instance') or self._auto_memory_instance is None:
+                self._auto_memory_instance = AutoMemory(
+                    self._memory_instance,
+                    enabled=True,
+                    verbose=1 if getattr(self, 'verbose', False) else 0
+                )
+            self._auto_memory_instance.process_interaction(
+                user_message=str(user_message),
+                assistant_response=str(assistant_response),
+            )
+        except Exception as e:
+            logging.debug(f"Auto-memory extraction failed: {e}")
+
     def _auto_save_session(self):
         """Auto-save session if auto_save is enabled."""
         if not self.auto_save or not self._memory_instance:
@@ -6765,24 +6898,40 @@ Write the complete compiled report:"""
         try:
             logging.info(f"Executing async tool: {function_name} with arguments: {arguments}")
             
-            # Check if approval is required for this tool
-            from ..approval import is_approval_required, request_approval, is_env_auto_approve, is_yaml_approved, mark_approved
-            if is_approval_required(function_name):
-                # Skip approval if auto-approve env var is set or tool is YAML-approved
-                if is_env_auto_approve() or is_yaml_approved(function_name):
-                    logging.debug(f"Tool {function_name} auto-approved (env={is_env_auto_approve()}, yaml={is_yaml_approved(function_name)})")
-                    mark_approved(function_name)
+            # Check if approval is required for this tool (protocol-driven)
+            # Priority: self._approval_backend (agent param) > registry (global/per-agent)
+            from ..approval import get_approval_registry
+            try:
+                backend = getattr(self, '_approval_backend', None)
+                if backend is not None:
+                    from ..approval.protocols import ApprovalRequest
+                    from ..approval.registry import DEFAULT_DANGEROUS_TOOLS
+                    if function_name in DEFAULT_DANGEROUS_TOOLS:
+                        request = ApprovalRequest(
+                            tool_name=function_name,
+                            arguments=arguments,
+                            risk_level=DEFAULT_DANGEROUS_TOOLS.get(function_name, "medium"),
+                            agent_name=getattr(self, 'name', None),
+                        )
+                        decision = await backend.request_approval(request)
+                    else:
+                        from ..approval.protocols import ApprovalDecision
+                        decision = ApprovalDecision(approved=True, reason="No approval required")
                 else:
-                    decision = await request_approval(function_name, arguments)
-                    if not decision.approved:
-                        error_msg = f"Tool execution denied: {decision.reason}"
-                        logging.warning(error_msg)
-                        return {"error": error_msg, "approval_denied": True}
-                    
-                    # Use modified arguments if provided
-                    if decision.modified_args:
-                        arguments = decision.modified_args
-                        logging.info(f"Using modified arguments: {arguments}")
+                    decision = await get_approval_registry().approve_async(
+                        getattr(self, 'name', None), function_name, arguments,
+                    )
+                if not decision.approved:
+                    error_msg = f"Tool execution denied: {decision.reason}"
+                    logging.warning(error_msg)
+                    return {"error": error_msg, "approval_denied": True}
+                if decision.modified_args:
+                    arguments = decision.modified_args
+                    logging.info(f"Using modified arguments: {arguments}")
+            except Exception as e:
+                error_msg = f"Error during approval process: {str(e)}"
+                logging.error(error_msg)
+                return {"error": error_msg, "approval_error": True}
             
             # Try to find the function in the agent's tools list first
             func = None
