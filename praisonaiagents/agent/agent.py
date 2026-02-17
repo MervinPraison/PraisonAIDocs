@@ -1918,6 +1918,9 @@ Summary:"""
             self.autonomy_config = {}
             self._autonomy_trigger = None
             self._doom_loop_tracker = None
+            self._file_snapshot = None
+            self._snapshot_stack = []
+            self._redo_stack = []
             return
         
         self.autonomy_enabled = True
@@ -1942,6 +1945,9 @@ Summary:"""
             self.autonomy_config = {}
             self._autonomy_trigger = None
             self._doom_loop_tracker = None
+            self._file_snapshot = None
+            self._snapshot_stack = []
+            self._redo_stack = []
             return
         
         # Preserve ALL AutonomyConfig fields in the dict (G14 fix: no lossy extraction)
@@ -1954,6 +1960,8 @@ Summary:"""
             "observe": config.observe,
             "completion_promise": config.completion_promise,
             "clear_context": config.clear_context,
+            "track_changes": config.effective_track_changes,
+            "snapshot_dir": config.snapshot_dir,
         }
         # Also preserve any extra user-provided keys from dict input
         if isinstance(autonomy, dict):
@@ -1967,6 +1975,21 @@ Summary:"""
         self._autonomy_trigger = AutonomyTrigger()
         self._doom_loop_tracker = DoomLoopTracker(threshold=config.doom_loop_threshold)
         
+        # Initialize FileSnapshot for filesystem tracking (lazy import)
+        self._file_snapshot = None
+        self._snapshot_stack = []  # Stack of snapshot hashes for undo/redo
+        self._redo_stack = []  # Redo stack
+        if config.effective_track_changes:
+            try:
+                from ..snapshot import FileSnapshot
+                import os
+                self._file_snapshot = FileSnapshot(
+                    project_path=os.getcwd(),
+                    snapshot_dir=config.snapshot_dir,
+                )
+            except Exception as e:
+                logger.debug(f"FileSnapshot init failed (git may not be available): {e}")
+        
         # Wire ObservabilityHooks when observe=True (G-UNUSED-2 fix)
         if config.observe:
             from ..escalation.observability import ObservabilityHooks
@@ -1976,6 +1999,93 @@ Summary:"""
         
         # Wire level → approval bridge (G3 fix)
         self._bridge_autonomy_level(config.level)
+    
+    # ================================================================
+    # Filesystem tracking convenience methods (powered by FileSnapshot)
+    # ================================================================
+    
+    def undo(self) -> bool:
+        """Undo the last set of file changes.
+        
+        Restores files to the state before the last autonomous iteration.
+        Requires ``autonomy=AutonomyConfig(track_changes=True)``.
+        
+        Returns:
+            True if undo was successful, False if nothing to undo.
+            
+        Example::
+        
+            agent = Agent(autonomy="full_auto")
+            result = agent.start("Refactor utils.py")
+            agent.undo()  # Restore original files
+        """
+        if self._file_snapshot is None or not self._snapshot_stack:
+            return False
+        try:
+            target_hash = self._snapshot_stack.pop()
+            # Get current hash before restore (for redo)
+            current_hash = self._file_snapshot.get_current_hash()
+            if current_hash:
+                self._redo_stack.append(current_hash)
+            self._file_snapshot.restore(target_hash)
+            return True
+        except Exception as e:
+            logger.debug(f"Undo failed: {e}")
+            return False
+    
+    def redo(self) -> bool:
+        """Redo a previously undone set of file changes.
+        
+        Re-applies file changes that were reverted by :meth:`undo`.
+        
+        Returns:
+            True if redo was successful, False if nothing to redo.
+        """
+        if self._file_snapshot is None or not self._redo_stack:
+            return False
+        try:
+            target_hash = self._redo_stack.pop()
+            current_hash = self._file_snapshot.get_current_hash()
+            if current_hash:
+                self._snapshot_stack.append(current_hash)
+            self._file_snapshot.restore(target_hash)
+            return True
+        except Exception as e:
+            logger.debug(f"Redo failed: {e}")
+            return False
+    
+    def diff(self, from_hash: Optional[str] = None):
+        """Get file diffs from autonomous execution.
+        
+        Returns a list of :class:`FileDiff` objects showing what files
+        were modified, with additions/deletions counts.
+        
+        Args:
+            from_hash: Base commit hash to diff from. If None, uses the
+                first snapshot (pre-autonomous state).
+        
+        Returns:
+            List of FileDiff objects, or empty list if tracking not enabled.
+            
+        Example::
+        
+            agent = Agent(autonomy="full_auto")
+            result = agent.start("Refactor utils.py")
+            for d in agent.diff():
+                print(f"{d.status}: {d.path} (+{d.additions}/-{d.deletions})")
+        """
+        if self._file_snapshot is None:
+            return []
+        try:
+            base = from_hash
+            if base is None and self._snapshot_stack:
+                base = self._snapshot_stack[0]
+            if base is None:
+                return []
+            return self._file_snapshot.diff(base)
+        except Exception as e:
+            logger.debug(f"Diff failed: {e}")
+            return []
     
     def analyze_prompt(self, prompt: str) -> set:
         """Analyze prompt for autonomy signals.
@@ -2032,6 +2142,64 @@ Summary:"""
         """Reset doom loop tracking."""
         if self._doom_loop_tracker is not None:
             self._doom_loop_tracker.reset()
+    
+    @staticmethod
+    def _is_completion_signal(response_text: str) -> bool:
+        """Check if response contains a completion signal using word boundaries.
+        
+        Uses regex word boundaries to avoid false positives like
+        'abandoned' matching 'done' or 'unfinished' matching 'finished'.
+        
+        Args:
+            response_text: The agent response to check
+            
+        Returns:
+            True if a completion signal is detected
+        """
+        import re
+        response_lower = response_text.lower()
+        # Negation patterns that should NOT be treated as completion
+        _NEGATION_RE = re.compile(
+            r'\b(?:not|never|no longer|hardly|barely|isn\'t|aren\'t|wasn\'t|weren\'t|hasn\'t|haven\'t|hadn\'t|won\'t|wouldn\'t|can\'t|couldn\'t|shouldn\'t|don\'t|doesn\'t|didn\'t)\b'
+            r'.{0,20}'   # up to 20 chars between negation and keyword
+        )
+        # Word-boundary patterns to avoid substring false positives
+        _COMPLETION_PATTERNS = [
+            (re.compile(r'\btask\s+completed?\b'), False),         # no negation check needed
+            (re.compile(r'\bcompleted\s+successfully\b'), False),
+            (re.compile(r'\ball\s+done\b'), False),
+            (re.compile(r'\bdone\b'), True),          # 'done' needs negation check
+            (re.compile(r'\bfinished\b'), True),      # 'finished' needs negation check
+        ]
+        for pattern, needs_negation_check in _COMPLETION_PATTERNS:
+            match = pattern.search(response_lower)
+            if match:
+                if needs_negation_check:
+                    # Check if a negation word precedes the match within 30 chars
+                    start = max(0, match.start() - 30)
+                    prefix = response_lower[start:match.start()]
+                    if _NEGATION_RE.search(prefix):
+                        continue  # Skip — negated completion
+                    # Also check "not X yet" pattern
+                    end = min(len(response_lower), match.end() + 10)
+                    suffix = response_lower[match.end():end]
+                    if 'yet' in suffix:
+                        neg_prefix = response_lower[max(0, match.start() - 15):match.start()]
+                        if 'not' in neg_prefix:
+                            continue
+                return True
+        return False
+    
+    def _get_doom_recovery(self) -> str:
+        """Get doom loop recovery action from tracker.
+        
+        Returns:
+            Recovery action string: continue, retry_different, escalate_model,
+            request_help, or abort
+        """
+        if self._doom_loop_tracker is None:
+            return "continue"
+        return self._doom_loop_tracker.get_recovery_action()
     
     def _bridge_autonomy_level(self, level: str) -> None:
         """Bridge autonomy level to per-agent approval backend (G3/G-BRIDGE-1 fix).
@@ -2101,6 +2269,15 @@ Summary:"""
                 "Create agent with autonomy=True or autonomy={...}"
             )
         
+        # Take initial snapshot before autonomous execution starts
+        if self._file_snapshot is not None:
+            try:
+                snap_info = self._file_snapshot.track(message="pre-autonomous")
+                self._snapshot_stack.append(snap_info.commit_hash)
+                self._redo_stack.clear()
+            except Exception as e:
+                logger.debug(f"Pre-autonomous snapshot failed: {e}")
+        
         start_time = time_module.time()
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         iterations = 0
@@ -2144,18 +2321,44 @@ Summary:"""
                         started_at=started_at,
                     )
                 
-                # Check doom loop
+                # Check doom loop with graduated recovery (G-RECOVERY-2 fix)
                 if self._is_doom_loop():
-                    return AutonomyResult(
-                        success=False,
-                        output="Task stopped due to repeated actions (doom loop)",
-                        completion_reason="doom_loop",
-                        iterations=iterations,
-                        stage=stage,
-                        actions=actions_taken,
-                        duration_seconds=time_module.time() - start_time,
-                        started_at=started_at,
-                    )
+                    recovery = self._get_doom_recovery()
+                    obs = getattr(self, '_observability_hooks', None)
+                    if obs is not None:
+                        from ..escalation.observability import EventType as _EvtType
+                        obs.emit(_EvtType.STEP_END, {
+                            "doom_loop": True,
+                            "recovery_action": recovery,
+                            "iteration": iterations,
+                        })
+                    if recovery == "retry_different":
+                        prompt = prompt + "\n\n[System: Previous approach repeated. Try a completely different strategy.]"
+                        if self._doom_loop_tracker is not None:
+                            self._doom_loop_tracker.clear_actions()
+                        continue
+                    elif recovery == "request_help":
+                        return AutonomyResult(
+                            success=False,
+                            output="Task needs human guidance (doom loop recovery exhausted)",
+                            completion_reason="needs_help",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                    else:
+                        return AutonomyResult(
+                            success=False,
+                            output="Task stopped due to repeated actions (doom loop)",
+                            completion_reason="doom_loop",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
                 
                 # Execute one turn using the agent's chat method
                 # Always use the original prompt (prompt re-injection)
@@ -2233,14 +2436,8 @@ Summary:"""
                             started_at=started_at,
                         )
                 
-                # Check for keyword-based completion signals (fallback)
-                response_lower = response_str.lower()
-                completion_signals = [
-                    "task completed", "task complete", "done",
-                    "finished", "completed successfully",
-                ]
-                
-                if any(signal in response_lower for signal in completion_signals):
+                # Check for keyword-based completion signals (word-boundary, G-COMPLETION-1 fix)
+                if self._is_completion_signal(response_str):
                     return AutonomyResult(
                         success=True,
                         output=response_str,
@@ -2280,7 +2477,18 @@ Summary:"""
                 duration_seconds=time_module.time() - start_time,
                 started_at=started_at,
             )
-            
+        
+        except KeyboardInterrupt:
+            return AutonomyResult(
+                success=False,
+                output="Task cancelled by user",
+                completion_reason="cancelled",
+                iterations=iterations,
+                stage=stage,
+                actions=actions_taken,
+                duration_seconds=time_module.time() - start_time,
+                started_at=started_at,
+            )
         except Exception as e:
             return AutonomyResult(
                 success=False,
@@ -2396,18 +2604,44 @@ Summary:"""
                         started_at=started_at,
                     )
                 
-                # Check doom loop
+                # Check doom loop with graduated recovery (G-RECOVERY-2 fix)
                 if self._is_doom_loop():
-                    return AutonomyResult(
-                        success=False,
-                        output="Task stopped due to repeated actions (doom loop)",
-                        completion_reason="doom_loop",
-                        iterations=iterations,
-                        stage=stage,
-                        actions=actions_taken,
-                        duration_seconds=time_module.time() - start_time,
-                        started_at=started_at,
-                    )
+                    recovery = self._get_doom_recovery()
+                    obs = getattr(self, '_observability_hooks', None)
+                    if obs is not None:
+                        from ..escalation.observability import EventType as _EvtType
+                        obs.emit(_EvtType.STEP_END, {
+                            "doom_loop": True,
+                            "recovery_action": recovery,
+                            "iteration": iterations,
+                        })
+                    if recovery == "retry_different":
+                        prompt = prompt + "\n\n[System: Previous approach repeated. Try a completely different strategy.]"
+                        if self._doom_loop_tracker is not None:
+                            self._doom_loop_tracker.clear_actions()
+                        continue
+                    elif recovery == "request_help":
+                        return AutonomyResult(
+                            success=False,
+                            output="Task needs human guidance (doom loop recovery exhausted)",
+                            completion_reason="needs_help",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                    else:
+                        return AutonomyResult(
+                            success=False,
+                            output="Task stopped due to repeated actions (doom loop)",
+                            completion_reason="doom_loop",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
                 
                 # Execute one turn using the agent's async chat method
                 # Always use the original prompt (prompt re-injection)
@@ -2485,14 +2719,8 @@ Summary:"""
                             started_at=started_at,
                         )
                 
-                # Check for keyword-based completion signals (fallback)
-                response_lower = response_str.lower()
-                completion_signals = [
-                    "task completed", "task complete", "done",
-                    "finished", "completed successfully",
-                ]
-                
-                if any(signal in response_lower for signal in completion_signals):
+                # Check for keyword-based completion signals (word-boundary, G-COMPLETION-1 fix)
+                if self._is_completion_signal(response_str):
                     return AutonomyResult(
                         success=True,
                         output=response_str,
@@ -2538,7 +2766,18 @@ Summary:"""
                 duration_seconds=time_module.time() - start_time,
                 started_at=started_at,
             )
-            
+        
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            return AutonomyResult(
+                success=False,
+                output="Task cancelled",
+                completion_reason="cancelled",
+                iterations=iterations,
+                stage=stage,
+                actions=actions_taken,
+                duration_seconds=time_module.time() - start_time,
+                started_at=started_at,
+            )
         except Exception as e:
             return AutonomyResult(
                 success=False,
@@ -5165,6 +5404,54 @@ Your Goal: {self.goal}"""
         """Get the current session ID."""
         return self._session_id
 
+    def as_tool(
+        self,
+        description: Optional[str] = None,
+        tool_name: Optional[str] = None,
+    ) -> 'Handoff':
+        """Convert this agent to a callable tool for use by other agents.
+        
+        Unlike handoffs which pass conversation context, as_tool() creates a tool
+        where the child agent receives only the generated input (no history).
+        The parent agent retains control and receives the result.
+        
+        This is useful for hierarchical agent composition where you want to
+        invoke a specialist agent as a subordinate tool.
+        
+        Args:
+            description: Tool description for the LLM (what this agent does)
+            tool_name: Custom tool name (default: invoke_<agent_name>)
+        
+        Returns:
+            Handoff configured as a tool with no context passed
+        
+        Example:
+            researcher = Agent(name="Researcher", instructions="Research topics")
+            coder = Agent(name="Coder", instructions="Write Python code")
+            
+            writer = Agent(
+                name="Writer",
+                tools=[
+                    researcher.as_tool("Research a topic and return findings"),
+                    coder.as_tool("Write Python code for a given task"),
+                ]
+            )
+            
+            result = writer.chat("Write an article about async Python")
+        """
+        from .handoff import Handoff, HandoffConfig, ContextPolicy
+        
+        # Generate default tool name
+        agent_name_snake = self.name.lower().replace(' ', '_').replace('-', '_')
+        default_tool_name = f"invoke_{agent_name_snake}"
+        
+        return Handoff(
+            agent=self,
+            tool_name_override=tool_name or default_tool_name,
+            tool_description_override=description or f"Invoke {self.name} to complete a subtask and return the result",
+            config=HandoffConfig(context_policy=ContextPolicy.NONE),
+        )
+
     def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None, config=None, force_retrieval=False, skip_retrieval=False, attachments=None, tool_choice=None):
         """
         Chat with the agent.
@@ -6168,9 +6455,36 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             **kwargs: Additional arguments passed to achat()
             
         Returns:
-            The agent's response as a string
+            The agent's response as a string, or AutonomyResult if autonomy enabled
+            
+        Note:
+            If autonomy=True was set on the agent, astart() automatically uses
+            the autonomous loop (run_autonomous_async) instead of single-turn chat.
         """
         import sys
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # UNIFIED AUTONOMY API: If autonomy is enabled, route to run_autonomous_async
+        # This allows: Agent(autonomy=True) + await agent.astart("Task") to just work!
+        # ─────────────────────────────────────────────────────────────────────
+        if self.autonomy_enabled:
+            # Extract autonomy-specific kwargs
+            timeout = kwargs.pop('timeout', None)
+            kwargs.pop('stream', None)  # Not used in autonomous mode
+            
+            # Get config values from autonomy_config
+            auto_config = self.autonomy_config or {}
+            max_iterations = auto_config.get('max_iterations', 20)
+            completion_promise = auto_config.get('completion_promise')
+            clear_context = auto_config.get('clear_context', False)
+            
+            return await self.run_autonomous_async(
+                prompt=prompt,
+                max_iterations=max_iterations,
+                timeout_seconds=timeout,
+                completion_promise=completion_promise,
+                clear_context=clear_context,
+            )
         
         # Determine streaming behavior (same logic as start())
         stream_requested = kwargs.get('stream')
@@ -6403,6 +6717,9 @@ Write the complete compiled report:"""
             Unlike .run() which is always silent (production use), .start()
             enables verbose output by default when in a TTY for beginner-friendly
             interactive use. Use .run() for programmatic/scripted usage.
+            
+            If autonomy=True was set on the agent, start() automatically uses
+            the autonomous loop (run_autonomous) instead of single-turn chat.
         """
         import sys
         
@@ -6414,6 +6731,28 @@ Write the complete compiled report:"""
         if prompt and "{{" in prompt:
             from praisonaiagents.utils.variables import substitute_variables
             prompt = substitute_variables(prompt, {})
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # UNIFIED AUTONOMY API: If autonomy is enabled, route to run_autonomous
+        # This allows: Agent(autonomy=True) + agent.start("Task") to just work!
+        # ─────────────────────────────────────────────────────────────────────
+        if self.autonomy_enabled:
+            # Extract autonomy-specific kwargs
+            timeout = kwargs.pop('timeout', None)
+            
+            # Get config values from autonomy_config
+            auto_config = self.autonomy_config or {}
+            max_iterations = auto_config.get('max_iterations', 20)
+            completion_promise = auto_config.get('completion_promise')
+            clear_context = auto_config.get('clear_context', False)
+            
+            return self.run_autonomous(
+                prompt=prompt,
+                max_iterations=max_iterations,
+                timeout_seconds=timeout,
+                completion_promise=completion_promise,
+                clear_context=clear_context,
+            )
         
         # Load history from past sessions
         self._load_history_context()

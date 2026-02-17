@@ -77,6 +77,9 @@ _AUTONOMY_TO_ESCALATION_SIGNAL = {v: k for k, v in _ESCALATION_TO_AUTONOMY_SIGNA
 class AutonomyConfig:
     """Configuration for Agent autonomy features.
     
+    Autonomy is the safety center: doom loops, escalation, sandbox,
+    filesystem tracking, and verification hooks all live here.
+    
     Attributes:
         enabled: Whether autonomy is enabled
         level: Autonomy level (suggest, auto_edit, full_auto)
@@ -87,6 +90,24 @@ class AutonomyConfig:
         completion_promise: Optional string that signals completion when wrapped in <promise>TEXT</promise>
         clear_context: Whether to clear chat history between iterations
         verification_hooks: List of VerificationHook instances for output verification
+        track_changes: Whether to track filesystem changes via shadow git.
+            Defaults to True when level="full_auto", False otherwise.
+            When enabled, agent.undo()/redo()/diff() become available.
+        sandbox: Optional SandboxConfig for execution isolation.
+            When level="full_auto" and sandbox is None, subprocess sandbox is auto-enabled.
+        snapshot_dir: Directory for snapshot storage. Defaults to ~/.praisonai/snapshots.
+    
+    Usage::
+    
+        # Simple — full_auto auto-enables tracking + sandbox
+        Agent(autonomy="full_auto")
+        
+        # Advanced — explicit config
+        Agent(autonomy=AutonomyConfig(
+            level="full_auto",
+            track_changes=True,
+            sandbox=SandboxConfig.native(writable_paths=["./src"]),
+        ))
     """
     enabled: bool = True
     level: str = "suggest"
@@ -97,6 +118,10 @@ class AutonomyConfig:
     completion_promise: Optional[str] = None
     clear_context: bool = False
     verification_hooks: Optional[List[Any]] = None
+    # Safety features — autonomy owns the safety model
+    track_changes: Optional[bool] = None  # None = auto (True for full_auto)
+    sandbox: Optional[Any] = None  # SandboxConfig (lazy import to avoid circular)
+    snapshot_dir: Optional[str] = None  # Defaults to ~/.praisonai/snapshots
     
     def __post_init__(self):
         if self.level not in VALID_AUTONOMY_LEVELS:
@@ -104,6 +129,20 @@ class AutonomyConfig:
                 f"Invalid autonomy level: {self.level!r}. "
                 f"Must be one of {sorted(VALID_AUTONOMY_LEVELS)}"
             )
+        # Auto-enable track_changes for full_auto if not explicitly set
+        if self.track_changes is None:
+            self.track_changes = (self.level == "full_auto")
+        # Default snapshot directory
+        if self.snapshot_dir is None:
+            import os
+            self.snapshot_dir = os.path.join(
+                os.path.expanduser("~"), ".praisonai", "snapshots"
+            )
+    
+    @property
+    def effective_track_changes(self) -> bool:
+        """Whether track_changes is effectively enabled."""
+        return bool(self.track_changes)
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AutonomyConfig":
@@ -124,11 +163,20 @@ class AutonomyConfig:
             completion_promise=data.get("completion_promise"),
             clear_context=data.get("clear_context", False),
             verification_hooks=data.get("verification_hooks"),
+            track_changes=data.get("track_changes"),
+            sandbox=data.get("sandbox"),
+            snapshot_dir=data.get("snapshot_dir"),
         )
 
 
 class AutonomySignal(str, Enum):
-    """Signals detected from prompts for autonomy decisions."""
+    """Signals detected from prompts for autonomy decisions.
+    
+    .. deprecated::
+        AutonomySignal is deprecated. Use EscalationSignal from
+        praisonaiagents.escalation.types instead. AutonomyTrigger
+        returns plain strings, not AutonomySignal values.
+    """
     SIMPLE_QUESTION = "simple_question"
     FILE_REFERENCES = "file_references"
     CODE_BLOCKS = "code_blocks"
@@ -137,6 +185,26 @@ class AutonomySignal(str, Enum):
     REFACTOR_INTENT = "refactor_intent"
     MULTI_STEP = "multi_step"
     COMPLEX_KEYWORDS = "complex_keywords"
+    
+    def __init_subclass__(cls, **kwargs):
+        import warnings
+        warnings.warn(
+            "AutonomySignal is deprecated. Use EscalationSignal instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init_subclass__(**kwargs)
+
+
+def _warn_autonomy_signal():
+    """Emit deprecation warning when AutonomySignal is accessed."""
+    import warnings
+    warnings.warn(
+        "AutonomySignal is deprecated. Use EscalationSignal from "
+        "praisonaiagents.escalation.types instead.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 class AutonomyTrigger:
@@ -212,29 +280,36 @@ class AutonomyResult:
 
 
 class DoomLoopTracker:
-    """Tracks actions to detect doom loops with recovery actions.
+    """Tracks actions to detect doom loops with graduated recovery.
     
-    A doom loop occurs when the agent repeats the same action
-    multiple times without making progress.
+    Delegates to DoomLoopDetector (DRY, G-DUP-2 fix) for detection
+    while providing graduated recovery actions on top.
     
-    Enhanced (G-DUP-2 fix): adds get_recovery_action() for
-    graduated recovery instead of immediate abort.
+    Recovery progression:
+        1st doom loop → retry_different (try new approach)
+        2nd doom loop → escalate_model (use stronger model)
+        3rd doom loop → request_help (ask human)
+        4th+ doom loop → abort (stop execution)
     """
     
     def __init__(self, threshold: int = 3):
-        """Initialize tracker.
+        """Initialize tracker with DoomLoopDetector delegation.
         
         Args:
             threshold: Number of repeated actions to trigger doom loop
         """
+        from ..escalation.doom_loop import DoomLoopDetector, DoomLoopConfig
         self.threshold = threshold
-        self.actions: List[str] = []
-        self.action_counts: Dict[str, int] = {}
-        self._consecutive_failures: int = 0
+        self._delegate = DoomLoopDetector(DoomLoopConfig(
+            max_identical_actions=threshold,
+            max_consecutive_failures=threshold,
+            max_similar_actions=threshold + 2,
+        ))
+        self._delegate.start_session()
         self._recovery_attempts: int = 0
     
     def record(self, action_type: str, args: Dict[str, Any], result: Any, success: bool) -> None:
-        """Record an action.
+        """Record an action for loop detection.
         
         Args:
             action_type: Type of action (e.g., "read_file")
@@ -242,16 +317,12 @@ class DoomLoopTracker:
             result: Action result
             success: Whether action succeeded
         """
-        # Create action signature
-        sig = f"{action_type}:{hash(str(sorted(args.items())))}"
-        self.actions.append(sig)
-        self.action_counts[sig] = self.action_counts.get(sig, 0) + 1
-        
-        # Track consecutive failures
-        if not success:
-            self._consecutive_failures += 1
-        else:
-            self._consecutive_failures = 0
+        self._delegate.record_action(
+            action_type=action_type,
+            args=args,
+            result=result,
+            success=success,
+        )
     
     def is_doom_loop(self) -> bool:
         """Check if we're in a doom loop.
@@ -259,19 +330,7 @@ class DoomLoopTracker:
         Returns:
             True if doom loop detected
         """
-        if not self.actions:
-            return False
-        
-        # Check if any action repeated too many times
-        for count in self.action_counts.values():
-            if count >= self.threshold:
-                return True
-        
-        # Check consecutive failures
-        if self._consecutive_failures >= self.threshold:
-            return True
-        
-        return False
+        return self._delegate.is_doom_loop()
     
     def get_recovery_action(self) -> str:
         """Get recommended recovery action when doom loop detected.
@@ -297,11 +356,21 @@ class DoomLoopTracker:
         else:
             return "abort"
     
+    def clear_actions(self) -> None:
+        """Clear action history but keep recovery attempt count."""
+        self._delegate.start_session()
+    
+    def mark_progress(self, marker: str) -> None:
+        """Mark meaningful progress to reset no-progress detection.
+        
+        Args:
+            marker: Description of progress made
+        """
+        self._delegate.mark_progress(marker)
+    
     def reset(self) -> None:
-        """Reset the tracker."""
-        self.actions.clear()
-        self.action_counts.clear()
-        self._consecutive_failures = 0
+        """Reset the tracker completely."""
+        self._delegate.start_session()
         self._recovery_attempts = 0
 
 
