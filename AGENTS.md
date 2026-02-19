@@ -1109,3 +1109,89 @@ docs/bots/
 8. **group_policy enforcement**: Adapters MUST check group_policy before processing group messages
 9. **Reply threading**: All adapters MUST pass reply_to when responding to a specific message
 10. **Persistence by default**: Sessions SHOULD persist to disk; in-memory-only should require opt-in
+
+---
+
+## 16. Security & Sandbox Documentation Rules
+
+When documenting security features (sandbox, tool approval, code execution), follow these rules:
+
+### 16.1 Python Code Sandbox (`execute_code`)
+
+The sandbox uses three defense layers: **AST validation** → **text pattern check** → **runtime restricted builtins**. Always document all three layers.
+
+**Auto-rejected patterns table (MUST include in security docs):**
+
+| Category | Code Example | Rejection Layer |
+|---|---|---|
+| Imports | `import os` | AST |
+| From imports | `from pathlib import Path` | AST |
+| eval/exec/compile | `eval("1+1")` | AST |
+| open/input | `open("/etc/passwd")` | AST |
+| setattr/delattr/dir | `setattr(int, 'x', 1)` | AST |
+| Dunder access | `().__class__`, `obj.__globals__` | AST |
+| Frame introspection | `gen.gi_frame`, `f.f_globals` | AST |
+| \_\_import\_\_ | `__import__("os")` | AST + Text |
+
+**Exploit attempts table (MUST include to show defense-in-depth):**
+
+| Exploit | How Blocked |
+|---|---|
+| `getattr((), '__cl'+'ass__')` | `_safe_getattr` blocks `_`-prefixed names |
+| `chr(95)+chr(95)+'class'...` | `chr` not in safe_builtins |
+| `b'\x5f\x5f...'.decode()` → getattr | `_safe_getattr` blocks result |
+| `type(t).__subclasses__(t)` | AST blocks `__subclasses__` |
+| `e.__traceback__` | AST blocks `__traceback__` |
+| `gen.gi_frame` | AST blocks `gi_frame` |
+
+**Allowed code table (MUST include to show usability preserved):**
+
+| Pattern | Status |
+|---|---|
+| Arithmetic, strings, lists, dicts | ✅ Allowed |
+| Functions and classes | ✅ Allowed |
+| Comprehensions | ✅ Allowed |
+| Exception handling | ✅ Allowed |
+| Safe builtins (len, sum, sorted, etc) | ✅ Allowed |
+| isinstance, type, hasattr | ✅ Allowed |
+
+### 16.2 Tool Approval Gateway
+
+All tools with side effects use `@require_approval`. Always include the **tool approval matrix**:
+
+| Tool | Function | Risk Level | Approval Required |
+|---|---|---|---|
+| Shell | `execute_command` | 🔴 Critical | Yes |
+| Shell | `kill_process` | 🔴 Critical | Yes |
+| Python | `execute_code` | 🔴 Critical | Yes |
+| File | `write_file` / `copy_file` / `move_file` / `delete_file` | 🟠 High | Yes |
+| File | `download_file` | 🟡 Medium | Yes |
+| File | `read_file` / `list_files` | — | No |
+| Search | `internet_search` | — | No |
+| Spider | `scrape_page` / `crawl` | — | No |
+
+**Approval modes (always document all three):**
+
+```
+# Auto-approve (development only)
+PRAISONAI_AUTO_APPROVE=true
+
+# Console approval (default)
+# Agent prompts for Y/N in terminal
+
+# External approval (production)
+praisonai --approval slack|telegram|http
+```
+
+### 16.3 Security Section SDK Mapping
+
+| Security Feature | SDK File | Documentation Page |
+|---|---|---|
+| Code sandbox | `praisonaiagents/tools/python_tools.py` | `docs/best-practices/security.mdx` |
+| Tool approval | `praisonaiagents/approval/` | `docs/concepts/approval.mdx` |
+| Injection defense | `praisonai/security/` | `docs/best-practices/security.mdx` |
+| Protected paths | `praisonai/security/` | `docs/best-practices/security.mdx` |
+| SSRF validation | `praisonaiagents/tools/spider_tools.py` | `docs/best-practices/security.mdx` |
+| Path traversal | `praisonaiagents/tools/file_tools.py` | `docs/best-practices/security.mdx` |
+| Shell safety | `praisonaiagents/tools/shell_tools.py` | `docs/best-practices/security.mdx` |
+
