@@ -439,6 +439,7 @@ class Agent:
         skills: Optional[Union[List[str], Any]] = None,  # Union[list, SkillsConfig]
         approval: Optional[Union[bool, Any]] = None,  # Union[bool, ApprovalProtocol backend]
         tool_timeout: Optional[int] = None,  # P8/G11: Timeout in seconds for each tool call
+        learn: Optional[Union[bool, Any]] = None,  # Union[bool, LearnConfig] - Continuous learning (peer to memory)
     ):
         """Initialize an Agent instance.
 
@@ -509,6 +510,11 @@ class Agent:
             skills: Agent skills. Accepts:
                 - List[str]: Skill directory paths
                 - SkillsConfig: Custom configuration
+            learn: Continuous learning configuration. Accepts:
+                - bool: True enables with defaults, False disables
+                - LearnConfig: Custom configuration
+                Learning is a first-class citizen, peer to memory. It captures patterns,
+                preferences, and insights from interactions to improve future responses.
 
         Raises:
             ValueError: If all of name, role, goal, backstory, and instructions are None.
@@ -968,6 +974,49 @@ class Agent:
                 pass
         elif memory is False:
             memory = None
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # Resolve LEARN param - FAST PATH (top-level, peer to memory)
+        # learn= is a first-class citizen, independent of memory=
+        # ─────────────────────────────────────────────────────────────────────
+        from ..config.feature_configs import LearnConfig
+        
+        _learn_config = None
+        
+        # Top-level learn= takes precedence over memory.learn
+        if learn is not None:
+            # Explicit top-level learn= param
+            if learn is False:
+                _learn_config = None
+            elif learn is True:
+                # learn=True shorthand enables AGENTIC mode (auto-learning)
+                from ..memory.learn.protocols import LearnMode
+                _learn_config = LearnConfig(mode=LearnMode.AGENTIC)
+            elif isinstance(learn, LearnConfig):
+                _learn_config = learn
+            elif isinstance(learn, dict):
+                _learn_config = LearnConfig(**learn)
+            else:
+                _learn_config = learn  # Pass through
+        elif _memory_config is not None and isinstance(_memory_config, MemoryConfig):
+            # Fallback to memory.learn for backward compatibility
+            if _memory_config.learn:
+                if _memory_config.learn is True:
+                    # learn=True shorthand enables AGENTIC mode
+                    from ..memory.learn.protocols import LearnMode
+                    _learn_config = LearnConfig(mode=LearnMode.AGENTIC)
+                elif isinstance(_memory_config.learn, LearnConfig):
+                    _learn_config = _memory_config.learn
+                elif isinstance(_memory_config.learn, dict):
+                    _learn_config = LearnConfig(**_memory_config.learn)
+        
+        # If learn is enabled but memory is not, we need to enable memory for learn to work
+        if _learn_config is not None and memory is None:
+            # Enable minimal memory for learn to work
+            memory = {"learn": _learn_config.to_dict() if hasattr(_learn_config, 'to_dict') else _learn_config}
+        elif _learn_config is not None and isinstance(memory, dict):
+            # Merge learn config into memory dict
+            memory["learn"] = _learn_config.to_dict() if hasattr(_learn_config, 'to_dict') else _learn_config
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve HISTORY from MemoryConfig - FAST PATH
@@ -1575,6 +1624,10 @@ Your Goal: {self.goal}
         self._history_enabled = _history_enabled
         self._history_limit = _history_limit
         self._history_session_id = _history_session_id
+        
+        # Learning configuration (top-level, peer to memory)
+        # Stored for access via agent._learn_config
+        self._learn_config = _learn_config
 
         # Agent-centric feature instances (lazy loaded for zero performance impact)
         self._auto_memory = auto_memory
@@ -3422,10 +3475,17 @@ Summary:"""
         if not self._memory_instance:
             return
         
-        if memory_type == "short_term" and hasattr(self._memory_instance, 'add_short_term'):
-            self._memory_instance.add_short_term(content, **kwargs)
-        elif memory_type == "long_term" and hasattr(self._memory_instance, 'add_long_term'):
-            self._memory_instance.add_long_term(content, **kwargs)
+        # Use protocol names first (store_*), fallback to legacy names (add_*)
+        if memory_type == "short_term":
+            if hasattr(self._memory_instance, 'store_short_term'):
+                self._memory_instance.store_short_term(content, **kwargs)
+            elif hasattr(self._memory_instance, 'add_short_term'):
+                self._memory_instance.add_short_term(content, **kwargs)
+        elif memory_type == "long_term":
+            if hasattr(self._memory_instance, 'store_long_term'):
+                self._memory_instance.store_long_term(content, **kwargs)
+            elif hasattr(self._memory_instance, 'add_long_term'):
+                self._memory_instance.add_long_term(content, **kwargs)
         elif memory_type == "entity" and hasattr(self._memory_instance, 'add_entity'):
             self._memory_instance.add_entity(content, **kwargs)
         elif memory_type == "episodic" and hasattr(self._memory_instance, 'add_episodic'):
@@ -4603,6 +4663,36 @@ Your Goal: {self.goal}"""
             prompt_str = prompt if isinstance(prompt, str) else str(prompt)
             self._process_auto_memory(prompt_str, str(response))
         
+        # Auto-learning extraction (opt-in via LearnConfig(mode=LearnMode.AGENTIC))
+        self._process_auto_learning()
+        
+        return response
+
+    async def _atrigger_after_agent_hook(self, prompt, response, start_time, tools_used=None):
+        """Async version: Trigger AFTER_AGENT hook and return response."""
+        from ..hooks import HookEvent, AfterAgentInput
+        after_agent_input = AfterAgentInput(
+            session_id=getattr(self, '_session_id', 'default'),
+            cwd=os.getcwd(),
+            event_name=HookEvent.AFTER_AGENT,
+            timestamp=str(time.time()),
+            agent_name=self.name,
+            prompt=prompt if isinstance(prompt, str) else str(prompt),
+            response=response or "",
+            tools_used=tools_used or [],
+            total_tokens=0,
+            execution_time_ms=(time.time() - start_time) * 1000
+        )
+        await self._hook_runner.execute(HookEvent.AFTER_AGENT, after_agent_input)
+        
+        # Auto-memory extraction (opt-in via MemoryConfig(auto_memory=True))
+        if response:
+            prompt_str = prompt if isinstance(prompt, str) else str(prompt)
+            self._process_auto_memory(prompt_str, str(response))
+        
+        # Auto-learning extraction (opt-in via LearnConfig(mode=LearnMode.AGENTIC))
+        self._process_auto_learning()
+        
         return response
 
     
@@ -4863,7 +4953,14 @@ Your Goal: {self.goal}"""
         return {"error": error_msg}
 
     def clear_history(self):
+        """Clear all chat history.
+        
+        Also resets _auto_save_last_index to prevent silent message loss
+        when auto_save is enabled.
+        """
         self.chat_history = []
+        # Reset auto-save index to prevent stale index causing message loss
+        self._auto_save_last_index = 0
 
     # -------------------------------------------------------------------------
     #                       History Management Methods
@@ -4888,6 +4985,8 @@ Your Goal: {self.goal}"""
             
             deleted_count = len(self.chat_history) - keep_last
             self.chat_history = self.chat_history[-keep_last:]
+            # Reset auto-save index to match new history length
+            self._auto_save_last_index = len(self.chat_history)
             return deleted_count
     
     def delete_history(self, index: int) -> bool:
@@ -4905,6 +5004,12 @@ Your Goal: {self.goal}"""
         with self._history_lock:
             try:
                 del self.chat_history[index]
+                # Adjust auto-save index if deletion affects saved range
+                if hasattr(self, '_auto_save_last_index'):
+                    self._auto_save_last_index = min(
+                        self._auto_save_last_index,
+                        len(self.chat_history)
+                    )
                 return True
             except IndexError:
                 return False
@@ -4927,7 +5032,14 @@ Your Goal: {self.goal}"""
                 msg for msg in self.chat_history
                 if pattern.lower() not in msg.get("content", "").lower()
             ]
-            return original_len - len(self.chat_history)
+            deleted_count = original_len - len(self.chat_history)
+            # Adjust auto-save index if deletion affects saved range
+            if deleted_count > 0 and hasattr(self, '_auto_save_last_index'):
+                self._auto_save_last_index = min(
+                    self._auto_save_last_index,
+                    len(self.chat_history)
+                )
+            return deleted_count
     
     def get_history_size(self) -> int:
         """Get the current number of messages in chat history."""
@@ -5987,7 +6099,7 @@ Your Goal: {self.goal}"""
                                 validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                                 # Execute callback after validation
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
-                                return validated_response
+                                return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                             except Exception as e:
                                 logging.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
                                 # Rollback chat history on guardrail failure
@@ -6019,7 +6131,7 @@ Your Goal: {self.goal}"""
                                 validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                                 # Execute callback after validation
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
-                                return validated_response
+                                return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                             except Exception as e:
                                 logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
                                 # Rollback chat history on guardrail failure
@@ -6089,7 +6201,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     self._end_run(validated_response, "completed", {"duration_ms": (time.time() - start_time) * 1000})
-                                    return validated_response
+                                    return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
                                     # Rollback chat history on guardrail failure
@@ -6108,7 +6220,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
-                                    return validated_response
+                                    return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
                                     # Rollback chat history on guardrail failure
@@ -6296,7 +6408,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id)
                         # Execute callback after validation
                         self._execute_callback_and_display(normalized_content, validated_response, time.time() - start_time, task_name, task_description, task_id)
-                        return validated_response
+                        return await self._atrigger_after_agent_hook(prompt, validated_response, start_time)
                     except Exception as e:
                         logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
                         # Rollback chat history on guardrail failure
@@ -6374,7 +6486,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                         # Execute callback after tool completion
                         self._execute_callback_and_display(original_prompt, result, time.time() - start_time, task_name, task_description, task_id)
-                        return result
+                        return await self._atrigger_after_agent_hook(original_prompt, result, start_time)
                     elif output_json or output_pydantic:
                         response = await self._openai_client.async_client.chat.completions.create(
                             model=self.llm,
@@ -6388,7 +6500,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                         # Execute callback after JSON/Pydantic completion
                         self._execute_callback_and_display(original_prompt, response_text, time.time() - start_time, task_name, task_description, task_id)
-                        return response_text
+                        return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
                     else:
                         response = await self._openai_client.async_client.chat.completions.create(
                             model=self.llm,
@@ -6428,7 +6540,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
                                             total_time = time.time() - start_time
                                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
-                                        return response_text
+                                        return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
                                     
                                     reflection_response = await self._openai_client.async_client.beta.chat.completions.parse(
                                         model=self.reflect_llm if self.reflect_llm else self.llm,
@@ -6486,7 +6598,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
                             # Execute callback after validation
                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
-                            return validated_response
+                            return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
                         except Exception as e:
                             logging.error(f"Agent {self.name}: Guardrail validation failed for OpenAI client: {e}")
                             # Rollback chat history on guardrail failure
@@ -7207,9 +7319,88 @@ Write the complete compiled report:"""
         except Exception as e:
             logging.debug(f"Auto-memory extraction failed: {e}")
 
+    def _process_auto_learning(self):
+        """Process auto-learning extraction after agent response.
+        
+        Called after each agent response when LearnMode.AGENTIC is set.
+        Uses LearnManager.process_conversation() to extract and store learnings
+        (persona, insights, patterns) from the conversation. No-op when learning
+        is disabled or mode is not AGENTIC.
+        """
+        # Quick exit if no learn config or mode is not AGENTIC
+        if not self._learn_config:
+            return
+        
+        # Check if mode is AGENTIC (auto-extract learnings)
+        from ..memory.learn.protocols import LearnMode
+        mode = getattr(self._learn_config, 'mode', None)
+        
+        # Handle PROPOSE mode — extract but store as pending for user approval
+        if (isinstance(mode, LearnMode) and mode == LearnMode.PROPOSE) or \
+           (isinstance(mode, str) and mode == 'propose'):
+            learn_manager = None
+            if self._memory_instance and hasattr(self._memory_instance, 'learn'):
+                learn_manager = self._memory_instance.learn
+            if learn_manager:
+                try:
+                    recent_messages = self.chat_history[-2:] if len(self.chat_history) >= 2 else self.chat_history
+                    if recent_messages:
+                        # Use same extraction as AGENTIC, but don't auto-store
+                        result = learn_manager.process_conversation(
+                            messages=recent_messages,
+                            llm=getattr(self._learn_config, 'llm', None) or self.llm,
+                            extract_only=True,
+                        )
+                        # Move extracted items to pending queue
+                        if result:
+                            for p in result.get("persona", []):
+                                if p:
+                                    learn_manager.add_pending(p, category="persona")
+                            for i in result.get("insights", []):
+                                if i:
+                                    learn_manager.add_pending(i, category="insights")
+                            for pt in result.get("patterns", []):
+                                if pt:
+                                    learn_manager.add_pending(pt, category="patterns")
+                except Exception as e:
+                    logging.debug(f"PROPOSE mode learning extraction failed: {e}")
+            return
+        
+        if mode is None or (isinstance(mode, LearnMode) and mode != LearnMode.AGENTIC):
+            return
+        if isinstance(mode, str) and mode != 'agentic':
+            return
+        
+        # Get LearnManager from memory instance
+        learn_manager = None
+        if self._memory_instance and hasattr(self._memory_instance, 'learn'):
+            learn_manager = self._memory_instance.learn
+        
+        if not learn_manager:
+            return
+        
+        try:
+            # Process recent conversation (last 2 messages: user + assistant)
+            recent_messages = self.chat_history[-2:] if len(self.chat_history) >= 2 else self.chat_history
+            if recent_messages:
+                learn_manager.process_conversation(
+                    messages=recent_messages,
+                    llm=getattr(self._learn_config, 'llm', None) or self.llm,
+                )
+        except Exception as e:
+            logging.debug(f"Auto-learning extraction failed: {e}")
+
     def _auto_save_session(self):
-        """Auto-save session if auto_save is enabled."""
-        if not self.auto_save or not self._memory_instance:
+        """Auto-save session if auto_save is enabled.
+        
+        G-1 FIX: Routes to SessionStore instead of Memory.save_session() to
+        maintain clean separation between conversation history (SessionStore)
+        and semantic memory (Memory).
+        
+        Issue 1 FIX: Track last saved index to avoid duplicate insertion when
+        called multiple times in the same session.
+        """
+        if not self.auto_save:
             return
         
         try:
@@ -7219,12 +7410,36 @@ Write the complete compiled report:"""
                 for msg in self.chat_history
             ]
             
-            self._memory_instance.save_session(
-                name=self.auto_save,
-                conversation_history=clean_history,
-                metadata={"agent_name": self.name, "user_id": self.user_id}
-            )
-            logging.debug(f"Auto-saved session: {self.auto_save}")
+            # Issue 1 FIX: Only save NEW messages since last save
+            # Track last saved index to avoid duplicates
+            last_saved = getattr(self, '_auto_save_last_index', 0)
+            new_messages = clean_history[last_saved:]
+            
+            if not new_messages:
+                return  # Nothing new to save
+            
+            # G-1 FIX: Use SessionStore for conversation history persistence
+            # This maintains clean separation: Memory = facts, SessionStore = turns
+            if self._session_store is not None:
+                # Persist only NEW messages to SessionStore
+                for msg in new_messages:
+                    self._session_store.add_message(
+                        self.auto_save,  # Use auto_save name as session_id
+                        role=msg.get("role", "user"),
+                        content=msg.get("content", ""),
+                    )
+                # Update last saved index
+                self._auto_save_last_index = len(clean_history)
+                logging.debug(f"Auto-saved {len(new_messages)} new messages to SessionStore: {self.auto_save}")
+            elif self._memory_instance and hasattr(self._memory_instance, 'save_session'):
+                # Fallback to Memory.save_session() for backward compatibility
+                # Memory.save_session() replaces entire history, so no duplicate issue
+                self._memory_instance.save_session(
+                    name=self.auto_save,
+                    conversation_history=clean_history,
+                    metadata={"agent_name": self.name, "user_id": self.user_id}
+                )
+                logging.debug(f"Auto-saved session to Memory: {self.auto_save}")
         except Exception as e:
             logging.debug(f"Error auto-saving session: {e}")
 

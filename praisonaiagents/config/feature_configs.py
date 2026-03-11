@@ -57,6 +57,34 @@ class LearnScope(str, Enum):
     SHARED = "shared"     # Shared with all agents
 
 
+class LearnMode(str, Enum):
+    """Learning mode for automatic learning extraction.
+    
+    DISABLED: No automatic learning (manual capture only)
+    AGENTIC: Agent autonomously extracts and stores learnings after each conversation
+    PROPOSE: (Future) Agent proposes learnings for user approval before storing.
+             Note: PROPOSE mode is defined but not yet implemented. Using it will
+             behave the same as DISABLED until the approval workflow is added.
+    """
+    DISABLED = "disabled"
+    AGENTIC = "agentic"
+    PROPOSE = "propose"
+
+
+class LearnBackend(str, Enum):
+    """Storage backend for learning data.
+    
+    FILE: JSON files (default, zero dependencies)
+    SQLITE: SQLite database
+    REDIS: Redis (requires redis package)
+    MONGODB: MongoDB (requires pymongo)
+    """
+    FILE = "file"
+    SQLITE = "sqlite"
+    REDIS = "redis"
+    MONGODB = "mongodb"
+
+
 @dataclass
 class LearnConfig:
     """
@@ -66,16 +94,21 @@ class LearnConfig:
     to improve future responses. All learning data is stored within the memory system.
     
     Usage:
-        # Simple enable
-        Agent(memory=MemoryConfig(learn=True))
+        # Simple enable (top-level param)
+        Agent(learn=True)
         
         # With specific capabilities
-        Agent(memory=MemoryConfig(
-            learn=LearnConfig(
-                persona=True,      # User preferences
-                insights=True,     # Observations
-                patterns=True,     # Reusable knowledge
-            )
+        Agent(learn=LearnConfig(
+            persona=True,      # User preferences
+            insights=True,     # Observations
+            patterns=True,     # Reusable knowledge
+            mode="agentic",    # Auto-extract learnings
+        ))
+        
+        # With database backend
+        Agent(learn=LearnConfig(
+            backend="sqlite",
+            db_url="sqlite:///learn.db",
         ))
     """
     # Learning capabilities
@@ -87,15 +120,19 @@ class LearnConfig:
     feedback: bool = False     # Outcome signals
     improvements: bool = False # Self-improvement proposals
     
+    # Learning mode
+    mode: Union[str, LearnMode] = LearnMode.DISABLED  # How to extract learnings
+    
     # Scope configuration
     scope: Union[str, LearnScope] = LearnScope.PRIVATE
     
-    # Storage configuration
-    store_path: Optional[str] = None  # Custom storage path
+    # Storage backend configuration
+    backend: Union[str, LearnBackend] = LearnBackend.FILE  # Storage backend
+    db_url: Optional[str] = None  # Database connection URL (for non-file backends)
+    store_path: Optional[str] = None  # Custom storage path (for file backend)
     
-    # Maintenance settings
-    auto_consolidate: bool = True     # Auto-consolidate learnings
-    retention_days: Optional[int] = None  # Days to retain (None = forever)
+    # LLM for learning extraction
+    llm: Optional[str] = None  # LLM model for extracting learnings (defaults to agent's LLM)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -107,10 +144,12 @@ class LearnConfig:
             "decisions": self.decisions,
             "feedback": self.feedback,
             "improvements": self.improvements,
+            "mode": self.mode.value if isinstance(self.mode, LearnMode) else self.mode,
             "scope": self.scope.value if isinstance(self.scope, LearnScope) else self.scope,
+            "backend": self.backend.value if isinstance(self.backend, LearnBackend) else self.backend,
+            "db_url": self.db_url,
             "store_path": self.store_path,
-            "auto_consolidate": self.auto_consolidate,
-            "retention_days": self.retention_days,
+            "llm": self.llm,
         }
 
 
