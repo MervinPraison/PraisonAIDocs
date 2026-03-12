@@ -1,0 +1,196 @@
+---
+title: "A2A Architecture"
+description: "Architecture and data flow diagrams for the A2A protocol"
+icon: "diagram-project"
+---
+
+# A2A Protocol Architecture
+
+## Overview
+
+The A2A (Agent-to-Agent) protocol enables PraisonAI agents to communicate with other A2A-compatible systems using JSON-RPC 2.0 over HTTP.
+
+## Architecture Diagram
+
+```mermaid
+flowchart TD
+    subgraph Client["A2A Client"]
+        CC[Client Code]
+    end
+
+    subgraph Server["PraisonAI A2A Server"]
+        subgraph Endpoints["FastAPI Router"]
+            DC["GET /.well-known/agent.json"]
+            ST["GET /status"]
+            JR["POST /a2a (JSON-RPC 2.0)"]
+        end
+
+        subgraph Handlers["JSON-RPC Handlers"]
+            MS["message/send"]
+            MST["message/stream"]
+            TG["tasks/get"]
+            TC["tasks/cancel"]
+        end
+
+        subgraph Core["Core Modules"]
+            AC["AgentCard Generator"]
+            TS["TaskStore"]
+            CV["Message Converter"]
+            SM["SSE Streaming"]
+        end
+
+        subgraph Agent["PraisonAI Agent"]
+            AG["agent.chat()"]
+        end
+    end
+
+    CC -->|Discovery| DC --> AC
+    CC -->|Health| ST
+    CC -->|JSON-RPC| JR
+
+    JR -->|Route| MS
+    JR -->|Route| MST
+    JR -->|Route| TG
+    JR -->|Route| TC
+
+    MS --> CV --> AG
+    MS --> TS
+    MST --> SM --> AG
+    TG --> TS
+    TC --> TS
+```
+
+## Data Flow: message/send
+
+```mermaid
+sequenceDiagram
+    participant C as A2A Client
+    participant R as POST /a2a
+    participant TS as TaskStore
+    participant CV as Converter
+    participant AG as Agent
+
+    C->>R: JSON-RPC request
+    Note over C,R: method: "message/send"
+    R->>R: Validate jsonrpc == "2.0"
+    R->>TS: create_task(message)
+    TS-->>R: Task (submitted)
+    R->>TS: update_status(working)
+    R->>CV: extract_user_input(message)
+    CV-->>R: "user text"
+    R->>AG: agent.chat("user text")
+    AG-->>R: response text
+    R->>CV: praisonai_to_a2a_message()
+    R->>CV: create_artifact()
+    R->>TS: add_artifact + add_to_history
+    R->>TS: update_status(completed)
+    TS-->>R: Task (completed)
+    R-->>C: JSON-RPC response with Task
+```
+
+## Data Flow: message/stream
+
+```mermaid
+sequenceDiagram
+    participant C as A2A Client
+    participant R as POST /a2a
+    participant TS as TaskStore
+    participant SM as SSE Streamer
+    participant AG as Agent
+
+    C->>R: JSON-RPC request
+    Note over C,R: method: "message/stream"
+    R->>TS: create_task(message)
+    TS-->>R: Task (submitted)
+    R->>SM: stream_agent_response()
+    SM-->>C: SSE: event:task.status (working)
+    SM->>AG: agent.chat("user text")
+    AG-->>SM: response text
+    SM-->>C: SSE: event:task.artifact (response)
+    SM-->>C: SSE: event:task.status (completed)
+    SM-->>C: SSE: event:done
+```
+
+## Task Lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> submitted: message/send or message/stream
+    submitted --> working: Agent starts processing
+    working --> completed: Agent responds successfully
+    working --> failed: Agent error
+    working --> cancelled: tasks/cancel
+    working --> input_required: Agent needs more info
+    input_required --> working: User sends follow-up
+    completed --> [*]
+    failed --> [*]
+    cancelled --> [*]
+```
+
+## Module Structure
+
+```mermaid
+graph LR
+    subgraph "praisonaiagents.ui.a2a"
+        A["a2a.py<br/>A2A class + router"]
+        B["types.py<br/>Pydantic models"]
+        C["task_store.py<br/>Task CRUD"]
+        D["streaming.py<br/>SSE encoder"]
+        E["conversion.py<br/>Message converter"]
+        F["agent_card.py<br/>Card generator"]
+    end
+
+    A --> B
+    A --> C
+    A --> D
+    A --> E
+    A --> F
+
+    style A fill:#4CAF50,color:#fff
+    style B fill:#2196F3,color:#fff
+    style C fill:#FF9800,color:#fff
+    style D fill:#9C27B0,color:#fff
+    style E fill:#f44336,color:#fff
+    style F fill:#795548,color:#fff
+```
+
+## Quick Setup
+
+```python
+from praisonaiagents import Agent, A2A
+from fastapi import FastAPI
+import uvicorn
+
+agent = Agent(
+    name="Assistant",
+    instructions="You are a helpful assistant",
+    tools=[search, calculate]
+)
+
+# 2 lines to expose as A2A server
+a2a = A2A(agent=agent, url="http://localhost:8000/a2a")
+
+app = FastAPI()
+app.include_router(a2a.get_router())
+uvicorn.run(app, port=8000)
+```
+
+## JSON-RPC Methods
+
+| Method | Description | Required Params |
+|--------|-------------|----------------|
+| `message/send` | Send message, get response | `params.message` |
+| `message/stream` | Stream response as SSE | `params.message` |
+| `tasks/get` | Get task by ID | `params.id` |
+| `tasks/cancel` | Cancel task by ID | `params.id` |
+
+## Error Codes
+
+| Code | Meaning |
+|------|---------|
+| `-32700` | Parse error (invalid JSON) |
+| `-32600` | Invalid Request (bad jsonrpc) |
+| `-32601` | Method not found |
+| `-32602` | Invalid params |
+| `-32603` | Internal error |
+| `-32000` | Task not found |
