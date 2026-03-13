@@ -2020,6 +2020,8 @@ Summary:"""
             self._file_snapshot = None
             self._snapshot_stack = []
             self._redo_stack = []
+            self._autonomy_turn_tool_count = 0
+            self._consecutive_no_tool_turns = 0
             return
         
         self.autonomy_enabled = True
@@ -2047,12 +2049,15 @@ Summary:"""
             self._file_snapshot = None
             self._snapshot_stack = []
             self._redo_stack = []
+            self._autonomy_turn_tool_count = 0
+            self._consecutive_no_tool_turns = 0
             return
         
         # Preserve ALL AutonomyConfig fields in the dict (G14 fix: no lossy extraction)
         self.autonomy_config = {
             "enabled": config.enabled,
             "level": config.level,
+            "mode": config.mode,
             "max_iterations": config.max_iterations,
             "doom_loop_threshold": config.doom_loop_threshold,
             "auto_escalate": config.auto_escalate,
@@ -2488,6 +2493,8 @@ Summary:"""
                 
                 # Execute one turn using the agent's chat method
                 # Always use the original prompt (prompt re-injection)
+                # Reset per-turn tool count for no-tool-call detection
+                self._autonomy_turn_tool_count = 0
                 try:
                     response = self.chat(prompt)
                 except Exception as e:
@@ -2504,6 +2511,10 @@ Summary:"""
                     )
                 
                 response_str = str(response)
+                
+                # Record response text for content streaming loop detection
+                if self._doom_loop_tracker is not None:
+                    self._doom_loop_tracker.record_response(response_str)
                 
                 # Record the action for doom loop tracking (G1 fix: was missing)
                 # Use iteration number + response hash to avoid false positives
@@ -2622,6 +2633,30 @@ Summary:"""
                 # Clear context between iterations if enabled
                 if effective_clear_context:
                     self.clear_history()
+                
+                # No-tool-call termination: if model makes no tool calls for 2+
+                # consecutive turns, treat as completion signal.
+                # Skip first iteration (model may be planning).
+                if self._autonomy_turn_tool_count == 0 and iterations > 1:
+                    self._consecutive_no_tool_turns += 1
+                    if self._consecutive_no_tool_turns >= 2:
+                        execute_sync_callback('autonomy_complete',
+                            completion_reason="no_tool_calls",
+                            iterations=iterations,
+                            duration_seconds=time_module.time() - start_time
+                        )
+                        return AutonomyResult(
+                            success=True,
+                            output=response_str,
+                            completion_reason="no_tool_calls",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                else:
+                    self._consecutive_no_tool_turns = 0
             
             # Max iterations reached
             # P3/G2: Emit completion callback for max iterations
@@ -4520,6 +4555,8 @@ Your Goal: {self.goal}"""
             run_id=getattr(self, '_current_run_id', 'unknown'),
             session_id=getattr(self, '_session_id', None) or 'default',
             last_user_message=self.chat_history[-1].get('content') if self.chat_history else None,
+            memory=getattr(self, '_memory_instance', None),
+            learn_manager=getattr(getattr(self, '_memory_instance', None), 'learn', None),
             metadata={'agent_name': self.name}
         )
         
@@ -4631,6 +4668,9 @@ Your Goal: {self.goal}"""
                 is_error = isinstance(result, dict) and result.get('error')
                 if not is_error:
                     self._doom_loop_tracker.mark_progress(f"tool:{function_name}")
+            
+            # Increment per-turn tool count for no-tool-call detection
+            self._autonomy_turn_tool_count = getattr(self, '_autonomy_turn_tool_count', 0) + 1
             
             return result
         except Exception as e:
@@ -6742,23 +6782,49 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # This allows: Agent(autonomy=True) + await agent.astart("Task") to just work!
         # ─────────────────────────────────────────────────────────────────────
         if self.autonomy_enabled:
-            # Extract autonomy-specific kwargs
-            timeout = kwargs.pop('timeout', None)
-            kwargs.pop('stream', None)  # Not used in autonomous mode
-            
-            # Get config values from autonomy_config
             auto_config = self.autonomy_config or {}
-            max_iterations = auto_config.get('max_iterations', 20)
-            completion_promise = auto_config.get('completion_promise')
-            clear_context = auto_config.get('clear_context', False)
+            mode = auto_config.get('mode', 'caller')
             
-            return await self.run_autonomous_async(
-                prompt=prompt,
-                max_iterations=max_iterations,
-                timeout_seconds=timeout,
-                completion_promise=completion_promise,
-                clear_context=clear_context,
-            )
+            if mode == 'iterative':
+                # Iterative mode: use run_autonomous_async (backward compat for full_auto)
+                timeout = kwargs.pop('timeout', None)
+                kwargs.pop('stream', None)  # Not used in autonomous mode
+                max_iterations = auto_config.get('max_iterations', 20)
+                completion_promise = auto_config.get('completion_promise')
+                clear_context = auto_config.get('clear_context', False)
+                
+                return await self.run_autonomous_async(
+                    prompt=prompt,
+                    max_iterations=max_iterations,
+                    timeout_seconds=timeout,
+                    completion_promise=completion_promise,
+                    clear_context=clear_context,
+                )
+            else:
+                # Caller mode: single achat() call, wrapper-equivalent
+                import time as time_module
+                from datetime import datetime, timezone
+                start_time = time_module.time()
+                started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                
+                response = await self.achat(prompt, **kwargs)
+                response_str = str(response) if response else ""
+                
+                # Auto-save session after chat
+                self._auto_save_session()
+                
+                # Wrap in AutonomyResult for consistent API
+                from .autonomy import AutonomyResult
+                return AutonomyResult(
+                    success=True,
+                    output=response_str,
+                    completion_reason="caller_mode",
+                    iterations=1,
+                    stage="direct",
+                    actions=[],
+                    duration_seconds=time_module.time() - start_time,
+                    started_at=started_at,
+                )
         
         # Determine streaming behavior (same logic as start())
         stream_requested = kwargs.get('stream')
@@ -7011,22 +7077,54 @@ Write the complete compiled report:"""
         # This allows: Agent(autonomy=True) + agent.start("Task") to just work!
         # ─────────────────────────────────────────────────────────────────────
         if self.autonomy_enabled:
-            # Extract autonomy-specific kwargs
-            timeout = kwargs.pop('timeout', None)
-            
-            # Get config values from autonomy_config
             auto_config = self.autonomy_config or {}
-            max_iterations = auto_config.get('max_iterations', 20)
-            completion_promise = auto_config.get('completion_promise')
-            clear_context = auto_config.get('clear_context', False)
+            mode = auto_config.get('mode', 'caller')
             
-            return self.run_autonomous(
-                prompt=prompt,
-                max_iterations=max_iterations,
-                timeout_seconds=timeout,
-                completion_promise=completion_promise,
-                clear_context=clear_context,
-            )
+            if mode == 'iterative':
+                # Iterative mode: use run_autonomous (backward compat for full_auto)
+                timeout = kwargs.pop('timeout', None)
+                max_iterations = auto_config.get('max_iterations', 20)
+                completion_promise = auto_config.get('completion_promise')
+                clear_context = auto_config.get('clear_context', False)
+                
+                return self.run_autonomous(
+                    prompt=prompt,
+                    max_iterations=max_iterations,
+                    timeout_seconds=timeout,
+                    completion_promise=completion_promise,
+                    clear_context=clear_context,
+                )
+            else:
+                # Caller mode: single chat() call, wrapper-equivalent
+                # All init-time features (approval, doom-loop per-tool,
+                # track_changes, sandbox, default_tools) are already wired.
+                import time as time_module
+                from datetime import datetime, timezone
+                start_time = time_module.time()
+                started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                
+                # Load history from past sessions
+                self._load_history_context()
+                
+                # Use chat() — all tools, approval, doom-loop per-tool work
+                response = self.chat(prompt, **kwargs)
+                response_str = str(response) if response else ""
+                
+                # Auto-save session after chat
+                self._auto_save_session()
+                
+                # Wrap in AutonomyResult for consistent API
+                from .autonomy import AutonomyResult
+                return AutonomyResult(
+                    success=True,
+                    output=response_str,
+                    completion_reason="caller_mode",
+                    iterations=1,
+                    stage="direct",
+                    actions=[],
+                    duration_seconds=time_module.time() - start_time,
+                    started_at=started_at,
+                )
         
         # Load history from past sessions
         self._load_history_context()
