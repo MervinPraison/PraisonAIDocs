@@ -2022,6 +2022,7 @@ Summary:"""
             self._redo_stack = []
             self._autonomy_turn_tool_count = 0
             self._consecutive_no_tool_turns = 0
+            self._doom_recovery_active = False
             return
         
         self.autonomy_enabled = True
@@ -2051,6 +2052,7 @@ Summary:"""
             self._redo_stack = []
             self._autonomy_turn_tool_count = 0
             self._consecutive_no_tool_turns = 0
+            self._doom_recovery_active = False
             return
         
         # Preserve ALL AutonomyConfig fields in the dict (G14 fix: no lossy extraction)
@@ -2079,6 +2081,7 @@ Summary:"""
         
         self._autonomy_trigger = AutonomyTrigger()
         self._doom_loop_tracker = DoomLoopTracker(threshold=config.doom_loop_threshold)
+        self._doom_recovery_active = False
         
         # Initialize FileSnapshot for filesystem tracking (lazy import)
         self._file_snapshot = None
@@ -2439,57 +2442,6 @@ Summary:"""
                         started_at=started_at,
                     )
                 
-                # Check doom loop with graduated recovery (G-RECOVERY-2 fix)
-                if self._is_doom_loop():
-                    recovery = self._get_doom_recovery()
-                    
-                    # P3/G2: Emit doom loop callback for CLI visibility
-                    execute_sync_callback('autonomy_doom_loop',
-                        iteration=iterations,
-                        recovery_action=recovery
-                    )
-                    
-                    obs = getattr(self, '_observability_hooks', None)
-                    if obs is not None:
-                        from ..escalation.observability import EventType as _EvtType
-                        obs.emit(_EvtType.STEP_END, {
-                            "doom_loop": True,
-                            "recovery_action": recovery,
-                            "iteration": iterations,
-                        })
-                    if recovery == "retry_different":
-                        prompt = prompt + "\n\n[System: Previous approach repeated. Try a completely different strategy.]"
-                        if self._doom_loop_tracker is not None:
-                            self._doom_loop_tracker.clear_actions()
-                        continue
-                    elif recovery == "escalate_model":
-                        # Give the agent one more try with explicit error guidance
-                        prompt = prompt + "\n\n[System: You are stuck in a loop. CRITICAL: Check that all tool argument names exactly match the function signature. Do NOT add '=' to argument names. Use only the documented parameter names.]"
-                        if self._doom_loop_tracker is not None:
-                            self._doom_loop_tracker.clear_actions()
-                        continue
-                    elif recovery == "request_help":
-                        return AutonomyResult(
-                            success=False,
-                            output="Task needs human guidance (doom loop recovery exhausted)",
-                            completion_reason="needs_help",
-                            iterations=iterations,
-                            stage=stage,
-                            actions=actions_taken,
-                            duration_seconds=time_module.time() - start_time,
-                            started_at=started_at,
-                        )
-                    else:
-                        return AutonomyResult(
-                            success=False,
-                            output="Task stopped due to repeated actions (doom loop)",
-                            completion_reason="doom_loop",
-                            iterations=iterations,
-                            stage=stage,
-                            actions=actions_taken,
-                            duration_seconds=time_module.time() - start_time,
-                            started_at=started_at,
-                        )
                 
                 # Execute one turn using the agent's chat method
                 # Always use the original prompt (prompt re-injection)
@@ -2517,14 +2469,71 @@ Summary:"""
                     self._doom_loop_tracker.record_response(response_str)
                 
                 # Record the action for doom loop tracking (G1 fix: was missing)
-                # Use iteration number + response hash to avoid false positives
-                # when same prompt is re-injected (G8 fix: doom loop false positive)
+                # Use response hash only — iteration was removed because it made
+                # every fingerprint unique, preventing doom loop detection.
                 self._record_action(
                     "chat", 
-                    {"iteration": iterations, "response_hash": hash(response_str[:500])}, 
+                    {"response_hash": hash(response_str[:500])}, 
                     response_str[:200], 
                     True
                 )
+                
+                # Check doom loop AFTER recording action so detector sees
+                # the current iteration's fingerprint (repositioned from top
+                # of loop for correct detection timing).
+                if self._is_doom_loop():
+                    recovery = self._get_doom_recovery()
+                    
+                    # P3/G2: Emit doom loop callback for CLI visibility
+                    execute_sync_callback('autonomy_doom_loop',
+                        iteration=iterations,
+                        recovery_action=recovery
+                    )
+                    
+                    obs = getattr(self, '_observability_hooks', None)
+                    if obs is not None:
+                        from ..escalation.observability import EventType as _EvtType
+                        obs.emit(_EvtType.STEP_END, {
+                            "doom_loop": True,
+                            "recovery_action": recovery,
+                            "iteration": iterations,
+                        })
+                    if recovery == "retry_different":
+                        prompt = prompt + "\n\n[System: Previous approach repeated. Try a completely different strategy.]"
+                        if self._doom_loop_tracker is not None:
+                            self._doom_loop_tracker.clear_actions()
+                        self._consecutive_no_tool_turns = 0
+                        self._doom_recovery_active = True
+                        continue
+                    elif recovery == "escalate_model":
+                        prompt = prompt + "\n\n[System: You are stuck in a loop. CRITICAL: Check that all tool argument names exactly match the function signature. Do NOT add '=' to argument names. Use only the documented parameter names.]"
+                        if self._doom_loop_tracker is not None:
+                            self._doom_loop_tracker.clear_actions()
+                        self._consecutive_no_tool_turns = 0
+                        self._doom_recovery_active = True
+                        continue
+                    elif recovery == "request_help":
+                        return AutonomyResult(
+                            success=False,
+                            output="Task needs human guidance (doom loop recovery exhausted)",
+                            completion_reason="needs_help",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                    else:
+                        return AutonomyResult(
+                            success=False,
+                            output="Task stopped due to repeated actions (doom loop)",
+                            completion_reason="doom_loop",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
                 
                 # Record for action history
                 actions_taken.append({
@@ -2551,6 +2560,30 @@ Summary:"""
                 
                 # Auto-save session after each iteration (memory integration)
                 self._auto_save_session()
+                
+                # ─────────────────────────────────────────────────────────────
+                # TOOL-CALL COMPLETION: If the model used tools this turn AND
+                # produced a substantive response, the inner loop completed
+                # the task naturally (model stopped calling tools = done).
+                # This is the same signal the CLI/wrapper path trusts.
+                # ─────────────────────────────────────────────────────────────
+                if self._autonomy_turn_tool_count > 0 and len(response_str) > 100:
+                    # P3/G2: Emit completion callback
+                    execute_sync_callback('autonomy_complete',
+                        completion_reason="tool_completion",
+                        iterations=iterations,
+                        duration_seconds=time_module.time() - start_time
+                    )
+                    return AutonomyResult(
+                        success=True,
+                        output=response_str,
+                        completion_reason="tool_completion",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
                 
                 # Auto-escalate stage if stuck (G11 fix: wire auto_escalate)
                 if (self.autonomy_config.get("auto_escalate")
@@ -2637,7 +2670,11 @@ Summary:"""
                 # No-tool-call termination: if model makes no tool calls for 2+
                 # consecutive turns, treat as completion signal.
                 # Skip first iteration (model may be planning).
-                if self._autonomy_turn_tool_count == 0 and iterations > 1:
+                # Suppressed when doom recovery is active — once a doom loop
+                # is detected, no_tool_calls (a success exit) should not fire;
+                # the doom loop system manages termination instead.
+                if (self._autonomy_turn_tool_count == 0 and iterations > 1
+                        and not self._doom_recovery_active):
                     self._consecutive_no_tool_turns += 1
                     if self._consecutive_no_tool_turns >= 2:
                         execute_sync_callback('autonomy_complete',
@@ -2802,7 +2839,45 @@ Summary:"""
                         started_at=started_at,
                     )
                 
-                # Check doom loop with graduated recovery (G-RECOVERY-2 fix)
+                
+                # Execute one turn using the agent's async chat method
+                # Always use the original prompt (prompt re-injection)
+                # Reset per-turn tool count for no-tool-call detection
+                self._autonomy_turn_tool_count = 0
+                try:
+                    response = await self.achat(prompt)
+                except Exception as e:
+                    return AutonomyResult(
+                        success=False,
+                        output=str(e),
+                        completion_reason="error",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        error=str(e),
+                        started_at=started_at,
+                    )
+                
+                response_str = str(response)
+                
+                # Record response text for content streaming loop detection
+                if self._doom_loop_tracker is not None:
+                    self._doom_loop_tracker.record_response(response_str)
+                
+                # Record the action for doom loop tracking (G1 fix: was missing)
+                # Use response hash only — iteration was removed because it made
+                # every fingerprint unique, preventing doom loop detection.
+                self._record_action(
+                    "chat", 
+                    {"response_hash": hash(response_str[:500])}, 
+                    response_str[:200], 
+                    True
+                )
+                
+                # Check doom loop AFTER recording action so detector sees
+                # the current iteration's fingerprint (repositioned from top
+                # of loop for correct detection timing).
                 if self._is_doom_loop():
                     recovery = self._get_doom_recovery()
                     obs = getattr(self, '_observability_hooks', None)
@@ -2817,11 +2892,15 @@ Summary:"""
                         prompt = prompt + "\n\n[System: Previous approach repeated. Try a completely different strategy.]"
                         if self._doom_loop_tracker is not None:
                             self._doom_loop_tracker.clear_actions()
+                        self._consecutive_no_tool_turns = 0
+                        self._doom_recovery_active = True
                         continue
                     elif recovery == "escalate_model":
                         prompt = prompt + "\n\n[System: You are stuck in a loop. CRITICAL: Check that all tool argument names exactly match the function signature. Do NOT add '=' to argument names. Use only the documented parameter names.]"
                         if self._doom_loop_tracker is not None:
                             self._doom_loop_tracker.clear_actions()
+                        self._consecutive_no_tool_turns = 0
+                        self._doom_recovery_active = True
                         continue
                     elif recovery == "request_help":
                         return AutonomyResult(
@@ -2845,35 +2924,6 @@ Summary:"""
                             duration_seconds=time_module.time() - start_time,
                             started_at=started_at,
                         )
-                
-                # Execute one turn using the agent's async chat method
-                # Always use the original prompt (prompt re-injection)
-                try:
-                    response = await self.achat(prompt)
-                except Exception as e:
-                    return AutonomyResult(
-                        success=False,
-                        output=str(e),
-                        completion_reason="error",
-                        iterations=iterations,
-                        stage=stage,
-                        actions=actions_taken,
-                        duration_seconds=time_module.time() - start_time,
-                        error=str(e),
-                        started_at=started_at,
-                    )
-                
-                response_str = str(response)
-                
-                # Record the action for doom loop tracking (G2 fix: was missing)
-                # Use iteration number + response hash to avoid false positives
-                # when same prompt is re-injected (G8 fix: doom loop false positive)
-                self._record_action(
-                    "chat", 
-                    {"iteration": iterations, "response_hash": hash(response_str[:500])}, 
-                    response_str[:200], 
-                    True
-                )
                 
                 # Record for action history
                 actions_taken.append({
@@ -2900,6 +2950,23 @@ Summary:"""
                 
                 # Auto-save session after each async iteration (memory integration)
                 self._auto_save_session()
+                
+                # ─────────────────────────────────────────────────────────────
+                # TOOL-CALL COMPLETION: If the model used tools this turn AND
+                # produced a substantive response, the inner loop completed
+                # the task naturally (model stopped calling tools = done).
+                # ─────────────────────────────────────────────────────────────
+                if self._autonomy_turn_tool_count > 0 and len(response_str) > 100:
+                    return AutonomyResult(
+                        success=True,
+                        output=response_str,
+                        completion_reason="tool_completion",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
                 
                 # Auto-escalate stage if stuck (G11 fix: wire auto_escalate)
                 if (self.autonomy_config.get("auto_escalate")
@@ -2956,6 +3023,28 @@ Summary:"""
                 # Clear context between iterations if enabled
                 if effective_clear_context:
                     self.clear_history()
+                
+                # No-tool-call termination: if model makes no tool calls for 2+
+                # consecutive turns, treat as completion signal.
+                # Suppressed when doom recovery is active — once a doom loop
+                # is detected, no_tool_calls (a success exit) should not fire;
+                # the doom loop system manages termination instead.
+                if (self._autonomy_turn_tool_count == 0 and iterations > 1
+                        and not self._doom_recovery_active):
+                    self._consecutive_no_tool_turns += 1
+                    if self._consecutive_no_tool_turns >= 2:
+                        return AutonomyResult(
+                            success=True,
+                            output=response_str,
+                            completion_reason="no_tool_calls",
+                            iterations=iterations,
+                            stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                else:
+                    self._consecutive_no_tool_turns = 0
                 
                 # Yield control to allow other async tasks to run
                 await asyncio.sleep(0)
@@ -4186,6 +4275,7 @@ Your Goal: {self.goal}"""
             
             if tool_names:
                 system_prompt += f"\n\nYou have access to the following tools: {', '.join(tool_names)}. Use these tools when appropriate to help complete your tasks. Always use tools when they can help provide accurate information or perform actions."
+                system_prompt += "\n\nExplain Before Acting: When calling tools, provide a brief one-sentence explanation of what you are about to do and why before making the tool call. This helps maintain transparency. Skip explanations only for repetitive low-level operations where narration would be noisy."
         
         # Cache the generated system prompt (only if cache_key is set, i.e., memory not enabled)
         # Simple cache size limit to prevent unbounded growth
@@ -4538,10 +4628,16 @@ Your Goal: {self.goal}"""
             logging.debug(f"Type casting failed for {getattr(func, '__name__', 'unknown function')}: {e}")
             return arguments
 
-    def execute_tool(self, function_name, arguments):
+    def execute_tool(self, function_name, arguments, tool_call_id=None):
         """
         Execute a tool dynamically based on the function name and arguments.
         Injects agent state for tools with Injected[T] parameters.
+        
+        Args:
+            function_name: Name of the tool function to execute
+            arguments: Dictionary of arguments to pass to the tool
+            tool_call_id: Optional ID from the LLM's tool_call (e.g., 'call_xxxxx')
+                         Used for correlating TOOL_CALL_START/RESULT stream events
         """
         logging.debug(f"{self.name} executing tool {function_name} with arguments: {arguments}")
         
@@ -4561,18 +4657,41 @@ Your Goal: {self.goal}"""
         )
         
         # Execute within injection context
-        return self._execute_tool_with_context(function_name, arguments, state)
+        return self._execute_tool_with_context(function_name, arguments, state, tool_call_id)
     
-    def _execute_tool_with_context(self, function_name, arguments, state):
-        """Execute tool within injection context, with optional output truncation."""
+    def _execute_tool_with_context(self, function_name, arguments, state, tool_call_id=None):
+        """Execute tool within injection context, with optional output truncation.
+        
+        Args:
+            function_name: Name of the tool function to execute
+            arguments: Dictionary of arguments to pass to the tool
+            state: AgentState for injection context
+            tool_call_id: Optional ID from the LLM's tool_call (e.g., 'call_xxxxx')
+        """
         from ..tools.injected import with_injection_context
         from ..trace.context_events import get_context_emitter
+        from ..streaming.events import StreamEvent, StreamEventType
         import time as _time
         
         # Emit tool call start event (zero overhead when not set)
         _trace_emitter = get_context_emitter()
         _trace_emitter.tool_call_start(self.name, function_name, arguments)
         _tool_start_time = _time.time()
+        _tool_start_perf = _time.perf_counter()
+        
+        # Emit TOOL_CALL_START to stream_emitter (for AIUI/AG-UI consumers)
+        # Zero overhead when no callbacks registered
+        if hasattr(self, '_Agent__stream_emitter') and self.__stream_emitter is not None and self.__stream_emitter.has_callbacks:
+            self.__stream_emitter.emit(StreamEvent(
+                type=StreamEventType.TOOL_CALL_START,
+                timestamp=_tool_start_perf,
+                tool_call={
+                    "name": function_name,
+                    "arguments": arguments,  # PARSED DICT, not JSON string
+                    "id": tool_call_id,  # Now properly threaded through
+                },
+                agent_id=self.name,
+            ))
         
         try:
             # Trigger BEFORE_TOOL hook
@@ -4646,6 +4765,24 @@ Your Goal: {self.goal}"""
             # Emit tool call end event (truncation handled by context_events.py)
             _duration_ms = (_time.time() - _tool_start_time) * 1000
             _trace_emitter.tool_call_end(self.name, function_name, str(result) if result else None, _duration_ms)
+            
+            # Emit TOOL_CALL_RESULT to stream_emitter (for AIUI/AG-UI consumers)
+            # Zero overhead when no callbacks registered
+            if hasattr(self, '_Agent__stream_emitter') and self.__stream_emitter is not None and self.__stream_emitter.has_callbacks:
+                # Truncate result for stream event (keep it reasonable for UI display)
+                result_summary = str(result)[:500] if result else None
+                self.__stream_emitter.emit(StreamEvent(
+                    type=StreamEventType.TOOL_CALL_RESULT,
+                    timestamp=_time.perf_counter(),
+                    tool_call={
+                        "name": function_name,
+                        "arguments": arguments,
+                        "result": result_summary,
+                        "id": tool_call_id,  # Now properly threaded through
+                    },
+                    agent_id=self.name,
+                    metadata={"duration_ms": _duration_ms},
+                ))
             
             # Trigger AFTER_TOOL hook
             from ..hooks import HookEvent, AfterToolInput
@@ -7841,7 +7978,8 @@ Write the complete compiled report:"""
                                     
                                     tool_result = self.execute_tool(
                                         tool_call['function']['name'], 
-                                        parsed_args
+                                        parsed_args,
+                                        tool_call_id=tool_call.get('id')
                                     )
                                     # Add tool result to chat history
                                     self.chat_history.append({
