@@ -1045,7 +1045,7 @@ class Agent:
             session_id = _history_session_id
         elif _history_enabled and session_id is None and _history_session_id is None:
             import hashlib as _hl
-            _agent_hash = _hl.md5(name.encode()).hexdigest()[:8]
+            _agent_hash = _hl.md5((name or "agent").encode()).hexdigest()[:8]
             session_id = f"history_{_agent_hash}"
             _history_session_id = session_id
         
@@ -4278,7 +4278,7 @@ Your Goal: {self.goal}"""
             
             if tool_names:
                 system_prompt += f"\n\nYou have access to the following tools: {', '.join(tool_names)}. Use these tools when appropriate to help complete your tasks. Always use tools when they can help provide accurate information or perform actions."
-                system_prompt += "\n\nExplain Before Acting: When calling tools, provide a brief one-sentence explanation of what you are about to do and why before making the tool call. This helps maintain transparency. Skip explanations only for repetitive low-level operations where narration would be noisy."
+                system_prompt += "\n\nExplain Before Acting: Before calling a tool, provide a brief one-sentence explanation of what you are about to do and why. Skip explanations only for repetitive low-level operations where narration would be noisy. When performing a batch of similar operations (e.g. searching for multiple items), explain the group once rather than narrating each call individually."
         
         # Cache the generated system prompt (only if cache_key is set, i.e., memory not enabled)
         # Simple cache size limit to prevent unbounded growth
@@ -5722,7 +5722,7 @@ Your Goal: {self.goal}"""
             from datetime import datetime, timezone
             # Per-hour session ID: YYYYMMDDHH (UTC) + agent name hash for uniqueness
             hour_str = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-            agent_hash = hashlib.md5(self.name.encode()).hexdigest()[:6]
+            agent_hash = hashlib.md5((self.name or "agent").encode()).hexdigest()[:6]
             self._session_id = f"{hour_str}-{agent_hash}"
         
         # Call db adapter's on_agent_start to get previous messages
