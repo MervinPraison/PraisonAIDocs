@@ -5,7 +5,17 @@ description: "Understand how autonomy and interactive modes differ, their tool s
 icon: "scale-balanced"
 ---
 
-PraisonAI provides two distinct execution approaches: **Autonomy** (structured result with optional multi-turn loops) and **Interactive** (single-turn, human-in-the-loop). Understanding the `mode` field — `"caller"` vs `"iterative"` — helps you choose the right approach.
+PraisonAI provides two primary execution approaches: **Autonomy** (agent-driven results) and **Interactive** (human-driven sessions). Understanding the distinction between **Iterative** (autonomous loop) and **Interactive** (manual loop) is key to building complex workflows.
+
+## At a Glance: Iterative vs. Interactive
+
+While the names sound similar, they represent the two sides of "who drives the loop":
+
+| Term | Driver | Paradigm | Best For |
+|------|--------|----------|----------|
+| **Interactive** | 👤 **Human** | Chat / TUI | Exploratory work, manual guidance |
+| **Iterative** | 🧠 **Agent** | Autonomy (mode="iterative") | Self-correction, multi-step automation |
+| **Caller** | — | Single-turn response | Quick actions, direct pipelines |
 
 ## Execution Mode
 
@@ -51,31 +61,33 @@ sequenceDiagram
     participant Agent as agent.start()
     participant Auto as run_autonomous()
     participant Chat as chat()
-    participant Tools as Tool Executor
+    participant Inner as Inner Tool Loop
+    participant LLM as LLM
 
     User->>Agent: agent.start(prompt)
-    Note over Agent: autonomy=True detected
+    Note over Agent: mode="iterative"
     Agent->>Auto: Route to autonomous loop
-    Auto->>Auto: Git snapshot (before)
-    loop while iterations < max
-        Auto->>Chat: chat(prompt)
-        Chat->>Tools: Execute tool calls
-        Tools-->>Chat: Tool results
-        Chat-->>Auto: LLM response
-        Auto->>Auto: Doom loop check
-        Auto->>Auto: Completion promise check
-        Auto->>Auto: Stage escalation
-        Auto->>Auto: Auto-save session
+    Auto->>Chat: chat(prompt)
+    Chat->>Inner: _chat_completion(messages, tools)
+    
+    loop Model decides what tools to call
+        Inner->>LLM: prompt + tools
+        LLM-->>Inner: tool_calls=[search, write_file]
+        Inner->>Inner: Execute tools, collect results
     end
-    Auto->>Auto: Git snapshot (after)
-    alt Promise found
-        Auto-->>User: ✅ AutonomyResult(success=True)
-    else Max iterations reached
-        Auto-->>User: ⚠️ AutonomyResult(reason="max_iterations")
-    else Doom loop detected
-        Auto-->>User: 🛑 AutonomyResult(reason="doom_loop")
-    end
+    
+    Inner->>LLM: tool results
+    LLM-->>Inner: Summary response (no more tools)
+    Note over Inner: Model stopped calling tools
+    Inner-->>Chat: Final response
+    Chat-->>Auto: Response text
+    Note over Auto: Tools used + response produced = done
+    Auto-->>User: ✅ AutonomyResult(reason="tool_completion")
 ```
+
+<Tip>
+**Key insight**: All three modes use the same inner tool loop. The difference is what wraps it — nothing (interactive), an AutonomyResult wrapper (caller), or a multi-turn retry loop (iterative).
+</Tip>
 
 ### Interactive Mode Flow
 
@@ -107,19 +119,21 @@ sequenceDiagram
 ```
 
 <Note>
-**Key difference**: In **caller mode**, the agent performs one `chat()` call and wraps the result. In **iterative mode**, the agent drives a loop internally with safety checks. In **interactive mode**, the human drives the loop externally. All three use the same `chat()` → tool executor underneath.
+**The Loop Driver Distinction**:
+- **Interactive Mode**: The **human** provides the prompt, the agent responds once, and the human decides the next prompt.
+- **Iterative Mode**: The **agent** provides its own prompts to itself in a loop until it detects the task is complete.
+- **Caller Mode**: A simplified "one-shot" interaction that returns rich metadata.
 </Note>
 
 ## Feature Comparison
 
 | Dimension | Caller Mode (`autonomy=True`) | Iterative Mode (`full_auto`) | Interactive (no autonomy) |
 |-----------|-------------------------------|------------------------------|---------------------------|
-| **Mode** | `"caller"` | `"iterative"` | N/A |
-| **Turns** | 1 (single `chat()`) | Up to `max_iterations` | Single turn per call |
+| **Primary Driver** | Application Code | 🧠 **Agent** (Internal Loop) | 👤 **Human** (External Loop) |
+| **Turns** | 1 (single `chat()`) | Up to `max_iterations` | Single turn per interaction |
+| **Complexity Mgt** | Simple pipelines | Automated self-correction | Manual refinement |
 | **Return type** | `AutonomyResult` | `AutonomyResult` | `str` |
-| **Self-correction** | ❌ | ✅ Doom loop + recovery | ❌ |
-| **Completion signal** | `"caller_mode"` | Promise/keyword detection | N/A |
-| **Stage escalation** | ❌ | ✅ Auto-escalate | N/A |
+| **Self-correction** | ❌ | ✅ Doom loop + recovery | ❌ (Human corrects) |
 | **Session persistence** | Manual | Auto-saves each iteration | Manual |
 | **Observability** | Standard | Built-in event emission | Standard |
 
@@ -172,7 +186,7 @@ Per-iteration overhead is **~0.5ms** — negligible compared to LLM API calls (t
 </Warning>
 
 <Warning>
-**Early completion risk**: If the LLM says `"I'm done searching"` mid-task, autonomy mode stops early. For multi-step tasks, use structured completion signals:
+**Early completion risk**: If the LLM says `"I'm done searching"` mid-task, keyword-based detection might stop early. For multi-step tasks, the **tool completion** signal is the primary mechanism — the model naturally stops calling tools when done. For explicit control, use structured completion signals:
 ```python
 Agent(autonomy={"completion_promise": "COMPLETED"})
 ```
@@ -302,36 +316,47 @@ Interactive tools are defined as groups in `interactive_tools.py` with a `TOOL_G
   </Accordion>
 </AccordionGroup>
 
-## When to use which mode
+## When to Use Each Mode
 
-<CardGroup cols={2}>
-  <Card title="Use Autonomy Mode" icon="robot">
-    - Multi-step tasks (refactoring, debugging)
-    - Tasks that need self-correction
-    - Batch/unattended execution
-    - Tasks where you want git safety nets
-    
+| Mode | Best For | Example Prompt | What Happens |
+|------|----------|---------------|--------------|
+| **No autonomy** | Questions, explanations, advice | "Explain authentication patterns" | Agent answers from knowledge — doesn't touch files or run tools |
+| **Caller** (default) | Single-shot automation, pipelines | "Search for X and save results to file" | Agent uses tools in one turn, returns `AutonomyResult` with metadata |
+| **Iterative** | Multi-step self-correction, build→test→fix | "Refactor auth module and verify tests pass" | Agent loops until task is complete, with doom loop protection |
+
+<CardGroup cols={3}>
+  <Card title="No Autonomy" icon="message">
+    **Fastest** — agent explains but doesn't act.
+
     ```python
     agent = Agent(
-        instructions="Refactor and test",
-        autonomy=True,
-        tools=[my_tools]
-    )
-    agent.start("Refactor the auth module")
-    ```
-  </Card>
-  <Card title="Use Interactive Mode" icon="message">
-    - Conversational Q&A
-    - Quick one-off tasks
-    - Human-guided workflows
-    - Streaming responses
-    
-    ```python
-    agent = Agent(
-        instructions="Help with coding",
-        tools=[my_tools]
+        instructions="Help with coding"
     )
     agent.start("Explain this function")
+    ```
+  </Card>
+  <Card title="Caller Mode" icon="bolt">
+    **One turn** — agent acts immediately with tools.
+
+    ```python
+    agent = Agent(
+        instructions="You are a research assistant",
+        autonomy=True
+    )
+    result = agent.start("Search and save to file")
+    print(result.success)
+    ```
+  </Card>
+  <Card title="Iterative Mode" icon="rotate">
+    **Multi-turn** — agent self-corrects until done.
+
+    ```python
+    agent = Agent(
+        instructions="Build and test features",
+        autonomy={"mode": "iterative"}
+    )
+    result = agent.start("Refactor the auth module")
+    print(result.iterations)
     ```
   </Card>
 </CardGroup>

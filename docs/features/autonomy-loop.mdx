@@ -14,21 +14,25 @@ Autonomous loops let agents work iteratively on complex tasks, automatically sto
 flowchart LR
     A[Start Loop] --> B[Execute Task]
     B --> S[Auto-Save Session]
-    S --> C{Check Completion}
-    C -->|Promise Found| D[✅ Success]
+    S --> TC{Tools used\nthis turn?}
+    TC -->|Yes + response| D1["✅ Tool Completion"]
+    TC -->|No| C{Check Other Signals}
+    C -->|Promise Found| D[✅ Promise Match]
     C -->|Max Iterations| E[⚠️ Limit Reached]
     C -->|Doom Loop| F[🛑 Stopped]
-    C -->|Continue| G[Clear Context?]
-    G -->|Yes| H[Reset Memory]
-    G -->|No| B
-    H --> B
+    C -->|Continue| B
     
     style A fill:#8B0000,color:#fff
     style S fill:#F59E0B,color:#fff
+    style D1 fill:#10B981,color:#fff
     style D fill:#189AB4,color:#fff
     style E fill:#189AB4,color:#fff
     style F fill:#189AB4,color:#fff
 ```
+
+<Info>
+The most common completion path is **tool completion** — the model calls tools to do the work, then produces a summary without requesting more tools. This is the same mechanism ChatGPT and Claude use.
+</Info>
 
 ## Quick Start
 
@@ -96,31 +100,33 @@ sequenceDiagram
     participant Agent as agent.start()
     participant Auto as run_autonomous()
     participant Chat as chat()
-    participant Tools as Tool Executor
+    participant Inner as Inner Tool Loop
+    participant LLM as LLM
 
     User->>Agent: agent.start(prompt)
     Note over Agent: autonomy=True detected
     Agent->>Auto: Route to autonomous loop
-    Auto->>Auto: Git snapshot (before)
-    loop while iterations < max
-        Auto->>Chat: chat(prompt)
-        Chat->>Tools: Execute tool calls
-        Tools-->>Chat: Tool results
-        Chat-->>Auto: LLM response
-        Auto->>Auto: Doom loop check
-        Auto->>Auto: Completion promise check
-        Auto->>Auto: Stage escalation
-        Auto->>Auto: Auto-save session
+    Auto->>Chat: chat(prompt)
+    Chat->>Inner: _chat_completion(messages, tools)
+    
+    loop Model calls tools until satisfied
+        Inner->>LLM: prompt + tools
+        LLM-->>Inner: tool_calls=[search]
+        Inner->>Inner: Execute tool, append results
+        Inner->>LLM: results + tools
+        LLM-->>Inner: "Here's your answer..." (no more tools)
     end
-    Auto->>Auto: Git snapshot (after)
-    alt Promise found
-        Auto-->>User: ✅ AutonomyResult(success=True)
-    else Max iterations reached
-        Auto-->>User: ⚠️ AutonomyResult(reason="max_iterations")
-    else Doom loop detected
-        Auto-->>User: 🛑 AutonomyResult(reason="doom_loop")
-    end
+    
+    Note over Inner: No tool_calls = model is done
+    Inner-->>Chat: Final response
+    Chat-->>Auto: Response text
+    Note over Auto: Tools were used + response > 100 chars
+    Auto-->>User: ✅ AutonomyResult(reason="tool_completion")
 ```
+
+<Tip>
+**Behind the scenes**: The inner tool loop handles ALL tool calls in a single turn. The model keeps calling tools until it's satisfied, then stops. The outer loop detects this and returns immediately — no unnecessary extra iterations.
+</Tip>
 
 ## Key Features
 
@@ -212,7 +218,7 @@ result = agent.start(prompt)  # when autonomy=True
 # Available fields
 result.success          # bool - Task completed successfully
 result.output           # str - Final response
-result.completion_reason # str - "promise", "goal", "max_iterations", "doom_loop", "timeout", "error"
+result.completion_reason # str - "tool_completion", "promise", "caller_mode", "max_iterations", "doom_loop", "timeout", "error"
 result.iterations       # int - Number of iterations executed
 result.duration_seconds # float - Total execution time
 result.started_at       # str - ISO 8601 timestamp when execution started
@@ -220,14 +226,46 @@ result.actions          # list - Actions taken each iteration
 result.error            # str | None - Error message if failed
 ```
 
+## How Completion Detection Works
+
+```mermaid
+graph TB
+    Response["📝 Agent produces response"] --> ToolCheck{Used tools\nthis turn?}
+    ToolCheck -->|"Yes + response > 100 chars"| TC["✅ tool_completion\n(most common)"] 
+    ToolCheck -->|No| Promise{Promise tag\nin response?}
+    Promise -->|Yes| PM["✅ promise"]
+    Promise -->|No| Keyword{Completion\nkeywords?}
+    Keyword -->|Yes| KW["✅ goal"]
+    Keyword -->|No| NoTool{2+ turns with\nno tool calls?}
+    NoTool -->|Yes| NT["✅ no_tool_calls"]
+    NoTool -->|No| Continue["🔄 Next iteration"]
+    
+    classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef continue fill:#F59E0B,stroke:#7C90A0,color:#fff
+    
+    class Response,ToolCheck,Promise,Keyword,NoTool check
+    class TC,PM,KW,NT success
+    class Continue continue
+```
+
 ## Completion Reasons
 
 <AccordionGroup>
+  <Accordion title="tool_completion (most common)">
+    The model used tools to complete the task and then produced a summary response without requesting more tools. This is the **most reliable** completion signal — it's the same mechanism used by ChatGPT and all major LLM APIs.
+  </Accordion>
+  <Accordion title="caller_mode">
+    Agent was in caller mode (`autonomy=True` default). Single `chat()` call wrapped in AutonomyResult.
+  </Accordion>
   <Accordion title="promise">
     Agent output contained a promise tag with TEXT matching the configured promise.
   </Accordion>
   <Accordion title="goal">
     Agent output contained completion keywords like "task completed" or "done".
+  </Accordion>
+  <Accordion title="no_tool_calls">
+    The model produced text without calling any tools for 2+ consecutive turns — indicates it has nothing left to do.
   </Accordion>
   <Accordion title="max_iterations">
     Reached the maximum iteration limit without completion signal.
