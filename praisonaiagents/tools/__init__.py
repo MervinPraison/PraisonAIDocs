@@ -138,9 +138,9 @@ TOOL_MAPPINGS = {
     'get_available_providers': ('.web_search', None),
     
     # Unified Web Crawl (auto-fallback across providers)
-    'web_crawl': ('.web_crawl', None),
-    'crawl_web': ('.web_crawl', None),  # Alias
-    'get_available_crawl_providers': ('.web_crawl', None),
+    'web_crawl': ('.web_crawl_tools', None),
+    'crawl_web': ('.web_crawl_tools', None),  # Alias
+    'get_available_crawl_providers': ('.web_crawl_tools', None),
     
     # Skill Tools (for Agent Skills script execution)
     'run_skill_script': ('.skill_tools', None),
@@ -172,11 +172,13 @@ TOOL_MAPPINGS = {
     'store_learning': ('.learning', None),
     'search_learning': ('.learning', None),
 
-    # Email Tools (AgentMail-based send/read/list)
+    # Email Tools (AgentMail-based send/read/list/reply/create)
     'send_email': ('.email_tools', None),
     'list_emails': ('.email_tools', None),
     'read_email': ('.email_tools', None),
+    'reply_email': ('.email_tools', None),
     'list_inboxes': ('.email_tools', None),
+    'create_inbox': ('.email_tools', None),
     # Email Tools (SMTP/IMAP-based — direct mailbox credentials)
     'smtp_send_email': ('.email_tools', None),
     'smtp_read_inbox': ('.email_tools', None),
@@ -242,7 +244,7 @@ def __getattr__(name: str) -> Any:
             'ast_grep_search', 'ast_grep_rewrite', 'ast_grep_scan', 'is_ast_grep_available', 'get_ast_grep_tools',
             'store_memory', 'search_memory',
             'store_learning', 'search_learning',
-            'send_email', 'list_emails', 'read_email', 'list_inboxes',
+            'send_email', 'list_emails', 'read_email', 'reply_email', 'list_inboxes', 'create_inbox',
             'smtp_send_email', 'smtp_read_inbox'
         ]:
             return getattr(module, name)
