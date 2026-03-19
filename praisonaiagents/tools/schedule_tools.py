@@ -25,12 +25,28 @@ logger = logging.getLogger(__name__)
 _store_instance = None
 
 
+def set_store(store):
+    """Inject an external schedule store (e.g., config.yaml-backed).
+
+    When PraisonAIUI is running, it calls this at startup to redirect
+    all agent schedule_add/list/remove operations to the unified
+    ``config.yaml`` instead of the default ``jobs.json``.
+    """
+    global _store_instance
+    _store_instance = store
+
+
 def _get_store():
-    """Return (or create) the global ``FileScheduleStore``."""
+    """Return (or create) the global schedule store.
+
+    Uses ``ConfigYamlScheduleStore`` (config.yaml) by default.
+    Automatically migrates any existing ``jobs.json`` data on first use.
+    """
     global _store_instance
     if _store_instance is None:
-        from ..scheduler.store import FileScheduleStore
-        _store_instance = FileScheduleStore()
+        from ..scheduler.config_store import ConfigYamlScheduleStore
+        _store_instance = ConfigYamlScheduleStore()
+        _store_instance.migrate_from_json()
     return _store_instance
 
 

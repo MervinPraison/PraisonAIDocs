@@ -1,11 +1,11 @@
 """
-File-based schedule store for PraisonAI Agents.
+Config YAML-based schedule store for PraisonAI Agents.
 
-Persists scheduled jobs to ``~/.praisonai/schedules/jobs.json``.
-Thread-safe, no external dependencies.
+Persists scheduled jobs to ``~/.praisonai/config.yaml`` under
+the ``schedules`` top-level key.  Thread-safe, preserves all
+other config.yaml content.
 """
 
-import json
 import logging
 import os
 import threading
@@ -16,23 +16,25 @@ from .models import ScheduleJob, RunRecord
 
 logger = logging.getLogger(__name__)
 
-from ..paths import get_schedules_dir as _get_schedules_dir
-_DEFAULT_DIR = str(_get_schedules_dir())
-_JOBS_FILE = "jobs.json"
-_HISTORY_FILE = "history.json"
+_HISTORY_FILE = "run_history.yaml"
 _MAX_HISTORY = 200
 
 
-class FileScheduleStore:
-    """CRUD store backed by a single JSON file.
+class ConfigYamlScheduleStore:
+    """CRUD store backed by ``config.yaml``.
+
+    Schedules are stored as a dict under the ``schedules`` key,
+    alongside existing keys like ``agents``, ``server``, etc.
 
     Thread-safe for multi-agent scenarios.
     """
 
-    def __init__(self, store_dir: Optional[str] = None, max_history: int = _MAX_HISTORY):
-        self._dir = store_dir or _DEFAULT_DIR
-        self._path = os.path.join(self._dir, _JOBS_FILE)
-        self._history_path = os.path.join(self._dir, _HISTORY_FILE)
+    def __init__(self, config_path: Optional[str] = None, max_history: int = _MAX_HISTORY):
+        if config_path is None:
+            from ..paths import get_data_dir
+            config_path = str(get_data_dir() / "config.yaml")
+        self._path = config_path
+        self._history_path = os.path.join(os.path.dirname(config_path), _HISTORY_FILE)
         self._max_history = max_history
         self._lock = threading.RLock()
         self._jobs: Dict[str, ScheduleJob] = {}
@@ -135,49 +137,121 @@ class FileScheduleStore:
     # ── persistence ──────────────────────────────────────────────────
 
     def _load(self) -> None:
+        """Load schedule jobs from config.yaml's ``schedules`` section."""
         if not os.path.exists(self._path):
             return
         try:
+            import yaml
             with open(self._path, "r") as f:
-                data = json.load(f)
-            for d in data:
-                job = ScheduleJob.from_dict(d)
-                self._jobs[job.id] = job
+                data = yaml.safe_load(f) or {}
+            schedules = data.get("schedules", {})
+            if isinstance(schedules, dict):
+                for job_id, job_data in schedules.items():
+                    if isinstance(job_data, dict) and job_data.get("name"):
+                        job_data.setdefault("id", job_id)
+                        job = ScheduleJob.from_dict(job_data)
+                        self._jobs[job.id] = job
         except Exception as e:
-            logger.warning("Failed to load schedule store from %s: %s", self._path, e)
+            logger.warning("Failed to load schedules from %s: %s", self._path, e)
 
     def _save(self) -> None:
+        """Write schedule jobs into config.yaml's ``schedules`` key.
+
+        Preserves all other top-level keys (agents, server, etc.).
+        """
         try:
-            os.makedirs(self._dir, exist_ok=True)
-            data = [j.to_dict() for j in self._jobs.values()]
+            import yaml
+
+            # Read existing config
+            data: dict = {}
+            if os.path.exists(self._path):
+                with open(self._path, "r") as f:
+                    data = yaml.safe_load(f) or {}
+
+            # Update only the schedules section
+            schedules = {}
+            for job in self._jobs.values():
+                schedules[job.id] = job.to_dict()
+            data["schedules"] = schedules
+
+            # Atomic write
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
             tmp = self._path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(data, f, indent=2)
+                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
             os.replace(tmp, self._path)
         except Exception as e:
-            logger.warning("Failed to save schedule store to %s: %s", self._path, e)
+            logger.warning("Failed to save schedules to %s: %s", self._path, e)
 
     def _load_history(self) -> None:
-        """Load execution history from history.json."""
+        """Load execution history from run_history.yaml."""
         if not os.path.exists(self._history_path):
             return
         try:
+            import yaml
             with open(self._history_path, "r") as f:
-                data = json.load(f)
-            for d in data:
-                record = RunRecord.from_dict(d)
-                self._history.append(record)
+                data = yaml.safe_load(f) or []
+            if isinstance(data, list):
+                for d in data:
+                    if isinstance(d, dict):
+                        record = RunRecord.from_dict(d)
+                        self._history.append(record)
         except Exception as e:
             logger.warning("Failed to load history from %s: %s", self._history_path, e)
 
     def _save_history(self) -> None:
-        """Save execution history to history.json."""
+        """Save execution history to run_history.yaml."""
         try:
-            os.makedirs(self._dir, exist_ok=True)
+            import yaml
+            os.makedirs(os.path.dirname(self._history_path), exist_ok=True)
             data = [r.to_dict() for r in self._history]
             tmp = self._history_path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(data, f, indent=2)
+                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
             os.replace(tmp, self._history_path)
         except Exception as e:
             logger.warning("Failed to save history to %s: %s", self._history_path, e)
+
+    # ── migration ────────────────────────────────────────────────────
+
+    def migrate_from_json(self, json_path: Optional[str] = None) -> int:
+        """Import jobs from a legacy ``jobs.json`` file.
+
+        Args:
+            json_path: Path to ``jobs.json``. Defaults to
+                       ``~/.praisonai/schedules/jobs.json``.
+
+        Returns:
+            Number of jobs migrated.
+        """
+        import json
+
+        if json_path is None:
+            from ..paths import get_schedules_dir
+            json_path = str(get_schedules_dir() / "jobs.json")
+
+        if not os.path.exists(json_path):
+            return 0
+
+        try:
+            with open(json_path, "r") as f:
+                items = json.load(f)
+            if not isinstance(items, list):
+                return 0
+            count = 0
+            with self._lock:
+                for d in items:
+                    job = ScheduleJob.from_dict(d)
+                    if job.id not in self._jobs:
+                        self._jobs[job.id] = job
+                        count += 1
+                if count:
+                    self._save()
+                    logger.info(
+                        "Migrated %d schedule(s) from %s into config.yaml",
+                        count, json_path,
+                    )
+            return count
+        except Exception as e:
+            logger.warning("Failed to migrate from %s: %s", json_path, e)
+            return 0
