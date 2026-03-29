@@ -2,7 +2,7 @@
 
 This file contains the exact instructions, principles, and patterns for AI agents to create documentation pages for PraisonAI. Follow these instructions precisely to produce consistent, high-quality documentation.
 
----
+--- 
 
 ## 1. Documentation Creation Process
 
