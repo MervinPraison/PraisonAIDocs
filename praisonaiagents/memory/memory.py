@@ -3,15 +3,23 @@ import sqlite3
 import json
 import time
 import shutil
+import threading
 from typing import Any, Dict, List, Optional, Union, Literal
 import logging
 from datetime import datetime
 
+# Decomposed memory functionality - imported as mixins for backward compatibility
+from .storage import StorageMixin
+from .search import SearchMixin
+from .core import MemoryCoreMixin
+
 # Disable litellm telemetry before any imports
 os.environ["LITELLM_TELEMETRY"] = "False"
 
-# Set up logger with custom TRACE level
-logger = logging.getLogger(__name__)
+# Set up logger using centralized logging utility
+# Keep existing custom TRACE level functionality for this module
+from .._logging import get_logger
+logger = get_logger(__name__, extra_data={"subsystem": "memory"})
 
 # Add custom TRACE level (below DEBUG)
 TRACE_LEVEL = 5
@@ -23,107 +31,152 @@ def trace(self, message, *args, **kwargs):
 
 logging.Logger.trace = trace
 
-# Lazy availability flags and cached imports
-_chromadb_cache = {"available": None, "module": None, "settings": None}
-_mem0_cache = {"available": None, "module": None}
-_openai_cache = {"available": None, "module": None}
-_litellm_cache = {"available": None, "module": None}
-_pymongo_cache = {"available": None, "module": None, "client": None}
+# Thread-safe lazy imports using proper thread synchronization
+import threading
+
+# Thread-safe import cache
+_import_lock = threading.Lock()
+_module_cache = {}
 
 def _check_chromadb():
-    """Lazily check chromadb availability and cache."""
-    if _chromadb_cache["available"] is None:
+    """Thread-safe lazy check for chromadb availability."""
+    if "chromadb" in _module_cache:
+        return _module_cache["chromadb"]["available"]
+    
+    with _import_lock:
+        if "chromadb" in _module_cache:
+            return _module_cache["chromadb"]["available"]
+        
         try:
             import chromadb
             from chromadb.config import Settings as ChromaSettings
-            _chromadb_cache["available"] = True
-            _chromadb_cache["module"] = chromadb
-            _chromadb_cache["settings"] = ChromaSettings
+            _module_cache["chromadb"] = {
+                "available": True,
+                "module": chromadb,
+                "settings": ChromaSettings
+            }
         except ImportError:
-            _chromadb_cache["available"] = False
-    return _chromadb_cache["available"]
+            _module_cache["chromadb"] = {"available": False}
+        
+        return _module_cache["chromadb"]["available"]
 
 def _get_chromadb():
-    """Get chromadb module (lazy load)."""
+    """Get chromadb module and settings (thread-safe lazy load)."""
     if not _check_chromadb():
         raise ImportError("chromadb is required. Install with: pip install chromadb")
-    return _chromadb_cache["module"], _chromadb_cache["settings"]
+    return _module_cache["chromadb"]["module"], _module_cache["chromadb"]["settings"]
 
 def _check_mem0():
-    """Lazily check mem0 availability."""
-    if _mem0_cache["available"] is None:
+    """Thread-safe lazy check for mem0 availability."""
+    if "mem0" in _module_cache:
+        return _module_cache["mem0"]["available"]
+    
+    with _import_lock:
+        if "mem0" in _module_cache:
+            return _module_cache["mem0"]["available"]
+        
         try:
             import mem0
-            _mem0_cache["available"] = True
-            _mem0_cache["module"] = mem0
+            _module_cache["mem0"] = {
+                "available": True,
+                "module": mem0
+            }
         except ImportError:
-            _mem0_cache["available"] = False
-    return _mem0_cache["available"]
+            _module_cache["mem0"] = {"available": False}
+        
+        return _module_cache["mem0"]["available"]
 
 def _get_mem0():
-    """Get mem0 module (lazy load)."""
+    """Get mem0 module (thread-safe lazy load)."""
     if not _check_mem0():
         raise ImportError("mem0 is required. Install with: pip install mem0ai")
-    return _mem0_cache["module"]
+    return _module_cache["mem0"]["module"]
 
 def _check_openai():
-    """Lazily check openai availability."""
-    if _openai_cache["available"] is None:
+    """Thread-safe lazy check for openai availability."""
+    if "openai" in _module_cache:
+        return _module_cache["openai"]["available"]
+    
+    with _import_lock:
+        if "openai" in _module_cache:
+            return _module_cache["openai"]["available"]
+        
         try:
             import openai
-            _openai_cache["available"] = True
-            _openai_cache["module"] = openai
+            _module_cache["openai"] = {
+                "available": True,
+                "module": openai
+            }
         except ImportError:
-            _openai_cache["available"] = False
-    return _openai_cache["available"]
+            _module_cache["openai"] = {"available": False}
+        
+        return _module_cache["openai"]["available"]
 
 def _get_openai():
-    """Get openai module (lazy load)."""
+    """Get openai module (thread-safe lazy load)."""
     if not _check_openai():
         raise ImportError("openai is required. Install with: pip install openai")
-    return _openai_cache["module"]
+    return _module_cache["openai"]["module"]
 
 def _check_litellm():
-    """Lazily check litellm availability."""
-    if _litellm_cache["available"] is None:
+    """Thread-safe lazy check for litellm availability."""
+    if "litellm" in _module_cache:
+        return _module_cache["litellm"]["available"]
+    
+    with _import_lock:
+        if "litellm" in _module_cache:
+            return _module_cache["litellm"]["available"]
+        
         try:
             import litellm
             litellm.telemetry = False
-            _litellm_cache["available"] = True
-            _litellm_cache["module"] = litellm
+            _module_cache["litellm"] = {
+                "available": True,
+                "module": litellm
+            }
         except ImportError:
-            _litellm_cache["available"] = False
-    return _litellm_cache["available"]
+            _module_cache["litellm"] = {"available": False}
+        
+        return _module_cache["litellm"]["available"]
 
 def _get_litellm():
-    """Get litellm module (lazy load)."""
+    """Get litellm module (thread-safe lazy load)."""
     if not _check_litellm():
         raise ImportError("litellm is required. Install with: pip install litellm")
-    return _litellm_cache["module"]
+    return _module_cache["litellm"]["module"]
 
 def _check_pymongo():
-    """Lazily check pymongo availability."""
-    if _pymongo_cache["available"] is None:
+    """Thread-safe lazy check for pymongo availability."""
+    if "pymongo" in _module_cache:
+        return _module_cache["pymongo"]["available"]
+    
+    with _import_lock:
+        if "pymongo" in _module_cache:
+            return _module_cache["pymongo"]["available"]
+        
         try:
             import pymongo
             from pymongo import MongoClient
-            _pymongo_cache["available"] = True
-            _pymongo_cache["module"] = pymongo
-            _pymongo_cache["client"] = MongoClient
+            _module_cache["pymongo"] = {
+                "available": True,
+                "module": pymongo,
+                "client": MongoClient
+            }
         except ImportError:
-            _pymongo_cache["available"] = False
-    return _pymongo_cache["available"]
+            _module_cache["pymongo"] = {"available": False}
+        
+        return _module_cache["pymongo"]["available"]
 
 def _get_pymongo():
-    """Get pymongo module and MongoClient (lazy load)."""
+    """Get pymongo module and MongoClient (thread-safe lazy load)."""
     if not _check_pymongo():
         raise ImportError("pymongo is required. Install with: pip install pymongo")
-    return _pymongo_cache["module"], _pymongo_cache["client"]
+    return _module_cache["pymongo"]["module"], _module_cache["pymongo"]["client"]
 
 
 
 
-class Memory:
+class Memory(StorageMixin, SearchMixin, MemoryCoreMixin):
     """
     A single-file memory manager covering:
     - Short-term memory (STM) for ephemeral context
@@ -189,6 +242,16 @@ class Memory:
         self.cfg = config or {}
         self.verbose = verbose
         
+        # Thread-local storage for SQLite connections (thread-safe)
+        self._local = threading.local()
+        
+        # Write lock for serializing database modifications (thread-safe)
+        self._write_lock = threading.Lock()
+        
+        # Connection registry for cleanup across threads (use regular set with careful cleanup)
+        self._all_connections = set()
+        self._connection_lock = threading.Lock()  # Protect the connection registry
+        
         # Set logger level based on verbose
         if verbose >= 5:
             logger.setLevel(logging.INFO)
@@ -247,6 +310,50 @@ class Memory:
         elif self.use_rag:
             self._init_chroma()
 
+    def _get_stm_conn(self):
+        """Get thread-local short-term memory SQLite connection."""
+        if not hasattr(self._local, 'stm_conn') or self._local.stm_conn is None:
+            self._local.stm_conn = sqlite3.connect(
+                self.short_db,
+                check_same_thread=False,  # Allow cross-thread cleanup
+                timeout=30.0  # 30 second timeout for lock contention
+            )
+            # Configure busy timeout for better contention handling
+            self._local.stm_conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
+            
+            # Enable WAL mode for concurrent read/write without blocking
+            result = self._local.stm_conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if result and result[0].upper() != 'WAL':
+                logger.warning(f"WAL mode not enabled for STM, got: {result[0]}")
+            self._local.stm_conn.commit()
+            
+            # Register connection for cleanup
+            with self._connection_lock:
+                self._all_connections.add(self._local.stm_conn)
+        return self._local.stm_conn
+
+    def _get_ltm_conn(self):
+        """Get thread-local long-term memory SQLite connection."""
+        if not hasattr(self._local, 'ltm_conn') or self._local.ltm_conn is None:
+            self._local.ltm_conn = sqlite3.connect(
+                self.long_db,
+                check_same_thread=False,  # Allow cross-thread cleanup
+                timeout=30.0  # 30 second timeout for lock contention
+            )
+            # Configure busy timeout for better contention handling
+            self._local.ltm_conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds
+            
+            # Enable WAL mode for concurrent read/write without blocking
+            result = self._local.ltm_conn.execute("PRAGMA journal_mode=WAL").fetchone()
+            if result and result[0].upper() != 'WAL':
+                logger.warning(f"WAL mode not enabled for LTM, got: {result[0]}")
+            self._local.ltm_conn.commit()
+            
+            # Register connection for cleanup
+            with self._connection_lock:
+                self._all_connections.add(self._local.ltm_conn)
+        return self._local.ltm_conn
+
     def _log_verbose(self, msg: str, level: int = logging.INFO):
         """Only log if verbose >= 5"""
         if self.verbose >= 5:
@@ -267,8 +374,10 @@ class Memory:
                 emitter.memory_store(agent_name, memory_type, content_length, metadata)
             elif event_type == "search":
                 emitter.memory_search(agent_name, query, result_count, memory_type, top_score)
-        except Exception:
-            pass  # Silent fail - tracing should never break memory operations
+        except Exception as e:
+            # Silent fail - tracing should never break memory operations
+            # But log at debug level for troubleshooting
+            logger.debug(f"Memory trace emit failed: {e}")
 
     # -------------------------------------------------------------------------
     #                          Initialization
@@ -276,7 +385,7 @@ class Memory:
     def _init_stm(self):
         """Creates or verifies short-term memory table."""
         os.makedirs(os.path.dirname(self.short_db) or ".", exist_ok=True)
-        conn = sqlite3.connect(self.short_db)
+        conn = self._get_stm_conn()
         c = conn.cursor()
         c.execute("""
         CREATE TABLE IF NOT EXISTS short_mem (
@@ -287,12 +396,11 @@ class Memory:
         )
         """)
         conn.commit()
-        conn.close()
 
     def _init_ltm(self):
         """Creates or verifies long-term memory table."""
         os.makedirs(os.path.dirname(self.long_db) or ".", exist_ok=True)
-        conn = sqlite3.connect(self.long_db)
+        conn = self._get_ltm_conn()
         c = conn.cursor()
         c.execute("""
         CREATE TABLE IF NOT EXISTS long_mem (
@@ -303,7 +411,6 @@ class Memory:
         )
         """)
         conn.commit()
-        conn.close()
 
     def _init_mem0(self):
         """Initialize Mem0 client for agent or user memory with optional graph support."""
@@ -579,15 +686,15 @@ class Memory:
                 logger.error(f"Failed to store in MongoDB short-term memory: {e}")
                 raise
 
-        # Existing SQLite store logic
+        # Existing SQLite store logic (with write lock for concurrency safety)
         try:
-            conn = sqlite3.connect(self.short_db)
-            conn.execute(
-                "INSERT INTO short_mem (id, content, meta, created_at) VALUES (?,?,?,?)",
-                (ident, text, json.dumps(metadata), created_at)
-            )
-            conn.commit()
-            conn.close()
+            conn = self._get_stm_conn()
+            with self._write_lock:  # Serialize write operations
+                conn.execute(
+                    "INSERT INTO short_mem (id, content, meta, created_at) VALUES (?,?,?,?)",
+                    (ident, text, json.dumps(metadata), created_at)
+                )
+                conn.commit()
             logger.info(f"Successfully stored in SQLite short-term memory with ID: {ident}")
         except Exception as e:
             logger.error(f"Failed to store in SQLite short-term memory: {e}")
@@ -713,13 +820,12 @@ class Memory:
         
         else:
             # Local fallback
-            conn = sqlite3.connect(self.short_db)
+            conn = self._get_stm_conn()
             c = conn.cursor()
             rows = c.execute(
                 "SELECT id, content, meta FROM short_mem WHERE content LIKE ? LIMIT ?",
                 (f"%{query}%", limit)
             ).fetchall()
-            conn.close()
 
             results = []
             for row in rows:
@@ -739,10 +845,10 @@ class Memory:
 
     def reset_short_term(self):
         """Completely clears short-term memory."""
-        conn = sqlite3.connect(self.short_db)
-        conn.execute("DELETE FROM short_mem")
-        conn.commit()
-        conn.close()
+        conn = self._get_stm_conn()
+        with self._write_lock:  # Serialize write operations
+            conn.execute("DELETE FROM short_mem")
+            conn.commit()
 
     # -------------------------------------------------------------------------
     #                           Long-Term Methods
@@ -813,15 +919,15 @@ class Memory:
                 logger.error(f"Failed to store in MongoDB long-term memory: {e}")
                 # Continue to SQLite fallback
         
-        # Store in SQLite
+        # Store in SQLite (with write lock for concurrency safety)
         try:
-            conn = sqlite3.connect(self.long_db)
-            conn.execute(
-                "INSERT INTO long_mem (id, content, meta, created_at) VALUES (?,?,?,?)",
-                (ident, text, json.dumps(metadata), created)
-            )
-            conn.commit()
-            conn.close()
+            conn = self._get_ltm_conn()
+            with self._write_lock:  # Serialize write operations
+                conn.execute(
+                    "INSERT INTO long_mem (id, content, meta, created_at) VALUES (?,?,?,?)",
+                    (ident, text, json.dumps(metadata), created)
+                )
+                conn.commit()
             logger.info(f"Successfully stored in SQLite with ID: {ident}")
         except Exception as e:
             logger.error(f"Error storing in SQLite: {e}")
@@ -1002,13 +1108,12 @@ class Memory:
                 self._log_verbose(f"Error searching ChromaDB: {e}", logging.ERROR)
 
         # Always try SQLite as fallback or additional source
-        conn = sqlite3.connect(self.long_db)
+        conn = self._get_ltm_conn()
         c = conn.cursor()
         rows = c.execute(
             "SELECT id, content, meta, created_at FROM long_mem WHERE content LIKE ? LIMIT ?",
             (f"%{query}%", limit)
         ).fetchall()
-        conn.close()
 
         for row in rows:
             meta = json.loads(row[2] or "{}")
@@ -1051,10 +1156,10 @@ class Memory:
 
     def reset_long_term(self):
         """Clear local LTM DB, plus Chroma, MongoDB, or mem0 if in use."""
-        conn = sqlite3.connect(self.long_db)
-        conn.execute("DELETE FROM long_mem")
-        conn.commit()
-        conn.close()
+        conn = self._get_ltm_conn()
+        with self._write_lock:  # Serialize write operations
+            conn.execute("DELETE FROM long_mem")
+            conn.commit()
 
         if self.use_mem0 and hasattr(self, "mem0_client"):
             # Mem0 has no universal reset API. Could implement partial or no-op.
@@ -1085,16 +1190,16 @@ class Memory:
         """
         deleted = False
         
-        # Delete from SQLite
+        # Delete from SQLite (with write lock for concurrency safety)
         try:
-            conn = sqlite3.connect(self.short_db)
-            cursor = conn.execute(
-                "DELETE FROM short_mem WHERE id = ?", (memory_id,)
-            )
-            if cursor.rowcount > 0:
-                deleted = True
-            conn.commit()
-            conn.close()
+            conn = self._get_stm_conn()
+            with self._write_lock:  # Serialize write operations
+                cursor = conn.execute(
+                    "DELETE FROM short_mem WHERE id = ?", (memory_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted = True
+                conn.commit()
         except Exception as e:
             self._log_verbose(f"Error deleting from SQLite short-term: {e}", logging.ERROR)
         
@@ -1126,16 +1231,16 @@ class Memory:
         """
         deleted = False
         
-        # Delete from SQLite
+        # Delete from SQLite (with write lock for concurrency safety)
         try:
-            conn = sqlite3.connect(self.long_db)
-            cursor = conn.execute(
-                "DELETE FROM long_mem WHERE id = ?", (memory_id,)
-            )
-            if cursor.rowcount > 0:
-                deleted = True
-            conn.commit()
-            conn.close()
+            conn = self._get_ltm_conn()
+            with self._write_lock:  # Serialize write operations
+                cursor = conn.execute(
+                    "DELETE FROM long_mem WHERE id = ?", (memory_id,)
+                )
+                if cursor.rowcount > 0:
+                    deleted = True
+                conn.commit()
         except Exception as e:
             self._log_verbose(f"Error deleting from SQLite long-term: {e}", logging.ERROR)
         
@@ -1790,10 +1895,9 @@ class Memory:
         
         try:
             # Get short-term memories
-            conn = sqlite3.connect(self.short_db)
+            conn = self._get_stm_conn()
             c = conn.cursor()
             rows = c.execute("SELECT id, content, meta, created_at FROM short_mem").fetchall()
-            conn.close()
             
             for row in rows:
                 meta = json.loads(row[2] or "{}")
@@ -1806,10 +1910,9 @@ class Memory:
                 })
             
             # Get long-term memories
-            conn = sqlite3.connect(self.long_db)
+            conn = self._get_ltm_conn()
             c = conn.cursor()
             rows = c.execute("SELECT id, content, meta, created_at FROM long_mem").fetchall()
-            conn.close()
             
             for row in rows:
                 meta = json.loads(row[2] or "{}")
@@ -1873,3 +1976,57 @@ class Memory:
         if self.learn is None:
             return ""
         return self.learn.to_system_prompt_context()
+
+    def close_connections(self):
+        """
+        Close database connections.
+        
+        Closes the current thread's connections and attempts to close all known
+        connections from other threads. Each thread should call this method before
+        terminating to ensure proper cleanup.
+        """
+        # Close current thread's connections
+        if hasattr(self._local, 'stm_conn') and self._local.stm_conn:
+            try:
+                self._local.stm_conn.close()
+                self._local.stm_conn = None
+            except Exception as e:
+                logger.warning(f"Error closing current thread's STM connection: {e}")
+        
+        if hasattr(self._local, 'ltm_conn') and self._local.ltm_conn:
+            try:
+                self._local.ltm_conn.close()
+                self._local.ltm_conn = None
+            except Exception as e:
+                logger.warning(f"Error closing current thread's LTM connection: {e}")
+        
+        # Close all known connections from the registry
+        with self._connection_lock:  # Ensure thread safety during cleanup
+            connections_to_close = list(self._all_connections)
+            for conn in connections_to_close:
+                try:
+                    conn.close()
+                except Exception as e:
+                    logger.debug(f"Error closing registered connection: {e}")
+            # Clear the registry
+            self._all_connections.clear()
+    
+    def __enter__(self):
+        """Allow Memory to be used as a context manager."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ensure connections are closed when leaving a context manager block."""
+        self.close_connections()
+    
+    def __del__(self):
+        """
+        Attempt to clean up any open SQLite connections when this instance
+        is garbage-collected. Errors are suppressed to avoid issues during
+        interpreter shutdown.
+        """
+        try:
+            self.close_connections()
+        except Exception as e:
+            # Best-effort cleanup during garbage collection
+            logger.debug(f"Memory cleanup failed: {e}")

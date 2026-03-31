@@ -5,8 +5,18 @@ import logging
 import asyncio
 import contextlib
 import threading
+import concurrent.futures
 from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Generator
+from collections import OrderedDict
 import inspect
+
+# Decomposed agent functionality - imported as mixins for backward compatibility
+from .tool_execution import ToolExecutionMixin
+from .chat_handler import ChatHandlerMixin  
+from .session_manager import SessionManagerMixin
+
+# Module-level logger for thread safety errors and debugging
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # Performance: Lazy imports for heavy dependencies
@@ -186,7 +196,7 @@ class BudgetExceededError(Exception):
         )
 
 
-class Agent:
+class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
     _agent_counter_lock = threading.Lock()
@@ -643,42 +653,55 @@ class Agent:
         # DEPRECATION WARNINGS for params consolidated into configs
         # Old params still work but emit warnings pointing to new API
         # ============================================================
-        import warnings as _warnings
+        from ..utils.deprecation import warn_deprecated_param
         
         if allow_delegation:
-            _warnings.warn(
-                "Parameter 'allow_delegation' is deprecated. Use 'handoffs=[other_agent]' instead.",
-                DeprecationWarning, stacklevel=2,
+            warn_deprecated_param(
+                "allow_delegation",
+                since="1.0.0",
+                removal="2.0.0",
+                alternative="use 'handoffs=[other_agent]' instead",
+                stacklevel=3
             )
         if allow_code_execution:
-            _warnings.warn(
-                "Parameter 'allow_code_execution' is deprecated. "
-                "Use 'execution=ExecutionConfig(code_execution=True)' instead.",
-                DeprecationWarning, stacklevel=2,
+            warn_deprecated_param(
+                "allow_code_execution", 
+                since="1.0.0",
+                removal="2.0.0",
+                alternative="use 'execution=ExecutionConfig(code_execution=True)' instead",
+                stacklevel=3
             )
         if code_execution_mode != "safe":
-            _warnings.warn(
-                "Parameter 'code_execution_mode' is deprecated. "
-                "Use 'execution=ExecutionConfig(code_mode=\"unsafe\")' instead.",
-                DeprecationWarning, stacklevel=2,
+            warn_deprecated_param(
+                "code_execution_mode",
+                since="1.0.0", 
+                removal="2.0.0",
+                alternative='use \'execution=ExecutionConfig(code_mode="unsafe")\' instead',
+                stacklevel=3
             )
         if auto_save is not None:
-            _warnings.warn(
-                "Parameter 'auto_save' is deprecated. "
-                "Use 'memory=MemoryConfig(auto_save=\"name\")' instead.",
-                DeprecationWarning, stacklevel=2,
+            warn_deprecated_param(
+                "auto_save",
+                since="1.0.0",
+                removal="2.0.0", 
+                alternative='use \'memory=MemoryConfig(auto_save="name")\' instead',
+                stacklevel=3
             )
         if rate_limiter is not None:
-            _warnings.warn(
-                "Parameter 'rate_limiter' is deprecated. "
-                "Use 'execution=ExecutionConfig(rate_limiter=obj)' instead.",
-                DeprecationWarning, stacklevel=2,
+            warn_deprecated_param(
+                "rate_limiter",
+                since="1.0.0",
+                removal="2.0.0",
+                alternative="use 'execution=ExecutionConfig(rate_limiter=obj)' instead",
+                stacklevel=3
             )
         if verification_hooks is not None:
-            _warnings.warn(
-                "Parameter 'verification_hooks' is deprecated. "
-                "Use 'autonomy=AutonomyConfig(verification_hooks=[...])' instead.",
-                DeprecationWarning, stacklevel=2,
+            warn_deprecated_param(
+                "verification_hooks",
+                since="1.0.0", 
+                removal="2.0.0",
+                alternative="use 'autonomy=AutonomyConfig(verification_hooks=[...])' instead",
+                stacklevel=3
             )
 
         # ============================================================
@@ -1333,12 +1356,12 @@ class Agent:
         # Handle llm= deprecation: model= is the preferred parameter name
         # llm= still works but shows deprecation warning
         if llm is not None and model is None:
-            import warnings
-            warnings.warn(
-                "Parameter 'llm' is deprecated, use 'model' instead. "
-                "Example: Agent(model='gpt-4o-mini') instead of Agent(llm='gpt-4o-mini')",
-                DeprecationWarning,
-                stacklevel=2
+            warn_deprecated_param(
+                "llm",
+                since="1.0.0",
+                removal="2.0.0", 
+                alternative="use 'model' instead. Example: Agent(model='gpt-4o-mini')",
+                stacklevel=3
             )
         # model= is the preferred parameter (no warning)
         if model is not None:
@@ -1511,9 +1534,12 @@ class Agent:
         self.embedder_config = embedder_config
         self.knowledge = knowledge
         self.use_system_prompt = use_system_prompt
-        # Thread-safe chat_history with lazy lock for concurrent access
+        # Thread-safe chat_history with eager lock initialization
         self.chat_history = []
-        self.__history_lock = None  # Lazy initialized
+        self.__history_lock = threading.Lock()  # Eager initialization to prevent race conditions
+        
+        # Thread-safe snapshot/redo stack lock - always available even when autonomy is disabled
+        self.__snapshot_lock = threading.Lock()
         self.markdown = markdown
         self.stream = stream
         self.metrics = metrics
@@ -1632,10 +1658,11 @@ Your Goal: {self.goal}
         # P8/G11: Tool timeout - prevent slow tools from blocking
         self._tool_timeout = tool_timeout
         
-        # Cache for system prompts and formatted tools with lazy thread-safe lock
-        self._system_prompt_cache = {}
-        self._formatted_tools_cache = {}
-        self.__cache_lock = None  # Lazy initialized RLock
+        # Cache for system prompts and formatted tools with eager thread-safe lock
+        # Use OrderedDict for LRU behavior
+        self._system_prompt_cache = OrderedDict()
+        self._formatted_tools_cache = OrderedDict()
+        self.__cache_lock = threading.RLock()  # Eager initialization to prevent race conditions
         # Limit cache size to prevent unbounded growth
         self._max_cache_size = 100
 
@@ -1747,19 +1774,105 @@ Your Goal: {self.goal}
 
     @property
     def _history_lock(self):
-        """Lazy-loaded history lock for thread-safe chat history access."""
-        if self.__history_lock is None:
-            import threading
-            self.__history_lock = threading.Lock()
+        """Thread-safe chat history lock."""
         return self.__history_lock
 
     @property
     def _cache_lock(self):
-        """Lazy-loaded cache lock for thread-safe cache access."""
-        if self.__cache_lock is None:
-            import threading
-            self.__cache_lock = threading.RLock()
+        """Thread-safe cache lock."""
         return self.__cache_lock
+
+    @property
+    def _snapshot_lock(self):
+        """Thread-safe snapshot/redo stack lock."""
+        return self.__snapshot_lock
+    
+    def _cache_put(self, cache_dict, key, value):
+        """Thread-safe LRU cache put operation.
+        
+        Args:
+            cache_dict: The cache dictionary (OrderedDict)
+            key: Cache key 
+            value: Value to cache
+        """
+        with self._cache_lock:
+            # Move to end if already exists (LRU update)
+            if key in cache_dict:
+                del cache_dict[key]
+            
+            # Add new entry
+            cache_dict[key] = value
+            
+            # Evict oldest if over limit
+            while len(cache_dict) > self._max_cache_size:
+                cache_dict.popitem(last=False)  # Remove oldest (FIFO)
+    
+    def _add_to_chat_history(self, role, content):
+        """Thread-safe method to add messages to chat history.
+        
+        Args:
+            role: Message role ("user", "assistant", "system")
+            content: Message content
+        """
+        with self._history_lock:
+            self.chat_history.append({"role": role, "content": content})
+    
+    def _add_to_chat_history_if_not_duplicate(self, role, content):
+        """Thread-safe method to add messages to chat history only if not duplicate.
+        
+        Atomically checks for duplicate and adds message under the same lock to prevent TOCTOU races.
+        
+        Args:
+            role: Message role ("user", "assistant", "system") 
+            content: Message content
+            
+        Returns:
+            bool: True if message was added, False if duplicate was detected
+        """
+        with self._history_lock:
+            # Check for duplicate within the same critical section
+            if (self.chat_history and 
+                self.chat_history[-1].get("role") == role and 
+                self.chat_history[-1].get("content") == content):
+                return False
+            
+            # Not a duplicate, add the message
+            self.chat_history.append({"role": role, "content": content})
+            return True
+    
+    def _get_chat_history_length(self):
+        """Thread-safe method to get chat history length."""
+        with self._history_lock:
+            return len(self.chat_history)
+    
+    def _truncate_chat_history(self, length):
+        """Thread-safe method to truncate chat history to specified length.
+        
+        Args:
+            length: Target length for chat history
+        """
+        with self._history_lock:
+            self.chat_history = self.chat_history[:length]
+    
+    def _cache_get(self, cache_dict, key):
+        """Thread-safe LRU cache get operation.
+        
+        Args:
+            cache_dict: The cache dictionary (OrderedDict)
+            key: Cache key
+        
+        Returns:
+            Value if found, None otherwise
+        """
+        with self._cache_lock:
+            if key not in cache_dict:
+                return None
+            
+            # Move to end (mark as recently used)
+            value = cache_dict[key]
+            del cache_dict[key]
+            cache_dict[key] = value
+            return value
 
     @property
     def auto_memory(self):
@@ -2220,19 +2333,23 @@ Summary:"""
             result = agent.start("Refactor utils.py")
             agent.undo()  # Restore original files
         """
-        if self._file_snapshot is None or not self._snapshot_stack:
+        if self._file_snapshot is None:
             return False
-        try:
-            target_hash = self._snapshot_stack.pop()
-            # Get current hash before restore (for redo)
-            current_hash = self._file_snapshot.get_current_hash()
-            if current_hash:
-                self._redo_stack.append(current_hash)
-            self._file_snapshot.restore(target_hash)
-            return True
-        except Exception as e:
-            logger.debug(f"Undo failed: {e}")
-            return False
+        
+        with self._snapshot_lock:
+            if not self._snapshot_stack:
+                return False
+            try:
+                target_hash = self._snapshot_stack.pop()
+                # Get current hash before restore (for redo)
+                current_hash = self._file_snapshot.get_current_hash()
+                if current_hash:
+                    self._redo_stack.append(current_hash)
+                self._file_snapshot.restore(target_hash)
+                return True
+            except Exception as e:
+                logger.debug(f"Undo failed: {e}")
+                return False
     
     def redo(self) -> bool:
         """Redo a previously undone set of file changes.
@@ -2242,18 +2359,22 @@ Summary:"""
         Returns:
             True if redo was successful, False if nothing to redo.
         """
-        if self._file_snapshot is None or not self._redo_stack:
+        if self._file_snapshot is None:
             return False
-        try:
-            target_hash = self._redo_stack.pop()
-            current_hash = self._file_snapshot.get_current_hash()
-            if current_hash:
-                self._snapshot_stack.append(current_hash)
-            self._file_snapshot.restore(target_hash)
-            return True
-        except Exception as e:
-            logger.debug(f"Redo failed: {e}")
-            return False
+        
+        with self._snapshot_lock:
+            if not self._redo_stack:
+                return False
+            try:
+                target_hash = self._redo_stack.pop()
+                current_hash = self._file_snapshot.get_current_hash()
+                if current_hash:
+                    self._snapshot_stack.append(current_hash)
+                self._file_snapshot.restore(target_hash)
+                return True
+            except Exception as e:
+                logger.debug(f"Redo failed: {e}")
+                return False
     
     def diff(self, from_hash: Optional[str] = None):
         """Get file diffs from autonomous execution.
@@ -2279,8 +2400,11 @@ Summary:"""
             return []
         try:
             base = from_hash
-            if base is None and self._snapshot_stack:
-                base = self._snapshot_stack[0]
+            if base is None:
+                # Protect snapshot stack read with lock to prevent TOCTOU with undo/redo
+                with self._snapshot_lock:
+                    if self._snapshot_stack:
+                        base = self._snapshot_stack[0]
             if base is None:
                 return []
             return self._file_snapshot.diff(base)
@@ -2477,8 +2601,9 @@ Summary:"""
         if self._file_snapshot is not None and self.autonomy_config.get("snapshot", False):
             try:
                 snap_info = self._file_snapshot.track(message="pre-autonomous")
-                self._snapshot_stack.append(snap_info.commit_hash)
-                self._redo_stack.clear()
+                with self._snapshot_lock:
+                    self._snapshot_stack.append(snap_info.commit_hash)
+                    self._redo_stack.clear()
             except Exception as e:
                 logging.debug(f"Pre-autonomous snapshot failed: {e}")
         
@@ -4304,8 +4429,9 @@ Answer:"""
             tools_key = self._get_tools_cache_key(tools)
             cache_key = f"{self.role}:{self.goal}:{tools_key}"
             
-            if cache_key in self._system_prompt_cache:
-                return self._system_prompt_cache[cache_key]
+            cached_prompt = self._cache_get(self._system_prompt_cache, cache_key)
+            if cached_prompt is not None:
+                return cached_prompt
         else:
             cache_key = None  # Don't cache when memory is enabled
             
@@ -4371,9 +4497,9 @@ Your Goal: {self.goal}"""
                 system_prompt += "\n\nExplain Before Acting: Before calling a tool, provide a brief one-sentence explanation of what you are about to do and why. Skip explanations only for repetitive low-level operations where narration would be noisy. When performing a batch of similar operations (e.g. searching for multiple items), explain the group once rather than narrating each call individually."
         
         # Cache the generated system prompt (only if cache_key is set, i.e., memory not enabled)
-        # Simple cache size limit to prevent unbounded growth
-        if cache_key and len(self._system_prompt_cache) < self._max_cache_size:
-            self._system_prompt_cache[cache_key] = system_prompt
+        # Use LRU eviction to prevent unbounded growth
+        if cache_key:
+            self._cache_put(self._system_prompt_cache, cache_key, system_prompt)
         return system_prompt
 
     def _build_response_format(self, schema_model):
@@ -4567,8 +4693,9 @@ Your Goal: {self.goal}"""
         
         # Check cache first
         tools_key = self._get_tools_cache_key(tools)
-        if tools_key in self._formatted_tools_cache:
-            return self._formatted_tools_cache[tools_key]
+        cached_tools = self._cache_get(self._formatted_tools_cache, tools_key)
+        if cached_tools is not None:
+            return cached_tools
             
         formatted_tools = []
         for tool in tools:
@@ -4619,10 +4746,8 @@ Your Goal: {self.goal}"""
                 logging.error(f"Tools are not JSON serializable: {e}")
                 return []
         
-        # Cache the formatted tools
-        # Simple cache size limit to prevent unbounded growth
-        if len(self._formatted_tools_cache) < self._max_cache_size:
-            self._formatted_tools_cache[tools_key] = formatted_tools
+        # Cache the formatted tools with LRU eviction
+        self._cache_put(self._formatted_tools_cache, tools_key, formatted_tools)
         return formatted_tools
 
     def generate_task(self) -> 'Task':
@@ -4812,7 +4937,6 @@ Your Goal: {self.goal}"""
                 # P8/G11: Apply tool timeout if configured
                 tool_timeout = getattr(self, '_tool_timeout', None)
                 if tool_timeout and tool_timeout > 0:
-                    import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                         future = executor.submit(self._execute_tool_impl, function_name, arguments)
                         try:
@@ -5027,6 +5151,101 @@ Your Goal: {self.goal}"""
         tail = text[-tail_limit:] if tail_limit > 0 else ""
         return f"{head}\n...[{len(text):,} chars, showing first/last portions]...\n{tail}"
     
+    def _resolve_approval_decision(self, tool_name: str, tool_args: dict, is_async: bool = False):
+        """Shared approval logic for both sync and async paths.
+        
+        Args:
+            tool_name: Name of the tool to check approval for
+            tool_args: Arguments to pass to the tool
+            is_async: Whether this is called from async context
+            
+        Returns:
+            ApprovalDecision or coroutine: The approval decision (sync) or coroutine (async)
+        """
+        from ..approval import get_approval_registry
+        from ..approval.protocols import ApprovalRequest, ApprovalDecision
+        from ..approval.registry import DEFAULT_DANGEROUS_TOOLS
+        
+        backend = getattr(self, '_approval_backend', None)
+        approve_all = getattr(self, '_approve_all_tools', False)
+        
+        if backend is not None:
+            needs_approval = approve_all or tool_name in DEFAULT_DANGEROUS_TOOLS
+            if needs_approval:
+                request = ApprovalRequest(
+                    tool_name=tool_name,
+                    arguments=tool_args,
+                    risk_level=DEFAULT_DANGEROUS_TOOLS.get(tool_name, "medium"),
+                    agent_name=getattr(self, 'name', None),
+                )
+                
+                if is_async:
+                    # Async path - return the coroutine for caller to await
+                    cfg_timeout = getattr(self, '_approval_timeout', 0)
+                    if cfg_timeout is None:
+                        return backend.request_approval(request)
+                    elif cfg_timeout > 0:
+                        import asyncio
+                        return asyncio.wait_for(
+                            backend.request_approval(request),
+                            timeout=cfg_timeout,
+                        )
+                    else:
+                        return backend.request_approval(request)
+                else:
+                    # Sync path - handle timeout and sync/async backend compatibility
+                    cfg_timeout = getattr(self, '_approval_timeout', 0)
+                    orig_timeout = None
+                    if cfg_timeout is None:
+                        orig_timeout = getattr(backend, '_timeout', None)
+                        if orig_timeout is not None:
+                            backend._timeout = 86400 * 365
+                    elif cfg_timeout > 0:
+                        orig_timeout = getattr(backend, '_timeout', None)
+                        if orig_timeout is not None:
+                            backend._timeout = cfg_timeout
+                    
+                    try:
+                        if hasattr(backend, 'request_approval_sync'):
+                            return backend.request_approval_sync(request)
+                        else:
+                            # Use the shared utility to avoid code duplication and handle timeout correctly
+                            from ..approval.utils import run_coroutine_safely
+                            
+                            # Compute effective timeout from agent configuration
+                            if cfg_timeout is None:
+                                effective_timeout = None  # indefinite wait
+                            elif cfg_timeout > 0:
+                                effective_timeout = cfg_timeout
+                            else:
+                                # cfg_timeout == 0: use backend default or fallback
+                                effective_timeout = getattr(backend, '_timeout', 60)
+                            
+                            return run_coroutine_safely(
+                                backend.request_approval(request),
+                                timeout=effective_timeout
+                            )
+                    finally:
+                        if orig_timeout is not None and hasattr(backend, '_timeout'):
+                            backend._timeout = orig_timeout
+            else:
+                if is_async:
+                    # For async, wrap the decision in a coroutine
+                    async def _async_approval():
+                        return ApprovalDecision(approved=True, reason="Not a dangerous tool")
+                    return _async_approval()
+                else:
+                    return ApprovalDecision(approved=True, reason="Not a dangerous tool")
+        else:
+            if is_async:
+                return get_approval_registry().approve_async(
+                    getattr(self, 'name', None), tool_name, tool_args,
+                )
+            else:
+                return get_approval_registry().approve_sync(
+                    getattr(self, 'name', None), tool_name, tool_args,
+                )
+
     def _check_tool_approval_sync(self, function_name, arguments):
         """Check tool approval synchronously. Returns (decision, arguments) or error dict."""
         # Permission tier fast-path (O(1) frozenset lookup, resolved at __init__)
@@ -5035,50 +5254,16 @@ Your Goal: {self.goal}"""
         if self._perm_allow is not None and function_name not in self._perm_allow:
             return {"error": f"Tool '{function_name}' not in allowed tools list", "permission_denied": True}
 
-        from ..approval import get_approval_registry
-        backend = getattr(self, '_approval_backend', None)
-        approve_all = getattr(self, '_approve_all_tools', False)
-        if backend is not None:
-            from ..approval.protocols import ApprovalRequest, ApprovalDecision
-            from ..approval.registry import DEFAULT_DANGEROUS_TOOLS
-            needs_approval = approve_all or function_name in DEFAULT_DANGEROUS_TOOLS
-            if needs_approval:
-                request = ApprovalRequest(
-                    tool_name=function_name,
-                    arguments=arguments,
-                    risk_level=DEFAULT_DANGEROUS_TOOLS.get(function_name, "medium"),
-                    agent_name=getattr(self, 'name', None),
-                )
-                cfg_timeout = getattr(self, '_approval_timeout', 0)
-                if cfg_timeout is None:
-                    orig_timeout = getattr(backend, '_timeout', None)
-                    if orig_timeout is not None:
-                        backend._timeout = 86400 * 365
-                elif cfg_timeout > 0:
-                    orig_timeout = getattr(backend, '_timeout', None)
-                    if orig_timeout is not None:
-                        backend._timeout = cfg_timeout
-                else:
-                    orig_timeout = None
-                try:
-                    if hasattr(backend, 'request_approval_sync'):
-                        decision = backend.request_approval_sync(request)
-                    else:
-                        decision = asyncio.run(backend.request_approval(request))
-                finally:
-                    if orig_timeout is not None and hasattr(backend, '_timeout'):
-                        backend._timeout = orig_timeout
-            else:
-                decision = ApprovalDecision(approved=True, reason="Not a dangerous tool")
-        else:
-            decision = get_approval_registry().approve_sync(
-                getattr(self, 'name', None), function_name, arguments,
-            )
+        decision = self._resolve_approval_decision(function_name, arguments, is_async=False)
+        
         if not decision.approved:
             error_msg = f"Tool execution denied: {decision.reason}"
             logging.warning(error_msg)
             return {"error": error_msg, "approval_denied": True}
+        
+        from ..approval import get_approval_registry
         get_approval_registry().mark_approved(function_name)
+        
         if decision.modified_args:
             arguments = decision.modified_args
             logging.info(f"Using modified arguments: {arguments}")
@@ -5086,41 +5271,23 @@ Your Goal: {self.goal}"""
 
     async def _check_tool_approval_async(self, function_name, arguments):
         """Check tool approval asynchronously. Returns (decision, arguments) or error dict."""
-        from ..approval import get_approval_registry
-        backend = getattr(self, '_approval_backend', None)
-        approve_all = getattr(self, '_approve_all_tools', False)
-        if backend is not None:
-            from ..approval.protocols import ApprovalRequest, ApprovalDecision
-            from ..approval.registry import DEFAULT_DANGEROUS_TOOLS
-            needs_approval = approve_all or function_name in DEFAULT_DANGEROUS_TOOLS
-            if needs_approval:
-                request = ApprovalRequest(
-                    tool_name=function_name,
-                    arguments=arguments,
-                    risk_level=DEFAULT_DANGEROUS_TOOLS.get(function_name, "medium"),
-                    agent_name=getattr(self, 'name', None),
-                )
-                cfg_timeout = getattr(self, '_approval_timeout', 0)
-                if cfg_timeout is None:
-                    decision = await backend.request_approval(request)
-                elif cfg_timeout > 0:
-                    decision = await asyncio.wait_for(
-                        backend.request_approval(request),
-                        timeout=cfg_timeout,
-                    )
-                else:
-                    decision = await backend.request_approval(request)
-            else:
-                decision = ApprovalDecision(approved=True, reason="Not a dangerous tool")
-        else:
-            decision = await get_approval_registry().approve_async(
-                getattr(self, 'name', None), function_name, arguments,
-            )
+        # Permission tier fast-path (O(1) frozenset lookup, resolved at __init__)
+        if self._perm_deny and function_name in self._perm_deny:
+            return {"error": f"Tool '{function_name}' blocked by permission policy", "permission_denied": True}
+        if self._perm_allow is not None and function_name not in self._perm_allow:
+            return {"error": f"Tool '{function_name}' not in allowed tools list", "permission_denied": True}
+
+        decision_coro = self._resolve_approval_decision(function_name, arguments, is_async=True)
+        decision = await decision_coro
+        
         if not decision.approved:
             error_msg = f"Tool execution denied: {decision.reason}"
             logging.warning(error_msg)
             return {"error": error_msg, "approval_denied": True}
+        
+        from ..approval import get_approval_registry
         get_approval_registry().mark_approved(function_name)
+        
         if decision.modified_args:
             arguments = decision.modified_args
             logging.info(f"Using modified arguments: {arguments}")
@@ -6279,12 +6446,9 @@ Your Goal: {self.goal}"""
                     # Extract text from multimodal prompts
                     normalized_content = next((item["text"] for item in prompt if item.get("type") == "text"), "")
                 
-                # Prevent duplicate messages
-                if not (self.chat_history and 
-                        self.chat_history[-1].get("role") == "user" and 
-                        self.chat_history[-1].get("content") == normalized_content):
-                    # Add user message to chat history BEFORE LLM call so handoffs can access it
-                    self.chat_history.append({"role": "user", "content": normalized_content})
+                # Add user message to chat history BEFORE LLM call so handoffs can access it
+                # Use atomic check-then-act to prevent TOCTOU race conditions
+                if self._add_to_chat_history_if_not_duplicate("user", normalized_content):
                     # Persist user message to DB
                     self._persist_message("user", normalized_content)
                 
@@ -6334,7 +6498,7 @@ Your Goal: {self.goal}"""
                     
                     response_text = self.llm_instance.get_response(**llm_kwargs)
 
-                    self.chat_history.append({"role": "assistant", "content": response_text})
+                    self._add_to_chat_history("assistant", response_text)
                     # Persist assistant message to DB
                     self._persist_message("assistant", response_text)
 
@@ -7082,7 +7246,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         result = await tool(**arguments)
                     else:
                         # Run sync function in executor to avoid blocking
-                        loop = asyncio.get_event_loop()
+                        loop = asyncio.get_running_loop()
                         result = await loop.run_in_executor(None, lambda: tool(**arguments))
 
                     # --- AFTER_TOOL hook ---
@@ -8447,7 +8611,7 @@ Write the complete compiled report:"""
                     result = await func(**arguments)
                 else:
                     logging.debug(f"Executing sync function in executor: {function_name}")
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     result = await loop.run_in_executor(None, lambda: func(**arguments))
                 
                 # Ensure result is JSON serializable
@@ -8471,50 +8635,68 @@ Write the complete compiled report:"""
 
     def launch(self, path: str = '/', port: int = 8000, host: str = '0.0.0.0', debug: bool = False, protocol: str = "http"):
         """
-        Launch the agent as an HTTP API endpoint or an MCP server.
+        Launch the agent as an HTTP API endpoint or MCP server.
+        
+        This method now delegates to protocol-based launchers to follow
+        the protocol-driven architecture. Heavy implementations (FastAPI/uvicorn)
+        are only imported when needed through lazy loading.
         
         Args:
             path: API endpoint path (default: '/') for HTTP, or base path for MCP.
             port: Server port (default: 8000)
             host: Server host (default: '0.0.0.0')
-            debug: Enable debug mode for uvicorn (default: False)
+            debug: Enable debug mode (default: False)
             protocol: "http" to launch as FastAPI, "mcp" to launch as MCP server.
             
         Returns:
             None
         """
+        # Delegate to protocol-specific launcher
         if protocol == "http":
-            global _server_started, _registered_agents, _shared_apps, _server_lock
+            return self._launch_http_server(path, port, host, debug)
+        elif protocol == "mcp":
+            return self._launch_mcp_server(path, port, host, debug)
+        else:
+            raise ValueError(f"Unsupported protocol: {protocol}. Use 'http' or 'mcp'")
 
-            # Try to import FastAPI dependencies - lazy loading
-            try:
-                import uvicorn
-                from fastapi import FastAPI, HTTPException, Request
-                from fastapi.responses import JSONResponse
-                from pydantic import BaseModel
-                import threading
-                import time
-                import asyncio
-                
-                # Define the request model here since we need pydantic
-                class AgentQuery(BaseModel):
-                    query: str
+    def _launch_http_server(self, path: str, port: int, host: str, debug: bool):
+        """
+        Launch HTTP server using FastAPI (internal implementation).
+        
+        NOTE: This implementation will be moved to wrapper layer in future version.
+        For now, it maintains backward compatibility while following lazy import patterns.
+        """
+        global _server_started, _registered_agents, _shared_apps, _server_lock
+
+        # Try to import FastAPI dependencies - lazy loading
+        try:
+            import uvicorn
+            from fastapi import FastAPI, HTTPException, Request
+            from fastapi.responses import JSONResponse
+            from pydantic import BaseModel
+            import threading
+            import time
+            import asyncio
+            
+            # Define the request model here since we need pydantic
+            class AgentQuery(BaseModel):
+                query: str
                     
-            except ImportError as e:
-                # Check which specific module is missing
-                missing_module = str(e).split("No module named '")[-1].rstrip("'")
-                _get_display_functions()['display_error'](f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
-                logging.error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
-                print(f"\nTo add API capabilities, install the required dependencies:")
-                print(f"pip install {missing_module}")
-                print("\nOr install all API dependencies with:")
-                print("pip install 'praisonaiagents[api]'")
-                return None
+        except ImportError as e:
+            # Check which specific module is missing
+            missing_module = str(e).split("No module named '")[-1].rstrip("'")
+            _get_display_functions()['display_error'](f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
+            logging.error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
+            print(f"\nTo add API capabilities, install the required dependencies:")
+            print(f"pip install {missing_module}")
+            print("\nOr install all API dependencies with:")
+            print("pip install 'praisonaiagents[api]'")
+            return None
                 
-            with _server_lock:
-                # Initialize port-specific collections if needed
-                if port not in _registered_agents:
-                    _registered_agents[port] = {}
+        with _server_lock:
+            # Initialize port-specific collections if needed
+            if port not in _registered_agents:
+                _registered_agents[port] = {}
 
                 # Initialize shared FastAPI app if not already created for this port
                 if _shared_apps.get(port) is None:
@@ -8582,7 +8764,7 @@ Write the complete compiled report:"""
                             response = await self.achat(query, task_name=None, task_description=None, task_id=None)
                         else:
                             # Run sync function in a thread to avoid blocking
-                            loop = asyncio.get_event_loop()
+                            loop = asyncio.get_running_loop()
                             response = await loop.run_in_executor(None, lambda p=query: self.chat(p))
 
                         return {"response": response}
@@ -8595,12 +8777,12 @@ Write the complete compiled report:"""
 
                 print(f"🚀 Agent '{self.name}' available at http://{host}:{port}")
 
-                # Start the server if it's not already running for this port
+                # Check and mark server as started atomically to prevent race conditions
                 should_start = not _server_started.get(port, False)
                 if should_start:
                     _server_started[port] = True
 
-            # Server start/wait outside the lock to avoid holding it during sleep
+            # Server start/wait outside the lock to avoid holding it during sleep  
             if should_start:
                 # Start the server in a separate thread
                 def run_server():
@@ -8663,141 +8845,73 @@ Write the complete compiled report:"""
                     except KeyboardInterrupt:
                         print("\nServers stopped")
             return None
-            
-        elif protocol == "mcp":
-            try:
-                import uvicorn
-                from mcp.server.fastmcp import FastMCP
-                from mcp.server.sse import SseServerTransport
-                from starlette.applications import Starlette
-                from starlette.requests import Request
-                from starlette.routing import Mount, Route
-                from mcp.server import Server as MCPServer  # noqa: F401 - imported for availability check
-                import threading
-                import time
-                import inspect
-                import asyncio  # Import asyncio in the MCP scope
-                # logging is already imported at the module level
-                
-            except ImportError as e:
-                missing_module = str(e).split("No module named '")[-1].rstrip("'")
-                _get_display_functions()['display_error'](f"Missing dependency: {missing_module}. Required for launch() method with MCP mode.")
-                logging.error(f"Missing dependency: {missing_module}. Required for launch() method with MCP mode.")
-                print(f"\nTo add MCP capabilities, install the required dependencies:")
-                print(f"pip install {missing_module} mcp praison-mcp starlette uvicorn") # Added mcp, praison-mcp, starlette, uvicorn
-                print("\nOr install all MCP dependencies with relevant packages.")
-                return None
 
+    def _launch_mcp_server(self, path: str, port: int, host: str, debug: bool):
+        """
+        Launch MCP server (internal implementation).
+        
+        NOTE: This implementation will be moved to wrapper layer in future version.
+        For now, it maintains backward compatibility while following lazy import patterns.
+        """
+        # For now, delegate to the existing MCP implementation 
+        # This will be extracted to a proper adapter in the future
+        try:
+            import uvicorn
+            from mcp.server.fastmcp import FastMCP
+            from mcp.server.sse import SseServerTransport
+            from starlette.applications import Starlette
+            import threading
+            import time
+            import asyncio
+            
             mcp_server_instance_name = f"{self.name}_mcp_server" if self.name else "agent_mcp_server"
             mcp = FastMCP(mcp_server_instance_name)
 
             # Determine the MCP tool name based on self.name
-            actual_mcp_tool_name = f"execute_{self.name.lower().replace(' ', '_').replace('-', '_')}_task" if self.name \
-                else "execute_task"
+            actual_mcp_tool_name = f"execute_{self.name.lower().replace(' ', '_').replace('-', '_')}_task" if self.name else "execute_task"
 
             @mcp.tool(name=actual_mcp_tool_name)
             async def execute_agent_task(prompt: str) -> str:
                 """Executes the agent's primary task with the given prompt."""
-                logging.info(f"MCP tool '{actual_mcp_tool_name}' called with prompt: {prompt}")
                 try:
-                    # Ensure self.achat is used as it's the async version and pass its tools
                     if hasattr(self, 'achat') and asyncio.iscoroutinefunction(self.achat):
                         response = await self.achat(prompt, tools=self.tools, task_name=None, task_description=None, task_id=None)
-                    elif hasattr(self, 'chat'): # Fallback for synchronous chat
-                        # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                    elif hasattr(self, 'chat'):
                         from ..trace.context_events import copy_context_to_callable
                         loop = asyncio.get_event_loop()
                         response = await loop.run_in_executor(None, copy_context_to_callable(lambda p=prompt: self.chat(p, tools=self.tools)))
                     else:
-                        logging.error(f"Agent {self.name} has no suitable chat or achat method for MCP tool.")
                         return f"Error: Agent {self.name} misconfigured for MCP."
                     return response if response is not None else "Agent returned no response."
                 except Exception as e:
-                    logging.error(f"Error in MCP tool '{actual_mcp_tool_name}': {e}", exc_info=True)
                     return f"Error executing task: {str(e)}"
 
-            # Normalize base_path for MCP routes
-            base_path = path.rstrip('/')
-            sse_path = f"{base_path}/sse"
-            messages_path_prefix = f"{base_path}/messages" # Prefix for message posting
-            
-            # Ensure messages_path ends with a slash for Mount
-            if not messages_path_prefix.endswith('/'):
-                messages_path_prefix += '/'
-
-
-            sse_transport = SseServerTransport(messages_path_prefix) # Pass the full prefix
-
-            async def handle_sse_connection(request: Request) -> None:
-                logging.debug(f"SSE connection request received from {request.client} for path {request.url.path}")
-                async with sse_transport.connect_sse(
-                        request.scope,
-                        request.receive,
-                        request._send,  # noqa: SLF001
-                ) as (read_stream, write_stream):
-                    await mcp._mcp_server.run( # Use the underlying server from FastMCP
-                        read_stream,
-                        write_stream,
-                        mcp._mcp_server.create_initialization_options(),
-                    )
-            
+            # Create and run MCP server
+            transport = SseServerTransport(f"{path}/sse")
             starlette_app = Starlette(
-                debug=debug,
-                routes=[
-                    Route(sse_path, endpoint=handle_sse_connection),
-                    Mount(messages_path_prefix, app=sse_transport.handle_post_message),
-                ],
+                routes=[Mount(f"{path}", mcp.create_app())]
             )
 
-            print(f"🚀 Agent '{self.name}' MCP server starting on http://{host}:{port}")
-            print(f"📡 MCP SSE endpoint available at {sse_path}")
-            print(f"📢 MCP messages post to {messages_path_prefix}")
-            # Instead of trying to extract tool names, hardcode the known tool name
-            tool_names = [actual_mcp_tool_name]  # Use the determined dynamic tool name
-            print(f"🛠️ Available MCP tools: {', '.join(tool_names)}")
-
-            # Uvicorn server running logic (similar to HTTP mode but standalone for MCP)
             def run_mcp_server():
                 try:
                     uvicorn.run(starlette_app, host=host, port=port, log_level="debug" if debug else "info")
                 except Exception as e:
                     logging.error(f"Error starting MCP server: {str(e)}", exc_info=True)
-                    print(f"❌ Error starting MCP server: {str(e)}")
 
             server_thread = threading.Thread(target=run_mcp_server, daemon=True)
             server_thread.start()
-            time.sleep(0.5) # Allow server to start
+            time.sleep(0.5)
 
-            # Blocking logic for MCP mode
-            import inspect # Already imported but good for clarity
-            stack = inspect.stack()
-            if len(stack) > 1 and stack[1].filename.endswith('.py'):
-                caller_frame = stack[1]
-                caller_line = caller_frame.lineno
-                try:
-                    with open(caller_frame.filename, 'r') as f:
-                        lines = f.readlines()
-                    has_more_launches = False
-                    for line_content in lines[caller_line:]: # renamed line to line_content
-                        if '.launch(' in line_content and not line_content.strip().startswith('#'):
-                            has_more_launches = True
-                            break
-                    if not has_more_launches:
-                        try:
-                            print("\nAgent MCP server running. Press Ctrl+C to stop.")
-                            while True:
-                                time.sleep(1)
-                        except KeyboardInterrupt:
-                            print("\nMCP Server stopped")
-                except Exception as e:
-                    logging.error(f"Error in MCP launch detection: {e}")
-                    try:
-                        print("\nKeeping MCP server alive. Press Ctrl+C to stop.")
-                        while True:
-                            time.sleep(1)
-                    except KeyboardInterrupt:
-                        print("\nMCP Server stopped")
+            try:
+                print("\nKeeping MCP server alive. Press Ctrl+C to stop.")
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\nMCP Server stopped")
             return None
-        else:
-            _get_display_functions()['display_error'](f"Invalid protocol: {protocol}. Choose 'http' or 'mcp'.")
+            
+        except ImportError as e:
+            missing_module = str(e).split("No module named '")[-1].rstrip("'")
+            _get_display_functions()['display_error'](f"Missing dependency: {missing_module}. Required for MCP mode.")
+            print(f"\nTo add MCP capabilities, install: pip install {missing_module}")
             return None 

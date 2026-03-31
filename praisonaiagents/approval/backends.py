@@ -116,7 +116,7 @@ class ConsoleBackend:
 
     async def request_approval(self, request: ApprovalRequest) -> ApprovalDecision:
         """Async wrapper — runs the sync prompt in an executor."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.request_approval_sync, request)
 
 
@@ -210,7 +210,7 @@ class AgentApproval:
             if hasattr(approver, "achat"):
                 response = await approver.achat(prompt)
             elif hasattr(approver, "chat"):
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 response = await loop.run_in_executor(None, approver.chat, prompt)
             else:
                 return ApprovalDecision(
@@ -237,18 +237,8 @@ class AgentApproval:
 
     def request_approval_sync(self, request: ApprovalRequest) -> ApprovalDecision:
         """Synchronous wrapper."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(asyncio.run, self.request_approval(request))
-                return future.result(timeout=60)
-        else:
-            return asyncio.run(self.request_approval(request))
+        from .utils import run_coroutine_safely
+        return run_coroutine_safely(self.request_approval(request), timeout=60)
 
 
 class CallbackBackend:
@@ -274,7 +264,7 @@ class CallbackBackend:
         if asyncio.iscoroutinefunction(self._callback):
             result = await self._callback(request.tool_name, request.arguments, request.risk_level)
         else:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None, self._callback, request.tool_name, request.arguments, request.risk_level,
             )

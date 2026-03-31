@@ -1,8 +1,10 @@
 """Tools package for PraisonAI Agents - uses lazy loading for performance"""
 from importlib import import_module
 from typing import Any
+import threading
 
-# Lazy loading cache
+# Thread-safe lazy loading cache
+_tools_lock = threading.Lock()
 _tools_lazy_cache = {}
 
 # Export core tool items for organized imports (lightweight)
@@ -22,6 +24,19 @@ from .validators import (
     PassthroughValidator,
 )
 from .retry import RetryPolicy, FallbackChain, ToolExecutionConfig
+
+# Circuit breaker functionality (lazy loaded)
+_CIRCUIT_BREAKER_EXPORTS = frozenset({
+    'CircuitBreaker', 'CircuitBreakerProtocol', 'CircuitBreakerConfig', 'CircuitBreakerException',
+    'CircuitBreakerStats', 'CircuitState', 'HealthCheckProtocol', 'CircuitBreakerRegistry',
+    'get_circuit_breaker', 'get_all_circuit_breaker_stats', 'reset_all_circuit_breakers',
+    # Integration utilities
+    'with_circuit_breaker', 'LLMCircuitBreakerIntegration', 'MemoryCircuitBreakerIntegration',
+    'MCPCircuitBreakerIntegration', 'create_resilient_external_call', 'integrate_with_retry_policy',
+    # Health monitoring
+    'HealthMonitor', 'HealthMetrics', 'ServiceHealthConfig', 'TelemetryProtocol',
+    'get_health_monitor', 'get_circuit_breaker_dashboard_data'
+})
 
 # Map of function names to their module and class (if any)
 TOOL_MAPPINGS = {
@@ -185,7 +200,7 @@ TOOL_MAPPINGS = {
     'email_tools': ('.email_tools', None),
 }
 
-_instances = {}  # Cache for class instances
+_instances = {}  # Cache for class instances (protected by _tools_lock)
 
 # Profile exports (lazy loaded)
 _PROFILE_EXPORTS = frozenset({
@@ -195,7 +210,65 @@ _PROFILE_EXPORTS = frozenset({
 
 def __getattr__(name: str) -> Any:
     """Smart lazy loading of tools and profiles."""
-    # Handle profile imports first
+    # Handle circuit breaker imports first
+    if name in _CIRCUIT_BREAKER_EXPORTS:
+        from .circuit_breaker import (
+            CircuitBreaker, CircuitBreakerProtocol, CircuitBreakerConfig, CircuitBreakerException,
+            CircuitBreakerStats, CircuitState, HealthCheckProtocol, CircuitBreakerRegistry,
+            get_circuit_breaker, get_all_circuit_breaker_stats, reset_all_circuit_breakers
+        )
+        # Lazy import integration utilities
+        integration_imports = {}
+        if name in {'with_circuit_breaker', 'LLMCircuitBreakerIntegration', 'MemoryCircuitBreakerIntegration',
+                    'MCPCircuitBreakerIntegration', 'create_resilient_external_call', 'integrate_with_retry_policy'}:
+            from .circuit_breaker_integrations import (
+                with_circuit_breaker, LLMCircuitBreakerIntegration, MemoryCircuitBreakerIntegration,
+                MCPCircuitBreakerIntegration, create_resilient_external_call, integrate_with_retry_policy
+            )
+            integration_imports.update({
+                'with_circuit_breaker': with_circuit_breaker,
+                'LLMCircuitBreakerIntegration': LLMCircuitBreakerIntegration,
+                'MemoryCircuitBreakerIntegration': MemoryCircuitBreakerIntegration,
+                'MCPCircuitBreakerIntegration': MCPCircuitBreakerIntegration,
+                'create_resilient_external_call': create_resilient_external_call,
+                'integrate_with_retry_policy': integrate_with_retry_policy,
+            })
+        
+        # Lazy import health monitoring
+        health_imports = {}
+        if name in {'HealthMonitor', 'HealthMetrics', 'ServiceHealthConfig', 'TelemetryProtocol',
+                    'get_health_monitor', 'get_circuit_breaker_dashboard_data'}:
+            from .health_monitor import (
+                HealthMonitor, HealthMetrics, ServiceHealthConfig, TelemetryProtocol,
+                get_health_monitor, get_circuit_breaker_dashboard_data
+            )
+            health_imports.update({
+                'HealthMonitor': HealthMonitor,
+                'HealthMetrics': HealthMetrics,
+                'ServiceHealthConfig': ServiceHealthConfig,
+                'TelemetryProtocol': TelemetryProtocol,
+                'get_health_monitor': get_health_monitor,
+                'get_circuit_breaker_dashboard_data': get_circuit_breaker_dashboard_data,
+            })
+        
+        _circuit_breaker_map = {
+            'CircuitBreaker': CircuitBreaker,
+            'CircuitBreakerProtocol': CircuitBreakerProtocol,
+            'CircuitBreakerConfig': CircuitBreakerConfig,
+            'CircuitBreakerException': CircuitBreakerException,
+            'CircuitBreakerStats': CircuitBreakerStats,
+            'CircuitState': CircuitState,
+            'HealthCheckProtocol': HealthCheckProtocol,
+            'CircuitBreakerRegistry': CircuitBreakerRegistry,
+            'get_circuit_breaker': get_circuit_breaker,
+            'get_all_circuit_breaker_stats': get_all_circuit_breaker_stats,
+            'reset_all_circuit_breakers': reset_all_circuit_breakers,
+            **integration_imports,
+            **health_imports,
+        }
+        return _circuit_breaker_map[name]
+    
+    # Handle profile imports
     if name in _PROFILE_EXPORTS:
         from .profiles import (
             ToolProfile, AUTONOMY_PROFILE, BUILTIN_PROFILES,
@@ -252,11 +325,14 @@ def __getattr__(name: str) -> Any:
             return module  # Returns the callable module
         return getattr(module, name)
     else:
-        # Class method import
+        # Class method import (thread-safe)
         if class_name not in _instances:
-            module = import_module(module_path, __package__)
-            class_ = getattr(module, class_name)
-            _instances[class_name] = class_()
+            with _tools_lock:
+                # Double-check pattern to avoid race conditions
+                if class_name not in _instances:
+                    module = import_module(module_path, __package__)
+                    class_ = getattr(module, class_name)
+                    _instances[class_name] = class_()
         
         # Get the method and bind it to the instance
         method = getattr(_instances[class_name], name)
@@ -271,6 +347,16 @@ __all__ = list(TOOL_MAPPINGS.keys()) + [
     # Validation and retry protocols
     'ValidationResult', 'ToolValidatorProtocol', 'AsyncToolValidatorProtocol', 'PassthroughValidator',
     'RetryPolicy', 'FallbackChain', 'ToolExecutionConfig',
+    # Circuit breaker functionality
+    'CircuitBreaker', 'CircuitBreakerProtocol', 'CircuitBreakerConfig', 'CircuitBreakerException',
+    'CircuitBreakerStats', 'CircuitState', 'HealthCheckProtocol', 'CircuitBreakerRegistry',
+    'get_circuit_breaker', 'get_all_circuit_breaker_stats', 'reset_all_circuit_breakers',
+    # Integration utilities
+    'with_circuit_breaker', 'LLMCircuitBreakerIntegration', 'MemoryCircuitBreakerIntegration',
+    'MCPCircuitBreakerIntegration', 'create_resilient_external_call', 'integrate_with_retry_policy',
+    # Health monitoring
+    'HealthMonitor', 'HealthMetrics', 'ServiceHealthConfig', 'TelemetryProtocol',
+    'get_health_monitor', 'get_circuit_breaker_dashboard_data',
     # Tool profiles (DRY tool sets for autonomy/interactive modes)
     'ToolProfile', 'AUTONOMY_PROFILE', 'BUILTIN_PROFILES',
     'register_profile', 'get_profile', 'resolve_profiles', 'list_profiles',
