@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+from praisonaiagents._logging import get_logger
 from typing import Any, Dict, Optional, List
 from ..main import display_error, TaskOutput
 from ..agent.agent import Agent
@@ -27,7 +28,7 @@ class TaskStatus(Enum):
     UNKNOWN = "unknown"
 
 # Set up logger
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Global variables for managing the shared servers with thread-safety
 import threading
@@ -62,7 +63,6 @@ def process_video(video_path: str, seconds_per_frame=2):
         curr_frame += frames_to_skip
     video.release()
     return base64_frames
-
 
 def get_multimodal_message(text_prompt: str, images: list) -> list:
     """
@@ -107,7 +107,6 @@ def get_multimodal_message(text_prompt: str, images: list) -> list:
                 "image_url": {"url": img}
             })
     return content
-
 
 def process_task_context(context_item, verbose=0, user_id=None):
     """
@@ -450,17 +449,18 @@ class AgentTeam:
         
         # Set logger level based on verbose
         if _verbose >= 5:
-            logger.setLevel(logging.INFO)
+            logger.setLevel(10)  # DEBUG
         elif _verbose >= 3:
-            logger.setLevel(logging.DEBUG)
+            logger.setLevel(20)  # INFO
         else:
-            logger.setLevel(logging.WARNING)
-            
+            logger.setLevel(30)  # WARNING
+
         # Also set third-party loggers to WARNING
-        logging.getLogger('chromadb').setLevel(logging.WARNING)
-        logging.getLogger('openai').setLevel(logging.WARNING)
-        logging.getLogger('httpx').setLevel(logging.WARNING)
-        logging.getLogger('httpcore').setLevel(logging.WARNING)
+        import logging as _logging
+        get_logger('chromadb').setLevel(_logging.WARNING)
+        get_logger('openai').setLevel(_logging.WARNING)
+        get_logger('httpx').setLevel(_logging.WARNING)
+        get_logger('httpcore').setLevel(_logging.WARNING)
 
         if self.verbose:
             logger.info(f"Using model {self.manager_llm} for manager")
@@ -653,28 +653,46 @@ class AgentTeam:
         if task.status == "not started":
             task.status = "in progress"
 
+        # Initialize memory before task execution
+        if not task.memory:
+            task.memory = task.initialize_memory()
+
         executor_agent = task.agent
+        
+        # Create agent from agent_config if provided and no agent assigned
+        if executor_agent is None and getattr(task, 'agent_config', None):
+            executor_agent = self._create_agent_from_config(task.agent_config)
+            task.agent = executor_agent
         
         # Set current agent for token tracking
         llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
         if llm and hasattr(llm, 'set_current_agent'):
             llm.set_current_agent(executor_agent.display_name)
 
-        # Ensure tools are available from both task and agent
-        tools = task.tools or []
+        # Ensure tools are available from both task and agent (create copy to avoid mutation)
+        tools = list(task.tools or [])
         if executor_agent and executor_agent.tools:
             tools.extend(executor_agent.tools)
 
-        task_prompt = f"""
-You need to do the following task: {task.description}.
-Expected Output: {task.expected_output}.
-"""
+        logger.info(f"Task config: {task.config}")
+        logger.info(f"Task memory status: {'Initialized' if task.memory else 'Not initialized'}")
+
+        # Substitute variables in task description if provided
+        task_description = task.description
+        if getattr(task, 'variables', None):
+            for key, value in task.variables.items():
+                task_description = task_description.replace(f"{{{{{key}}}}}", str(value))
+
+        # Build context first to include in task prompt
+        context_text = ""
         if task.context:
             context_results = []  # Use list to avoid duplicates
             for context_item in task.context:
                 # Use the centralized helper function
                 context_str = process_task_context(context_item, self.verbose, self.user_id)
-                context_results.append(context_str)
+                # Only add non-empty context strings
+                if context_str and context_str.strip():
+                    context_results.append(context_str)
             
             # Join unique context results with proper formatting
             unique_contexts = list(dict.fromkeys(context_results))  # Remove duplicates
@@ -683,15 +701,38 @@ Expected Output: {task.expected_output}.
                 for i, ctx in enumerate(unique_contexts):
                     logger.debug(f"Context {i+1}: {ctx[:100]}...")
             context_separator = '\n\n'
-            task_prompt += f"""
-Context:
+            context_text = context_separator.join(unique_contexts)
+        
+        # Build task prompt - only use "User Input/Topic" format if there's actual content
+        if context_text and context_text.strip():
+            task_prompt = f"""
+User Input/Topic: {context_text}
 
-{context_separator.join(unique_contexts)}
-"""
-        task_prompt += "Please provide only the final result of your work. Do not add any conversation or extra explanation."
+Task: {task_description}
+Expected Output: {task.expected_output}
+
+IMPORTANT: Your response must be about the user's input/topic above. Incorporate it into your task."""
+        else:
+            task_prompt = f"""
+You need to do the following task: {task_description}.
+Expected Output: {task.expected_output}."""
+
+        # Add memory context if available
+        if task.memory:
+            try:
+                memory_context = task.memory.build_context_for_task(task.description)
+                if memory_context:
+                    # Log detailed memory context for debugging
+                    logger.debug(f"Memory context for task '{task.description}': {memory_context}")
+                    # Include actual memory content without verbose headers (essential for AI agent functionality)
+                    task_prompt += f"\n\n{memory_context}"
+            except Exception as e:
+                logger.error(f"Error getting memory context: {e}")
+
+        task_prompt += "\nPlease provide only the final result of your work. Do not add any conversation or extra explanation."
 
         if self.verbose >= 2:
-            logger.info(f"Executing task {task_id}: {task.description} using {executor_agent.display_name}")
+            logger.info(f"Executing task {task_id}: {task_description} using {executor_agent.display_name}")
         logger.debug(f"Starting execution of task {task_id} with prompt:\n{task_prompt}")
 
         if task.images:
@@ -717,6 +758,17 @@ Context:
             )
 
         if agent_output:
+            # Store the response in memory
+            if task.memory:
+                try:
+                    task.store_in_memory(
+                        content=agent_output,
+                        agent_name=executor_agent.display_name,
+                        task_id=task_id
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to store agent output in memory: {e}")
+
             task_output = TaskOutput(
                 description=task.description,
                 summary=task.description[:10],
@@ -983,22 +1035,27 @@ Context:
         if llm and hasattr(llm, 'set_current_agent'):
             llm.set_current_agent(executor_agent.display_name)
 
+        # Ensure tools are available from both task and agent (create copy to avoid mutation)
+        tools = list(task.tools or [])
+        if executor_agent and executor_agent.tools:
+            tools.extend(executor_agent.tools)
+
         # Substitute variables in task description if provided
         task_description = task.description
         if getattr(task, 'variables', None):
             for key, value in task.variables.items():
                 task_description = task_description.replace(f"{{{{{key}}}}}", str(value))
 
-        task_prompt = f"""
-You need to do the following task: {task_description}.
-Expected Output: {task.expected_output}.
-"""
+        # Build context first to include in task prompt
+        context_text = ""
         if task.context:
             context_results = []  # Use list to avoid duplicates
             for context_item in task.context:
                 # Use the centralized helper function
                 context_str = process_task_context(context_item, self.verbose, self.user_id)
-                context_results.append(context_str)
+                # Only add non-empty context strings
+                if context_str and context_str.strip():
+                    context_results.append(context_str)
             
             # Join unique context results with proper formatting
             unique_contexts = list(dict.fromkeys(context_results))  # Remove duplicates
@@ -1007,11 +1064,21 @@ Expected Output: {task.expected_output}.
                 for i, ctx in enumerate(unique_contexts):
                     logger.debug(f"Context {i+1}: {ctx[:100]}...")
             context_separator = '\n\n'
-            task_prompt += f"""
-Context:
+            context_text = context_separator.join(unique_contexts)
+        
+        # Build task prompt - only use "User Input/Topic" format if there's actual content
+        if context_text and context_text.strip():
+            task_prompt = f"""
+User Input/Topic: {context_text}
 
-{context_separator.join(unique_contexts)}
-"""
+Task: {task_description}
+Expected Output: {task.expected_output}
+
+IMPORTANT: Your response must be about the user's input/topic above. Incorporate it into your task."""
+        else:
+            task_prompt = f"""
+You need to do the following task: {task_description}.
+Expected Output: {task.expected_output}."""
 
         # Add memory context if available
         if task.memory:
@@ -1025,7 +1092,7 @@ Context:
             except Exception as e:
                 logger.error(f"Error getting memory context: {e}")
 
-        task_prompt += "Please provide only the final result of your work. Do not add any conversation or extra explanation."
+        task_prompt += "\nPlease provide only the final result of your work. Do not add any conversation or extra explanation."
 
         if self.verbose >= 2:
             logger.info(f"Executing task {task_id}: {task.description} using {executor_agent.display_name}")
@@ -1035,7 +1102,7 @@ Context:
             # Use shared multimodal helper (DRY - defined at module level)
             agent_output = executor_agent.chat(
                 get_multimodal_message(task_prompt, task.images),
-                tools=task.tools,
+                tools=tools,
                 output_json=task.output_json,
                 output_pydantic=task.output_pydantic,
                 task_name=task.name,
@@ -1045,7 +1112,7 @@ Context:
         else:
             agent_output = executor_agent.chat(
                 task_prompt,
-                tools=task.tools,
+                tools=tools,
                 output_json=task.output_json,
                 output_pydantic=task.output_pydantic,
                 stream=self.stream,
@@ -2434,7 +2501,6 @@ Context:
         # Restore original tasks reference for result retrieval
         self._plan_tasks = self.tasks.copy()
         # Keep plan tasks for results but note original tasks are preserved in _plan_tasks
-
 
 # Backward compatibility aliases (silent - no deprecation warnings)
 # AgentTeam is the primary name (v1.0+)

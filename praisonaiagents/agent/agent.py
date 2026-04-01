@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+from praisonaiagents._logging import get_logger
 import asyncio
 import contextlib
 import threading
@@ -16,7 +17,7 @@ from .chat_handler import ChatHandlerMixin
 from .session_manager import SessionManagerMixin
 
 # Module-level logger for thread safety errors and debugging
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ============================================================================
 # Performance: Lazy imports for heavy dependencies
@@ -195,7 +196,6 @@ class BudgetExceededError(Exception):
             f"${total_cost:.4f} >= ${max_budget:.4f}"
         )
 
-
 class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
@@ -220,14 +220,14 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin):
         return self.__hook_runner
     
     @property
-    def stream_emitter(self):
+    def stream_emitter(self) -> Optional[Any]:
         """Lazy-loaded StreamEventEmitter for real-time events (zero overhead when not used)."""
         if self.__stream_emitter is None:
             self.__stream_emitter = _get_stream_emitter()()
         return self.__stream_emitter
     
     @stream_emitter.setter
-    def stream_emitter(self, value):
+    def stream_emitter(self, value: Optional[Any]) -> None:
         """Allow setting stream_emitter directly."""
         self.__stream_emitter = value
     
@@ -255,16 +255,16 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin):
     def _configure_logging(cls):
         """Configure logging settings once for all agent instances."""
         # Configure logging to suppress unwanted outputs
-        logging.getLogger("litellm").setLevel(logging.WARNING)
+        get_logger("litellm").setLevel(logging.WARNING)
         
         # Allow httpx logging when LOGLEVEL=debug, otherwise suppress it
         loglevel = os.environ.get('LOGLEVEL', 'INFO').upper()
         if loglevel == 'DEBUG':
-            logging.getLogger("httpx").setLevel(logging.INFO)
-            logging.getLogger("httpcore").setLevel(logging.INFO)
+            get_logger("httpx").setLevel(logging.INFO)
+            get_logger("httpcore").setLevel(logging.INFO)
         else:
-            logging.getLogger("httpx").setLevel(logging.WARNING)
-            logging.getLogger("httpcore").setLevel(logging.WARNING)
+            get_logger("httpx").setLevel(logging.WARNING)
+            get_logger("httpcore").setLevel(logging.WARNING)
     
     @classmethod
     def from_template(
@@ -1875,57 +1875,57 @@ Your Goal: {self.goal}
             return value
 
     @property
-    def auto_memory(self):
+    def auto_memory(self) -> Optional[bool]:
         """AutoMemory instance for automatic memory extraction."""
         return self._auto_memory
     
     @auto_memory.setter
-    def auto_memory(self, value):
+    def auto_memory(self, value: Optional[bool]) -> None:
         self._auto_memory = value
 
     @property
-    def policy(self):
+    def policy(self) -> Optional[Any]:
         """PolicyEngine instance for execution control."""
         return self._policy
     
     @policy.setter
-    def policy(self, value):
+    def policy(self, value: Optional[Any]) -> None:
         self._policy = value
 
     @property
-    def background(self):
+    def background(self) -> Optional[bool]:
         """BackgroundRunner instance for async task execution."""
         return self._background
     
     @background.setter
-    def background(self, value):
+    def background(self, value: Optional[bool]) -> None:
         self._background = value
 
     @property
-    def checkpoints(self):
+    def checkpoints(self) -> Optional[bool]:
         """CheckpointService instance for file-level undo/restore."""
         return self._checkpoints
     
     @checkpoints.setter
-    def checkpoints(self, value):
+    def checkpoints(self, value: Optional[bool]) -> None:
         self._checkpoints = value
 
     @property
-    def output_style(self):
+    def output_style(self) -> Optional[str]:
         """OutputStyle instance for response formatting."""
         return self._output_style
     
     @output_style.setter
-    def output_style(self, value):
+    def output_style(self, value: Optional[str]) -> None:
         self._output_style = value
 
     @property
-    def thinking_budget(self):
+    def thinking_budget(self) -> Optional[int]:
         """ThinkingBudget instance for extended thinking control."""
         return self._thinking_budget
     
     @thinking_budget.setter
-    def thinking_budget(self, value):
+    def thinking_budget(self, value: Optional[int]) -> None:
         self._thinking_budget = value
 
     @property
@@ -1948,7 +1948,7 @@ Your Goal: {self.goal}
         }
 
     @property
-    def context_manager(self):
+    def context_manager(self) -> Optional[Any]:
         """
         ContextManager instance for unified context management.
         
@@ -2091,7 +2091,7 @@ Summary:"""
         return llm_summarize
 
     @property
-    def console(self):
+    def console(self) -> Optional[Any]:
         """Lazily initialize Rich Console only when needed AND verbose is True."""
         # Only return console if verbose mode is enabled
         # This prevents panels from being shown in status/silent modes
@@ -2103,7 +2103,7 @@ Summary:"""
         return self._console
     
     @property
-    def skill_manager(self):
+    def skill_manager(self) -> Optional[Any]:
         """Lazily initialize SkillManager only when skills are accessed."""
         if self._skill_manager is None and (self._skills or self._skills_dirs):
             from ..skills import SkillManager
@@ -2187,7 +2187,7 @@ Summary:"""
         return self.__openai_client
 
     @property
-    def agent_id(self):
+    def agent_id(self) -> str:
         """Lazily generate agent ID when first accessed."""
         if self._agent_id is None:
             import uuid
@@ -2771,7 +2771,7 @@ Summary:"""
                         "agent_name": getattr(self, 'name', None),
                     })
                 elif self.autonomy_config.get("observe"):
-                    logging.getLogger(__name__).info(
+                    get_logger(__name__).info(
                         f"[autonomy] iteration={iterations} stage={stage} "
                         f"response_len={len(response_str)}"
                     )
@@ -3161,7 +3161,7 @@ Summary:"""
                         "agent_name": getattr(self, 'name', None),
                     })
                 elif self.autonomy_config.get("observe"):
-                    logging.getLogger(__name__).info(
+                    get_logger(__name__).info(
                         f"[autonomy-async] iteration={iterations} stage={stage} "
                         f"response_len={len(response_str)}"
                     )
@@ -3624,7 +3624,7 @@ Summary:"""
         return supports_prompt_caching(model_name)
     
     @property
-    def rules_manager(self):
+    def rules_manager(self) -> Optional[Any]:
         """
         Lazy-initialized RulesManager for persistent rules/instructions.
         
@@ -3805,7 +3805,7 @@ Summary:"""
         
         return ""
     
-    def store_memory(self, content: str, memory_type: str = "short_term", **kwargs):
+    def store_memory(self, content: str, memory_type: str = "short_term", **kwargs: Any) -> None:
         """
         Store content in memory.
         
@@ -3877,7 +3877,7 @@ Summary:"""
             ))
     
     @property
-    def llm_model(self):
+    def llm_model(self) -> Optional[str]:
         """Unified property to get the LLM model regardless of configuration type.
         
         Returns:
@@ -3913,12 +3913,12 @@ Summary:"""
             self._knowledge_processed = True
     
     @property
-    def retrieval_config(self):
+    def retrieval_config(self) -> Optional[Any]:
         """Get the unified retrieval configuration."""
         return self._retrieval_config
     
     @property
-    def rag(self):
+    def rag(self) -> Optional[Any]:
         """
         Lazy-loaded RAG instance for advanced retrieval with citations.
         
@@ -4846,7 +4846,7 @@ Your Goal: {self.goal}"""
             logging.debug(f"Type casting failed for {getattr(func, '__name__', 'unknown function')}: {e}")
             return arguments
 
-    def execute_tool(self, function_name, arguments, tool_call_id=None):
+    def execute_tool(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None) -> Any:
         """
         Execute a tool dynamically based on the function name and arguments.
         Injects agent state for tools with Injected[T] parameters.
@@ -5529,7 +5529,7 @@ Your Goal: {self.goal}"""
         return len(self.chat_history)
     
     @contextlib.contextmanager
-    def ephemeral(self):
+    def ephemeral(self) -> Generator[None, None, None]:
         """
         Context manager for ephemeral conversations.
         
@@ -6252,7 +6252,7 @@ Your Goal: {self.goal}"""
             config=HandoffConfig(context_policy=ContextPolicy.NONE),
         )
 
-    def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None, config=None, force_retrieval=False, skip_retrieval=False, attachments=None, tool_choice=None):
+    def chat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None) -> Optional[str]:
         """
         Chat with the agent.
         
@@ -6337,7 +6337,7 @@ Your Goal: {self.goal}"""
         self._final_display_shown = False
         
         # Log all parameter values when in debug mode
-        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+        if get_logger().getEffectiveLevel() == logging.DEBUG:
             param_info = {
                 "prompt": str(prompt)[:100] + "..." if isinstance(prompt, str) and len(str(prompt)) > 100 else str(prompt),
                 "temperature": temperature,
@@ -6503,7 +6503,7 @@ Your Goal: {self.goal}"""
                     self._persist_message("assistant", response_text)
 
                     # Log completion time if in debug mode
-                    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                    if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
                         logging.debug(f"Agent.chat completed in {total_time:.2f} seconds")
 
@@ -6846,7 +6846,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         self._final_display_shown = False
         
         # Log all parameter values when in debug mode
-        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+        if get_logger().getEffectiveLevel() == logging.DEBUG:
             param_info = {
                 "prompt": str(prompt)[:100] + "..." if isinstance(prompt, str) and len(str(prompt)) > 100 else str(prompt),
                 "temperature": temperature,
@@ -6950,7 +6950,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
                     self.chat_history.append({"role": "assistant", "content": response_text})
 
-                    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                    if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
                         logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                     
@@ -6969,7 +6969,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # Rollback chat history if LLM call fails
                     self.chat_history = self.chat_history[:chat_history_length]
                     _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
-                    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                    if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
                         logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
                     return None
@@ -7058,7 +7058,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             tools=formatted_tools,
                         )
                         result = await self._achat_completion(response, tools)
-                        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                        if get_logger().getEffectiveLevel() == logging.DEBUG:
                             total_time = time.time() - start_time
                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                         # Execute callback after tool completion
@@ -7072,7 +7072,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             response_format={"type": "json_object"}
                         )
                         response_text = response.choices[0].message.content
-                        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                        if get_logger().getEffectiveLevel() == logging.DEBUG:
                             total_time = time.time() - start_time
                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                         # Execute callback after JSON/Pydantic completion
@@ -7114,7 +7114,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         # Return the original response without reflection
                                         self.chat_history.append({"role": "user", "content": original_prompt})
                                         self.chat_history.append({"role": "assistant", "content": response_text})
-                                        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                                        if get_logger().getEffectiveLevel() == logging.DEBUG:
                                             total_time = time.time() - start_time
                                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                                         return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
@@ -7166,7 +7166,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         break
                                     continue
                         
-                        if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                        if get_logger().getEffectiveLevel() == logging.DEBUG:
                             total_time = time.time() - start_time
                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                         
@@ -7183,13 +7183,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             return None
                 except Exception as e:
                     _get_display_functions()['display_error'](f"Error in chat completion: {e}")
-                    if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+                    if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
                         logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
                     return None
         except Exception as e:
             _get_display_functions()['display_error'](f"Error in achat: {e}")
-            if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
+            if get_logger().getEffectiveLevel() == logging.DEBUG:
                 total_time = time.time() - start_time
                 logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
             return None
@@ -7270,7 +7270,6 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 except Exception as e:
                     _get_display_functions()['display_error'](f"Error executing tool {function_name}: {e}")
                     results.append(None)
-
 
             # If we have results, format them into a response
             if results:
@@ -7415,7 +7414,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         kwargs['stream'] = stream_requested
         return await self.achat(prompt, **kwargs)
 
-    def run(self, prompt: str, **kwargs):
+    def run(self, prompt: str, **kwargs: Any) -> Optional[str]:
         """Execute agent silently and return structured result.
         
         Production-friendly execution. Always uses silent mode with no streaming
@@ -7601,7 +7600,7 @@ Write the complete compiled report:"""
         
         # Chat history is preserved in self.chat_history (no action needed)
 
-    def start(self, prompt: str = None, **kwargs):
+    def start(self, prompt: Optional[str] = None, **kwargs: Any) -> Union[str, Generator[str, None, None], None]:
         """Start the agent interactively with verbose output.
         
         Beginner-friendly execution. Defaults to verbose output with streaming
@@ -8554,7 +8553,7 @@ Write the complete compiled report:"""
         """Number of approval requests still waiting."""
         return len(self._pending_approvals)
 
-    def execute(self, task, context=None):
+    def execute(self, task: Any, context: Optional[Any] = None) -> Optional[str]:
         """Execute a task synchronously - backward compatibility method"""
         if hasattr(task, 'description'):
             prompt = task.description
