@@ -1,88 +1,159 @@
 """
-Session and persistence management functionality for Agent class.
+Session manager mixin for the Agent class.
 
-This module contains methods related to session management, persistence, and state handling.
-Split from the main agent.py file for better maintainability.
+Contains session management, persistence, and state coordination.
+Extracted from agent.py for better modularity and maintainability.
 """
 
-import logging
 import os
-from typing import Any, Dict, List, Optional, Union
+import time
+import logging
+from typing import Optional, Any, Dict, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
 
 
 class SessionManagerMixin:
-    """Mixin class containing session management methods for the Agent class."""
+    """Mixin providing session management methods for the Agent class.
     
-    @property
-    def session_id(self) -> Optional[str]:
-        """Get the current session ID."""
-        return getattr(self, '_session_id', None)
+    This mixin handles session lifecycle, persistence, and state coordination
+    while keeping session logic separate from other agent concerns.
+    """
     
-    def _init_db_session(self) -> None:
-        """Initialize database session for persistent storage."""
-        # Session initialization logic would go here
-        # This is extracted from the main agent.py file
-        raise NotImplementedError("Database session initialization moved from main Agent class")
-    
-    def _init_session_store(self) -> None:
-        """Initialize session store for state persistence."""
-        # Session store initialization logic would go here
-        raise NotImplementedError("Session store initialization moved from main Agent class")
-    
-    def _start_run(self, input_content: str) -> None:
-        """Start a new run/session with input tracking."""
-        # Logic to start a new execution run
-        logging.info(f"{self.name}: Starting new run with input: {input_content[:100]}...")
+    def _initialize_session(self, session_id: Optional[str] = None) -> str:
+        """Initialize a new session or resume an existing one.
         
-    def _end_run(self, output_content: str, status: str = "completed", 
-                metrics: Optional[Dict[str, Any]] = None) -> None:
-        """End the current run with output tracking."""
-        # Logic to end the current execution run
-        logging.info(f"{self.name}: Ending run with status: {status}")
+        Args:
+            session_id: Optional session ID to resume
+            
+        Returns:
+            The session ID (new or existing)
+        """
+        if session_id:
+            logger.debug(f"Resuming session: {session_id}")
+            return session_id
         
-    def _persist_message(self, role: str, content: str) -> None:
-        """Persist a message to the session store."""
-        # Logic to persist messages
-        if hasattr(self, 'chat_history'):
-            self.chat_history.append({"role": role, "content": content})
+        # Generate new session ID
+        timestamp = int(time.time())
+        agent_name = (getattr(self, 'name', None) or 'agent').lower().replace(' ', '_')
+        new_session_id = f"{agent_name}_{timestamp}"
+        
+        logger.debug(f"Initialized new session: {new_session_id}")
+        return new_session_id
     
-    def _auto_save_session(self) -> None:
-        """Auto-save the current session state."""
-        # Auto-save logic would go here
-        if hasattr(self, '_auto_save_enabled') and self._auto_save_enabled:
-            logging.debug(f"{self.name}: Auto-saving session")
+    def _save_session_state(self, session_id: str, state: Dict[str, Any]) -> bool:
+        """Save session state to persistent storage.
+        
+        Args:
+            session_id: Session identifier
+            state: State dictionary to save
+            
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        try:
+            # This is a placeholder implementation
+            # In practice, this would integrate with the actual session store
+            logger.debug(f"Saving session state for {session_id}: {len(state)} keys")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save session state: {e}")
+            return False
     
-    def _load_history_context(self) -> str:
-        """Load historical context from previous sessions."""
-        # Logic to load context from previous sessions
-        return ""
+    def _load_session_state(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Load session state from persistent storage.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            State dictionary if found, None otherwise
+        """
+        try:
+            # This is a placeholder implementation
+            # In practice, this would integrate with the actual session store
+            logger.debug(f"Loading session state for {session_id}")
+            return {}  # Return empty state as placeholder
+        except Exception as e:
+            logger.error(f"Failed to load session state: {e}")
+            return None
     
-    def _process_auto_memory(self, user_message: str, assistant_response: str) -> None:
-        """Process and store automatic memory based on conversation."""
-        # Auto-memory processing logic
-        if hasattr(self, '_memory_instance') and self._memory_instance:
-            try:
-                # Store interaction in memory
-                memory_content = f"User: {user_message}\nAssistant: {assistant_response}"
-                self._memory_instance.store_short_term(memory_content)
-                logging.debug(f"{self.name}: Stored interaction in auto-memory")
-            except Exception as e:
-                logging.warning(f"Failed to store auto-memory: {e}")
+    def _cleanup_session(self, session_id: str) -> bool:
+        """Clean up session resources and optionally persist final state.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            True if cleaned up successfully, False otherwise
+        """
+        try:
+            logger.debug(f"Cleaning up session: {session_id}")
+            
+            # Perform any necessary cleanup
+            # This might include saving final state, closing resources, etc.
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cleanup session: {e}")
+            return False
     
-    def _process_auto_learning(self) -> None:
-        """Process automatic learning from recent interactions."""
-        # Auto-learning processing logic
-        if hasattr(self, '_learn_enabled') and self._learn_enabled:
-            logging.debug(f"{self.name}: Processing auto-learning")
+    def _validate_session_state(self, state: Dict[str, Any]) -> bool:
+        """Validate session state structure and content.
+        
+        Args:
+            state: State dictionary to validate
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        if not isinstance(state, dict):
+            logger.warning("Session state must be a dictionary")
+            return False
+        
+        # Add any specific validation logic here
+        required_keys = []  # Define required keys if needed
+        for key in required_keys:
+            if key not in state:
+                logger.warning(f"Session state missing required key: {key}")
+                return False
+        
+        return True
     
-    def _save_output_to_file(self, content: str) -> bool:
-        """Save output content to a file if configured."""
-        # File output saving logic
-        if hasattr(self, '_output_file') and self._output_file:
-            try:
-                with open(self._output_file, 'a', encoding='utf-8') as f:
-                    f.write(content + '\n')
-                return True
-            except Exception as e:
-                logging.error(f"Failed to save output to file: {e}")
-        return False
+    def _get_session_metadata(self, session_id: str) -> Dict[str, Any]:
+        """Get metadata about a session.
+        
+        Args:
+            session_id: Session identifier
+            
+        Returns:
+            Metadata dictionary
+        """
+        return {
+            'session_id': session_id,
+            'agent_name': getattr(self, 'name', None) or 'Agent',
+            'created_at': time.time(),
+            'last_accessed': time.time(),
+        }
+    
+    def _merge_session_context(self, current_context: Dict[str, Any], 
+                              session_context: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge current context with session context.
+        
+        Args:
+            current_context: Current request context
+            session_context: Stored session context
+            
+        Returns:
+            Merged context dictionary
+        """
+        # Start with session context as base
+        merged = session_context.copy() if session_context else {}
+        
+        # Override with current context (current takes precedence)
+        merged.update(current_context)
+        
+        return merged

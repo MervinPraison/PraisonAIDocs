@@ -1,144 +1,118 @@
 """
-Chat and conversation handling functionality for Agent class.
+Chat handler mixin for the Agent class.
 
-This module contains methods related to chat, streaming, and conversation management.
-Split from the main agent.py file for better maintainability.
+Contains chat management, response processing, and message formatting.
+Extracted from agent.py for better modularity and maintainability.
 """
 
 import logging
-import asyncio
-from typing import Any, Dict, List, Optional, Union, Generator
+import time
+from typing import Optional, Any, Dict, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
 
 
 class ChatHandlerMixin:
-    """Mixin class containing chat handling methods for the Agent class."""
+    """Mixin providing chat handling methods for the Agent class.
     
-    def chat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, 
-             output_json: Optional[str] = None, output_pydantic: Optional[Any] = None,
-             reasoning_steps: bool = False, stream: Optional[bool] = None, 
-             task_name: Optional[str] = None, task_description: Optional[str] = None,
-             task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None,
-             force_retrieval: bool = False, skip_retrieval: bool = False,
-             attachments: Optional[List[Any]] = None, tool_choice: Optional[str] = None) -> str:
-        """
-        Chat with the agent using a prompt.
+    This mixin focuses on high-level chat coordination and response processing,
+    while the actual LLM interaction is handled by ChatMixin.
+    """
+    
+    def _format_chat_response(self, response: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Format chat response with any necessary post-processing.
         
         Args:
-            prompt: The user message/prompt
-            temperature: Sampling temperature (0.0-2.0)
-            tools: Tools available for this conversation
-            output_json: JSON schema for structured output
-            output_pydantic: Pydantic model for structured output
-            reasoning_steps: Whether to include reasoning steps
-            stream: Whether to stream the response
-            task_name: Name of the task for context
-            task_description: Description of the task
-            task_id: Unique identifier for the task
-            config: Additional configuration
-            force_retrieval: Force knowledge retrieval
-            skip_retrieval: Skip knowledge retrieval
-            attachments: File attachments
-            tool_choice: Tool selection strategy
+            response: Raw response from the LLM
+            metadata: Optional metadata about the response
             
         Returns:
-            The agent's response as a string
+            Formatted response string
         """
-        return self._chat_impl(
-            prompt=prompt,
-            temperature=temperature, 
-            tools=tools,
-            output_json=output_json,
-            output_pydantic=output_pydantic,
-            reasoning_steps=reasoning_steps,
-            stream=stream,
-            task_name=task_name,
-            task_description=task_description,
-            task_id=task_id,
-            config=config,
-            force_retrieval=force_retrieval,
-            skip_retrieval=skip_retrieval,
-            attachments=attachments,
-            _trace_emitter=None,
-            tool_choice=tool_choice
-        )
+        if not response:
+            return ""
+            
+        # Basic response formatting - can be extended with additional logic
+        formatted = response.strip()
+        
+        # Add any metadata-based formatting if needed
+        if metadata and metadata.get('add_timestamp'):
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+            formatted = f"[{timestamp}] {formatted}"
+            
+        return formatted
     
-    def _chat_impl(self, prompt: str, temperature: float, tools: Optional[List[Any]], 
-                  output_json: Optional[str], output_pydantic: Optional[Any],
-                  reasoning_steps: bool, stream: Optional[bool], 
-                  task_name: Optional[str], task_description: Optional[str],
-                  task_id: Optional[str], config: Optional[Dict[str, Any]],
-                  force_retrieval: bool, skip_retrieval: bool,
-                  attachments: Optional[List[Any]], _trace_emitter: Optional[Any],
-                  tool_choice: Optional[str] = None) -> str:
-        """Internal chat implementation with full parameter control."""
-        raise NotImplementedError("Chat implementation moved from main Agent class")
-
-    async def achat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None,
-                   output_json: Optional[str] = None, output_pydantic: Optional[Any] = None,
-                   reasoning_steps: bool = False, task_name: Optional[str] = None,
-                   task_description: Optional[str] = None, task_id: Optional[str] = None,
-                   attachments: Optional[List[Any]] = None) -> str:
-        """Async version of chat method."""
-        return await self._achat_impl(
-            prompt=prompt,
-            temperature=temperature,
-            tools=tools,
-            output_json=output_json,
-            output_pydantic=output_pydantic,
-            reasoning_steps=reasoning_steps,
-            task_name=task_name,
-            task_description=task_description,
-            task_id=task_id,
-            attachments=attachments,
-            _trace_emitter=None
-        )
-    
-    async def _achat_impl(self, prompt: str, temperature: float, tools: Optional[List[Any]],
-                         output_json: Optional[str], output_pydantic: Optional[Any],
-                         reasoning_steps: bool, task_name: Optional[str],
-                         task_description: Optional[str], task_id: Optional[str],
-                         attachments: Optional[List[Any]], _trace_emitter: Optional[Any]) -> str:
-        """Internal async chat implementation."""
-        raise NotImplementedError("Async chat implementation moved from main Agent class")
-    
-    def iter_stream(self, prompt: str, **kwargs) -> Generator[str, None, None]:
-        """Stream chat response as an iterator."""
-        raise NotImplementedError("Stream iteration implementation moved from main Agent class")
-    
-    def _start_stream(self, prompt: str, **kwargs) -> Generator[str, None, None]:
-        """Internal streaming implementation."""
-        raise NotImplementedError("Stream implementation moved from main Agent class")
-    
-    def clear_history(self) -> None:
-        """Clear the chat history."""
-        if hasattr(self, 'chat_history'):
-            self.chat_history.clear()
-        logging.info(f"{self.name}: Chat history cleared")
-    
-    def prune_history(self, keep_last: int = 5) -> int:
-        """
-        Prune chat history to keep only the last N messages.
+    def _validate_chat_input(self, prompt: str) -> bool:
+        """Validate chat input before processing.
         
         Args:
-            keep_last: Number of recent messages to keep
+            prompt: Input prompt to validate
             
         Returns:
-            Number of messages removed
+            True if valid, False otherwise
         """
-        if not hasattr(self, 'chat_history'):
-            return 0
+        if not prompt or not isinstance(prompt, str):
+            logger.warning("Invalid chat input: prompt must be a non-empty string")
+            return False
             
-        original_length = len(self.chat_history)
-        if original_length <= keep_last:
-            return 0
+        if len(prompt.strip()) == 0:
+            logger.warning("Invalid chat input: prompt cannot be empty or whitespace only")
+            return False
             
-        self.chat_history = self.chat_history[-keep_last:]
-        removed_count = original_length - len(self.chat_history)
-        logging.info(f"{self.name}: Pruned {removed_count} messages from history")
-        return removed_count
+        return True
     
-    def get_history_size(self) -> int:
-        """Get the current chat history size."""
-        if hasattr(self, 'chat_history'):
-            return len(self.chat_history)
-        return 0
+    def _prepare_chat_context(self, prompt: str, **kwargs) -> Dict[str, Any]:
+        """Prepare context for chat processing.
+        
+        Args:
+            prompt: Input prompt
+            **kwargs: Additional context parameters
+            
+        Returns:
+            Context dictionary for chat processing
+        """
+        context = {
+            'prompt': prompt,
+            'timestamp': time.time(),
+            'agent_name': getattr(self, 'name', None) or 'Agent',
+        }
+        
+        # Add any additional context from kwargs
+        context.update(kwargs)
+        
+        return context
+    
+    def _handle_chat_error(self, error: Exception, prompt: str) -> str:
+        """Handle chat processing errors gracefully.
+        
+        Args:
+            error: The exception that occurred
+            prompt: The original prompt that caused the error
+            
+        Returns:
+            Error response message
+        """
+        logger.error(f"Chat error occurred: {error}", exc_info=True)
+        
+        # Return a user-friendly error message without exposing internal details.
+        # Include a timestamp reference so users can correlate with server logs.
+        error_ref = time.strftime('%Y%m%d%H%M%S')
+        return f"I encountered an error while processing your request (ref: {error_ref}). Please try again."
+    
+    def _log_chat_interaction(self, prompt: str, response: str, duration: Optional[float] = None):
+        """Log chat interaction for debugging and analytics.
+        
+        Args:
+            prompt: Input prompt
+            response: Generated response  
+            duration: Processing duration in seconds
+        """
+        agent_name = getattr(self, 'name', None) or 'Agent'
+        duration_str = f" (took {duration:.2f}s)" if duration else ""
+        
+        logger.debug(f"[{agent_name}] Chat interaction{duration_str}")
+        logger.debug(f"[{agent_name}] Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
+        logger.debug(f"[{agent_name}] Response: {response[:100]}{'...' if len(response) > 100 else ''}")
