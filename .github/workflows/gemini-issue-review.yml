@@ -1,0 +1,200 @@
+name: Gemini Issue Review
+
+on:
+  workflow_dispatch:
+#   issue_comment:
+#     types: [created]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: read
+
+jobs:
+  review-issue:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && 
+       !github.event.issue.pull_request && 
+       contains(github.event.comment.body, '@gemini') &&
+       !contains(github.event.comment.body, '@gemini triage') &&
+       (github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR' ||
+        github.event.comment.author_association == 'CONTRIBUTOR'))
+    runs-on: ubuntu-latest
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    steps:
+      - name: Generate token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+
+      - name: Set up Git
+        run: |
+          git config --local user.email "454862+MervinPraison@users.noreply.github.com"
+          git config --local user.name "MervinPraison"
+
+      - name: Get issue data
+        id: issue_data
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          # Pass user-controlled inputs via environment variables to prevent script injection (GHSL-2025-093)
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # Get issue number from event or context
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            ISSUE_NUMBER="$EVENT_ISSUE_NUMBER"
+          elif [ "$EVENT_NAME" = "issues" ]; then
+            ISSUE_NUMBER="$EVENT_ISSUE_NUMBER"
+          else
+            echo "Unable to determine issue number"
+            exit 1
+          fi
+          
+          # Get issue details
+          gh issue view $ISSUE_NUMBER --json title,body,labels,assignees > issue_details.json
+          
+          # Extract additional instructions from comment if triggered by comment
+          ADDITIONAL_INSTRUCTIONS=""
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            COMMENT_BODY="$EVENT_COMMENT_BODY"
+            ADDITIONAL_INSTRUCTIONS=$(echo "$COMMENT_BODY" | sed -n 's/.*@gemini[[:space:]]*\(.*\)/\1/p' | head -1)
+          fi
+          
+          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          echo "ADDITIONAL_INSTRUCTIONS=$ADDITIONAL_INSTRUCTIONS" >> $GITHUB_OUTPUT
+
+      - name: Run Gemini CLI
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
+          ISSUE_NUMBER: ${{ steps.issue_data.outputs.ISSUE_NUMBER }}
+          ADDITIONAL_INSTRUCTIONS: ${{ steps.issue_data.outputs.ADDITIONAL_INSTRUCTIONS }}
+          REPOSITORY: ${{ github.repository }}
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: 'gemini-2.5-flash'
+          prompt: |
+            You are a helpful GitHub issue assistant. Your task is to analyze and help with GitHub issues.
+            
+            **Issue Details:**
+            - Issue Number: #${ISSUE_NUMBER}
+            - Repository: ${REPOSITORY}
+            - Issue URL: ${{ github.event.issue.html_url }}
+            
+            **Additional Instructions:** ${ADDITIONAL_INSTRUCTIONS}
+            
+            **CRITICAL: When making code modifications, follow this EXACT workflow:**
+            
+            **STEP 1: Analyze the Issue**
+            - Use: `gh issue view ${ISSUE_NUMBER} --json title,body,labels,assignees`
+            - Analyze issue content thoroughly
+            - Search codebase for related files using `glob`, `search_file_content`, `list_directory`
+            
+            **STEP 2: If Code Changes Are Needed**
+            MANDATORY FIRST STEP: Before writing any code, you MUST use `read_file` to carefully read "AGENTS.md". You must honor this repository's extremely specific Architecture, Protocol-First design rules, and Agent-Centric Philosophy!
+            
+            Create a new branch with 'gemini/' prefix:
+            - Use: `git checkout -b gemini/issue-${ISSUE_NUMBER}-description`
+            - Example: `git checkout -b gemini/issue-123-fix-sequential-tools`
+            
+            **STEP 3: Make Code Modifications**
+            - Use `read_file` to examine existing code
+            - Use `write_file` or `replace` to make changes
+            - Use `search_file_content` to find related code
+            - Make focused, targeted changes to fix the issue
+            
+            **STEP 4: Test Changes (if applicable)**
+            - Run relevant tests if test files exist
+            - Use `run_shell_command` to execute test commands
+            
+            **STEP 5: Commit and Push Changes**
+            - Use: `git add .` (or specific files)
+            - Use: `git commit -m "Gemini: [Issue #${ISSUE_NUMBER}] Brief description of fix"`
+            - Use: `git push -u origin gemini/issue-${ISSUE_NUMBER}-description`
+            
+            **STEP 6: Create Pull Request**
+            - Use: `gh pr create --title "Fix #${ISSUE_NUMBER}: Issue description" --body "Fixes #${ISSUE_NUMBER}\n\nSummary of changes:\n- Change 1\n- Change 2" --head gemini/issue-${ISSUE_NUMBER}-description --base main`
+            - This will return a PR URL like: https://github.com/repo/pull/123
+            
+            **STEP 7: Comment on Issue with Results**
+            Use: `gh issue comment ${ISSUE_NUMBER} -b "MESSAGE"`
+            
+            **Your final comment MUST include:**
+            - Summary of what was analyzed
+            - What changes were made (if any)
+            - Link to the created PR (if applicable)
+            - Brief explanation of the solution
+            
+            **Example final comment:**
+            ```
+            Hi! I've analyzed and fixed this issue.
+            
+            **Problem:** Sequential tool calling was getting stuck after first tool call.
+            
+            **Solution:** Added proper prompt handling after each tool call in the Ollama model integration.
+            
+            **Changes Made:**
+            - Modified `src/praisonai-agents/ollama-sequential.py`
+            - Added continuation prompts for multi-step tool execution
+            
+            **Pull Request:** https://github.com/MervinPraison/PraisonAI/pull/856
+            
+            The fix is ready for review. Please test and let me know if you encounter any issues!
+            ```
+            
+            **IMPORTANT NOTES:**
+            - Always create branches with 'gemini/' prefix
+            - Always include issue number in branch name and commit message
+            - Always create PR that references the issue
+            - Always provide PR link in your final response
+            - Use the GITHUB_TOKEN environment variable for authentication
+            
+            Please proceed with helping resolve this issue following this exact workflow.
+
+          settings: |
+            {
+              "coreTools": [
+                "run_shell_command(echo)",
+                "run_shell_command(gh issue view)",
+                "run_shell_command(gh issue comment)",
+                "run_shell_command(gh issue list)",
+                "run_shell_command(gh issue edit)",
+                "run_shell_command(gh pr create)",
+                "run_shell_command(gh pr view)",
+                "run_shell_command(gh pr list)",
+                "run_shell_command(cat)",
+                "run_shell_command(head)",
+                "run_shell_command(tail)",
+                "run_shell_command(grep)",
+                "run_shell_command(find)",
+                "run_shell_command(git checkout)",
+                "run_shell_command(git add)",
+                "run_shell_command(git commit)",
+                "run_shell_command(git push)",
+                "run_shell_command(git status)",
+                "run_shell_command(git branch)",
+                "list_directory",
+                "read_file",
+                "read_many_files",
+                "write_file",
+                "replace",
+                "glob",
+                "search_file_content",
+                "web_fetch",
+                "google_web_search",
+                "save_memory"
+              ]
+            }

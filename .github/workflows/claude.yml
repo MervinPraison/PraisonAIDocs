@@ -1,4 +1,4 @@
-name: Claude Code
+name: Claude Assistant
 
 on:
   issue_comment:
@@ -6,35 +6,242 @@ on:
   pull_request_review_comment:
     types: [created]
   issues:
-    types: [opened, assigned]
+    types: [assigned, labeled, opened]
   pull_request_review:
     types: [submitted]
 
 jobs:
-  claude:
+  # ================================================================
+  # Job 1: Lightweight triage for ALL new issues (including external users)
+  # Posts welcome comment + adds triage labels. No Claude code execution.
+  # ================================================================
+  issue-triage:
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      github.event_name == 'issues' &&
+      github.event.action == 'opened' &&
+      !contains(toJSON(github.event.issue.labels), 'claude')
     runs-on: ubuntu-latest
     permissions:
+      issues: write
       contents: read
-      pull-requests: read
-      issues: read
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Triage and acknowledge issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const issue = context.payload.issue;
+            const title = (issue.title || '').toLowerCase();
+            const body = (issue.body || '').toLowerCase();
+            const content = title + ' ' + body;
+            const isOwner = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(
+              issue.author_association
+            );
+
+            // --- Label triage ---
+            const labels = [];
+
+            // Kind labels
+            if (content.includes('feature request') || content.includes('[feature')) {
+              labels.push('enhancement');
+            } else if (content.includes('bug') || content.includes('error') || content.includes('crash') || content.includes('traceback')) {
+              labels.push('bug');
+            } else if (content.includes('question') || content.includes('how do i') || content.includes('how to')) {
+              labels.push('question');
+            }
+
+            // Area labels
+            if (content.includes('security') || content.includes('cve') || content.includes('vulnerability')) {
+              labels.push('security');
+            }
+            if (content.includes('performance') || content.includes('slow') || content.includes('memory leak')) {
+              labels.push('performance');
+            }
+            if (content.includes('documentation') || content.includes('docs')) {
+              labels.push('documentation');
+            }
+            if (content.includes('typescript') || content.includes('javascript') || content.includes('npm')) {
+              labels.push('javascript');
+            }
+
+            // Apply labels
+            if (labels.length > 0) {
+              await github.rest.issues.addLabels({
+                issue_number: issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels
+              });
+            }
+
+            // --- Acknowledgment comment (external users only) ---
+            if (!isOwner) {
+              await github.rest.issues.createComment({
+                issue_number: issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: [
+                  `👋 Thanks for opening this issue, @${issue.user.login}!`,
+                  '',
+                  'A maintainer will review this shortly. In the meantime:',
+                  '- Make sure you\'ve included steps to reproduce (for bugs)',
+                  '- Check [existing issues](https://github.com/MervinPraison/PraisonAI/issues) for duplicates',
+                  '- Review the [documentation](https://docs.praison.ai) for related guides',
+                  '',
+                  '_A maintainer can trigger deeper analysis by commenting `@claude` on this issue._'
+                ].join('\n')
+              });
+            }
+
+            // --- For owner: add 'claude' label to trigger the code-fix job ---
+            if (isOwner) {
+              await github.rest.issues.addLabels({
+                issue_number: issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: ['claude']
+              });
+            }
+
+  # ================================================================
+  # Job 2: Full Claude code-fix (owner/collaborator only)
+  # Triggers on: labeled 'claude', @claude comments, assignments
+  # ================================================================
+  claude-response:
+    # Allow: human users, github-actions[bot] (auto-comments/labels)
+    # Block: dependabot, cursor, renovate, other bots
+    # Skip 'opened' events — triage job handles those above
+    if: |
+      github.event.action != 'opened' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'claude') &&
+      (github.event_name != 'issue_comment' || contains(github.event.comment.body, '@claude')) &&
+      (
+        !contains(github.actor, '[bot]') ||
+        github.actor == 'github-actions[bot]' ||
+        github.actor == 'praisonai-triage-agent[bot]'
+      ) &&
+      github.actor != 'dependabot[bot]' &&
+      github.actor != 'cursor[bot]' &&
+      github.actor != 'renovate[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
       id-token: write
     steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          submodules: 'recursive'
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
 
-      - name: Run Claude Code (OAuth)
-        id: claude
-        uses: grll/claude-code-action@beta
+      - uses: anthropics/claude-code-action@beta
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
-          use_oauth: true
-          claude_access_token: ${{ secrets.CLAUDE_ACCESS_TOKEN }}
-          claude_refresh_token: ${{ secrets.CLAUDE_REFRESH_TOKEN }}
-          claude_expires_at: ${{ secrets.CLAUDE_EXPIRES_AT }}
+          allowed_bots: 'praisonai-triage-agent[bot]'
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          trigger_phrase: "@claude"
+          label_trigger: "claude"
+
+          direct_prompt: |
+            You are working on the PraisonAI SDK. Follow AGENTS.md strictly.
+
+            STEP 0 — SETUP GIT IDENTITY & AUTH (GLOBAL — required for all repos):
+            git config --global user.name "MervinPraison"
+            git config --global user.email "454862+MervinPraison@users.noreply.github.com"
+            gh auth setup-git
+
+
+            STEP 1 — READ GUIDELINES:
+            Read AGENTS.md to understand the architecture rules.
+
+            STEP 2 — ARCHITECTURE VALIDATION & ROUTING (MANDATORY before writing code):
+            Before implementing anything, answer these questions:
+            - CORE vs WRAPPER vs TOOLS vs DOCS vs PLUGINS ROUTING:
+              1. Core SDK (praisonaiagents/): Only core protocols, base classes, decorators. No heavy implementations.
+              2. Wrapper (praisonai/): CLI, heavy implementations, optional dependencies.
+              3. Tools (PraisonAI-Tools): Capabilities Agents actively call during execution (e.g. SurrealDB tool, Slack tool).
+              4. Documentation (PraisonAIDocs): Documentation pages, guides, API references.
+              5. Plugins (PraisonAI-Plugins): Framework lifecycle extensions replacing systemic behavior (e.g. tracing, logging, metrics, hooks, guardrails).
+              For items routed to an EXTERNAL repository (Tools, Docs, Plugins), follow STEP 3-ALT below.
+            - Does it duplicate existing functionality? Check if Agent already supports this via existing params (reflection, planning, tools, hooks, memory).
+            - Does it inherit from Agent properly? New agent types MUST inherit Agent, not wrap it with composition.
+            - Does it add new dependencies? Only optional deps allowed, must be lazy-imported.
+            - Will agent.py grow larger? If the change adds >50 lines to agent.py, find a way to extract instead.
+            - Is there a name collision with existing exports in __init__.py?
+            If ANY of these conceptual checks fail (excluding routing), add a comment to the issue explaining why and close it. Do NOT create a PR.
+
+            STEP 3 — IMPLEMENT (for changes in THIS repo — PraisonAI):
+            - Create a fix branch and implement a minimal, focused fix
+            - Follow protocol-driven design: protocols in core SDK, heavy implementations in wrapper
+            - Keep changes small and backward-compatible
+
+            STEP 3-ALT — IMPLEMENT IN EXTERNAL REPO (for PraisonAI-Tools, PraisonAIDocs, PraisonAI-Plugins):
+            When work must happen in a different repository, follow these steps EXACTLY. Do NOT attempt to use `cd`, as directory state is not preserved. Use `git -C` for all commands.
+            a) Clone the repository:
+               gh repo clone MervinPraison/<REPO_NAME> /tmp/<REPO_NAME>
+            b) Copy GitHub authentication from the main repository so push works seamlessly:
+               git -C /tmp/<REPO_NAME> config http."https://github.com/".extraheader "$(git config --get http."https://github.com/".extraheader)"
+            c) Create a feature branch (NEVER commit to main):
+               git -C /tmp/<REPO_NAME> checkout -b claude/issue-$ISSUE_NUMBER-$(date +%Y%m%d)
+            d) Make your changes using absolute paths (e.g. edit /tmp/<REPO_NAME>/docs.json)
+            e) Commit:
+               git -C /tmp/<REPO_NAME> add -A
+               git -C /tmp/<REPO_NAME> commit -m "feat: <description> (fixes #$ISSUE_NUMBER)"
+            f) Push the branch:
+               git -C /tmp/<REPO_NAME> push origin claude/issue-$ISSUE_NUMBER-$(date +%Y%m%d)
+            g) Create PR in the EXTERNAL repo:
+               gh pr create -R MervinPraison/<REPO_NAME> --head claude/issue-$ISSUE_NUMBER-$(date +%Y%m%d) --title "feat: <title>" --body "Fixes MervinPraison/PraisonAI#$ISSUE_NUMBER
+
+               <body>"
+
+            STEP 4 — TEST:
+            - For SDK changes: cd src/praisonai-agents && PYTHONPATH=. python -m pytest tests/ -x -q --timeout=30
+            - For docs changes: verify files exist and are valid markdown/MDX
+            - Ensure no regressions
+
+            STEP 5 — CREATE PR:
+            - Commit with descriptive message, push, and create PR using `gh pr create`
+            - For external repos, use `gh pr create -R MervinPraison/<REPO_NAME>`
+            CRITICAL: You MUST create the PR automatically using `gh pr create`. Do NOT just provide a link or say "manual push required".
+            NOTE: If you worked on an external repo, the wrapper action will report "No commits" for the main repo at the end. This is expected, do not worry about it.
+          allowed_tools: |
+            Bash(git:*)
+            Bash(python:*)
+            Bash(pip:*)
+            Bash(conda:*)
+            Bash(pytest:*)
+            Bash(gh:*)
+            Bash(python -m pytest:*)
+            Bash(python -m pip:*)
+            Bash(poetry:*)
+            View
+            GlobTool
+            GrepTool
+            BatchTool
+            Edit
+            Replace
+            mcp__github__get_issue
+            mcp__github__get_issue_comments
+            mcp__github__update_issue
+          timeout_minutes: 30
