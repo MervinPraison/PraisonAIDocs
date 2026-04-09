@@ -50,6 +50,7 @@ class HandoffConfig:
         detect_cycles: Enable cycle detection to prevent infinite loops
         max_depth: Maximum handoff chain depth
         async_mode: Enable async execution
+        allow_parallel: Enable parallel execution (from Delegator)
         on_handoff: Callback when handoff starts
         on_complete: Callback when handoff completes
         on_error: Callback when handoff fails
@@ -62,7 +63,7 @@ class HandoffConfig:
     
     # Execution control
     timeout_seconds: float = 300.0
-    max_concurrent: int = 3
+    max_concurrent: int = 5
     
     # Safety
     detect_cycles: bool = True
@@ -70,6 +71,7 @@ class HandoffConfig:
     
     # Execution mode
     async_mode: bool = False
+    allow_parallel: bool = False
     
     # Callbacks
     on_handoff: Optional[Callable] = None
@@ -88,6 +90,7 @@ class HandoffConfig:
             "detect_cycles": self.detect_cycles,
             "max_depth": self.max_depth,
             "async_mode": self.async_mode,
+            "allow_parallel": self.allow_parallel,
         }
     
     @classmethod
@@ -97,29 +100,13 @@ class HandoffConfig:
             data["context_policy"] = ContextPolicy(data["context_policy"])
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
-class HandoffError(Exception):
-    """Base exception for handoff errors."""
-    pass
-
-class HandoffCycleError(HandoffError):
-    """Raised when a cycle is detected in handoff chain."""
-    def __init__(self, chain: List[str]):
-        self.chain = chain
-        super().__init__(f"Handoff cycle detected: {' -> '.join(chain)}")
-
-class HandoffDepthError(HandoffError):
-    """Raised when max handoff depth is exceeded."""
-    def __init__(self, depth: int, max_depth: int):
-        self.depth = depth
-        self.max_depth = max_depth
-        super().__init__(f"Max handoff depth exceeded: {depth} > {max_depth}")
-
-class HandoffTimeoutError(HandoffError):
-    """Raised when handoff times out."""
-    def __init__(self, timeout: float, agent_name: str):
-        self.timeout = timeout
-        self.agent_name = agent_name
-        super().__init__(f"Handoff to {agent_name} timed out after {timeout}s")
+# Import structured error hierarchy from central errors module
+from ..errors import (
+    HandoffError, 
+    HandoffCycleError, 
+    HandoffDepthError, 
+    HandoffTimeoutError
+)
 
 # Thread-local storage for tracking handoff chains
 _handoff_context = threading.local()
@@ -267,12 +254,26 @@ class Handoff:
         if self.config.detect_cycles:
             chain = _get_handoff_chain()
             if target_name in chain:
-                raise HandoffCycleError(chain + [target_name])
+                cycle_path = chain + [target_name]
+                raise HandoffCycleError(
+                    f"Handoff cycle detected: {' -> '.join(cycle_path)}",
+                    source_agent=source_agent.name if hasattr(source_agent, 'name') else 'unknown',
+                    target_agent=target_name,
+                    agent_id=source_agent.name if hasattr(source_agent, 'name') else 'unknown',
+                    cycle_path=cycle_path
+                )
         
         # Check depth
         current_depth = _get_handoff_depth()
         if current_depth >= self.config.max_depth:
-            raise HandoffDepthError(current_depth + 1, self.config.max_depth)
+            raise HandoffDepthError(
+                f"Max handoff depth exceeded: {current_depth + 1} > {self.config.max_depth}",
+                source_agent=source_agent.name if hasattr(source_agent, 'name') else 'unknown',
+                target_agent=target_name,
+                agent_id=source_agent.name if hasattr(source_agent, 'name') else 'unknown',
+                max_depth=self.config.max_depth,
+                current_depth=current_depth + 1
+            )
     
     def _prepare_context(self, source_agent: 'Agent', kwargs: Dict[str, Any]) -> HandoffInputData:
         """
@@ -538,7 +539,13 @@ class Handoff:
                 handoff_depth=_get_handoff_depth(),
             )
             self._execute_callback(self.config.on_error, source_agent, kwargs, result)
-            raise HandoffTimeoutError(self.config.timeout_seconds, self.agent.name)
+            raise HandoffTimeoutError(
+                f"Handoff to {self.agent.name} timed out after {self.config.timeout_seconds}s",
+                timeout_seconds=self.config.timeout_seconds,
+                source_agent=source_agent.name if hasattr(source_agent, "name") else "unknown",
+                target_agent=self.agent.name,
+                agent_id=source_agent.name if hasattr(source_agent, "name") else "unknown"
+            )
         except Exception as e:
             result = HandoffResult(
                 success=False,
@@ -817,6 +824,102 @@ RECOMMENDED_PROMPT_PREFIX = """You have the ability to transfer tasks to special
 When you determine that a task would be better handled by another agent with specific expertise, 
 use the transfer tool to hand off the task. The receiving agent will have the full context of 
 the conversation and will continue helping the user."""
+
+async def parallel_handoffs(
+    source: 'Agent',
+    targets: List[tuple],  # [(agent, prompt), ...]
+    max_concurrent: int = 5,
+    config: Optional[HandoffConfig] = None,
+) -> List['HandoffResult']:
+    """
+    Execute multiple handoffs in parallel with concurrency control.
+    
+    This function provides the parallel execution capabilities from SubagentDelegator
+    while using the unified Handoff system.
+    
+    Args:
+        source: Source agent performing the handoffs
+        targets: List of (agent, prompt) tuples for parallel execution
+        max_concurrent: Maximum concurrent handoffs (overrides config)
+        config: Optional HandoffConfig for additional settings
+        
+    Returns:
+        List of HandoffResult objects from each parallel handoff
+        
+    Example:
+        results = await parallel_handoffs(
+            source=main_agent,
+            targets=[
+                (research_agent, "Research topic X"),
+                (analysis_agent, "Analyze data Y"),
+                (summary_agent, "Summarize findings Z")
+            ],
+            max_concurrent=3
+        )
+    """
+    if not hasattr(source, 'handoff_to_async'):
+        raise ValueError("Source agent must support async handoffs")
+    
+    # Check if parallel execution is allowed by config
+    if config and not config.allow_parallel:
+        raise ValueError("Parallel handoffs are disabled in the provided HandoffConfig")
+    
+    # Use config's max_concurrent if max_concurrent wasn't explicitly set and config is provided
+    if config and max_concurrent == 5:  # Check if default value
+        effective_max_concurrent = config.max_concurrent
+    else:
+        effective_max_concurrent = max_concurrent
+    
+    # Create semaphore for concurrency control (0 or negative = unlimited)
+    semaphore = asyncio.Semaphore(effective_max_concurrent) if effective_max_concurrent > 0 else None
+    
+    async def _run_one(agent, prompt):
+        async def _do_handoff():
+            try:
+                return await source.handoff_to_async(agent, prompt, config=config)
+            except Exception as e:
+                logger.error(f"Parallel handoff failed to {getattr(agent, 'name', str(agent))}: {e}")
+                # Return a failed HandoffResult object
+                return HandoffResult(
+                    success=False,
+                    response="",
+                    target_agent=getattr(agent, 'name', str(agent)),
+                    source_agent=getattr(source, 'name', str(source)),
+                    duration_seconds=0.0,
+                    error=str(e),
+                    handoff_depth=0
+                )
+        
+        if semaphore:
+            async with semaphore:
+                return await _do_handoff()
+        else:
+            return await _do_handoff()
+    
+    # Execute all handoffs concurrently
+    tasks = [_run_one(agent, prompt) for agent, prompt in targets]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Convert any exceptions to failed results
+    processed_results = []
+    for i, result in enumerate(results):
+        if isinstance(result, HandoffResult):
+            processed_results.append(result)
+        else:
+            # Handle Exception, BaseException (like CancelledError), or any other unexpected result
+            agent, _prompt = targets[i]  # Prefix with _ to mark intentionally unused
+            processed_results.append(HandoffResult(
+                success=False,
+                response="",
+                target_agent=getattr(agent, 'name', str(agent)),
+                source_agent=getattr(source, 'name', str(source)),
+                duration_seconds=0.0,
+                error=str(result),
+                handoff_depth=0
+            ))
+    
+    return processed_results
+
 
 def prompt_with_handoff_instructions(base_prompt: str, agent: 'Agent') -> str:
     """

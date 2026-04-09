@@ -57,23 +57,24 @@ class PluginManager:
         Returns:
             True if registered successfully
         """
-        try:
-            info = plugin.info
-            if info.name in self._plugins:
-                logger.warning(f"Plugin '{info.name}' already registered")
+        with self._lock:
+            try:
+                info = plugin.info
+                if info.name in self._plugins:
+                    logger.warning(f"Plugin '{info.name}' already registered")
+                    return False
+                
+                self._plugins[info.name] = plugin
+                self._enabled[info.name] = True
+                
+                # Initialize plugin
+                plugin.on_init({})
+                
+                logger.info(f"Registered plugin: {info.name} v{info.version}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to register plugin: {e}")
                 return False
-            
-            self._plugins[info.name] = plugin
-            self._enabled[info.name] = True
-            
-            # Initialize plugin
-            plugin.on_init({})
-            
-            logger.info(f"Registered plugin: {info.name} v{info.version}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to register plugin: {e}")
-            return False
     
     def unregister(self, name: str) -> bool:
         """
@@ -423,6 +424,99 @@ class PluginManager:
     def get_single_file_plugin(self, name: str) -> Optional[Dict[str, Any]]:
         """Get a single-file plugin by name."""
         return self._single_file_plugins.get(name)
+    
+    def discover_entry_points(self) -> int:
+        """
+        Discover plugins registered via pip entry_points.
+        
+        Looks for entry_points in the "praisonaiagents.plugins" group.
+        Compatible with Python 3.8+ using importlib.metadata backport.
+        
+        Returns:
+            Number of plugins loaded
+        """
+        # Lazy import to reduce startup time
+        def _get_entry_points():
+            try:
+                from importlib.metadata import entry_points as _ep
+                return _ep
+            except ImportError:
+                logger.warning("importlib.metadata not available - cannot discover entry_points plugins")
+                return None
+        
+        get_ep = _get_entry_points()
+        if get_ep is None:
+            return 0
+            
+        try:
+            # Python 3.10+ style - try group= first
+            eps = get_ep(group="praisonaiagents.plugins")
+        except TypeError:
+            # Python 3.9 fallback - call then get group
+            try:
+                all_eps = get_ep()
+                eps = all_eps.get("praisonaiagents.plugins", [])
+            except Exception:
+                eps = []
+
+        loaded = 0
+        # Use lock to ensure thread-safe discovery of multiple entry points
+        with self._lock:
+            for ep in eps:
+                try:
+                    plugin_class = ep.load()
+                    plugin = plugin_class()
+                    # register() also acquires lock but that's fine (RLock allows re-entry)
+                    if self.register(plugin):
+                        loaded += 1
+                        logger.info(f"Loaded entry_point plugin: {ep.name}")
+                except Exception as e:
+                    logger.error(f"Failed to load entry_point plugin {ep.name}: {e}")
+        
+        return loaded
+
+    # =========================================================================
+    # Entry Point Discovery Support (External Packages)
+    # =========================================================================
+
+    def discover_entry_points(self) -> int:
+        """
+        Auto-discover and load protocol-driven plugins installed via pip
+        that register in the 'praisonai.plugins' entry-point group.
+        
+        Returns:
+            Number of plugins loaded successfully.
+        """
+        loaded = 0
+        try:
+            import importlib.metadata
+            # Python 3.10+
+            entry_points = importlib.metadata.entry_points(group="praisonai.plugins")
+        except ImportError:
+            logger.debug("importlib.metadata not available. Cannot discover plugins.")
+            return 0
+        except TypeError:
+            # Python 3.8/3.9 fallback
+            try:
+                entry_points = importlib.metadata.entry_points().get("praisonai.plugins", [])
+            except Exception as e:
+                logger.error(f"Failed to get entry points: {e}")
+                return 0
+                
+        for ep in entry_points:
+            try:
+                plugin_cls = ep.load()
+                # Duck-type check or inheritance check isn't strictly necessary if it conforms to Plugin interface at runtime
+                if callable(plugin_cls):
+                    plugin = plugin_cls()
+                    if self.register(plugin):
+                        loaded += 1
+                else:
+                    logger.warning(f"Entry point {ep.name} is not callable")
+            except Exception as e:
+                logger.error(f"Failed to load plugin from entry point {ep.name}: {e}")
+                
+        return loaded
 
 # Global plugin manager instance
 _default_manager: Optional[PluginManager] = None

@@ -187,23 +187,8 @@ if TYPE_CHECKING:
     from ..rag.models import RAGResult, ContextPack
     from ..eval.results import EvaluationLoopResult
 
-class BudgetExceededError(Exception):
-    """Raised when an agent exceeds its max_budget.
-
-    Usage:
-        try:
-            agent.start("...")
-        except BudgetExceededError as e:
-            print(f"Agent '{e.agent_name}' spent ${e.total_cost:.4f} of ${e.max_budget:.4f}")
-    """
-    def __init__(self, agent_name: str, total_cost: float, max_budget: float):
-        self.agent_name = agent_name
-        self.total_cost = total_cost
-        self.max_budget = max_budget
-        super().__init__(
-            f"Agent '{agent_name}' exceeded budget: "
-            f"${total_cost:.4f} >= ${max_budget:.4f}"
-        )
+# Import structured error from central errors module
+from ..errors import BudgetExceededError
 
 class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin):
     # Class-level counter for generating unique display names for nameless agents
@@ -1153,8 +1138,18 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
             session_id = _history_session_id
         elif _history_enabled and session_id is None and _history_session_id is None:
             import hashlib as _hl
-            _agent_hash = _hl.md5((name or "agent").encode()).hexdigest()[:8]
-            session_id = f"history_{_agent_hash}"
+            _agent_hash = _hl.sha256((name or "agent").encode()).hexdigest()[:8]
+            # Backward compat: check if legacy md5-based session exists first
+            _legacy_hash = _hl.md5((name or "agent").encode()).hexdigest()[:8]
+            _legacy_id = f"history_{_legacy_hash}"
+            _new_id = f"history_{_agent_hash}"
+            # Prefer legacy if it exists on disk, else use new SHA-256 ID
+            import os as _os
+            _session_dir = _os.path.join(_os.path.expanduser("~"), ".praisonai", "sessions")
+            if _os.path.exists(_os.path.join(_session_dir, f"{_legacy_id}.json")):
+                session_id = _legacy_id  # preserve existing history
+            else:
+                session_id = _new_id
             _history_session_id = session_id
         
         # ─────────────────────────────────────────────────────────────────────
@@ -4040,17 +4035,28 @@ Summary:"""
                 return "", None
             
             # Normalize results format (filter out None values, handle None metadata)
-            if isinstance(search_results, dict) and 'results' in search_results:
+            # Normalize results format (filter out None values, handle None metadata)
+            if hasattr(search_results, "results") and isinstance(getattr(search_results, "results"), list):
+                search_results = getattr(search_results, "results")
+            elif isinstance(search_results, dict) and 'results' in search_results:
+                search_results = search_results['results']
+                
+            if isinstance(search_results, list):
                 results = []
-                for r in search_results['results']:
+                for r in search_results:
                     if r is None:
                         continue
-                    text = r.get('memory', '') or ''
-                    metadata = r.get('metadata') or {}  # Handle None metadata
+                    if isinstance(r, dict):
+                        text = r.get('memory', '') or r.get('text', '') or ''
+                        metadata = r.get('metadata') or {}
+                    else:
+                        text = getattr(r, 'text', None) or getattr(r, 'memory', None) or ''
+                        metadata = getattr(r, 'metadata', None)
+                        if metadata is None:
+                            metadata = {}
+                    
                     if text:
-                        results.append({"text": text, "metadata": metadata})
-            elif isinstance(search_results, list):
-                results = [{"text": str(r), "metadata": {}} for r in search_results if r is not None and str(r)]
+                        results.append({"text": str(text), "metadata": metadata})
             else:
                 results = [{"text": str(search_results), "metadata": {}}] if search_results else []
             

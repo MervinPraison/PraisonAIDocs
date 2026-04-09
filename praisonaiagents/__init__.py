@@ -170,16 +170,17 @@ _LAZY_IMPORTS = {
     'Handoff': ('praisonaiagents.agent.handoff', 'Handoff'),
     'handoff': ('praisonaiagents.agent.handoff', 'handoff'),
     'handoff_filters': ('praisonaiagents.agent.handoff', 'handoff_filters'),
+    'parallel_handoffs': ('praisonaiagents.agent.handoff', 'parallel_handoffs'),
     'RECOMMENDED_PROMPT_PREFIX': ('praisonaiagents.agent.handoff', 'RECOMMENDED_PROMPT_PREFIX'),
     'prompt_with_handoff_instructions': ('praisonaiagents.agent.handoff', 'prompt_with_handoff_instructions'),
     'HandoffConfig': ('praisonaiagents.agent.handoff', 'HandoffConfig'),
     'HandoffResult': ('praisonaiagents.agent.handoff', 'HandoffResult'),
     'HandoffInputData': ('praisonaiagents.agent.handoff', 'HandoffInputData'),
     'ContextPolicy': ('praisonaiagents.agent.handoff', 'ContextPolicy'),
-    'HandoffError': ('praisonaiagents.agent.handoff', 'HandoffError'),
-    'HandoffCycleError': ('praisonaiagents.agent.handoff', 'HandoffCycleError'),
-    'HandoffDepthError': ('praisonaiagents.agent.handoff', 'HandoffDepthError'),
-    'HandoffTimeoutError': ('praisonaiagents.agent.handoff', 'HandoffTimeoutError'),
+    'HandoffError': ('praisonaiagents.errors', 'HandoffError'),
+    'HandoffCycleError': ('praisonaiagents.errors', 'HandoffCycleError'),
+    'HandoffDepthError': ('praisonaiagents.errors', 'HandoffDepthError'),
+    'HandoffTimeoutError': ('praisonaiagents.errors', 'HandoffTimeoutError'),
     
     # Embedding API (Note: embedding/embeddings handled in custom_handler to override subpackage)
     'aembedding': ('praisonaiagents.embedding.embed', 'aembedding'),
@@ -203,7 +204,15 @@ _LAZY_IMPORTS = {
     
     # Agent classes
     'Agent': ('praisonaiagents.agent.agent', 'Agent'),
-    'BudgetExceededError': ('praisonaiagents.agent.agent', 'BudgetExceededError'),
+    'BudgetExceededError': ('praisonaiagents.errors', 'BudgetExceededError'),
+    
+    # Error hierarchy - structured exception handling
+    'PraisonAIError': ('praisonaiagents.errors', 'PraisonAIError'),
+    'ToolExecutionError': ('praisonaiagents.errors', 'ToolExecutionError'),
+    'LLMError': ('praisonaiagents.errors', 'LLMError'),
+    'ValidationError': ('praisonaiagents.errors', 'ValidationError'),
+    'NetworkError': ('praisonaiagents.errors', 'NetworkError'),
+    'ErrorContextProtocol': ('praisonaiagents.errors', 'ErrorContextProtocol'),
     'Heartbeat': ('praisonaiagents.agent.heartbeat', 'Heartbeat'),
     'HeartbeatConfig': ('praisonaiagents.agent.heartbeat', 'HeartbeatConfig'),
     'ImageAgent': ('praisonaiagents.agent.image_agent', 'ImageAgent'),
