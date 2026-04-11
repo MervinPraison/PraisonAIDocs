@@ -170,13 +170,18 @@ class _LazyObsModule:
                 # Get the provider class (naming convention: XxxProvider)
                 class_name = f"{provider_name.title().replace('_', '')}Provider"
                 provider_cls = getattr(module, class_name, None)
-                if provider_cls:
-                    return provider_cls(**kwargs)
-                # Fallback: try to find any class ending with Provider
-                for attr_name in dir(module):
-                    if attr_name.endswith("Provider"):
-                        return getattr(module, attr_name)(**kwargs)
-                raise AttributeError(f"No provider class found in {module}")
+                if provider_cls is None:
+                    # Fallback: try to find any class ending with Provider
+                    for attr_name in dir(module):
+                        if attr_name.endswith("Provider"):
+                            provider_cls = getattr(module, attr_name)
+                            break
+                if provider_cls is None:
+                    raise AttributeError(f"No provider class found in {module}")
+                instance = provider_cls()
+                # Call init() to instrument OpenAI and set up the provider
+                instance.init(**kwargs)
+                return instance
             except ImportError as e:
                 raise ImportError(
                     f"Observability provider '{provider_name}' requires praisonai-tools. "
@@ -190,9 +195,30 @@ class _LazyObsModule:
         Auto-detect observability provider from environment variables.
         
         Checks for common env vars like LANGFUSE_PUBLIC_KEY, LANGSMITH_API_KEY, etc.
+        Also loads configuration from ~/.praisonai/langfuse.env if it exists.
         Returns None if no provider is detected.
         """
         import os
+        from pathlib import Path
+        
+        # First, try to load from praisonai config file if present
+        # This bridges the gap between CLI config and Agent observability
+        config_file = Path.home() / ".praisonai" / "langfuse.env"
+        if config_file.exists():
+            try:
+                with open(config_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key, value = line.split("=", 1)
+                            key = key.strip()
+                            value = value.strip()
+                            # Only set if not already in environment
+                            if not os.environ.get(key):
+                                os.environ[key] = value
+            except Exception:
+                # Silently fail if config file can't be read
+                pass
         
         # Check for common provider env vars
         provider_env_map = {
