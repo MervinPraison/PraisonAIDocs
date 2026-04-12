@@ -9,7 +9,7 @@ This enables:
 
 These protocols are lightweight and have zero performance impact.
 """
-from typing import Protocol, runtime_checkable, Optional, Any, Dict, List
+from typing import Protocol, runtime_checkable, Optional, Any, AsyncIterator, Dict, List
 
 
 @runtime_checkable
@@ -302,6 +302,135 @@ class McpLauncherProtocol(Protocol):
         ...
 
 
+@runtime_checkable
+class ManagedBackendProtocol(Protocol):
+    """Protocol for external managed agent backends.
+    
+    Defines the contract between PraisonAI Agent's delegation layer
+    (``execution_mixin._delegate_to_backend``) and any managed agent
+    infrastructure provider (Anthropic Managed Agents, etc.).
+    
+    The Core SDK defines *what* — this protocol.
+    The Wrapper implements *how* — the provider-specific adapter.
+    
+    Lifecycle::
+    
+        backend = SomeManagedBackend(config={...})
+        agent = Agent(name="coder", backend=backend)
+        result = agent.start("Write a script")  # delegates to backend.execute()
+    
+    Implementations must handle:
+    - Agent/environment/session creation and caching
+    - Event streaming (agent.message, agent.tool_use, session.status_idle)
+    - Custom tool calls (agent.custom_tool_use → user.custom_tool_result)
+    - Tool confirmation (always_ask policy → user.tool_confirmation)
+    - Usage tracking (input_tokens, output_tokens)
+    - Session reset for multi-turn isolation
+    
+    Example::
+    
+        class MockManagedBackend:
+            async def execute(self, prompt: str, **kwargs) -> str:
+                return "mock response"
+            
+            async def stream(self, prompt: str, **kwargs):
+                yield "mock "
+                yield "response"
+            
+            def reset_session(self) -> None:
+                pass
+            
+            def reset_all(self) -> None:
+                pass
+        
+        assert isinstance(MockManagedBackend(), ManagedBackendProtocol)
+    """
+    
+    async def execute(self, prompt: str, **kwargs) -> str:
+        """Execute a prompt on managed infrastructure and return the full response.
+        
+        This is the primary entry point called by Agent._delegate_to_backend().
+        
+        Args:
+            prompt: The user message to send to the managed agent.
+            **kwargs: Provider-specific options (e.g., timeout, metadata).
+            
+        Returns:
+            The agent's complete text response.
+        """
+        ...
+    
+    async def stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+        """Stream a prompt response as text chunks.
+        
+        Yields text fragments as the managed agent produces them.
+        Used when Agent is invoked with stream=True.
+        
+        Args:
+            prompt: The user message.
+            **kwargs: Provider-specific options.
+            
+        Yields:
+            Text chunks from the agent's response.
+        """
+        ...
+        yield ""  # type: ignore[misc]
+    
+    def reset_session(self) -> None:
+        """Discard the cached session so the next execute() creates a fresh one.
+        
+        The agent and environment remain cached for reuse.
+        """
+        ...
+    
+    def reset_all(self) -> None:
+        """Discard all cached state (agent, environment, session, client).
+        
+        Next execute() call will re-create everything from scratch.
+        """
+        ...
+
+    # ── Optional methods (default no-ops for backward compat) ──
+
+    def update_agent(self, **kwargs) -> None:
+        """Update an existing managed agent's configuration.
+        
+        Allows changing system prompt, tools, model, etc. on a previously
+        created agent without recreating it.
+        
+        Args:
+            **kwargs: Fields to update (system, tools, model, name, etc.).
+        """
+        ...
+
+    def interrupt(self) -> None:
+        """Send a user interrupt to the active session.
+        
+        Signals the managed agent to stop its current work (equivalent to
+        ``user.interrupt`` event in the Anthropic API).
+        """
+        ...
+
+    def retrieve_session(self) -> Dict[str, Any]:
+        """Retrieve the current managed session's metadata and usage.
+        
+        Returns:
+            Dict with session info (id, status, usage, etc.).
+        """
+        ...
+
+    def list_sessions(self, **kwargs) -> List[Dict[str, Any]]:
+        """List sessions for the current agent.
+        
+        Args:
+            **kwargs: Provider-specific filters (limit, status, etc.).
+            
+        Returns:
+            List of session summary dicts.
+        """
+        ...
+
+
 __all__ = [
     'AgentProtocol',
     'RunnableAgentProtocol', 
@@ -311,4 +440,5 @@ __all__ = [
     'ContextEngineerProtocol',
     'HttpLauncherProtocol',
     'McpLauncherProtocol',
+    'ManagedBackendProtocol',
 ]

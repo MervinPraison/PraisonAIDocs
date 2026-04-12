@@ -279,26 +279,51 @@ class ExecutionMixin:
         return result
 
     def _delegate_to_backend(self, prompt: str, **kwargs) -> Optional[str]:
-        """Delegate execution to external managed backend (e.g., ManagedAgentIntegration)."""
+        """Delegate execution to external managed backend (e.g., ManagedAgentIntegration).
+        
+        Also records the prompt and response in the Agent's chat_history so that
+        PraisonAI's session management (SessionStore, auto_save) stays consistent
+        with managed-backend conversations.
+        """
         import asyncio
         
-        # Check if backend has required methods
-        if not hasattr(self.backend, 'execute'):
+        # Check if backend satisfies ManagedBackendProtocol
+        from praisonaiagents.agent.protocols import ManagedBackendProtocol
+        if not (isinstance(self.backend, ManagedBackendProtocol) or hasattr(self.backend, 'execute')):
             raise RuntimeError(f"Backend {type(self.backend).__name__} does not support execute() method")
         
         # Handle streaming vs non-streaming
         stream_requested = kwargs.get('stream', False)
         
-        if stream_requested:
-            # For streaming, delegate to backend's stream method if available
+        if stream_requested and hasattr(self.backend, '_execute_sync'):
+            # Fast path: backend supports sync streaming (prints token-by-token)
+            result = self.backend._execute_sync(prompt, stream_live=True)
+        elif stream_requested:
             if hasattr(self.backend, 'stream'):
-                return self._delegate_streaming_to_backend(prompt, **kwargs)
+                result = self._delegate_streaming_to_backend(prompt, **kwargs)
             else:
-                # Fallback: execute non-streaming even if stream was requested
-                return self._execute_backend_sync(prompt, **kwargs)
+                result = self._execute_backend_sync(prompt, **kwargs)
         else:
-            # Non-streaming execution
-            return self._execute_backend_sync(prompt, **kwargs)
+            result = self._execute_backend_sync(prompt, **kwargs)
+        
+        # ── Chat history & session linkage ──
+        # Record prompt+response in chat_history so SessionStore/auto_save works
+        if result is not None:
+            self.chat_history.append({"role": "user", "content": prompt})
+            self.chat_history.append({"role": "assistant", "content": str(result)})
+            # Link managed session ID into SessionStore gateway_session_id
+            if hasattr(self.backend, 'managed_session_id'):
+                msid = self.backend.managed_session_id
+                if msid and self._session_store is not None:
+                    try:
+                        sid = getattr(self, 'auto_save', None) or getattr(self, '_session_id', None)
+                        if sid and hasattr(self._session_store, 'set_gateway_info'):
+                            self._session_store.set_gateway_info(sid, gateway_session_id=msid)
+                    except Exception:
+                        pass  # Best-effort linkage
+            self._auto_save_session()
+        
+        return result
     
     def _execute_backend_sync(self, prompt: str, **kwargs) -> Optional[str]:
         """Execute backend in sync mode, handling async backends."""
@@ -621,6 +646,12 @@ Write the complete compiled report:"""
         
         # Check if external managed backend is configured
         if hasattr(self, 'backend') and self.backend is not None:
+            # Detect streaming preference BEFORE delegating (same logic as normal path)
+            if 'stream' not in kwargs:
+                if getattr(self, 'stream', None) is not None:
+                    kwargs['stream'] = self.stream
+                else:
+                    kwargs['stream'] = sys.stdout.isatty()
             return self._delegate_to_backend(prompt, **kwargs)
         
         # ─────────────────────────────────────────────────────────────────────
