@@ -1,0 +1,568 @@
+---
+title: "PostgreSQL + ManagedAgent"
+sidebarTitle: "PostgreSQL Persistence"
+description: "Production-grade persistence with full ACID compliance for ManagedAgent"
+icon: "elephant"
+---
+
+PostgreSQL provides enterprise-grade persistence for ManagedAgent with full ACID compliance, advanced indexing, and horizontal scaling capabilities.
+
+```mermaid
+graph TB
+    subgraph "PostgreSQL + ManagedAgent Architecture"
+        User[👤 User] --> Agent[🤖 Agent]
+        Agent --> Managed[🧠 ManagedAgent]
+        Managed --> Anthropic[☁️ Anthropic API]
+        Managed --> DB[💾 PraisonDB]
+        DB --> Pool[🏊 Connection Pool]
+        Pool --> PG[🐘 PostgreSQL]
+        
+        subgraph PostgresDB[🐘 PostgreSQL Database]
+            Messages[messages table]
+            Runs[runs table]
+            Sessions[sessions table]
+            Spans[spans table]
+            Indexes[🔍 Indexes]
+        end
+        
+        PG --> PostgresDB
+    end
+    
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef api fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef database fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef storage fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class User user
+    class Agent,Managed agent
+    class Anthropic api
+    class DB,Pool database
+    class PG,PostgresDB,Messages,Runs,Sessions,Spans,Indexes storage
+```
+
+## Prerequisites
+
+<Steps>
+<Step title="Install Dependencies">
+```bash
+pip install praisonai anthropic psycopg2-binary
+# or for async: psycopg[binary,pool]
+```
+</Step>
+
+<Step title="Database Setup">
+```sql
+-- Create database and user
+CREATE DATABASE praisonai_agents;
+CREATE USER praison_user WITH PASSWORD 'secure_password';
+GRANT ALL PRIVILEGES ON DATABASE praisonai_agents TO praison_user;
+
+-- Connect to database
+\c praisonai_agents;
+
+-- Grant schema permissions
+GRANT ALL ON SCHEMA public TO praison_user;
+```
+</Step>
+
+<Step title="Docker Setup (Development)">
+```bash
+# Start PostgreSQL with Docker
+docker run -d \
+  --name praison-postgres \
+  -p 5432:5432 \
+  -e POSTGRES_DB=praisonai_agents \
+  -e POSTGRES_USER=praison_user \
+  -e POSTGRES_PASSWORD=secure_password \
+  -v pgdata:/var/lib/postgresql/data \
+  postgres:16
+
+# Wait for database to be ready
+docker exec praison-postgres pg_isready -U praison_user -d praisonai_agents
+```
+</Step>
+</Steps>
+
+## Complete Example
+
+```python
+import psycopg2
+from datetime import datetime
+from praisonai import Agent, ManagedAgent, ManagedConfig
+from praisonaiagents import db
+
+class PostgreSQLManagedExample:
+    def __init__(self, database_url=None):
+        self.database_url = database_url or (
+            "postgresql://praison_user:secure_password@localhost:5432/praisonai_agents"
+        )
+        self.managed = None
+        self.agent = None
+        
+    def setup_agent(self):
+        """Initialize ManagedAgent with PostgreSQL persistence."""
+        self.managed = ManagedAgent(
+            config=ManagedConfig(
+                name="PostgreSQL Agent",
+                model="claude-4o-mini",
+                system="You are a data analyst with persistent memory across sessions.",
+                tools=[{"type": "agent_toolset_20260401"}],
+                packages={"pip": ["psycopg2-binary", "pandas"]}
+            ),
+            db=db(database_url=self.database_url)
+        )
+        
+        self.agent = Agent(
+            name="data_analyst",
+            backend=self.managed
+        )
+        
+        print(f"✅ Agent created with PostgreSQL persistence")
+        return self.managed.session_id
+    
+    def teach_data_facts(self):
+        """Teach the agent data analysis facts."""
+        facts = [
+            "Our Q4 revenue target is $2.5M with 15% growth expected",
+            "The top product categories are Electronics (40%), Books (25%), Clothing (20%), Home (15%)",
+            "Customer acquisition cost in Q4 was $45 per customer",
+            "Monthly recurring revenue (MRR) is currently $180K with 5% month-over-month growth"
+        ]
+        
+        print("\n📊 Teaching data facts to agent:")
+        for i, fact in enumerate(facts, 1):
+            result = self.agent.start(f"Remember this business metric: {fact}")
+            print(f"  {i}. Taught: {fact[:60]}...")
+            print(f"     Response: {result[:50]}...")
+    
+    def verify_postgresql(self):
+        """Verify data persistence using direct PostgreSQL connection."""
+        print(f"\n🔍 Verifying PostgreSQL database")
+        
+        # Parse connection info from URL
+        conn = psycopg2.connect(self.database_url)
+        cursor = conn.cursor()
+        
+        # Check tables exist
+        cursor.execute("""
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public'
+            ORDER BY table_name
+        """)
+        tables = cursor.fetchall()
+        print(f"📋 Created tables: {[table[0] for table in tables]}")
+        
+        # Check message count
+        cursor.execute("SELECT COUNT(*) FROM messages")
+        count = cursor.fetchone()[0]
+        print(f"💬 Total messages: {count}")
+        
+        # Check conversation content
+        cursor.execute("""
+            SELECT session_id, role, content, created_at
+            FROM messages 
+            WHERE content LIKE '%revenue%' OR content LIKE '%growth%'
+            ORDER BY created_at DESC
+            LIMIT 3
+        """)
+        
+        business_messages = cursor.fetchall()
+        print(f"\n📈 Business metric messages found: {len(business_messages)}")
+        for session_id, role, content, created_at in business_messages:
+            print(f"  [{role}] {content[:60]}...")
+        
+        # Show database performance stats
+        cursor.execute("SELECT schemaname, tablename, n_tup_ins, n_tup_upd FROM pg_stat_user_tables")
+        stats = cursor.fetchall()
+        print(f"\n⚡ Table statistics:")
+        for schema, table, inserts, updates in stats:
+            print(f"  {table}: {inserts} inserts, {updates} updates")
+            
+        cursor.close()
+        conn.close()
+        return count > 0
+    
+    def test_session_resume(self, session_id):
+        """Test session resume with PostgreSQL persistence."""
+        print(f"\n🔄 Testing session resume with PostgreSQL...")
+        
+        # Destroy current instance
+        del self.managed, self.agent
+        
+        # Create new instance with same database
+        managed2 = ManagedAgent(
+            config=ManagedConfig(
+                model="claude-4o-mini",
+                system="You are a data analyst with persistent memory across sessions."
+            ),
+            db=db(database_url=self.database_url)
+        )
+        
+        # Resume session
+        managed2.resume_session(session_id)
+        agent2 = Agent(name="data_analyst", backend=managed2)
+        
+        # Test business knowledge recall
+        questions = [
+            "What's our Q4 revenue target and expected growth?",
+            "What are the top product categories and their percentages?",
+            "What's our customer acquisition cost?",
+            "What's our current MRR and growth rate?"
+        ]
+        
+        print(f"\n❓ Testing business knowledge recall:")
+        for i, question in enumerate(questions, 1):
+            result = agent2.start(question)
+            print(f"  {i}. Q: {question}")
+            print(f"     A: {result[:80]}...")
+            
+        return managed2, agent2
+    
+    def run_analytics_query(self, agent):
+        """Test complex analytics capability."""
+        print(f"\n📊 Testing analytics capability:")
+        
+        analytics_request = """
+        Based on the business metrics I shared:
+        1. Calculate the total expected Q4 revenue if we hit our growth target
+        2. What's the revenue contribution from each product category?
+        3. If we maintain current MRR growth, what will our annual recurring revenue be?
+        """
+        
+        result = agent.start(analytics_request)
+        print(f"Analytics Response: {result}")
+        
+        return result
+    
+    def run_example(self):
+        """Run complete PostgreSQL + ManagedAgent example."""
+        print("🐘 Starting PostgreSQL + ManagedAgent Persistence Example")
+        print("=" * 65)
+        
+        try:
+            # Phase 1: Setup and teach
+            session_id = self.setup_agent()
+            self.teach_data_facts()
+            
+            # Phase 2: Verify PostgreSQL persistence
+            persistence_ok = self.verify_postgresql()
+            assert persistence_ok, "❌ PostgreSQL persistence failed"
+            
+            # Phase 3: Test session resume
+            managed2, agent2 = self.test_session_resume(session_id)
+            
+            # Phase 4: Test analytics
+            analytics_result = self.run_analytics_query(agent2)
+            
+            print(f"\n✅ PostgreSQL example completed successfully!")
+            print(f"📊 Session ID: {session_id}")
+            print(f"🐘 Database: {self.database_url}")
+            
+            return managed2, agent2
+            
+        except Exception as e:
+            print(f"❌ Example failed: {e}")
+            raise
+
+if __name__ == "__main__":
+    # Example usage with different connection strings
+    
+    # Development (Docker)
+    example = PostgreSQLManagedExample(
+        "postgresql://praison_user:secure_password@localhost:5432/praisonai_agents"
+    )
+    
+    # Production with connection pooling
+    # example = PostgreSQLManagedExample(
+    #     "postgresql://user:pass@production-host:5432/agents?pool_size=20&max_overflow=30"
+    # )
+    
+    managed, agent = example.run_example()
+```
+
+## Production Configuration
+
+```python
+from praisonai import Agent, ManagedAgent, ManagedConfig
+from praisonaiagents import db
+
+# Production PostgreSQL with optimizations
+managed = ManagedAgent(
+    config=ManagedConfig(
+        name="Production Agent",
+        model="claude-4o-mini",
+        system="You are a production-grade assistant."
+    ),
+    db=db(
+        database_url=(
+            "postgresql://user:password@prod-host:5432/agents"
+            "?pool_size=20"           # Connection pool size
+            "&max_overflow=30"        # Maximum overflow connections
+            "&pool_timeout=10"        # Pool checkout timeout
+            "&pool_recycle=3600"      # Connection recycle time
+            "&pool_pre_ping=true"     # Test connections before use
+        )
+    )
+)
+```
+
+## Advanced Features
+
+### Connection Pooling
+
+```python
+import psycopg2.pool
+
+class AdvancedPostgreSQLAgent:
+    def __init__(self):
+        # Create connection pool manually for fine control
+        self.pool = psycopg2.pool.ThreadedConnectionPool(
+            1,  # min connections
+            20, # max connections
+            host="localhost",
+            database="praisonai_agents", 
+            user="praison_user",
+            password="secure_password"
+        )
+        
+    def get_managed_agent(self):
+        return ManagedAgent(
+            config=ManagedConfig(
+                model="claude-4o-mini",
+                system="Production agent with connection pooling."
+            ),
+            db=db(
+                database_url="postgresql://praison_user:secure_password@localhost:5432/praisonai_agents",
+                pool=self.pool  # Use existing pool
+            )
+        )
+        
+    def cleanup(self):
+        self.pool.closeall()
+```
+
+### High Availability Setup
+
+```python
+# Multiple database URLs for failover
+DATABASE_URLS = [
+    "postgresql://user:pass@primary:5432/agents",
+    "postgresql://user:pass@replica1:5432/agents",
+    "postgresql://user:pass@replica2:5432/agents"
+]
+
+def create_ha_managed_agent():
+    """Create ManagedAgent with high availability database."""
+    for url in DATABASE_URLS:
+        try:
+            managed = ManagedAgent(
+                config=ManagedConfig(model="claude-4o-mini"),
+                db=db(database_url=url)
+            )
+            print(f"✅ Connected to: {url}")
+            return managed
+        except Exception as e:
+            print(f"❌ Failed to connect to {url}: {e}")
+            continue
+    
+    raise Exception("All database connections failed")
+```
+
+### Performance Monitoring
+
+```python
+def monitor_postgresql_performance(database_url):
+    """Monitor PostgreSQL performance metrics."""
+    import psycopg2
+    
+    conn = psycopg2.connect(database_url)
+    cursor = conn.cursor()
+    
+    # Connection stats
+    cursor.execute("""
+        SELECT count(*) as active_connections,
+               max_conn,
+               (count(*) * 100 / max_conn) as usage_percent
+        FROM pg_stat_activity, 
+             (SELECT setting::int as max_conn FROM pg_settings WHERE name = 'max_connections') s
+        WHERE state = 'active'
+        GROUP BY max_conn
+    """)
+    
+    conn_stats = cursor.fetchone()
+    print(f"Connections: {conn_stats[0]}/{conn_stats[1]} ({conn_stats[2]:.1f}%)")
+    
+    # Table sizes
+    cursor.execute("""
+        SELECT schemaname, tablename, 
+               pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size
+        FROM pg_tables 
+        WHERE schemaname = 'public'
+        ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
+    """)
+    
+    table_sizes = cursor.fetchall()
+    print("Table sizes:")
+    for schema, table, size in table_sizes:
+        print(f"  {table}: {size}")
+    
+    cursor.close()
+    conn.close()
+
+# Usage
+monitor_postgresql_performance(
+    "postgresql://praison_user:secure_password@localhost:5432/praisonai_agents"
+)
+```
+
+## Backup and Recovery
+
+```python
+import subprocess
+from datetime import datetime
+
+def backup_postgresql_database(
+    host="localhost",
+    port=5432,
+    database="praisonai_agents", 
+    username="praison_user",
+    backup_dir="/backups"
+):
+    """Create PostgreSQL database backup."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_file = f"{backup_dir}/praisonai_backup_{timestamp}.sql"
+    
+    cmd = [
+        "pg_dump",
+        f"--host={host}",
+        f"--port={port}",
+        f"--username={username}",
+        f"--dbname={database}",
+        f"--file={backup_file}",
+        "--verbose",
+        "--format=custom",  # Custom format for faster restore
+        "--no-password"     # Use .pgpass or environment
+    ]
+    
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(f"✅ Backup created: {backup_file}")
+        return backup_file
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Backup failed: {e}")
+        return None
+
+def restore_postgresql_database(backup_file, database="praisonai_agents"):
+    """Restore PostgreSQL database from backup."""
+    cmd = [
+        "pg_restore",
+        "--verbose",
+        "--clean",          # Drop existing objects
+        "--no-acl",         # Skip ACL restoration
+        "--no-owner",       # Skip ownership restoration
+        f"--dbname={database}",
+        backup_file
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True)
+        print(f"✅ Database restored from: {backup_file}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Restore failed: {e}")
+        return False
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+<Accordion title="Connection Issues">
+```python
+def diagnose_connection(database_url):
+    """Diagnose PostgreSQL connection issues."""
+    import psycopg2
+    from urllib.parse import urlparse
+    
+    parsed = urlparse(database_url)
+    
+    try:
+        conn = psycopg2.connect(database_url)
+        cursor = conn.cursor()
+        cursor.execute("SELECT version()")
+        version = cursor.fetchone()[0]
+        print(f"✅ Connection successful: {version}")
+        cursor.close()
+        conn.close()
+        
+    except psycopg2.OperationalError as e:
+        print(f"❌ Connection failed: {e}")
+        print(f"Host: {parsed.hostname}")
+        print(f"Port: {parsed.port}")
+        print(f"Database: {parsed.path[1:]}")
+        print(f"Username: {parsed.username}")
+```
+</Accordion>
+
+<Accordion title="Performance Optimization">
+```python
+def optimize_postgresql_tables(database_url):
+    """Optimize PostgreSQL tables for better performance."""
+    import psycopg2
+    
+    conn = psycopg2.connect(database_url)
+    cursor = conn.cursor()
+    
+    # Create indexes for common queries
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id)",
+        "CREATE INDEX IF NOT EXISTS idx_spans_run_id ON spans(run_id)"
+    ]
+    
+    for index_sql in indexes:
+        try:
+            cursor.execute(index_sql)
+            print(f"✅ Created index: {index_sql.split()[-1]}")
+        except Exception as e:
+            print(f"❌ Index creation failed: {e}")
+    
+    # Analyze tables for query planning
+    cursor.execute("ANALYZE")
+    print("✅ Tables analyzed")
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
+```
+</Accordion>
+
+<Accordion title="Security Configuration">
+```python
+def setup_postgresql_security():
+    """Security best practices for PostgreSQL."""
+    security_sql = [
+        # Create read-only user
+        "CREATE USER praison_readonly WITH PASSWORD 'readonly_pass'",
+        "GRANT CONNECT ON DATABASE praisonai_agents TO praison_readonly",
+        "GRANT USAGE ON SCHEMA public TO praison_readonly", 
+        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO praison_readonly",
+        
+        # Enable row level security
+        "ALTER TABLE messages ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE runs ENABLE ROW LEVEL SECURITY",
+        
+        # Create policy for session isolation
+        """
+        CREATE POLICY session_isolation ON messages
+        FOR ALL TO praison_user
+        USING (session_id = current_setting('app.current_session_id', true))
+        """
+    ]
+    
+    return security_sql
+```
+</Accordion>
+</AccordionGroup>
