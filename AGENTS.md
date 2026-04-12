@@ -130,6 +130,48 @@ This command:
 2. Generates `DOCS_PARITY.md` reports
 3. Copies reports to `docs/features/`, `docs/js/`, `docs/rust/`
 
+### 1.8 Folder Placement Rules
+
+> [!CAUTION]
+> **AI agents MUST follow these rules strictly. Violations will cause PRs to be rejected.**
+
+| Folder | Who Can Write | Purpose |
+|--------|--------------|---------|
+| `docs/concepts/` | **HUMAN ONLY** — requires explicit human approval | Core architecture concepts (agents, tasks, workflows) |
+| `docs/features/` | **AI agents + humans** | Feature documentation, guides, integrations |
+| `docs/tools/` | AI agents + humans | Tool-specific documentation |
+| `docs/guides/` | AI agents + humans | How-to guides and tutorials |
+| `docs/js/`, `docs/rust/` | **Auto-generated ONLY** | Managed by parity system — do not edit manually |
+
+```
+CRITICAL RULES FOR AI AGENTS:
+
+1. NEVER create or modify files in docs/concepts/ — this folder is HUMAN-APPROVED ONLY
+2. Place ALL new documentation pages in docs/features/ by default
+3. If a page logically belongs in docs/tools/ or docs/guides/, use those instead
+4. Update docs.json to add pages under "Features" group, NEVER under "Concepts"
+5. If an issue mentions "concepts", still place the file in docs/features/
+6. Do NOT modify existing docs/concepts/ pages without explicit human instruction
+7. When reviewing PRs: flag any files in docs/concepts/ as violations
+```
+
+### 1.9 AI Agent Behavioral Rules
+
+```
+MANDATORY for all AI agents working on this repository:
+
+1. ALWAYS read AGENTS.md before starting work
+2. ALWAYS read the SDK source code before documenting a feature
+3. NEVER guess API signatures — read the actual code
+4. NEVER create placeholder content or stub pages
+5. NEVER modify docs.json "Concepts" group entries
+6. ALWAYS create a feature branch (never commit to main)
+7. ALWAYS create a PR with `gh pr create`
+8. ALWAYS verify docs.json is valid JSON after modifications
+9. ALWAYS use Mintlify components (Steps, AccordionGroup, CardGroup)
+10. ALWAYS include a hero Mermaid diagram with the standard color scheme
+```
+
 ---
 
 ## 2. Page Structure Template
