@@ -1042,18 +1042,18 @@ class Agent(ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin
                 if _memory_config.auto_save is not None:
                     auto_save = _memory_config.auto_save
                 # Convert to internal format
-                backend = _memory_config.backend
-                if hasattr(backend, 'value'):
-                    backend = backend.value
+                memory_backend = _memory_config.backend
+                if hasattr(memory_backend, 'value'):
+                    memory_backend = memory_backend.value
                 # If learn is enabled, pass as dict to trigger full Memory class
                 if _memory_config.learn:
                     memory = _memory_config.to_dict()
-                elif backend == "file":
+                elif memory_backend == "file":
                     memory = True
                 elif _memory_config.config:
                     memory = _memory_config.config
                 else:
-                    memory = backend
+                    memory = memory_backend
             elif hasattr(_memory_config, 'search') and hasattr(_memory_config, 'add'):
                 # Memory instance - pass through
                 pass
@@ -4500,6 +4500,39 @@ Answer:"""
                 memory.close_connections()
         except Exception as e:
             logger.warning(f"Memory cleanup failed: {e}")
+
+        # LLM client cleanup - target actual live clients, not model strings
+        try:
+            # Primary cleanup targets - actual live clients
+            if hasattr(self, 'llm_instance') and self.llm_instance:
+                if hasattr(self.llm_instance, 'aclose'):
+                    # Try async close first
+                    try:
+                        import asyncio
+                        if asyncio.iscoroutinefunction(self.llm_instance.aclose):
+                            # We're in sync context, so use asyncio.run() for the cleanup
+                            asyncio.run(self.llm_instance.aclose())
+                        else:
+                            self.llm_instance.aclose()
+                    except Exception:
+                        # Fall back to sync close if async fails
+                        if hasattr(self.llm_instance, 'close'):
+                            self.llm_instance.close()
+                elif hasattr(self.llm_instance, 'close'):
+                    self.llm_instance.close()
+            
+            # Check for OpenAI client (common pattern in agents)
+            if hasattr(self, '_Agent__openai_client') and self._Agent__openai_client:
+                if hasattr(self._Agent__openai_client, 'close'):
+                    self._Agent__openai_client.close()
+            
+            # Legacy fallback - check self.llm._client (but less likely to work)
+            if hasattr(self, 'llm') and self.llm and not isinstance(self.llm, str):
+                llm_client = getattr(self.llm, '_client', None)
+                if llm_client and hasattr(llm_client, 'close'):
+                    llm_client.close()
+        except Exception as e:
+            logger.warning(f"LLM client cleanup failed: {e}")
 
         # MCP cleanup  
         try:
