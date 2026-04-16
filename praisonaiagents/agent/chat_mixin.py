@@ -536,121 +536,23 @@ Your Goal: {self.goal}"""
         formatted_tools = self._format_tools_for_completion(tools)
 
         try:
-            # NEW: Unified protocol dispatch path (Issue #1304)
-            # Check if unified dispatch is enabled (opt-in for backward compatibility)
-            if getattr(self, '_use_unified_llm_dispatch', False):
-                # Use composition instead of runtime class mutation for safety
-                final_response = self._execute_unified_chat_completion(
-                    messages=messages,
-                    temperature=temperature,
-                    tools=formatted_tools,
-                    stream=stream,
-                    reasoning_steps=reasoning_steps,
-                    task_name=task_name,
-                    task_description=task_description,
-                    task_id=task_id,
-                    response_format=response_format
-                )
-            
-            # LEGACY: Maintain existing dual execution paths for backward compatibility
-            elif self._using_custom_llm and hasattr(self, 'llm_instance'):
-                if stream:
-                    # Debug logs for tool info
-                    if formatted_tools:
-                        logging.debug(f"Passing {len(formatted_tools)} formatted tools to LLM instance: {formatted_tools}")
-                    
-                    # Use the LLM instance for streaming responses
-                    final_response = self.llm_instance.get_response(
-                        prompt=messages[1:],  # Skip system message as LLM handles it separately  
-                        system_prompt=messages[0]['content'] if messages and messages[0]['role'] == 'system' else None,
-                        temperature=temperature,
-                        tools=formatted_tools if formatted_tools else None,
-                        verbose=self.verbose,
-                        markdown=self.markdown,
-                        stream=stream,
-                        console=self.console,
-                        execute_tool_fn=self.execute_tool,
-                        agent_name=self.name,
-                        agent_role=self.role,
-                        agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
-                        task_name=task_name,
-                        task_description=task_description,
-                        task_id=task_id,
-                        reasoning_steps=reasoning_steps
-                    )
-                else:
-                    # Non-streaming with custom LLM - don't show streaming-like behavior
-                    if False:  # Don't use display_generating when stream=False to avoid streaming-like behavior
-                        # This block is disabled to maintain consistency with the OpenAI path fix
-                        with _get_live()(
-                            _get_display_functions()['display_generating']("", start_time),
-                            console=self.console,
-                            refresh_per_second=4,
-                        ) as live:
-                            final_response = self.llm_instance.get_response(
-                                prompt=messages[1:],
-                                system_prompt=messages[0]['content'] if messages and messages[0]['role'] == 'system' else None,
-                                temperature=temperature,
-                                tools=formatted_tools if formatted_tools else None,
-                                verbose=self.verbose,
-                                markdown=self.markdown,
-                                stream=stream,
-                                console=self.console,
-                                execute_tool_fn=self.execute_tool,
-                                agent_name=self.name,
-                                agent_role=self.role,
-                                agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
-                                task_name=task_name,
-                                task_description=task_description,
-                                task_id=task_id,
-                                reasoning_steps=reasoning_steps
-                            )
-                    else:
-                        final_response = self.llm_instance.get_response(
-                            prompt=messages[1:],
-                            system_prompt=messages[0]['content'] if messages and messages[0]['role'] == 'system' else None,
-                            temperature=temperature,
-                            tools=formatted_tools if formatted_tools else None,
-                            verbose=self.verbose,
-                            markdown=self.markdown,
-                            stream=stream,
-                            console=self.console,
-                            execute_tool_fn=self.execute_tool,
-                            agent_name=self.name,
-                            agent_role=self.role,
-                            agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
-                            task_name=task_name,
-                            task_description=task_description,
-                            task_id=task_id,
-                            reasoning_steps=reasoning_steps
-                        )
-            else:
-                # Use the standard OpenAI client approach with tool support
-                # Note: openai_client expects tools in various formats and will format them internally
-                # But since we already have formatted_tools, we can pass them directly
-                if self._openai_client is None:
-                    raise ValueError("OpenAI client is not initialized. Please provide OPENAI_API_KEY or use a custom LLM provider.")
-                
-                # Build kwargs including response_format if provided
-                chat_kwargs = {
-                    "messages": messages,
-                    "model": self.llm,
-                    "temperature": temperature,
-                    "tools": formatted_tools,  # Already formatted for OpenAI
-                    "execute_tool_fn": self.execute_tool,
-                    "stream": stream,
-                    "console": self.console if (self.verbose or stream) else None,
-                    "display_fn": self._display_generating if self.verbose else None,
-                    "reasoning_steps": reasoning_steps,
-                    "verbose": self.verbose,
-                    "max_iterations": 10,
-                    "stream_callback": self.stream_emitter.emit,
-                    "emit_events": True,
-                }
-                if response_format:
-                    chat_kwargs["response_format"] = response_format
-                
-                final_response = self._openai_client.chat_completion_with_tools(**chat_kwargs)
+            # NEW: Unified protocol dispatch path (Issue #1304, #1362)
+            # UNIFIED: Single protocol-driven dispatch path (fixes DRY violation)
+            # All LLM providers now go through unified dispatcher for consistency and maintainability
+            stream_callback = self.stream_emitter.emit if hasattr(self, 'stream_emitter') else None
+            final_response = self._execute_unified_chat_completion(
+                messages=messages,
+                temperature=temperature,
+                tools=formatted_tools,
+                stream=stream,
+                reasoning_steps=reasoning_steps,
+                task_name=task_name,
+                task_description=task_description,
+                task_id=task_id,
+                response_format=response_format,
+                stream_callback=stream_callback,
+                emit_events=True,
+            )
 
             # Emit LLM response trace event with token usage
             _duration_ms = (time.time() - start_time) * 1000
@@ -677,26 +579,31 @@ Your Goal: {self.goal}"""
             )
 
             # Budget tracking & enforcement (zero overhead when _max_budget is None)
-            self._total_cost += _cost_usd
-            self._total_tokens_in += _prompt_tokens
-            self._total_tokens_out += _completion_tokens
-            self._llm_call_count += 1
-            if self._max_budget and self._total_cost >= self._max_budget:
+            # Thread-safe cost tracking (Gap 1a fix)
+            with self._cost_lock:
+                self._total_cost += _cost_usd
+                self._total_tokens_in += _prompt_tokens
+                self._total_tokens_out += _completion_tokens
+                self._llm_call_count += 1
+                budget_exceeded = self._max_budget and self._total_cost >= self._max_budget
+                current_cost = self._total_cost
+            
+            if budget_exceeded:
                 if self._on_budget_exceeded == "stop":
                     raise BudgetExceededError(
-                        f"Agent '{self.name}' exceeded budget: ${self._total_cost:.4f} >= ${self._max_budget:.4f}",
+                        f"Agent '{self.name}' exceeded budget: ${current_cost:.4f} >= ${self._max_budget:.4f}",
                         budget_type="cost",
                         limit=self._max_budget,
-                        used=self._total_cost,
+                        used=current_cost,
                         agent_id=self.name
                     )
                 elif self._on_budget_exceeded == "warn":
                     logging.warning(
-                        f"[budget] {self.name}: ${self._total_cost:.4f} exceeded "
+                        f"[budget] {self.name}: ${current_cost:.4f} exceeded "
                         f"${self._max_budget:.4f} budget"
                     )
                 elif callable(self._on_budget_exceeded):
-                    self._on_budget_exceeded(self._total_cost, self._max_budget)
+                    self._on_budget_exceeded(current_cost, self._max_budget)
             
             # Trigger AFTER_LLM hook
             from ..hooks import HookEvent, AfterLLMInput
@@ -779,7 +686,9 @@ Your Goal: {self.goal}"""
         task_name=None,
         task_description=None,
         task_id=None,
-        response_format=None
+        response_format=None,
+        stream_callback=None,
+        emit_events=True,
     ):
         """
         Execute unified chat completion using composition instead of runtime class mutation.
@@ -805,10 +714,14 @@ Your Goal: {self.goal}"""
             self._unified_dispatcher = dispatcher
         
         # Execute unified dispatch with all necessary parameters
+        # Includes all parameters from both legacy paths to ensure full compatibility
         try:
+            if stream_callback is None and hasattr(self, 'stream_emitter'):
+                stream_callback = getattr(self.stream_emitter, 'emit', None)
             final_response = self._unified_dispatcher.chat_completion(
                 messages=messages,
                 tools=tools,
+                tool_choice=getattr(self, 'tool_choice', None),
                 temperature=temperature,
                 max_tokens=getattr(self, 'max_tokens', None),
                 stream=stream,
@@ -816,14 +729,29 @@ Your Goal: {self.goal}"""
                 execute_tool_fn=getattr(self, 'execute_tool', None),
                 console=self.console if (self.verbose or stream) else None,
                 display_fn=self._display_generating if self.verbose else None,
-                stream_callback=getattr(self.stream_emitter, 'emit', None) if hasattr(self, 'stream_emitter') else None,
-                emit_events=True,
+                stream_callback=stream_callback,
+                emit_events=emit_events,
                 verbose=self.verbose,
                 max_iterations=10,
                 reasoning_steps=reasoning_steps,
                 task_name=task_name,
                 task_description=task_description,
-                task_id=task_id
+                task_id=task_id,
+                # Additional parameters from legacy custom LLM path
+                markdown=self.markdown,
+                agent_name=self.name,
+                agent_role=self.role,
+                agent_tools=(
+                    [
+                        t["function"]["name"]
+                        if isinstance(t, dict)
+                        and isinstance(t.get("function"), dict)
+                        and "name" in t["function"]
+                        else getattr(t, "__name__", str(t))
+                        for t in (tools if tools is not None else self.tools or [])
+                    ]
+                    or None
+                ),
             )
             return final_response
             
@@ -841,7 +769,9 @@ Your Goal: {self.goal}"""
         task_name=None,
         task_description=None,
         task_id=None,
-        response_format=None
+        response_format=None,
+        stream_callback=None,
+        emit_events=True,
     ):
         """
         Execute unified async chat completion using composition instead of runtime class mutation.
@@ -867,10 +797,14 @@ Your Goal: {self.goal}"""
             self._unified_dispatcher = dispatcher
         
         # Execute unified async dispatch with all necessary parameters
+        # Includes all parameters from both legacy paths to ensure full compatibility
         try:
+            if stream_callback is None and hasattr(self, 'stream_emitter'):
+                stream_callback = getattr(self.stream_emitter, 'emit', None)
             final_response = await self._unified_dispatcher.achat_completion(
                 messages=messages,
                 tools=tools,
+                tool_choice=getattr(self, 'tool_choice', None),
                 temperature=temperature,
                 max_tokens=getattr(self, 'max_tokens', None),
                 stream=stream,
@@ -878,14 +812,29 @@ Your Goal: {self.goal}"""
                 execute_tool_fn=getattr(self, 'execute_tool', None),
                 console=self.console if (self.verbose or stream) else None,
                 display_fn=self._display_generating if self.verbose else None,
-                stream_callback=getattr(self.stream_emitter, 'emit', None) if hasattr(self, 'stream_emitter') else None,
-                emit_events=True,
+                stream_callback=stream_callback,
+                emit_events=emit_events,
                 verbose=self.verbose,
                 max_iterations=10,
                 reasoning_steps=reasoning_steps,
                 task_name=task_name,
                 task_description=task_description,
-                task_id=task_id
+                task_id=task_id,
+                # Additional parameters from legacy custom LLM path
+                markdown=self.markdown,
+                agent_name=self.name,
+                agent_role=self.role,
+                agent_tools=(
+                    [
+                        t["function"]["name"]
+                        if isinstance(t, dict)
+                        and isinstance(t.get("function"), dict)
+                        and "name" in t["function"]
+                        else getattr(t, "__name__", str(t))
+                        for t in (tools if tools is not None else self.tools or [])
+                    ]
+                    or None
+                ),
             )
             return final_response
             
@@ -919,7 +868,17 @@ Your Goal: {self.goal}"""
                               generation_time=generation_time, console=self.console,
                               agent_name=self.name,
                               agent_role=self.role,
-                              agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
+                              agent_tools=(
+                    [
+                        t["function"]["name"]
+                        if isinstance(t, dict)
+                        and isinstance(t.get("function"), dict)
+                        and "name" in t["function"]
+                        else getattr(t, "__name__", str(t))
+                        for t in (tools if tools is not None else self.tools or [])
+                    ]
+                    or None
+                ),
                               task_name=None,  # Not available in this context
                               task_description=None,  # Not available in this context
                               task_id=None)  # Not available in this context
@@ -1860,8 +1819,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     formatted_tools = self._format_tools_for_completion(tools)
                     
                     # NEW: Unified protocol dispatch path (Issue #1304) - Async version
-                    # Check if unified dispatch is enabled (opt-in for backward compatibility)
-                    if getattr(self, '_use_unified_llm_dispatch', False):
+                    # Enable unified dispatch by default for DRY and feature parity (sync/async consistent)
+                    if getattr(self, '_use_unified_llm_dispatch', True):
+                        # Build response_format for native structured output (parity with sync path)
+                        schema_model = output_pydantic or output_json
+                        response_format = None
+                        if schema_model and self._supports_native_structured_output():
+                            response_format = self._build_response_format(schema_model)
+                        
                         # Use composition instead of runtime class mutation for safety
                         response = await self._execute_unified_achat_completion(
                             messages=messages,
@@ -2513,4 +2478,3 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             response = self.chat(prompt, **kwargs)
             if response:
                 yield response
-
