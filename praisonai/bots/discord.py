@@ -1,0 +1,498 @@
+"""
+Discord Bot implementation for PraisonAI.
+
+Provides a full Discord bot runtime with slash commands,
+message handling, and agent integration.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from praisonaiagents import Agent
+
+from praisonai.bots._protocol_mixin import ChatCommandMixin, MessageHookMixin
+from praisonaiagents.bots import (
+    BotConfig,
+    BotMessage,
+    BotUser,
+    BotChannel,
+    MessageType,
+)
+
+from ._commands import format_status, format_help
+from ._session import BotSessionManager
+from ._debounce import InboundDebouncer
+from ._ack import AckReactor
+
+logger = logging.getLogger(__name__)
+
+
+class DiscordBot(ChatCommandMixin, MessageHookMixin):
+    """Discord bot runtime for PraisonAI agents.
+    
+    Connects an agent to Discord, handling messages, slash commands,
+    and providing full bot functionality.
+    
+    Example:
+        from praisonai.bots import DiscordBot
+        from praisonaiagents import Agent
+        
+        agent = Agent(name="assistant")
+        bot = DiscordBot(token="YOUR_BOT_TOKEN", agent=agent)
+        
+        @bot.on_command("help")
+        async def help_command(message):
+            await bot.send_message(message.channel.channel_id, "Help text...")
+        
+        await bot.start()
+    
+    Requires: pip install discord.py
+    """
+    
+    def __init__(
+        self,
+        token: str,
+        agent: Optional["Agent"] = None,
+        config: Optional[BotConfig] = None,
+        **kwargs,
+    ):
+        """Initialize the Discord bot.
+        
+        Args:
+            token: Discord bot token
+            agent: Optional agent to handle messages
+            config: Optional bot configuration
+            **kwargs: Additional arguments for forward compatibility
+        """
+        # B9: Store extra kwargs for forward compatibility
+        self._extra_kwargs = kwargs
+        self._token = token
+        self._agent = agent
+        self.config = config or BotConfig(token=token)
+        
+        self._is_running = False
+        self._bot_user: Optional[BotUser] = None
+        self._client = None
+        
+        self._message_handlers: List[Callable] = []
+        self._command_handlers: Dict[str, Callable] = {}
+        self._started_at: Optional[float] = None
+        try:
+            from praisonaiagents.session import get_default_session_store
+            _store = get_default_session_store()
+        except Exception:
+            _store = None
+        self._session: BotSessionManager = BotSessionManager(
+            store=_store,
+            platform="discord",
+        )
+        self._debouncer: InboundDebouncer = InboundDebouncer(
+            debounce_ms=self.config.debounce_ms,
+        )
+        self._ack: AckReactor = AckReactor(
+            ack_emoji=self.config.ack_emoji,
+            done_emoji=self.config.done_emoji,
+        )
+    
+    @property
+    def is_running(self) -> bool:
+        return self._is_running
+    
+    @property
+    def platform(self) -> str:
+        return "discord"
+    
+    @property
+    def bot_user(self) -> Optional[BotUser]:
+        return self._bot_user
+    
+    async def start(self) -> None:
+        """Start the Discord bot."""
+        if self._is_running:
+            logger.warning("Bot already running")
+            return
+        
+        try:
+            import discord
+            from discord.ext import commands
+        except ImportError:
+            raise ImportError(
+                "DiscordBot requires discord.py. "
+                "Install with: pip install discord.py"
+            )
+        
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        
+        self._client = commands.Bot(
+            command_prefix=self.config.command_prefix,
+            intents=intents,
+        )
+        self._started_at = time.time()
+        
+        @self._client.event
+        async def on_ready():
+            self._bot_user = BotUser(
+                user_id=str(self._client.user.id),
+                username=self._client.user.name,
+                display_name=self._client.user.display_name,
+                is_bot=True,
+            )
+            self._is_running = True
+            logger.info(f"Discord bot started: {self._client.user.name}")
+        
+        @self._client.event
+        async def on_message(message):
+            if message.author.bot:
+                return
+            
+            bot_message = self._convert_message(message)
+            
+            self.fire_message_received(bot_message)
+            
+            if not self.config.is_user_allowed(bot_message.sender.user_id if bot_message.sender else ""):
+                return
+            if not self.config.is_channel_allowed(bot_message.channel.channel_id if bot_message.channel else ""):
+                return
+            
+            if bot_message.is_command:
+                command = bot_message.command
+                if command == "status":
+                    await message.reply(self._format_status())
+                    return
+                elif command == "new":
+                    user_id = str(message.author.id)
+                    self._session.reset(user_id)
+                    await message.reply("Session reset. Starting fresh conversation.")
+                    return
+                elif command == "help":
+                    await message.reply(self._format_help())
+                    return
+                elif command and command in self._command_handlers:
+                    handler = self._command_handlers[command]
+                    try:
+                        if asyncio.iscoroutinefunction(handler):
+                            await handler(bot_message)
+                        else:
+                            handler(bot_message)
+                    except Exception as e:
+                        logger.error(f"Command handler error: {e}")
+                return
+            
+            should_respond = False
+            if message.guild is None:
+                should_respond = True
+            elif self._client.user.mentioned_in(message) or not self.config.mention_required:
+                should_respond = True
+            
+            if should_respond:
+                for handler in self._message_handlers:
+                    try:
+                        if asyncio.iscoroutinefunction(handler):
+                            await handler(bot_message)
+                        else:
+                            handler(bot_message)
+                    except Exception as e:
+                        logger.error(f"Message handler error: {e}")
+                
+                if self._agent:
+                    user_id = str(message.author.id)
+                    
+                    # Ack reaction - show processing indicator
+                    ack_ctx = None
+                    if self._ack.enabled:
+                        async def _discord_react(emoji, **kw):
+                            try:
+                                await message.add_reaction(emoji)
+                            except Exception:
+                                pass  # Reactions may not be supported
+                        async def _discord_unreact(emoji, **kw):
+                            try:
+                                await message.remove_reaction(emoji, self._client.user)
+                            except Exception:
+                                pass
+                        ack_ctx = await self._ack.ack(react_fn=_discord_react)
+                    
+                    async def _send_agent_response():
+                        text_to_send = await self._debouncer.debounce(user_id, bot_message.text)
+                        response = await self._session.chat(self._agent, user_id, text_to_send)
+                        send_result = self.fire_message_sending(
+                            str(message.channel.id), str(response),
+                        )
+                        if send_result["cancel"]:
+                            return
+                        await self._send_long_message(message.channel, send_result["content"], reference=message)
+                        self.fire_message_sent(str(message.channel.id), send_result["content"])
+                        # Done reaction - show completion
+                        if ack_ctx:
+                            await self._ack.done(ack_ctx, react_fn=_discord_react, unreact_fn=_discord_unreact)
+
+                    if self.config.typing_indicator:
+                        async with message.channel.typing():
+                            try:
+                                await _send_agent_response()
+                            except Exception as e:
+                                logger.error(f"Agent error: {e}")
+                                await message.reply(f"Error: {str(e)}")
+                    else:
+                        try:
+                            await _send_agent_response()
+                        except Exception as e:
+                            logger.error(f"Agent error: {e}")
+                            await message.reply(f"Error: {str(e)}")
+        
+        await self._client.start(self._token)
+    
+    async def stop(self) -> None:
+        """Stop the Discord bot."""
+        if not self._is_running:
+            return
+        
+        self._is_running = False
+        self._debouncer.cancel_all()
+        
+        if self._client:
+            await self._client.close()
+        
+        logger.info("Discord bot stopped")
+    
+    def set_agent(self, agent: "Agent") -> None:
+        """Set the agent that handles messages."""
+        self._agent = agent
+    
+    def get_agent(self) -> Optional["Agent"]:
+        """Get the current agent."""
+        return self._agent
+    
+    async def send_message(
+        self,
+        channel_id: str,
+        content: Union[str, Dict[str, Any]],
+        reply_to: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> BotMessage:
+        """Send a message to a channel."""
+        if not self._client:
+            raise RuntimeError("Bot not started")
+        
+        text = content if isinstance(content, str) else str(content)
+        channel = self._client.get_channel(int(channel_id))
+        
+        if not channel:
+            raise ValueError(f"Channel not found: {channel_id}")
+        
+        if thread_id:
+            thread = channel.get_thread(int(thread_id))
+            if thread:
+                channel = thread
+        
+        sent = await channel.send(text)
+        
+        return BotMessage(
+            message_id=str(sent.id),
+            content=text,
+            message_type=MessageType.TEXT,
+            channel=BotChannel(channel_id=channel_id),
+        )
+    
+    async def _send_long_message(self, channel, text: str, reference=None) -> None:
+        """Send a long message, splitting with markdown-aware chunking."""
+        from ._chunk import chunk_message
+
+        max_len = min(self.config.max_message_length, 2000)
+        
+        if len(text) <= max_len:
+            if reference:
+                await channel.send(text, reference=reference)
+            else:
+                await channel.send(text)
+        else:
+            chunks = chunk_message(text, max_length=max_len, preserve_fences=True)
+            for i, chunk in enumerate(chunks):
+                if i == 0 and reference:
+                    await channel.send(chunk, reference=reference)
+                else:
+                    await channel.send(chunk)
+    
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        content: Union[str, Dict[str, Any]],
+    ) -> BotMessage:
+        """Edit an existing message."""
+        if not self._client:
+            raise RuntimeError("Bot not started")
+        
+        text = content if isinstance(content, str) else str(content)
+        channel = self._client.get_channel(int(channel_id))
+        
+        if not channel:
+            raise ValueError(f"Channel not found: {channel_id}")
+        
+        message = await channel.fetch_message(int(message_id))
+        await message.edit(content=text)
+        
+        return BotMessage(
+            message_id=message_id,
+            content=text,
+            message_type=MessageType.EDIT,
+            channel=BotChannel(channel_id=channel_id),
+        )
+    
+    async def delete_message(
+        self,
+        channel_id: str,
+        message_id: str,
+    ) -> bool:
+        """Delete a message."""
+        if not self._client:
+            raise RuntimeError("Bot not started")
+        
+        try:
+            channel = self._client.get_channel(int(channel_id))
+            if channel:
+                message = await channel.fetch_message(int(message_id))
+                await message.delete()
+                return True
+        except Exception as e:
+            logger.error(f"Delete message error: {e}")
+        return False
+    
+    def on_message(self, handler: Callable[[BotMessage], Any]) -> Callable:
+        """Register a message handler."""
+        self._message_handlers.append(handler)
+        return handler
+    
+    def on_command(self, command: str) -> Callable:
+        """Decorator to register a command handler."""
+        def decorator(func: Callable) -> Callable:
+            self._command_handlers[command] = func
+            return func
+        return decorator
+    
+    async def send_typing(self, channel_id: str) -> None:
+        """Send typing indicator."""
+        if self._client:
+            channel = self._client.get_channel(int(channel_id))
+            if channel:
+                await channel.trigger_typing()
+    
+    async def get_user(self, user_id: str) -> Optional[BotUser]:
+        """Get user information."""
+        if not self._client:
+            return None
+        
+        try:
+            user = await self._client.fetch_user(int(user_id))
+            return BotUser(
+                user_id=str(user.id),
+                username=user.name,
+                display_name=user.display_name,
+                is_bot=user.bot,
+            )
+        except Exception:
+            return None
+    
+    async def get_channel(self, channel_id: str) -> Optional[BotChannel]:
+        """Get channel information."""
+        if not self._client:
+            return None
+        
+        try:
+            channel = self._client.get_channel(int(channel_id))
+            if channel:
+                channel_type = "dm" if hasattr(channel, "recipient") else "channel"
+                return BotChannel(
+                    channel_id=str(channel.id),
+                    name=getattr(channel, "name", None),
+                    channel_type=channel_type,
+                )
+        except Exception:
+            pass
+        return None
+    
+    async def probe(self):
+        """Test Discord API connectivity without starting the bot."""
+        from praisonaiagents.bots import ProbeResult
+        started = time.time()
+        try:
+            import aiohttp
+            url = "https://discord.com/api/v10/users/@me"
+            headers = {"Authorization": f"Bot {self._token}"}
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    elapsed = (time.time() - started) * 1000
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return ProbeResult(
+                            ok=True, platform="discord", elapsed_ms=elapsed,
+                            bot_username=data.get("username"),
+                            details={"bot_id": data.get("id"), "discriminator": data.get("discriminator")},
+                        )
+                    else:
+                        text = await resp.text()
+                        return ProbeResult(ok=False, platform="discord", elapsed_ms=elapsed, error=f"HTTP {resp.status}: {text[:200]}")
+        except Exception as e:
+            return ProbeResult(ok=False, platform="discord", elapsed_ms=(time.time() - started) * 1000, error=str(e))
+
+    async def health(self):
+        """Get detailed health status of the Discord bot."""
+        from praisonaiagents.bots import HealthResult
+        probe_result = await self.probe()
+        uptime = (time.time() - self._started_at) if self._started_at else None
+        session_count = len(self._session._histories) if hasattr(self._session, '_histories') else 0
+        return HealthResult(
+            ok=self._is_running and probe_result.ok, platform="discord",
+            is_running=self._is_running, uptime_seconds=uptime,
+            probe=probe_result, sessions=session_count,
+            error=probe_result.error if not probe_result.ok else None,
+        )
+
+    def _format_status(self) -> str:
+        """Format /status response."""
+        return format_status(self._agent, self.platform, self._started_at, self._is_running)
+    
+    def _format_help(self) -> str:
+        """Format /help response."""
+        extra = {cmd: "Custom command" for cmd in self._command_handlers}
+        return format_help(self._agent, self.platform, extra)
+    
+    def _convert_message(self, message) -> BotMessage:
+        """Convert Discord Message to BotMessage."""
+        sender = BotUser(
+            user_id=str(message.author.id),
+            username=message.author.name,
+            display_name=message.author.display_name,
+            is_bot=message.author.bot,
+        )
+        
+        channel_type = "dm" if message.guild is None else "channel"
+        channel = BotChannel(
+            channel_id=str(message.channel.id),
+            name=getattr(message.channel, "name", None),
+            channel_type=channel_type,
+        )
+        
+        content = message.content
+        if self._client and self._client.user:
+            content = content.replace(f"<@{self._client.user.id}>", "").strip()
+            content = content.replace(f"<@!{self._client.user.id}>", "").strip()
+        
+        msg_type = MessageType.COMMAND if content.startswith(self.config.command_prefix) else MessageType.TEXT
+        
+        return BotMessage(
+            message_id=str(message.id),
+            content=content,
+            message_type=msg_type,
+            sender=sender,
+            channel=channel,
+            timestamp=message.created_at.timestamp() if message.created_at else 0,
+            thread_id=str(message.thread.id) if hasattr(message, "thread") and message.thread else None,
+        )
