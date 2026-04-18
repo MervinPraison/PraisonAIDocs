@@ -50,17 +50,7 @@ _DEFAULT_TOOLS = [
     "search_web",
 ]
 
-TOOL_ALIAS_MAP = {
-    "bash": "execute_command",
-    "read": "read_file",
-    "write": "write_file",
-    "edit": "write_file",
-    "glob": "list_files",
-    "grep": "execute_command",
-    "web_fetch": "web_crawl",
-    "search": "search_web",
-    "web_search": "search_web",
-}
+from ._tool_aliases import TOOL_ALIAS_MAP
 
 
 @dataclass
@@ -88,11 +78,11 @@ class LocalManagedConfig:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # ── Environment fields ──
-    sandbox_type: str = "subprocess"
     working_dir: str = ""
     env: Dict[str, str] = field(default_factory=dict)
     packages: Optional[Dict[str, List[str]]] = None
     networking: Dict[str, Any] = field(default_factory=lambda: {"type": "unrestricted"})
+    host_packages_ok: bool = False  # Allow packages on host (security opt-out)
 
     # ── Session fields ──
     session_title: str = "PraisonAI local session"
@@ -298,7 +288,12 @@ class LocalManagedAgent:
     # Tool resolution
     # ------------------------------------------------------------------
     def _resolve_tools(self) -> List:
-        """Resolve tool names to actual PraisonAI tool functions."""
+        """Resolve tool names to actual PraisonAI tool functions.
+        
+        When a compute provider is attached, shell-based tools (execute_command,
+        read_file, write_file, list_files) are bridged to run in the compute
+        environment instead of on the host.
+        """
         raw_tools = self._cfg.get("tools", list(_DEFAULT_TOOLS))
         tool_names = _translate_anthropic_tools(raw_tools)
 
@@ -309,12 +304,18 @@ class LocalManagedAgent:
 
         # Import tools lazily
         tools = []
+        compute_bridged_tools = {"execute_command", "read_file", "write_file", "list_files"}
+        
         for name in resolved_names:
             try:
                 from praisonaiagents import tools as tool_module
                 func = getattr(tool_module, name, None)
                 if func is not None:
-                    tools.append(func)
+                    # Bridge shell-based tools to compute when available
+                    if self._compute and name in compute_bridged_tools:
+                        tools.append(self._create_compute_bridge_tool(name, func))
+                    else:
+                        tools.append(func)
                 else:
                     logger.warning("[local_managed] tool not found: %s", name)
             except Exception as e:
@@ -336,6 +337,119 @@ class LocalManagedAgent:
                         )
 
         return tools
+
+    def _create_compute_bridge_tool(self, tool_name: str, original_func: Callable) -> Callable:
+        """Create a compute-bridged version of a tool.
+        
+        Wraps the original tool function to execute commands in the compute
+        environment instead of on the host.
+        """
+        import inspect
+        import asyncio
+        
+        def compute_bridged_tool(*args, **kwargs):
+            """Compute-bridged tool wrapper."""
+            # Auto-provision compute if needed
+            if self._compute_instance_id is None:
+                try:
+                    loop = asyncio.get_event_loop()
+                    loop.run_until_complete(self.provision_compute())
+                except RuntimeError:
+                    asyncio.run(self.provision_compute())
+            
+            if tool_name == "execute_command":
+                # For execute_command, directly route to compute
+                command = args[0] if args else kwargs.get("command", "")
+                if not command:
+                    return "Error: No command specified"
+                
+                try:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        result = loop.run_until_complete(
+                            self._compute.execute(self._compute_instance_id, command)
+                        )
+                    except RuntimeError:
+                        result = asyncio.run(
+                            self._compute.execute(self._compute_instance_id, command)
+                        )
+                    
+                    # Format result similar to local execute_command
+                    if result.get("exit_code", 0) == 0:
+                        return result.get("stdout", "")
+                    else:
+                        return f"Command failed (exit {result.get('exit_code', 1)}): {result.get('stderr', '')}"
+                        
+                except Exception as e:
+                    return f"Compute execution error: {e}"
+                    
+            elif tool_name in {"read_file", "write_file", "list_files"}:
+                # For file operations, convert to shell commands in compute
+                return self._bridge_file_tool(tool_name, *args, **kwargs)
+            
+            else:
+                # Fallback to original tool (shouldn't happen for bridged tools)
+                return original_func(*args, **kwargs)
+        
+        # Copy function metadata
+        compute_bridged_tool.__name__ = tool_name
+        compute_bridged_tool.__doc__ = original_func.__doc__ or f"Compute-bridged {tool_name}"
+        
+        # Copy signature if available
+        try:
+            compute_bridged_tool.__signature__ = inspect.signature(original_func)
+            compute_bridged_tool.__annotations__ = getattr(original_func, "__annotations__", {})
+        except (ValueError, TypeError):
+            pass
+            
+        return compute_bridged_tool
+
+    def _bridge_file_tool(self, tool_name: str, *args, **kwargs) -> str:
+        """Bridge file operations to compute environment."""
+        import asyncio
+        
+        if tool_name == "read_file":
+            filepath = args[0] if args else kwargs.get("filepath", "")
+            if not filepath:
+                return "Error: No filepath specified"
+            
+            command = f'cat "{filepath}"'
+            
+        elif tool_name == "write_file":
+            filepath = args[0] if args else kwargs.get("filepath", "")
+            content = args[1] if len(args) > 1 else kwargs.get("content", "")
+            if not filepath:
+                return "Error: No filepath specified"
+            
+            # Escape content for shell
+            import shlex
+            command = f'cat > "{filepath}" << "EOF"\n{content}\nEOF'
+            
+        elif tool_name == "list_files":
+            directory = args[0] if args else kwargs.get("directory", ".")
+            command = f'ls -la "{directory}"'
+            
+        else:
+            return f"Error: Unsupported bridged tool: {tool_name}"
+        
+        try:
+            try:
+                loop = asyncio.get_event_loop()
+                result = loop.run_until_complete(
+                    self._compute.execute(self._compute_instance_id, command)
+                )
+            except RuntimeError:
+                result = asyncio.run(
+                    self._compute.execute(self._compute_instance_id, command)
+                )
+            
+            if result.get("exit_code", 0) == 0:
+                return result.get("stdout", "")
+            else:
+                return f"Command failed (exit {result.get('exit_code', 1)}): {result.get('stderr', '')}"
+                
+        except Exception as e:
+            return f"Compute execution error: {e}"
 
     # ------------------------------------------------------------------
     # Inner agent (lazy)
@@ -461,21 +575,86 @@ class LocalManagedAgent:
                 self.provider = saved_cfg["provider"]
 
     def _install_packages(self) -> None:
-        """Install packages specified in config before agent starts."""
+        """Install packages specified in config before agent starts.
+        
+        Security behavior:
+        - If compute provider is attached: installs in sandbox via compute.execute()
+        - If no compute and host_packages_ok=True: installs on host (developer mode)
+        - If no compute and host_packages_ok=False: raises ManagedSandboxRequired
+        """
         packages = self._cfg.get("packages")
         if not packages:
             return
 
         pip_pkgs = packages.get("pip", []) if isinstance(packages, dict) else []
-        if pip_pkgs:
+        if not pip_pkgs:
+            return
+
+        # Security check: require compute provider OR explicit opt-out
+        if self._compute is None:
+            host_packages_ok = self._cfg.get("host_packages_ok", False)
+            if not host_packages_ok:
+                from .managed_agents import ManagedSandboxRequired
+                raise ManagedSandboxRequired(
+                    f"Package installation requested ({pip_pkgs}) but no compute provider specified. "
+                    f"This would install packages on the host system, creating a security risk. "
+                    f"Either specify a compute provider (compute='docker') or explicitly allow "
+                    f"host packages with LocalManagedConfig(host_packages_ok=True)."
+                )
+            
+            # Host installation (explicit opt-out)
             cmd = [sys.executable, "-m", "pip", "install", "-q"] + pip_pkgs
-            logger.info("[local_managed] installing pip packages: %s", pip_pkgs)
+            logger.warning("[local_managed] installing pip packages on HOST system: %s", pip_pkgs)
             try:
                 subprocess.run(cmd, check=True, capture_output=True, timeout=120)
+                logger.info("[local_managed] host pip install completed")
             except subprocess.CalledProcessError as e:
                 logger.warning("[local_managed] pip install failed: %s", e.stderr)
             except subprocess.TimeoutExpired:
                 logger.warning("[local_managed] pip install timed out")
+        else:
+            # Sandbox installation via compute provider
+            self._install_packages_in_compute(pip_pkgs)
+
+    def _install_packages_in_compute(self, pip_pkgs: List[str]) -> None:
+        """Install pip packages in the compute environment."""
+        if not self._compute:
+            raise RuntimeError("No compute provider available")
+        
+        # Auto-provision compute if not done yet
+        if self._compute_instance_id is None:
+            try:
+                import asyncio
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(self.provision_compute())
+            except RuntimeError:
+                # No event loop, create one
+                asyncio.run(self.provision_compute())
+        
+        pip_cmd = "python -m pip install -q " + " ".join(f'"{pkg}"' for pkg in pip_pkgs)
+        logger.info("[local_managed] installing pip packages in compute: %s", pip_pkgs)
+        
+        try:
+            # Run installation synchronously in compute
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                result = loop.run_until_complete(
+                    self._compute.execute(self._compute_instance_id, pip_cmd, timeout=120)
+                )
+            except RuntimeError:
+                # No event loop, create one
+                result = asyncio.run(
+                    self._compute.execute(self._compute_instance_id, pip_cmd, timeout=120)
+                )
+            
+            if result.get("exit_code", 0) == 0:
+                logger.info("[local_managed] compute pip install completed")
+            else:
+                logger.warning("[local_managed] compute pip install failed: %s", result.get("stderr", ""))
+                
+        except Exception as e:
+            logger.warning("[local_managed] compute pip install error: %s", e)
 
     def _ensure_agent(self) -> Any:
         """Create or return the inner PraisonAI Agent."""
@@ -547,34 +726,64 @@ class LocalManagedAgent:
 
     def _execute_sync(self, prompt: str, stream_live: bool = False) -> str:
         """Synchronous execution using PraisonAI Agent.chat()."""
+        # Get context emitter (zero-overhead when no emitter is installed)
+        try:
+            from praisonaiagents.trace.context_events import get_context_emitter
+            emitter = get_context_emitter()
+        except ImportError:
+            emitter = None
+
         agent = self._ensure_agent()
         self._ensure_session()
         self._persist_message("user", prompt)
+        agent_name = self._cfg.get("name", "Agent")
 
-        if stream_live:
-            result_parts = []
-            gen = agent.chat(prompt, stream=True)
-            if hasattr(gen, '__iter__'):
-                for chunk in gen:
-                    if chunk:
-                        sys.stdout.write(str(chunk))
-                        sys.stdout.flush()
-                        result_parts.append(str(chunk))
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                full = "".join(result_parts)
+        # Emit agent_start event
+        if emitter:
+            emitter.agent_start(agent_name, {
+                "input": prompt,
+                "goal": self._cfg.get("system", self.instructions)
+            })
+
+        try:
+            if stream_live:
+                result_parts = []
+                gen = agent.chat(prompt, stream=True)
+                if hasattr(gen, '__iter__'):
+                    for chunk in gen:
+                        if chunk:
+                            sys.stdout.write(str(chunk))
+                            sys.stdout.flush()
+                            result_parts.append(str(chunk))
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    full = "".join(result_parts)
+                else:
+                    full = str(gen) if gen else ""
+                    sys.stdout.write(full + "\n")
+                    sys.stdout.flush()
             else:
-                full = str(gen) if gen else ""
-                sys.stdout.write(full + "\n")
-                sys.stdout.flush()
-        else:
-            result = agent.chat(prompt)
-            full = str(result) if result else ""
+                result = agent.chat(prompt)
+                full = str(result) if result else ""
 
-        self._persist_message("assistant", full)
-        self._sync_usage()
-        self._persist_state()
-        return full
+            # Emit llm_response event for the response
+            if emitter and full:
+                emitter.llm_response(
+                    agent_name,
+                    response_content=full,
+                    prompt_tokens=self.total_input_tokens,
+                    completion_tokens=self.total_output_tokens
+                )
+
+            self._persist_message("assistant", full)
+            self._sync_usage()
+            self._persist_state()
+            return full
+
+        finally:
+            # Emit agent_end event
+            if emitter:
+                emitter.agent_end(agent_name)
 
     # ------------------------------------------------------------------
     # stream() — ManagedBackendProtocol
@@ -671,16 +880,28 @@ class LocalManagedAgent:
     # retrieve_session / list_sessions — ManagedBackendProtocol
     # ------------------------------------------------------------------
     def retrieve_session(self) -> Dict[str, Any]:
-        """Retrieve current session metadata."""
+        """Retrieve current session metadata.
+        
+        Returns unified SessionInfo schema with all fields always present:
+        - id: Session ID
+        - status: Session status (idle, running, error, etc.)
+        - title: Session title/name  
+        - usage: Token usage with input_tokens and output_tokens
+        """
+        from ._session_info import SessionInfo
+        
         self._sync_usage()
-        return {
-            "id": self._session_id,
-            "status": "idle" if self._session_id else "none",
-            "usage": {
+        
+        session_info = SessionInfo(
+            id=self._session_id or "",
+            status="idle" if self._session_id else "unknown",
+            title="",  # Local agent doesn't track titles
+            usage={
                 "input_tokens": self.total_input_tokens,
                 "output_tokens": self.total_output_tokens,
-            },
-        }
+            }
+        )
+        return session_info.to_dict()
 
     def list_sessions(self, **kwargs) -> List[Dict[str, Any]]:
         """List all sessions created in this backend instance."""

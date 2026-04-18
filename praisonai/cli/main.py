@@ -350,6 +350,10 @@ class PraisonAI:
         initializes the necessary attributes, and then calls the appropriate methods based on the
         provided arguments.
         """
+        # Set OpenTelemetry SDK to disabled to prevent telemetry collection
+        # Moved from agents_generator.py to CLI entry point per architecture requirements
+        os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+        
         # Store the original agent_file from constructor
         original_agent_file = self.agent_file
         
@@ -726,7 +730,10 @@ class PraisonAI:
             if args.ui == "gradio":
                 self.create_gradio_interface()
             elif args.ui == "chainlit":
-                self.create_chainlit_interface()
+                # Deprecation warning and route to new aiui agents interface
+                print("\n\033[93mWARNING: --ui chainlit is deprecated and will be removed in a future release.\033[0m")
+                print("Launching the new aiui-based agents interface instead...")
+                self.create_aiui_agents_interface()
             else:
                 # Modify code to allow default UI
                 AgentsGenerator = _get_agents_generator()
@@ -1067,6 +1074,8 @@ class PraisonAI:
         # External Agent - use external AI CLI tools
         parser.add_argument("--external-agent", type=str, choices=["claude", "gemini", "codex", "cursor"],
                           help="Use external AI CLI tool (claude, gemini, codex, cursor)")
+        parser.add_argument("--external-agent-direct", action="store_true",
+                          help="Use external agent as direct proxy (skip manager Agent delegation)")
         
         # Compare - compare different CLI modes
         parser.add_argument("--compare", type=str, help="Compare CLI modes (comma-separated: basic,tools,research,planning)")
@@ -4365,11 +4374,13 @@ Do NOT add any explanations or formatting."""
                             existing_tools = list(mcp_tools)
                         agent_config['tools'] = existing_tools
                 
-                # External Agent - Use external AI CLI tools directly
+                # External Agent - Use external AI CLI tools with manager delegation
                 if getattr(self.args, 'external_agent', None):
                     from rich.console import Console
                     ext_console = Console()
                     external_agent_name = self.args.external_agent
+                    direct = getattr(self.args, 'external_agent_direct', False)
+                    
                     try:
                         from .features.external_agents import ExternalAgentsHandler
                         handler = ExternalAgentsHandler(verbose=getattr(self.args, 'verbose', False))
@@ -4379,23 +4390,43 @@ Do NOT add any explanations or formatting."""
                         
                         integration = handler.get_integration(external_agent_name, workspace=workspace)
                         
-                        if integration.is_available:
-                            ext_console.print(f"[bold cyan]🔌 Using external agent: {external_agent_name}[/bold cyan]")
-                            
-                            # Run the external agent directly instead of PraisonAI agent
+                        if not integration.is_available:
+                            ext_console.print(f"[yellow]⚠️ External agent '{external_agent_name}' is not installed[/yellow]")
+                            ext_console.print(f"[dim]Install with: {handler._get_install_instructions(external_agent_name)}[/dim]")
+                            return None
+                        
+                        if direct:
+                            # Pass-through proxy (original behavior, preserved as escape hatch)
+                            ext_console.print(f"[bold cyan]🔌 Using external agent (direct): {external_agent_name}[/bold cyan]")
                             import asyncio
                             try:
                                 result = asyncio.run(integration.execute(prompt))
                                 ext_console.print(f"\n[bold green]Result from {external_agent_name}:[/bold green]")
                                 ext_console.print(result)
-                                # Return empty string to avoid duplicate printing by caller
                                 return ""
                             except Exception as e:
-                                ext_console.print(f"[red]Error executing {external_agent_name}: {e}[/red]")
+                                ext_console.print(f"[red]Error executing {external_agent_name}: {e.__class__.__name__}: {e}[/red]")
                                 return None
-                        else:
-                            ext_console.print(f"[yellow]⚠️ External agent '{external_agent_name}' is not installed[/yellow]")
-                            ext_console.print(f"[dim]Install with: {handler._get_install_instructions(external_agent_name)}[/dim]")
+                        
+                        # NEW default: manager Agent uses external CLI as subagent tool
+                        ext_console.print(f"[bold cyan]🔌 Using external agent via manager delegation: {external_agent_name}[/bold cyan]")
+                        try:
+                            from praisonaiagents import Agent
+                            manager = Agent(
+                                name="Manager",
+                                instructions=(
+                                    f"You are a manager that delegates tasks to the {external_agent_name} subagent "
+                                    f"via the {integration.cli_command}_tool. Call the tool for coding/analysis tasks."
+                                ),
+                                tools=[integration.as_tool()],
+                                llm=agent_config.get('llm') or os.environ.get("MODEL_NAME", "gpt-4o-mini"),
+                            )
+                            result = manager.start(prompt)
+                            ext_console.print(f"\n[bold green]Manager delegation result:[/bold green]")
+                            ext_console.print(result)
+                            return ""
+                        except Exception as e:
+                            ext_console.print(f"[red]Error with manager delegation: {e.__class__.__name__}: {e}[/red]")
                             return None
                     except Exception as e:
                         ext_console.print(f"[red]Error setting up external agent: {e}[/red]")
@@ -5271,6 +5302,27 @@ Now, {final_instruction.lower()}:"""
             _get_chainlit_run()([realtime_ui_path])
         else:
             print("ERROR: Realtime UI is not installed. Please install it with 'pip install \"praisonai[realtime]\"' to use the realtime UI.")
+
+    def create_aiui_agents_interface(self):
+        """
+        Create an aiui-based agents interface (replaces Chainlit).
+        
+        Routes to the new `praisonai ui agents` subcommand.
+        """
+        try:
+            from praisonai.cli.commands.ui import _launch_aiui_app
+            print("🤖 Launching PraisonAI Agents Dashboard (aiui)...")
+            _launch_aiui_app(
+                app_dir="ui_agents",
+                default_app_name="ui_agents",
+                port=8082,  # Use same port as old Chainlit agents
+                host="0.0.0.0",
+                app_file=None,
+                reload=False,
+                ui_name="Agents Dashboard"
+            )
+        except ImportError:
+            print("ERROR: PraisonAI UI (aiui) is not installed. Please install it with 'pip install \"praisonai[ui]\"' to use the agents dashboard.")
 
     def handle_context_command(self, url: str, goal: str, auto_analyze: bool = False) -> str:
         """
