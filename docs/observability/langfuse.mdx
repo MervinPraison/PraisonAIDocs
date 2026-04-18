@@ -9,21 +9,31 @@ Langfuse provides observability and evaluation tools for LLM applications with a
 
 ```mermaid
 graph LR
-    subgraph "Langfuse Tracing"
-        Agent[🤖 Agent] --> OpenAI[📡 LLM Calls]
-        OpenAI --> Langfuse[📊 Langfuse]
-        CLI[💻 CLI] --> Local[🐳 Local Server]
-        Local --> Traces[📈 Traces]
+    subgraph "Two Paths to Enable Langfuse"
+        A[📝 Path A: obs.langfuse()] --> B[📡 OpenAI Drop-in]
+        C[💻 Path B: --observe langfuse] --> D[🔄 Context Bridge]
+        B --> E[📊 Langfuse]
+        D --> E
     end
     
-    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef pathA fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef pathB fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef output fill:#10B981,stroke:#7C90A0,color:#fff
     
-    class Agent agent
-    class OpenAI,CLI process
-    class Langfuse,Local,Traces output
+    class A,B pathA
+    class C,D pathB
+    class E output
 ```
+
+## Path Comparison
+
+| | Path A — `obs.langfuse()` | Path B — `praisonai --observe langfuse` |
+|---|---|---|
+| **Usage** | Python script | CLI flag (also `PRAISONAI_OBSERVE=langfuse`) |
+| **Mechanism** | Instruments OpenAI client globally via `langfuse.openai` drop-in | `LangfuseSink` + `ContextTraceEmitter` bridge |
+| **Span Coverage** | Per-LLM-call generations (input/output, tokens, model) | Full lifecycle: `agent_start`, `agent_end`, `tool_call_*`, `llm_*` |
+| **Manual flush needed?** | Yes — `provider.flush()` | No — `atexit` registers it |
+| **Best for** | Programmatic agents, any Python flow | YAML / CLI workflows, multi-agent pipelines |
 
 ## Quick Start
 
@@ -78,7 +88,7 @@ result = agent.start("Hello!")
 
 ---
 
-## How It Works
+## How Path A Works — `obs.langfuse()`
 
 ```mermaid
 sequenceDiagram
@@ -126,7 +136,96 @@ export LANGFUSE_HOST=http://localhost:3000
 
 ---
 
-## CLI Commands
+## CLI Observability — `--observe langfuse`
+
+Enable full agent lifecycle tracing with a single CLI flag:
+
+```bash
+# Basic usage
+praisonai --observe langfuse run agents.yaml
+
+# With environment variable
+PRAISONAI_OBSERVE=langfuse praisonai run agents.yaml
+
+# Multi-agent workflows
+praisonai --observe langfuse agents "Research AI trends" "Write a summary"
+```
+
+### What Gets Traced
+
+```mermaid
+sequenceDiagram
+    participant CLI
+    participant Agent
+    participant LLM
+    participant Tool
+    participant Langfuse
+    
+    CLI->>Agent: agent_start
+    Agent->>LLM: llm_request
+    LLM-->>Agent: llm_response
+    Agent->>Tool: tool_call_start
+    Tool-->>Agent: tool_call_end
+    Agent->>CLI: agent_end
+    
+    Note over CLI,Langfuse: All events auto-traced to Langfuse
+```
+
+The CLI `--observe langfuse` captures:
+- **Agent lifecycle**: `agent_start` / `agent_end` spans
+- **LLM interactions**: `llm_request` / `llm_response` with readable content
+- **Tool usage**: `tool_call_start` / `tool_call_end` with args and results
+- **Automatic flush**: No manual `provider.flush()` required
+
+<Note>
+As of PR #1461, `atexit` auto-closes the sink — no manual flush required for CLI runs. See [Custom Tracing](/docs/observability/custom-tracing) for the underlying `ContextTraceSinkProtocol`.
+</Note>
+
+---
+
+## Programmatic — `LangfuseSink` + Context Bridge
+
+For full control over Langfuse tracing in Python code:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.trace.protocol import TraceEmitter, set_default_emitter
+from praisonaiagents.trace.context_events import ContextTraceEmitter, set_context_emitter
+from praisonai.observability import LangfuseSink, LangfuseSinkConfig
+import atexit
+
+sink = LangfuseSink(LangfuseSinkConfig())  # reads env vars
+
+# Action-level events (RouterAgent / PlanningAgent)
+set_default_emitter(TraceEmitter(sink=sink, enabled=True))
+
+# Context-level events (Agent.start lifecycle, tool calls, LLM I/O) — required for full coverage
+set_context_emitter(ContextTraceEmitter(sink=sink.context_sink(), enabled=True))
+
+atexit.register(sink.close)
+
+agent = Agent(name="Writer", instructions="Write a haiku about code.")
+agent.start("Write a haiku about code.")
+```
+
+<Note>
+The `set_context_emitter(... sink=sink.context_sink() ...)` call is **required** for typical single-agent flows. Without it, only `RouterAgent` token-usage and `PlanningAgent.plan_created` events appear in Langfuse — `Agent.start()` lifecycle is silent.
+</Note>
+
+### LangfuseSinkConfig Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `public_key` | `str` | `""` (then `LANGFUSE_PUBLIC_KEY`) | Langfuse public key (`pk-lf-...`) |
+| `secret_key` | `str` | `""` (then `LANGFUSE_SECRET_KEY`) | Langfuse secret key (`sk-lf-...`) |
+| `host` | `str` | `""` (then `LANGFUSE_HOST` → `LANGFUSE_BASE_URL` → `https://cloud.langfuse.com`) | Langfuse server URL |
+| `flush_at` | `int` | `20` | Number of events that triggers a flush |
+| `flush_interval` | `float` | `10.0` | Seconds between background flushes |
+| `enabled` | `bool` | `True` | Master switch |
+
+---
+
+## CLI Server Commands
 
 <Tabs>
 <Tab title="Local Server">
@@ -247,14 +346,16 @@ if provider:
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Always Flush Before Exit">
-Call `provider.flush()` to ensure all traces are sent:
+<Accordion title="Always Flush Before Exit (Path A)">
+Call `provider.flush()` to ensure all traces are sent for `obs.langfuse()`:
 
 ```python
 provider = obs.langfuse()
 # ... run agents ...
 provider.flush()  # Critical for trace delivery
 ```
+
+Path B (`--observe langfuse`) auto-registers `atexit.close` since PR #1461.
 </Accordion>
 
 <Accordion title="Use Auto-Detection">
@@ -265,8 +366,22 @@ provider = obs.auto()  # Detects Langfuse automatically
 ```
 </Accordion>
 
-<Accordion title="Langfuse v4 Compatibility">
-PraisonAI uses Langfuse v4 SDK with `langfuse.openai` drop-in for automatic instrumentation. No manual trace creation needed.
+<Accordion title="Trace Content Quality (PR #1461)">
+As of PR #1461, `llm_response` spans contain the assistant message text (or `[tool_calls: name1, name2]` summary), not the raw `ChatCompletion(...)` repr. The Langfuse "Output" panel is now human-readable:
+
+- **Before**: `ChatCompletion(id='chatcmpl-...', choices=[Choice(...)], ...)`
+- **After**: `"The capital of France is Paris."` or `[tool_calls: search_web, calculator]`
+</Accordion>
+
+<Accordion title="Context Bridge for Full Coverage">
+For programmatic usage, include the context emitter for complete lifecycle tracing:
+
+```python
+from praisonaiagents.trace.context_events import ContextTraceEmitter, set_context_emitter
+set_context_emitter(ContextTraceEmitter(sink=sink.context_sink(), enabled=True))
+```
+
+Without this, only `RouterAgent` and `PlanningAgent` events appear — `Agent.start()` flows are silent.
 </Accordion>
 
 <Accordion title="Local Development Setup">
