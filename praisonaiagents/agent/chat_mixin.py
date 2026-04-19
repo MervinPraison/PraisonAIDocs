@@ -457,6 +457,26 @@ Your Goal: {self.goal}"""
         
         return content
 
+    def _extract_llm_response_content(self, response) -> Optional[str]:
+        """Return assistant message text, a tool-call summary, or str(response) as fallback."""
+        if not response:
+            return None
+        try:
+            if hasattr(response, "choices") and response.choices:
+                choice = response.choices[0]
+                msg = getattr(choice, "message", None)
+                if msg is not None:
+                    content = getattr(msg, "content", None)
+                    if content:
+                        return content
+                    tool_calls = getattr(msg, "tool_calls", None) or []
+                    if tool_calls:
+                        names = [getattr(tc.function, "name", "?") for tc in tool_calls]
+                        return f"[tool_calls: {', '.join(names)}]"
+        except (AttributeError, IndexError, TypeError):
+            pass
+        return str(response)
+
     def _process_stream_response(self, messages, temperature, start_time, formatted_tools=None, reasoning_steps=False):
         """Internal helper for streaming response processing with real-time events."""
         if self._openai_client is None:
@@ -572,7 +592,7 @@ Your Goal: {self.goal}"""
             _trace_emitter.llm_response(
                 self.name,
                 duration_ms=_duration_ms,
-                response_content=str(final_response) if final_response else None,
+                response_content=self._extract_llm_response_content(final_response),
                 prompt_tokens=_prompt_tokens,
                 completion_tokens=_completion_tokens,
                 cost_usd=_cost_usd,
@@ -995,6 +1015,56 @@ Your Goal: {self.goal}"""
             logging.warning(f"Tool output truncation error: {e}")
             return output
 
+    def _resolve_skill_invocation(self, prompt):
+        """If ``prompt`` is ``/skill-name [args]``, render the skill body.
+
+        Returns:
+            The rendered prompt when a user-invocable skill matches, else
+            the original ``prompt`` unchanged. Non-string prompts (e.g.
+            multimodal lists) are returned as-is.
+        """
+        if not isinstance(prompt, str):
+            return prompt
+        text = prompt.lstrip()
+        if not text.startswith("/"):
+            return prompt
+        # Avoid path-like "/usr/..." inputs
+        head = text[1:].split(None, 1)
+        if not head:
+            return prompt
+        name = head[0]
+        args = head[1] if len(head) > 1 else ""
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", name):
+            return prompt
+        mgr = getattr(self, "skill_manager", None)
+        if mgr is None:
+            return prompt
+        rendered = mgr.invoke(name, raw_args=args)
+        if rendered is None:
+            return prompt
+        # G6: Best-effort pre-approve any tools declared under
+        # `allowed-tools` in the skill frontmatter. Non-fatal on error.
+        try:
+            tool_names = mgr.get_allowed_tools(name)
+            if tool_names:
+                from ..approval import get_approval_registry, AutoApproveBackend
+
+                registry = get_approval_registry()
+                agent_name = getattr(self, "name", None)
+                for _tn in tool_names:
+                    try:
+                        registry.set_backend(
+                            AutoApproveBackend(),
+                            agent_name=agent_name,
+                            tool_name=_tn,
+                        )
+                    except TypeError:
+                        # Older registry may not accept tool_name kwarg
+                        registry.set_backend(AutoApproveBackend(), agent_name=agent_name)
+        except Exception:  # pragma: no cover - approval is optional
+            pass
+        return rendered
+
     def chat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None) -> Optional[str]:
         """
         Chat with the agent.
@@ -1008,6 +1078,10 @@ Your Goal: {self.goal}"""
                         'required' forces the LLM to call a tool before responding.
             ...other args...
         """
+        # Slash-command invocation: /skill-name [args] renders the skill
+        # body before any backend/LLM call.
+        prompt = self._resolve_skill_invocation(prompt)
+
         # Check if external managed backend is configured
         if hasattr(self, 'backend') and self.backend is not None:
             # Extract kwargs for delegation, excluding 'self' and function locals
@@ -1250,7 +1324,7 @@ Your Goal: {self.goal}"""
                         task_description=task_description,
                         task_id=task_id,
                         execute_tool_fn=self.execute_tool,
-                        parallel_tool_calls=getattr(self.execution, "parallel_tool_calls", False),
+                        parallel_tool_calls=getattr(getattr(self, "execution", None), "parallel_tool_calls", False),
                         reasoning_steps=reasoning_steps,
                         stream=stream
                     )
@@ -1564,6 +1638,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             attachments: Optional list of image/file paths that are ephemeral
                         (used for THIS turn only, NEVER stored in history).
         """
+        # Slash-command invocation: /skill-name [args] renders the skill body.
+        prompt = self._resolve_skill_invocation(prompt)
+
         # Emit context trace event (zero overhead when not set)
         from ..trace.context_events import get_context_emitter
         _trace_emitter = get_context_emitter()
@@ -1720,7 +1797,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         task_description=task_description,
                         task_id=task_id,
                         execute_tool_fn=self.execute_tool_async,
-                        parallel_tool_calls=getattr(self.execution, "parallel_tool_calls", False),
+                        parallel_tool_calls=getattr(getattr(self, "execution", None), "parallel_tool_calls", False),
                         reasoning_steps=reasoning_steps,
                         stream=stream
                     )
@@ -2251,7 +2328,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         task_description=kwargs.get('task_description'),
                         task_id=kwargs.get('task_id'),
                         execute_tool_fn=self.execute_tool,
-                        parallel_tool_calls=getattr(self.execution, "parallel_tool_calls", False)
+                        parallel_tool_calls=getattr(getattr(self, "execution", None), "parallel_tool_calls", False)
                     ):
                         response_content += chunk
                         yield chunk

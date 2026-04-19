@@ -22,20 +22,28 @@ def _common_options():
 
 @app.command("start")
 def bot_start(
-    config: str = typer.Option(..., "--config", "-c", help="Path to bot YAML config file"),
+    config: str = typer.Option(
+        "bot.yaml", "--config", "-c",
+        help="Path to bot YAML config file (defaults to ./bot.yaml if present, else ~/.praisonai/bot.yaml)",
+    ),
 ):
     """Start a bot from a single YAML config file (zero-code).
-    
+
     The config file contains platform, token, and agent settings all in one place.
-    
+    Resolution order when ``--config`` is not given:
+    ``./bot.yaml`` (back-compat) → ``~/.praisonai/bot.yaml`` (canonical).
+
     Examples:
-        praisonai bot start --config bot.yaml
+        praisonai bot start                              # auto-detect
+        praisonai bot start --config ~/.praisonai/bot.yaml
         praisonai bot start -c my-telegram-bot.yaml
     """
+    from .._paths import resolve_bot_config_path
     from ..features.bots_cli import BotHandler
-    
+
+    resolved = resolve_bot_config_path(config)
     handler = BotHandler()
-    handler.start_from_config(config)
+    handler.start_from_config(resolved)
 
 
 @app.command("telegram")
@@ -438,6 +446,48 @@ def bot_agentmail(
     )
 
 
+@app.command("install-daemon")
+def bot_install_daemon(
+    config: str = typer.Option(
+        "bot.yaml", "--config",
+        help="Path to bot.yaml (defaults to ./bot.yaml → ~/.praisonai/bot.yaml)",
+    ),
+    start: bool = typer.Option(True, "--start/--no-start", help="Start after install"),
+):
+    """Install bot as OS daemon service (alias for 'praisonai gateway install').
+    
+    Examples:
+        praisonai bot install-daemon
+        praisonai bot install-daemon --config my-bot.yaml --no-start
+    """
+    from praisonai.daemon import install_daemon
+    from .._paths import resolve_bot_config_path
+    from ..output.console import get_output_controller
+    
+    output = get_output_controller()
+    config = resolve_bot_config_path(config)
+    
+    try:
+        result = install_daemon(config_path=config)
+        if result.get("ok"):
+            output.print_success(result.get("message", "Service installed successfully"))
+            if start:
+                output.print_info("Starting the service...")
+                from praisonai.daemon import get_daemon_status
+                status = get_daemon_status()
+                if status.get("running"):
+                    output.print_success("Service is now running")
+                else:
+                    output.print_warning("Service installed but not running. Check system logs.")
+        else:
+            error = result.get("error", "Installation failed")
+            output.print_error(f"Installation failed: {error}")
+            raise typer.Exit(1)
+    except Exception as e:
+        output.print_error(f"Installation error: {str(e)}")
+        raise typer.Exit(1)
+
+
 @app.callback(invoke_without_command=True)
 def bot_callback(ctx: typer.Context):
     """Show bot help if no subcommand provided."""
@@ -454,6 +504,9 @@ Start a bot on any platform with: praisonai bot <platform>
   [green]whatsapp[/green]    WhatsApp Cloud API or Web mode (QR scan)
   [green]email[/green]       Email via IMAP/SMTP
   [green]agentmail[/green]   AgentMail API (API-first email for AI agents)
+
+[bold]Daemon Management:[/bold]
+  [green]install-daemon[/green]   Install bot as OS daemon service (auto-start)
 
 [bold]Capability Options (all platforms):[/bold]
   [yellow]--agent FILE[/yellow]          Agent YAML configuration

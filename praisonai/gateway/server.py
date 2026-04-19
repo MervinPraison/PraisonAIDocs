@@ -203,12 +203,21 @@ class WebSocketGateway:
         """
         self.config = config or GatewayConfig(host=host, port=port)
         if hasattr(self.config, 'auth_token') and not self.config.auth_token:
-            import secrets
-            self.config.auth_token = secrets.token_hex(16)
-            logger.warning(
-                f"No auth_token provided for Gateway server. Generated temporary token: {self.config.auth_token}. "
-                "For production, set GATEWAY_AUTH_TOKEN."
-            )
+            # Prefer a user-configured token (persisted by `praisonai onboard`
+            # to ~/.praisonai/.env as GATEWAY_AUTH_TOKEN) so the dashboard
+            # URL stays stable across daemon restarts. Only fall back to
+            # generating a random ephemeral token if nothing is set.
+            env_tok = os.environ.get("GATEWAY_AUTH_TOKEN", "").strip()
+            if env_tok:
+                self.config.auth_token = env_tok
+                logger.info("Gateway using GATEWAY_AUTH_TOKEN from environment")
+            else:
+                import secrets
+                self.config.auth_token = secrets.token_hex(16)
+                logger.warning(
+                    f"No auth_token provided for Gateway server. Generated temporary token: {self.config.auth_token}. "
+                    "For production, set GATEWAY_AUTH_TOKEN."
+                )
         
         self._host = self.config.host
         self._port = self.config.port
@@ -267,17 +276,27 @@ class WebSocketGateway:
             return JSONResponse(self.health())
         
         def _check_auth(request) -> Optional[JSONResponse]:
-            """Validate auth token if configured. Returns error response or None."""
+            """Validate auth token if configured. Returns error response or None.
+
+            Accepts either:
+              - ``Authorization: Bearer <token>`` header (preferred for APIs)
+              - ``?token=<token>`` query parameter (so the dashboard URL from
+                ``praisonai onboard`` is clickable in a browser)
+            """
             if not self.config.auth_token:
                 return None
             auth_header = request.headers.get("authorization", "")
-            if not auth_header.startswith("Bearer "):
+            token: str = ""
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+            else:
+                token = request.query_params.get("token", "")
+            if not token:
                 return JSONResponse(
                     {"error": "Authentication required"},
                     status_code=401,
                     headers={"WWW-Authenticate": "Bearer"},
                 )
-            token = auth_header[7:]
             if not secrets.compare_digest(token, self.config.auth_token):
                 return JSONResponse(
                     {"error": "Invalid authentication token"},
@@ -1030,15 +1049,26 @@ class WebSocketGateway:
 
     @staticmethod
     def _substitute_env_vars(value: str) -> str:
-        """Replace ${VAR_NAME} patterns with environment variable values."""
+        """Replace ``${VAR_NAME}`` patterns with environment variable values.
+
+        Previously, missing env vars returned the literal ``${VAR_NAME}`` which
+        caused downstream APIs (e.g. Telegram) to receive a broken token
+        string and fail with opaque 404s. We now substitute missing vars with
+        an **empty string** so the schema validator's required-field checks
+        (e.g. ``token`` must be truthy) trip cleanly instead.
+        """
         if not isinstance(value, str):
             return value
         def _replacer(match):
             var_name = match.group(1)
             env_val = os.environ.get(var_name)
             if env_val is None:
-                logger.warning(f"Environment variable {var_name} not set")
-                return match.group(0)
+                logger.warning(
+                    f"Environment variable {var_name} not set "
+                    f"— substituting empty string. "
+                    f"Run `praisonai onboard` or set it in ~/.praisonai/.env."
+                )
+                return ""
             return env_val
         return re.sub(r'\$\{([^}]+)\}', _replacer, value)
 
