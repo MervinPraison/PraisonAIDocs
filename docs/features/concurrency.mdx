@@ -1,0 +1,350 @@
+---
+title: "Concurrency"
+sidebarTitle: "Concurrency"
+description: "Limit parallel agent runs and bound tool execution time"
+icon: "gauge"
+---
+
+Concurrency controls let you limit parallel agent execution and set timeouts for tool calls to prevent resource exhaustion.
+
+```mermaid
+graph LR
+    subgraph "Concurrency Control Flow"
+        User[👤 User] --> Registry[🛂 ConcurrencyRegistry]
+        Registry --> Agent[🧠 Agent]
+        Agent --> ToolPool[🔧 Tool Pool<br/>2-thread executor]
+        ToolPool --> Timeout{⏱️ Timeout?}
+        Timeout -->|Yes| Error[❌ Timeout Result]
+        Timeout -->|No| Success[✅ Tool Result]
+    end
+    
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef registry fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef agent fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef pool fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    
+    class User user
+    class Registry registry
+    class Agent agent
+    class ToolPool pool
+    class Success result
+    class Error error
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Limit parallel runs of an agent">
+Control how many instances of the same agent can run concurrently:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.agent.concurrency import ConcurrencyRegistry
+
+registry = ConcurrencyRegistry()
+registry.set_limit("researcher", 2)  # at most 2 concurrent runs
+
+agent = Agent(name="researcher", instructions="Research topics")
+
+# Sync context
+registry.acquire_sync("researcher")
+try:
+    agent.start("Research Mars exploration")
+finally:
+    registry.release("researcher")
+```
+</Step>
+
+<Step title="Same, async">
+Use async context for better resource utilization:
+
+```python
+await registry.acquire("researcher")
+try:
+    await agent.astart("Research Mars exploration")
+finally:
+    registry.release("researcher")
+```
+</Step>
+
+<Step title="Bound tool time with tool_timeout">
+Prevent slow tools from blocking agent execution:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Assistant",
+    instructions="Use tools to help users",
+    tools=["get_weather"],
+    tool_timeout=30,  # seconds; slow tools return a timeout dict
+)
+agent.start("What's the weather in Tokyo?")
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Registry as ConcurrencyRegistry
+    participant Agent
+    participant Executor as Tool Executor
+    
+    User->>Registry: acquire_sync("researcher")
+    Registry->>Registry: Check semaphore limit
+    Registry->>Agent: Grant execution slot
+    Agent->>Executor: submit(tool, timeout=30s)
+    
+    alt Tool completes in time
+        Executor->>Agent: Return result
+    else Tool times out
+        Executor->>Agent: {"error": "Tool timed out after 30s", "timeout": True}
+    end
+    
+    Agent->>User: Response
+    User->>Registry: release("researcher")
+```
+
+| Component | Purpose | Thread Safety |
+|-----------|---------|---------------|
+| `ConcurrencyRegistry` | Limits parallel agent runs | ✅ Thread-safe |
+| Tool Executor | Runs tools with timeout | ✅ Per-agent pool |
+| Plugin APIs | Enable/disable plugins | ✅ Lock-protected |
+
+---
+
+## Sync vs Async Rule
+
+The concurrency registry enforces strict separation between sync and async contexts:
+
+| Context | Method | What happens if you mix |
+|---------|--------|-------------------------|
+| **Sync** | `registry.acquire_sync(name)` | ✅ Works correctly |
+| **Async** | `await registry.acquire(name)` | ✅ Works correctly |
+| **Mixed** | `acquire_sync()` in async | ❌ Raises `RuntimeError` |
+
+<Warning>
+Calling `acquire_sync()` from an async context raises `RuntimeError("acquire_sync('<agent_name>') cannot be called with a running event loop; use async acquire() in async contexts.")`. Use `await acquire()` instead.
+</Warning>
+
+**Example error:**
+```python
+async def bad_example():
+    registry.acquire_sync("agent")  # RuntimeError!
+
+async def good_example():
+    await registry.acquire("agent")  # ✅ Correct
+```
+
+---
+
+## Tool Timeout Behavior
+
+When `tool_timeout` is set, tools run in a dedicated executor with these characteristics:
+
+```mermaid
+graph TB
+    subgraph "Tool Execution with Timeout"
+        Call[Tool Call] --> Check{Has timeout?}
+        Check -->|No| Direct[Direct execution]
+        Check -->|Yes| Pool[Per-agent 2-thread pool]
+        Pool --> Submit[submit(tool, timeout)]
+        Submit --> Wait{Within timeout?}
+        Wait -->|Yes| Result[Return result]
+        Wait -->|No| TimeoutDict[{"error": "Tool timed out after Ns", "timeout": True}]
+    end
+    
+    classDef call fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#F59E0B,stroke:#7C90A0,color:#fff
+    
+    class Call call
+    class Check,Pool,Submit process
+    class Direct,Result result
+    class TimeoutDict error
+```
+
+### Timeout Return Shape
+
+On timeout, tools return a dict (not an exception):
+```python
+{
+    "error": "Tool timed out after 30s", 
+    "timeout": True
+}
+```
+
+### Executor Details
+
+- **One executor per `Agent` instance** (lazy creation)
+- **`max_workers=2`** threads per agent
+- **Thread name prefix:** `tool-<agent_name>` — useful for log filtering
+- **Reused across calls** — no resource leak
+
+**Which timeout to choose:**
+```mermaid
+flowchart TD
+    Start[Tool Type] --> IO{Network IO?}
+    IO -->|Yes| Net[30-60s]
+    IO -->|No| Local{Local computation?}
+    Local -->|Yes| CPU[5-10s] 
+    Local -->|No| None[No timeout needed]
+    
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef timeout fill:#189AB4,stroke:#7C90A0,color:#fff
+    
+    class IO,Local decision
+    class Net,CPU,None timeout
+```
+
+---
+
+## Common Patterns
+
+### Limit FastAPI Route Concurrency
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.agent.concurrency import ConcurrencyRegistry
+
+registry = ConcurrencyRegistry()
+registry.set_limit("chat_agent", 5)
+
+@app.post("/chat")
+async def chat_endpoint(message: str):
+    await registry.acquire("chat_agent")
+    try:
+        agent = Agent(name="chat_agent", instructions="Help users")
+        response = await agent.astart(message)
+        return {"response": response}
+    finally:
+        registry.release("chat_agent")
+```
+
+### Async Context Manager Helper
+
+```python
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def throttled_agent(name: str, max_concurrent: int = 3):
+    registry = ConcurrencyRegistry()
+    registry.set_limit(name, max_concurrent)
+    await registry.acquire(name)
+    try:
+        yield
+    finally:
+        registry.release(name)
+
+# Usage
+async with throttled_agent("researcher", 2):
+    agent = Agent(name="researcher", instructions="Research topics")
+    result = await agent.astart("Study quantum computing")
+```
+
+### Timeout Selection by Tool Type
+
+```python
+def get_agent_with_timeouts():
+    return Agent(
+        name="MultiTool Assistant",
+        instructions="Help with various tasks",
+        tools=[
+            "web_search",      # Network IO
+            "file_processor",  # Local computation  
+            "simple_math"      # Fast operation
+        ],
+        tool_timeout=45  # Good balance for mixed workload
+    )
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Always release in finally blocks">
+Prevents deadlocks when exceptions occur:
+
+```python
+registry.acquire_sync("agent")
+try:
+    # Agent work here
+    agent.start("task")
+finally:
+    registry.release("agent")  # Always runs
+```
+</Accordion>
+
+<Accordion title="Don't mix sync and async acquire">
+Keep acquisition method consistent with execution context:
+
+```python
+# ✅ Good - sync context, sync acquire
+def sync_handler():
+    registry.acquire_sync("agent")
+    try:
+        agent.start("task")
+    finally:
+        registry.release("agent")
+
+# ✅ Good - async context, async acquire  
+async def async_handler():
+    await registry.acquire("agent")
+    try:
+        await agent.astart("task")
+    finally:
+        registry.release("agent")
+```
+</Accordion>
+
+<Accordion title="Set tool_timeout for network tools">
+Any tool that does network IO should have a timeout:
+
+```python
+# Tools that need timeouts
+network_tools = ["web_search", "api_call", "download_file"]
+local_tools = ["calculate", "format_text", "parse_json"]
+
+agent = Agent(
+    name="Assistant",
+    tools=network_tools + local_tools,
+    tool_timeout=30  # Protects against slow network
+)
+```
+</Accordion>
+
+<Accordion title="Use thread names for debugging">
+Filter logs by agent name using the thread prefix:
+
+```bash
+# Filter tool execution logs by agent
+grep "tool-researcher" app.log
+
+# Or in Python logging
+import logging
+logging.basicConfig(format='%(threadName)s: %(message)s')
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Plugins" icon="puzzle-piece" href="/docs/features/plugins">
+  Plugin thread-safety and concurrent execution
+</Card>
+<Card title="Tool Configuration" icon="wrench" href="/docs/configuration/tool-config">
+  Tool timeout settings and performance tuning
+</Card>
+</CardGroup>
