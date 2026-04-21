@@ -951,7 +951,7 @@ class WebSocketGateway:
                 "platform": platform,
                 "running": running,
             }
-        return {
+        result = {
             "status": "healthy" if self._is_running else "stopped",
             "uptime": uptime,
             "agents": len(self._agents),
@@ -959,6 +959,22 @@ class WebSocketGateway:
             "clients": len(self._clients),
             "channels": channel_status,
         }
+        
+        # Add push status if enabled (push infra lives in wrapper; guard defensively)
+        if getattr(self, "_push_enabled", False):
+            push_status: Dict[str, Any] = {"enabled": True}
+            channel_mgr = getattr(self, "_channel_mgr", None)
+            if channel_mgr is not None:
+                push_status["push_channels"] = len(channel_mgr.list_channels())
+            presence_mgr = getattr(self, "_presence_mgr", None)
+            if presence_mgr is not None:
+                push_status["online_clients"] = presence_mgr.get_online_count()
+            redis_pubsub = getattr(self, "_redis_pubsub", None)
+            if redis_pubsub is not None:
+                push_status["redis_connected"] = getattr(redis_pubsub, "_client", None) is not None
+            result["push"] = push_status
+        
+        return result
 
     # ── Scheduled delivery ────────────────────────────────────────────
 
