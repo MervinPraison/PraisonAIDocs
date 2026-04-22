@@ -7,7 +7,7 @@
 # It summarizes news articles and generates podcast-style discussion points.  
 # The notebook is CI-friendly: it uses dummy data if API keys are not set, so all tests/checks will pass.
 
-# [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Dhivya-Bharathy/PraisonAI/blob/main/examples/cookbooks/SocialMedia_Content_Agents/News_And_Podcast_Aggregator_Agent.ipynb)
+# [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Dhivya-Bharathy/PraisonAI/blob/main/examples/python/cookbooks/SocialMedia_Content_Agents/News_And_Podcast_Aggregator_Agent.ipynb)
 # 
 
 # # Dependencies
