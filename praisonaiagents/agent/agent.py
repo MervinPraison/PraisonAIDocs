@@ -245,6 +245,7 @@ if TYPE_CHECKING:
     from ..context.models import ContextConfig
     from ..context.manager import ContextManager
     from ..knowledge.knowledge import Knowledge
+    from .interrupt import InterruptController
     from ..agent.autonomy import AutonomyConfig
     from ..task.task import Task
     from .handoff import Handoff, HandoffConfig, HandoffResult
@@ -531,7 +532,7 @@ class Agent(UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, Session
         # CONSOLIDATED FEATURE PARAMS (agent-centric API)
         # Each follows: False=disabled, True=defaults, Config=custom
         # ============================================================
-        memory: Optional[Union[bool, str, 'MemoryConfig', 'MemoryManager']] = None,
+        memory: Optional[Union[bool, str, 'MemoryConfig', Any]] = None,
         knowledge: Optional[Union[bool, str, List[str], 'KnowledgeConfig', 'Knowledge']] = None,
         planning: Optional[Union[bool, str, 'PlanningConfig']] = False,
         reflection: Optional[Union[bool, str, 'ReflectionConfig']] = None,
@@ -551,6 +552,7 @@ class Agent(UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, Session
         parallel_tool_calls: bool = False,  # Gap 2: Enable parallel execution of batched LLM tool calls
         learn: Optional[Union[bool, str, Dict[str, Any], 'LearnConfig']] = None,  # Continuous learning (peer to memory)
         backend: Optional[Any] = None,  # External managed agent backend (e.g., ManagedAgentIntegration)
+        interrupt_controller: Optional['InterruptController'] = None,  # G2: Cooperative cancellation
     ):
         """Initialize an Agent instance.
 
@@ -575,7 +577,7 @@ class Agent(UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, Session
             memory: Memory system configuration. Accepts:
                 - bool: True enables defaults, False disables
                 - MemoryConfig: Custom configuration
-                - MemoryManager: Pre-configured instance
+                - Any: Pre-configured memory instance
             knowledge: Knowledge sources. Accepts:
                 - bool: True enables defaults
                 - List[str]: File paths, URLs, or text content
@@ -1458,6 +1460,8 @@ class Agent(UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, Session
         self.instructions = instructions
         # Gap 2: Store parallel tool calls setting for ToolCallExecutor selection
         self.parallel_tool_calls = parallel_tool_calls
+        # G2: Store interrupt controller for cooperative cancellation
+        self.interrupt_controller = interrupt_controller
         # Check for model name in environment variable if not provided
         self._using_custom_llm = False
         # Flag to track if final result has been displayed to prevent duplicates
@@ -1756,6 +1760,29 @@ Your Goal: {self.goal}
             self._approval_backend = None
             self._approve_all_tools = False
             self._approval_timeout = 0
+            # No explicit approval kwarg — honour PRAISONAI_TOOL_SAFETY.
+            # Default preset "default" blocks only destructive ops
+            # (delete_*, execute_command, execute_code, kill_process, move/copy)
+            # while leaving read / create / edit tools fully auto-approved.
+            # Users who want the pre-4.6.27 "trust everything" behaviour
+            # export PRAISONAI_TOOL_SAFETY=off. This adds zero Agent kwargs.
+            _raw_safety_env = os.environ.get("PRAISONAI_TOOL_SAFETY")
+            _safety_env = (_raw_safety_env or "").strip().lower()
+            if _safety_env not in ("off", "full", "none", "0", "false"):
+                from ..approval.registry import PERMISSION_PRESETS
+                _resolved_safety_env = _safety_env or "default"
+                _preset_deny = PERMISSION_PRESETS.get(_resolved_safety_env)
+                if _preset_deny is None and _safety_env:
+                    # Unknown env value - fall back to safe default and log warning
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "Unknown PRAISONAI_TOOL_SAFETY value %r; falling back to 'default' preset.",
+                        _raw_safety_env,
+                    )
+                    _resolved_safety_env = "default"
+                    _preset_deny = PERMISSION_PRESETS.get(_resolved_safety_env)
+                if _preset_deny is not None:
+                    self._perm_deny = _preset_deny
         elif isinstance(approval, ApprovalConfig):
             self._approval_backend = approval.backend
             self._approve_all_tools = approval.all_tools
@@ -1910,13 +1937,29 @@ Your Goal: {self.goal}
     
     @chat_history.setter
     def chat_history(self, value):
-        """Set chat history (updates the underlying async-safe state)."""
-        self.__chat_history_state.value = value
+        """Set chat history (updates the underlying async-safe state with lock)."""
+        with self.__chat_history_state.lock():
+            self.__chat_history_state.value = value
     
     @property
     def _history_lock(self):
         """Get appropriate lock for chat history based on execution context."""
         return self.__chat_history_state
+    
+    def _append_to_chat_history(self, message: dict):
+        """Thread-safe append to chat history using proper locking."""
+        with self._history_lock.lock():
+            self._history_lock.value.append(message)
+    
+    def _truncate_chat_history(self, length: int):
+        """Thread-safe truncation of chat history using proper locking."""
+        with self._history_lock.lock():
+            self._history_lock.value[:] = self._history_lock.value[:length]
+    
+    def _replace_chat_history(self, new_history: List[Dict[str, Any]]):
+        """Thread-safe replacement of entire chat history using proper locking."""
+        with self._history_lock.lock():
+            self._history_lock.value[:] = new_history
 
     @property
     def _cache_lock(self):
@@ -2835,6 +2878,19 @@ Summary:"""
                         started_at=started_at,
                     )
                 
+                # G2: Check for interrupt request (cooperative cancellation) - sync version
+                if self.interrupt_controller and self.interrupt_controller.is_set():
+                    reason = self.interrupt_controller.reason or "unknown"
+                    return AutonomyResult(
+                        success=False,
+                        output=f"Task interrupted: {reason}",
+                        completion_reason="interrupted",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
                 
                 # Execute one turn using the agent's chat method
                 # Always use the original prompt (prompt re-injection)
@@ -3225,6 +3281,20 @@ Summary:"""
                         success=False,
                         output="Task timed out",
                         completion_reason="timeout",
+                        iterations=iterations,
+                        stage=stage,
+                        actions=actions_taken,
+                        duration_seconds=time_module.time() - start_time,
+                        started_at=started_at,
+                    )
+                
+                # G2: Check for interrupt request (cooperative cancellation)
+                if self.interrupt_controller and self.interrupt_controller.is_set():
+                    reason = self.interrupt_controller.reason or "unknown"
+                    return AutonomyResult(
+                        success=False,
+                        output=f"Task interrupted: {reason}",
+                        completion_reason="interrupted",
                         iterations=iterations,
                         stage=stage,
                         actions=actions_taken,
@@ -4604,9 +4674,6 @@ Answer:"""
     # -------------------------------------------------------------------------
     
     
-    @contextlib.contextmanager
-    
-
     # -------------------------------------------------------------------------
     #                       Resource Lifecycle Management
     # -------------------------------------------------------------------------
@@ -4631,10 +4698,10 @@ Answer:"""
                 if hasattr(self.llm_instance, 'aclose'):
                     # Try async close first
                     try:
-                        import asyncio
                         if asyncio.iscoroutinefunction(self.llm_instance.aclose):
-                            # We're in sync context, so use asyncio.run() for the cleanup
-                            asyncio.run(self.llm_instance.aclose())
+                            # Use async bridge to safely close from any context
+                            from ..utils.async_bridge import run_coroutine_from_any_context
+                            run_coroutine_from_any_context(self.llm_instance.aclose())
                         else:
                             self.llm_instance.aclose()
                     except Exception:
