@@ -12,7 +12,7 @@
 
 # This agent uses a custom DuckDuckGo search tool to intelligently retrieve and summarize real-time information based on user queries.
 
-# [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DhivyaBharathy-web/PraisonAI/blob/main/examples/python/cookbooks/Flow_Intelligent_Agent_PraisonAI.ipynb)
+# [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/DhivyaBharathy-web/PraisonAI/blob/main/examples/cookbooks/Flow_Intelligent_Agent_PraisonAI.ipynb)
 
 # ## Tools
 # - `praisonaiagents` – Intelligent Agent framework
