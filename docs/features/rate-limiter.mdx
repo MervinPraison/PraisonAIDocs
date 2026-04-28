@@ -1,61 +1,212 @@
 ---
 title: "Rate Limiter"
-description: "Token bucket rate limiting for LLM API calls"
+sidebarTitle: "Rate Limiter"
+description: "Cap API request rate and token usage across agents and threads"
+icon: "gauge-high"
 ---
 
-## Overview
+Rate Limiter caps how fast your agents call the LLM, so you stay inside provider rate limits and protect your budget — safely, even when many agents share the same limiter.
 
-Control API request rates with token bucket algorithm. Prevents rate limit errors and manages costs. The rate limiter is shared by both the initial LLM call and the follow-up call that runs after tool execution in streaming mode — you don't need to configure them separately.
+```mermaid
+graph LR
+    subgraph "Shared Rate Limiter"
+        A1[🤖 Agent 1] --> L{⚖️ RateLimiter<br/>60 rpm}
+        A2[🤖 Agent 2] --> L
+        A3[🤖 Agent 3] --> L
+        L -->|Allow| API[☁️ LLM API]
+        L -->|Wait| Queue[⏳ Queued]
+        Queue --> L
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef limiter fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef api fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef queue fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class A1,A2,A3 agent
+    class L limiter
+    class API api
+    class Queue queue
+```
+
+The rate limiter is shared by both the initial LLM call and the follow-up call that runs after tool execution in streaming mode — you don't need to configure them separately.
 
 ## Quick Start
 
-<Tabs>
-  <Tab title="ExecutionConfig (Recommended)">
+<Steps>
+<Step title="Simple RPM limit on one agent">
 ```python
+from praisonaiagents import Agent
+from praisonaiagents.config.feature_configs import ExecutionConfig
+
+agent = Agent(
+    name="Researcher",
+    instructions="You research topics on the web.",
+    execution=ExecutionConfig(max_rpm=60)
+)
+
+agent.start("Summarise the latest Mars rover news")
+```
+</Step>
+
+<Step title="Share one limiter across multiple agents">
+```python
+from praisonaiagents import Agent, PraisonAIAgents
+from praisonaiagents.config.feature_configs import ExecutionConfig
+from praisonaiagents.llm import RateLimiter
+
+shared = RateLimiter(requests_per_minute=60, burst=5)
+
+researcher = Agent(
+    name="Researcher",
+    instructions="Research topics",
+    execution=ExecutionConfig(rate_limiter=shared)
+)
+writer = Agent(
+    name="Writer",
+    instructions="Write articles",
+    execution=ExecutionConfig(rate_limiter=shared)
+)
+
+team = PraisonAIAgents(agents=[researcher, writer])
+team.start()
+```
+
+<Note>
+The same `RateLimiter` instance can be shared across any number of agents and threads — the combined throughput stays inside the configured budget.
+</Note>
+</Step>
+
+<Step title="Token-based limiting (for TPM-quoted providers)">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.config.feature_configs import ExecutionConfig
+from praisonaiagents.llm import RateLimiter
+
+limiter = RateLimiter(
+    requests_per_minute=60,
+    tokens_per_minute=90_000,
+    burst=5,
+)
+
+agent = Agent(
+    name="Analyst",
+    instructions="Analyse long documents",
+    execution=ExecutionConfig(rate_limiter=limiter)
+)
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Agent1
+    participant Agent2
+    participant Limiter as RateLimiter
+    participant LLM
+
+    Agent1->>Limiter: acquire()
+    Limiter->>Limiter: lock → refill → -1 token
+    Limiter-->>Agent1: ok
+    Agent1->>LLM: request
+
+    Agent2->>Limiter: acquire()
+    Limiter->>Limiter: lock (waits for Agent1)
+    Limiter->>Limiter: refill → -1 token
+    Limiter-->>Agent2: ok
+    Agent2->>LLM: request
+```
+
+| Step | What happens |
+|------|--------------|
+| Refill | Tokens regenerate based on elapsed time and `requests_per_minute` / `tokens_per_minute`. |
+| Acquire | A thread reserves a token; under contention, only one thread mutates state at a time. |
+| Wait | If no tokens are available, the caller sleeps (sync) or awaits (async) until the next refill. |
+| Release | No explicit release — tokens refill automatically on a rolling window. |
+
+---
+
+## Choose Your Mode
+
+```mermaid
+graph TB
+    Start[Need rate limiting?] --> Q1{Single agent,<br/>simple RPM?}
+    Q1 -->|Yes| A[Use max_rpm=N<br/>in ExecutionConfig]
+    Q1 -->|No| Q2{Multiple agents<br/>sharing budget?}
+    Q2 -->|Yes| B[Create one RateLimiter<br/>and pass to each agent]
+    Q2 -->|No| Q3{Provider quotes<br/>TPM not just RPM?}
+    Q3 -->|Yes| C[Set tokens_per_minute<br/>on RateLimiter]
+    Q3 -->|No| A
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start,Q1,Q2,Q3 question
+    class A,B,C answer
+```
+
+---
+
+## Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `requests_per_minute` | `int` | Required | Max LLM requests per rolling 60-second window. |
+| `tokens_per_minute` | `int` | `None` | Optional token-budget limit (for TPM-quoted providers). |
+| `burst` | `int` | `1` | Max burst size — requests allowed back-to-back before the rate kicks in. |
+
+---
+
+## Thread Safety & Multi-Agent Use
+
+<Note>
+Every method on `RateLimiter` — both sync (`acquire`, `acquire_tokens`, `try_acquire`, `reset`) and async (`acquire_async`, `acquire_tokens_async`) — is safe to call concurrently. You can share a single `RateLimiter` across threads, `AgentTeam` members, `PraisonAIAgents`, and `ParallelToolCallExecutor` workers without exceeding the configured budget.
+</Note>
+
+### Thread pool with shared limiter
+
+```python
+from concurrent.futures import ThreadPoolExecutor
 from praisonaiagents import Agent
 from praisonaiagents.config.feature_configs import ExecutionConfig
 from praisonaiagents.llm import RateLimiter
 
 limiter = RateLimiter(requests_per_minute=60, burst=5)
 
-agent = Agent(
-    name="Bot",
-    instructions="Helper",
-    execution=ExecutionConfig(rate_limiter=limiter)
-)
+def run_agent(question: str) -> str:
+    agent = Agent(
+        name="Worker",
+        instructions="Answer concisely",
+        execution=ExecutionConfig(rate_limiter=limiter),
+    )
+    return agent.start(question)
 
-response = agent.chat("Hello")
+with ThreadPoolExecutor(max_workers=10) as pool:
+    answers = list(pool.map(run_agent, [f"Q{i}" for i in range(50)]))
 ```
-  </Tab>
-  <Tab title="Simple RPM Limit">
+
+### Monitoring available budget
+
 ```python
-from praisonaiagents import Agent
-from praisonaiagents.config.feature_configs import ExecutionConfig
+limiter = RateLimiter(requests_per_minute=60, tokens_per_minute=90_000)
 
-agent = Agent(
-    name="Bot",
-    instructions="Helper",
-    execution=ExecutionConfig(max_rpm=60)
-)
-
-response = agent.chat("Hello")
+print(f"Requests left: {limiter.available_tokens:.1f}")
+print(f"API tokens left: {limiter.available_api_tokens:.1f}")
 ```
-  </Tab>
-</Tabs>
 
 <Note>
-The standalone `rate_limiter=` parameter is deprecated. Use `execution=ExecutionConfig(rate_limiter=obj)` instead.
+`available_tokens` and `available_api_tokens` are safe to read from any thread — they acquire the same locks as `acquire()` internally.
 </Note>
 
-## Parameters
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `requests_per_minute` | Max requests per minute | Required |
-| `tokens_per_minute` | Token-based limiting (optional) | None |
-| `burst` | Max burst size | 1 |
+---
 
 ## Manual Usage
+
+When not using `ExecutionConfig`, you can acquire tokens directly:
 
 ```python
 limiter = RateLimiter(requests_per_minute=60)
@@ -72,8 +223,45 @@ if limiter.try_acquire():
     pass
 ```
 
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Share one limiter across related agents">
+If three agents hit the same provider key, give them the same `RateLimiter` so the combined throughput stays inside quota.
+</Accordion>
+
+<Accordion title="Match burst to your workload">
+A low burst (1–5) smooths traffic; a high burst tolerates spiky demand.
+</Accordion>
+
+<Accordion title="Use tokens_per_minute when the provider charges by tokens">
+OpenAI / Anthropic quote both RPM and TPM — limiting only on RPM can still trip 429s.
+</Accordion>
+
+<Accordion title="Prefer async paths in async flows">
+`agent.achat(...)` automatically calls `acquire_async()`; avoid mixing sync and async limiters in one workflow.
+</Accordion>
+</AccordionGroup>
+
+---
+
 ## CLI
 
 ```bash
 praisonai "task" --rpm 60
 ```
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card icon="lock" href="/docs/features/thread-safety">
+    Thread-safe chat history and caches
+  </Card>
+  <Card icon="gauge" href="/docs/features/concurrency">
+    Limit parallel agent runs
+  </Card>
+</CardGroup>
