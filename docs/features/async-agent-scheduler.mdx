@@ -54,7 +54,7 @@ async def main():
     # ... run your app ...
 
     await scheduler.stop()
-    print(await scheduler.get_stats())
+    print(scheduler.get_stats())
 
 asyncio.run(main())
 ```
@@ -93,8 +93,8 @@ async def main():
         await asyncio.sleep(3600)  # Run for 1 hour
     finally:
         await scheduler.stop()
-        stats = await scheduler.get_stats()
-        print(f"Completed {stats['success_count']} successful executions")
+        stats = scheduler.get_stats()
+        print(f"Completed {stats['successful_executions']} successful executions")
 
 asyncio.run(main())
 ```
@@ -127,10 +127,34 @@ sequenceDiagram
     end
     
     User->>Scheduler: stop()
-    Scheduler->>Scheduler: Cancel gracefully (30s timeout)
+    Scheduler->>Scheduler: Cancel gracefully (10s timeout)
 ```
 
 The AsyncAgentScheduler uses async-native execution with cooperative cancellation, replacing the old thread-based scheduler.
+
+```mermaid
+graph TB
+    A[🔄 Scheduler Loop] --> B{Exception?}
+    B -->|No| C[✅ Clean exit]
+    B -->|Yes - in _execute_with_retry| D[❗ Logged]
+    D --> E[finally: is_running = False]
+    C --> E
+    F[👤 User calls stop()] --> G{Task exception?}
+    G -->|No| H[✅ Returns True]
+    G -->|CancelledError| H
+    G -->|Other Exception| I[❗ logger.error]
+    I --> H
+
+    classDef loop fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A loop
+    class C,E,H good
+    class D,I warn
+    class F,G,B user
+```
 
 ---
 
@@ -171,12 +195,11 @@ The AsyncAgentScheduler uses async-native execution with cooperative cancellatio
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `is_running` | `bool` | Whether scheduler is currently running |
-| `execution_count` | `int` | Total number of execution attempts |
-| `success_count` | `int` | Number of successful executions |
-| `failure_count` | `int` | Number of failed executions |
-| `agent_name` | `str` | Name of the agent being scheduled |
-| `task` | `str` | Task description being executed |
+| `is_running` | `bool` | Whether the scheduler loop is currently active |
+| `total_executions` | `int` | Total number of execution attempts |
+| `successful_executions` | `int` | Number of successful executions |
+| `failed_executions` | `int` | Number of failed executions |
+| `success_rate` | `float` | Successful / total × 100, or `0` when no executions yet |
 
 ---
 
@@ -275,7 +298,7 @@ async def main():
     finally:
         if scheduler:
             await scheduler.stop()
-            stats = await scheduler.get_stats()
+            stats = scheduler.get_stats()
             print(f"Final stats: {stats}")
 
 asyncio.run(main())
@@ -287,7 +310,7 @@ asyncio.run(main())
 
 <AccordionGroup>
 <Accordion title="Always await scheduler.stop() before exiting">
-The `stop()` method waits up to 30 seconds for the current execution to complete before canceling. This prevents data corruption and ensures clean shutdown.
+The `stop()` method waits up to 10 seconds for the current execution to complete before canceling. This prevents data corruption and ensures clean shutdown.
 
 ```python
 # Good
@@ -347,6 +370,31 @@ await scheduler.start("hourly")
 from praisonai.scheduler import AgentScheduler
 scheduler = AgentScheduler(agent, task)
 scheduler.start("hourly")
+```
+</Accordion>
+
+<Accordion title="Reliability and exception safety">
+The scheduler guarantees that:
+
+- **`is_running` always reflects reality.** When the internal scheduling loop exits — whether on a clean stop, an unhandled exception, or task cancellation — `is_running` is cleared in a `finally` block.
+- **`stop()` never raises.** If the scheduler task crashed in the background, `stop()` logs the error via the standard `logging` module and still returns `True` so your shutdown path stays clean.
+
+This means you can drive the scheduler from a `lifespan` context manager or signal handler without wrapping `stop()` in your own `try/except`:
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = AsyncAgentScheduler(agent, task="…")
+    await scheduler.start("hourly")
+    yield
+    await scheduler.stop()  # always safe, even if the task crashed earlier
+```
+
+To surface scheduler crashes in your own monitoring, configure the `praisonai.async_agent_scheduler` logger:
+
+```python
+import logging
+logging.getLogger("praisonai.async_agent_scheduler").setLevel(logging.ERROR)
 ```
 </Accordion>
 </AccordionGroup>
