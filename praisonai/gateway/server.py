@@ -178,6 +178,7 @@ class WebSocketGateway:
             host=_substitute(gateway_config.get("host", "127.0.0.1")),
             port=int(gateway_config.get("port", 8765)),
             auth_token=_substitute(gateway_config.get("auth_token")),
+            allowed_origins=gateway_config.get("allowed_origins", []),
             max_connections=int(gateway_config.get("max_connections", 1000)),
             heartbeat_interval=int(gateway_config.get("heartbeat_interval", 30)),
             reconnect_timeout=int(gateway_config.get("reconnect_timeout", 60)),
@@ -202,6 +203,10 @@ class WebSocketGateway:
             config: Optional gateway configuration
         """
         self.config = config or GatewayConfig(host=host, port=port)
+        
+        # Set bind_host for bind-aware authentication
+        self.config.bind_host = self.config.host
+        
         if hasattr(self.config, 'auth_token') and not self.config.auth_token:
             # Prefer a user-configured token (persisted by `praisonai onboard`
             # to ~/.praisonai/.env as GATEWAY_AUTH_TOKEN) so the dashboard
@@ -213,11 +218,30 @@ class WebSocketGateway:
                 logger.info("Gateway using GATEWAY_AUTH_TOKEN from environment")
             else:
                 import secrets
-                self.config.auth_token = secrets.token_hex(16)
-                logger.warning(
-                    f"No auth_token provided for Gateway server. Generated temporary token: {self.config.auth_token}. "
-                    "For production, set GATEWAY_AUTH_TOKEN."
-                )
+                from praisonaiagents.gateway.protocols import is_loopback
+                from .auth import get_auth_token_fingerprint, save_auth_token_to_env
+
+                if is_loopback(self.config.bind_host):
+                    self.config.auth_token = secrets.token_hex(16)
+                    fingerprint = get_auth_token_fingerprint(self.config.auth_token)
+                    logger.warning(
+                        f"No auth_token provided for Gateway server. Generated temporary token: {fingerprint}. "
+                        "For production, set GATEWAY_AUTH_TOKEN."
+                    )
+
+                    # Save to ~/.praisonai/.env for future use
+                    try:
+                        save_auth_token_to_env(self.config.auth_token)
+                    except Exception as e:
+                        logger.debug(f"Could not save auth token to .env: {e}")
+        
+        # Load allowed origins from environment if not set
+        if hasattr(self.config, 'allowed_origins') and not self.config.allowed_origins:
+            env_origins = os.environ.get("GATEWAY_ALLOWED_ORIGINS", "").strip()
+            if env_origins:
+                # Split by comma and clean up whitespace
+                self.config.allowed_origins = [origin.strip() for origin in env_origins.split(",") if origin.strip()]
+                logger.info(f"Gateway using GATEWAY_ALLOWED_ORIGINS from environment: {self.config.allowed_origins}")
         
         self._host = self.config.host
         self._port = self.config.port
@@ -239,6 +263,10 @@ class WebSocketGateway:
         self._routing_rules: Dict[str, Dict[str, str]] = {}  # channel_name -> {context -> agent_id}
         self._channel_tasks: List[asyncio.Task] = []
         
+        # Pairing store for channel authorization
+        from .pairing import PairingStore
+        self.pairing_store = PairingStore()
+        
         # Scheduler tick background task
         self._scheduler_task: Optional[asyncio.Task] = None
     
@@ -259,6 +287,25 @@ class WebSocketGateway:
         if self._is_running:
             logger.warning("Gateway already running")
             return
+        
+        # Validate bind-aware auth configuration before starting
+        from .auth import assert_external_bind_safe
+        self.config.host = self._host
+        self.config.port = self._port
+        self.config.bind_host = self._host
+        assert_external_bind_safe(self.config)
+
+        # Import origin checking functionality
+        from .origin_check import check_origin, is_loopback, GatewayStartupError
+
+        # Validate allowed_origins configuration for external binds
+        if not is_loopback(self._host) and not self.config.allowed_origins:
+            logger.error("Gateway startup failed due to configuration error")
+            raise GatewayStartupError(
+                f"Gateway is binding to external interface '{self._host}' but no allowed_origins configured. "
+                "Set GATEWAY_ALLOWED_ORIGINS environment variable or configure allowed_origins in gateway config. "
+                "Example: GATEWAY_ALLOWED_ORIGINS=\"https://your-ui.example.com,https://localhost:3000\""
+            )
         
         try:
             from starlette.applications import Starlette
@@ -282,18 +329,53 @@ class WebSocketGateway:
               - ``Authorization: Bearer <token>`` header (preferred for APIs)
               - ``?token=<token>`` query parameter (so the dashboard URL from
                 ``praisonai onboard`` is clickable in a browser)
+              - Cookie-based authentication (praisonai_session cookie)
             """
             if not self.config.auth_token:
                 return None
+            
+            # Check for cookie authentication first
+            try:
+                from .cookie_auth import create_auth_manager_from_env
+                auth_manager = create_auth_manager_from_env()
+                if auth_manager:
+                    cookie_header = request.headers.get("cookie", "")
+                    token_from_cookie = auth_manager.extract_token_from_cookies(cookie_header)
+                    if token_from_cookie and auth_manager.is_token_valid(token_from_cookie):
+                        return None  # Authenticated via cookie
+            except ImportError:
+                pass
+            
+            # Check loopback bypass for local requests (only if explicitly enabled)
+            allow_loopback = os.environ.get("ALLOW_LOOPBACK_BYPASS", "").lower() in ("true", "1", "yes")
+            if allow_loopback:
+                client_host = getattr(request.client, 'host', None) if request.client else None
+                if client_host and client_host in ('127.0.0.1', '::1', 'localhost'):
+                    # Reject if proxy headers are present (indicates request went through proxy)
+                    proxy_headers = ["x-forwarded-for", "via", "x-real-ip", "x-forwarded-host"]
+                    has_proxy_headers = any(header in request.headers for header in proxy_headers)
+                    if not has_proxy_headers:
+                        # Allow local requests without auth for development
+                        return None
+            
+            # Fall back to token-based auth
             auth_header = request.headers.get("authorization", "")
             token: str = ""
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
             else:
                 token = request.query_params.get("token", "")
+                if token:
+                    import warnings
+                    warnings.warn(
+                        "DeprecationWarning: Use Sec-WebSocket-Protocol or magic link cookie",
+                        DeprecationWarning,
+                        stacklevel=2
+                    )
+            
             if not token:
                 return JSONResponse(
-                    {"error": "Authentication required"},
+                    {"error": "Authentication required. Please use your magic link."},
                     status_code=401,
                     headers={"WWW-Authenticate": "Bearer"},
                 )
@@ -317,10 +399,51 @@ class WebSocketGateway:
             })
         
         async def websocket_endpoint(websocket: WebSocket):
-            # Authenticate WebSocket via query param or first message
+            # Get client IP for rate limiting
+            client_ip = websocket.client.host if websocket.client else "unknown"
+
+            # Rate limiting for WebSocket upgrades (exempt loopback per acceptance criteria)
+            if not is_loopback(client_ip) and not is_loopback(self._host):
+                if not _ws_upgrade_rate.allow("ws_upgrade", client_ip):
+                    retry = _ws_upgrade_rate.time_until_allowed("ws_upgrade", client_ip)
+                    await websocket.close(code=4008, reason="Rate limited")
+                    logger.warning(f"WebSocket upgrade rate limited for {client_ip} (retry in {retry:.0f}s)")
+                    return
+
+            # Origin validation (CSWSH defense)
+            origin = websocket.headers.get("origin")
+            try:
+                if not check_origin(origin, self.config.allowed_origins, self._host):
+                    await websocket.close(code=4003, reason="Origin not allowed")
+                    logger.warning(f"WebSocket connection rejected: origin '{origin}' not in allowed list")
+                    return
+            except GatewayStartupError as e:
+                await websocket.close(code=4003, reason="Configuration error")
+                logger.error(f"WebSocket connection failed due to configuration error: {e}")
+                return
+
+            # Authenticate WebSocket via session cookie or query param
             if self.config.auth_token:
-                ws_token = websocket.query_params.get("token", "")
-                if not secrets.compare_digest(ws_token, self.config.auth_token):
+                authenticated = False
+                
+                # First try cookie-based authentication
+                try:
+                    from .cookie_auth import CookieAuthManager
+                    auth_manager = CookieAuthManager(secret_key=self.config.auth_token)
+                    cookie_header = websocket.headers.get("cookie", "")
+                    token_from_cookie = auth_manager.extract_token_from_cookies(cookie_header)
+                    if token_from_cookie and auth_manager.is_token_valid(token_from_cookie):
+                        authenticated = True
+                except ImportError:
+                    pass
+                
+                # Fall back to query param token authentication
+                if not authenticated:
+                    ws_token = websocket.query_params.get("token", "")
+                    if ws_token and secrets.compare_digest(ws_token, self.config.auth_token):
+                        authenticated = True
+                
+                if not authenticated:
                     await websocket.close(code=4003, reason="Authentication required")
                     return
             
@@ -361,9 +484,14 @@ class WebSocketGateway:
         # or fail if optional deps are missing.
         from .exec_approval import Resolution, get_exec_approval_manager
         from .rate_limiter import AuthRateLimiter
+        from .pairing_routes import create_pairing_routes
 
         _approval_mgr = get_exec_approval_manager()
         _approval_rate = AuthRateLimiter(max_attempts=10, window_seconds=60)
+        _ws_upgrade_rate = AuthRateLimiter(max_attempts=10, window_seconds=60)
+
+        # Create pairing routes
+        _pairing_routes = create_pairing_routes(self.pairing_store, _check_auth, _approval_rate)
 
         async def approval_pending(request):
             """GET /api/approval/pending — list pending approval requests."""
@@ -481,12 +609,92 @@ class WebSocketGateway:
 
             return JSONResponse({"error": "Method not allowed"}, status_code=405)
 
+        # ── Magic Link Authentication ────────────────────────────────────
+        from .magic_link import MagicLinkStore
+        from .cookie_auth import create_auth_manager_from_env
+        from .rate_limiter import AuthRateLimiter
+        
+        # Initialize magic link store and rate limiter
+        _magic_store = MagicLinkStore()
+        _magic_rate = AuthRateLimiter(max_attempts=5, window_seconds=60)
+        
+        async def magic_link_handler(request):
+            """Handle GET /?link=<nonce> magic link authentication."""
+            nonce = request.query_params.get("link", "")
+            if not nonce:
+                # No magic link, redirect to auth required page or return 401
+                return JSONResponse(
+                    {"error": "Authentication required. Get a fresh link: praisonai gateway mint-link"},
+                    status_code=401
+                )
+            
+            client_ip = request.client.host if request.client else "unknown"
+            if not _magic_rate.allow("magic_link", client_ip):
+                retry = _magic_rate.time_until_allowed("magic_link", client_ip)
+                return JSONResponse(
+                    {"error": "Rate limited", "retry_after_seconds": round(retry)},
+                    status_code=429,
+                )
+            
+            # Try to consume the nonce
+            if not _magic_store.consume(nonce):
+                return JSONResponse(
+                    {"error": "This link was already used or has expired. Get a fresh one: praisonai gateway mint-link"},
+                    status_code=401
+                )
+            
+            # Create session cookie
+            try:
+                auth_manager = create_auth_manager_from_env()
+                if not auth_manager:
+                    return JSONResponse(
+                        {"error": "Cookie authentication not available"},
+                        status_code=500
+                    )
+                
+                session_token = auth_manager.create_session(
+                    user_id="gateway_user",
+                    auth_method="magic_link"
+                )
+                
+                # Determine if HTTPS
+                is_https = (
+                    request.headers.get("x-forwarded-proto") == "https" or
+                    request.url.scheme == "https"
+                )
+                
+                cookie_header = auth_manager.create_cookie_header(
+                    session_token,
+                    secure=is_https,
+                    http_only=True,
+                    same_site="Strict"
+                )
+                
+                # Redirect to remove the nonce from URL
+                from starlette.responses import RedirectResponse
+                response = RedirectResponse(
+                    url=str(request.url.replace(query="")),
+                    status_code=302
+                )
+                response.headers["Set-Cookie"] = cookie_header
+                return response
+                
+            except ImportError:
+                return JSONResponse(
+                    {"error": "Cookie authentication dependencies not available"},
+                    status_code=500
+                )
+        
         routes = [
+            Route("/", magic_link_handler, methods=["GET"]),
             Route("/health", health, methods=["GET"]),
             Route("/info", info, methods=["GET"]),
             Route("/api/approval/pending", approval_pending, methods=["GET"]),
             Route("/api/approval/resolve", approval_resolve, methods=["POST"]),
             Route("/api/approval/allow-list", approval_allowlist, methods=["GET", "POST", "DELETE"]),
+            Route("/api/pairing/pending", _pairing_routes["pending"], methods=["GET"]),
+            Route("/api/pairing/approve", _pairing_routes["approve"], methods=["POST"]),
+            Route("/api/pairing/revoke", _pairing_routes["revoke"], methods=["POST"]),
             WebSocketRoute("/ws", websocket_endpoint),
         ]
         
@@ -1227,6 +1435,10 @@ class WebSocketGateway:
                 instructions = agent_def.get("system_prompt", "") or ""
 
             # Resolve tools from YAML config
+            # Track if tools key was explicitly set (even as empty list) vs omitted
+            tools_key_present = "tools" in agent_def
+            explicit_empty_tools = tools_key_present and not agent_def.get("tools")
+            
             agent_tools = []
             yaml_tool_names = agent_def.get("tools", [])
             if yaml_tool_names and tool_resolver:
@@ -1287,6 +1499,10 @@ class WebSocketGateway:
             # Store tool_choice for later use in chat()
             if tool_choice:
                 agent._yaml_tool_choice = tool_choice
+            
+            # Store explicit empty tools flag to prevent smart defaults injection
+            if explicit_empty_tools:
+                agent._explicit_empty_tools = True
 
             self.register_agent(agent, agent_id=agent_id)
             logger.info(
@@ -1378,12 +1594,30 @@ class WebSocketGateway:
             group_policy = ch_cfg.get("group_policy", "mention_only")
             mention_required = (group_policy == "mention_only")
 
-            config = BotConfig(
+            # Extract auto_approve_tools setting (default True for chat bots)
+            _raw_auto_approve = ch_cfg.get("auto_approve_tools")
+            if _raw_auto_approve is None:
+                auto_approve_tools = True   # SAFE-DEFAULT: safe tools auto-approved in chat
+            elif isinstance(_raw_auto_approve, str):
+                auto_approve_tools = _raw_auto_approve.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                auto_approve_tools = bool(_raw_auto_approve)
+
+            config_kwargs = dict(
                 token=token,
                 allowed_users=list(_raw_allowed),
                 allowed_channels=list(_raw_channels),
                 mention_required=mention_required,
+                auto_approve_tools=auto_approve_tools,
             )
+            
+            # Only pass default_tools when the channel explicitly overrides it,
+            # so BotConfig's own default_factory stays the single source of truth.
+            _raw_yaml_tools = ch_cfg.get("default_tools")
+            if isinstance(_raw_yaml_tools, list):
+                config_kwargs["default_tools"] = _raw_yaml_tools
+            
+            config = BotConfig(**config_kwargs)
 
             # Warn if no allowlist is configured
             if not config.allowed_users:
@@ -1419,6 +1653,24 @@ class WebSocketGateway:
         ch_cfg: Dict[str, Any],
     ) -> Any:
         """Create a bot instance for the given channel type."""
+        # Clone agent to prevent channel-specific settings from leaking between channels
+        import copy
+        agent = copy.deepcopy(agent)
+        
+        # Apply smart defaults to agent (same logic as Bot() wrapper)
+        from praisonai.bots._defaults import apply_bot_smart_defaults
+        agent = apply_bot_smart_defaults(agent, config)
+
+        # Check if agent ended up with zero tools after defaults and warn
+        current_tools = getattr(agent, 'tools', None) or []
+        if not current_tools:
+            logger.warning(
+                "Bot for channel %r started with zero tools — chat will be text-only. "
+                "Check that `praisonaiagents.tools` is installed and that "
+                "`tools: []` is not set explicitly in bot.yaml.",
+                ch_cfg.get('platform', channel_type),
+            )
+
         if channel_type == "telegram":
             from praisonai.bots import TelegramBot
             return TelegramBot(token=token, agent=agent, config=config)

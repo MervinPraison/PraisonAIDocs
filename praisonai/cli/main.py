@@ -141,33 +141,12 @@ def _get_agents_generator():
     return AgentsGenerator
 
 # Optional module imports with availability checks
-CHAINLIT_AVAILABLE = False
 GRADIO_AVAILABLE = False
 CALL_MODULE_AVAILABLE = False
 CREWAI_AVAILABLE = False
 AUTOGEN_AVAILABLE = False
 PRAISONAI_AVAILABLE = False
 TRAIN_AVAILABLE = False
-try:
-    import importlib.util
-    CHAINLIT_AVAILABLE = importlib.util.find_spec("chainlit") is not None
-except ImportError:
-    pass
-
-def _get_chainlit_run():
-    """Lazy import chainlit to avoid loading .env at startup"""
-    # Create necessary directories and set CHAINLIT_APP_ROOT
-    if "CHAINLIT_APP_ROOT" not in os.environ:
-        chainlit_root = os.path.join(os.path.expanduser("~"), ".praison")
-        os.environ["CHAINLIT_APP_ROOT"] = chainlit_root
-    else:
-        chainlit_root = os.environ["CHAINLIT_APP_ROOT"]
-        
-    os.makedirs(chainlit_root, exist_ok=True)
-    os.makedirs(os.path.join(chainlit_root, ".files"), exist_ok=True)
-    
-    from chainlit.cli import chainlit_run
-    return chainlit_run
 
 # Use find_spec for fast availability checks (no actual import)
 import importlib.util
@@ -269,6 +248,9 @@ class PraisonAI:
         """
         Initialize the PraisonAI object with default parameters.
         """
+        # Initialize telemetry defaults (moved from lazy __getattr__ hook)
+        from praisonai import _ensure_telemetry_defaults
+        _ensure_telemetry_defaults()
         self.agent_yaml = agent_yaml
         self._interactive_mode = False  # Flag for interactive TUI mode
         # Create config_list with AutoGen compatibility
@@ -352,9 +334,7 @@ class PraisonAI:
         initializes the necessary attributes, and then calls the appropriate methods based on the
         provided arguments.
         """
-        # Set OpenTelemetry SDK to disabled to prevent telemetry collection
-        # Moved from agents_generator.py to CLI entry point per architecture requirements
-        os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+        # Telemetry defaults now handled in PraisonAI.__init__ with Langfuse awareness
         
         # Store the original agent_file from constructor
         original_agent_file = self.agent_file
@@ -371,6 +351,7 @@ class PraisonAI:
         self.args = args
         invocation_cmd = "praisonai"
         version_string = f"PraisonAI version {__version__}"
+        
 
         # Handle -p/--prompt flag - treat as direct prompt
         if getattr(args, 'prompt_flag', None):
@@ -414,6 +395,28 @@ class PraisonAI:
                     exit_code = AgentSchedulerHandler.handle_schedule_command(args, unknown_args, daemon_mode=daemon_mode)
                 
                 sys.exit(exit_code)
+            
+            # Handle backends command
+            elif args.command == "backends":
+                from rich import print
+                subcommand = unknown_args[0] if unknown_args and not unknown_args[0].startswith('-') else None
+                
+                if subcommand == "list" or subcommand is None:
+                    # List registered CLI backends
+                    try:
+                        from praisonai.cli_backends import list_cli_backends
+                        backends = list_cli_backends()
+                        for backend in backends:
+                            print(backend)
+                        return ""
+                    except ImportError:
+                        print("[red]CLI backends not available[/red]")
+                        return None
+                else:
+                    print(f"[red]Unknown backends subcommand: {subcommand}[/red]")
+                    print("Available subcommands: list")
+                    return None
+            
             elif args.command.startswith("tests.test") or args.command.startswith("tests/test"):  # Argument used for testing purposes
                 print("test")
                 return "test"
@@ -578,10 +581,15 @@ class PraisonAI:
             return
 
         # chat and code commands are now terminal-native (handled by Typer commands)
-        # They no longer open Chainlit browser UI
 
         if getattr(args, 'realtime', False):
-            self.create_realtime_interface()
+            try:
+                from praisonai.cli.commands.ui import _launch_aiui_app
+                _launch_aiui_app("ui_realtime", "ui_realtime", 8085, "127.0.0.1", None, False, "Realtime Voice")
+            except ImportError:
+                print("\033[91mERROR: Realtime UI is not installed.\033[0m")
+                print('Install with: pip install "praisonai[ui]"')
+                sys.exit(1)
             return
 
         if getattr(args, 'call', False):
@@ -891,7 +899,7 @@ class PraisonAI:
             return default_args
         
         # Define special commands
-        special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag', 'browser', 'replay', 'bot', 'gateway', 'sandbox', 'wizard', 'migrate', 'security', 'persistence', 'paths', 'claw', 'github', 'managed', 'flow', 'dashboard']
+        special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag', 'browser', 'replay', 'bot', 'gateway', 'sandbox', 'wizard', 'migrate', 'security', 'persistence', 'paths', 'claw', 'github', 'managed', 'flow', 'dashboard', 'backends']
         
         parser = argparse.ArgumentParser(prog="praisonai", description="praisonAI command-line interface")
         parser.add_argument("--framework", choices=["crewai", "autogen", "praisonai"], help="Specify the framework")
@@ -1073,9 +1081,23 @@ class PraisonAI:
         # Sandbox Execution - secure command execution
         parser.add_argument("--sandbox", type=str, choices=["off", "basic", "strict"], help="Enable sandboxed command execution")
         
-        # External Agent - use external AI CLI tools
-        parser.add_argument("--external-agent", type=str, choices=["claude", "gemini", "codex", "cursor"],
+        # Backend group - mutually exclusive external agent and CLI backend options
+        backend_group = parser.add_mutually_exclusive_group()
+        backend_group.add_argument("--external-agent", type=str, choices=["claude", "gemini", "codex", "cursor"],
                           help="Use external AI CLI tool (claude, gemini, codex, cursor)")
+        
+        # CLI Backend - delegate agent turns to CLI backend
+        # Dynamically populate choices from registered backends
+        try:
+            from praisonai.cli_backends import list_cli_backends
+            cli_backend_choices = list_cli_backends() or None
+        except ImportError:
+            cli_backend_choices = None
+        
+        backend_group.add_argument("--cli-backend", type=str, choices=cli_backend_choices,
+                          help="Delegate agent turns to a CLI backend (see praisonai backends list)")
+        
+        # External agent direct mode (not mutually exclusive with backend choice)
         parser.add_argument("--external-agent-direct", action="store_true",
                           help="Use external agent as direct proxy (skip manager Agent delegation)")
         
@@ -1148,7 +1170,7 @@ class PraisonAI:
             # UI command — routes to Typer CLI for clean chat UI (praisonaiui)
             pass
         # chat and code commands are now terminal-native (handled by Typer commands)
-        # They no longer set args.ui = 'chainlit' or open browser
+        # Legacy --ui handling is preserved via the deprecation path above
         
         # Handle --claudecode flag for code command
         if getattr(args, 'claudecode', False):
@@ -1238,11 +1260,13 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'realtime':
-                if not CHAINLIT_AVAILABLE:
-                    print("[red]ERROR: Realtime UI is not installed. Install with:[/red]")
-                    print("\npip install \"praisonai[realtime]\"\n")
+                try:
+                    from praisonai.cli.commands.ui import _launch_aiui_app
+                    _launch_aiui_app("ui_realtime", "ui_realtime", 8085, "127.0.0.1", None, False, "Realtime Voice")
+                except ImportError:
+                    print("\033[91mERROR: Realtime UI is not installed.\033[0m")
+                    print('Install with: pip install "praisonai[ui]"')
                     sys.exit(1)
-                self.create_realtime_interface()
                 sys.exit(0)
 
             elif args.command == 'train':
@@ -4521,6 +4545,14 @@ Do NOT add any explanations or formatting."""
                 
                 return result
             
+            # CLI Backend - delegate agent turns to external CLI tools
+            if hasattr(self, 'args') and getattr(self.args, 'cli_backend', None):
+                try:
+                    from praisonai.cli_backends import resolve_cli_backend
+                    agent_config["cli_backend"] = resolve_cli_backend(self.args.cli_backend)
+                except Exception as e:
+                    self.logger.warning(f"Failed to resolve CLI backend '{self.args.cli_backend}': {e}")
+            
             # Flow Display - Visual workflow tracking
             if hasattr(self, 'args') and getattr(self.args, 'flow_display', False):
                 from .features.flow_display import FlowDisplayHandler
@@ -5189,45 +5221,6 @@ Now, {final_instruction.lower()}:"""
         except KeyboardInterrupt:
             print("\n👋 Server stopped.")
 
-    def create_chainlit_chat_interface(self):
-        """
-        Create a Chainlit interface for the chat application.
-        """
-        if CHAINLIT_AVAILABLE:
-            import praisonai
-            os.environ["CHAINLIT_PORT"] = "8084"
-            root_path = os.path.join(os.path.expanduser("~"), ".praison")
-            if "CHAINLIT_APP_ROOT" not in os.environ:
-                os.environ["CHAINLIT_APP_ROOT"] = root_path
-            chat_ui_path = os.path.join(os.path.dirname(praisonai.__file__), 'ui', 'chat.py')
-            _get_chainlit_run()([chat_ui_path])
-        else:
-            print("ERROR: Chat UI is not installed. Please install it with 'pip install \"praisonai[chat]\"' to use the chat UI.")
-
-    def create_code_interface(self):
-        """
-        Create a Chainlit interface for the code application.
-        """
-        if CHAINLIT_AVAILABLE:
-            import praisonai
-            os.environ["CHAINLIT_PORT"] = "8086"
-            root_path = os.path.join(os.path.expanduser("~"), ".praison")
-            if "CHAINLIT_APP_ROOT" not in os.environ:
-                os.environ["CHAINLIT_APP_ROOT"] = root_path
-            public_folder = os.path.join(os.path.dirname(__file__), 'public')
-            if not os.path.exists(os.path.join(root_path, "public")):
-                if os.path.exists(public_folder):
-                    shutil.copytree(public_folder, os.path.join(root_path, "public"), dirs_exist_ok=True)
-                    logging.info("Public folder copied successfully!")
-                else:
-                    logging.info("Public folder not found in the package.")
-            else:
-                logging.info("Public folder already exists.")
-            code_ui_path = os.path.join(os.path.dirname(praisonai.__file__), 'ui', 'code.py')
-            _get_chainlit_run()([code_ui_path])
-        else:
-            print("ERROR: Code UI is not installed. Please install it with 'pip install \"praisonai[code]\"' to use the code UI.")
-
     def create_gradio_interface(self):
         """
         Create a Gradio interface for generating agents and performing tasks.
@@ -5260,51 +5253,6 @@ Now, {final_instruction.lower()}:"""
         else:
             print("ERROR: Gradio is not installed. Please install it with 'pip install gradio' to use this feature.")
 
-    def create_chainlit_interface(self):
-        """
-        Create a Chainlit interface for generating agents and performing tasks.
-        """
-        if CHAINLIT_AVAILABLE:
-            import praisonai
-            os.environ["CHAINLIT_PORT"] = "8082"
-            public_folder = os.path.join(os.path.dirname(praisonai.__file__), 'public')
-            if not os.path.exists("public"):
-                if os.path.exists(public_folder):
-                    shutil.copytree(public_folder, 'public', dirs_exist_ok=True)
-                    logging.info("Public folder copied successfully!")
-                else:
-                    logging.info("Public folder not found in the package.")
-            else:
-                logging.info("Public folder already exists.")
-            chainlit_ui_path = os.path.join(os.path.dirname(praisonai.__file__), 'ui', 'agents.py')
-            _get_chainlit_run()([chainlit_ui_path])
-        else:
-            print("ERROR: Chainlit is not installed. Please install it with 'pip install \"praisonai[ui]\"' to use the UI.")
-
-    def create_realtime_interface(self):
-        """
-        Create a Chainlit interface for the realtime voice interaction application.
-        """
-        if CHAINLIT_AVAILABLE:
-            import praisonai
-            os.environ["CHAINLIT_PORT"] = "8088"
-            root_path = os.path.join(os.path.expanduser("~"), ".praison")
-            if "CHAINLIT_APP_ROOT" not in os.environ:
-                os.environ["CHAINLIT_APP_ROOT"] = root_path
-            public_folder = os.path.join(os.path.dirname(praisonai.__file__), 'public')
-            if not os.path.exists(os.path.join(root_path, "public")):
-                if os.path.exists(public_folder):
-                    shutil.copytree(public_folder, os.path.join(root_path, "public"), dirs_exist_ok=True)
-                    logging.info("Public folder copied successfully!")
-                else:
-                    logging.info("Public folder not found in the package.")
-            else:
-                logging.info("Public folder already exists.")
-            realtime_ui_path = os.path.join(os.path.dirname(praisonai.__file__), 'ui', 'realtime.py')
-            _get_chainlit_run()([realtime_ui_path])
-        else:
-            print("ERROR: Realtime UI is not installed. Please install it with 'pip install \"praisonai[realtime]\"' to use the realtime UI.")
-
     def create_aiui_agents_interface(self):
         """
         Create an aiui-based agents interface (replaces Chainlit).
@@ -5318,7 +5266,7 @@ Now, {final_instruction.lower()}:"""
                 app_dir="ui_agents",
                 default_app_name="ui_agents",
                 port=8082,  # Use same port as old Chainlit agents
-                host="0.0.0.0",
+                host="127.0.0.1",
                 app_file=None,
                 reload=False,
                 ui_name="Agents Dashboard"

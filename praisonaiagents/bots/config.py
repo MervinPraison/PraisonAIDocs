@@ -5,7 +5,9 @@ Provides configuration dataclasses for bot settings.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
+
+from .pairing_types import UnknownUserPolicy
 
 
 @dataclass
@@ -48,16 +50,32 @@ class BotConfig:
     # Group message policy
     group_policy: str = "mention_only"  # respond_all, mention_only, command_only
     
-    # Default tools enabled for all bots
+    # Default safe tools (auto-injected for bots with no tools configured)
+    # With workspace scoping, file operations are now safe by construction
     default_tools: List[str] = field(default_factory=lambda: [
-        "execute_command", "search_web", "web_crawl",
-        "schedule_add", "schedule_list", "schedule_remove",
+        # Web (existing)
+        "search_web", "web_crawl",
+        # Memory / learning (existing)
         "store_memory", "search_memory",
         "store_learning", "search_learning",
+        # Scheduling (existing)
+        "schedule_add", "schedule_list", "schedule_remove",
+        # Clarify tool (new from main)
+        "clarify",
+        # Files — NEW (workspace-scoped, safe by construction)
+        "read_file", "write_file", "edit_file", "list_files", "search_files",
+        # Planning — NEW
+        "todo_add", "todo_list", "todo_update",
+        # Skills (self-improving) — NEW
+        "skills_list", "skill_view", "skill_manage",
+        # Delegation & session tools are intentionally NOT auto-injected yet;
+        # their reference implementations are placeholders. Users can opt in
+        # via BotConfig(default_tools=[..., "delegate_task", "session_search"]).
     ])
     
     # Auto-approve tool calls (useful for trusted environments)
-    auto_approve_tools: bool = False  # If True, skip confirmation for tool execution
+    # Default to True for chat bots - they can't show CLI approval prompts
+    auto_approve_tools: bool = True  # If True, skip confirmation for safe tool execution
     
     # Inbound message debounce (ms). Coalesces rapid messages from same user.
     # 0 = disabled (default). Recommended: 1000-2000 for chat bots.
@@ -72,6 +90,24 @@ class BotConfig:
     # Session TTL in seconds. 0 = disabled (sessions never expire).
     # When set, stale sessions older than this are auto-reaped.
     session_ttl: int = 0
+    
+    # Workspace settings for file operation containment and security
+    workspace_dir: Optional[str] = None  # default: ~/.praisonai/workspaces/<scope>/<session_key>
+    workspace_access: str = "rw"  # "rw" (read-write) | "ro" (read-only) | "none" (copy-on-write sandbox)
+    workspace_scope: str = "session"  # "shared" | "session" | "user" | "agent"
+    
+    # Unknown user policy: "deny" (default), "pair", or "allow"
+    unknown_user_policy: UnknownUserPolicy = "deny"
+    
+    # Owner user ID for pairing approvals (platform-specific format)
+    owner_user_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.unknown_user_policy not in {"deny", "pair", "allow"}:
+            raise ValueError(
+                f"unknown_user_policy must be one of: deny, pair, allow. Got: {self.unknown_user_policy}"
+            )
+    
     
     metadata: Dict[str, Any] = field(default_factory=dict)
     
@@ -100,6 +136,11 @@ class BotConfig:
             "ack_emoji": self.ack_emoji,
             "done_emoji": self.done_emoji,
             "session_ttl": self.session_ttl,
+            "workspace_dir": self.workspace_dir,
+            "workspace_access": self.workspace_access,
+            "workspace_scope": self.workspace_scope,
+            "unknown_user_policy": self.unknown_user_policy,
+            "owner_user_id": "***" if self.owner_user_id else None,
             "metadata": self.metadata,
         }
     

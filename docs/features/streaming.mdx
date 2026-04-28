@@ -172,6 +172,89 @@ asyncio.run(main())
 
 ---
 
+## Streaming with Tools
+
+When your agent uses tools, streaming happens in two phases: the initial response that decides to call tools, and a follow-up response that synthesizes the tool results.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Agent  
+    participant L as LLM
+    participant T as Tools
+    
+    U->>A: Request with stream=True
+    A->>L: Phase 1 (streamed)
+    L-->>A: "I'll use tool_name..."
+    A->>T: Execute tool_name()
+    T-->>A: Tool result
+    A->>L: Phase 2 follow-up (streamed) 
+    L-->>A: Synthesized response
+    A-->>U: Combined stream
+    
+    Note over L: Both phases use retry-wrapped LLM calls
+```
+
+```python
+from praisonaiagents import Agent, tool
+
+@tool
+def get_weather(city: str) -> str:
+    """Get weather for a city."""
+    return f"Weather in {city}: 72°F, sunny"
+
+agent = Agent(
+    instructions="You are a weather assistant",
+    tools=[get_weather]
+)
+
+for chunk in agent.start("What's the weather in Paris?", stream=True):
+    print(chunk, end="", flush=True)
+```
+
+Both phases go through the same retry-wrapped LLM path, so transient rate-limit or network errors are retried automatically without any caller intervention.
+
+---
+
+## Error Handling in the Stream
+
+If the LLM call fails after retries, the stream ends with a visible error sentence instead of silently dropping.
+
+You may receive this exact sentinel string:
+
+```
+[Error: Failed to generate final response after tool execution (ref: followup-1713957912345). Please retry. If it continues, try reducing prompt size.]
+```
+
+| Part | Meaning |
+|------|---------|
+| `ref: followup-<timestamp>` | Correlation ID logged server-side — share this when reporting issues |
+| `Please retry` | Retries already ran internally; another attempt may succeed if the root cause was transient |
+| `reducing prompt size` | Common root cause is context-length or provider capacity errors |
+
+Detect the error sentinel in your stream consumer:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="You are a helpful assistant", tools=[...])
+
+full = ""
+for chunk in agent.iter_stream("Research and summarize quantum computing"):
+    full += chunk
+    print(chunk, end="", flush=True)
+
+if "[Error:" in full and "ref:" in full:
+    # Surface ref to your logs / retry externally
+    print(f"\n⚠️ Error detected, check logs for correlation ID")
+```
+
+<Note>
+The **initial** LLM call and the **follow-up** LLM call (after tool execution) now share the same retry and rate-limiting behavior — users no longer need to add their own retry wrapper around streaming + tools.
+</Note>
+
+---
+
 ## StreamEvent Protocol
 
 Every streaming chunk emits a `StreamEvent` with full context.
@@ -284,7 +367,7 @@ praisonai chat --stream --verbose "Explain quantum computing"
   </Accordion>
   
   <Accordion title="Handle errors in callbacks">
-    The emitter catches callback exceptions silently to avoid breaking the stream. Log errors inside your callback.
+    Two layers of error handling. Callback exceptions are still caught by the emitter to avoid breaking the stream — log them inside your callback. LLM call failures, however, are now retried automatically and, on persistent failure, surface as a visible `[Error: ... (ref: ...)]` sentence at the end of the stream — check for this sentinel when consuming `iter_stream()`.
   </Accordion>
 </AccordionGroup>
 
@@ -303,15 +386,25 @@ This is TTFT, not buffering. The model is generating the first token. Check:
 
 Normal. Providers may batch tokens for efficiency.
 
+### "Stream ends with `[Error: Failed to generate final response after tool execution (ref: followup-...)]`"
+
+The follow-up LLM call (the one that synthesizes tool results into a final answer) failed after the built-in retries. Common causes:
+- Persistent rate limit — pair streaming with a [Rate Limiter](/docs/features/rate-limiter) at higher RPM, or back off the caller.
+- Context-length overflow — reduce conversation history or tool-result size.
+- Provider outage — include the `ref:` ID when reporting. The internal log line (`ref=..., model=..., error=...`) makes it searchable.
+
 ---
 
 ## Related
 
-<CardGroup cols={2}>
+<CardGroup cols={3}>
   <Card title="Output & Display" icon="display" href="/docs/features/display-system">
     Output formatting options
   </Card>
   <Card title="Async" icon="clock" href="/docs/features/async">
     Async agent execution
+  </Card>
+  <Card title="Rate Limiter" icon="gauge" href="/docs/features/rate-limiter">
+    Control request rates across initial and follow-up LLM calls
   </Card>
 </CardGroup>
