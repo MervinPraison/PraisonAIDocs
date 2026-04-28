@@ -1,0 +1,266 @@
+---
+title: "Structured LLM Errors"
+sidebarTitle: "Structured LLM Errors"
+description: "Handle LLM failures with structured error classification and retry logic"
+icon: "circle-alert"
+---
+
+LLM failures are now raised as structured `LLMError` exceptions instead of returning `None`, enabling proper error handling and retry policies.
+
+```mermaid
+graph LR
+    subgraph "LLM Error Flow"
+        Request[📝 LLM Request] --> Error{❌ Failure}
+        Error --> Classify[🏷️ Classify]
+        Classify --> Structure[📋 LLMError]
+        Structure --> Hook[🪝 on_error]
+        Hook --> Retry{🔄 Retryable?}
+        Retry -->|Yes| Orchestration[⚙️ Retry]
+        Retry -->|No| Fail[🛑 Fail]
+    end
+    
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class Request request
+    class Classify,Hook process
+    class Error,Structure,Fail error
+    class Orchestration success
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Handle LLM Errors">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.errors import LLMError
+
+agent = Agent(
+    name="Error Handler",
+    instructions="Process user requests",
+    on_error=lambda error: print(f"LLM failed: {error.message}")
+)
+
+try:
+    result = agent.start("Hello world")
+except LLMError as e:
+    if e.is_retryable:
+        print(f"Can retry: {e.message}")
+    else:
+        print(f"Fatal error: {e.message}")
+```
+</Step>
+
+<Step title="Custom Error Classification">
+```python
+from praisonaiagents import Agent
+
+def handle_llm_error(error):
+    """Custom error handler with context logging"""
+    print(f"Model: {error.model_name}")
+    print(f"Agent: {error.agent_id}")
+    print(f"Session: {error.session_id}")
+    print(f"Retryable: {error.is_retryable}")
+
+agent = Agent(
+    name="Custom Handler",
+    instructions="Process requests",
+    on_error=handle_llm_error
+)
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant LLM
+    participant ErrorHandler
+    participant Orchestrator
+    
+    Agent->>LLM: Chat completion request
+    LLM-->>Agent: Error response
+    Agent->>Agent: Classify error
+    Agent->>ErrorHandler: on_error(LLMError)
+    ErrorHandler-->>Agent: Continue/stop
+    Agent->>Orchestrator: Raise LLMError
+    Orchestrator->>Orchestrator: Check is_retryable
+    alt Retryable
+        Orchestrator->>Agent: Retry request
+    else Non-retryable
+        Orchestrator->>Orchestrator: Task fails
+    end
+```
+
+| Component | Purpose |
+|-----------|---------|
+| **LLMError** | Structured exception with retry classification |
+| **on_error Hook** | Intercept errors before propagation |
+| **is_retryable** | Boolean flag for orchestration decisions |
+| **Context Overflow** | Recursive depth limit of 2 |
+
+---
+
+## Error Classification
+
+LLM errors are automatically classified as retryable or non-retryable based on error messages:
+
+### Retryable Errors
+- Rate limits: `429`, `rate limit`, `too many requests`
+- Network issues: `timeout`, `connection reset`, `socket error`
+- Server errors: `500`, `502`, `503`, `504`, `service unavailable`
+- DNS/Network: `dns`, `network`, `connection refused`
+
+### Non-Retryable Errors  
+- Authentication: `401`, `403`, `unauthorized`, `invalid_api_key`
+- Client errors: Most 4xx status codes
+
+### Default Behavior
+Unknown errors default to `is_retryable=True` for resilience.
+
+---
+
+## LLMError Structure
+
+The `LLMError` class provides structured error information:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `message` | `str` | Error description |
+| `model_name` | `str` | LLM model that failed |
+| `agent_id` | `str` | Agent identifier |
+| `session_id` | `str` | Session identifier |
+| `is_retryable` | `bool` | Whether error can be retried |
+
+```python
+from praisonaiagents.errors import LLMError
+
+# Error structure
+error = LLMError(
+    message="Rate limit exceeded",
+    model_name="gpt-4",
+    agent_id="research_agent",
+    is_retryable=True,
+    session_id="session_123"
+)
+```
+
+---
+
+## Context Overflow Protection
+
+LLM context overflow triggers automatic retry with truncated messages, limited to depth 2:
+
+```python
+# Automatic context management
+agent = Agent(
+    name="Long Context Agent",
+    instructions="Process very long inputs"
+)
+
+# Automatically handles context overflow:
+# 1. First overflow: truncate and retry
+# 2. Second overflow: truncate and retry  
+# 3. Third overflow: raise LLMError with is_retryable=False
+```
+
+---
+
+## Migration Guide
+
+**Before (returned None):**
+```python
+response = agent._chat_completion(messages)
+if response is None:
+    # Handle failure
+    print("LLM call failed")
+```
+
+**After (raises LLMError):**
+```python
+try:
+    response = agent._chat_completion(messages)
+except LLMError as e:
+    if e.is_retryable:
+        # Orchestration will retry
+        raise
+    else:
+        # Handle fatal error
+        print(f"Fatal: {e.message}")
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Use on_error for Logging">
+Implement the `on_error` hook to log errors without interrupting the retry flow:
+
+```python
+def log_llm_errors(error):
+    """Log errors for debugging without stopping retries"""
+    import logging
+    logging.error(f"LLM Error: {error.message} (retryable: {error.is_retryable})")
+
+agent = Agent(on_error=log_llm_errors)
+```
+</Accordion>
+
+<Accordion title="Handle Authentication Separately">
+Authentication errors are non-retryable and need immediate attention:
+
+```python
+def handle_auth_errors(error):
+    if "401" in error.message or "invalid_api_key" in error.message:
+        print("Check your API key configuration")
+        # Could trigger key rotation logic here
+```
+</Accordion>
+
+<Accordion title="Monitor Error Patterns">
+Track error patterns to identify systemic issues:
+
+```python
+error_counts = {"rate_limit": 0, "auth": 0, "network": 0}
+
+def track_errors(error):
+    if "rate limit" in error.message.lower():
+        error_counts["rate_limit"] += 1
+    elif "401" in error.message:
+        error_counts["auth"] += 1
+    # Send to monitoring system
+```
+</Accordion>
+
+<Accordion title="Graceful Degradation">
+Use error information to implement graceful degradation:
+
+```python
+def fallback_handler(error):
+    if error.model_name == "gpt-4" and error.is_retryable:
+        # Could switch to backup model
+        print("Switching to backup model")
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Task Retry Policy" icon="rotate-ccw" href="/features/task-retry-policy">
+  Configure task-level retry behavior
+</Card>
+<Card title="Hooks" icon="webhook" href="/features/hooks">
+  Agent lifecycle hooks and events
+</Card>
+</CardGroup>
