@@ -1,0 +1,241 @@
+---
+title: "Non-Fatal Errors"
+sidebarTitle: "Non-Fatal Errors"
+description: "See which callbacks or memory operations failed without stopping your workflow"
+icon: "triangle-exclamation"
+---
+
+Non-fatal errors expose callback and memory failures that used to be silently swallowed, so your agent can see what went wrong without crashing the workflow.
+
+```mermaid
+graph LR
+    subgraph "Task Execution"
+        Task[📋 Task] --> Run[🧠 Agent Runs]
+        Run --> CB{🪝 Callback}
+        CB -->|Success| OK[✅ TaskOutput]
+        CB -->|Raises| Capture[⚠️ Captured]
+        Capture --> OK
+    end
+
+    OK --> Check[🔍 Check output.callback_error / output.non_fatal_errors]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    class Task input
+    class Run,CB process
+    class OK,Check output
+    class Capture error
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Reading non-fatal errors from a task output">
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+def my_callback(output):
+    raise RuntimeError("downstream webhook timed out")
+
+agent = Agent(name="Reporter", instructions="Summarise the input.")
+task = Task(description="Summarise 'hello'", agent=agent, callback=my_callback)
+
+workflow = PraisonAIAgents(agents=[agent], tasks=[task])
+workflow.start()
+
+if task.output.callback_error:
+    print("Callback failed:", task.output.callback_error)
+if task.output.non_fatal_errors:
+    for err in task.output.non_fatal_errors:
+        print("Non-fatal:", err)
+```
+</Step>
+
+<Step title="Inspecting accumulated errors on the Task itself">
+```python
+# Same workflow as above
+for err in task.non_fatal_errors:
+    print(err)   # e.g. "callback: downstream webhook timed out"
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Task
+    participant Callback
+    participant Memory
+
+    User->>Agent: Request
+    Agent->>Task: Execute
+    Task->>Task: Run agent
+    Task->>Callback: Execute callback
+    
+    alt Callback succeeds
+        Callback-->>Task: Success
+    else Callback fails
+        Callback-->>Task: Exception
+        Task->>Task: Capture error
+        Note over Task: Sets callback_error<br/>Adds to non_fatal_errors
+    end
+
+    Task->>Memory: Store output
+    alt Memory fails
+        Memory-->>Task: Exception
+        Task->>Task: Capture error
+        Note over Task: Adds to non_fatal_errors
+    end
+
+    Task-->>Agent: TaskOutput
+    Agent-->>User: Result + errors
+```
+
+| Surface | Type | When populated |
+|---------|------|----------------|
+| `TaskOutput.callback_error` | `Optional[str]` | Only if a `callback` function raises |
+| `TaskOutput.non_fatal_errors` | `Optional[list[str]]` | All non-fatal errors (memory ops + callback) from this run |
+| `Task.non_fatal_errors` | `list[str]` | Same list, available on the Task instance directly |
+
+---
+
+## Common Patterns
+
+### Pattern A: Skip to next task only when callback succeeded
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+def critical_callback(output):
+    # This must succeed for the workflow to be valid
+    pass
+
+agent = Agent(name="Worker", instructions="Process the data.")
+task = Task(description="Process input", agent=agent, callback=critical_callback)
+
+workflow = PraisonAIAgents(agents=[agent], tasks=[task])
+workflow.start()
+
+# Only proceed if callback succeeded
+if task.output.callback_error is None:
+    print("Safe to continue to next task")
+else:
+    print("Workflow failed - callback error:", task.output.callback_error)
+```
+
+### Pattern B: Route failures to alerting system
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+def alert_on_errors(task):
+    if task.non_fatal_errors:
+        # Send to monitoring system
+        for error in task.non_fatal_errors:
+            send_alert(f"Task {task.description}: {error}")
+
+agent = Agent(name="Processor", instructions="Process data.")
+task = Task(description="Important task", agent=agent)
+
+workflow = PraisonAIAgents(agents=[agent], tasks=[task])
+workflow.start()
+
+alert_on_errors(task)
+```
+
+---
+
+## User Interaction Flow
+
+```mermaid
+graph LR
+    subgraph "User Request"
+        User[👤 User] --> Request[📝 Request]
+    end
+    
+    subgraph "Agent Processing"
+        Request --> Agent[🤖 Agent]
+        Agent --> Process[⚙️ Process]
+        Process --> CB{🪝 Callback}
+    end
+    
+    subgraph "Results"
+        CB -->|Success| Result[✅ Result]
+        CB -->|Failure| ErrorLog[📋 Error Log]
+        Result --> User
+        ErrorLog --> User
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    
+    class User,Request input
+    class Agent,Process,CB process
+    class Result output
+    class ErrorLog error
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Don't treat non-fatal errors as success">
+Always inspect the output before chaining tasks. A task that completed with non-fatal errors may not have produced the expected result.
+
+```python
+if task.output.non_fatal_errors:
+    print("Task completed with issues:", task.output.non_fatal_errors)
+    # Decide whether to continue or retry
+```
+</Accordion>
+
+<Accordion title="Memory failures are non-fatal by design">
+If `quality_check=True` was requested but the memory adapter isn't ready, the task still completes. Check `non_fatal_errors` for memory-related issues.
+
+```python
+# Look for memory-specific errors
+memory_errors = [err for err in task.non_fatal_errors 
+                if "memory" in err.lower()]
+if memory_errors:
+    print("Memory operations failed:", memory_errors)
+```
+</Accordion>
+
+<Accordion title="Raise explicitly for critical callbacks">
+If a callback must block the workflow on failure, re-raise inside it. The framework currently captures the message but does NOT re-raise automatically.
+
+```python
+def critical_callback(output):
+    try:
+        # Critical operation
+        result = send_to_external_api(output.raw)
+    except Exception as e:
+        # Log the error and re-raise to stop the workflow
+        log.error(f"Critical callback failed: {e}")
+        raise  # This will stop the entire workflow
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Task Output" icon="display" href="/concepts/output">
+  TaskOutput reference and all available fields
+</Card>
+<Card title="Task Lifecycle" icon="list-check" href="/concepts/tasks">
+  Task execution phases and configuration
+</Card>
+</CardGroup>
