@@ -6,7 +6,21 @@ icon: "lock"
 
 # Thread-Safe Agent State
 
-PraisonAI Agents v0.5.0+ includes thread-safe management of chat history and caches, enabling safe concurrent access from multiple threads.
+PraisonAI Agents v0.5.0+ includes thread-safe management of chat history and caches; PR #1567 makes the underlying lock re-entrant and adds a per-event-loop async lock.
+
+<Warning>
+**Behaviour change in PR #1548**: `run_sync()` now raises `RuntimeError` when called from inside a running event loop. Previously it would auto-fallback to a background loop.
+
+```python
+# Before PR #1548 (worked, but unsafe)
+async def handler():
+    result = run_sync(some_coro())  # silently used background loop
+
+# After PR #1548 (raises RuntimeError)
+async def handler():
+    result = await some_coro()  # use this from async context
+```
+</Warning>
 
 ## Thread-Safe Components
 
@@ -53,6 +67,18 @@ Prior to PR #1488, chat_history mutations bypassed thread-safety locks at 31+ ca
 - `chat_history` setter now acquires the `AsyncSafeState` lock for assignments
 </Note>
 
+#### What changed in PR #1514
+
+<Note>
+PR #1514 enhanced thread-safety in three key areas:
+
+**1. Locked Memory Initialization**: `Task.initialize_memory()` now uses `threading.Lock` with double-checked locking pattern. A new async variant `initialize_memory_async()` uses `asyncio.Lock` and offloads construction with `asyncio.to_thread()` to prevent event loop blocking.
+
+**2. Async-Locked Workflow State**: New `_set_workflow_finished(value)` method uses async locks to safely update workflow completion status across concurrent tasks.
+
+**3. Non-Mutating Task Context**: Task execution no longer mutates `task.description` during runs. Per-execution context is stored in `_execution_context` field, keeping the user-facing `task.description` stable across multiple executions.
+</Note>
+
 #### Safe operations
 
 ```python
@@ -71,6 +97,10 @@ Internal caches use `threading.RLock` for reentrant locking:
 
 - `_system_prompt_cache` - Cached system prompts
 - `_formatted_tools_cache` - Cached tool definitions
+
+### Rate Limiter
+
+`RateLimiter` can be shared across threads and agents. Both the sync and async method families are fully locked — see [Rate Limiter → Thread Safety & Multi-Agent Use](/docs/features/rate-limiter#thread-safety--multi-agent-use) for patterns.
 
 ## LiteAgent Thread Safety
 
@@ -98,8 +128,10 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 
 | Component | Lock Type | Reason |
 |-----------|-----------|--------|
-| chat_history | `Lock` | Simple mutual exclusion |
-| caches | `RLock` | Allows reentrant access |
+| `chat_history` | `AsyncSafeState` (DualLock: RLock + per-loop `asyncio.Lock`) | Re-entrant on same thread; non-blocking in async contexts |
+| `_cache_lock` | `threading.RLock` | Allows reentrant access from cached helpers |
+| `RateLimiter` (sync) | `threading.Lock` | Protects `_tokens`, `_api_tokens`, and refill state from races in multi-threaded acquire calls |
+| `RateLimiter` (async) | `asyncio.Lock` | Same protection for coroutine contexts |
 
 ### Lock Usage Pattern
 
@@ -107,19 +139,21 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 # Internal implementation pattern
 class Agent:
     def __init__(self):
-        self._history_lock = threading.Lock()
+        self.__chat_history_state = AsyncSafeState([])
         self._cache_lock = threading.RLock()
-        self.chat_history = []
     
-    def _add_to_history(self, message):
-        with self._history_lock:
-            self.chat_history.append(message)
+    @property
+    def _history_lock(self):
+        return self.__chat_history_state
     
-    def _get_cached_prompt(self):
-        with self._cache_lock:
-            # Safe reentrant access
-            return self._system_prompt_cache.get(key)
+    def _append_to_chat_history(self, message):
+        with self._history_lock.lock():
+            self._history_lock.value.append(message)
 ```
+
+### Why a re-entrant lock?
+
+Nested calls (e.g. a helper that holds the lock and then assigns `chat_history`, which itself acquires the lock) used to deadlock. `RLock` permits the same thread to re-enter. See [PR #1567](https://github.com/MervinPraison/PraisonAI/pull/1567) for details.
 
 ## Best Practices
 
@@ -156,23 +190,69 @@ agent.clear_history()  # Thread-safe
 
 ## Async Considerations
 
-For async code, use asyncio locks instead:
+`agent.chat_history` is async-aware out of the box — no external `asyncio.Lock` is required when all calls are inside the same event loop.
 
 ```python
 import asyncio
 from praisonaiagents import Agent
 
 agent = Agent(name="AsyncAgent")
-lock = asyncio.Lock()
 
 async def async_chat(prompt):
-    async with lock:
-        # Ensure sequential access in async context
-        return agent.chat(prompt)
+    # No external lock needed - AsyncSafeState handles this
+    return agent.chat(prompt)
 
 async def main():
     tasks = [async_chat(f"Question {i}") for i in range(5)]
     results = await asyncio.gather(*tasks)
+```
+
+<Warning>
+Since PR #1567, `DualLock.sync()` and `DualLock.async_lock()` use **independent** locks. A sync caller holding the lock will **not** block an async caller from acquiring it, and vice versa. Within a single context (all-sync or all-async) the lock works as expected; across contexts it does not coordinate. If you mutate `agent.chat_history` from both sync and async code paths, serialise the boundary yourself.
+</Warning>
+
+```mermaid
+graph TB
+    subgraph "Sync Context"
+        SyncCaller[👨‍💻 Sync Caller] --> SyncLock[🔒 threading.RLock]
+        SyncLock --> ChatHistory[💬 chat_history]
+    end
+    
+    subgraph "Async Context"
+        AsyncCaller[🚀 Async Caller] --> AsyncLock[🔄 asyncio.Lock<br/>per event loop]
+        AsyncLock --> ChatHistory
+    end
+    
+    SyncLock -.->|no cross-context<br/>coordination| AsyncLock
+    
+    classDef sync fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef async fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef shared fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class SyncCaller,SyncLock sync
+    class AsyncCaller,AsyncLock async
+    class ChatHistory shared
+```
+
+An external lock **is** still useful for serialising chat-history mutations from a thread pool that mixes sync and async callers:
+
+```python
+import asyncio
+import threading
+from praisonaiagents import Agent
+
+agent = Agent(name="MixedAgent")
+external_lock = threading.Lock()
+
+def sync_worker(prompt):
+    with external_lock:
+        return agent.chat(prompt)
+
+async def async_worker(prompt):
+    # Convert to sync context for coordination
+    loop = asyncio.get_event_loop()
+    with external_lock:
+        return await loop.run_in_executor(None, agent.chat, prompt)
 ```
 
 ## Verifying Thread Safety
@@ -241,6 +321,105 @@ thread2.join()
 # - http://localhost:8000/team_a
 # - http://localhost:8000/team_b
 ```
+
+## Wrapper-layer thread safety (`praisonai` package)
+
+The `praisonai` wrapper layer (distinct from the `praisonaiagents` content above) provides thread-safe OpenAI client management and CLI command discovery.
+
+```mermaid
+graph LR
+    subgraph "Thread-Safe OpenAI Client"
+        T1[🧵 Thread 1] --> K1[🔑 API Key A]
+        T2[🧵 Thread 2] --> K2[🔑 API Key B]
+        K1 --> C1[📡 Client A]
+        K2 --> C2[📡 Client B]
+        L[🔒 Lock] -.-> C1
+        L -.-> C2
+    end
+    
+    classDef thread fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef key fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef client fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef lock fill:#6366F1,stroke:#7C90A0,color:#fff
+    
+    class T1,T2 thread
+    class K1,K2 key
+    class C1,C2 client
+    class L lock
+```
+
+### Key-aware OpenAI client
+
+The OpenAI client is now cached per `(api_key, base_url)` tuple, allowing multiple keys in the same process without cross-talk:
+
+```python
+from praisonai import PraisonAI
+import threading
+
+def worker_with_different_key(api_key, task_name):
+    # Each thread gets its own client based on the key
+    praisonai = PraisonAI(
+        auto=f"Create a {task_name}",
+        api_key=api_key  # Different key per thread
+    )
+    result = praisonai.run()
+    print(f"{task_name} completed")
+
+# Two threads with different OpenAI keys
+thread1 = threading.Thread(
+    target=worker_with_different_key,
+    args=("sk-key-team-a", "marketing plan")
+)
+thread2 = threading.Thread(
+    target=worker_with_different_key, 
+    args=("sk-key-team-b", "technical doc")
+)
+
+thread1.start()
+thread2.start()
+thread1.join()
+thread2.join()
+```
+
+### Thread-safe Typer command discovery
+
+Embedding `python -m praisonai` from multiple threads is now safe. The CLI command discovery uses a double-check lock pattern and doesn't poison the cache on failure:
+
+```python
+import threading
+import subprocess
+
+def run_cli_command(command):
+    # Safe to call from multiple threads
+    result = subprocess.run(
+        ["python", "-m", "praisonai"] + command,
+        capture_output=True, text=True
+    )
+    return result.stdout
+
+# Multiple threads can safely use the CLI
+threads = [
+    threading.Thread(target=run_cli_command, args=(["--version"],))
+    for _ in range(5)
+]
+
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+### Failure-safe cache
+
+A transient discovery error does not lock the CLI into a broken state — the next call retries instead of permanently breaking dispatch. This ensures reliable operation in multi-threaded server environments where temporary import failures might occur.
+
+### New Thread-Safe Components in PR #1548
+
+**AsyncAgentScheduler** is now loop-aware. The `start()` method binds its async primitives (`asyncio.Event`, `asyncio.Lock`) to the running loop, and `stop()` raises `RuntimeError` if called from a different loop than `start()`.
+
+**Lazy loaders in `praisonai/auto.py`** are now thread-safe. A single `_load_optional(key, loader)` helper with a module-level lock replaces the previous unguarded module-level globals.
+
+**Integration registry** (`praisonai/integrations/registry.py`) now has a per-instance `threading.Lock` guarding `register`/`unregister`/`create`/`list_registered` operations.
 
 ## Related
 

@@ -34,12 +34,17 @@ graph LR
 
 ```python
 from praisonaiagents import Agent
+from praisonaiagents.bots import BotConfig
 
 # Secure bot with allowlist
+config = BotConfig(
+    allowed_users=["@your_username", "123456789"],
+    unknown_user_policy="deny"  # Default secure behavior
+)
+
 agent = Agent(
     instructions="You are a helpful assistant",
-    # Note: Security features shown are conceptual
-    # Actual implementation may vary
+    # Bot configuration handled by adapter
 )
 ```
 
@@ -49,12 +54,19 @@ agent = Agent(
 
 ```python
 from praisonaiagents import Agent
+from praisonaiagents.bots import BotConfig
 
-# Production security setup
+# Production security setup with pairing
+config = BotConfig(
+    allowed_users=["@admin_user"],
+    unknown_user_policy="pair",  # Secure pairing flow
+    auto_approve_tools=True,     # For bot environments
+    group_policy="mention_only"  # Only respond when mentioned
+)
+
 agent = Agent(
     instructions="Secure production assistant",
-    # Security configuration would go here
-    # when implemented in the SDK
+    # Configure with your bot adapter
 )
 ```
 
@@ -212,68 +224,244 @@ channels:
 WhatsApp has the **strongest security defaults** and serves as the reference implementation for other channels.
 </Tip>
 
-## Gateway Pairing
+## Owner-DM Pairing
 
-<Warning>
-**Note:** The pairing system described below represents planned functionality. Current SDK implementation may differ. Verify against actual SDK documentation.
-</Warning>
+The pairing system is now shipped and enables owner-approval for unknown users with inline Approve/Deny buttons sent directly to your DM.
 
-For production deployments, use **gateway pairing** to authorize channels dynamically:
+For production deployments, use **owner-DM pairing** to authorize unknown users dynamically:
 
-### 1. Set Gateway Secret
+### 1. Set Callback Secret
 
 ```bash
-export PRAISONAI_GATEWAY_SECRET="your-secure-secret-key"
+export PRAISONAI_CALLBACK_SECRET="$(openssl rand -hex 32)"
 ```
 
 <Warning>
-Without `PRAISONAI_GATEWAY_SECRET`, pairing codes will **not persist across restarts**. Set this in production.
+Without `PRAISONAI_CALLBACK_SECRET`, inline-button callbacks will **not work across restarts**. Set this in production.
 </Warning>
 
-### 2. Generate Pairing Code
+### 2. Configure Unknown User Policy
 
 ```python
-# Note: This API is conceptual - verify implementation
-from praisonaiagents.gateway.pairing import PairingStore
+from praisonaiagents import Agent
+from praisonaiagents.bots import BotConfig
+
+config = BotConfig(
+    token="your-bot-token",
+    unknown_user_policy="pair",     # Enable owner-approval workflow
+    owner_user_id="123456789",      # Your platform user ID
+)
+
+agent = Agent(
+    name="Support Bot",
+    instructions="Help users with their questions",
+)
+```
+
+### 3. Owner Approval Workflow
+
+When an unknown user messages your bot:
+
+1. Bot generates a pairing code
+2. **Owner receives DM with inline Approve/Deny buttons**
+3. Owner clicks Approve → User is permanently approved
+4. Owner clicks Deny → Request is rejected
+
+**CLI Fallback:** If `owner_user_id` is not set, the bot replies:
+```
+Your pairing code: abc12345. Ask the owner to run: praisonai pairing approve telegram abc12345
+```
+
+### 4. Manual Approval (CLI)
+
+Owners can approve pairing requests manually:
+
+```bash
+# Approve a specific pairing code
+praisonai pairing approve telegram abc12345
+
+# Approve for Discord
+praisonai pairing approve discord def67890
+
+# Approve for Slack
+praisonai pairing approve slack ghi13579
+```
+
+## Gateway Pairing
+
+For production deployments, use **gateway pairing** to authorize channels dynamically with the shipped pairing system:
+
+<Note>
+The gateway secret is optional - if unset, a per-install secret is auto-generated at `<store_dir>/.gateway_secret` with `0600` permissions and reused across restarts.
+</Note>
+
+### Enable Pairing Policy
+
+```python
+from praisonaiagents.bots import BotConfig
+
+config = BotConfig(
+    allowed_users=["@owner"],
+    unknown_user_policy="pair"  # Enable pairing for unknown users
+)
+
+# Unknown users will automatically receive pairing codes when they DM the bot
+```
+
+### Approve Pairing Requests
+
+When unknown users DM your bot, they receive pairing codes. Approve them via CLI:
+
+```bash
+# User receives: "Your pairing code: ABCD1234"
+# Owner approves:
+praisonai pairing approve telegram ABCD1234 --label "alice"
+```
+
+### Manage Pairings
+
+```bash
+# List all paired channels
+praisonai pairing list
+
+# Revoke access for specific channel
+praisonai pairing revoke telegram 987654321
+
+# Clear all pairings
+praisonai pairing clear --confirm
+```
+
+<Tip>
+For detailed pairing documentation, see the [Bot Pairing](/docs/features/bot-pairing) guide.
+</Tip>
+
+### List Pending Requests
+
+List all pending pairing codes waiting for approval:
+
+```python
+from praisonai.gateway.pairing import PairingStore
 
 store = PairingStore()
-code = store.generate_code(channel_type="telegram")
-print(f"Pairing code: {code}")  # 8-character hex code
+
+# All pending codes across every channel
+for req in store.list_pending():
+    print(req["code"], req["channel_type"], req["channel_id"], req["age_seconds"])
+
+# Filter by channel
+telegram_only = store.list_pending(channel_type="telegram")
 ```
 
-### 3. Verify in Channel
+**Response Schema:**
 
-Send the code to your bot in the target channel:
+| Key | Type | Source | Notes |
+|-----|------|--------|-------|
+| `code` | `str` | canonical | 8-char pairing code |
+| `channel_type` | `str` | canonical | e.g. `"telegram"`, `"discord"`, `"slack"`, `"whatsapp"` |
+| `channel_id` | `str \| None` | canonical | Bound channel id if code was generated with one |
+| `created_at` | `float` | canonical | Unix timestamp (seconds) when code was generated |
+| `channel` | `str` | UI alias | Same value as `channel_type`, kept for UI banner compatibility |
+| `user_id` | `str` | UI alias | Currently equals `code` (see note in `approve()` docstring) |
+| `user_name` | `str` | UI alias | Formatted as `"User {code}"` |
+| `age_seconds` | `int` | UI alias | `int(now - created_at)` |
 
+<Note>
+Canonical keys (`code`, `channel_type`, `channel_id`, `created_at`) are the stable contract. The `channel`, `user_id`, `user_name`, and `age_seconds` aliases are provided for UI consumers and should not be relied on for scripting — use the canonical keys.
+</Note>
+
+### CLI Commands
+
+Use the `praisonai pairing` commands to manage pairings from the command line:
+
+```bash
+# List all paired channels
+praisonai pairing list
+
+# Approve a pairing code (this is the exact command shown to users)
+praisonai pairing approve telegram abc12345
+
+# Revoke a paired channel
+praisonai pairing revoke telegram @username
+
+# Clear all paired channels
+praisonai pairing clear
 ```
-/pair abc12345
+
+**Available Commands:**
+
+| Command | Purpose | Required Args |
+|---------|---------|---------------|
+| `praisonai pairing list` | List all paired channels | — |
+| `praisonai pairing approve PLATFORM CODE [CHANNEL_ID]` | Approve an 8-char pairing code | `platform`, `code` |
+| `praisonai pairing revoke PLATFORM CHANNEL_ID` | Revoke a paired channel | `platform`, `channel_id` |
+| `praisonai pairing clear` | Clear all paired channels | — |
+
+**Platform values:** `telegram`, `discord`, `slack`, `whatsapp`
+
+**Pairing Flow:**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Bot
+    participant PairingStore
+    participant CLI
+    
+    User->>Bot: unknown message (triggers pairing)
+    Bot->>PairingStore: generate_code(channel_type, channel_id)
+    PairingStore-->>Bot: abc12345
+    Bot->>User: Ask owner to run: praisonai pairing approve telegram abc12345
+    CLI->>PairingStore: approve(telegram, abc12345)
+    PairingStore->>PairingStore: verify_and_pair()
+    PairingStore-->>CLI: success
+    User->>Bot: now authorised
+    Bot-->>User: response
+    
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef bot fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class User user
+    class Bot,PairingStore,CLI bot
 ```
 
-The bot will verify the HMAC signature and authorize the channel.
+### 7. REST API
 
-### 4. Check Status
+The gateway exposes REST endpoints for pairing management:
 
-```python
-# Check if channel is paired  
-# Note: Verify this API exists in current SDK
-paired = store.is_paired("@username", "telegram")
-print(f"Channel paired: {paired}")
+| Method | Path | Body / Query | Response | Auth Required |
+|--------|------|--------------|----------|---------------|
+| `GET` | `/api/pairing/pending` | — | `list_pending()` schema | ✅ |
+| `POST` | `/api/pairing/approve` | `{ "channel": str, "code": str }` | `{ "approved": true, ... }` | ✅ |
+| `POST` | `/api/pairing/revoke` | `{ "channel": str, "user_id": str }` | `{ "revoked": true, ... }` | ✅ |
 
-# List all paired channels  
-for channel in store.list_paired():
-    print(f"{channel.channel_type}: {channel.channel_id}")
+**Example Usage:**
+
+```bash
+# List pending requests
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8000/api/pairing/pending
+
+# Approve a code  
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"channel":"telegram","code":"abc12345"}' \
+  http://localhost:8000/api/pairing/approve
+
+# Revoke a channel
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -d '{"channel":"telegram","user_id":"@username"}' \
+  http://localhost:8000/api/pairing/revoke
 ```
+
+<Note>
+All endpoints are **authenticated** and **rate-limited**. Rate limits are applied per client IP with separate buckets for `pairing_pending`, `pairing_approve`, and `pairing_revoke` operations.
+</Note>
 
 ## Doctor Security Check
-
-<Warning>
-**Note:** The doctor command shown may not be available in current SDK version. Verify implementation status.
-</Warning>
 
 Use the built-in doctor to audit your bot security configuration:
 
 ```bash
-# Note: Verify this command exists
 praisonai doctor --category bots
 ```
 
@@ -311,8 +499,10 @@ Remediation: Consider allowlists for DM security and 'mention_only' group policy
 
   <Accordion title="✅ Gateway Pairing Active" icon="link">
     - [ ] `PRAISONAI_GATEWAY_SECRET` set
-    - [ ] Pairing codes generated and shared securely
-    - [ ] All production channels paired and verified
+    - [ ] `PRAISONAI_CALLBACK_SECRET` set (for inline buttons)
+    - [ ] `unknown_user_policy` configured (`deny`/`pair`/`allow`)
+    - [ ] `owner_user_id` set for inline approvals
+    - [ ] Pairing workflow tested and verified
     - [ ] Revocation process documented
   </Accordion>
 
@@ -471,6 +661,11 @@ def is_verified_user(user_id: str) -> bool:
 **Solution:** 
 1. Set `PRAISONAI_GATEWAY_SECRET` env var
 2. Codes without persistent secret are temporary
+
+**Problem:** `praisonai pairing approve` reports "Invalid or expired code" even though a code was just generated from the UI
+**Solution:** 
+1. Upgrade to the latest `praisonai` version (fix included in 2026-04-22 release)
+2. Older builds had a duplicate internal method that stripped the canonical `code` key when the UI pairing banner was loaded
 
 ### Allowlist Issues
 

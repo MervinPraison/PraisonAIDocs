@@ -99,10 +99,20 @@ export PRAISONAI_ALLOW_LOCAL_TOOLS=true
 unset PRAISONAI_ALLOW_LOCAL_TOOLS
 ```
 
-**Affected Components**:
-- Tool resolver system
-- Agent API calls
-- Real-time UI interactions
+**Affected Components** (verified against PR #1583 head `12eb019b`):
+- `praisonaiagents` agent generator (`load_tools_from_tools_py`, `generate_crew_and_kickoff`)
+- `praisonai run` YAML workflows (recipe `tools.py` under `_run_yaml_workflow`)
+- `praisonai research --tools <file.py>`
+- `praisonai chat --rewrite-tools <file.py>` and `--expand-tools <file.py>`
+- Generic CLI `_load_tools(tools_path)`
+- HTTP API: `praisonai.api.call.import_tools_from_file` (raises `ValueError` if disabled)
+- Path-traversal guard: files outside the current working directory are refused even when `PRAISONAI_ALLOW_LOCAL_TOOLS=true`
+
+<Note>
+Even when `PRAISONAI_ALLOW_LOCAL_TOOLS=true`, the loader refuses any path outside the current working directory. This is a deliberate defence-in-depth layer for HTTP-API callers (`praisonai.api.call.import_tools_from_file`) where the path can come from network input. Move the `tools.py` you want to load into your CWD if you hit `Refusing to exec ... outside working directory.` in the logs.
+</Note>
+
+`PRAISONAI_ALLOW_LOCAL_TOOLS` accepts only `true` (case-insensitive). Values like `1`, `yes`, or `on` are **not** truthy for this variable (unlike `PRAISONAI_ALLOW_TEMPLATE_TOOLS`).
 
 **Usage Example**:
 ```python
@@ -115,6 +125,53 @@ agent = Agent(
 )
 
 agent.start("Calculate using local tools")
+```
+
+**Error & Warning Messages**
+
+| When | Where it appears | Message |
+|------|------------------|---------|
+| Env var unset, CLI tool loader (research/rewrite/expand/recipe) | stdout (rich `[yellow]`) | `Warning: Tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.` |
+| Env var unset, agent generator | logger.warning | `Refusing to exec tools.py: set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.` |
+| Env var unset, HTTP API (`api/call.py`) | raised exception | `ValueError("Local tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.")` |
+| Path outside CWD, env var **set** | logger.warning | `Refusing to exec <path>: outside working directory.` |
+| Path outside CWD via HTTP API, env var **set** | raised exception | `LocalToolsDisabled("Refusing to exec <path>: outside working directory.")` |
+
+### PRAISONAI_ALLOW_TEMPLATE_TOOLS
+
+Controls implicit `tools.py` autoload by the template tool-override system, both from the current working directory and from a recipe's template directory.
+
+**Security Risk**: Remote Code Execution (RCE) when loading recipes/templates from untrusted sources (e.g. recipes fetched from a remote registry)
+
+```bash
+# Enable template tools autoload
+export PRAISONAI_ALLOW_TEMPLATE_TOOLS=1
+
+# Disable (default - secure)
+unset PRAISONAI_ALLOW_TEMPLATE_TOOLS
+```
+
+**Default**: unset → disabled  
+**Accepted truthy values**: `1`, `true`, `yes`, `on` (case-insensitive, whitespace-stripped)
+
+**Affected Components**:
+- `praisonai.templates.tool_override.create_tool_registry_with_overrides`
+- `praisonai.templates.tool_override.resolve_tools`
+
+**Note**: Explicit `override_files`, `override_dirs`, and `tools_sources` continue to work without this opt-in and are the recommended way to load custom tools.
+
+**Usage Example**:
+```python
+from praisonai.templates.tool_override import create_tool_registry_with_overrides
+
+# This will only load implicit tools.py if PRAISONAI_ALLOW_TEMPLATE_TOOLS=1
+registry = create_tool_registry_with_overrides(include_defaults=True)
+
+# Explicit loading works without the env var
+registry = create_tool_registry_with_overrides(
+    override_files=["./my_tools.py"],  # Always works
+    include_defaults=True
+)
 ```
 
 ### PRAISONAI_ALLOW_JOB_WORKFLOWS
@@ -185,6 +242,22 @@ server = BrowserServer(host="0.0.0.0", port=8080)
 server.start()
 ```
 
+### PRAISONAI_RUN_SYNC_TIMEOUT
+
+Default maximum seconds the wrapper's sync-to-async bridge will wait for a coroutine to complete.
+
+**Default:** `300` (5 minutes)
+
+```bash
+# Tighten for latency-sensitive servers
+export PRAISONAI_RUN_SYNC_TIMEOUT=30
+
+# Loosen for long-running batch jobs
+export PRAISONAI_RUN_SYNC_TIMEOUT=3600
+```
+
+Applies to every `praisonai` CLI entry and wrapper-based server (gateway, a2u, mcp_server, scheduler). The SDK (`praisonaiagents`) uses a separate bridge — see [Async Bridge](/docs/features/async-bridge).
+
 ---
 
 ## Common Patterns
@@ -194,8 +267,10 @@ server.start()
 ```bash
 # Enable all features for development
 export PRAISONAI_ALLOW_LOCAL_TOOLS=true
+export PRAISONAI_ALLOW_TEMPLATE_TOOLS=true
 export PRAISONAI_ALLOW_JOB_WORKFLOWS=true  
 export PRAISONAI_BROWSER_ALLOW_REMOTE=true
+export PRAISONAI_RUN_SYNC_TIMEOUT=30
 
 # Add to ~/.bashrc or ~/.zshrc for persistence
 echo 'export PRAISONAI_ALLOW_LOCAL_TOOLS=true' >> ~/.bashrc
@@ -206,15 +281,19 @@ echo 'export PRAISONAI_ALLOW_LOCAL_TOOLS=true' >> ~/.bashrc
 ```bash
 # Secure defaults - explicitly unset dangerous variables
 unset PRAISONAI_ALLOW_LOCAL_TOOLS
+unset PRAISONAI_ALLOW_TEMPLATE_TOOLS
 unset PRAISONAI_ALLOW_JOB_WORKFLOWS
 unset PRAISONAI_BROWSER_ALLOW_REMOTE
+export PRAISONAI_RUN_SYNC_TIMEOUT=300
 
 # Or use systemd service with secure environment
 # /etc/systemd/system/praisonai.service
 [Service]
 Environment="PRAISONAI_ALLOW_LOCAL_TOOLS=false"
+Environment="PRAISONAI_ALLOW_TEMPLATE_TOOLS=false"
 Environment="PRAISONAI_ALLOW_JOB_WORKFLOWS=false"
 Environment="PRAISONAI_BROWSER_ALLOW_REMOTE=false"
+Environment="PRAISONAI_RUN_SYNC_TIMEOUT=300"
 ```
 </Tab>
 
@@ -248,16 +327,20 @@ CMD ["python", "-m", "praisonai"]
 <Step title="Identify Usage">
 Check if you use any of these features:
 - Local `tools.py` files
+- Recipes / templates that ship a `tools.py` and rely on it being implicitly loaded
 - Job or hybrid workflows with shell/script execution
 - Browser server binding to `0.0.0.0`
+- HTTP API callers that pass a `file_path` to `praisonai.api.call.import_tools_from_file` — these now raise `ValueError` until you opt in
 </Step>
 
 <Step title="Add Environment Variables">
 ```bash
 # Only add variables for features you actually use
 export PRAISONAI_ALLOW_LOCAL_TOOLS=true      # If you use tools.py
+export PRAISONAI_ALLOW_TEMPLATE_TOOLS=1      # If you rely on implicit template/CWD tools.py autoload
 export PRAISONAI_ALLOW_JOB_WORKFLOWS=true    # If you use job workflows
 export PRAISONAI_BROWSER_ALLOW_REMOTE=true   # If you bind browser to 0.0.0.0
+export PRAISONAI_RUN_SYNC_TIMEOUT=300        # Adjust timeout as needed
 ```
 </Step>
 
@@ -317,7 +400,7 @@ export PRAISONAI_ALLOW_LOCAL_TOOLS=true
 </Accordion>
 
 <Accordion title="📁 File System Security">
-When `PRAISONAI_ALLOW_LOCAL_TOOLS=true`, ensure your working directory doesn't contain untrusted `tools.py` files.
+When `PRAISONAI_ALLOW_LOCAL_TOOLS=true` or `PRAISONAI_ALLOW_TEMPLATE_TOOLS=1` is set, ensure your working directory doesn't contain untrusted `tools.py` files. This is especially risky for recipes fetched from remote registries.
 
 ```bash
 # Check for tools.py before running
@@ -353,6 +436,7 @@ These environment variables address the following security vulnerabilities:
 | Advisory | Severity | Description | Environment Variable |
 |----------|----------|-------------|---------------------|
 | **GHSA-g985-wjh9-qxxc** | High | RCE via Automatic tools.py Import | `PRAISONAI_ALLOW_LOCAL_TOOLS` |
+| **GHSA-xcmw-grxf-wjhj** | High | Implicit RCE via template/CWD tools.py autoload | `PRAISONAI_ALLOW_TEMPLATE_TOOLS` |
 | **GHSA-vc46-vw85-3wvm** | Critical | RCE via job workflow YAML | `PRAISONAI_ALLOW_JOB_WORKFLOWS` |  
 | **GHSA-8x8f-54wf-vv92** | Critical | WebSocket session hijacking | `PRAISONAI_BROWSER_ALLOW_REMOTE` |
 
@@ -361,6 +445,8 @@ These environment variables address the following security vulnerabilities:
 **Fixed Versions**:
 - **praisonai**: `>=0.0.57` 
 - **praisonaiagents**: `>=0.0.23`
+
+PR #1583 (2026-04-30) extended `PRAISONAI_ALLOW_LOCAL_TOOLS` enforcement to research/rewrite/expand/recipe tool-loading paths and the HTTP API, and added a CWD-only path constraint as defence-in-depth. No new advisory was filed; the threat model is unchanged from GHSA-g985-wjh9-qxxc.
 
 ---
 

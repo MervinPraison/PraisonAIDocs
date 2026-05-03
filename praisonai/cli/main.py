@@ -6,41 +6,55 @@ import warnings
 import os
 import json
 
-# Suppress Pydantic serialization warnings from LiteLLM BEFORE any imports
-# These warnings occur when LiteLLM's response objects have field mismatches
-# Using both filterwarnings AND patching warnings.warn for complete suppression
+# Warning filter support - now opt-in only (no global mutation at import)
+import atexit
 
-warnings.filterwarnings("ignore", message=".*Pydantic serializer warnings.*")
-warnings.filterwarnings("ignore", message=".*PydanticSerializationUnexpectedValue.*")
-warnings.filterwarnings("ignore", message=".*Expected \\d+ fields but got.*")
-warnings.filterwarnings("ignore", message=".*Expected `StreamingChoices`.*")
-warnings.filterwarnings("ignore", message=".*Expected `Message`.*")
-warnings.filterwarnings("ignore", message=".*serialized value may not be as expected.*")
-warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
-
-# Patch warnings.showwarning to intercept ALL warnings including those from crewai's patched warn
-# This is the final output function that actually displays warnings
-_SUPPRESSED_PATTERNS = [
+_SUPPRESSED_PATTERNS = (
     "Pydantic serializer warnings",
     "PydanticSerializationUnexpectedValue",
-    "Expected",  # Catches "Expected N fields but got M"
+    "Expected ",  # Narrowed from just "Expected" to avoid false positives
     "StreamingChoices",
     "serialized value may not be as expected",
-    "duckduckgo_search",  # Suppress duckduckgo rename warning
-]
+    "duckduckgo_search",
+)
 
-_original_showwarning = warnings.showwarning
+_installed = False
+_original_showwarning = None
+_original_filters = None
 
-def _patched_showwarning(message, category, filename, lineno, file=None, line=None):
-    msg_str = str(message)
-    for pattern in _SUPPRESSED_PATTERNS:
-        if pattern in msg_str:
-            return
-    if category is UserWarning and "pydantic" in filename.lower():
+def install_warning_filters() -> None:
+    """Install PraisonAI's noise filters. Idempotent. CLI-only."""
+    global _installed, _original_showwarning, _original_filters
+    if _installed:
         return
-    _original_showwarning(message, category, filename, lineno, file, line)
+    _original_showwarning = warnings.showwarning
+    _original_filters = list(warnings.filters)
 
-warnings.showwarning = _patched_showwarning
+    # Install filterwarnings for common patterns
+    for pattern in _SUPPRESSED_PATTERNS:
+        warnings.filterwarnings("ignore", message=f".*{pattern}.*")
+    warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
+
+    def _filtered_showwarning(message, category, filename, lineno, file=None, line=None):
+        msg_str = str(message)
+        if any(pattern in msg_str for pattern in _SUPPRESSED_PATTERNS):
+            return
+        if category is UserWarning and "pydantic" in filename.lower():
+            return
+        _original_showwarning(message, category, filename, lineno, file, line)
+
+    warnings.showwarning = _filtered_showwarning
+    atexit.register(_uninstall_warning_filters)
+    _installed = True
+
+def _uninstall_warning_filters() -> None:
+    """Restore original warnings behavior on exit."""
+    global _installed, _original_filters, _original_showwarning
+    if _installed and _original_showwarning is not None:
+        warnings.showwarning = _original_showwarning
+        if _original_filters is not None:
+            warnings.filters[:] = _original_filters
+        _installed = False
 
 # Suppress crewai RuntimeWarning about module loading order (only in non-debug mode)
 # This warning is harmless and occurs when running as `python -m praisonai.cli.main`
@@ -248,6 +262,9 @@ class PraisonAI:
         """
         Initialize the PraisonAI object with default parameters.
         """
+        # Initialize telemetry defaults (moved from lazy __getattr__ hook)
+        from praisonai import _ensure_telemetry_defaults
+        _ensure_telemetry_defaults()
         self.agent_yaml = agent_yaml
         self._interactive_mode = False  # Flag for interactive TUI mode
         # Create config_list with AutoGen compatibility
@@ -331,9 +348,9 @@ class PraisonAI:
         initializes the necessary attributes, and then calls the appropriate methods based on the
         provided arguments.
         """
-        # Set OpenTelemetry SDK to disabled to prevent telemetry collection
-        # Moved from agents_generator.py to CLI entry point per architecture requirements
-        os.environ.setdefault("OTEL_SDK_DISABLED", "true")
+        # Warning filters now installed via Typer callback for CLI-only usage
+        
+        # Telemetry defaults now handled in PraisonAI.__init__ with Langfuse awareness
         
         # Store the original agent_file from constructor
         original_agent_file = self.agent_file
@@ -1922,16 +1939,16 @@ class PraisonAI:
                     # Load from file
                     try:
                         import inspect
-                        import importlib.util
-                        spec = importlib.util.spec_from_file_location("rewrite_tools_module", rewrite_tools)
-                        if spec and spec.loader:
-                            module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(module)
+                        from .._safe_loader import load_user_module
+                        module = load_user_module(rewrite_tools, name="rewrite_tools_module")
+                        if module is not None:
                             for name, obj in inspect.getmembers(module):
                                 if inspect.isfunction(obj) and not name.startswith('_'):
                                     rewrite_tools_list.append(obj)
                             if rewrite_tools_list:
                                 print(f"[cyan]Loaded {len(rewrite_tools_list)} tools for query rewriter[/cyan]")
+                        else:
+                            print(f"[yellow]Warning: Rewrite tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
                     except Exception as e:
                         print(f"[yellow]Warning: Failed to load rewrite tools: {e}[/yellow]")
                 else:
@@ -2014,16 +2031,16 @@ class PraisonAI:
                     # Load from file
                     try:
                         import inspect
-                        import importlib.util
-                        spec = importlib.util.spec_from_file_location("expand_tools_module", expand_tools)
-                        if spec and spec.loader:
-                            module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(module)
+                        from .._safe_loader import load_user_module
+                        module = load_user_module(expand_tools, name="expand_tools_module")
+                        if module is not None:
                             for name, obj in inspect.getmembers(module):
                                 if inspect.isfunction(obj) and not name.startswith('_'):
                                     expand_tools_list.append(obj)
                             if expand_tools_list:
                                 print(f"[cyan]Loaded {len(expand_tools_list)} tools for prompt expander[/cyan]")
+                        else:
+                            print(f"[yellow]Warning: Expand tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
                     except Exception as e:
                         print(f"[yellow]Warning: Failed to load expand tools: {e}[/yellow]")
                 else:
@@ -2099,15 +2116,16 @@ class PraisonAI:
             # Load from file
             try:
                 import inspect
-                spec = importlib.util.spec_from_file_location("tools_module", tools_path)
-                if spec and spec.loader:
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
+                from .._safe_loader import load_user_module
+                module = load_user_module(tools_path, name="tools_module")
+                if module is not None:
                     for name, obj in inspect.getmembers(module):
                         if inspect.isfunction(obj) and not name.startswith('_'):
                             tools_list.append(obj)
                     if tools_list:
                         print(f"[cyan]Loaded {len(tools_list)} tools from {tools_path}[/cyan]")
+                else:
+                    print(f"[yellow]Warning: Tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
             except Exception as e:
                 print(f"[yellow]Warning: Failed to load tools from {tools_path}: {e}[/yellow]")
         else:
@@ -2735,14 +2753,16 @@ class PraisonAI:
             
             if tools_file.exists():
                 try:
-                    spec = importlib.util.spec_from_file_location("recipe_tools", str(tools_file))
-                    tools_module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(tools_module)
-                    
-                    # Build registry from public callable functions
-                    for name, obj in vars(tools_module).items():
-                        if callable(obj) and not name.startswith('_'):
-                            tool_registry[name] = obj
+                    from .._safe_loader import load_user_module
+                    tools_module = load_user_module(str(tools_file), name="recipe_tools")
+                    if tools_module is not None:
+                        import inspect
+                        # Build registry from public functions only
+                        for name, obj in vars(tools_module).items():
+                            if inspect.isfunction(obj) and not name.startswith('_') and inspect.getmodule(obj) is tools_module:
+                                tool_registry[name] = obj
+                    else:
+                        logging.getLogger(__name__).warning("Recipe tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.")
                     
                     if tool_registry:
                         print(f"[cyan]Loaded {len(tool_registry)} tools from tools.py: {', '.join(tool_registry.keys())}[/cyan]")
@@ -5364,16 +5384,17 @@ Now, {final_instruction.lower()}:"""
                     # Load from file
                     try:
                         import inspect
-                        spec = importlib.util.spec_from_file_location("tools_module", tools_path)
-                        if spec and spec.loader:
-                            module = importlib.util.module_from_spec(spec)
-                            spec.loader.exec_module(module)
+                        from .._safe_loader import load_user_module
+                        module = load_user_module(tools_path, name="tools_module")
+                        if module is not None:
                             # Get all callable functions from the module
                             for name, obj in inspect.getmembers(module):
                                 if inspect.isfunction(obj) and not name.startswith('_'):
                                     tools_list.append(obj)
                             if tools_list:
                                 print(f"[cyan]Loaded {len(tools_list)} tools from {tools_path}[/cyan]")
+                        else:
+                            print(f"[yellow]Warning: Tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
                     except Exception as e:
                         print(f"[yellow]Warning: Failed to load tools from {tools_path}: {e}[/yellow]")
                 else:
@@ -6778,5 +6799,7 @@ Provide a concise summary (max 200 words):"""
                 logging.getLogger(logger_name).setLevel(level)
 
 if __name__ == "__main__":
+    # Install warning filters when run as script
+    install_warning_filters()
     praison_ai = PraisonAI()
     praison_ai.main()

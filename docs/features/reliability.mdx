@@ -1,0 +1,340 @@
+---
+title: "Reliability"
+sidebarTitle: "Reliability"
+description: "Make agents resilient: retry jitter, workflow timeouts, and task failure policies"
+icon: "shield-check"
+---
+
+Make your agents survive flaky LLMs, hung workflows, and broken callbacks.
+
+```mermaid
+graph LR
+    subgraph "Agent Reliability Flow"
+        A[📋 Request] --> B[🔄 Retry with Jitter]
+        B --> C[⏱️ Timeout Guard]
+        C --> D[⚙️ Task with Failure Policies]
+        D --> E[✅ Output]
+    end
+    
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef guard fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef task fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class A input
+    class B process
+    class C guard
+    class D task
+    class E output
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Simple Usage">
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+task = Task(
+    description="Summarise the article",
+    fail_on_callback_error=True,   # surface callback bugs instead of swallowing
+    fail_on_memory_error=False,    # tolerate memory hiccups
+)
+
+workflow = PraisonAIAgents(
+    agents=[Agent(name="Writer", instructions="Summarise clearly")],
+    tasks=[task],
+    workflow_timeout=120,           # hard kill after 2 min (sync + async)
+)
+workflow.start()
+```
+</Step>
+
+<Step title="Production Configuration">
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+# Strict mode for CI/testing
+strict_task = Task(
+    description="Validate the output",
+    fail_on_callback_error=True,
+    fail_on_memory_error=True,
+)
+
+# Lenient mode for production
+lenient_task = Task(
+    description="Generate content",
+    fail_on_callback_error=False,  # default
+    fail_on_memory_error=False,    # default
+)
+
+workflow = PraisonAIAgents(
+    agents=[Agent(name="Validator", instructions="Check quality")],
+    tasks=[strict_task, lenient_task],
+    workflow_timeout=300,
+)
+
+result = workflow.start()
+# Check for non-fatal errors in production
+if result.non_fatal_errors:
+    logger.warning(f"Non-fatal errors: {result.non_fatal_errors}")
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant LLM
+    participant Workflow
+    
+    User->>Agent: Request
+    Agent->>LLM: API Call
+    LLM-->>Agent: Rate Limit (429)
+    Note over Agent: Exponential backoff + jitter
+    Agent->>LLM: Retry after delay
+    LLM-->>Agent: Success
+    
+    Agent->>Workflow: Task Complete
+    Note over Workflow: Check timeout
+    Workflow-->>User: Response or Timeout
+```
+
+| Component | Purpose | Behavior |
+|-----------|---------|----------|
+| Retry Jitter | Prevents thundering herd | Random delays for multi-agent rate limits |
+| Workflow Timeout | Stops hung processes | Hard kill after specified seconds |
+| Failure Policies | Controls error handling | Surface or swallow exceptions |
+
+---
+
+## Retry Jitter (LLM Backoff)
+
+Prevents multi-agent thundering herd when many agents hit rate limits at once.
+
+```mermaid
+sequenceDiagram
+    participant A1 as Agent 1
+    participant A2 as Agent 2
+    participant A3 as Agent 3
+    participant LLM as LLM API
+    
+    Note over A1,A3: Without Jitter (synchronized)
+    A1->>LLM: Request
+    A2->>LLM: Request
+    A3->>LLM: Request
+    LLM-->>A1: 429 Rate Limit
+    LLM-->>A2: 429 Rate Limit
+    LLM-->>A3: 429 Rate Limit
+    
+    Note over A1,A3: All retry at same time
+    A1->>LLM: Retry (3s delay)
+    A2->>LLM: Retry (3s delay)
+    A3->>LLM: Retry (3s delay)
+    LLM-->>A1: 429 Again!
+    
+    Note over A1,A3: With Jitter (desynchronized)
+    A1->>LLM: Retry (2.1s + jitter)
+    A2->>LLM: Retry (3.7s + jitter)
+    A3->>LLM: Retry (2.8s + jitter)
+    LLM-->>A1: Success
+    LLM-->>A2: Success
+    LLM-->>A3: Success
+```
+
+| Error category | Behavior | Floor | Cap |
+|---|---|---|---|
+| `RATE_LIMIT` | exp backoff (×3) + full jitter | `base_delay` (default `1.0`) | 60.0s |
+| `TRANSIENT` | exp backoff (×2) + full jitter | `base_delay` (default `1.0`) | 30.0s |
+| `CONTEXT_LIMIT` | deterministic | `0.5s` | `0.5s` |
+| `AUTH` / `INVALID_REQUEST` / `PERMANENT` | no retry | — | `0` |
+
+Jitter is automatic — there is no flag to turn it off.
+
+---
+
+## Workflow Timeout
+
+Stop runaway sync workflows that previously ignored `workflow_timeout`.
+
+```mermaid
+graph TB
+    Start[Workflow Start] --> Check{elapsed > timeout?}
+    Check -->|Yes| Cancel[Set workflow_cancelled = True]
+    Check -->|No| Execute[Execute Task]
+    Execute --> Check
+    Cancel --> Exit[Exit Workflow]
+```
+
+```python
+PraisonAIAgents(agents=[...], tasks=[...], workflow_timeout=60)
+```
+
+`workflow_cancelled` is the read-only flag set when a timeout fires (useful for downstream callbacks).
+
+**Scope change:** async already enforced this; **sync now does too**.
+
+---
+
+## Task Failure Policies
+
+By default, callback and memory exceptions are logged and swallowed. These flags surface them.
+
+```mermaid
+graph TB
+    Question[Should the workflow stop?] --> Yes[Set flag to True]
+    Question --> No[Leave default False]
+    No --> Inspect[Inspect TaskOutput.non_fatal_errors]
+    Yes --> Surface[Exceptions bubble up]
+```
+
+| Param | Type | Default | Effect when `True` |
+|---|---|---|---|
+| `fail_on_callback_error` | `bool` | `False` | Re-raises any exception thrown inside `task.callback`. |
+| `fail_on_memory_error` | `bool` | `False` | Re-raises memory-store failures (both inside and after the task). |
+
+```python
+from praisonaiagents import Agent, Task
+
+def buggy_callback(task_output):
+    raise ValueError("This callback always fails!")
+
+# This task will crash the workflow when callback fails
+strict_task = Task(
+    description="Process data",
+    callback=buggy_callback,
+    fail_on_callback_error=True,  # Surface the bug
+)
+
+# This task will log the error but continue
+lenient_task = Task(
+    description="Process data", 
+    callback=buggy_callback,
+    fail_on_callback_error=False,  # Swallow and log
+)
+
+# Check non-fatal errors after execution
+result = agent.start(lenient_task)
+print(f"Callback error: {result.callback_error}")
+print(f"All non-fatal errors: {result.non_fatal_errors}")
+```
+
+---
+
+## Common Patterns
+
+**Strict CI mode:**
+```python
+task = Task(
+    description="Validate output",
+    fail_on_callback_error=True,
+    fail_on_memory_error=True,
+)
+workflow = PraisonAIAgents(tasks=[task], workflow_timeout=60)
+```
+
+**Lenient production mode:**
+```python
+task = Task(
+    description="Generate content",
+    fail_on_callback_error=False,
+    fail_on_memory_error=False,
+)
+result = workflow.start()
+if result.non_fatal_errors:
+    metrics.increment("non_fatal_errors", tags={"task": task.name})
+```
+
+**Multi-agent fan-out:**
+```python
+# Jitter automatically prevents thundering herd
+agents = [Agent(name=f"Worker-{i}") for i in range(10)]
+# All agents hitting same LLM get automatic jitter - no config needed
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Set workflow_timeout for any agent that calls external APIs">
+Network calls can hang indefinitely. Always set a reasonable timeout:
+
+```python
+# Good: timeout prevents hung workflows
+workflow = PraisonAIAgents(workflow_timeout=300)
+
+# Bad: no timeout, workflow can hang forever
+workflow = PraisonAIAgents()
+```
+
+Use 60s for quick tasks, 300s for complex multi-step workflows.
+</Accordion>
+
+<Accordion title="Turn fail_on_callback_error=True in tests, leave False in prod">
+Tests should surface bugs immediately, production should be resilient:
+
+```python
+# Test environment
+if os.getenv("ENV") == "test":
+    fail_on_callback_error = True
+else:
+    fail_on_callback_error = False
+
+task = Task(
+    description="Process data",
+    fail_on_callback_error=fail_on_callback_error
+)
+```
+</Accordion>
+
+<Accordion title="Don't catch jitter-related delays — let the SDK handle backoff">
+The retry system is designed to handle rate limits automatically:
+
+```python
+# Good: let SDK handle retries
+agent = Agent(name="Worker")
+result = agent.start("Process this data")
+
+# Bad: don't manually catch and retry
+try:
+    result = agent.start("Process this data")
+except RateLimitError:
+    time.sleep(5)  # Wrong! SDK already does this with jitter
+    result = agent.start("Process this data")
+```
+</Accordion>
+
+<Accordion title="Inspect TaskOutput.non_fatal_errors in your monitoring pipeline">
+Non-fatal errors indicate potential issues that should be tracked:
+
+```python
+result = workflow.start()
+for error in result.non_fatal_errors:
+    logger.warning(f"Non-fatal error in {task.name}: {error}")
+    metrics.increment("task.non_fatal_error", tags={
+        "task": task.name,
+        "error_type": type(error).__name__
+    })
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Task Configuration" icon="gear" href="/concepts/tasks">
+  Task parameters and configuration options
+</Card>
+<Card title="Process Execution" icon="play" href="/concepts/process">
+  Workflow execution and management
+</Card>
+</CardGroup>

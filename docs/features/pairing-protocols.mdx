@@ -1,0 +1,401 @@
+---
+title: "Custom Auth & Pairing Protocols"
+sidebarTitle: "Auth Protocols"
+description: "Plug in your own auth, pairing store, or session binding using runtime-checkable Protocols"
+icon: "plug"
+---
+
+Protocols define extension points for custom authentication, pairing stores, and session binding implementations.
+
+```mermaid
+graph LR
+    Gateway --> AuthProtocol
+    Gateway --> PairingProtocol
+    Gateway --> SessionBindingProtocol
+    AuthProtocol --> YourAuth[Your Implementation]
+    PairingProtocol --> YourPairing[Your Implementation]
+    SessionBindingProtocol --> YourSession[Your Implementation]
+    
+    classDef gateway fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef protocol fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef impl fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class Gateway gateway
+    class AuthProtocol,PairingProtocol,SessionBindingProtocol protocol
+    class YourAuth,YourPairing,YourSession impl
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Import Protocols">
+
+```python
+from praisonaiagents.gateway.protocols import AuthProtocol, PairingProtocol, SessionBindingProtocol
+```
+
+</Step>
+
+<Step title="Implement Custom Store">
+
+```python
+import redis
+import secrets
+from typing import List, Dict, Any, Optional
+
+class RedisPairingStore:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+    
+    def generate_code(self, channel_type: str = "unknown", channel_id: Optional[str] = None) -> str:
+        code = secrets.token_hex(4).upper()  # 8-character hex
+        self.redis.setex(f"pairing:{code}", 300, f"{channel_type}:{channel_id or ''}")
+        return code
+    
+    def approve(self, channel_type: str, code: str, user_id: str = "", user_name: str = "") -> bool:
+        stored = self.redis.get(f"pairing:{code}")
+        if not stored:
+            return False
+        
+        self.redis.delete(f"pairing:{code}")
+        self.redis.set(f"paired:{channel_type}:{user_id}", user_name)
+        return True
+    
+    def is_paired(self, channel_id: str, channel_type: str) -> bool:
+        return bool(self.redis.exists(f"paired:{channel_type}:{channel_id}"))
+    
+    def list_paired(self) -> List["PairedChannel"]:
+        # Minimal implementation for protocol compliance
+        keys = self.redis.keys("paired:*")
+        return []  # Return empty for simplicity
+    
+    def revoke(self, channel_id: str, channel_type: str) -> bool:
+        return bool(self.redis.delete(f"paired:{channel_type}:{channel_id}"))
+    
+    def list_pending(self, channel_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        # Minimal implementation for protocol compliance
+        return []  # Return empty for simplicity
+
+# Use as protocol-compatible instance
+store = RedisPairingStore(redis.Redis())
+```
+
+</Step>
+</Steps>
+
+---
+
+## Protocol Specifications
+
+### AuthProtocol
+
+Authentication implementations for gateway requests.
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `check` | `check(request: Any) -> Dict[str, Any]` | `{ success: bool, user_id: Optional[str], role: Optional[str], metadata: Dict[str, Any] }` |
+
+### PairingProtocol
+
+Channel pairing and authorization management.
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `generate_code` | `generate_code(channel_type: str = "unknown", channel_id: Optional[str] = None) -> str` | The generated pairing code |
+| `approve` | `approve(channel_type: str, code: str, user_id: str = "", user_name: str = "") -> bool` | `True` if approval succeeded |
+| `is_paired` | `is_paired(channel_id: str, channel_type: str) -> bool` | Whether the channel is authorised |
+| `list_paired` | `list_paired() -> List["PairedChannel"]` | All paired channels |
+| `revoke` | `revoke(channel_id: str, channel_type: str) -> bool` | `True` if revocation succeeded |
+| `list_pending` | `list_pending(channel_type: Optional[str] = None) -> List[Dict[str, any]]` | Pending requests with channel, code, user info, age |
+
+### SessionBindingProtocol
+
+Session to principal mapping for state tracking.
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `bind` | `bind(session_id: str, principal: Dict[str, Any]) -> None` | — |
+| `lookup` | `lookup(session_id: str) -> Optional[Dict[str, Any]]` | Principal info if found |
+
+<Info>
+These are `@runtime_checkable` `typing.Protocol` classes — any object whose method shapes match (duck typing) satisfies them. No inheritance required.
+</Info>
+
+<Warning>
+Importing the Protocol classes is via `from praisonaiagents.gateway.protocols import AuthProtocol, PairingProtocol, SessionBindingProtocol`.
+</Warning>
+
+---
+
+## Custom Implementation Example
+
+```python
+from praisonaiagents.gateway.protocols import PairingProtocol
+import sqlite3
+import secrets
+import time
+from typing import List, Dict, Any, Optional
+
+class SQLitePairingStore:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS pending_codes (
+                code TEXT PRIMARY KEY,
+                channel_type TEXT,
+                channel_id TEXT,
+                created_at INTEGER
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS paired_channels (
+                channel_id TEXT,
+                channel_type TEXT,
+                user_name TEXT,
+                paired_at INTEGER,
+                PRIMARY KEY (channel_id, channel_type)
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def generate_code(self, channel_type: str = "unknown", channel_id: Optional[str] = None) -> str:
+        code = secrets.token_hex(4).upper()  # 8-character hex
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            'INSERT OR REPLACE INTO pending_codes VALUES (?, ?, ?, ?)',
+            (code, channel_type, channel_id or "", int(time.time()))
+        )
+        conn.commit()
+        conn.close()
+        return code
+    
+    def approve(self, channel_type: str, code: str, user_id: str = "", user_name: str = "") -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            'SELECT channel_id FROM pending_codes WHERE code = ? AND channel_type = ?',
+            (code, channel_type)
+        )
+        result = cursor.fetchone()
+        
+        if not result:
+            conn.close()
+            return False
+        
+        channel_id = result[0] or user_id
+        
+        # Remove pending code
+        conn.execute('DELETE FROM pending_codes WHERE code = ?', (code,))
+        
+        # Add to paired channels
+        conn.execute(
+            'INSERT OR REPLACE INTO paired_channels VALUES (?, ?, ?, ?)',
+            (channel_id, channel_type, user_name, int(time.time()))
+        )
+        
+        conn.commit()
+        conn.close()
+        return True
+    
+    def is_paired(self, channel_id: str, channel_type: str) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            'SELECT 1 FROM paired_channels WHERE channel_id = ? AND channel_type = ?',
+            (channel_id, channel_type)
+        )
+        result = cursor.fetchone() is not None
+        conn.close()
+        return result
+    
+    def list_paired(self) -> List["PairedChannel"]:
+        # Return empty list for simplicity - implement based on your PairedChannel structure
+        return []
+    
+    def revoke(self, channel_id: str, channel_type: str) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.execute(
+            'DELETE FROM paired_channels WHERE channel_id = ? AND channel_type = ?',
+            (channel_id, channel_type)
+        )
+        success = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return success
+    
+    def list_pending(self, channel_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        conn = sqlite3.connect(self.db_path)
+        if channel_type:
+            cursor = conn.execute(
+                'SELECT code, channel_type, channel_id, created_at FROM pending_codes WHERE channel_type = ?',
+                (channel_type,)
+            )
+        else:
+            cursor = conn.execute('SELECT code, channel_type, channel_id, created_at FROM pending_codes')
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                "code": row[0],
+                "channel_type": row[1], 
+                "channel_id": row[2],
+                "age_seconds": int(time.time()) - row[3]
+            })
+        conn.close()
+        return results
+
+# Use the custom store
+custom_store = SQLitePairingStore("pairing.db")
+```
+
+---
+
+## How It Works
+
+Protocol implementations allow you to plug custom backends into the PraisonAI gateway without modifying core code.
+
+```mermaid
+sequenceDiagram
+    participant Gateway
+    participant YourProtocol as Your Implementation
+    participant Backend as Your Backend
+    
+    Gateway->>YourProtocol: check(request)
+    YourProtocol->>Backend: Validate credentials
+    Backend-->>YourProtocol: User info
+    YourProtocol-->>Gateway: Auth result
+```
+
+| Protocol | Purpose | Extension Point |
+|----------|---------|-----------------|
+| `AuthProtocol` | Request authentication | Custom auth backends (LDAP, OAuth, etc.) |
+| `PairingProtocol` | Channel pairing storage | Custom storage (Redis, DB, etc.) |
+| `SessionBindingProtocol` | Session management | Custom session stores |
+
+---
+
+## Configuration Options
+
+Protocol implementations are dependency-injected into the gateway:
+
+```python
+from praisonaiagents.gateway import create_gateway
+from your_module import MyCustomPairingStore
+
+# Inject your custom implementation
+gateway = create_gateway(
+    pairing_store=MyCustomPairingStore(),
+    # Other protocols...
+)
+```
+
+---
+
+## Common Patterns
+
+<Tabs>
+<Tab title="Redis Backend">
+```python
+# Fast, distributed storage for high-traffic scenarios
+class RedisPairingStore:
+    def __init__(self, redis_url: str):
+        self.redis = redis.from_url(redis_url)
+```
+Best for: Multi-instance deployments, high throughput.
+</Tab>
+
+<Tab title="Database Backend">
+```python  
+# Persistent storage with ACID guarantees
+class DBPairingStore:
+    def __init__(self, db_url: str):
+        self.engine = create_engine(db_url)
+```
+Best for: Audit trails, complex queries, data persistence.
+</Tab>
+
+<Tab title="File Backend">
+```python
+# Simple file-based storage for development
+class FilePairingStore:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+```
+Best for: Development, single-instance deployments.
+</Tab>
+</Tabs>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Implement all protocol methods" icon="code">
+Protocol compliance requires implementing all methods, even if some return empty results for your use case.
+
+```python
+def list_pending(self, channel_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    # Even if you don't need pending logic, implement the method
+    return []
+```
+</Accordion>
+
+<Accordion title="Handle database errors gracefully" icon="shield">
+Wrap database operations in try-catch blocks and return safe defaults.
+
+```python
+def is_paired(self, channel_id: str, channel_type: str) -> bool:
+    try:
+        # Database operation
+        return self._check_database(channel_id, channel_type)
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+        return False  # Fail closed
+```
+</Accordion>
+
+<Accordion title="Use connection pooling for performance" icon="gauge">
+For database backends, use connection pools to avoid connection overhead.
+
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.pool import QueuePool
+
+engine = create_engine(
+    db_url,
+    poolclass=QueuePool,
+    pool_size=10,
+    max_overflow=20
+)
+```
+</Accordion>
+
+<Accordion title="Validate inputs to prevent injection" icon="lock">
+Always validate and sanitize inputs, especially for database queries.
+
+```python
+def approve(self, channel_type: str, code: str, user_id: str = "", user_name: str = "") -> bool:
+    # Validate inputs
+    if not code.isalnum() or len(code) != 8:
+        return False
+    # Use parameterized queries
+    return self._execute_query("UPDATE ...", (channel_type, code))
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Bot Pairing" icon="handshake" href="/docs/features/bot-pairing">
+Complete pairing system documentation
+</Card>
+<Card title="Unknown User Pairing" icon="user-check" href="/docs/features/bot-unknown-user-pairing">
+Owner-DM inline-button approval flow
+</Card>
+</CardGroup>
