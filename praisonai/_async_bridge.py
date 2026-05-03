@@ -6,7 +6,6 @@ handling nested event loop scenarios without creating a new event loop
 on every call (which is expensive and breaks multi-agent workflows).
 """
 import asyncio
-import atexit
 import os
 import threading
 from concurrent.futures import Future
@@ -22,18 +21,38 @@ class _BackgroundLoop:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
+    def _spawn_locked(self) -> asyncio.AbstractEventLoop:
+        """Create the loop+thread; caller must hold ``self._lock``.
+
+        The thread is marked ``daemon=True`` so that short-lived scripts
+        (e.g. CLI commands, smoke tests) exit cleanly without waiting on
+        the background loop to be shut down explicitly. Long-running
+        server processes should call :func:`shutdown` explicitly to cancel
+        in-flight tasks before process exit.
+        """
+        # Enforce the documented invariant. ``threading.Lock.locked()``
+        # is process-wide, not thread-local, but combined with the fact
+        # that the only callers are :py:meth:`get` and :py:meth:`get_unlocked`
+        # (the latter only invoked from inside ``run_sync`` while holding
+        # the lock), this catches the "forgot to hold the lock" mistake.
+        assert self._lock.locked(), "_spawn_locked() requires self._lock to be held"
+        if self._loop is None or self._loop.is_closed():
+            self._loop = asyncio.new_event_loop()
+            self._thread = threading.Thread(
+                target=self._loop.run_forever,
+                name="praisonai-async",
+                daemon=True,
+            )
+            self._thread.start()
+        return self._loop
+
     def get(self) -> asyncio.AbstractEventLoop:
         with self._lock:
-            if self._loop is None or self._loop.is_closed():
-                self._loop = asyncio.new_event_loop()
-                # non-daemon so shutdown must be explicit and clean
-                self._thread = threading.Thread(
-                    target=self._loop.run_forever,
-                    name="praisonai-async",
-                    daemon=False,
-                )
-                self._thread.start()
-            return self._loop
+            return self._spawn_locked()
+
+    def get_unlocked(self) -> asyncio.AbstractEventLoop:
+        """Get loop assuming caller holds _lock. For run_sync() use only."""
+        return self._spawn_locked()
 
     def shutdown(self, timeout: float = 5.0) -> None:
         with self._lock:
@@ -58,17 +77,14 @@ class _BackgroundLoop:
                 self._thread = None
 
 _BG = _BackgroundLoop()
-atexit.register(_BG.shutdown)
 
 
 def run_sync(coro: Awaitable[T], *, timeout: float | None = _DEFAULT_TIMEOUT) -> T:
     """
-    Run a coroutine synchronously, safe inside a running loop.
+    Run a coroutine synchronously using the background loop.
     
-    This function automatically detects if there's already a running event loop
-    and handles the execution appropriately:
-    - If no loop is running: uses background loop (consistent behavior)
-    - If a loop is running: schedules on background loop (safe path)
+    IMPORTANT: This function cannot be called from within a running event loop
+    as it would cause deadlock. Use 'await coro' directly from async contexts.
     
     Args:
         coro: The coroutine to run
@@ -78,24 +94,27 @@ def run_sync(coro: Awaitable[T], *, timeout: float | None = _DEFAULT_TIMEOUT) ->
         The result of the coroutine
         
     Raises:
+        RuntimeError: If called from within a running event loop
         TimeoutError: If timeout is exceeded
         Any exception raised by the coroutine
     """
     try:
         asyncio.get_running_loop()
-        running = True
     except RuntimeError:
-        running = False
+        pass
+    else:
+        raise RuntimeError(
+            "run_sync() cannot be called from a running event loop; "
+            "await the coroutine directly instead."
+        )
 
-    if not running:
-        # Reuse the background loop instead of creating a new one per call.
-        fut: Future = asyncio.run_coroutine_threadsafe(coro, _BG.get())
-        return fut.result(timeout=timeout)
-
-    fut = asyncio.run_coroutine_threadsafe(coro, _BG.get())
+    # Submit the coroutine inside the lock to prevent shutdown races
+    with _BG._lock:
+        loop = _BG.get_unlocked()
+        fut: Future = asyncio.run_coroutine_threadsafe(coro, loop)
     return fut.result(timeout=timeout)
 
 
 def shutdown() -> None:
-    """Public hook for servers (gateway, a2u, mcp_server) to stop the bridge cleanly."""
+    """Public hook for long-running server processes to stop the bridge cleanly."""
     _BG.shutdown()

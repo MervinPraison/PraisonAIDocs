@@ -17,10 +17,8 @@ import re
 import keyword
 
 # Import new architecture components
-from .framework_adapters import (
-    FrameworkAdapter, CrewAIAdapter, AutoGenAdapter, 
-    AutoGenV4Adapter, AG2Adapter, PraisonAIAdapter
-)
+from .framework_adapters.base import FrameworkAdapter
+from .framework_adapters.registry import FrameworkAdapterRegistry
 from .tool_registry import ToolRegistry
 
 # Import availability flags
@@ -51,14 +49,8 @@ try:
 except ImportError:
     pass
 
-# Registry of available adapters (lazy-loaded)
-FRAMEWORK_ADAPTERS = {
-    "crewai": CrewAIAdapter,
-    "autogen": AutoGenAdapter, 
-    "autogen_v4": AutoGenV4Adapter,
-    "ag2": AG2Adapter,
-    "praisonai": PraisonAIAdapter
-}
+# Framework adapter registry - now uses proper registry pattern
+# This replaces the hardcoded FRAMEWORK_ADAPTERS dict
 
 # Note: OTEL_SDK_DISABLED moved to CLI entry point per issue requirements
 
@@ -258,12 +250,8 @@ class AgentsGenerator:
         Raises:
             ValueError: If framework is not supported
         """
-        if framework not in FRAMEWORK_ADAPTERS:
-            raise ValueError(f"Unsupported framework: {framework}. "
-                           f"Supported frameworks: {list(FRAMEWORK_ADAPTERS.keys())}")
-        
-        adapter_class = FRAMEWORK_ADAPTERS[framework]
-        return adapter_class()
+        adapter_registry = FrameworkAdapterRegistry.get_instance()
+        return adapter_registry.create(framework)
 
     def _merge_cli_config(self, config, cli_config):
         """
@@ -363,6 +351,24 @@ class AgentsGenerator:
         spec.loader.exec_module(module)
         return {name: obj for name, obj in inspect.getmembers(module, self.is_function_or_decorated)}
     
+    def _extract_tool_classes(self, module):
+        """
+        Extract tool classes from a loaded module that inherit from BaseTool 
+        or are part of langchain_community.tools package.
+        """
+        result = {}
+        for name, obj in inspect.getmembers(module, 
+            lambda x: inspect.isclass(x) and (
+                x.__module__.startswith('langchain_community.tools') or 
+                (PRAISONAI_TOOLS_AVAILABLE and BaseTool and issubclass(x, BaseTool))
+            ) and x is not BaseTool):
+            try:
+                result[name] = obj()
+            except Exception as e:
+                self.logger.warning(f"Error instantiating tool class {name}: {e}")
+                continue
+        return result
+    
     def load_tools_from_module_class(self, module_path):
         """
         Loads tools from a specified module path containing classes that inherit from BaseTool 
@@ -415,15 +421,12 @@ class AgentsGenerator:
         """
         tools_list = []
         try:
-            # Try to import tools.py from current directory
-            spec = importlib.util.spec_from_file_location("tools", "tools.py")
-            self.logger.debug(f"Spec: {spec}")
-            if spec is None:
-                self.logger.debug("tools.py not found in current directory")
+            # Try to import tools.py from current directory using safe loading
+            from ._safe_loader import load_user_module
+            module = load_user_module("tools.py", name="tools")
+            if module is None:
+                self.logger.debug("tools.py not found or local tools loading disabled")
                 return tools_list
-
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
 
             # Register functions in the tool registry instead of globals()
             registered_tools = self.tool_registry.register_from_module(module)
@@ -544,11 +547,21 @@ class AgentsGenerator:
         tools_dir_path = Path(root_directory) / 'tools'
         
         if os.path.isfile(tools_py_path):
-            tools_dict.update(self.load_tools_from_module_class(tools_py_path))
-            self.logger.debug("tools.py exists in the root directory. Loading tools.py and skipping tools folder.")
+            from ._safe_loader import load_user_module
+            module = load_user_module(tools_py_path, name="tools_module")
+            if module is not None:
+                tools_dict.update(self._extract_tool_classes(module))
+                self.logger.debug("tools.py exists in the root directory. Loading tools.py and skipping tools folder.")
         elif tools_dir_path.is_dir():
-            tools_dict.update(self.load_tools_from_module_class(tools_dir_path))
-            self.logger.debug("tools folder exists in the root directory")
+            from ._safe_loader import load_user_module
+            for py_file in tools_dir_path.glob("*.py"):
+                if py_file.name.startswith("__"):
+                    continue
+                module = load_user_module(py_file, name=f"tools_{py_file.stem}")
+                if module is not None:
+                    tools_dict.update(self._extract_tool_classes(module))
+            if tools_dict:
+                self.logger.debug("tools folder exists in the root directory")
 
         framework = self.framework or config.get('framework', 'crewai')
 

@@ -19,6 +19,7 @@ warnings.warn(
 from .scheduler.shared import ScheduleParser, backoff_delay, safe_call
 import asyncio
 import logging
+import threading
 from datetime import datetime
 from typing import Optional, Dict, Any, Callable, Union
 from abc import ABC, abstractmethod
@@ -115,12 +116,34 @@ class AsyncAgentScheduler:
         
         self.is_running = False
         self._task: Optional[asyncio.Task] = None
-        self._stop_event = asyncio.Event()
         self._executor = AsyncPraisonAgentExecutor(agent)
         self._execution_count = 0
         self._success_count = 0
         self._failure_count = 0
         
+        # Sync lock for async primitives creation and bound loop tracking
+        self._primitives_lock = threading.Lock()
+        self._stop_event: Optional[asyncio.Event] = None
+        self._cancel_event: Optional[asyncio.Event] = None
+        self._stats_lock: Optional[asyncio.Lock] = None
+        self._bound_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _ensure_async_primitives(self) -> None:
+        """Create async primitives if they don't exist yet.
+        
+        Thread-safe and loop-aware: primitives are bound to the current running loop.
+        If called from a different loop, new primitives are created.
+        """
+        loop = asyncio.get_running_loop()  # must be called from a coroutine
+        
+        with self._primitives_lock:
+            if self._bound_loop is not loop:
+                self._stop_event = asyncio.Event()
+                self._cancel_event = asyncio.Event()
+                self._stats_lock = asyncio.Lock()
+                self._bound_loop = loop
+
+
     async def start(
         self,
         schedule_expr: str,
@@ -145,6 +168,7 @@ class AsyncAgentScheduler:
         try:
             interval = ScheduleParser.parse(schedule_expr)
             self.is_running = True
+            self._ensure_async_primitives()  # NEW — bind to the loop start() runs on
             self._stop_event.clear()
             
             logger.info(f"Starting async agent scheduler: {getattr(self.agent, 'name', 'Agent')}")
@@ -173,14 +197,35 @@ class AsyncAgentScheduler:
         """
         Stop the scheduler gracefully.
         
+        IMPORTANT: This method must be called from the same event loop
+        that was used to start the scheduler.
+        
         Returns:
             True if stopped successfully
+            
+        Raises:
+            RuntimeError: If called from a different event loop than start()
         """
         if not self.is_running:
             logger.info("Async scheduler is not running")
             return True
-            
+        
         logger.info("Stopping async agent scheduler...")
+        
+        # _stop_event is guaranteed non-None after a successful start()
+        if self._stop_event is None:
+            logger.warning("stop() called before start(); nothing to stop.")
+            self.is_running = False
+            return True
+            
+        # Ensure we're on the same loop that was bound during start()
+        current_loop = asyncio.get_running_loop()
+        if self._bound_loop is not None and current_loop is not self._bound_loop:
+            raise RuntimeError(
+                "stop() must be called from the same event loop as start(). "
+                f"Expected: {self._bound_loop}, got: {current_loop}"
+            )
+            
         self._stop_event.set()
         
         try:
@@ -226,6 +271,7 @@ class AsyncAgentScheduler:
     async def _run_schedule(self, interval: int, max_retries: int):
         """Internal method to run scheduled agent executions."""
         try:
+            self._ensure_async_primitives()
             while not self._stop_event.is_set():
                 logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting async scheduled agent execution")
                 
