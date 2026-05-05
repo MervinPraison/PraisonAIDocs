@@ -47,7 +47,30 @@ class MyFrameworkAdapter(BaseFrameworkAdapter):
         except ImportError:
             return False
     
-    def run(self, config, llm_config, topic):
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ):
+        # Resolve agent tools from tools_dict
+        agent_tool_list = []
+        if tools_dict:
+            for t in config.get("roles", {}).get("agent_name", {}).get("tools", []):
+                if t in tools_dict:
+                    agent_tool_list.append(tools_dict[t])
+
+        # Wire callbacks
+        # if agent_callback:
+        #     agent.step_callback = agent_callback
+        # if task_callback:
+        #     task.callback = task_callback
+        
         # Framework execution logic
         return "Framework execution result"
     
@@ -144,8 +167,22 @@ Framework adapters must implement the `FrameworkAdapter` protocol:
 |--------|----------|-------------|
 | `name` | ✅ | Unique framework identifier |
 | `is_available()` | ✅ | Check framework dependencies |
-| `run(config, llm_config, topic)` | ✅ | Execute framework logic |
+| `run(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ✅ | Execute framework logic |
 | `cleanup()` | ✅ | Clean up resources |
+
+| Parameter | Type | Default | Purpose |
+|-----------|------|---------|-------------|
+| `config` | `Dict[str, Any]` | - | Framework configuration |
+| `llm_config` | `List[Dict]` | - | LLM configuration list |
+| `topic` | `str` | - | Topic for the tasks |
+| `tools_dict` | `Optional[Dict[str, Any]]` | `None` | Available tools dictionary |
+| `agent_callback` | `Optional[Callable]` | `None` | Callback for agent events |
+| `task_callback` | `Optional[Callable]` | `None` | Callback for task events |
+| `cli_config` | `Optional[Dict[str, Any]]` | `None` | CLI configuration |
+
+<Note>
+**Migrating from old signature**: Adapters written for PraisonAI < 1615 (only `run(config, llm_config, topic)`) still work because the new args are keyword-only with defaults. To use tool wiring or callbacks, accept `**kwargs` or the explicit kw-only params.
+</Note>
 
 ---
 
@@ -167,8 +204,25 @@ class CustomCrewAIAdapter(BaseFrameworkAdapter):
         except ImportError:
             return False
     
-    def run(self, config, llm_config, topic):
-        # Custom CrewAI execution logic
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ):
+        # Resolve tools for agents
+        if tools_dict:
+            for role_config in config.get('roles', {}).values():
+                agent_tools = role_config.get('tools', [])
+                resolved_tools = [tools_dict[t] for t in agent_tools if t in tools_dict]
+                # Wire tools to your framework's agents
+        
+        # Custom CrewAI execution logic with callbacks
         return "Custom CrewAI result"
 
 # Override built-in CrewAI adapter
@@ -193,10 +247,30 @@ class NonPythonAdapter(BaseFrameworkAdapter):
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
     
-    def run(self, config, llm_config, topic):
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ):
         # Convert config to external format
         cmd = ["external_framework", "run", "--topic", topic]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Pass tools as environment variables or config file
+        if tools_dict:
+            import json
+            import os
+            env = os.environ.copy()
+            env['FRAMEWORK_TOOLS'] = json.dumps(list(tools_dict.keys()))
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        else:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
         return result.stdout
 ```
 
@@ -221,12 +295,31 @@ class OptionalDepsAdapter(BaseFrameworkAdapter):
             logger.debug(f"Framework not available: {e}")
             return False
     
-    def run(self, config, llm_config, topic):
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ):
         if not self.is_available():
             raise RuntimeError("Framework dependencies not installed")
         
         import advanced_framework
-        return advanced_framework.execute(config, llm_config, topic)
+        
+        # Pass all parameters to framework
+        return advanced_framework.execute(
+            config=config,
+            llm_config=llm_config,
+            topic=topic,
+            tools=tools_dict,
+            callbacks={'agent': agent_callback, 'task': task_callback},
+            cli_options=cli_config
+        )
 ```
 
 ---
@@ -265,24 +358,61 @@ def is_available(self) -> bool:
 
 <Accordion title="Avoid Import-Time Failures">
 
-Don't import heavy dependencies at module level:
+Don't import heavy dependencies at module level. Follow three concrete patterns to avoid import-time failures:
 
 ```python
 # ❌ Bad - imports at module level
 import heavy_framework
 from expensive.module import Component
+# ❌ Bad - environment setup at module level
+load_dotenv()
+logging.getLogger('framework.cli.config').setLevel(logging.ERROR)
 
 class BadAdapter(BaseFrameworkAdapter):
     pass
 
 # ✅ Good - lazy imports
 class GoodAdapter(BaseFrameworkAdapter):
-    def run(self, config, llm_config, topic):
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ):
         # Import only when needed
         import heavy_framework
         from expensive.module import Component
-        return heavy_framework.run(config)
+        
+        # Move environment setup here
+        self._load_env_once()
+        
+        # Configure framework-specific logging
+        logging.getLogger('framework.cli.config').setLevel(logging.ERROR)
+        
+        return heavy_framework.run(
+            config, llm_config, topic,
+            tools=tools_dict,
+            callbacks={'agent': agent_callback, 'task': task_callback}
+        )
+    
+    def _load_env_once(self):
+        """Load environment variables only when needed."""
+        if not hasattr(self, '_env_loaded'):
+            from dotenv import load_dotenv
+            load_dotenv()
+            self._env_loaded = True
 ```
+
+**Three critical patterns to follow:**
+
+1. **Move `load_dotenv()` from module top to a function called at run/CLI entry** (not at import).
+2. **Move framework-specific logger config** (e.g. `logging.getLogger('framework.cli.config').setLevel(logging.ERROR)`) into the adapter's `run()` body, not the wrapper's `__init__.py`.
+3. **Use lazy registration via `__getattr__`** instead of calling registration functions at import time.
 
 </Accordion>
 
@@ -299,10 +429,27 @@ class LoggingAdapter(BaseFrameworkAdapter):
         super().__init__()
         self.logger = logging.getLogger(__name__)
     
-    def run(self, config, llm_config, topic):
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ):
         self.logger.info(f"Starting {self.name} execution for topic: {topic}")
+        self.logger.debug(f"Available tools: {list(tools_dict.keys()) if tools_dict else 'None'}")
         try:
-            result = self._execute_framework(config, llm_config, topic)
+            result = self._execute_framework(
+                config, llm_config, topic,
+                tools_dict=tools_dict,
+                agent_callback=agent_callback,
+                task_callback=task_callback,
+                cli_config=cli_config
+            )
             self.logger.info(f"Execution completed successfully")
             return result
         except Exception as e:
@@ -323,13 +470,29 @@ class ResourceAwareAdapter(BaseFrameworkAdapter):
         self._connections = []
         self._temp_files = []
     
-    def run(self, config, llm_config, topic):
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ):
         # Create resources during execution
         conn = self._create_connection()
         self._connections.append(conn)
         
         temp_file = self._create_temp_file()
         self._temp_files.append(temp_file)
+        
+        # Wire tools and callbacks
+        if tools_dict:
+            self._setup_tools(tools_dict)
+        if agent_callback:
+            self._setup_agent_callback(agent_callback)
         
         # Use resources...
         return result
@@ -351,6 +514,37 @@ class ResourceAwareAdapter(BaseFrameworkAdapter):
         
         self._connections.clear()
         self._temp_files.clear()
+```
+
+</Accordion>
+
+<Accordion title="Be Multi-Agent and Multi-Tenant Safe">
+
+Avoid shared global state mutations at import time that could affect other adapters:
+
+```python
+# ❌ Bad - global state mutations at import time
+_global_registry = {}
+_configure_logging()  # Affects all adapters
+
+class BadAdapter(BaseFrameworkAdapter):
+    def __init__(self):
+        _global_registry[self.name] = self  # Shared state
+
+# ✅ Good - scoped state management
+class GoodAdapter(BaseFrameworkAdapter):
+    def __init__(self):
+        self._local_state = {}  # Instance-scoped
+    
+    def run(self, config, llm_config, topic, *, tools_dict=None, **kwargs):
+        # Configure only what this adapter needs
+        with self._scoped_configuration():
+            return self._execute_safely(config, llm_config, topic)
+    
+    def _scoped_configuration(self):
+        """Context manager for adapter-specific configuration."""
+        # Temporary, reversible configuration changes
+        pass
 ```
 
 </Accordion>
