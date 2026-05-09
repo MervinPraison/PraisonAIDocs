@@ -26,7 +26,30 @@ result = agent.start("What is 123 + 456?", stream=True)
 def handle_calculator(tool_name, tool_input):
     expr = tool_input.get("expression", "0")
     try:
-        val = eval(expr, {"__builtins__": {}})
+        import ast
+        import operator
+
+        _OPS = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+
+        def _safe_eval(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return node.value
+            elif isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+                return _OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+            elif isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+                return _OPS[type(node.op)](_safe_eval(node.operand))
+            else:
+                raise ValueError("Unsupported expression")
+
+        val = _safe_eval(ast.parse(expr, mode="eval").body)
     except Exception:
         val = "error"
     print(f"  [Calculator: {expr} = {val}]")
