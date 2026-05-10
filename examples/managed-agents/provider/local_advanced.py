@@ -23,10 +23,40 @@ print(f"[2] Updated to v{managed.agent_version}")
 result = agent.start("What is 123 + 456?", stream=True)
 
 # ── 3. Custom tool ──
+def _safe_eval_arithmetic(expression: str) -> float:
+    """Safely evaluate a numeric arithmetic expression using AST parsing."""
+    import ast
+    import operator
+
+    _OPS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Pow: operator.pow,
+        ast.USub: operator.neg,
+        ast.UAdd: operator.pos,
+    }
+
+    def _safe_eval(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        elif isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+            return _OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+        elif isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+            return _OPS[type(node.op)](_safe_eval(node.operand))
+        else:
+            raise ValueError("Unsupported expression")
+
+    try:
+        return _safe_eval(ast.parse(expression, mode="eval").body)
+    except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError):
+        raise ValueError("Invalid arithmetic expression")
+
 def handle_calculator(tool_name, tool_input):
     expr = tool_input.get("expression", "0")
     try:
-        val = eval(expr, {"__builtins__": {}})
+        val = _safe_eval_arithmetic(expr)
     except Exception:
         val = "error"
     print(f"  [Calculator: {expr} = {val}]")
