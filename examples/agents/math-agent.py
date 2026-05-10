@@ -14,12 +14,34 @@ import re
 def basic_calculator(expression: str) -> str:
     """Evaluate basic mathematical expressions safely."""
     try:
-        # Remove any non-mathematical characters for safety
-        safe_expr = re.sub(r'[^0-9+\-*/().,\s]', '', expression)
-        result = eval(safe_expr)
+        # Evaluate using safe AST parser
+        import ast
+        import operator
+
+        _OPS = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+
+        def _safe_eval(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return node.value
+            elif isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+                return _OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+            elif isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+                return _OPS[type(node.op)](_safe_eval(node.operand))
+            else:
+                raise ValueError("Unsupported expression")
+
+        result = _safe_eval(ast.parse(expression, mode="eval").body)
         return f"Result: {result}"
-    except Exception as e:
-        return f"Error in calculation: {str(e)}"
+    except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError):
+        return f"Error in calculation: Invalid expression"
 
 def solve_quadratic(a: float, b: float, c: float) -> str:
     """Solve quadratic equation ax² + bx + c = 0."""

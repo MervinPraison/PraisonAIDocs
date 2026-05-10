@@ -49,10 +49,34 @@ def calculate_with_tracking(expression: str) -> str:
     time.sleep(0.05)
     
     try:
-        result = eval(expression)
+        # Safely evaluate math expression using AST
+        import ast
+        import operator
+
+        _OPS = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+
+        def _safe_eval(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return node.value
+            elif isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+                return _OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+            elif isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+                return _OPS[type(node.op)](_safe_eval(node.operand))
+            else:
+                raise ValueError("Unsupported expression")
+
+        result = _safe_eval(ast.parse(expression, mode="eval").body)
         return f"Result: {result}"
-    except Exception as e:
-        return f"Error: {str(e)}"
+    except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError):
+        return f"Error: Invalid expression"
 
 
 # Example 3: Tool with context manager tracking

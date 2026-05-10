@@ -47,15 +47,34 @@ def calculate(expression: str) -> Dict[str, Any]:
         The result of the calculation
     """
     try:
-        # Safe evaluation of mathematical expressions
-        allowed_chars = set("0123456789+-*/.() ")
-        if not all(c in allowed_chars for c in expression):
-            return {"error": "Invalid characters in expression"}
-        
-        result = eval(expression)  # Use safer alternative in production
+        # Safely evaluate mathematical expressions using AST
+        import ast
+        import operator
+
+        _OPS = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.Pow: operator.pow,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+
+        def _safe_eval(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return node.value
+            elif isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+                return _OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+            elif isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+                return _OPS[type(node.op)](_safe_eval(node.operand))
+            else:
+                raise ValueError("Unsupported expression")
+
+        result = _safe_eval(ast.parse(expression, mode="eval").body)
         return {"expression": expression, "result": result}
-    except Exception as e:
-        return {"error": str(e)}
+    except (ValueError, SyntaxError, TypeError, ZeroDivisionError, OverflowError):
+        return {"error": "Invalid arithmetic expression"}
 
 
 def get_weather(city: str, units: str = "celsius") -> Dict[str, Any]:
