@@ -250,10 +250,21 @@ class AsyncAgentScheduler:
             self.is_running = False
         
         logger.info("Async agent scheduler stopped")
-        logger.info(f"Execution stats - Total: {self._execution_count}, Success: {self._success_count}, Failed: {self._failure_count}")
+        
+        # Log final stats with consistent snapshot
+        if self._stats_lock is not None:
+            async with self._stats_lock:
+                total = self._execution_count
+                ok = self._success_count
+                fail = self._failure_count
+        else:
+            total = self._execution_count
+            ok = self._success_count
+            fail = self._failure_count
+        logger.info(f"Execution stats - Total: {total}, Success: {ok}, Failed: {fail}")
         return True
     
-    def get_stats(self) -> Dict[str, Any]:
+    async def get_stats(self) -> Dict[str, Any]:
         """
         Get current execution statistics (synchronous, best-effort).
         
@@ -264,12 +275,26 @@ class AsyncAgentScheduler:
         Returns:
             Dictionary with execution stats
         """
+        # Primitives are created lazily in _ensure_async_primitives(); if not yet
+        # initialized there are no concurrent writers, so a direct read is safe.
+        if self._stats_lock is not None:
+            async with self._stats_lock:
+                total = self._execution_count
+                ok = self._success_count
+                fail = self._failure_count
+                running = self.is_running
+        else:
+            total = self._execution_count
+            ok = self._success_count
+            fail = self._failure_count
+            running = self.is_running
+            
         return {
-            "is_running": self.is_running,
-            "total_executions": self._execution_count,
-            "successful_executions": self._success_count,
-            "failed_executions": self._failure_count,
-            "success_rate": (self._success_count / self._execution_count * 100) if self._execution_count > 0 else 0
+            "is_running": running,
+            "total_executions": total,
+            "successful_executions": ok,
+            "failed_executions": fail,
+            "success_rate": (ok / total * 100) if total > 0 else 0
         }
     
     async def get_stats_async(self) -> Dict[str, Any]:
@@ -327,11 +352,8 @@ class AsyncAgentScheduler:
     
     async def _execute_with_retry(self, max_retries: int):
         """Execute agent with retry logic."""
-        # Ensure async primitives are available
-        if self._stats_lock is None:
-            self._ensure_async_primitives()
-        
-        # Atomically increment execution count
+        self._ensure_async_primitives()  # guarantees _stats_lock is bound to current loop
+
         async with self._stats_lock:
             self._execution_count += 1
         
@@ -344,7 +366,6 @@ class AsyncAgentScheduler:
                 logger.info(f"Async agent execution successful on attempt {attempt + 1}")
                 logger.info(f"Result: {result}")
                 
-                # Atomically increment success count
                 async with self._stats_lock:
                     self._success_count += 1
                 safe_call(self.on_success, result)
@@ -359,7 +380,6 @@ class AsyncAgentScheduler:
                     logger.info(f"Waiting {wait_time}s before async retry...")
                     await asyncio.sleep(wait_time)
         
-        # Atomically increment failure count
         async with self._stats_lock:
             self._failure_count += 1
         logger.error(f"Async agent execution failed after {max_retries} attempts")

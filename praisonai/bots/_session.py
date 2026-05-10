@@ -62,6 +62,7 @@ class BotSessionManager:
         max_history: int = 100,
         store: Optional[Any] = None,
         platform: str = "",
+        dlq: Optional[Any] = None,
         identity_resolver: Optional[Any] = None,
     ) -> None:
         self._histories: Dict[str, List[Dict[str, Any]]] = {}
@@ -71,6 +72,10 @@ class BotSessionManager:
         self._store = store
         self._platform = platform
         self._last_active: Dict[str, float] = {}
+        # N4: optional inbound DLQ — when set, failed agent.chat() calls
+        # are persisted for later replay. Default ``None`` preserves
+        # legacy behaviour (exception bubbles up untouched).
+        self._dlq = dlq
         # W1: optional cross-platform identity resolver. When set, the
         # session key is the resolver-returned unified user id, so the
         # same human pinging from multiple platforms shares one history.
@@ -172,6 +177,13 @@ class BotSessionManager:
 
         Uses both a per-user lock (serialise same user) and a per-agent
         lock (prevent concurrent history swaps on a shared Agent).
+
+        N4 — Inbound DLQ: if a ``dlq`` was passed to ``__init__`` and
+        ``agent.chat()`` raises, the failing message is persisted to
+        the dead-letter queue **before** the exception is re-raised.
+        This makes the error visible to the caller (so the bot adapter
+        can log / show the user a friendly message) while preserving
+        the message for later replay.
         """
         self._last_active[self._storage_key(user_id)] = time.monotonic()
         user_lock = self._get_lock(user_id)
@@ -209,9 +221,6 @@ class BotSessionManager:
                 # W1 robustness: hold ``agent_lock`` across the FULL LLM call
                 # (not only the history swap) so concurrent users on a shared
                 # Agent instance never observe each other's chat_history.
-                # Throughput on a shared agent is then bounded by the LLM's
-                # serial latency — this is correct: a single Agent's
-                # ``chat_history`` is mutable and cannot be safely interleaved.
                 async with agent_lock:
                     saved_history = agent.chat_history
                     agent.chat_history = user_history
@@ -226,6 +235,28 @@ class BotSessionManager:
                         )
                         # Capture updated history before restoring caller's.
                         updated_history = agent.chat_history
+                    except Exception as exc:
+                        # N4: persist the failed inbound message before bubbling.
+                        if self._dlq is not None:
+                            try:
+                                await loop.run_in_executor(
+                                    None,
+                                    lambda: self._dlq.enqueue(
+                                        platform=self._platform,
+                                        user_id=user_id,
+                                        prompt=prompt,
+                                        error=f"{type(exc).__name__}: {exc}",
+                                        chat_id=chat_id,
+                                        thread_id=thread_id,
+                                        user_name=user_name,
+                                    )
+                                )
+                            except Exception as dlq_exc:  # pragma: no cover — defensive
+                                logger.error(
+                                    "Failed to enqueue inbound DLQ entry: %s", dlq_exc
+                                )
+                        agent.chat_history = saved_history
+                        raise
                     finally:
                         agent.chat_history = saved_history
 

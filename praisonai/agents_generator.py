@@ -19,7 +19,7 @@ import difflib
 
 # Import new architecture components
 from .framework_adapters.base import FrameworkAdapter
-from .framework_adapters.registry import FrameworkAdapterRegistry
+from .framework_adapters.registry import FrameworkAdapterRegistry, get_default_registry
 from .tool_registry import ToolRegistry
 
 # Import availability flags
@@ -43,10 +43,12 @@ except ImportError:
 # Check for additional framework availability
 AG2_AVAILABLE = False
 PRAISONAI_AVAILABLE = False
+AGENTOPS_AVAILABLE = False
 try:
     import importlib.util
     AG2_AVAILABLE = importlib.util.find_spec("ag2") is not None
     PRAISONAI_AVAILABLE = importlib.util.find_spec("praisonaiagents") is not None
+    AGENTOPS_AVAILABLE = importlib.util.find_spec("agentops") is not None
 except ImportError:
     pass
 
@@ -179,7 +181,7 @@ def _resolve_yaml_cli_backend(cli_backend_config, logger):
 
 
 class AgentsGenerator:
-    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None):
+    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None, adapter_registry=None):
         """
         Initialize the AgentsGenerator object.
 
@@ -193,6 +195,7 @@ class AgentsGenerator:
             agent_yaml (str, optional): The content of the YAML file. Defaults to None.
             tools (dict, optional): A dictionary containing the tools to be used for the agents. Defaults to None.
             cli_config (dict, optional): CLI configuration to override YAML settings. Defaults to None.
+            adapter_registry (FrameworkAdapterRegistry, optional): Registry for framework adapters. Defaults to process default.
 
         Attributes:
             agent_file (str): The path to the agent file.
@@ -233,6 +236,10 @@ class AgentsGenerator:
         self.tool_registry = ToolRegistry()
         self.tool_registry.register_builtin_autogen_adapters()
         
+        # DI-friendly: tests/multi-tenant runtimes pass their own registry;
+        # CLI users get the process default.
+        self._adapter_registry = adapter_registry or get_default_registry()
+        
         # Get framework adapter (availability already validated at CLI entry)
         self.framework_adapter = self._get_framework_adapter(framework)
 
@@ -249,8 +256,7 @@ class AgentsGenerator:
         Raises:
             ValueError: If framework is not supported
         """
-        adapter_registry = FrameworkAdapterRegistry.get_instance()
-        return adapter_registry.create(framework)
+        return self._adapter_registry.create(framework)
 
     def _merge_cli_config(self, config, cli_config):
         """
@@ -375,20 +381,19 @@ class AgentsGenerator:
 
     def load_tools_from_module(self, module_path):
         """
-        Loads tools from a specified module path.
+        Load function tools from a user-supplied module (gated by PRAISONAI_ALLOW_LOCAL_TOOLS).
 
         Parameters:
             module_path (str): The path to the module containing the tools.
 
         Returns:
             dict: A dictionary containing the names of the tools as keys and the corresponding functions or objects as values.
-
-        Raises:
-            FileNotFoundError: If the specified module path does not exist.
+                  Returns an empty dict if the module cannot be loaded (path missing, loading blocked by PRAISONAI_ALLOW_LOCAL_TOOLS, or any other load error).
         """
-        spec = importlib.util.spec_from_file_location("tools_module", module_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        from ._safe_loader import load_user_module
+        module = load_user_module(module_path, name="tools_module")
+        if module is None:
+            return {}
         return {name: obj for name, obj in inspect.getmembers(module, self.is_function_or_decorated)}
     
     def _extract_tool_classes(self, module):
@@ -411,21 +416,13 @@ class AgentsGenerator:
     
     def load_tools_from_module_class(self, module_path):
         """
-        Loads tools from a specified module path containing classes that inherit from BaseTool 
-        or are part of langchain_community.tools package.
+        Load BaseTool / langchain tool classes from a user-supplied module (gated by PRAISONAI_ALLOW_LOCAL_TOOLS).
         """
-        spec = importlib.util.spec_from_file_location("tools_module", module_path)
-        module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-            return {name: obj() for name, obj in inspect.getmembers(module, 
-                lambda x: inspect.isclass(x) and (
-                    x.__module__.startswith('langchain_community.tools') or 
-                    (PRAISONAI_TOOLS_AVAILABLE and BaseTool and issubclass(x, BaseTool))
-                ) and x is not BaseTool)}
-        except ImportError as e:
-            self.logger.warning(f"Error loading tools from {module_path}: {e}")
+        from ._safe_loader import load_user_module
+        module = load_user_module(module_path, name="tools_module")
+        if module is None:
             return {}
+        return self._extract_tool_classes(module)
 
     def load_tools_from_package(self, package_path):
         """
@@ -784,7 +781,11 @@ class AgentsGenerator:
         result = "### Output ###\n" + response[-1].summary if hasattr(response[-1], 'summary') else ""
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result
 
@@ -1171,7 +1172,11 @@ class AgentsGenerator:
         result = f"### Task Output ###\n{response}"
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result
 
@@ -1479,6 +1484,10 @@ class AgentsGenerator:
                     self.logger.error(f"Error stopping InteractiveRuntime: {e}")
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result
