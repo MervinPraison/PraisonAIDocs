@@ -5,7 +5,7 @@ Provides lazy-loaded integration with AutoGen v0.2, AutoGen v0.4, and AG2 framew
 """
 
 import logging
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Callable
 from .base import BaseFrameworkAdapter
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,17 @@ class AutoGenAdapter(BaseFrameworkAdapter):
         except ImportError:
             return False
     
-    def run(self, config: Dict[str, Any], llm_config: List[Dict], topic: str) -> str:
+    def run(
+        self,
+        config: Dict[str, Any],
+        llm_config: List[Dict],
+        topic: str,
+        *,
+        tools_dict: Optional[Dict[str, Any]] = None,
+        agent_callback: Optional[Callable] = None,
+        task_callback: Optional[Callable] = None,
+        cli_config: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """
         Run AutoGen v0.2 with given configuration.
         
@@ -34,6 +44,10 @@ class AutoGenAdapter(BaseFrameworkAdapter):
             config: AutoGen configuration with agents
             llm_config: LLM configuration list
             topic: Topic for the tasks
+            tools_dict: Available tools dictionary
+            agent_callback: Callback for agent events
+            task_callback: Callback for task events
+            cli_config: CLI configuration
             
         Returns:
             Execution result as string
@@ -110,7 +124,17 @@ class AutoGenV4Adapter(BaseFrameworkAdapter):
         except ImportError:
             return False
     
-    def run(self, config: Dict[str, Any], llm_config: List[Dict], topic: str) -> str:
+    def run(
+        self,
+        config: Dict[str, Any],
+        llm_config: List[Dict],
+        topic: str,
+        *,
+        tools_dict: Optional[Dict[str, Any]] = None,
+        agent_callback: Optional[Callable] = None,
+        task_callback: Optional[Callable] = None,
+        cli_config: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """
         Run AutoGen v0.4 with given configuration.
         
@@ -118,6 +142,10 @@ class AutoGenV4Adapter(BaseFrameworkAdapter):
             config: AutoGen v0.4 configuration with agents
             llm_config: LLM configuration list
             topic: Topic for the tasks
+            tools_dict: Available tools dictionary
+            agent_callback: Callback for agent events
+            task_callback: Callback for task events
+            cli_config: CLI configuration
             
         Returns:
             Execution result as string
@@ -128,7 +156,7 @@ class AutoGenV4Adapter(BaseFrameworkAdapter):
         # For now, return a proper error message instead of delegating
         # TODO: Implement full AutoGen v0.4 adapter logic
         logger.warning("AutoGen v0.4 adapter is not yet fully implemented")
-        return "### AutoGen v0.4 Output ###\nAutoGen v0.4 adapter is not yet fully implemented. Please use 'autogen' framework for AutoGen v0.2 support."
+        raise NotImplementedError("AutoGen v0.4 adapter is not yet fully implemented. Please use 'autogen' framework for AutoGen v0.2 support.")
 
 
 class AG2Adapter(BaseFrameworkAdapter):
@@ -148,7 +176,17 @@ class AG2Adapter(BaseFrameworkAdapter):
         except Exception:
             return False
     
-    def run(self, config: Dict[str, Any], llm_config: List[Dict], topic: str) -> str:
+    def run(
+        self,
+        config: Dict[str, Any],
+        llm_config: List[Dict],
+        topic: str,
+        *,
+        tools_dict: Optional[Dict[str, Any]] = None,
+        agent_callback: Optional[Callable] = None,
+        task_callback: Optional[Callable] = None,
+        cli_config: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """
         Run AG2 with given configuration.
         
@@ -156,6 +194,10 @@ class AG2Adapter(BaseFrameworkAdapter):
             config: AG2 configuration with agents
             llm_config: LLM configuration list  
             topic: Topic for the tasks
+            tools_dict: Available tools dictionary
+            agent_callback: Callback for agent events
+            task_callback: Callback for task events
+            cli_config: CLI configuration
             
         Returns:
             Execution result as string
@@ -166,4 +208,4 @@ class AG2Adapter(BaseFrameworkAdapter):
         # For now, return a proper error message instead of delegating
         # TODO: Implement full AG2 adapter logic
         logger.warning("AG2 adapter is not yet fully implemented")
-        return "### AG2 Output ###\nAG2 adapter is not yet fully implemented. Please use 'autogen' framework for AutoGen/AG2 support."
+        raise NotImplementedError("AG2 adapter is not yet fully implemented. Please use 'autogen' framework for AutoGen/AG2 support.")
