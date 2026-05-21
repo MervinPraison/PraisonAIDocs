@@ -63,6 +63,7 @@ import cProfile
 import pstats
 import io
 import statistics
+from collections import OrderedDict
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field, asdict
@@ -266,7 +267,8 @@ class _ProfilerImpl:
         self._memory = deque(maxlen=max_records)
         self._enabled: bool = False
         self._flow_step: int = 0
-        self._files_accessed: Dict[str, int] = {}
+        self._files_accessed: "OrderedDict[str, int]" = OrderedDict()
+        self._files_accessed_max = max_records   # reuse the existing bound
         self._line_profile_data: Dict[str, Any] = {}
         self._cprofile_stats = deque(maxlen=max_records)
         self._lock = threading.Lock()
@@ -312,9 +314,15 @@ class _ProfilerImpl:
                 line=line
             ))
             
-            # Track file access
+            # Track file access with LRU eviction
             if file:
-                self._files_accessed[file] = self._files_accessed.get(file, 0) + 1
+                if file in self._files_accessed:
+                    self._files_accessed[file] += 1
+                    self._files_accessed.move_to_end(file)
+                else:
+                    self._files_accessed[file] = 1
+                    if len(self._files_accessed) > self._files_accessed_max:
+                        self._files_accessed.popitem(last=False)
     
     def record_import(self, module: str, duration_ms: float, parent: str = "") -> None:
         """Record an import timing."""
@@ -950,152 +958,6 @@ def check_module_available(module_name: str) -> bool:
     import importlib.util
     return importlib.util.find_spec(module_name) is not None
 
-
-# ============================================================================
-# Context-Aware Default Profiler
-# ============================================================================
-
-# Context variable for current profiler (enables per-agent isolation)
-_current_profiler: ContextVar[Optional[_ProfilerImpl]] = ContextVar("current_profiler", default=None)
-
-# Module-level default for CLI and backward compatibility
-_default_profiler = None
-_default_lock = threading.Lock()
-
-def get_profiler() -> _ProfilerImpl:
-    """Get the current profiler (context-aware or default)."""
-    # Check context variable first (for per-agent use)
-    profiler = _current_profiler.get()
-    if profiler is not None:
-        return profiler
-    
-    # Fall back to module-level default
-    global _default_profiler
-    if _default_profiler is None:
-        with _default_lock:
-            if _default_profiler is None:
-                _default_profiler = _ProfilerImpl()
-    return _default_profiler
-
-def set_profiler(profiler: _ProfilerImpl) -> None:
-    """Set the current profiler in context."""
-    _current_profiler.set(profiler)
-
-class ProfilerCompat:
-    """
-    Compatibility wrapper for old classmethod-based Profiler usage.
-    
-    Delegates all calls to the current profiler instance via get_profiler().
-    This maintains backward compatibility while enabling per-agent isolation.
-    """
-    
-    @staticmethod
-    def enable() -> None:
-        """Enable profiling."""
-        get_profiler().enable()
-    
-    @staticmethod
-    def disable() -> None:
-        """Disable profiling."""
-        get_profiler().disable()
-    
-    @staticmethod
-    def is_enabled() -> bool:
-        """Check if profiling is enabled."""
-        return get_profiler().is_enabled()
-    
-    @staticmethod
-    def clear() -> None:
-        """Clear all profiling data."""
-        get_profiler().clear()
-    
-    @staticmethod
-    def record_timing(name: str, duration_ms: float, category: str = "function", 
-                      file: str = "", line: int = 0) -> None:
-        """Record a timing measurement."""
-        get_profiler().record_timing(name, duration_ms, category, file, line)
-    
-    @staticmethod
-    def record_import(module: str, duration_ms: float, parent: str = "") -> None:
-        """Record an import timing."""
-        get_profiler().record_import(module, duration_ms, parent)
-    
-    @staticmethod
-    def record_flow(name: str, duration_ms: float, file: str = "", line: int = 0) -> None:
-        """Record a flow step."""
-        get_profiler().record_flow(name, duration_ms, file, line)
-    
-    @staticmethod
-    def block(name: str, category: str = "block"):
-        """Context manager for profiling a block of code."""
-        return get_profiler().block(name, category)
-    
-    @staticmethod
-    def get_timings(category: Optional[str] = None):
-        """Get timing records."""
-        return get_profiler().get_timings(category)
-    
-    @staticmethod
-    def get_imports(min_duration_ms: float = 0):
-        """Get import records."""
-        return get_profiler().get_imports(min_duration_ms)
-    
-    @staticmethod
-    def get_flow():
-        """Get flow records."""
-        return get_profiler().get_flow()
-    
-    @staticmethod
-    def get_files_accessed():
-        """Get files accessed."""
-        return get_profiler().get_files_accessed()
-    
-    @staticmethod
-    def get_summary():
-        """Get profiling summary."""
-        return get_profiler().get_summary()
-    
-    @staticmethod
-    def report(output: str = "console") -> str:
-        """Generate and output profiling report."""
-        return get_profiler().report(output)
-    
-    @staticmethod
-    def record_flow(name: str, duration_ms: float, file: str = "", line: int = 0) -> None:
-        """Record a flow step."""
-        get_profiler().record_flow(name, duration_ms, file, line)
-    
-    @staticmethod
-    def record_api_call(endpoint: str, method: str, duration_ms: float,
-                        status_code: int = 0, request_size: int = 0,
-                        response_size: int = 0) -> None:
-        """Record an API/HTTP call timing."""
-        get_profiler().record_api_call(endpoint, method, duration_ms, 
-                                       status_code, request_size, response_size)
-    
-    @staticmethod
-    def block(name: str, category: str = "block"):
-        """Context manager for profiling a block of code."""
-        return get_profiler().block(name, category)
-    
-    @staticmethod
-    def streaming(name: str):
-        """Context manager for profiling streaming operations."""
-        return get_profiler().streaming(name)
-    
-    @staticmethod
-    def api_call(endpoint: str, method: str = "GET"):
-        """Context manager for profiling API calls."""
-        return get_profiler().api_call(endpoint, method)
-
-# Create compatibility instance that acts like old singleton
-# This allows existing code to work: Profiler.enable(), etc.
-# But it actually delegates to the context-aware profiler
-ProfilerSingleton = ProfilerCompat()
-
-# Replace the class-based Profiler with the compatibility wrapper
-# This ensures all existing code continues to work
-Profiler = ProfilerCompat
 
 
 # ============================================================================
