@@ -30,6 +30,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 from types import MappingProxyType
+from ._safe_loader import load_user_module
 
 logger = logging.getLogger(__name__)
 
@@ -74,30 +75,15 @@ class ToolResolver:
             if self._local_tools_loaded:  # Double-check inside lock
                 return self._local_tools_cache
             
-            # Security: Require explicit opt-in for local tools loading
-            if os.environ.get("PRAISONAI_ALLOW_LOCAL_TOOLS", "").lower() != "true":
-                logger.debug("Local tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.")
-                self._local_tools_cache = MappingProxyType({})
-                self._local_tools_loaded = True
-                return self._local_tools_cache
-            
             tools_path = Path(self._tools_py_path)
-            if not tools_path.exists():
-                logger.debug(f"No local tools.py found at {tools_path}")
-                self._local_tools_cache = MappingProxyType({})
-                self._local_tools_loaded = True
-                return self._local_tools_cache
-            
             try:
-                spec = importlib.util.spec_from_file_location("tools", str(tools_path))
-                if spec is None or spec.loader is None:
-                    logger.warning(f"Could not load spec for {tools_path}")
+                # Use the same safe loader as other tools.py loading paths
+                module = load_user_module(self._tools_py_path, name="tools")
+                if module is None:
+                    logger.debug(f"Local tools loading disabled or tools.py not found at {self._tools_py_path}")
                     self._local_tools_cache = MappingProxyType({})
                     self._local_tools_loaded = True
                     return self._local_tools_cache
-                
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
                 
                 # Build cache locally, then freeze
                 cache: Dict[str, Callable] = {}
@@ -108,13 +94,13 @@ class ToolResolver:
                         cache[name] = obj
                         logger.debug(f"Loaded local tool: {name}")
                 
-                logger.info(f"Loaded {len(cache)} tools from {tools_path}")
+                logger.info(f"Loaded {len(cache)} tools from {self._tools_py_path}")
                 
                 # Create immutable view to prevent concurrent modification
                 self._local_tools_cache = MappingProxyType(cache)
                 
             except Exception as e:
-                logger.warning(f"Error loading tools from {tools_path}: {e}")
+                logger.warning(f"Error loading tools from {self._tools_py_path}: {e}")
                 self._local_tools_cache = MappingProxyType({})
             
             self._local_tools_loaded = True
@@ -381,20 +367,99 @@ class ToolResolver:
         with self._local_tools_lock:
             self._local_tools_cache = MappingProxyType({})
             self._local_tools_loaded = False
+    
+    def get_local_callables(self) -> List[Callable]:
+        """Get functions exposed by tools.py (path A semantics).
+        
+        Returns:
+            List of callable functions from tools.py
+        """
+        local_tools = self._load_local_tools()
+        return list(local_tools.values())
+    
+    def get_local_tool_classes(self) -> Dict[str, Any]:
+        """Get BaseTool/langchain class instances from tools.py (path B semantics).
+        
+        Returns:
+            Dictionary mapping class names to instantiated tool objects
+        """
+        try:
+            # Use the same safe loader to get the module
+            module = load_user_module(self._tools_py_path, name="tools_module")
+            if module is None:
+                return {}
+            
+            # Import the necessary classes (matching agents_generator.py logic)
+            BaseTool = None
+            PRAISONAI_TOOLS_AVAILABLE = False
+            try:
+                from praisonai_tools import BaseTool
+                PRAISONAI_TOOLS_AVAILABLE = True
+            except ImportError:
+                try:
+                    from praisonai.tools import BaseTool
+                    PRAISONAI_TOOLS_AVAILABLE = True
+                except ImportError:
+                    pass
+            
+            result = {}
+            for name, obj in inspect.getmembers(module, 
+                lambda x: inspect.isclass(x) and (
+                    x.__module__.startswith('langchain_community.tools') or 
+                    (PRAISONAI_TOOLS_AVAILABLE and BaseTool and issubclass(x, BaseTool))
+                ) and x is not BaseTool):
+                try:
+                    result[name] = obj()
+                    logger.debug(f"Loaded local tool class: {name}")
+                except Exception as e:
+                    logger.warning(f"Error instantiating tool class {name}: {e}")
+                    continue
+            
+            return result
+        except Exception as e:
+            logger.warning(f"Error loading tool classes from {self._tools_py_path}: {e}")
+            return {}
 
 
-# Convenience functions that construct resolver explicitly (no global singleton)
+# Process-level lazy singleton for performance (matches profiler.py pattern)
+_default_resolver: Optional[ToolResolver] = None
+_default_resolver_lock = threading.Lock()
+
+def _get_default_resolver() -> ToolResolver:
+    """Process-default ToolResolver (double-checked lazy init).
+    
+    Returns cached ToolResolver that is anchored to the working directory
+    at first call. Local tools.py resolution is CWD-dependent and cached
+    for the lifetime of the process.
+    
+    For test isolation or multi-project CLIs, create explicit resolver
+    instances instead of using this cached default.
+    """
+    global _default_resolver
+    if _default_resolver is None:
+        with _default_resolver_lock:
+            if _default_resolver is None:
+                _default_resolver = ToolResolver()
+    return _default_resolver
+
+
+# Convenience functions that use cached default resolver for performance
 def resolve_tool(name: str, resolver: Optional[ToolResolver] = None) -> Optional[Callable]:
     """Resolve a tool name to a callable.
     
     Args:
         name: Tool name to resolve
-        resolver: Optional resolver instance. If None, creates a new one.
+        resolver: Optional resolver instance. If None, uses cached default resolver.
         
     Returns:
         Callable if found, None otherwise
+        
+    Note:
+        When resolver=None, uses a process-level cached resolver that is anchored
+        to the working directory at first call. For test isolation or multi-project
+        CLIs, pass an explicit resolver instance.
     """
-    return (resolver or ToolResolver()).resolve(name)
+    return (resolver or _get_default_resolver()).resolve(name)
 
 
 def resolve_tools(names: List[str], resolver: Optional[ToolResolver] = None) -> List[Callable]:
@@ -402,24 +467,24 @@ def resolve_tools(names: List[str], resolver: Optional[ToolResolver] = None) -> 
     
     Args:
         names: List of tool names
-        resolver: Optional resolver instance. If None, creates a new one.
+        resolver: Optional resolver instance. If None, uses cached default resolver.
         
     Returns:
         List of resolved callables
     """
-    return (resolver or ToolResolver()).resolve_many(names)
+    return (resolver or _get_default_resolver()).resolve_many(names)
 
 
 def list_available_tools(resolver: Optional[ToolResolver] = None) -> Dict[str, str]:
     """List all available tools with descriptions.
     
     Args:
-        resolver: Optional resolver instance. If None, creates a new one.
+        resolver: Optional resolver instance. If None, uses cached default resolver.
     
     Returns:
         Dict mapping tool names to descriptions
     """
-    return (resolver or ToolResolver()).list_available()
+    return (resolver or _get_default_resolver()).list_available()
 
 
 def has_tool(name: str, resolver: Optional[ToolResolver] = None) -> bool:
@@ -427,12 +492,12 @@ def has_tool(name: str, resolver: Optional[ToolResolver] = None) -> bool:
     
     Args:
         name: Tool name to check
-        resolver: Optional resolver instance. If None, creates a new one.
+        resolver: Optional resolver instance. If None, uses cached default resolver.
         
     Returns:
         True if tool exists, False otherwise
     """
-    return (resolver or ToolResolver()).has_tool(name)
+    return (resolver or _get_default_resolver()).has_tool(name)
 
 
 def validate_yaml_tools(yaml_config: Dict[str, Any], resolver: Optional[ToolResolver] = None) -> List[str]:
@@ -440,9 +505,9 @@ def validate_yaml_tools(yaml_config: Dict[str, Any], resolver: Optional[ToolReso
     
     Args:
         yaml_config: Parsed YAML configuration
-        resolver: Optional resolver instance. If None, creates a new one.
+        resolver: Optional resolver instance. If None, uses cached default resolver.
         
     Returns:
         List of missing tool names
     """
-    return (resolver or ToolResolver()).validate_yaml_tools(yaml_config)
+    return (resolver or _get_default_resolver()).validate_yaml_tools(yaml_config)

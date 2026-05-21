@@ -57,7 +57,7 @@ class CloudDeployer:
             file.write("FROM python:3.11-slim\n")
             file.write("WORKDIR /app\n")
             file.write("COPY . .\n")
-            file.write("RUN pip install flask praisonai==4.6.37 gunicorn markdown\n")
+            file.write("RUN pip install flask praisonai==4.6.44 gunicorn markdown\n")
             file.write("EXPOSE 8080\n")
             file.write('CMD ["gunicorn", "-b", "0.0.0.0:8080", "api:app"]\n')
             
@@ -76,7 +76,8 @@ class CloudDeployer:
         with open("api.py", "w") as file:
             file.write("from flask import Flask\n")
             file.write("from praisonai import PraisonAI\n")
-            file.write("import markdown\n\n")
+            file.write("import markdown\n")
+            file.write("import bleach\n\n")
             file.write("app = Flask(__name__)\n\n")
             file.write("def basic():\n")
             file.write("    praisonai = PraisonAI(agent_file=\"agents.yaml\")\n")
@@ -84,17 +85,21 @@ class CloudDeployer:
             file.write("@app.route('/')\n")
             file.write("def home():\n")
             file.write("    output = basic()\n")
-            file.write("    html_output = markdown.markdown(output)\n")
-            file.write("    return f'<html><body>{html_output}</body></html>'\n\n")
+            file.write("    rendered = markdown.markdown(str(output))\n")
+            file.write("    safe_html = bleach.clean(rendered, tags=bleach.sanitizer.ALLOWED_TAGS, attributes=bleach.sanitizer.ALLOWED_ATTRIBUTES)\n")
+            file.write("    return f'<html><body>{safe_html}</body></html>'\n\n")
             file.write("if __name__ == \"__main__\":\n")
             file.write("    import os\n")
             file.write("    app.run(debug=os.environ.get('DEBUG', 'false').lower() == 'true')\n")
     
     def set_environment_variables(self):
         """Sets environment variables with fallback to .env values or defaults."""
-        os.environ["OPENAI_MODEL_NAME"] = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
-        os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "Enter your API key")
-        os.environ["OPENAI_API_BASE"] = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
+        from praisonai.llm.env import resolve_llm_endpoint
+        ep = resolve_llm_endpoint()
+        
+        os.environ["OPENAI_MODEL_NAME"] = ep.model
+        os.environ["OPENAI_API_KEY"] = ep.api_key or "Enter your API key"
+        os.environ["OPENAI_API_BASE"] = ep.base_url
 
     def run_commands(self):
         """
@@ -129,9 +134,11 @@ class CloudDeployer:
             return
         
         # Get environment variables
-        openai_model = os.environ.get('OPENAI_MODEL_NAME', 'gpt-5-nano')
-        openai_key = os.environ.get('OPENAI_API_KEY', 'Enter your API key')
-        openai_base = os.environ.get('OPENAI_API_BASE', 'https://api.openai.com/v1')
+        from praisonai.llm.env import resolve_llm_endpoint
+        ep = resolve_llm_endpoint()
+        openai_model = ep.model
+        openai_key = ep.api_key or 'Enter your API key'
+        openai_base = ep.base_url
         
         # Build commands with actual values
         commands = [

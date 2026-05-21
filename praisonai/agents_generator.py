@@ -15,19 +15,16 @@ import os
 import logging
 import re
 import keyword
+import difflib
 
 # Import new architecture components
 from .framework_adapters.base import FrameworkAdapter
-from .framework_adapters.registry import FrameworkAdapterRegistry
+from .framework_adapters.registry import FrameworkAdapterRegistry, get_default_registry
 from .tool_registry import ToolRegistry
 
 # Import availability flags
-try:
-    from .inbuilt_tools import PRAISONAI_TOOLS_AVAILABLE, CREWAI_AVAILABLE, AUTOGEN_AVAILABLE
-except ImportError:
-    PRAISONAI_TOOLS_AVAILABLE = False
-    CREWAI_AVAILABLE = False
-    AUTOGEN_AVAILABLE = False
+# Compatibility imports - now handled by centralized detection
+# (inbuilt_tools still defines these but they're read-only compatibility)
 
 # Import BaseTool for tools handling
 BaseTool = None
@@ -39,15 +36,14 @@ except ImportError:
     except ImportError:
         pass
 
-# Check for additional framework availability
-AG2_AVAILABLE = False
-PRAISONAI_AVAILABLE = False
-try:
-    import importlib.util
-    AG2_AVAILABLE = importlib.util.find_spec("ag2") is not None
-    PRAISONAI_AVAILABLE = importlib.util.find_spec("praisonaiagents") is not None
-except ImportError:
-    pass
+# Check for additional framework availability using centralized detection
+from ._framework_availability import is_available
+PRAISONAI_TOOLS_AVAILABLE = is_available("praisonai_tools")
+CREWAI_AVAILABLE          = is_available("crewai")
+AUTOGEN_AVAILABLE         = is_available("autogen")
+AG2_AVAILABLE             = is_available("ag2")
+PRAISONAI_AVAILABLE       = is_available("praisonaiagents")
+AGENTOPS_AVAILABLE        = is_available("agentops")
 
 # Framework adapter registry - now uses proper registry pattern
 # This replaces the hardcoded FRAMEWORK_ADAPTERS dict
@@ -178,7 +174,7 @@ def _resolve_yaml_cli_backend(cli_backend_config, logger):
 
 
 class AgentsGenerator:
-    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None):
+    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None, adapter_registry=None):
         """
         Initialize the AgentsGenerator object.
 
@@ -192,6 +188,7 @@ class AgentsGenerator:
             agent_yaml (str, optional): The content of the YAML file. Defaults to None.
             tools (dict, optional): A dictionary containing the tools to be used for the agents. Defaults to None.
             cli_config (dict, optional): CLI configuration to override YAML settings. Defaults to None.
+            adapter_registry (FrameworkAdapterRegistry, optional): Registry for framework adapters. Defaults to process default.
 
         Attributes:
             agent_file (str): The path to the agent file.
@@ -232,10 +229,12 @@ class AgentsGenerator:
         self.tool_registry = ToolRegistry()
         self.tool_registry.register_builtin_autogen_adapters()
         
-        # Get framework adapter and validate availability
+        # DI-friendly: tests/multi-tenant runtimes pass their own registry;
+        # CLI users get the process default.
+        self._adapter_registry = adapter_registry or get_default_registry()
+        
+        # Get framework adapter (availability already validated at CLI entry)
         self.framework_adapter = self._get_framework_adapter(framework)
-        if not self.framework_adapter.is_available():
-            raise ImportError(f"Framework '{framework}' is not available. Please install the required dependencies.")
 
     def _get_framework_adapter(self, framework: str) -> FrameworkAdapter:
         """
@@ -250,8 +249,7 @@ class AgentsGenerator:
         Raises:
             ValueError: If framework is not supported
         """
-        adapter_registry = FrameworkAdapterRegistry.get_instance()
-        return adapter_registry.create(framework)
+        return self._adapter_registry.create(framework)
 
     def _merge_cli_config(self, config, cli_config):
         """
@@ -321,6 +319,47 @@ class AgentsGenerator:
                     agent_config[field] = value
                     self.logger.debug(f"CLI override for agent {agent_name}: {field} = {value}")
 
+    def _validate_agents_config(self, config):
+        """
+        Validate agent configuration for typos in field names and provide suggestions.
+        
+        Args:
+            config (dict): The parsed YAML configuration
+        """
+        known_fields = {
+            'role', 'goal', 'instructions', 'backstory', 'tools', 'tasks', 'llm',
+            'function_calling_llm', 'allow_delegation', 'max_iter', 'max_rpm',
+            'max_execution_time', 'verbose', 'cache', 'system_template',
+            'prompt_template', 'response_template', 'tool_timeout', 'planning_tools',
+            'planning', 'autonomy', 'guardrails', 'streaming', 'stream',
+            'approval', 'skills', 'cli_backend', 'reflection'
+        }
+
+        for section_name in ('agents', 'roles'):
+            section = config.get(section_name, {})
+            if not isinstance(section, dict):
+                continue
+
+            entity_name = 'agent' if section_name == 'agents' else 'role'
+            for name, section_config in section.items():
+                if not isinstance(section_config, dict):
+                    continue
+
+                for field_name in section_config:
+                    if field_name in known_fields:
+                        continue
+
+                    close_matches = difflib.get_close_matches(
+                        field_name,
+                        known_fields,
+                        n=1,
+                        cutoff=0.6
+                    )
+                    suggestion = f" Did you mean '{close_matches[0]}'?" if close_matches else ""
+                    self.logger.warning(
+                        f"Unknown field '{field_name}' in {entity_name} '{name}'.{suggestion}"
+                    )
+
     def is_function_or_decorated(self, obj):
         """
         Checks if the given object is a function or has a __call__ method.
@@ -335,20 +374,19 @@ class AgentsGenerator:
 
     def load_tools_from_module(self, module_path):
         """
-        Loads tools from a specified module path.
+        Load function tools from a user-supplied module (gated by PRAISONAI_ALLOW_LOCAL_TOOLS).
 
         Parameters:
             module_path (str): The path to the module containing the tools.
 
         Returns:
             dict: A dictionary containing the names of the tools as keys and the corresponding functions or objects as values.
-
-        Raises:
-            FileNotFoundError: If the specified module path does not exist.
+                  Returns an empty dict if the module cannot be loaded (path missing, loading blocked by PRAISONAI_ALLOW_LOCAL_TOOLS, or any other load error).
         """
-        spec = importlib.util.spec_from_file_location("tools_module", module_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        from ._safe_loader import load_user_module
+        module = load_user_module(module_path, name="tools_module")
+        if module is None:
+            return {}
         return {name: obj for name, obj in inspect.getmembers(module, self.is_function_or_decorated)}
     
     def _extract_tool_classes(self, module):
@@ -371,21 +409,13 @@ class AgentsGenerator:
     
     def load_tools_from_module_class(self, module_path):
         """
-        Loads tools from a specified module path containing classes that inherit from BaseTool 
-        or are part of langchain_community.tools package.
+        Load BaseTool / langchain tool classes from a user-supplied module (gated by PRAISONAI_ALLOW_LOCAL_TOOLS).
         """
-        spec = importlib.util.spec_from_file_location("tools_module", module_path)
-        module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-            return {name: obj() for name, obj in inspect.getmembers(module, 
-                lambda x: inspect.isclass(x) and (
-                    x.__module__.startswith('langchain_community.tools') or 
-                    (PRAISONAI_TOOLS_AVAILABLE and BaseTool and issubclass(x, BaseTool))
-                ) and x is not BaseTool)}
-        except ImportError as e:
-            self.logger.warning(f"Error loading tools from {module_path}: {e}")
+        from ._safe_loader import load_user_module
+        module = load_user_module(module_path, name="tools_module")
+        if module is None:
             return {}
+        return self._extract_tool_classes(module)
 
     def load_tools_from_package(self, package_path):
         """
@@ -411,36 +441,6 @@ class AgentsGenerator:
                     tools_dict[name] = obj
         return tools_dict
 
-    def load_tools_from_tools_py(self):
-        """
-        Imports and returns all contents from tools.py file.
-        Uses the tool registry instead of global namespace pollution.
-
-        Returns:
-            list: A list of callable functions with proper formatting
-        """
-        tools_list = []
-        try:
-            # Try to import tools.py from current directory using safe loading
-            from ._safe_loader import load_user_module
-            module = load_user_module("tools.py", name="tools")
-            if module is None:
-                self.logger.debug("tools.py not found or local tools loading disabled")
-                return tools_list
-
-            # Register functions in the tool registry instead of globals()
-            registered_tools = self.tool_registry.register_from_module(module)
-            tools_list = [self.tool_registry.get_function(name) for name in registered_tools]
-
-            self.logger.debug(f"Loaded {len(tools_list)} tool functions from tools.py")
-            self.logger.debug(f"Registered tools: {registered_tools}")
-            
-        except FileNotFoundError:
-            self.logger.debug("tools.py not found in current directory")
-        except Exception as e:
-            self.logger.warning(f"Error loading tools from tools.py: {e}")
-            
-        return tools_list
 
     def generate_crew_and_kickoff(self):
         """
@@ -506,6 +506,10 @@ class AgentsGenerator:
 
         # Get workflow input: 'input' is canonical, 'topic' is alias for backward compatibility
         topic = config.get('input', config.get('topic', ''))
+        
+        # Validate agents configuration for typos in field names
+        self._validate_agents_config(config)
+        
         tools_dict = {}
         
         # Use ToolResolver to get available tools (consistent tool resolution)
@@ -546,12 +550,10 @@ class AgentsGenerator:
         tools_py_path = os.path.join(root_directory, 'tools.py')
         tools_dir_path = Path(root_directory) / 'tools'
         
+        # Use consolidated ToolResolver for tools.py loading
+        tools_dict.update(self.tool_resolver.get_local_tool_classes())
         if os.path.isfile(tools_py_path):
-            from ._safe_loader import load_user_module
-            module = load_user_module(tools_py_path, name="tools_module")
-            if module is not None:
-                tools_dict.update(self._extract_tool_classes(module))
-                self.logger.debug("tools.py exists in the root directory. Loading tools.py and skipping tools folder.")
+            self.logger.debug("tools.py exists in the root directory. Loading tools.py and skipping tools folder.")
         elif tools_dir_path.is_dir():
             from ._safe_loader import load_user_module
             for py_file in tools_dir_path.glob("*.py"):
@@ -597,10 +599,10 @@ class AgentsGenerator:
             self.framework = framework
             self.framework_adapter = self._get_framework_adapter(framework)
             
-        # Final availability check
-        if not self.framework_adapter.is_available():
-            raise ImportError(f"Framework '{framework}' is not available. Please install the required dependencies.")
-            
+        # Validate framework availability for non-CLI callers
+        from .framework_adapters.validators import assert_framework_available
+        assert_framework_available(framework)
+        
         self.logger.info(f"Using framework: {framework}")
         return self.framework_adapter.run(
             config,
@@ -740,7 +742,11 @@ class AgentsGenerator:
         result = "### Output ###\n" + response[-1].summary if hasattr(response[-1], 'summary') else ""
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result
 
@@ -892,10 +898,13 @@ class AgentsGenerator:
         api_type = _resolve("api_type", default="openai").lower()
         model_name = _resolve("model", default="gpt-4o-mini")
         api_key = _resolve("api_key", env_var="OPENAI_API_KEY")
+        # Use resolver for consistent env-var precedence as fallback
+        from praisonai.llm.env import resolve_llm_endpoint
+        ep = resolve_llm_endpoint()
+        
         base_url = (model_config.get("base_url")
                     or yaml_llm.get("base_url")
-                    or os.environ.get("OPENAI_BASE_URL")
-                    or os.environ.get("OPENAI_API_BASE"))
+                    or ep.base_url)
 
         # Build LLMConfig — Bedrock needs no api_key
         if api_type == "bedrock":
@@ -1124,7 +1133,11 @@ class AgentsGenerator:
         result = f"### Task Output ###\n{response}"
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result
 
@@ -1143,8 +1156,8 @@ class AgentsGenerator:
 
         # Use existing tool resolver instance
         
-        # Load tools from local tools.py (backward compat)
-        tools_list = self.load_tools_from_tools_py()
+        # Load tools from local tools.py (backward compat) - use consolidated ToolResolver
+        tools_list = self.tool_resolver.get_local_callables()
         self.logger.debug(f"Loaded tools from tools.py: {tools_list}")
 
         # Initialize InteractiveRuntime for ACP/LSP if enabled globally
@@ -1152,9 +1165,9 @@ class AgentsGenerator:
         acp_enabled = global_config.get('acp', False)
         lsp_enabled = global_config.get('lsp', False)
         interactive_runtime = None
-        interactive_loop = None
         
         if acp_enabled or lsp_enabled:
+            runtime_started = False
             try:
                 import asyncio
                 from praisonai.cli.features.interactive_runtime import InteractiveRuntime, RuntimeConfig
@@ -1170,27 +1183,34 @@ class AgentsGenerator:
                 interactive_runtime = InteractiveRuntime(runtime_config)
                 self.logger.info(f"Starting InteractiveRuntime (ACP: {acp_enabled}, LSP: {lsp_enabled})")
                 
-                # Create a scoped event loop instead of modifying process globals
-                interactive_loop = asyncio.new_event_loop()
-                try:
-                    interactive_loop.run_until_complete(interactive_runtime.start())
-                    
-                    centric_tools = create_agent_centric_tools(interactive_runtime)
-                    self.logger.info(f"Loaded {len(centric_tools)} InteractiveRuntime tools")
-                    tools_list.extend(centric_tools)
-                    
-                finally:
-                    try:
-                        interactive_loop.run_until_complete(interactive_runtime.stop())
-                    except Exception as stop_error:
-                        self.logger.warning(f"Error stopping InteractiveRuntime: {stop_error}")
-                    finally:
-                        interactive_loop.close()
+                # Runs on the persistent background loop; safe from sync and async callers.
+                # run_sync raises RuntimeError early if called from inside a running loop
+                # so the bug is loud instead of a deadlock.
+                from ._async_bridge import run_sync
+                run_sync(interactive_runtime.start())
+                runtime_started = True
+                
+                centric_tools = create_agent_centric_tools(interactive_runtime)
+                self.logger.info(f"Loaded {len(centric_tools)} InteractiveRuntime tools")
+                tools_list.extend(centric_tools)
                 
             except ImportError as e:
                 self.logger.warning(f"Failed to load InteractiveRuntime components: {e}")
+                interactive_runtime = None
+            except RuntimeError:
+                # Don't swallow RuntimeError from run_sync - preserve fail-fast semantics
+                raise
             except Exception as e:
+                if runtime_started and interactive_runtime is not None:
+                    try:
+                        from ._async_bridge import run_sync
+                        run_sync(interactive_runtime.stop())
+                    except Exception as stop_error:
+                        self.logger.error(
+                            f"Error stopping partially started InteractiveRuntime: {stop_error}"
+                        )
                 self.logger.error(f"Error starting InteractiveRuntime: {e}")
+                interactive_runtime = None
 
         # Create agents from config
         for role, details in config['roles'].items():
@@ -1424,14 +1444,19 @@ class AgentsGenerator:
             self.logger.debug(f"Result: {response}")
             result = response if response else ""
         finally:
-            if interactive_runtime and interactive_loop:
+            if interactive_runtime:
                 try:
                     self.logger.info("Stopping InteractiveRuntime...")
-                    interactive_loop.run_until_complete(interactive_runtime.stop())
+                    from ._async_bridge import run_sync
+                    run_sync(interactive_runtime.stop())
                 except Exception as e:
                     self.logger.error(f"Error stopping InteractiveRuntime: {e}")
         
         if AGENTOPS_AVAILABLE:
-            agentops.end_session("Success")
+            import agentops
+            try:
+                agentops.end_session("Success")
+            except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
+                self.logger.warning(f"agentops.end_session failed: {e}")
             
         return result

@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from .agentmail import AgentMailBot
     from .bot import Bot
     from .botos import BotOS
+    from ._session import BotSessionManager
+    from ._dlq import InboundDLQ, DLQEntry
     from ._slack_approval import SlackApproval
     from ._telegram_approval import TelegramApproval
     from ._discord_approval import DiscordApproval
@@ -67,11 +69,29 @@ def __getattr__(name: str):
     if name == "HTTPApproval":
         from ._http_approval import HTTPApproval
         return HTTPApproval
+    # W1 — cross-platform mirror + identity
+    if name == "mirror_to_session":
+        from ._mirror import mirror_to_session
+        return mirror_to_session
+    if name == "BotSessionManager":
+        from ._session import BotSessionManager
+        return BotSessionManager
+    # N4 — inbound dead-letter queue
+    if name == "InboundDLQ":
+        from ._dlq import InboundDLQ
+        return InboundDLQ
+    if name == "DLQEntry":
+        from ._dlq import DLQEntry
+        return DLQEntry
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "TelegramBot", "DiscordBot", "SlackBot", "WhatsAppBot", "LinearBot", "EmailBot", "AgentMailBot",
     "Bot", "BotOS",
+    "BotSessionManager",
+    "InboundDLQ", "DLQEntry",
     "SlackApproval", "TelegramApproval", "DiscordApproval",
     "WebhookApproval", "HTTPApproval",
+    # W1
+    "mirror_to_session", "BotSessionManager",
 ]

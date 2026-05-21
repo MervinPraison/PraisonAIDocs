@@ -7,7 +7,7 @@ import threading
 from typing import Any, Dict, List, Optional, Union, Literal
 import logging
 from praisonaiagents._logging import get_logger
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Decomposed memory functionality - imported as mixins for backward compatibility
 from .storage import StorageMixin
@@ -143,6 +143,9 @@ class Memory(StorageMixin, SearchMixin, MemoryCoreMixin):
         adapter_name = provider_mapping.get(provider, provider)
         
         # Try to get preferred adapter, fallback to available ones
+        adapter = None
+        provider_explicitly_requested = provider != "rag"  # "rag" is default, others are explicit
+        
         try:
             adapter_config = self._get_adapter_config_for_provider(adapter_name)
             adapter = get_memory_adapter(adapter_name, **adapter_config)
@@ -154,6 +157,37 @@ class Memory(StorageMixin, SearchMixin, MemoryCoreMixin):
             adapter = None
         
         if adapter is None:
+            # If the provider was explicitly requested, try to give a helpful error message
+            if provider_explicitly_requested:
+                try:
+                    # Try the factory function directly to get the specific ImportError message
+                    from .adapters.factories import (
+                        create_mem0_memory_adapter,
+                        create_chroma_memory_adapter,
+                        create_mongodb_memory_adapter,
+                    )
+                    factory_map = {
+                        "mem0": create_mem0_memory_adapter,
+                        "chroma": create_chroma_memory_adapter, 
+                        "mongodb": create_mongodb_memory_adapter,
+                    }
+                    if adapter_name in factory_map:
+                        # Call the factory to get ImportError with installation hint
+                        # or capture successful adapter creation
+                        adapter_config = self._get_adapter_config_for_provider(adapter_name)
+                        adapter = factory_map[adapter_name](**adapter_config)
+                except ImportError:
+                    # Re-raise ImportError with installation instructions
+                    raise
+                # All other exceptions (e.g., ValueError for missing API key) 
+                # propagate naturally, preserving backward compatibility
+            
+            # If factory succeeded, use that adapter
+            if adapter is not None:
+                self.memory_adapter = adapter
+                self.provider = adapter_name
+                return
+                
             # Fallback to first available adapter
             self._log_verbose(f"Provider '{adapter_name}' not available, trying fallbacks")
             # Try each fallback preference individually
@@ -658,7 +692,7 @@ class Memory(StorageMixin, SearchMixin, MemoryCoreMixin):
                         "_id": ident,
                         "content": text,
                         "metadata": metadata,
-                        "created_at": datetime.utcnow(),
+                        "created_at": datetime.now(timezone.utc),
                         "memory_type": "short_term"
                     }
                     self.mongo_short_term.insert_one(doc)
@@ -884,7 +918,7 @@ class Memory(StorageMixin, SearchMixin, MemoryCoreMixin):
                     "_id": ident,
                     "content": text,
                     "metadata": metadata,
-                    "created_at": datetime.utcnow(),
+                    "created_at": datetime.now(timezone.utc),
                     "memory_type": "long_term"
                 }
                 
@@ -1407,14 +1441,14 @@ class Memory(StorageMixin, SearchMixin, MemoryCoreMixin):
             self.mem0_client.add(text, user_id=user_id, metadata=meta)
         elif self.use_mongodb and hasattr(self, "mongo_users"):
             try:
-                from datetime import datetime
+                from datetime import datetime, timezone
                 ident = str(time.time_ns())
                 doc = {
                     "_id": ident,
                     "user_id": user_id,
                     "content": text,
                     "metadata": meta,
-                    "created_at": datetime.utcnow()
+                    "created_at": datetime.now(timezone.utc)
                 }
                 self.mongo_users.insert_one(doc)
                 self._log_verbose(f"Successfully stored user memory for {user_id}")
