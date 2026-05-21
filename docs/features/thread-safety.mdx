@@ -367,58 +367,66 @@ The `praisonai` wrapper layer (distinct from the `praisonaiagents` content above
 
 ```mermaid
 graph LR
-    subgraph "Thread-Safe OpenAI Client"
-        T1[🧵 Thread 1] --> K1[🔑 API Key A]
-        T2[🧵 Thread 2] --> K2[🔑 API Key B]
-        K1 --> C1[📡 Client A]
-        K2 --> C2[📡 Client B]
-        L[🔒 Lock] -.-> C1
-        L -.-> C2
+    subgraph "Per-Instance OpenAI Client"
+        G1[🤖 BaseAutoGenerator A] --> L1[🔒 Instance Lock] --> C1[📡 Client A]
+        G2[🤖 BaseAutoGenerator B] --> L2[🔒 Instance Lock] --> C2[📡 Client B]
+        G1 -.close().-> X1[♻️ client.close]
+        G2 -.close().-> X2[♻️ client.close]
     end
-    
-    classDef thread fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef key fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef client fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    classDef generator fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef lock fill:#6366F1,stroke:#7C90A0,color:#fff
-    
-    class T1,T2 thread
-    class K1,K2 key
+    classDef client fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef cleanup fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class G1,G2 generator
+    class L1,L2 lock
     class C1,C2 client
-    class L lock
+    class X1,X2 cleanup
 ```
 
-### Key-aware OpenAI client
+### Per-instance OpenAI client lifecycle
 
-The OpenAI client is now cached per `(api_key, base_url)` tuple, allowing multiple keys in the same process without cross-talk:
+Each `BaseAutoGenerator` owns its own OpenAI client — no cross-instance sharing, no LRU eviction surprises.
 
 ```python
 from praisonai import PraisonAI
-import threading
 
-def worker_with_different_key(api_key, task_name):
-    # Each thread gets its own client based on the key
-    praisonai = PraisonAI(
-        auto=f"Create a {task_name}",
-        api_key=api_key  # Different key per thread
-    )
-    result = praisonai.run()
-    print(f"{task_name} completed")
+# Each PraisonAI instance constructs its own auto-generator, which owns
+# a single OpenAI client. Two concurrent instances cannot evict each
+# other's client — even with identical API keys.
+team_a = PraisonAI(auto="Draft a marketing plan", api_key="sk-team-a")
+team_b = PraisonAI(auto="Draft a technical doc", api_key="sk-team-b")
 
-# Two threads with different OpenAI keys
-thread1 = threading.Thread(
-    target=worker_with_different_key,
-    args=("sk-key-team-a", "marketing plan")
-)
-thread2 = threading.Thread(
-    target=worker_with_different_key, 
-    args=("sk-key-team-b", "technical doc")
-)
-
-thread1.start()
-thread2.start()
-thread1.join()
-thread2.join()
+team_a.run()  # safe to run in parallel threads
+team_b.run()
 ```
+
+<Note>
+The client is created lazily on first structured-completion call. The instance's `__del__` makes a best-effort `client.close()`, but the canonical path is explicit `close()` on the generator if you build one directly. This matters in long-lived server processes that spawn many generators.
+</Note>
+
+For power users building generators directly:
+
+```python
+from praisonai.auto import BaseAutoGenerator
+
+gen = BaseAutoGenerator(config_list=[{
+    "model": "gpt-4o-mini",
+    "api_key": "sk-...",
+    "base_url": None,
+}])
+try:
+    # _get_openai_client() is double-checked-locked; calling it from
+    # multiple threads on the same instance returns the same client.
+    result = gen._structured_completion(MyModel, messages=[...])
+finally:
+    gen.close()  # explicit cleanup — recommended over relying on __del__
+```
+
+<Warning>
+**Behaviour change in PR #1681**: the module-level functions `praisonai.auto._get_openai_client(api_key, base_url)` and the `_openai_clients` / `_openai_clients_lock` globals **have been removed**. If you imported them, switch to constructing an `OpenAI` client yourself or call `BaseAutoGenerator(...).\_get_openai_client()`. Each generator now owns exactly one client; the previous bug — an in-use client being evicted from a process-wide LRU and closed while other threads still held a reference — is no longer possible.
+</Warning>
 
 ### Thread-safe Typer command discovery
 
@@ -457,6 +465,8 @@ A transient discovery error does not lock the CLI into a broken state — the ne
 **AsyncAgentScheduler** is now loop-aware. The `start()` method binds its async primitives (`asyncio.Event`, `asyncio.Lock`) to the running loop, and `stop()` raises `RuntimeError` if called from a different loop than `start()`.
 
 **Lazy loaders in `praisonai/auto.py`** are now thread-safe. A single `_load_optional(key, loader)` helper with a module-level lock replaces the previous unguarded module-level globals.
+
+**`inbuilt_tools` lazy import** (PR #1681) now routes through `praisonai.auto._load_optional("inbuilt_autogen_tools", ...)` instead of a hand-rolled re-entry guard. Negative results are cached, so a missing `crewai` or `autogen` install no longer pays the `find_spec` cost on every attribute access. `PRAISONAI_TOOLS_AVAILABLE` is now resolved lazily via `__getattr__`.
 
 **Integration registry** (`praisonai/integrations/registry.py`) now has a per-instance `threading.Lock` guarding `register`/`unregister`/`create`/`list_registered` operations.
 
