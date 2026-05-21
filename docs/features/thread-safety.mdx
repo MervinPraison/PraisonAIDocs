@@ -130,6 +130,7 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 |-----------|-----------|--------|
 | `chat_history` | `AsyncSafeState` (DualLock: RLock + per-loop `asyncio.Lock`) | Re-entrant on same thread; non-blocking in async contexts |
 | `_cache_lock` | `threading.RLock` | Allows reentrant access from cached helpers |
+| `PersistenceOrchestrator._cache_lock` | `threading.RLock` | Protects `_session_cache` reads/writes; reads return `deepcopy()` to prevent shared mutable state |
 | `RateLimiter` (sync) | `threading.Lock` | Protects `_tokens`, `_api_tokens`, and refill state from races in multi-threaded acquire calls |
 | `RateLimiter` (async) | `asyncio.Lock` | Same protection for coroutine contexts |
 
@@ -154,6 +155,44 @@ class Agent:
 ### Why a re-entrant lock?
 
 Nested calls (e.g. a helper that holds the lock and then assigns `chat_history`, which itself acquires the lock) used to deadlock. `RLock` permits the same thread to re-enter. See [PR #1567](https://github.com/MervinPraison/PraisonAI/pull/1567) for details.
+
+### Persistence Orchestrator session cache
+
+`PersistenceOrchestrator` now guards its in-memory session cache with `threading.RLock` and returns deep copies on read, so concurrent agents can share an orchestrator without corrupting cached `ConversationSession` objects.
+
+```python
+from praisonaiagents import Agent
+from praisonai.persistence import PersistenceOrchestrator
+import threading
+
+# Create shared orchestrator
+orchestrator = PersistenceOrchestrator()
+
+def agent_worker(agent_name, session_id):
+    agent = Agent(name=agent_name)
+    
+    # Safe: orchestrator returns deep copy of cached session
+    history = orchestrator.on_agent_start(agent, session_id=session_id)
+    
+    # Multiple agents can safely read/update sessions concurrently
+    orchestrator.on_message(session_id, "user", "Hello from " + agent_name)
+    orchestrator.on_agent_end(agent, session_id)
+
+# Multiple threads can safely share the orchestrator
+threads = [
+    threading.Thread(target=agent_worker, args=(f"Agent{i}", "session-123"))
+    for i in range(3)
+]
+
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+<Note>
+Reference: PraisonAI PR #1609. The session cache uses defensive copying to prevent shared mutable state between concurrent operations.
+</Note>
 
 ## Best Practices
 
