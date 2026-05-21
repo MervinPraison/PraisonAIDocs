@@ -7,10 +7,6 @@ icon: "sliders"
 
 Four small switches that make a PraisonAI agent **safer, more deterministic, and easier to interrupt** in production.
 
-<Note>
-All four are **opt-in and zero-overhead when unused**. No existing code changes behaviour unless you actively enable a feature.
-</Note>
-
 ```mermaid
 graph TD
     Caller["📞 Your Code"] -->|"agent.chat(..., seed=42, cancel_token=tok)"| Agent["🤖 Agent"]
@@ -29,29 +25,122 @@ graph TD
     class Reject gate
 ```
 
-## Quick reference
+## Quick Start
 
-<CardGroup cols={2}>
-  <Card title="seed" icon="dice">
-    Per-call determinism. Pass `seed=42` to `Agent.chat()` and the LLM receives the same seed — same prompt, same output.
-  </Card>
-  <Card title="cancel_token" icon="ban">
-    Cooperative cancellation. Pass an `InterruptController` to `Agent.chat()` and trip it from another thread to abort cleanly.
-  </Card>
-  <Card title="Tool validator" icon="shield-check">
-    Attach any `ToolValidatorProtocol` to reject bad tool-call arguments before the tool function runs.
-  </Card>
-  <Card title="PII redaction" icon="eye-slash">
-    One call — `enable_pii_redaction()` — scrubs API keys, SSNs, credit cards, and emails from every message sent to the LLM.
-  </Card>
-</CardGroup>
+<Steps>
+  <Step title="PII Redaction">
+    ```python
+    from praisonaiagents import Agent
+    from praisonaiagents.trace import enable_pii_redaction
+
+    enable_pii_redaction()  # idempotent; safe to call multiple times
+
+    agent = Agent(
+        name="helper",
+        instructions="You are a concise assistant.",
+        llm={"model": "gpt-4o-mini"},
+    )
+    print(agent.chat("My api_key=sk-XYZ — what is 2+2?"))
+    ```
+  </Step>
+  <Step title="Deterministic Seed & Cancellation">
+    ```python
+    from praisonaiagents import Agent
+    from praisonaiagents.agent.interrupt import InterruptController
+
+    agent = Agent(name="helper", instructions="You are a concise assistant.", llm={"model": "gpt-4o-mini"})
+    tok = InterruptController()
+
+    reply = agent.chat("Pick a number 1-100.", seed=42, cancel_token=tok)
+    ```
+  </Step>
+  <Step title="Tool Validation">
+    ```python
+    from praisonaiagents import Agent
+    from praisonaiagents.tools.validators import ValidationResult
+
+    class RangeValidator:
+        def validate_args(self, tool_name, args, context=None):
+            if tool_name == "set_temperature" and not 0 <= args.get("value", 0) <= 100:
+                return ValidationResult(valid=False, errors=["temperature 0-100"])
+            return ValidationResult(valid=True)
+        def validate_result(self, tool_name, result, context=None):
+            return ValidationResult(valid=True)
+
+    def set_temperature(value: float) -> str:
+        return f"set to {value}"
+
+    agent = Agent(name="thermostat", tools=[set_temperature], llm={"model": "gpt-4o-mini"})
+    agent._tool_validator = RangeValidator()
+    print(agent.chat("Set the temperature to 500"))
+    ```
+  </Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Agent
+    participant Scrubber as PII Hook
+    participant LLM
+    participant Validator
+    participant Tool
+
+    Caller->>Agent: chat(prompt, seed, cancel_token)
+    Agent->>Agent: cancel_token.is_set()? abort if true
+    Agent->>Scrubber: BEFORE_LLM (scrub messages)
+    Scrubber-->>Agent: redacted messages
+    Agent->>Agent: cancel_token.is_set()? (last-chance)
+    Agent->>LLM: completion(seed, messages, tools)
+    LLM-->>Agent: tool_call(name, args)
+    Agent->>Validator: validate_args(name, args)
+    alt valid
+        Validator-->>Agent: ok
+        Agent->>Tool: run(args)
+        Tool-->>Agent: result
+    else rejected
+        Validator-->>Agent: ValidationResult(valid=False)
+        Agent-->>LLM: "Tool arguments rejected: ..."
+    end
+    Agent-->>Caller: reply
+```
+
+---
+
+## Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `seed` | `int \| None` | `None` | Per-call random seed forwarded to the LLM. Overrides any `seed` set on the `LLM` instance for this call only. |
+| `cancel_token` | `InterruptController \| None` | `None` | Cooperative cancellation token. When `is_set()` returns true at a checkpoint, raises `InterruptedError(reason)`. Falls back to `agent.interrupt_controller` if not provided. |
+
+---
 
 ## Deterministic seed
 
-<Tip>Use this for snapshot tests, replayable demos, and reproducible evals.</Tip>
+Per-call determinism for reproducible outputs.
 
-<CodeGroup>
-```python Python
+```mermaid
+graph LR
+    Caller[📞 Caller] --> Agent["🤖 Agent.chat(seed=42)"]
+    Agent --> Kwargs["🔧 llm_kwargs['seed']=42"]
+    Kwargs --> LLM["🧠 LLM"]
+    LLM --> Output["📋 Deterministic Output"]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Caller input
+    class Agent,Kwargs process
+    class LLM,Output output
+```
+
+```python
 from praisonaiagents import Agent
 
 agent = Agent(
@@ -64,25 +153,36 @@ agent = Agent(
 print(agent.chat("Pick a number 1-100", seed=42))
 print(agent.chat("Pick a number 1-100", seed=42))
 ```
-</CodeGroup>
 
-<ParamField path="seed" type="int | None" default="None">
-Per-call random seed. Overrides any `seed` set on the underlying `LLM` instance for this call only.
-</ParamField>
+---
 
 ## Cooperative cancellation
 
-<Callout type="info">
-`cancel_token` is checked **at agent start** and **right before the LLM call** — no hard kills, no partial writes.
-</Callout>
+Thread-safe cancellation without hard kills.
 
-<CodeGroup>
-```python Python
+```mermaid
+graph LR
+    Thread["🧵 Other Thread"] --> Request["⚠️ tok.request(reason)"]
+    Request --> Flag["🚩 Flag Set"]
+    Chat["💬 Agent.chat()"] --> Checkpoint["🔍 Checkpoint"]
+    Flag --> Checkpoint
+    Checkpoint --> Error["❌ InterruptedError"]
+
+    classDef thread fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef signal fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Thread thread
+    class Request,Flag,Checkpoint signal
+    class Chat,Error result
+```
+
+```python
 import threading
 from praisonaiagents import Agent
 from praisonaiagents.agent.interrupt import InterruptController
 
-agent = Agent(name="worker", instructions="…", llm={"model": "gpt-4o-mini"})
+agent = Agent(name="worker", instructions="You are a helpful assistant.", llm={"model": "gpt-4o-mini"})
 tok = InterruptController()
 
 def do_work():
@@ -95,20 +195,34 @@ threading.Thread(target=do_work).start()
 # … later, from any thread:
 tok.request("user pressed stop")
 ```
-</CodeGroup>
 
-<ParamField path="cancel_token" type="InterruptController | None" default="None">
-A cooperative cancellation token. When tripped (via `tok.request(reason)`), the next checkpoint raises `InterruptedError`.
-</ParamField>
+---
 
 ## Tool argument validation
 
-<Warning>
-This runs **after** the `BEFORE_TOOL` hook and **before** the tool function. Rejections return a string error to the LLM instead of executing the tool.
-</Warning>
+Validate tool arguments before execution.
 
-<CodeGroup>
-```python Python
+```mermaid
+graph LR
+    LLM["🧠 LLM tool_call"] --> Hook["🪝 BEFORE_TOOL hook"]
+    Hook --> Validator["🛡️ validator.validate_args"]
+    Validator --> Valid{"✅ valid?"}
+    Valid -->|yes| Tool["🔧 Tool Function"]
+    Valid -->|no| Rejection["❌ rejection string → LLM"]
+    Tool --> Result["📋 Result"]
+
+    classDef llm fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class LLM llm
+    class Hook,Validator,Valid process
+    class Tool,Result result
+    class Rejection error
+```
+
+```python
 from praisonaiagents import Agent
 from praisonaiagents.tools.validators import ValidationResult
 
@@ -133,16 +247,39 @@ agent._tool_validator = RangeValidator()
 
 print(agent.chat("Set the temperature to 500"))  # validator rejects, tool never runs
 ```
-</CodeGroup>
 
-<Accordion title="Why attach via attribute instead of __init__?">
-`Agent.__init__` already has many parameters; adding a validator slot would grow the public surface.
-Attribute-assignment keeps the feature **fully opt-in with zero surface impact** on simple agents.
-</Accordion>
+**ValidationResult fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `valid` | `bool` | Whether validation passed |
+| `errors` | `List[str]` | List of error messages |
+| `warnings` | `List[str]` | List of warning messages |
+| `remediation` | `Optional[str]` | Suggested fix for validation errors |
+
+---
 
 ## PII redaction
 
-<Check>Scrubs **egress to the LLM** — the raw prompt still sits in your local chat history for audit.</Check>
+Scrub sensitive data from LLM requests.
+
+```mermaid
+graph LR
+    Messages["📝 messages"] --> Hook["🪝 BEFORE_LLM hook"]
+    Hook --> Scrubber["🧹 scrub_pii_text"]
+    Scrubber --> Redacted["🔒 redacted messages"]
+    Redacted --> LLM["🧠 LLM"]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef secure fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef llm fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Messages input
+    class Hook,Scrubber process
+    class Redacted secure
+    class LLM llm
+```
 
 <Steps>
   <Step title="Enable once at startup">
@@ -162,52 +299,122 @@ Attribute-assignment keeps the feature **fully opt-in with zero surface impact**
   </Step>
 </Steps>
 
-### What gets scrubbed
+**What gets scrubbed:**
+- Key=value pairs: `api_key=sk-…`, `password: hunter2`, `token=…` → `[REDACTED]`
+- Naked tokens: OpenAI-style `sk-ABCDEF…` keys → `[REDACTED]`
+- Identifiers: US SSNs `123-45-6789` → `[REDACTED-SSN]`, credit cards → `[REDACTED-CC]`, emails → `[REDACTED-EMAIL]`
 
-<Tabs>
-  <Tab title="Key=value pairs">
-    `api_key=sk-…`, `password: hunter2`, `token=…`, `secret_key=…` → `[REDACTED]`
-  </Tab>
-  <Tab title="Naked tokens">
-    OpenAI-style `sk-ABCDEF…` keys → `[REDACTED]`
-  </Tab>
-  <Tab title="Identifiers">
-    US SSNs `123-45-6789` → `[REDACTED-SSN]`, credit cards → `[REDACTED-CC]`, emails → `[REDACTED-EMAIL]`
-  </Tab>
-</Tabs>
+---
 
-<Accordion title="Can I customise the rules?">
-Yes — import `scrub_pii_text` and use it inside your own `BEFORE_LLM` hook, or extend `REDACT_KEYS` / `_VALUE_PATTERNS` before calling `enable_pii_redaction()`.
-</Accordion>
+## Which one do I use?
 
-## Combined example
+```mermaid
+graph TB
+    Start["🤔 What do you need?"] --> Repro{"🎯 Reproducible outputs\nfor evals/snapshots?"}
+    Start --> Stop{"🛑 User pressed stop/\ntime limit hit?"}
+    Start --> BadArgs{"🚫 LLM might call tools\nwith bad arguments?"}
+    Start --> Secrets{"🔒 Prompts may contain\nuser secrets/PII?"}
+    
+    Repro -->|yes| SeedSol["✅ Use seed parameter"]
+    Stop -->|yes| CancelSol["✅ Use cancel_token +\nInterruptController"]
+    BadArgs -->|yes| ValidatorSol["✅ Use _tool_validator"]
+    Secrets -->|yes| PIISol["✅ Use enable_pii_redaction()"]
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef solution fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start,Repro,Stop,BadArgs,Secrets question
+    class SeedSol,CancelSol,ValidatorSol,PIISol solution
+```
+
+---
+
+## Common Patterns
+
+### Reproducible eval
 
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.agent.interrupt import InterruptController
-from praisonaiagents.tools.validators import ValidationResult
-from praisonaiagents.trace import enable_pii_redaction
 
-enable_pii_redaction()
+agent = Agent(name="eval", instructions="Pick a random number 1-100", llm={"model": "gpt-4o-mini"})
 
-class AllowAll:
-    def validate_args(self, n, a, context=None):  return ValidationResult(valid=True)
-    def validate_result(self, n, r, context=None): return ValidationResult(valid=True)
-
-agent = Agent(name="all-four", instructions="…", llm={"model": "gpt-4o-mini"})
-agent._tool_validator = AllowAll()
-
-tok = InterruptController()
-reply = agent.chat(
-    "My api_key=sk-XYZ — what is 2+2?",
-    seed=42,
-    cancel_token=tok,
-)
-print(reply)
+# Same seed should give same output
+response1 = agent.chat("Pick a number", seed=42)
+response2 = agent.chat("Pick a number", seed=42)
+assert response1 == response2  # Should pass with most providers
 ```
 
-## Performance
+### Cancel from Ctrl+C handler
 
-<Info>
-Every feature short-circuits to a single attribute-read when inactive. No background threads, no module-level side-effects, no added imports in the hot path.
-</Info>
+```python
+import signal
+from praisonaiagents import Agent
+from praisonaiagents.agent.interrupt import InterruptController
+
+agent = Agent(name="worker", instructions="You are helpful", llm={"model": "gpt-4o-mini"})
+tok = InterruptController()
+
+def signal_handler(signum, frame):
+    tok.request("sigint")
+
+signal.signal(signal.SIGINT, signal_handler)
+
+try:
+    result = agent.chat("Write a very long essay", cancel_token=tok)
+    print(result)
+except InterruptedError as e:
+    print(f"Cancelled: {e}")
+```
+
+### Disable redaction in tests
+
+```python
+import pytest
+from praisonaiagents.trace import enable_pii_redaction, disable_pii_redaction
+
+@pytest.fixture(autouse=True)
+def test_redaction():
+    # Enable for production-like behavior
+    enable_pii_redaction()
+    yield
+    # Clean up after test
+    disable_pii_redaction()
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Seed reliability">
+    Some providers ignore `seed` or treat it as best-effort. Don't rely on it for production routing decisions.
+  </Accordion>
+  <Accordion title="Thread-safe cancellation">
+    `InterruptController.request(...)` is thread-safe. Trip it from a signal handler, an HTTP cancel endpoint, or a parent supervisor.
+  </Accordion>
+  <Accordion title="Fast validators">
+    Validators run on every tool invocation. Avoid network calls or heavy work — return fast `ValidationResult` objects.
+  </Accordion>
+  <Accordion title="Local audit trail">
+    `enable_pii_redaction()` only scrubs messages going to the LLM. Your local chat history still has the raw prompt — keep it secure or scrub it separately.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Approval" icon="user-check" href="/docs/features/approval">
+    Human-in-the-loop approvals for sensitive operations
+  </Card>
+  <Card title="Guardrails" icon="shield" href="/docs/features/guardrails">
+    Input and output validation with custom rules
+  </Card>
+  <Card title="Security Environment Variables" icon="key" href="/docs/features/security-environment-variables">
+    Secure handling of API keys and secrets
+  </Card>
+  <Card title="Hooks" icon="webhook" href="/docs/features/hooks">
+    Event system for BEFORE_LLM and BEFORE_TOOL hooks
+  </Card>
+</CardGroup>

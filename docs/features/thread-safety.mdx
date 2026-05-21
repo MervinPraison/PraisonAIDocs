@@ -130,6 +130,7 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 |-----------|-----------|--------|
 | `chat_history` | `AsyncSafeState` (DualLock: RLock + per-loop `asyncio.Lock`) | Re-entrant on same thread; non-blocking in async contexts |
 | `_cache_lock` | `threading.RLock` | Allows reentrant access from cached helpers |
+| `PersistenceOrchestrator._cache_lock` | `threading.RLock` | Protects `_session_cache` reads/writes; reads return `deepcopy()` to prevent shared mutable state |
 | `RateLimiter` (sync) | `threading.Lock` | Protects `_tokens`, `_api_tokens`, and refill state from races in multi-threaded acquire calls |
 | `RateLimiter` (async) | `asyncio.Lock` | Same protection for coroutine contexts |
 
@@ -154,6 +155,44 @@ class Agent:
 ### Why a re-entrant lock?
 
 Nested calls (e.g. a helper that holds the lock and then assigns `chat_history`, which itself acquires the lock) used to deadlock. `RLock` permits the same thread to re-enter. See [PR #1567](https://github.com/MervinPraison/PraisonAI/pull/1567) for details.
+
+### Persistence Orchestrator session cache
+
+`PersistenceOrchestrator` now guards its in-memory session cache with `threading.RLock` and returns deep copies on read, so concurrent agents can share an orchestrator without corrupting cached `ConversationSession` objects.
+
+```python
+from praisonaiagents import Agent
+from praisonai.persistence import PersistenceOrchestrator
+import threading
+
+# Create shared orchestrator
+orchestrator = PersistenceOrchestrator()
+
+def agent_worker(agent_name, session_id):
+    agent = Agent(name=agent_name)
+    
+    # Safe: orchestrator returns deep copy of cached session
+    history = orchestrator.on_agent_start(agent, session_id=session_id)
+    
+    # Multiple agents can safely read/update sessions concurrently
+    orchestrator.on_message(session_id, "user", "Hello from " + agent_name)
+    orchestrator.on_agent_end(agent, session_id)
+
+# Multiple threads can safely share the orchestrator
+threads = [
+    threading.Thread(target=agent_worker, args=(f"Agent{i}", "session-123"))
+    for i in range(3)
+]
+
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+<Note>
+Reference: PraisonAI PR #1609. The session cache uses defensive copying to prevent shared mutable state between concurrent operations.
+</Note>
 
 ## Best Practices
 
@@ -296,7 +335,7 @@ PraisonAI provides comprehensive thread-safety for HTTP server deployment:
 
 - Multiple `Agent` / `Agents` instances may call `.launch(port=N)` concurrently from different threads — registration is atomic.
 - If two launch calls use the same path on the same port, the second gets an auto-suffixed path (`/path_abc123`) and a warning is logged.
-- Server readiness is signalled deterministically (no fixed sleep); `.launch()` returns only after the port is accepting connections (5s timeout).
+- Server readiness is signalled deterministically (no fixed sleep); `.launch()` returns only after the port is accepting connections. The wait defaults to **5 seconds** and is configurable via the `PRAISONAI_SERVER_READY_TIMEOUT` environment variable. If the server doesn't become ready in time, `.launch()` still returns and a warning is logged — check server logs for startup errors.
 - `aworkflow()` state lock is created inside the running async context, so workflows remain stable when invoked under pytest-asyncio or when nested inside another loop.
 
 ```python
@@ -328,58 +367,66 @@ The `praisonai` wrapper layer (distinct from the `praisonaiagents` content above
 
 ```mermaid
 graph LR
-    subgraph "Thread-Safe OpenAI Client"
-        T1[🧵 Thread 1] --> K1[🔑 API Key A]
-        T2[🧵 Thread 2] --> K2[🔑 API Key B]
-        K1 --> C1[📡 Client A]
-        K2 --> C2[📡 Client B]
-        L[🔒 Lock] -.-> C1
-        L -.-> C2
+    subgraph "Per-Instance OpenAI Client"
+        G1[🤖 BaseAutoGenerator A] --> L1[🔒 Instance Lock] --> C1[📡 Client A]
+        G2[🤖 BaseAutoGenerator B] --> L2[🔒 Instance Lock] --> C2[📡 Client B]
+        G1 -.close().-> X1[♻️ client.close]
+        G2 -.close().-> X2[♻️ client.close]
     end
-    
-    classDef thread fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef key fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef client fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    classDef generator fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef lock fill:#6366F1,stroke:#7C90A0,color:#fff
-    
-    class T1,T2 thread
-    class K1,K2 key
+    classDef client fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef cleanup fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class G1,G2 generator
+    class L1,L2 lock
     class C1,C2 client
-    class L lock
+    class X1,X2 cleanup
 ```
 
-### Key-aware OpenAI client
+### Per-instance OpenAI client lifecycle
 
-The OpenAI client is now cached per `(api_key, base_url)` tuple, allowing multiple keys in the same process without cross-talk:
+Each `BaseAutoGenerator` owns its own OpenAI client — no cross-instance sharing, no LRU eviction surprises.
 
 ```python
 from praisonai import PraisonAI
-import threading
 
-def worker_with_different_key(api_key, task_name):
-    # Each thread gets its own client based on the key
-    praisonai = PraisonAI(
-        auto=f"Create a {task_name}",
-        api_key=api_key  # Different key per thread
-    )
-    result = praisonai.run()
-    print(f"{task_name} completed")
+# Each PraisonAI instance constructs its own auto-generator, which owns
+# a single OpenAI client. Two concurrent instances cannot evict each
+# other's client — even with identical API keys.
+team_a = PraisonAI(auto="Draft a marketing plan", api_key="sk-team-a")
+team_b = PraisonAI(auto="Draft a technical doc", api_key="sk-team-b")
 
-# Two threads with different OpenAI keys
-thread1 = threading.Thread(
-    target=worker_with_different_key,
-    args=("sk-key-team-a", "marketing plan")
-)
-thread2 = threading.Thread(
-    target=worker_with_different_key, 
-    args=("sk-key-team-b", "technical doc")
-)
-
-thread1.start()
-thread2.start()
-thread1.join()
-thread2.join()
+team_a.run()  # safe to run in parallel threads
+team_b.run()
 ```
+
+<Note>
+The client is created lazily on first structured-completion call. The instance's `__del__` makes a best-effort `client.close()`, but the canonical path is explicit `close()` on the generator if you build one directly. This matters in long-lived server processes that spawn many generators.
+</Note>
+
+For power users building generators directly:
+
+```python
+from praisonai.auto import BaseAutoGenerator
+
+gen = BaseAutoGenerator(config_list=[{
+    "model": "gpt-4o-mini",
+    "api_key": "sk-...",
+    "base_url": None,
+}])
+try:
+    # _get_openai_client() is double-checked-locked; calling it from
+    # multiple threads on the same instance returns the same client.
+    result = gen._structured_completion(MyModel, messages=[...])
+finally:
+    gen.close()  # explicit cleanup — recommended over relying on __del__
+```
+
+<Warning>
+**Behaviour change in PR #1681**: the module-level functions `praisonai.auto._get_openai_client(api_key, base_url)` and the `_openai_clients` / `_openai_clients_lock` globals **have been removed**. If you imported them, switch to constructing an `OpenAI` client yourself or call `BaseAutoGenerator(...).\_get_openai_client()`. Each generator now owns exactly one client; the previous bug — an in-use client being evicted from a process-wide LRU and closed while other threads still held a reference — is no longer possible.
+</Warning>
 
 ### Thread-safe Typer command discovery
 
@@ -419,7 +466,44 @@ A transient discovery error does not lock the CLI into a broken state — the ne
 
 **Lazy loaders in `praisonai/auto.py`** are now thread-safe. A single `_load_optional(key, loader)` helper with a module-level lock replaces the previous unguarded module-level globals.
 
+**`inbuilt_tools` lazy import** (PR #1681) now routes through `praisonai.auto._load_optional("inbuilt_autogen_tools", ...)` instead of a hand-rolled re-entry guard. Negative results are cached, so a missing `crewai` or `autogen` install no longer pays the `find_spec` cost on every attribute access. `PRAISONAI_TOOLS_AVAILABLE` is now resolved lazily via `__getattr__`.
+
 **Integration registry** (`praisonai/integrations/registry.py`) now has a per-instance `threading.Lock` guarding `register`/`unregister`/`create`/`list_registered` operations.
+
+### New Thread-Safe Components in PR #1673
+
+**InMemoryJobStore — locked reads and async `get_stats()`**
+
+All read methods (`get`, `get_by_idempotency_key`, `list_jobs`, `count`, `get_stats`) now hold an `asyncio.Lock` while reading internal dicts, so concurrent saves cannot tear a read.
+
+<Warning>
+**Breaking change:** `get_stats()` is now a coroutine. Update your code:
+
+```python
+# Before PR #1673
+stats = store.get_stats()
+
+# After PR #1673
+stats = await store.get_stats()
+```
+</Warning>
+
+**AgentScheduler — interruptible retry backoff (sync scheduler)**
+
+`stop()` now becomes responsive within milliseconds even during retry backoff. The sync scheduler also adopts the shared `backoff_delay()` curve so sync and async retries are identical.
+
+```python
+from praisonai.scheduler import AgentScheduler
+
+scheduler = AgentScheduler(agent, "Hourly news check")
+scheduler.start("hourly", max_retries=3)
+# ... later, from another thread or signal handler:
+scheduler.stop()  # returns within ms, even if a backoff sleep was in progress
+```
+
+**ToolRegistry — thread-safe registry operations**
+
+`ToolRegistry` now holds a `threading.Lock` around all reads and mutations, matching `PluginRegistry` / integration registry. Eliminates `RuntimeError: dictionary changed size during iteration` when registering tools concurrently with iteration. Reference: [PR #1673](https://github.com/MervinPraison/PraisonAI/pull/1673).
 
 ## Related
 

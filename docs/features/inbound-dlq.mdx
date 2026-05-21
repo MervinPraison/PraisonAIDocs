@@ -1,0 +1,182 @@
+---
+title: "Inbound Dead-Letter Queue"
+description: "Never lose a user's message when the LLM fails. Persist, inspect, replay."
+icon: "inbox"
+---
+
+<Note>
+**TL;DR** — When `agent.chat()` fails (LLM 5xx, timeout, rate-limit) the user's message is normally lost. Set `dlq=InboundDLQ(...)` and PraisonAI persists the failed message so you can replay it later.
+</Note>
+
+## Why you want this
+
+<CardGroup cols={2}>
+  <Card title="No silent data loss" icon="shield-check">
+    Failed inbound messages are persisted to a SQLite file before the exception bubbles up.
+  </Card>
+  <Card title="Operator-friendly replay" icon="rotate">
+    A single CLI command (`praisonai bot dlq replay`) re-runs failed messages through the agent.
+  </Card>
+  <Card title="Bounded by design" icon="ruler">
+    TTL + `max_size` keep the queue from growing unbounded; oldest entries evict first.
+  </Card>
+  <Card title="Zero new dependency" icon="feather">
+    Uses only stdlib `sqlite3`. Default OFF — your existing bots are untouched.
+  </Card>
+</CardGroup>
+
+## How it flows
+
+```mermaid
+flowchart LR
+    A[User message]:::agent --> B[BotSessionManager.chat]:::agent
+    B -->|LLM ok| C[Reply]:::agent
+    B -->|LLM fails| D[InboundDLQ]:::tool
+    D -->|operator replay| B
+    classDef agent fill:#8B0000,color:#fff,stroke:#fff,stroke-width:1px;
+    classDef tool fill:#189AB4,color:#fff,stroke:#fff,stroke-width:1px;
+```
+
+## Quick start (3 lines)
+
+```python
+from praisonai.bots import BotSessionManager, InboundDLQ
+
+dlq = InboundDLQ(path="~/.praisonai/dlq.sqlite")
+mgr = BotSessionManager(platform="telegram", dlq=dlq)
+# ↑ that's it — failed agent.chat() now lands in the DLQ
+```
+
+<Tip>
+Default behaviour is **unchanged** when no `dlq=` is passed. This is fully opt-in.
+</Tip>
+
+## CLI
+
+```bash
+# List failed messages (newest first)
+praisonai bot dlq list
+
+# List from a custom path
+praisonai bot dlq list --path /var/lib/myapp/dlq.sqlite --limit 50
+
+# Replay through your bot's configured agent
+praisonai bot dlq replay --config bot.yaml
+
+# Purge everything (asks for confirmation)
+praisonai bot dlq purge
+praisonai bot dlq purge --yes  # skip confirmation
+```
+
+## API reference
+
+<ParamField path="path" type="str | Path" required>
+  Where the SQLite file lives. Parent directories are created automatically.
+</ParamField>
+
+<ParamField path="max_size" type="int" default="10_000">
+  Maximum number of entries kept. When exceeded, oldest entries are dropped first.
+</ParamField>
+
+<ParamField path="ttl_seconds" type="int" default="604800 (7 days)">
+  Entries older than this are evicted on the next `enqueue()` or `evict_expired()`.
+</ParamField>
+
+### `DLQEntry`
+
+<Expandable title="Fields">
+  - `id: int` — primary key, monotonic.
+  - `ts: float` — UNIX time of failure.
+  - `platform: str` — bot platform (`telegram`, `discord`, etc).
+  - `user_id: str` — platform user id.
+  - `prompt: str` — the original user message.
+  - `chat_id: str`, `thread_id: str`, `user_name: str` — metadata when known.
+  - `error: str` — the error string that caused the failure.
+  - `attempts: int` — how many times replay has been attempted (and failed).
+</Expandable>
+
+### Methods
+
+<Tabs>
+  <Tab title="Inspect">
+    ```python
+    dlq.size()                  # int
+    dlq.list(limit=100)         # list[DLQEntry], newest first
+    ```
+  </Tab>
+  <Tab title="Mutate">
+    ```python
+    dlq.enqueue(
+        platform="telegram", user_id="12345",
+        prompt="hi", error="LLM 503",
+    )
+    dlq.purge()                 # delete all
+    dlq.evict_expired()         # drop entries older than ttl
+    ```
+  </Tab>
+  <Tab title="Replay">
+    ```python
+    async def handler(entry):
+        try:
+            await mgr.chat(agent, entry.user_id, entry.prompt,
+                           chat_id=entry.chat_id,
+                           user_name=entry.user_name)
+            return True   # success → entry deleted
+        except Exception:
+            return False  # keep entry, increment attempts
+
+    succeeded, failed = await dlq.replay(handler)
+    ```
+  </Tab>
+</Tabs>
+
+## Real LLM smoke test
+
+<Frame>
+```text
+[1] Sending failing message: 'What is 2 plus 2? Answer with a single digit.'
+   Caught expected error: simulated LLM 503
+   DLQ size after fail: 1  ✅
+
+[2] Replaying DLQ via real LLM …
+   succeeded=1, failed=0, remaining=0
+
+[Real LLM reply] 4
+
+PASS: DLQ → replay → real LLM produced expected '4'.
+```
+</Frame>
+
+## Operational notes
+
+<Warning>
+**Disk usage** — every failed message + its prompt is written to disk. With chronic LLM outages this can grow fast. Tune `max_size` and `ttl_seconds` for your retention policy.
+</Warning>
+
+<Info>
+**Thread safety** — every write is guarded by an internal `threading.Lock`. SQLite WAL is enabled. Safe to share one `InboundDLQ` instance across threads.
+</Info>
+
+<Check>
+**Backward compatible** — `BotSessionManager(...)` without `dlq=` behaves exactly as before. No behaviour change for existing bots.
+</Check>
+
+## Combining with other features
+
+<AccordionGroup>
+  <Accordion title="With Cross-Platform Mirror (W1)">
+    The DLQ records `platform`, `user_id`, and (if W1's `IdentityResolver` is wired) the same `user_id` resolves the same human across platforms. Replay restores the exact session.
+  </Accordion>
+  <Accordion title="With BackoffPolicy (resilience)">
+    For *transient* failures use `praisonai.bots._resilience.BackoffPolicy` to retry **inline** before falling back to the DLQ. The DLQ is the *last resort*, not the first.
+  </Accordion>
+  <Accordion title="With observability">
+    Wrap `dlq.enqueue()` with your tracer (e.g. OTEL span) to alert on DLQ growth. A non-zero `dlq.size()` is a great SLO trip-wire.
+  </Accordion>
+</AccordionGroup>
+
+## Paid upgrade path
+
+<Badge>OSS now</Badge> File-backed SQLite DLQ — single-host deploys.
+
+<Badge>Cloud (planned)</Badge> Multi-region replicated DLQ with web dashboard, automatic alerting, and one-click bulk replay.
