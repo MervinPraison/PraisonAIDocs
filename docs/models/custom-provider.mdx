@@ -9,8 +9,26 @@ icon: "plug"
 The Custom Provider Registry allows you to register custom LLM providers that extend PraisonAI's capabilities beyond the built-in providers (OpenAI, Anthropic, Google via LiteLLM).
 
 <Note>
-**Important**: This registry is for **custom provider extensions only**. Built-in providers (OpenAI, Anthropic, Google, etc.) are handled automatically by LiteLLM in `praisonaiagents`. You only need this registry when integrating providers not supported by LiteLLM.
+**Updated in PR #1624**: Built-in providers (`openai`, `anthropic`, `google`) plus aliases (`oai`, `claude`, `gemini`, `google_genai`) are now auto-registered and backed by LiteLLM. You add custom providers when you need a non-LiteLLM backend or a custom routing/caching/mocking layer.
 </Note>
+
+## Built-in providers
+
+Built-in providers are automatically registered when a registry is created:
+
+| Provider name | Aliases | Backend |
+|---|---|---|
+| `openai` | `oai` | LiteLLM (`litellm.completion` / `litellm.acompletion`) |
+| `anthropic` | `claude` | LiteLLM |
+| `google` | `gemini`, `google_genai` | LiteLLM |
+
+```python
+from praisonai.llm import create_llm_provider
+
+# Both work out of the box
+provider1 = create_llm_provider("openai/gpt-4o")
+provider2 = create_llm_provider("oai/gpt-4o")
+```
 
 ## What Problem Does It Solve?
 
@@ -33,14 +51,20 @@ class MyCustomProvider:
         self.config = config or {}
     
     def generate(self, prompt):
-        # Your implementation here
+        # Your implementation here (sync)
         return f"Response from {self.model_id}"
+    
+    async def generate_async(self, prompt):
+        # Async implementation (does not block event loop)
+        return f"Async response from {self.model_id}"
 
 # Register the provider
 register_llm_provider("my-custom", MyCustomProvider)
 
 # Use it
 provider = create_llm_provider("my-custom/my-model")
+provider.generate("Hello")            # sync
+await provider.generate_async("Hello") # async
 ```
 
 ## Thread Safety
@@ -85,13 +109,13 @@ When no provider is specified, the model name prefix determines the provider:
 | Other | `openai` (default) |
 
 ```python
-# These are equivalent:
-create_llm_provider("gpt-4o-mini")
-create_llm_provider("openai/gpt-4o-mini")
+# Built-in provider examples:
+create_llm_provider("openai/gpt-4o")
+create_llm_provider("oai/gpt-4o")  # Using alias
 
-# These are equivalent:
-create_llm_provider("claude-3-5-sonnet")
-create_llm_provider("anthropic/claude-3-5-sonnet")
+# Custom provider (after registration):
+register_llm_provider("cloudflare", CloudflareProvider)
+create_llm_provider("cloudflare/workers-ai-model")
 ```
 
 ### 3. Custom Provider with Explicit Name
@@ -100,6 +124,65 @@ create_llm_provider("anthropic/claude-3-5-sonnet")
 # After registering "cloudflare"
 create_llm_provider("cloudflare/workers-ai")
 # Resolves to your registered CloudflareProvider
+```
+
+## Provider Aliases
+
+Built-in providers support aliases for shorter, more convenient model specifications:
+
+| Canonical | Aliases |
+|-----------|---------|
+| `openai` | `oai` |
+| `anthropic` | `claude` |
+| `google` | `gemini`, `google_genai` |
+
+### Using Aliases
+
+```python
+from praisonaiagents import Agent
+
+# These are equivalent ways to use Claude
+agent1 = Agent(llm="anthropic/claude-3-5-sonnet")
+agent2 = Agent(llm="claude/claude-3-5-sonnet")  # Alias
+
+# These are equivalent ways to use OpenAI
+agent3 = Agent(llm="openai/gpt-4o")
+agent4 = Agent(llm="oai/gpt-4o")  # Alias
+
+# These are equivalent ways to use Google
+agent5 = Agent(llm="google/gemini-1.5-pro")
+agent6 = Agent(llm="gemini/gemini-1.5-pro")  # Alias
+```
+
+### Registering Custom Providers with Aliases
+
+When registering your own custom providers, you can specify aliases:
+
+```python
+from praisonai.llm import register_llm_provider
+
+class CloudflareProvider:
+    provider_id = "cloudflare"
+    
+    def __init__(self, model_id, config=None):
+        self.model_id = model_id
+        self.config = config or {}
+        
+    def generate(self, prompt):
+        # Implementation
+        pass
+
+# Register with aliases
+register_llm_provider(
+    "cloudflare", 
+    CloudflareProvider, 
+    aliases=["cf", "workers"]
+)
+
+# Now all these work:
+provider1 = create_llm_provider("cloudflare/workers-ai")
+provider2 = create_llm_provider("cf/workers-ai")
+provider3 = create_llm_provider("workers/workers-ai")
 ```
 
 ## Registering Custom Providers Safely
@@ -174,14 +257,15 @@ register_llm_provider("llm", LLMProvider)  # Too generic
 
 ### Reserved Names
 
-These provider names are reserved for model prefix inference and should not be used for custom providers:
+These provider names are now **registered providers** (not just inference defaults):
 
-- `openai` - Used for gpt-*, o1*, o3* models
-- `anthropic` - Used for claude-* models  
-- `google` - Used for gemini-* models
+- `openai` - Auto-registered LiteLLM provider
+- `anthropic` - Auto-registered LiteLLM provider  
+- `google` - Auto-registered LiteLLM provider
+- Their aliases: `oai`, `claude`, `gemini`, `google_genai`
 
 <Note>
-You **can** register these names, but it will override the default inference behavior. Only do this if you're intentionally replacing the built-in provider resolution.
+Re-registering them without `override=True` will raise `ValueError: Provider 'X' is already registered`. Use `override=True` only if you're intentionally replacing the built-in provider.
 </Note>
 
 ## Multi-Agent Guidance
@@ -274,6 +358,37 @@ from praisonai.llm import (
     parse_model_string,        # Parse "provider/model" strings
 )
 ```
+
+## Breaking Changes
+
+<Warning>
+**Advanced Users Only**: The following breaking changes affect low-level API usage. Most users should use `register_provider()` and `resolve_provider()` for new code.
+</Warning>
+
+### Removed APIs
+
+- `LLMProviderRegistry.get_instance()` → Use `get_default_llm_registry()`
+- `LLMProviderRegistry._instance` and `_instance_lock` class attributes removed
+- `praisonai.profiler.default_profiler` module attribute removed
+
+### Changed Semantics
+
+The `LLMProviderRegistry.register()` and `LLMProviderRegistry.resolve()` methods now have `PluginRegistry` semantics:
+
+```python
+# OLD (pre-PR #1675): 3-arg resolve
+registry.resolve(name, model_id, config)
+
+# NEW: Use register_provider/resolve_provider instead
+registry.register_provider(name, provider, aliases=aliases)
+provider_instance = registry.resolve_provider(name, model_id, config)
+```
+
+### Preserved Aliases
+
+These methods continue to work for backward compatibility:
+- `has()`, `list()`, `list_all()`
+- Module-level `register_llm_provider(...)`, `create_llm_provider(...)`
 
 ## Minimal Example
 

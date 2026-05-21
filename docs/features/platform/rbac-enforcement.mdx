@@ -196,13 +196,15 @@ All workspace-scoped API routes now enforce membership:
 
 ### Core Resources
 
-| Route Pattern | Enforcement | Minimum Role |
-|---------------|-------------|-------------|
-| `GET /workspaces/{id}` | ✅ | `member` |
-| `PATCH /workspaces/{id}` | ✅ | `admin` |
-| `DELETE /workspaces/{id}` | ✅ | `owner` |
-| `GET /workspaces/{id}/members` | ✅ | `member` |
-| `POST /workspaces/{id}/members` | ✅ | `admin` |
+| Route Pattern | Enforcement | Minimum Role | Notes |
+|---------------|-------------|-------------|-------|
+| `GET /workspaces/{id}` | ✅ | `member` | |
+| `PATCH /workspaces/{id}` | ✅ | `admin` | |
+| `DELETE /workspaces/{id}` | ✅ | `owner` | |
+| `GET /workspaces/{id}/members` | ✅ | `member` | |
+| `POST /workspaces/{id}/members` | ✅ | `admin` | **Extra check:** owner required for admin/owner roles |
+| `PATCH /workspaces/{id}/members/{user_id}` | ✅ | `admin` | |
+| `DELETE /workspaces/{id}/members/{user_id}` | ✅ | `admin` | |
 
 ### Project Management
 
@@ -234,6 +236,73 @@ All workspace-scoped API routes now enforce membership:
 
 ---
 
+<Warning>
+**Breaking Change**: If you have an existing client that mutates workspaces, members, agents, or issues as a non-admin member, those calls now return 403. Grant the calling user the `admin` (or `owner` where required) role first.
+</Warning>
+
+## Owner-only Sub-checks
+
+Beyond the base role requirements, certain operations require additional owner privileges:
+
+### Member Management with Owner Role
+
+| Operation | Requirement | Error Message |
+|-----------|-------------|---------------|
+| Add member with `role=owner` | Caller must be `owner` | `Only owners can add another owner` |
+| Change role to `owner` | Caller must be `owner` | `Only owners can assign the owner role` |
+| Change existing `owner` role | Caller must be `owner` | `Only owners can change an owner's role` |
+| Remove existing `owner` | Caller must be `owner` | `Only owners can remove an owner` |
+| Change your own role | Always forbidden | `Cannot change your own role` |
+| Remove yourself | Always forbidden | `Cannot remove yourself from the workspace` |
+
+### Example Owner-only Operations
+
+```python
+# These operations require the caller to be an owner:
+POST /workspaces/{id}/members {"user_id": "user-123", "role": "owner"}
+PATCH /workspaces/{id}/members/user-456 {"role": "owner"}  
+PATCH /workspaces/{id}/members/owner-789 {"role": "admin"}
+DELETE /workspaces/{id}/members/owner-789
+
+# These are always forbidden regardless of role:
+PATCH /workspaces/{id}/members/your-user-id {"role": "member"}  # Self role change
+DELETE /workspaces/{id}/members/your-user-id                   # Self removal
+```
+
+## Cross-workspace Access (IDOR)
+
+The `ensure_resource_in_workspace` function prevents cross-workspace resource access by returning **404 (not 403)** when a resource exists but belongs to a different workspace.
+
+### Protected Resources
+
+| Resource | Routes | 404 Message |
+|----------|--------|-------------|
+| Agents | `GET/PATCH/DELETE /agents/{id}` | `Agent not found` |
+| Issues | `GET/PATCH/DELETE /issues/{id}` | `Issue not found` |
+| Issue Comments | `POST/GET /issues/{id}/comments` | `Issue not found` |
+
+```mermaid
+graph TB
+    A[📨 Request /agents/agent-123] --> B[🔍 Load Agent]
+    B --> C{🏢 Same Workspace?}
+    C -->|Yes| D[✅ Allow Access]
+    C -->|No| E[❌ 404 Agent not found]
+    
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    
+    class A request
+    class B,C process
+    class D success
+    class E error
+```
+
+This prevents enumeration of resource IDs across workspaces by making cross-workspace resources appear non-existent.
+
+---
+
 ## Error Responses
 
 ### 403 Forbidden - Non-Member
@@ -254,6 +323,17 @@ When a member lacks the required role level:
 ```json
 {
   "detail": "Insufficient permissions. Requires admin role or higher",
+  "status_code": 403
+}
+```
+
+### 403 Forbidden - Owner Role Required
+
+When an admin attempts to assign admin or owner roles:
+
+```json
+{
+  "detail": "Only owners can assign admin or owner roles",
   "status_code": 403
 }
 ```
@@ -315,11 +395,15 @@ curl -X DELETE -H "Authorization: Bearer $ADMIN_TOKEN" \
 
 ### Behavior Changes
 
-| Scenario | Before GAP-8 | After GAP-8 |
+| Scenario | Before batch 3 | After batch 3 |
 |----------|-------------|-------------|
 | **Valid user, non-member** | ✅ Access granted | ❌ 403 Forbidden |
 | **Valid user, workspace member** | ✅ Access granted | ✅ Access granted |
 | **Invalid token** | ❌ 401 Unauthorized | ❌ 401 Unauthorized |
+| **Admin promotes member → admin** | ✅ allowed | ❌ 403 Forbidden |
+| **Admin promotes member → owner** | ❌ already blocked | ❌ still blocked |
+| **Owner promotes member → admin** | ✅ allowed | ✅ allowed |
+| **Cross-workspace resource access via service layer** | Surface IDOR risk | ❌ returns `None`/404 |
 
 ### Client Impact
 
