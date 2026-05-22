@@ -6,6 +6,8 @@ from .version import __version__
 # Define __all__ for lazy loading
 __all__ = [
     'PraisonAI',
+    'run',
+    'arun',
     '__version__',
     'Deploy',
     'DeployConfig',
@@ -92,7 +94,13 @@ def __getattr__(name):
     # Note: Telemetry initialization moved out of lazy hook to avoid side effects
     # It should be called explicitly from cli.PraisonAI.__init__ instead
 
-    if name == 'PraisonAI':
+    if name == 'run':
+        from ._entrypoint import run
+        return run
+    elif name == 'arun':
+        from ._entrypoint import arun
+        return arun
+    elif name == 'PraisonAI':
         from .cli import PraisonAI
         return PraisonAI
     elif name == 'Agent':
@@ -130,9 +138,12 @@ def __getattr__(name):
     elif name == 'EmbeddingResult':
         from praisonaiagents.embedding import EmbeddingResult
         return EmbeddingResult
-    elif name == 'AgentOS':
-        from .app import AgentOS
-        return AgentOS
+    elif name == 'build_host_app':
+        from .integration.host_app import build_host_app
+        return build_host_app
+    elif name == 'configure_host':
+        from .integration.host_app import configure_host
+        return configure_host
     elif name == 'AgentApp':
         # Silent alias for AgentOS (backward compatibility)
         from .app import AgentOS
