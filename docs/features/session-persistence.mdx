@@ -145,13 +145,46 @@ These fields enable cost tracking and usage analytics across sessions.
 
 ## Multi-Process Safety
 
-The session store uses file locking to ensure safe concurrent access:
+The session store is safe under concurrent multi-process and multi-instance use:
 
-- **Unix**: Uses `fcntl.flock()` for file locking
-- **Windows**: Uses `msvcrt.locking()` for file locking
-- **Atomic Writes**: Uses temp file + rename to prevent corruption
+- **File locking** — `fcntl.flock()` on Unix, `msvcrt.locking()` on Windows
+- **Atomic writes** — temp file + `os.replace()` prevents partial-write corruption
+- **Reload under lock** — every mutator (`add_message`, `set_agent_info`, `set_gateway_info`,
+  `clear_session`, `update_session_metadata`) reloads the session from disk inside the
+  `FileLock` before mutating, so two processes sharing the same session directory cannot
+  drop each other's messages.
 
-Multiple processes can safely read/write to the same session.
+<Note>
+The reload-under-lock guarantee was completed in PraisonAI PR #1709 (metadata) and PR #1724
+(agent info, gateway info, clear). Earlier releases could silently drop messages if
+`set_agent_info` / `clear_session` / `set_gateway_info` raced with `add_message` across
+two `DefaultSessionStore` instances pointed at the same directory.
+</Note>
+
+```mermaid
+sequenceDiagram
+    participant W as Worker A<br/>(add_message)
+    participant D as sessions/sess-1.json
+    participant R as Worker B<br/>(set_agent_info)
+
+    W->>D: FileLock acquire
+    W->>D: reload from disk
+    W->>D: append "hello"
+    W->>D: atomic write
+    W->>D: FileLock release
+
+    R->>D: FileLock acquire
+    Note over R,D: reload-under-lock<br/>sees "hello" ✅
+    R->>D: set agent_name
+    R->>D: atomic write (preserves "hello")
+    R->>D: FileLock release
+
+    classDef worker fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef file fill:#189AB4,stroke:#7C90A0,color:#fff
+    
+    class W,R worker
+    class D file
+```
 
 ## Direct Session Store Access
 
@@ -300,12 +333,17 @@ assert isinstance(get_default_session_store(), SessionStoreProtocol)
 
 | Method | Description |
 |--------|-------------|
-| `add_message(session_id, role, content)` | Add a message |
-| `add_user_message(session_id, content)` | Add a user message |
-| `add_assistant_message(session_id, content)` | Add an assistant message |
+| `add_message(session_id, role, content, metadata)` | Add a message (reload-under-lock) |
+| `add_user_message(session_id, content)` | Convenience wrapper for `add_message(role="user", ...)` |
+| `add_assistant_message(session_id, content)` | Convenience wrapper for `add_message(role="assistant", ...)` |
 | `get_chat_history(session_id, max_messages)` | Get chat history |
 | `get_session(session_id)` | Get full session data |
-| `clear_session(session_id)` | Clear all messages |
+| `clear_session(session_id)` | Clear all messages (reload-under-lock) |
 | `delete_session(session_id)` | Delete session completely |
 | `list_sessions(limit)` | List all sessions |
 | `session_exists(session_id)` | Check if session exists |
+| `set_agent_info(session_id, agent_name, user_id)` | Attach agent name / user id to a session (reload-under-lock) |
+| `set_gateway_info(session_id, gateway_session_id, agent_id)` | Link a session to a gateway session id and agent id |
+| `update_session_metadata(session_id, **fields)` | Merge run stats / metadata into a session; `agent_id` / `agent_name` / `user_id` keys also update the top-level fields |
+| `get_by_gateway_session(gateway_session_id)` | Look up a session by its gateway session id |
+| `invalidate_cache(session_id)` | Drop the in-memory cache entry; next read will hit disk |
