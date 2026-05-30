@@ -145,13 +145,33 @@ These fields enable cost tracking and usage analytics across sessions.
 
 ## Multi-Process Safety
 
-The session store uses file locking to ensure safe concurrent access:
+The session store uses file locking to ensure safe concurrent access on **both reads and writes**:
 
-- **Unix**: Uses `fcntl.flock()` for file locking
-- **Windows**: Uses `msvcrt.locking()` for file locking
-- **Atomic Writes**: Uses temp file + rename to prevent corruption
+- **Atomic writes**: `add_message` and friends reload under `FileLock`, mutate, then atomically write (temp file + rename) so concurrent writers can't corrupt a session file.
+- **Fresh reads**: `get_chat_history`, `get_session`, and `get_sessions_by_agent` reload from disk under `FileLock` on every call and refresh the in-process cache. Two store instances pointing at the same `session_dir` will always see each other's writes.
+- **Cross-platform locks**: `fcntl.flock` on Unix/macOS, `msvcrt.locking` on Windows.
 
-Multiple processes can safely read/write to the same session.
+<Note>
+Multiple processes (e.g. a gateway worker and a bot worker, or multiple uvicorn workers) can safely share the same `session_dir`. Each call to `get_chat_history` returns the latest committed state on disk — there is no stale-cache window.
+</Note>
+
+<Note>
+`store.invalidate_cache(session_id)` still exists for backwards compatibility, but since reads always reload from disk it is effectively a no-op on the read path. You no longer need to call it before `get_chat_history` / `get_session`.
+</Note>
+
+```mermaid
+sequenceDiagram
+    participant Reader as Store B (reader)
+    participant Disk as session-1.json
+    participant Writer as Store A (writer)
+
+    Writer->>Disk: add_user_message("first")
+    Reader->>Disk: get_chat_history()  [FileLock]
+    Disk-->>Reader: ["first"]
+    Writer->>Disk: add_user_message("second")
+    Reader->>Disk: get_chat_history()  [FileLock, fresh reload]
+    Disk-->>Reader: ["first", "second"]
+```
 
 ## Direct Session Store Access
 
