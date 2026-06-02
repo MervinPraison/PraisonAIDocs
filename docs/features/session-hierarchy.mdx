@@ -6,6 +6,26 @@ icon: "sitemap"
 
 Advanced session management with forking, snapshots, and revert capabilities.
 
+```mermaid
+graph LR
+    subgraph "Session Hierarchy"
+        A[📋 Agent] --> B[🗂️ Store]
+        B --> C[✨ Sessions]
+        C --> D[🔄 Fork]
+        C --> E[📸 Snapshot]
+        D --> F[⏮️ Revert]
+        E --> F
+    end
+    
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class A agent
+    class B,D,E,F process
+    class C output
+```
+
 <Note>
 **For basic session persistence**, use the Agent's `memory` parameter:
 ```python
@@ -21,31 +41,125 @@ See [Session Management](/concepts/session-management) for details.
 - **Snapshots** - Create labeled checkpoints within sessions
 - **Revert** - Restore sessions to previous states
 - **Export/Import** - Transfer sessions between systems
+- **Multi-Worker Safety** - Share sessions across multiple processes securely
 
-## Quick Start
+## Multi-Worker Safety
+
+Multiple workers can share one session directory safely — reads always see the latest disk state.
+
+```mermaid
+sequenceDiagram
+    participant WorkerA as 🤖 Worker A
+    participant Disk as 💾 session_dir
+    participant WorkerB as 🤖 Worker B
+
+    WorkerA->>Disk: add_user_message("session-1", "first")
+    WorkerB->>Disk: get_extended_session("session-1")
+    Disk-->>WorkerB: fresh state (includes Worker A's write)
+    
+    WorkerB->>Disk: add_user_message("session-1", "second")
+    WorkerA->>Disk: get_extended_session("session-1")
+    Disk-->>WorkerA: fresh state (both messages)
+```
 
 ```python
 from praisonaiagents.session.hierarchy import HierarchicalSessionStore
 
-# Create a hierarchical session store
-store = HierarchicalSessionStore(session_dir="./sessions")
+# Two workers sharing the same session directory
+worker_a = HierarchicalSessionStore(session_dir="./shared_sessions")
+worker_b = HierarchicalSessionStore(session_dir="./shared_sessions")
 
-# Create a session
-session_id = store.create_session(title="My Project")
+# Worker A creates session and adds message
+session_id = worker_a.create_session(title="Shared Session")
+worker_a.add_user_message(session_id, "Hello from Worker A")
 
-# Add messages
-store.add_message(session_id, "user", "Hello!")
-store.add_message(session_id, "assistant", "Hi there!")
+# Worker B immediately sees Worker A's write
+session = worker_b.get_extended_session(session_id)
+print(len(session.messages))  # 1 - sees Worker A's message
 
-# Create a snapshot
-snapshot_id = store.create_snapshot(session_id, label="Checkpoint 1")
+# Worker B adds message
+worker_b.add_assistant_message(session_id, "Hello from Worker B")
 
-# Continue working...
-store.add_message(session_id, "user", "Do something risky")
-
-# Revert to snapshot if needed
-store.revert_to_snapshot(session_id, snapshot_id)
+# Worker A sees Worker B's update
+session = worker_a.get_extended_session(session_id) 
+print(len(session.messages))  # 2 - sees both messages
 ```
+
+If you keep references to extended session objects across requests, call `store.invalidate_cache(session_id)` to drop in-process copies.
+
+## Cache Invalidation
+
+Clear in-process caches when you need to force a reload.
+
+```python
+# Invalidate cache for a specific session
+store.invalidate_cache(session_id="my-session")
+
+# Invalidate all cached sessions
+store.invalidate_cache()
+
+# Force fresh reload after manual file changes
+store.invalidate_cache("session-1")
+session = store.get_extended_session("session-1")  # Always fresh from disk
+```
+
+<Note>
+Most users will never need manual cache invalidation — `get_extended_session()`, `get_chat_history()`, `fork_session()`, and `revert_to_*` already read fresh from disk. Manual invalidation only matters if user code is holding on to `ExtendedSessionData` references loaded directly via internal APIs.
+</Note>
+
+## Quick Start
+
+<Steps>
+<Step title="Simple Usage with Agent">
+Enable hierarchical sessions for an agent to support forking and snapshots:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.session.hierarchy import HierarchicalSessionStore
+
+# Create agent with hierarchical session store
+store = HierarchicalSessionStore(session_dir="./sessions")
+agent = Agent(
+    name="Assistant",
+    instructions="You can fork conversations and create snapshots",
+    session_store=store
+)
+
+# Start conversation
+result = agent.start("Help me plan a project")
+session_id = agent.session_id
+
+# Create a snapshot before experimental changes
+snapshot_id = store.create_snapshot(session_id, label="Initial plan")
+```
+</Step>
+
+<Step title="With Multi-Worker Setup">
+Share sessions across multiple agent instances or workers:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.session.hierarchy import HierarchicalSessionStore
+
+# Shared store across workers
+shared_dir = "./shared_sessions"
+
+# Worker 1
+agent1 = Agent(
+    name="Assistant",
+    session_store=HierarchicalSessionStore(session_dir=shared_dir)
+)
+
+# Worker 2 
+agent2 = Agent(
+    name="Assistant", 
+    session_store=HierarchicalSessionStore(session_dir=shared_dir)
+)
+
+# Both agents see each other's session updates immediately
+```
+</Step>
+</Steps>
 
 ## API Reference
 
@@ -67,6 +181,12 @@ class HierarchicalSessionStore(DefaultSessionStore):
         title: Optional[str] = None
     ) -> str:
         """Fork a session from a specific message point."""
+    
+    def get_extended_session(self, session_id: str) -> ExtendedSessionData:
+        """Get extended session data (always reloaded from disk)."""
+    
+    def invalidate_cache(self, session_id: Optional[str] = None) -> None:
+        """Clear in-memory caches. Pass session_id for one session, omit for all."""
     
     def create_snapshot(
         self,
@@ -152,3 +272,69 @@ exported = store1.export_session(session_id)
 store2 = HierarchicalSessionStore(session_dir="./store2")
 new_id = store2.import_session(exported)
 ```
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Share one session_dir across workers">
+The store handles file locking and fresh reads for you. Multiple `HierarchicalSessionStore` instances pointing to the same `session_dir` stay consistent via `FileLock` and disk-fresh reads.
+
+```python
+# Multiple workers sharing sessions
+worker1 = HierarchicalSessionStore(session_dir="/shared/sessions")
+worker2 = HierarchicalSessionStore(session_dir="/shared/sessions")
+# Both see each other's writes immediately
+```
+</Accordion>
+
+<Accordion title="Use invalidate_cache() only when caching ExtendedSessionData">
+Regular methods like `get_extended_session()` already read fresh from disk. Only use manual cache invalidation if you cache `ExtendedSessionData` objects yourself.
+
+```python
+# Manual caching scenario
+session = store.get_extended_session("session-1")
+# ... later, if another process modified the session ...
+store.invalidate_cache("session-1")  # Force fresh read
+```
+</Accordion>
+
+<Accordion title="Avoid per-request HierarchicalSessionStore instances">
+Creating new stores for each request is inefficient. Instead, create one store instance and reuse it, or share one `session_dir` across multiple instances.
+
+```python
+# Good: Reuse store instance
+store = HierarchicalSessionStore(session_dir="./sessions")
+
+# Bad: New instance per request
+def handle_request():
+    store = HierarchicalSessionStore()  # Creates new temp dir each time
+```
+</Accordion>
+
+<Accordion title="Use snapshots for risky operations">
+Create snapshots before experimental changes so you can revert if needed.
+
+```python
+# Before risky operation
+snapshot_id = store.create_snapshot(session_id, label="Before experiment")
+
+# Try risky operation
+store.add_message(session_id, "user", "Experimental command")
+
+# Revert if needed
+if operation_failed:
+    store.revert_to_snapshot(session_id, snapshot_id)
+```
+</Accordion>
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Session Management" icon="database" href="/concepts/session-management">
+  Basic session persistence and management concepts
+</Card>
+<Card title="Session Persistence" icon="floppy-disk" href="/features/session-persistence">
+  File-based session storage and configuration
+</Card>
+</CardGroup>
