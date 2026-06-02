@@ -102,6 +102,35 @@ async def main():
 asyncio.run(main())
 ```
 </Step>
+
+<Step title="With Timeout & Budget Limit">
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonai.async_agent_scheduler import AsyncAgentScheduler
+
+async def main():
+    agent = Agent(
+        name="CostAwareAgent",
+        instructions="Summarise the latest tech headlines.",
+    )
+
+    scheduler = AsyncAgentScheduler(
+        agent,
+        task="Summarise tech news",
+        timeout=30,        # stop a single run after 30s
+        max_cost=1.00,     # auto-shutdown once $1.00 spent
+    )
+
+    await scheduler.start("hourly", run_immediately=True)
+    await asyncio.sleep(3600 * 4)
+    stats = await scheduler.get_stats_async()
+    print(f"Spent ${stats['total_cost_usd']}, remaining ${stats['remaining_budget']}")
+    await scheduler.stop()
+
+asyncio.run(main())
+```
+</Step>
 </Steps>
 
 ---
@@ -165,6 +194,8 @@ The scheduler's async primitives (`_stop_event`, `_cancel_event`, `_stats_lock`)
 | `config` | `Optional[Dict[str, Any]]` | `None` | Optional configuration dictionary |
 | `on_success` | `Optional[Callable[[Any], None]]` | `None` | Callback function on successful execution |
 | `on_failure` | `Optional[Callable[[Exception], None]]` | `None` | Callback function on failed execution |
+| `timeout` | `Optional[int]` | `None` | **NEW** — Maximum execution time per run in seconds. `None` means no limit. Enforced with `asyncio.wait_for()`. |
+| `max_cost` | `Optional[float]` | `1.00` | **NEW** — Maximum total cost in USD. Scheduler auto-stops when reached. Set to `None` to disable. Default `$1.00` is a safety guard. |
 
 ### start() Method Options
 
@@ -214,6 +245,8 @@ graph LR
 | `successful_executions` | `int` | Number of successful executions |
 | `failed_executions` | `int` | Number of failed executions |
 | `success_rate` | `float` | Success percentage (0-100) |
+| `total_cost_usd` | `float` | **NEW** — Running total cost in USD (4 dp) |
+| `remaining_budget` | `float \| None` | **NEW** — `max_cost - total_cost_usd`, or `None` if `max_cost` is disabled |
 
 ---
 
@@ -318,6 +351,54 @@ async def main():
 asyncio.run(main())
 ```
 
+### Budget-aware Scheduling
+
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonai.async_agent_scheduler import AsyncAgentScheduler
+
+async def main():
+    agent = Agent(name="ReportAgent", instructions="Generate hourly report")
+
+    # Hard-stop after $5 total spend, 60s per run
+    scheduler = AsyncAgentScheduler(
+        agent,
+        task="Generate report",
+        timeout=60,
+        max_cost=5.00,
+    )
+
+    await scheduler.start("hourly")
+    while scheduler.is_running:
+        await asyncio.sleep(60)
+        stats = await scheduler.get_stats_async()
+        if stats["remaining_budget"] is not None and stats["remaining_budget"] < 0.50:
+            print(f"⚠️  Budget nearly exhausted: ${stats['remaining_budget']:.4f} left")
+    print("Scheduler stopped (budget reached or manual stop)")
+
+asyncio.run(main())
+```
+
+```mermaid
+graph TB
+    Start[Execution Start] --> Check{total_cost >= max_cost?}
+    Check -->|Yes| Stop[stop_event.set] --> Halt[Scheduler Halts]
+    Check -->|No| Run[Run Agent]
+    Run --> AddCost[total_cost += ~$0.0001]
+    AddCost --> NextLoop[Wait for next interval]
+    
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef run fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class Start start
+    class Check check
+    class Stop,Halt stop
+    class Run,AddCost,NextLoop run
+```
+
 ---
 
 ## Best Practices
@@ -385,6 +466,35 @@ from praisonai.scheduler import AgentScheduler
 scheduler = AgentScheduler(agent, task)
 scheduler.start("hourly")
 ```
+</Accordion>
+
+<Accordion title="Budget Control">
+The default `max_cost=1.00` is intentional — it caps unattended cost runaway. For long-running production deployments, raise it explicitly to the budget you've approved, or set `max_cost=None` only when an external billing system enforces limits.
+
+```python
+# Production with explicit budget
+scheduler = AsyncAgentScheduler(agent, task, max_cost=50.00)
+
+# Disable budget (only when external limits exist)
+scheduler = AsyncAgentScheduler(agent, task, max_cost=None)
+```
+
+When the budget triggers, the scheduler logs a warning and calls `stop_event.set()` internally — `stats["is_running"]` flips to `False`.
+</Accordion>
+
+<Accordion title="Timeout Configuration">
+Set `timeout` to bound the worst-case wall-clock time per run. Internally implemented with `asyncio.wait_for()`, which raises `asyncio.TimeoutError` and triggers the standard retry path.
+
+```python
+scheduler = AsyncAgentScheduler(
+    agent,
+    task,
+    timeout=30,        # individual run cannot exceed 30s
+    max_cost=1.00,
+)
+```
+
+`timeout=None` (the default) imposes no limit.
 </Accordion>
 </AccordionGroup>
 
