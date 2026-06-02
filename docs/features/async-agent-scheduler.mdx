@@ -103,7 +103,7 @@ asyncio.run(main())
 ```
 </Step>
 
-<Step title="With Budget and Timeout">
+<Step title="With Custom Configuration">
 ```python
 import asyncio
 from praisonaiagents import Agent
@@ -118,8 +118,9 @@ async def main():
     scheduler = AsyncAgentScheduler(
         agent,
         task="Check the latest AI news",
-        timeout=60,        # cancel any run that exceeds 60s
-        max_cost=2.00,     # stop the scheduler after $2.00 total spend
+        config={"retry_backoff": True},
+        on_success=lambda result: print(f"Success: {result}"),
+        on_failure=lambda error: print(f"Failed: {error}"),
     )
     await scheduler.start("hourly", max_retries=3, run_immediately=True)
 
@@ -127,8 +128,8 @@ async def main():
 
     await scheduler.stop()
     stats = await scheduler.get_stats()
-    print(f"Total cost: ${stats['total_cost_usd']}")
-    print(f"Remaining budget: ${stats['remaining_budget']}")
+    print(f"Total executions: {stats['total_executions']}")
+    print(f"Success rate: {stats['success_rate']:.1f}%")
 
 asyncio.run(main())
 ```
@@ -196,8 +197,6 @@ The scheduler's async primitives (`_stop_event`, `_cancel_event`, `_stats_lock`)
 | `config` | `Optional[Dict[str, Any]]` | `None` | Optional configuration dictionary |
 | `on_success` | `Optional[Callable[[Any], None]]` | `None` | Callback function on successful execution |
 | `on_failure` | `Optional[Callable[[Exception], None]]` | `None` | Callback function on failed execution |
-| `timeout` | `Optional[int]` | `None` | Maximum execution time per run in seconds. When set, each agent execution is wrapped in `asyncio.wait_for(...)` — runs longer than this are cancelled and treated as a failure (retried per `max_retries`). `None` = no limit. |
-| `max_cost` | `Optional[float]` | `1.00` | Maximum total cost in USD across the scheduler's lifetime. Defaults to **$1.00 for safety**. Set to `None` to disable. When the budget is hit, the scheduler sets `_stop_event` and exits the loop on the next tick. |
 
 ### start() Method Options
 
@@ -207,56 +206,7 @@ The scheduler's async primitives (`_stop_event`, `_cancel_event`, `_stats_lock`)
 | `max_retries` | `int` | `3` | Maximum retry attempts on failure |
 | `run_immediately` | `bool` | `False` | If True, run agent immediately before starting schedule |
 
-## Factory Methods
-
-Create a scheduler directly from YAML or a recipe instead of wiring an agent manually.
-
-### `AsyncAgentScheduler.from_yaml(...)`
-
-```python
-from praisonai.scheduler.async_agent_scheduler import AsyncAgentScheduler
-
-scheduler = AsyncAgentScheduler.from_yaml("agents.yaml")
-await scheduler.start_from_yaml_config()   # uses interval/max_retries/run_immediately from YAML
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `yaml_path` | `str` | `"agents.yaml"` | Path to the agents.yaml file. |
-| `interval_override` | `Optional[str]` | `None` | Override the schedule interval from the YAML. |
-| `max_retries_override` | `Optional[int]` | `None` | Override `max_retries` from the YAML. |
-| `timeout_override` | `Optional[int]` | `None` | Override `timeout` from the YAML. |
-| `max_cost_override` | `Optional[float]` | `None` | Override `max_cost` from the YAML. |
-| `on_success` | `Optional[Callable]` | `None` | Success callback. |
-| `on_failure` | `Optional[Callable]` | `None` | Failure callback. |
-
-Raises `ValueError` if no `task` is present in the YAML.
-
-### `scheduler.start_from_yaml_config()`
-
-Async method. Must be called after `from_yaml()`. Reads `interval`, `max_retries`, and `run_immediately` from the YAML's schedule block and starts the scheduler.
-
-### `AsyncAgentScheduler.from_recipe(...)`
-
-```python
-scheduler = AsyncAgentScheduler.from_recipe("news-monitor")
-await scheduler.start_from_yaml_config()
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `recipe_name` | `str` | Required | Name of the recipe to schedule. |
-| `input_data` | `Any` | `None` | Input data forwarded to the recipe. |
-| `config` | `Optional[Dict[str, Any]]` | `None` | Per-recipe config overrides. |
-| `interval_override` | `Optional[str]` | `None` | Override schedule interval from recipe runtime config. |
-| `max_retries_override` | `Optional[int]` | `None` | Override `max_retries` from recipe runtime config. |
-| `timeout_override` | `Optional[int]` | `None` | Override `timeout`. Default falls back to `300s`. |
-| `max_cost_override` | `Optional[float]` | `None` | Override `max_cost`. Default falls back to `$1.00`. |
-| `on_success` / `on_failure` | `Optional[Callable]` | `None` | Callbacks. |
-
-The recipe is resolved via `praisonai.recipe.bridge.resolve(...)` and wrapped in an internal `AsyncRecipeExecutorAgent` that offloads sync recipe execution to `loop.run_in_executor`. Recipe-level `schedule.timeout_sec` and `schedule.max_cost_usd` are honoured unless overridden.
-
-### Reading Stats
+## Reading Stats
 
 ```mermaid
 graph LR
@@ -279,13 +229,12 @@ graph LR
     class H tear
 ```
 
+Statistics can be read in both sync and async contexts with different guarantees:
 | Method | Sync/Async | Atomicity | When to Use |
 |--------|-----------|-----------|-------------|
-| `await scheduler.get_stats()` | async | **Atomic snapshot** under `_stats_lock`. As of PR #1784, this method now delegates to `get_stats_async()`. | Anywhere — this is the canonical reader. |
-| `await scheduler.get_stats_async()` | async | **Atomic snapshot** under `_stats_lock`. | Equivalent to `get_stats()`; kept for explicit-naming readability. |
-| `scheduler.get_stats_sync()` | sync | **Best-effort, no lock** — counters may be observed mid-update. | Sync contexts only (tests, scripts, REPL). Avoid in async code. |
-
-⚠️ **Behaviour change from previous releases:** `get_stats()` used to be a sync best-effort read. Callers that did `scheduler.get_stats()` (no `await`) now receive a coroutine. Either `await` it, or call `get_stats_sync()` for a drop-in sync replacement.
+| `scheduler.get_stats()` | sync | **Best-effort, no lock** — counters may be observed mid-update during concurrent execution. | Backward compatibility. Quick stats access in sync contexts. |
+| `await scheduler.get_stats_async()` | async | **Atomic snapshot** under `_stats_lock` — all counters read together. | Async contexts where consistent stats are needed. |
+| `scheduler.get_stats_sync()` | sync | **Best-effort, no lock** — same as `get_stats()` for clarity. | Explicit sync contexts (tests, scripts, REPL). |
 
 ### Stats Response Format
 
@@ -296,60 +245,6 @@ graph LR
 | `successful_executions` | `int` | Number of successful executions |
 | `failed_executions` | `int` | Number of failed executions |
 | `success_rate` | `float` | Success percentage (0-100) |
-| `total_cost_usd` | `float` | Rough estimated total cost across all executions (`~$0.0001` per successful run as a placeholder estimate). Rounded to 4 dp. |
-| `remaining_budget` | `Optional[float]` | `max_cost - total_cost_usd`, rounded to 4 dp. `None` when `max_cost` is `None`. |
-
-## Budget & Timeout Behaviour
-
-The scheduler includes budget tracking and timeout support to prevent runaway costs and executions.
-
-```mermaid
-graph TB
-    A[Execution Start] --> B{Check Budget}
-    B -->|Over Budget| C[Set Stop Event]
-    C --> D[Exit Loop]
-    B -->|Within Budget| E[Start Execution]
-    E --> F{Timeout Set?}
-    F -->|Yes| G[asyncio.wait_for]
-    F -->|No| H[Direct Execution]
-    G --> I{Timeout?}
-    I -->|Yes| J[TimeoutError]
-    I -->|No| K[Success]
-    H --> L{Success?}
-    L -->|Yes| K
-    L -->|No| M[Failure]
-    J --> N[Increment Failures]
-    M --> N
-    K --> O[Update Cost]
-    N --> P{Retry?}
-    P -->|Yes| Q[Backoff Delay]
-    Q --> E
-    P -->|No| R[Final Failure]
-    
-    classDef budget fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef timeout fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef failure fill:#8B0000,stroke:#7C90A0,color:#fff
-    
-    class A,B,C budget
-    class E,F,G,I timeout
-    class K,O success
-    class J,M,N,R failure
-```
-
-### Budget Tracking
-
-- Default budget: **$1.00** for safety
-- Rough cost estimate: **$0.0001** per successful execution (placeholder)
-- When budget is exceeded, scheduler stops gracefully
-- Set `max_cost=None` to disable budget limits
-
-### Timeout Behavior
-
-- Per-execution timeout using `asyncio.wait_for()`
-- Timeout errors are treated as failures and trigger retries
-- Backoff delay applied between retry attempts
-- No timeout by default (`timeout=None`)
 
 ---
 
