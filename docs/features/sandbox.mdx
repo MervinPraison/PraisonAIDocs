@@ -574,6 +574,58 @@ async with SandboxManager(config) as sandbox:
 
 ---
 
+## Timeout Behavior & Resource Cleanup
+
+Understanding how different backends handle timeouts and resource cleanup ensures your resource limits are properly enforced.
+
+| Backend | Local cleanup on timeout | Remote cleanup on timeout |
+|---|---|---|
+| `subprocess` | Process killed | N/A |
+| `docker` | Client process killed **and** `docker kill <container>` issued on the named container (`praisonai-<execution_id>`) | Container stopped — resource limits enforced |
+| `ssh` | Local SSH client killed | Remote process terminated via `timeout N sh -c ...` wrapper; remote temp file cleaned up via `finally` (even on error) |
+| `e2b`, `modal`, `native`, `sandlock`, `daytona` | Backend-managed | Backend-managed |
+
+### Docker Timeout Handling
+
+Docker containers get deterministic names and are properly killed on timeout:
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Sandbox
+    participant Docker as docker run --name praisonai-X
+    participant Container
+    
+    Agent->>Sandbox: execute(code, timeout=30)
+    Sandbox->>Docker: start container
+    Docker->>Container: run code
+    
+    alt Execution completes
+        Container-->>Docker: exit 0
+        Docker-->>Sandbox: success
+    else Timeout occurs
+        Note over Sandbox: asyncio.TimeoutError
+        Sandbox->>Docker: docker kill praisonai-X
+        Docker->>Container: SIGKILL
+        Container-->>Docker: terminated
+        Docker-->>Sandbox: timeout result
+    end
+    
+    Sandbox-->>Agent: SandboxResult
+```
+
+**Why containers are no longer orphaned:** Every `docker run` is launched with `--name praisonai-<execution_id>`. On timeout, the sandbox issues `docker kill <name>` to stop the actual container — not just detach the client. Your `memory_mb` and `cpu_percent` limits are now enforced through the entire execution lifecycle.
+
+### SSH Timeout Handling
+
+SSH backend prevents both remote process leaks and temp file accumulation:
+
+**Remote process cleanup:** Commands are wrapped with `timeout N sh -c ...` to ensure remote processes terminate even if the SSH connection drops.
+
+**Temp file cleanup:** File cleanup (`rm -f`) is now in a `finally` block. Even if execution raises (timeout, network blip), the remote temp file is removed. Cleanup errors are swallowed so they never mask the real execution result.
+
+---
+
 ## Best Practices
 
 <AccordionGroup>

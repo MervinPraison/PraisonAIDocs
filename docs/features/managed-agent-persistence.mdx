@@ -477,6 +477,100 @@ result = agent2.start("What format is JSON?")
 
 ---
 
+## Session Metadata Persistence
+
+HostedAgent automatically persists both chat messages and session metadata to your database, ensuring complete session recovery after process restarts.
+
+```mermaid
+graph LR
+    subgraph "Metadata Persistence Flow"
+        A[🤖 Agent Turn] --> B[💾 Save Messages]
+        A --> C[📊 Save Metadata]
+        B --> D[💥 Process Restart]
+        C --> D
+        D --> E[🔄 New Process] 
+        E --> F[📂 Load Messages]
+        E --> G[📈 Load Metadata]
+        F --> H[✅ Full Session Restored]
+        G --> H
+    end
+    
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef storage fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class A agent
+    class B,C,F,G storage
+    class D,E process
+    class H result
+```
+
+### What Survives Process Restarts
+
+When using database persistence, these session components automatically survive crashes, restarts, and deployments:
+
+| Component | Purpose | Restored After Restart |
+|-----------|---------|----------------------|
+| **Chat Messages** | Full conversation history | ✅ Yes |
+| **Token Counts** | `total_input_tokens`, `total_output_tokens` | ✅ Yes |
+| **Session History** | Per-turn audit trail | ✅ Yes |
+| **Agent Identity** | `agent_id` for session continuity | ✅ Yes |
+| **Compute Instance** | Sandbox/runner references | ✅ Yes |
+
+### Complete Session Resume Example
+
+```python
+from praisonaiagents import Agent, db
+from praisonai import HostedAgent, HostedAgentConfig
+
+# First process: run a turn, metadata persisted automatically
+agent = Agent(
+    name="Assistant",
+    backend=HostedAgent(
+        provider="anthropic",
+        config=HostedAgentConfig(model="gpt-4o-mini")
+    ),
+    db=db(database_url="conversation.db"),
+    session_id="session-1",
+)
+response = agent.start("Plan a 3-step research workflow on quantum computing")
+
+# Check usage tokens (automatically tracked)
+print(f"Tokens used: {agent.total_tokens}")
+
+# Process exits. New process starts with same session_id.
+agent2 = Agent(
+    name="Assistant", 
+    backend=HostedAgent(
+        provider="anthropic",
+        config=HostedAgentConfig(model="gpt-4o-mini")
+    ),
+    db=db(database_url="conversation.db"),
+    session_id="session-1",  # Same ID → resumes with full metadata
+)
+
+# All metadata restored: token totals, session history, agent_id, compute instance
+response = agent2.start("Continue from step 2.")
+print(f"Total tokens across restarts: {agent2.total_tokens}")  # Cumulative count restored
+```
+
+### Metadata Fields Preserved
+
+The following metadata fields are automatically persisted and restored:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent_id` | `str` | Stable identity for session continuity |
+| `total_input_tokens` | `int` | Cumulative input tokens for cost tracking |
+| `total_output_tokens` | `int` | Cumulative output tokens for cost tracking |
+| `session_history` | `List[dict]` | Per-turn audit trail with actions and results |
+| `compute_instance` | `str` | Sandbox/runner ID for compute reattachment |
+
+These fields enable cost tracking, usage analytics, and compute resource management across process boundaries.
+
+---
+
 ## Configuration Options
 
 <Card title="HostedAgent API Reference" icon="code" href="/docs/sdk/reference/typescript/classes/HostedAgent">
@@ -493,6 +587,56 @@ result = agent2.start("What format is JSON?")
 | `HostedAgentConfig` | Agent definition | `model`, `system`, `tools`, `packages` |
 | `PraisonDB` | Database adapter | `database_url`, `state_url`, `analytics_url` |
 | `DbSessionAdapter` | Session bridge | Auto-configured based on database URL |
+
+---
+
+## Clearing & Deleting Sessions
+
+The `DbSessionAdapter` now properly purges persisted messages from the database, not just the in-memory cache, ensuring that cleared sessions stay clear even after restarts.
+
+```mermaid
+graph LR
+    subgraph "Session Clearing Flow"
+        A[🗑️ Clear Session] --> B[💾 Purge DB Rows]
+        B --> C[🔄 Empty Cache]
+        C --> D[✅ Clean Reload]
+    end
+    
+    classDef action fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class A action
+    class B,C process
+    class D result
+```
+
+### Clear vs Delete Sessions
+
+```python
+from praisonaiagents import Agent, db
+from praisonai.integrations.db_session_adapter import DbSessionAdapter
+
+store = DbSessionAdapter(db(database_url="conversation.db"))
+
+# Clear the conversation — also wipes persisted rows in the DB
+store.clear_session("session-1")
+assert store.get_chat_history("session-1") == []
+
+# A brand-new instance after a restart starts empty — no stale history
+store2 = DbSessionAdapter(db(database_url="conversation.db"))
+assert store2.get_chat_history("session-1") == []
+
+# Delete session completely — removes all data and metadata
+store.delete_session("session-1")
+```
+
+**Privacy Guarantee:** Cleared messages do not come back after a restart or when creating a new adapter instance. Both `clear_session()` and `delete_session()` now purge persisted messages from the underlying conversation store.
+
+| Method | Purpose | Behavior |
+|--------|---------|----------|
+| `clear_session(session_id)` | Empty the conversation but keep it re-creatable | Purges DB messages, resets cache to empty |
+| `delete_session(session_id)` | Remove the session entirely | Purges DB messages and removes all metadata |
 
 ---
 
@@ -609,7 +753,7 @@ agent = Agent(
 - Use meaningful session IDs (user-based, not random)
 - Implement session rotation for long conversations  
 - Store session metadata for debugging
-- Handle concurrent access with proper locking
+- Concurrent metadata writes are safe with `DefaultSessionStore` (locked read-modify-write); for custom stores, implement `update_session_metadata` or your own equivalent to avoid stale-copy overwrites
 </Accordion>
 
 <Accordion title="Database Selection">
