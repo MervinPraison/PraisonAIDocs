@@ -63,6 +63,62 @@ agent = Agent(
 For complete concurrency control documentation including per-agent limits and sync/async patterns, see [Concurrency](/docs/features/concurrency).
 </Note>
 
+### Wrapper-Level Tool Timeout (YAML / CLI — Defense-in-Depth)
+
+When you set `tool_timeout` in YAML (`framework: praisonai`) **or** pass `--tool-timeout` on the CLI, the wrapper now wraps every tool callable with a timeout-enforcing shim **before** handing the agent to the SDK.
+
+This means the `tool_timeout` knob is enforced even if the downstream SDK ignores it, even if the tool is a blocking C extension, and even if the tool is a subprocess that does not honour `CancelledError`.
+
+The wrapper handles **sync and async tools** differently:
+- **Sync tools** run in a daemon thread (`threading.Thread(daemon=True)`); on timeout the wrapper returns a JSON error dict and abandons the thread (daemon threads do not block process exit).
+- **Async tools** are wrapped with `asyncio.wait_for(...)`; on timeout the wrapper returns the same JSON error dict.
+
+The returned shape on wrapper-level timeout is a **JSON string** (because the wrapper boundary serialises) containing:
+```json
+{
+  "error": "tool_timeout",
+  "tool": "<function name>",
+  "timeout_seconds": 30
+}
+```
+
+If the worker thread exits without publishing a result (defensive fallback), the wrapper returns:
+```json
+{
+  "error": "tool_execution_error",
+  "tool": "<function name>",
+  "detail": "worker_exited_without_result"
+}
+```
+
+Crucially, the wrapper **also keeps passing** `tool_timeout` to the SDK Agent, so both layers are active — hence "defense in depth". The SDK's executor catches the common case; the wrapper catches the pathological one.
+
+**Example usage:**
+
+```yaml
+framework: praisonai
+topic: Fetch and summarise a slow upstream API
+
+config:
+  tool_timeout: 15  # Wrapper-level + SDK-level enforcement
+
+roles:
+  fetcher:
+    role: API Fetcher
+    goal: Pull data without wedging the crew on a slow upstream
+    backstory: Reliability-focused engineer.
+    tools:
+      - fetch_url
+    tasks:
+      fetch:
+        description: Fetch {topic}
+        expected_output: Summarised payload, or a structured timeout dict if the upstream is slow.
+```
+
+When `fetch_url` blocks for more than 15 s, the agent receives the structured JSON dict above instead of an indefinite hang, so the crew keeps moving.
+
+**Precedence note:** When both wrapper-level and SDK-level timeouts apply, the **shorter** of the two wins in practice (whichever fires first). Both currently read from the same `tool_timeout` value, so they fire at the same time; if a user later configures different values at different layers, the first-to-fire semantics still hold.
+
 ### Advanced Timeout Configuration
 
 ```python
