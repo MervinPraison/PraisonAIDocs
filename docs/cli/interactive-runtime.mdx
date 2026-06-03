@@ -54,6 +54,8 @@ async def main():
 asyncio.run(main())
 ```
 
+When the runtime is consumed via the PraisonAI YAML adapter (rather than constructed directly as above), startup failures now degrade gracefully — agents run without the runtime-backed centric tools instead of crashing the run.
+
 ## Configuration
 
 ### RuntimeConfig
@@ -217,20 +219,21 @@ roles:
 ```mermaid
 sequenceDiagram
     participant YAML as YAML Parser
-    participant Loop as Event Loop
+    participant Bridge as _async_bridge (shared loop)
     participant Runtime as InteractiveRuntime
     participant Tools as Agent Tools
     participant Team as AgentTeam
 
-    YAML->>Loop: Create scoped event loop
-    YAML->>Runtime: await runtime.start()
+    YAML->>Bridge: run_sync(runtime.start())
+    Bridge->>Runtime: start() on persistent bg loop
     Runtime->>Tools: create_agent_centric_tools(runtime)
     Tools->>YAML: Merge into tools_dict
     YAML->>Team: team.start() with merged tools
-    Team->>Team: Execute agents with runtime tools
+    Team->>Tools: tool_call → run_sync(_coro())
+    Tools->>Bridge: re-enters SAME loop
+    Bridge-->>Tools: result
     Team-->>YAML: Agent execution result
-    YAML->>Runtime: await runtime.stop() (finally block)
-    YAML->>Loop: loop.close()
+    YAML->>Bridge: run_sync(runtime.stop()) (finally block)
 ```
 
 ### YAML Configuration Details
@@ -240,7 +243,9 @@ The YAML route uses default `RuntimeConfig` values with these settings:
 - **Approval Mode**: `PRAISONAI_APPROVAL_MODE` environment variable (default: `"prompt"`)
 - **Trace Enabled**: Not explicitly set (uses RuntimeConfig default)
 
-The runtime stays alive across the entire agent execution, ensuring agent-centric tools remain accessible throughout the workflow.
+The runtime boots on the **shared `_async_bridge` background loop** (the same loop already used by ~77 wrapper-side `run_sync` callers), not on a per-run scoped loop. This is what makes ACP/LSP agent-centric tools safe — every async primitive owned by the runtime stays bound to a loop that is **still running** when tools re-enter.
+
+`run_sync()` now cancels the runtime startup/shutdown coroutine on timeout (PR #1692), so a hung LSP server or ACP backend no longer leaks.
 
 ### Full RuntimeConfig Control
 
@@ -283,6 +288,8 @@ result = asyncio.run(advanced_workflow())
 For more details on agent-centric tools and InteractiveRuntime integration, see [PraisonAI Agents Framework](/docs/framework/praisonaiagents).
 
 **As of PR #1658 (May 2026), ACP/LSP agent-centric tools work end-to-end in YAML runs. Earlier versions had a premature-teardown bug — upgrade to praisonai ≥ 0.0.58.**
+
+**PR #1692 (May 2026)** — `run_sync()` now cancels timed-out tasks on the background loop, and YAML `tool_timeout` is enforced at the wrapper boundary as well as inside the SDK. Upgrade to praisonai ≥ the release containing this PR for both behaviours.
 </Info>
 
 ## Operational Notes
