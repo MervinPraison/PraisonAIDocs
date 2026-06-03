@@ -165,6 +165,42 @@ store.update_session_metadata(
 
 ## Multi-Process Safety
 
+The session store is safe under concurrent multi-process and multi-instance use on **both reads and writes**:
+
+- **Atomic writes** — every mutator (`add_message`, `set_agent_info`, `set_gateway_info`, `clear_session`, `update_session_metadata`) reloads the session from disk inside `FileLock`, mutates, then atomically writes (temp file + `os.replace`). Concurrent writers cannot drop each other's messages.
+- **Fresh reads** — `get_chat_history`, `get_session`, and `get_sessions_by_agent` reload from disk under `FileLock` on every call and refresh the in-process cache. Two store instances pointing at the same `session_dir` will always see each other's writes.
+- **Cross-platform locks** — `fcntl.flock` on Unix/macOS, `msvcrt.locking` on Windows.
+
+```mermaid
+sequenceDiagram
+    participant Reader as Store B (reader)
+    participant Disk as session-1.json
+    participant Writer as Store A (writer)
+
+    Writer->>Disk: add_user_message("first") [FileLock]
+    Reader->>Disk: get_chat_history() [FileLock]
+    Disk-->>Reader: ["first"]
+    Writer->>Disk: add_user_message("second") [FileLock]
+    Reader->>Disk: get_chat_history() [FileLock, fresh reload]
+    Disk-->>Reader: ["first", "second"]
+    
+    classDef writer fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef reader fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef file fill:#189AB4,stroke:#7C90A0,color:#fff
+    
+    class Writer writer
+    class Reader reader
+    class Disk file
+```
+
+<Note>
+Multiple processes (a gateway worker and a bot worker, several uvicorn workers, a CLI alongside a server) can safely share the same `session_dir`. Each call to `get_chat_history` returns the latest committed state on disk — there is no stale-cache window.
+</Note>
+
+<Note>
+`store.invalidate_cache(session_id)` still exists for backwards compatibility, but since reads always reload from disk it is effectively a no-op on the read path. You no longer need to call it before `get_chat_history` / `get_session`.
+</Note>
+
 The session store is safe under concurrent multi-process and multi-instance use:
 
 - **File locking** — `fcntl.flock()` on Unix, `msvcrt.locking()` on Windows
@@ -418,6 +454,18 @@ assert isinstance(get_default_session_store(), SessionStoreProtocol)
 
 | Method | Description |
 |--------|-------------|
+| `add_message(session_id, role, content)` | Add a message |
+| `add_user_message(session_id, content)` | Convenience wrapper for `add_message(role="user", ...)` |
+| `add_assistant_message(session_id, content)` | Convenience wrapper for `add_message(role="assistant", ...)` |
+| `get_chat_history(session_id, max_messages)` | Get chat history (disk-fresh on every call) |
+| `get_session(session_id)` | Get full session data (disk-fresh on every call) |
+| `set_agent_info(session_id, agent_name, user_id)` | Attach agent name / user id (reload-under-lock) |
+| `set_gateway_info(session_id, gateway_session_id, agent_id)` | Link a session to a gateway session id and agent id |
+| `update_session_metadata(session_id, **fields)` | Merge run stats / metadata; `agent_id` / `agent_name` / `user_id` also update top-level fields |
+| `get_by_gateway_session(gateway_session_id)` | Look up a session by its gateway session id |
+| `get_sessions_by_agent(agent_name, limit)` | List sessions belonging to an agent (each loaded disk-fresh) |
+| `clear_session(session_id)` | Clear all messages |
+
 | `add_message(session_id, role, content, metadata)` | Add a message (reload-under-lock) |
 | `add_user_message(session_id, content)` | Convenience wrapper for `add_message(role="user", ...)` |
 | `add_assistant_message(session_id, content)` | Convenience wrapper for `add_message(role="assistant", ...)` |
@@ -426,8 +474,10 @@ assert isinstance(get_default_session_store(), SessionStoreProtocol)
 | `update_session_metadata(session_id, **fields)` | Merge run stats / metadata fields. Safe concurrently across processes. Skips `None` values. |
 | `set_agent_info(session_id, agent_name=None, user_id=None)` | Set or update agent info (reload-under-lock). |
 | `clear_session(session_id)` | Clear all messages (reload-under-lock) |
+
 | `delete_session(session_id)` | Delete session completely |
 | `list_sessions(limit)` | List all sessions |
+| `invalidate_cache(session_id)` | Drop the in-memory cache entry (no-op for reads; reads always reload) |
 | `session_exists(session_id)` | Check if session exists |
 | `set_agent_info(session_id, agent_name, user_id)` | Attach agent name / user id to a session (reload-under-lock) |
 | `set_gateway_info(session_id, gateway_session_id, agent_id)` | Link a session to a gateway session id and agent id |
