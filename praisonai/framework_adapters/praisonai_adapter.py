@@ -71,44 +71,44 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
         acp_enabled = global_config.get('acp', False)
         lsp_enabled = global_config.get('lsp', False)
         interactive_runtime = None
-        interactive_loop = None
         
         if acp_enabled or lsp_enabled:
             try:
-                import asyncio
+                from praisonai._async_bridge import run_sync
                 from praisonai.cli.features.interactive_runtime import InteractiveRuntime, RuntimeConfig
                 from praisonai.cli.features.agent_tools import create_agent_centric_tools
                 
-                # Use scoped event loop instead of process-global mutations
+                # Use scoped configuration instead of process-global mutations
                 runtime_config = RuntimeConfig(
                     workspace=os.getcwd(),
                     acp_enabled=acp_enabled,
                     lsp_enabled=lsp_enabled,
                     approval_mode=os.environ.get("PRAISONAI_APPROVAL_MODE", "prompt")
                 )
-                interactive_runtime = InteractiveRuntime(runtime_config)
+                rt = InteractiveRuntime(runtime_config)
                 logger.info(f"Starting InteractiveRuntime (ACP: {acp_enabled}, LSP: {lsp_enabled})")
                 
-                # Create a scoped event loop instead of modifying process globals
-                interactive_loop = asyncio.new_event_loop()
-                
-                # Start the runtime but keep it alive for agent execution
-                interactive_loop.run_until_complete(interactive_runtime.start())
-                
-                centric_tools = create_agent_centric_tools(interactive_runtime)
-                logger.info(f"Loaded {len(centric_tools)} InteractiveRuntime tools")
-                
-                # Merge with tools_dict
-                if tools_dict:
-                    tools_dict.update(centric_tools)
-                else:
-                    tools_dict = centric_tools
+                # Start the runtime on the shared background loop where it stays alive
+                # and its asyncio primitives remain valid for the duration of this call
+                run_sync(rt.start())
+                interactive_runtime = rt  # only assign AFTER start() succeeds
                 
             except ImportError as e:
                 logger.warning(f"InteractiveRuntime not available: {e}")
-            except Exception as e:
-                logger.error(f"Error setting up InteractiveRuntime: {e}")
+                interactive_runtime = None
+            except (RuntimeError, OSError, ConnectionError) as e:
+                logger.warning(f"InteractiveRuntime startup failed: {e}")
+                interactive_runtime = None
         try:
+            # All work that can throw *after* start() lives here, including
+            # create_agent_centric_tools, tools_dict.update, agent construction,
+            # team.start(), etc.
+            if interactive_runtime is not None:
+                from praisonai.cli.features.agent_tools import create_agent_centric_tools
+                centric_tools = create_agent_centric_tools(interactive_runtime)
+                logger.info(f"Loaded {len(centric_tools)} InteractiveRuntime tools")
+                tools_dict = {**(tools_dict or {}), **centric_tools}
+
             # Create agents from roles
             for role, details in config.get('roles', {}).items():
                 role_filled = self._format_template(details.get('role', role), topic=topic)
@@ -204,12 +204,11 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             return result
         finally:
             # Cleanup InteractiveRuntime if it was started
-            if interactive_runtime and interactive_loop:
+            if interactive_runtime is not None:
                 try:
                     logger.info("Stopping InteractiveRuntime")
-                    interactive_loop.run_until_complete(interactive_runtime.stop())
+                    from praisonai._async_bridge import run_sync
+                    run_sync(interactive_runtime.stop())
                 except Exception as e:
                     logger.error(f"Error stopping InteractiveRuntime: {e}")
-                finally:
-                    interactive_loop.close()
     

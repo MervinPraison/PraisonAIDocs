@@ -34,6 +34,9 @@ from ._safe_loader import load_user_module
 
 logger = logging.getLogger(__name__)
 
+# Sentinel for cache - needed because None is a valid cached result (tool not found)
+_SENTINEL = object()
+
 
 class ToolResolver:
     """Resolves tool names to callables from multiple sources.
@@ -45,19 +48,34 @@ class ToolResolver:
     Attributes:
         _local_tools_cache: Cached tools from local tools.py
         _local_tools_loaded: Whether local tools have been loaded
+        _registry: Optional ToolRegistry for wrapper-level tool registration
+        _resolve_cache: Cached results from resolve() calls
+        _resolve_cache_lock: Thread lock for resolve cache
     """
     
-    def __init__(self, tools_py_path: Optional[str] = None):
+    def __init__(
+        self,
+        tools_py_path: Optional[str] = None,
+        registry: Optional["ToolRegistry"] = None,
+    ):
         """Initialize the resolver.
         
         Args:
             tools_py_path: Optional path to tools.py. If None, uses ./tools.py
+            registry: Optional ToolRegistry to include in resolution chain
         """
-        self._tools_py_path = tools_py_path or "tools.py"
+        from pathlib import Path
+        # Resolve path eagerly in constructor to make binding explicit and inspectable
+        self._tools_py_path = str(Path(tools_py_path or "tools.py").resolve())
         self._local_tools_cache: Mapping[str, Callable] = MappingProxyType({})
         self._local_tools_loaded: bool = False
         self._praisonai_tools_available: Optional[bool] = None
         self._local_tools_lock = threading.Lock()
+        self._registry = registry
+        
+        # Cache for resolved tools to avoid repeated resolution
+        self._resolve_cache: Dict[str, Optional[Callable]] = {}
+        self._resolve_cache_lock = threading.Lock()
     
     def _load_local_tools(self) -> Mapping[str, Callable]:
         """Load tools from local tools.py file.
@@ -163,7 +181,8 @@ class ToolResolver:
         """
         # Cache availability check
         if self._praisonai_tools_available is None:
-            self._praisonai_tools_available = importlib.util.find_spec("praisonai_tools") is not None
+            from ._framework_availability import is_available
+            self._praisonai_tools_available = is_available("praisonai_tools")
         
         if not self._praisonai_tools_available:
             return None
@@ -183,6 +202,25 @@ class ToolResolver:
             pass
         except Exception as e:
             logger.debug(f"Error resolving '{name}' from praisonai-tools: {e}")
+        
+        return None
+    
+    def _resolve_from_wrapper_registry(self, name: str) -> Optional[Callable]:
+        """Resolve tool from the wrapper ToolRegistry.
+        
+        Args:
+            name: Tool name to resolve
+            
+        Returns:
+            Callable if found, None otherwise
+        """
+        if self._registry is None:
+            return None
+        
+        tool = self._registry.get_function(name)
+        if tool is not None:
+            logger.debug(f"Resolved '{name}' from wrapper ToolRegistry")
+            return tool
         
         return None
     
@@ -213,9 +251,10 @@ class ToolResolver:
         
         Resolution order:
         1. Local tools.py (backward compat, custom tools)
-        2. praisonaiagents.tools.TOOL_MAPPINGS (built-in)
-        3. praisonai-tools package (external, optional)
-        4. Tool registry (plugins)
+        2. Wrapper ToolRegistry (register_function API)
+        3. praisonaiagents.tools.TOOL_MAPPINGS (built-in)
+        4. praisonai-tools package (external, optional)
+        5. Core SDK tool registry (plugins)
         
         Args:
             name: Tool name to resolve
@@ -229,30 +268,56 @@ class ToolResolver:
         name = name.strip()
         if not name:
             return None
-        
-        # 1. Check local tools.py first (highest priority)
+
+        # Fast path: cached result
+        cached = self._resolve_cache.get(name, _SENTINEL)
+        if cached is not _SENTINEL:
+            return cached
+
+        # Load local tools outside the cache lock to prevent lock-order inversion
         local_tools = self._load_local_tools()
-        if name in local_tools:
-            logger.debug(f"Resolved '{name}' from local tools.py")
-            return local_tools[name]
-        
-        # 2. Check praisonaiagents.tools
-        tool = self._resolve_from_praisonaiagents(name)
-        if tool is not None:
-            return tool
-        
-        # 3. Check praisonai-tools package
-        tool = self._resolve_from_praisonai_tools(name)
-        if tool is not None:
-            return tool
-        
-        # 4. Check tool registry
-        tool = self._resolve_from_registry(name)
-        if tool is not None:
-            return tool
-        
-        logger.warning(f"Tool '{name}' not found in any source")
-        return None
+
+        with self._resolve_cache_lock:
+            # Double-check inside lock
+            cached = self._resolve_cache.get(name, _SENTINEL)
+            if cached is not _SENTINEL:
+                return cached
+
+            # 1. Check local tools.py first (highest priority)
+            if name in local_tools:
+                logger.debug(f"Resolved '{name}' from local tools.py")
+                tool = local_tools[name]
+                self._resolve_cache[name] = tool
+                return tool
+            
+            # 2. Check wrapper ToolRegistry (NEW - ahead of SDK paths)
+            tool = self._resolve_from_wrapper_registry(name)
+            if tool is not None:
+                self._resolve_cache[name] = tool
+                return tool
+            
+            # 3. Check praisonaiagents.tools
+            tool = self._resolve_from_praisonaiagents(name)
+            if tool is not None:
+                self._resolve_cache[name] = tool
+                return tool
+            
+            # 4. Check praisonai-tools package
+            tool = self._resolve_from_praisonai_tools(name)
+            if tool is not None:
+                self._resolve_cache[name] = tool
+                return tool
+            
+            # 5. Check core SDK tool registry
+            tool = self._resolve_from_registry(name)
+            if tool is not None:
+                self._resolve_cache[name] = tool
+                return tool
+            
+            # Cache the None result to avoid repeated failed lookups
+            logger.warning(f"Tool '{name}' not found in any source")
+            self._resolve_cache[name] = None
+            return None
     
     def resolve_many(self, names: List[str]) -> List[Callable]:
         """Resolve multiple tool names to callables.
@@ -314,7 +379,8 @@ class ToolResolver:
         
         # 3. Add praisonai-tools (if installed)
         if self._praisonai_tools_available is None:
-            self._praisonai_tools_available = importlib.util.find_spec("praisonai_tools") is not None
+            from ._framework_availability import is_available
+            self._praisonai_tools_available = is_available("praisonai_tools")
         
         if self._praisonai_tools_available:
             try:
@@ -360,13 +426,15 @@ class ToolResolver:
         return list(set(missing))  # Remove duplicates
     
     def clear_cache(self) -> None:
-        """Clear the local tools cache.
+        """Clear both the local tools cache and resolve cache.
         
         Useful when tools.py has been modified and needs to be reloaded.
         """
         with self._local_tools_lock:
             self._local_tools_cache = MappingProxyType({})
             self._local_tools_loaded = False
+        with self._resolve_cache_lock:
+            self._resolve_cache.clear()
     
     def get_local_callables(self) -> List[Callable]:
         """Get functions exposed by tools.py (path A semantics).
@@ -388,59 +456,99 @@ class ToolResolver:
             module = load_user_module(self._tools_py_path, name="tools_module")
             if module is None:
                 return {}
-            
-            # Import the necessary classes (matching agents_generator.py logic)
-            BaseTool = None
-            PRAISONAI_TOOLS_AVAILABLE = False
-            try:
-                from praisonai_tools import BaseTool
-                PRAISONAI_TOOLS_AVAILABLE = True
-            except ImportError:
-                try:
-                    from praisonai.tools import BaseTool
-                    PRAISONAI_TOOLS_AVAILABLE = True
-                except ImportError:
-                    pass
-            
-            result = {}
-            for name, obj in inspect.getmembers(module, 
-                lambda x: inspect.isclass(x) and (
-                    x.__module__.startswith('langchain_community.tools') or 
-                    (PRAISONAI_TOOLS_AVAILABLE and BaseTool and issubclass(x, BaseTool))
-                ) and x is not BaseTool):
-                try:
-                    result[name] = obj()
-                    logger.debug(f"Loaded local tool class: {name}")
-                except Exception as e:
-                    logger.warning(f"Error instantiating tool class {name}: {e}")
-                    continue
-            
-            return result
+            return self._extract_tool_classes(module)
         except Exception as e:
             logger.warning(f"Error loading tool classes from {self._tools_py_path}: {e}")
             return {}
 
+    def get_local_tool_classes_from_dir(self, tools_dir: "os.PathLike|str") -> Dict[str, Any]:
+        """Load BaseTool/langchain classes from every *.py in a tools/ directory.
+        
+        Args:
+            tools_dir: Path to the tools directory
+            
+        Returns:
+            Dictionary mapping class names to instantiated tool objects
+        """
+        from pathlib import Path
+        from ._safe_loader import load_user_module
+        
+        classes: Dict[str, Any] = {}
+        for py_file in Path(tools_dir).glob("*.py"):
+            if py_file.name.startswith("__"):
+                continue
+            try:
+                module = load_user_module(py_file, name=f"tools_{py_file.stem}")
+                if module is not None:
+                    classes.update(self._extract_tool_classes(module))
+            except Exception as e:
+                logger.warning(f"Error loading tool classes from file {py_file}: {e}")
+        return classes
 
-# Process-level lazy singleton for performance (matches profiler.py pattern)
-_default_resolver: Optional[ToolResolver] = None
-_default_resolver_lock = threading.Lock()
+    def _extract_tool_classes(self, module):
+        """Extract tool classes from a loaded module that inherit from BaseTool 
+        or are part of langchain_community.tools package.
+        """
+        # Import the necessary classes (matching agents_generator.py logic)
+        BaseTool = None
+        PRAISONAI_TOOLS_AVAILABLE = False
+        try:
+            from praisonai_tools import BaseTool
+            PRAISONAI_TOOLS_AVAILABLE = True
+        except ImportError:
+            try:
+                from praisonai.tools import BaseTool
+                PRAISONAI_TOOLS_AVAILABLE = True
+            except ImportError:
+                pass
+        
+        result = {}
+        for name, obj in inspect.getmembers(module, 
+            lambda x: inspect.isclass(x) and (
+                x.__module__.startswith('langchain_community.tools') or 
+                (PRAISONAI_TOOLS_AVAILABLE and BaseTool and issubclass(x, BaseTool))
+            ) and x is not BaseTool):
+            try:
+                result[name] = obj()
+                logger.debug(f"Loaded tool class: {name}")
+            except Exception as e:
+                logger.warning(f"Error instantiating tool class {name}: {e}")
+                continue
+        
+        return result
+
+
+# Context-local resolver for multi-project safety
+import contextvars
+
+_resolver_var: contextvars.ContextVar[Optional[ToolResolver]] = contextvars.ContextVar(
+    "tool_resolver", default=None,
+)
 
 def _get_default_resolver() -> ToolResolver:
-    """Process-default ToolResolver (double-checked lazy init).
+    """Per-context resolver. Falls back to a fresh ToolResolver per context,
+    so changing CWD between agents / requests is honoured.
     
-    Returns cached ToolResolver that is anchored to the working directory
-    at first call. Local tools.py resolution is CWD-dependent and cached
-    for the lifetime of the process.
+    Each context (agent/task/request) gets its own resolver anchored to the
+    working directory at the time of first use in that context. This prevents
+    the singleton bug where the first caller locks in their CWD for the entire process.
     
     For test isolation or multi-project CLIs, create explicit resolver
     instances instead of using this cached default.
     """
-    global _default_resolver
-    if _default_resolver is None:
-        with _default_resolver_lock:
-            if _default_resolver is None:
-                _default_resolver = ToolResolver()
-    return _default_resolver
+    resolver = _resolver_var.get()
+    if resolver is None:
+        resolver = ToolResolver()
+        _resolver_var.set(resolver)
+    return resolver
+
+def reset_default_resolver() -> None:
+    """Explicit invalidation hook for daemons / IDE plugins switching projects.
+    
+    Call this when changing working directories or switching between projects
+    to ensure the next tool resolution uses the new CWD.
+    """
+    _resolver_var.set(None)
 
 
 # Convenience functions that use cached default resolver for performance
@@ -455,8 +563,8 @@ def resolve_tool(name: str, resolver: Optional[ToolResolver] = None) -> Optional
         Callable if found, None otherwise
         
     Note:
-        When resolver=None, uses a process-level cached resolver that is anchored
-        to the working directory at first call. For test isolation or multi-project
+        When resolver=None, uses a context-local cached resolver anchored to the
+        working directory for that context. For test isolation or multi-project
         CLIs, pass an explicit resolver instance.
     """
     return (resolver or _get_default_resolver()).resolve(name)
@@ -511,3 +619,5 @@ def validate_yaml_tools(yaml_config: Dict[str, Any], resolver: Optional[ToolReso
         List of missing tool names
     """
     return (resolver or _get_default_resolver()).validate_yaml_tools(yaml_config)
+
+

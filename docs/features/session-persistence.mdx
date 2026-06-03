@@ -165,11 +165,11 @@ store.update_session_metadata(
 
 ## Multi-Process Safety
 
-The session store uses file locking to ensure safe concurrent access:
+The session store uses file locking to ensure safe concurrent access on **both reads and writes**:
 
-- **Unix**: Uses `fcntl.flock()` for file locking
-- **Windows**: Uses `msvcrt.locking()` for file locking
-- **Atomic Writes**: Uses temp file + rename to prevent corruption
+- **Atomic writes**: `add_message` and friends reload under `FileLock`, mutate, then atomically write (temp file + rename) so concurrent writers can't corrupt a session file.
+- **Fresh reads**: `get_chat_history`, `get_session`, and `get_sessions_by_agent` reload from disk under `FileLock` on every call and refresh the in-process cache. Two store instances pointing at the same `session_dir` will always see each other's writes.
+- **Cross-platform locks**: `fcntl.flock` on Unix/macOS, `msvcrt.locking` on Windows.
 
 All write methods — `add_message()`, `add_user_message()`, `add_assistant_message()`, `clear_session()`, **`update_session_metadata()`**, `set_agent_info()`, and `delete_session()` — acquire a cross-process file lock, reload the session from disk inside the lock, mutate it, and write atomically via a temp file + `os.replace()`. It is safe to share a session directory across multiple workers, containers, or store instances; concurrent metadata updates and message appends from different workers will both be preserved.
 
@@ -180,6 +180,14 @@ from praisonaiagents.session import DefaultSessionStore
 
 store = DefaultSessionStore(lock_timeout=30.0)
 ```
+
+<Note>
+Multiple processes (e.g. a gateway worker and a bot worker, or multiple uvicorn workers) can safely share the same `session_dir`. Each call to `get_chat_history` returns the latest committed state on disk — there is no stale-cache window.
+</Note>
+
+<Note>
+`store.invalidate_cache(session_id)` still exists for backwards compatibility, but since reads always reload from disk it is effectively a no-op on the read path. You no longer need to call it before `get_chat_history` / `get_session`.
+</Note>
 
 ```mermaid
 sequenceDiagram
@@ -198,6 +206,22 @@ sequenceDiagram
     Worker->>Cache: refresh cached SessionData
     Worker->>Lock: release
 ```
+
+```mermaid
+sequenceDiagram
+    participant Reader as Store B (reader)
+    participant Disk as session-1.json
+    participant Writer as Store A (writer)
+
+    Writer->>Disk: add_user_message("first")
+    Reader->>Disk: get_chat_history()  [FileLock]
+    Disk-->>Reader: ["first"]
+    Writer->>Disk: add_user_message("second")
+    Reader->>Disk: get_chat_history()  [FileLock, fresh reload]
+    Disk-->>Reader: ["first", "second"]
+```
+
+The same guarantees apply to `HierarchicalSessionStore`, which adds extended-field preservation (`parent_id`, `children_ids`, `snapshots`, `forked_from_message_id`) across all mutators as of PR #1745.
 
 ## Direct Session Store Access
 
@@ -237,7 +261,7 @@ store = DefaultSessionStore(
 
 ## Using with DB Adapter
 
-When a DB adapter is provided, it takes precedence over JSON persistence:
+When a DB adapter is provided, it takes precedence over JSON persistence. The `DbSessionAdapter` now persists both messages and metadata to the conversation store, ensuring session metadata survives process restarts.
 
 ```python
 from praisonaiagents import Agent
@@ -262,6 +286,10 @@ agent = Agent(
     db=MyDbAdapter()
 )
 ```
+
+<Note>
+When using the built-in `DbSessionAdapter` (via `praisonai.db`), both messages and metadata are automatically persisted to your database. The `set_metadata()` and `get_metadata()` methods now round-trip through the conversation store, so metadata survives process restarts without additional configuration. For complete examples, see the [HostedAgent persistence guide](/docs/features/managed-agent-persistence).
+</Note>
 
 ## Context Caching
 
