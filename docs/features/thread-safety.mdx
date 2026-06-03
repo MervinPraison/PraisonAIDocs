@@ -134,6 +134,10 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 | `RateLimiter` (sync) | `threading.Lock` | Protects `_tokens`, `_api_tokens`, and refill state from races in multi-threaded acquire calls |
 | `RateLimiter` (async) | `asyncio.Lock` | Same protection for coroutine contexts |
 
+### Deep-copy support
+
+Agent.__deepcopy__ replaces threading.RLock (__cache_lock) and threading.Lock (_cost_lock) with fresh instances during copy.deepcopy(agent), so the agent is copy-safe on every supported Python version (RLock pickling was broken on CPython < 3.13).
+
 ### Lock Usage Pattern
 
 ```python
@@ -193,6 +197,35 @@ for t in threads:
 <Note>
 Reference: PraisonAI PR #1609. The session cache uses defensive copying to prevent shared mutable state between concurrent operations.
 </Note>
+
+### DefaultSessionStore — cross-process safety
+
+`DefaultSessionStore` uses a per-session **file lock** (`fcntl.flock` on Unix, `msvcrt.locking` on Windows) for every write path:
+
+| Method | Locked read-modify-write | Atomic write |
+|---|---|---|
+| `add_message()` | ✅ | ✅ |
+| `add_user_message()` / `add_assistant_message()` | ✅ | ✅ |
+| `clear_session()` | ✅ | ✅ |
+| `update_session_metadata()` | ✅ *(since PR #1709)* | ✅ |
+| `set_agent_info()` | in-process lock + atomic write | ✅ |
+| `delete_session()` | in-process lock | n/a |
+
+Reads inside the lock guarantee that a metadata merge picks up any messages another worker appended just before. **Since PR #1709, `FileLock.__enter__` raises `IOError` on timeout** (previously the lock failure was silent, which could lead to torn writes on a stuck lock). The default `lock_timeout` is `5.0` seconds — pass `DefaultSessionStore(lock_timeout=...)` to tune it.
+
+<Warning>
+**Behaviour change in PR #1709**: `FileLock.__enter__` now raises `IOError` instead of returning silently on lock-acquisition timeout. If you have custom code that uses `FileLock` directly from `praisonaiagents.session.store`, wrap it in a `try/except IOError` or raise the timeout via `DefaultSessionStore(lock_timeout=...)`.
+</Warning>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Agent Cloning" icon="copy" href="/features/agent-cloning">
+  Clone agents for channel isolation
+</Card>
+</CardGroup>
 
 ## Best Practices
 
@@ -403,7 +436,7 @@ team_b.run()
 ```
 
 <Note>
-The client is created lazily on first structured-completion call. The instance's `__del__` makes a best-effort `client.close()`, but the canonical path is explicit `close()` on the generator if you build one directly. This matters in long-lived server processes that spawn many generators.
+The client is created lazily on first structured-completion call. `__del__` was removed in PR #1736 and the canonical path is now explicit `close()` or `aclose()` on the generator, or — better — the context managers. This matters in long-lived server processes that spawn many generators.
 </Note>
 
 For power users building generators directly:
@@ -411,21 +444,29 @@ For power users building generators directly:
 ```python
 from praisonai.auto import BaseAutoGenerator
 
-gen = BaseAutoGenerator(config_list=[{
+# Sync context manager
+with BaseAutoGenerator(config_list=[{
     "model": "gpt-4o-mini",
     "api_key": "sk-...",
     "base_url": None,
-}])
-try:
+}]) as gen:
     # _get_openai_client() is double-checked-locked; calling it from
     # multiple threads on the same instance returns the same client.
     result = gen._structured_completion(MyModel, messages=[...])
-finally:
-    gen.close()  # explicit cleanup — recommended over relying on __del__
+
+# Async context manager
+async with BaseAutoGenerator(config_list=[{
+    "model": "gpt-4o-mini",
+    "api_key": "sk-...",
+    "base_url": None,
+}]) as gen:
+    result = await gen._astructured_completion(MyModel, messages=[...])
 ```
 
 <Warning>
 **Behaviour change in PR #1681**: the module-level functions `praisonai.auto._get_openai_client(api_key, base_url)` and the `_openai_clients` / `_openai_clients_lock` globals **have been removed**. If you imported them, switch to constructing an `OpenAI` client yourself or call `BaseAutoGenerator(...).\_get_openai_client()`. Each generator now owns exactly one client; the previous bug — an in-use client being evicted from a process-wide LRU and closed while other threads still held a reference — is no longer possible.
+
+**Behaviour change in PR #1736**: `__del__` was removed and async support was added. New methods include `aclose`, `__aenter__`/`__aexit__`, and `_astructured_completion`. Use context managers or explicit cleanup instead of relying on destructors.
 </Warning>
 
 ### Thread-safe Typer command discovery
@@ -504,6 +545,16 @@ scheduler.stop()  # returns within ms, even if a backoff sleep was in progress
 **ToolRegistry — thread-safe registry operations**
 
 `ToolRegistry` now holds a `threading.Lock` around all reads and mutations, matching `PluginRegistry` / integration registry. Eliminates `RuntimeError: dictionary changed size during iteration` when registering tools concurrently with iteration. Reference: [PR #1673](https://github.com/MervinPraison/PraisonAI/pull/1673).
+
+### Multi-agent context safety (PR #1723)
+
+`praisonai.cli.features.interactive_tools._get_shared_runtime()` and `praisonai.tool_resolver._get_default_resolver()` were previously process-wide singletons. They are now **per-context** via `contextvars.ContextVar`:
+
+- Concurrent agents in the same process no longer share an `InteractiveRuntime` (no LSP/ACP config bleed).
+- Resolvers anchor to each agent's CWD, not whichever agent ran first.
+- For long-lived daemons that switch projects, call `praisonai.tool_resolver.reset_default_resolver()` to force re-anchoring.
+
+This eliminated the singleton-config-bleed and first-caller-CWD-wins bugs while keeping `cleanup_runtime()` and convenience functions like `resolve_tool()` source-compatible.
 
 ## Related
 
