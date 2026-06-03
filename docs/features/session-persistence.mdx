@@ -165,9 +165,25 @@ store.update_session_metadata(
 
 ## Multi-Process Safety
 
+The session store is safe under concurrent multi-process and multi-instance use:
+
+- **File locking** — `fcntl.flock()` on Unix, `msvcrt.locking()` on Windows
+- **Atomic writes** — temp file + `os.replace()` prevents partial-write corruption
+- **Reload under lock** — every mutator (`add_message`, `set_agent_info`, `set_gateway_info`,
+  `clear_session`, `update_session_metadata`) reloads the session from disk inside the
+  `FileLock` before mutating, so two processes sharing the same session directory cannot
+  drop each other's messages.
+
+<Note>
+The reload-under-lock guarantee was completed in PraisonAI PR #1709 (metadata) and PR #1724
+(agent info, gateway info, clear). Earlier releases could silently drop messages if
+`set_agent_info` / `clear_session` / `set_gateway_info` raced with `add_message` across
+two `DefaultSessionStore` instances pointed at the same directory.
+</Note>
+
 The session store uses file locking to ensure safe concurrent access on **both reads and writes**:
 
-- **Atomic writes**: `add_message` and friends reload under `FileLock`, mutate, then atomically write (temp file + rename) so concurrent writers can't corrupt a session file.
+- **Atomic writes**: `add_message` and friends reload under `FileLock`, mutate, then atomically write (temp file + rename) so concurrent writers cannot corrupt a session file.
 - **Fresh reads**: `get_chat_history`, `get_session`, and `get_sessions_by_agent` reload from disk under `FileLock` on every call and refresh the in-process cache. Two store instances pointing at the same `session_dir` will always see each other's writes.
 - **Cross-platform locks**: `fcntl.flock` on Unix/macOS, `msvcrt.locking` on Windows.
 
@@ -188,6 +204,31 @@ Multiple processes (e.g. a gateway worker and a bot worker, or multiple uvicorn 
 <Note>
 `store.invalidate_cache(session_id)` still exists for backwards compatibility, but since reads always reload from disk it is effectively a no-op on the read path. You no longer need to call it before `get_chat_history` / `get_session`.
 </Note>
+
+```mermaid
+sequenceDiagram
+    participant W as Worker A<br/>(add_message)
+    participant D as sessions/sess-1.json
+    participant R as Worker B<br/>(set_agent_info)
+
+    W->>D: FileLock acquire
+    W->>D: reload from disk
+    W->>D: append "hello"
+    W->>D: atomic write
+    W->>D: FileLock release
+
+    R->>D: FileLock acquire
+    Note over R,D: reload-under-lock<br/>sees "hello"
+    R->>D: set agent_name
+    R->>D: atomic write (preserves "hello")
+    R->>D: FileLock release
+
+    classDef worker fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef file fill:#189AB4,stroke:#7C90A0,color:#fff
+    
+    class W,R worker
+    class D file
+```
 
 ```mermaid
 sequenceDiagram
@@ -222,6 +263,7 @@ sequenceDiagram
 ```
 
 The same guarantees apply to `HierarchicalSessionStore`, which adds extended-field preservation (`parent_id`, `children_ids`, `snapshots`, `forked_from_message_id`) across all mutators as of PR #1745.
+
 
 ## Direct Session Store Access
 
@@ -374,14 +416,19 @@ assert isinstance(get_default_session_store(), SessionStoreProtocol)
 
 | Method | Description |
 |--------|-------------|
-| `add_message(session_id, role, content)` | Add a message |
-| `add_user_message(session_id, content)` | Add a user message |
-| `add_assistant_message(session_id, content)` | Add an assistant message |
-| `get_chat_history(session_id, max_messages)` | Get chat history |
+| `add_message(session_id, role, content, metadata)` | Add a message (reload-under-lock) |
+| `add_user_message(session_id, content)` | Convenience wrapper for `add_message(role="user", ...)` |
+| `add_assistant_message(session_id, content)` | Convenience wrapper for `add_message(role="assistant", ...)` |
+| `get_chat_history(session_id, max_messages)` | Get chat history (reload-under-lock on every call) |
 | `get_session(session_id)` | Get full session data |
-| `update_session_metadata(session_id, **fields)` | Merge run stats / metadata fields (e.g. `model`, `total_tokens`, `cost`, `agent_id`, `source`) into a persisted session. Safe to call concurrently across processes. Skips `None` values. Returns `True` on success. |
-| `set_agent_info(session_id, agent_name=None, user_id=None)` | Set or update agent info on a session. |
-| `clear_session(session_id)` | Clear all messages |
+| `update_session_metadata(session_id, **fields)` | Merge run stats / metadata fields. Safe concurrently across processes. Skips `None` values. |
+| `set_agent_info(session_id, agent_name=None, user_id=None)` | Set or update agent info (reload-under-lock). |
+| `clear_session(session_id)` | Clear all messages (reload-under-lock) |
 | `delete_session(session_id)` | Delete session completely |
 | `list_sessions(limit)` | List all sessions |
 | `session_exists(session_id)` | Check if session exists |
+| `set_agent_info(session_id, agent_name, user_id)` | Attach agent name / user id to a session (reload-under-lock) |
+| `set_gateway_info(session_id, gateway_session_id, agent_id)` | Link a session to a gateway session id and agent id |
+| `update_session_metadata(session_id, **fields)` | Merge run stats / metadata into a session; `agent_id` / `agent_name` / `user_id` keys also update the top-level fields |
+| `get_by_gateway_session(gateway_session_id)` | Look up a session by its gateway session id |
+| `invalidate_cache(session_id)` | Drop the in-memory cache entry; next read will hit disk |
