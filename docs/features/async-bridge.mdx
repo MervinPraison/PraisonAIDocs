@@ -276,7 +276,16 @@ The following synchronous APIs route through `run_sync()` and therefore honour `
 
 <Warning>
 These sync wrappers now raise `RuntimeError("run_sync() cannot be called from a running event loop; await the coroutine directly instead.")` when called from inside an active asyncio loop. Previously they would silently spawn a worker thread. **If you call any of these from async code, switch to `await request_approval(...)` (or the equivalent async method) directly.** This is a deliberate fail-fast change — the silent thread spawn was masking architectural bugs in multi-agent setups.
+
+**PR #1692 — cancellation on timeout (May 2026).** When a `run_sync()` call hits its timeout (default 300 s, or whatever `PRAISONAI_RUN_SYNC_TIMEOUT` is set to), the underlying coroutine is now actively cancelled on the background loop. The bridge waits up to 1 s for cancellation to propagate before re-raising `TimeoutError`. This means slow DB queries (SurrealDB, async MySQL), HTTP calls, and subprocess waits now **release their connection / socket / pipe** instead of leaking. Cancellation also fires on `KeyboardInterrupt`, `SystemExit`, and `GeneratorExit`.
 </Warning>
+
+<Note>
+The wrapper-layer bridge (`praisonai._async_bridge`) creates its
+background loop lazily on the first `run_sync()` call. Pure imports
+do not allocate a loop or thread. Calling `shutdown()` before any
+`run_sync()` is a safe no-op.
+</Note>
 
 ---
 
@@ -300,6 +309,12 @@ async def my_coroutine():
 
 This error used to leak from SDK internals before the async bridge was implemented. If you see this on current versions, upgrade to the latest release.
 
+| Symptom | Cause | Resolution |
+|---------|-------|-----------|
+| `TimeoutError` raised but you also see your coroutine's `finally:` block run after the exception | Expected: cancellation propagated, cleanup ran. | No action needed; this is the new PR #1692 behaviour. |
+
+**Test reference:** `praisonai/tests/unit/test_async_bridge.py::TestBridgeIntegration::test_timeout_cancels_coroutine_and_runs_finally` — quote this in the page so users can verify the behaviour locally.
+
 ### PermissionError in approval system
 
 The approval system now fails fast in async contexts. Configure a non-console backend:
@@ -310,6 +325,51 @@ from praisonaiagents.approval import get_approval_registry, WebhookBackend
 # Configure for async compatibility
 get_approval_registry().set_backend(WebhookBackend(url="http://localhost:8080/approve"))
 ```
+
+---
+
+## Wrapper Bridge (`praisonai._async_bridge`)
+
+The wrapper layer has its own async bridge for `PraisonAI`-level operations:
+
+```python
+from praisonai._async_bridge import run_sync, shutdown
+
+# Example: sync entry point calling async helper
+async def async_helper(data: str) -> str:
+    await asyncio.sleep(0.1)
+    return f"Processed: {data}"
+
+def sync_entry_point(data: str) -> str:
+    """Sync function that needs to call async code."""
+    return run_sync(async_helper(data), timeout=60)
+
+# For long-running servers
+import atexit
+atexit.register(shutdown)
+```
+
+**API Reference:**
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `run_sync` | `(coro, *, timeout=300) -> T` | Run coroutine on background loop |
+| `shutdown` | `() -> None` | Clean shutdown of background loop |
+
+**Environment:** 
+- `PRAISONAI_RUN_SYNC_TIMEOUT`: Default timeout in seconds (300)
+
+<Warning>
+Do **not** call `run_sync` from inside `async def` — use `await` instead. The function raises `RuntimeError` if called from within a running event loop to prevent deadlocks.
+</Warning>
+
+**Used by:**
+- CLI approval protocol (ACP/LSP tools)
+- Interactive runtime start/stop operations 
+- Deployment scheduler
+- Gateway operations
+
+See also: [Approval Protocol](/docs/features/approval-protocol) and [Gateway](/docs/features/gateway).
 
 ---
 
