@@ -35,6 +35,116 @@ graph TB
 
 ## Common Issues
 
+### Port Already In Use / Two Gateways Running
+
+**Symptom:** Gateway fails to start with a clear error message about port conflicts.
+
+```
+Error: Gateway port 8765 is already in use.
+
+  Another gateway may be running (PID 8864).
+  Stop it:  praisonai gateway stop
+  Or use a different port:  GATEWAY_PORT=8766 praisonai gateway start
+
+  Only ONE gateway process should poll each Telegram bot token.
+```
+
+<Steps>
+<Step title="Check PID lock and port status">
+```bash
+praisonai gateway status
+```
+
+Look for lines like:
+- `Gateway PID lock: Process 12345 running (127.0.0.1:8765)`
+- `Port 127.0.0.1:8765: In use`
+</Step>
+
+<Step title="Stop the existing gateway gracefully">
+```bash
+praisonai gateway stop
+```
+
+This sends SIGTERM and waits for graceful shutdown. The PID lock file will be automatically cleaned up.
+</Step>
+
+<Step title="If gateway is stuck, force stop">
+```bash
+praisonai gateway stop --force
+```
+
+This sends SIGKILL directly (SIGTERM on Windows) for immediate termination.
+</Step>
+
+<Step title="If port is used by non-gateway process">
+```bash
+# Find what's using the port
+lsof -i :8765
+# Linux alternative:
+netstat -ano | findstr :8765
+
+# Either kill that process or use a different port
+GATEWAY_PORT=8766 praisonai gateway start
+# Or:
+praisonai gateway start --port 8766
+```
+</Step>
+
+<Step title="Clean up stale lock file (if needed)">
+```bash
+# Check the PID lock file
+cat ~/.praisonai/gateway-127_0_0_1-8765.pid
+
+# Remove stale lock manually (auto-cleaned on next start)
+rm ~/.praisonai/gateway-127_0_0_1-8765.pid
+```
+
+Stale locks are automatically detected and removed, but you can clean them manually if needed.
+</Step>
+</Steps>
+
+---
+
+### Telegram Bot Goes Silent After Restart
+
+**Symptom:** Gateway `/health` endpoint returns healthy, but Telegram messages aren't received after a restart or crash.
+
+**Cause:** Two processes are polling the same Telegram bot token. Telegram delivers messages to only one poller, causing the bot to appear "silent" when the wrong process gets the messages.
+
+<Steps>
+<Step title="Stop all gateway instances">
+```bash
+praisonai gateway stop --force
+```
+
+This ensures all instances are terminated, even if PID files are corrupted.
+</Step>
+
+<Step title="Verify no processes are running">
+```bash
+praisonai gateway status
+```
+
+Should show:
+- `Gateway PID lock: No lock file found`
+- `Port 127.0.0.1:8765: Available`
+</Step>
+
+<Step title="Start a single gateway instance">
+```bash
+praisonai gateway start
+```
+
+Only start one instance to ensure exclusive bot token polling.
+</Step>
+
+<Step title="Test bot responsiveness">
+Send a message to your Telegram bot. It should respond normally now that only one process is polling the token.
+</Step>
+</Steps>
+
+---
+
 ### Daemon Running But Gateway Unreachable
 
 **Symptom:** `praisonai gateway status` shows `Daemon service: Running (launchd)` but `Gateway not reachable at http://127.0.0.1:8765/health`.
@@ -60,14 +170,16 @@ praisonai gateway logs
 Look for Python tracebacks or port binding errors.
 </Step>
 
-<Step title="Check if another process is using the port">
+<Step title="Check port and PID lock status">
 ```bash
-lsof -i :8765
-# or
-netstat -tulpn | grep :8765
+praisonai gateway status
 ```
 
-If another process is using port 8765, either stop it or change the gateway port.
+This now reports both port usage and PID lock status directly. Look for:
+- `Gateway PID lock: Process <pid> running` or `No lock file found`
+- `Port 127.0.0.1:8765: In use` or `Available`
+
+If another process is using the port, use `praisonai gateway stop` to stop an existing gateway, or choose a different port.
 </Step>
 
 <Step title="Verify PraisonAI version">
@@ -361,6 +473,25 @@ echo $GATEWAY_AUTH_TOKEN
 </Step>
 </Steps>
 
+### Magic-link login works in WebSocket but fails over HTTP (or vice versa)
+
+**Symptom:** One auth method works but the other fails, even with the same token.
+
+**Cause (pre-fix):** HTTP/magic-link and WebSocket used different secret sources before PR #1744.
+
+<Steps>
+<Step title="Upgrade PraisonAI">
+Upgrade to PraisonAI ≥ v4.6.47 (ships PR #1744). Config token now exports to env, unifying all auth paths.
+</Step>
+
+<Step title="Restart the gateway">
+```bash
+praisonai gateway restart
+```
+Config token precedence is now enforced on restart.
+</Step>
+</Steps>
+
 ---
 
 ## Restart After Config Change
@@ -402,6 +533,13 @@ praisonai gateway status --daemon-only
 
 # Recent logs (last 50 lines)
 praisonai gateway logs -n 50
+
+# Check the PID lock file
+cat ~/.praisonai/gateway-127_0_0_1-8765.pid
+
+# Stop a running gateway
+praisonai gateway stop
+praisonai gateway stop --force
 
 # Check port usage
 lsof -i :8765
@@ -468,6 +606,47 @@ schtasks /Query /TN PraisonAIGateway
 ```
 </Tab>
 </Tabs>
+
+---
+
+## Multi-Channel Troubleshooting
+
+Common failure modes when using multiple bots on the same platform:
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Token ${X} is used by multiple channels` | Two channels reference the same env var in `bot.yaml` | Give each channel its own env var and create a separate bot in @BotFather |
+| `Same bot token value is used by multiple channels` | Two different env vars resolve to the same actual token | Generate a fresh token from @BotFather for the duplicate channel |
+| `Channel '<x>' token '<env>' doesn't follow naming convention` | Custom env var name | Rename to `PLATFORM_<ROLE>_BOT_TOKEN` (e.g. `TELEGRAM_CFO_BOT_TOKEN`) |
+| `Missing token: <env>` | Env var referenced in `bot.yaml` is unset | Add it to `~/.praisonai/.env` |
+
+**Example Fix:**
+```bash
+# Problem: Both channels use the same token
+# Error: "Token TELEGRAM_BOT_TOKEN is used by multiple channels"
+
+# Solution: Create unique tokens per role
+# 1. Create new bot in @BotFather for CFO role
+# 2. Add unique environment variable
+export TELEGRAM_CFO_BOT_TOKEN="987654321:DEF..."
+
+# 3. Update bot.yaml
+channels:
+  telegram_cfo:
+    platform: telegram
+    token: ${TELEGRAM_CFO_BOT_TOKEN}  # Unique token
+    routes:
+      default: cfo
+```
+
+**Validation:**
+```bash
+# Check multi-channel configuration
+praisonai doctor multi_channel_tokens
+
+# ✅ Expected output:
+# "Multi-channel configuration looks good (N channels)"
+```
 
 ---
 
