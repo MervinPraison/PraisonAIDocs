@@ -83,16 +83,84 @@ The protocol requires exactly **five methods**:
 | `clear_session(session_id)` | `bool` | Remove all messages (keep metadata) |
 | `delete_session(session_id)` | `bool` | Delete session completely |
 | `session_exists(session_id)` | `bool` | Check if a session exists |
+| `update_session_metadata(session_id, **fields)` | `bool` | Merge metadata fields without touching messages |
+
+<Note>
+For **persistent backends (DB / JSON)**, `clear_session()` and `delete_session()` remove the underlying stored messages too, not just in-memory data. This ensures cleared history does not reappear after a reload or restart.
+</Note>
 
 <Tip>
 The protocol uses Python's `typing.Protocol` with `@runtime_checkable`, so any class with matching method signatures automatically satisfies it — no inheritance needed.
+</Tip>
+
+<Tip>
+If your custom store backs onto shared storage (Redis, Postgres, S3, another file system), make `get_chat_history`, `get_session`, and `get_sessions_by_agent` read from that backing store on every call rather than caching in process memory. `DefaultSessionStore` guarantees this; downstream code such as `BotSessionManager._load_history` relies on it.
+
+## update_session_metadata() API
+
+The `update_session_metadata()` method enables safe metadata updates across processes without touching messages:
+
+### Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | `str` | Unique session identifier |
+| `**fields` | `Any` | Metadata fields to merge (e.g., `model`, `total_tokens`, `cost`) |
+
+### Reserved Metadata Fields
+
+The SDK uses these reserved fields internally:
+
+| Field | Type | Description | Auto-populated |
+|-------|------|-------------|----------------|
+| `model` | `str` | LLM model name (e.g., "gpt-4o-mini") | ✅ |
+| `total_tokens` | `int` | Cumulative input + output tokens | ✅ |
+| `cost` | `float` | Estimated USD cost | ✅ |
+| `agent_id` | `str` | Gateway or registry agent ID | ✅ |
+| `source` | `str` | Origin: "chat", "gateway", "cli", "api" | ✅ |
+
+### Example Usage
+
+```python
+from praisonaiagents.session import get_default_session_store
+
+store = get_default_session_store()
+
+# Merge metadata into an existing session without touching messages
+store.update_session_metadata(
+    "user-123-chat",
+    model="gpt-4o-mini",
+    total_tokens=125,
+    cost=0.0032,
+    source="chat",
+    agent_id="assistant-001",
+)
+
+# None values are skipped
+store.update_session_metadata(
+    "user-123-chat",
+    cost=None,  # Ignored, doesn't overwrite existing cost
+    custom_field="my value"
+)
+```
+
+### Concurrency Safety
+
+In `DefaultSessionStore`, `update_session_metadata()` uses a cross-process file lock with locked reload-from-disk to ensure concurrent metadata updates and message appends are both preserved. This fixed a silent message-loss bug that affected multi-worker deployments before PR #1709.
+
+<Tip>
+If your custom store backs onto shared storage (Redis, Postgres, S3, another file system), make `get_chat_history` and `get_session` read from that backing store on every call rather than caching in process memory. `DefaultSessionStore` guarantees this; downstream code (e.g. `BotSessionManager._load_history`) relies on it.
+
 </Tip>
 
 ## Built-in Implementations
 
 <CardGroup cols={2}>
   <Card icon="file" title="DefaultSessionStore">
-    JSON file-based persistence with atomic writes and file locking. Zero dependencies.
+    JSON file-based persistence with atomic writes and file locking. Zero dependencies. All mutating methods *and* read methods reload from disk inside the file lock, so multiple processes can safely share one session directory.
+
+    JSON file-based persistence with atomic writes and file locking. Zero dependencies. All mutating methods reload from disk inside the file lock, so multiple processes can safely share one session directory.
+
 
     ```python
     from praisonaiagents.session import DefaultSessionStore

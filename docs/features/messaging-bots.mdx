@@ -169,7 +169,7 @@ from praisonaiagents import BotConfig
 config = BotConfig(
     token="your-bot-token",
     command_prefix="/",
-    typing_indicator=True,
+    typing_indicator=True,  # renews every 4s
     reply_in_thread=False,  # Inline replies
 )
 ```
@@ -468,7 +468,7 @@ config = BotConfig(
 | `webhook_url` | `str` | `None` | Webhook URL for webhook mode |
 | `command_prefix` | `str` | `"/"` | Prefix for bot commands |
 | `mention_required` | `bool` | `True` | Require @mention in channels (DMs never require mention) |
-| `typing_indicator` | `bool` | `True` | Show typing indicator |
+| `typing_indicator` | `bool` | `True` | Show typing indicator. On Telegram, the indicator is **renewed every 4 seconds** for the entire duration of the agent run so users keep seeing "typing…" even during 20–30s RAG / tool-call operations. |
 | `max_message_length` | `int` | `4096` | Max message length |
 | `allowed_users` | `list` | `[]` | Allowed user IDs |
 | `allowed_channels` | `list` | `[]` | Allowed channel IDs |
@@ -495,6 +495,8 @@ config = BotConfig(
 - `mention_only` — Bot only responds when @mentioned (default, safest)
 - `respond_all` — Bot responds to every message in the group
 - `command_only` — Bot only responds to `/commands`
+
+When running via the gateway, set `group_policy` per channel in `gateway.yaml`. See [Bot Gateway → Channel Security](/docs/features/bot-gateway#channel-security).
 </Note>
 
 <Note>
@@ -1342,6 +1344,13 @@ channels:
   #     default: "personal"
 ```
 
+**Channel key vs platform** — in gateway.yaml, the YAML key under `channels:` (e.g. `telegram`, `telegram_cfo`) is just an identifier you choose. When the key is not a platform name, set `platform: telegram` (or whichever) inside the block so the gateway can pick the right protocol. This enables running multiple bots on the same platform. Note: bot.yaml requires channel keys to be platform names.
+
+<Tip>
+Behind the scenes the gateway calls `Agent.clone_for_channel()` on the configured agent for each channel, so per-channel tools or routing rules never leak between bots. See [Agent Cloning](/features/agent-cloning).
+</Tip>
+
+
 ```bash
 praisonai gateway --config gateway.yaml
 ```
@@ -1365,6 +1374,36 @@ graph LR
 <Tip>
 The gateway uses **routing rules** to send messages to different agents based on context (DM vs group vs channel). Each channel can have its own routing configuration.
 </Tip>
+
+### Multiple bots on the same platform
+
+For role-specific bots on the same platform (e.g., multiple Telegram bots), use this pattern:
+
+```yaml
+agents:
+  cfo:
+    instructions: "You are a CFO agent specialized in financial analysis and budget planning."
+    model: gpt-4o-mini
+  ops:
+    instructions: "You are an ops agent specialized in system monitoring and infrastructure."
+    model: gpt-4o-mini
+
+channels:
+  telegram_cfo:
+    platform: telegram
+    token: ${TELEGRAM_CFO_BOT_TOKEN}
+    routes:
+      default: cfo
+  telegram_ops:
+    platform: telegram  
+    token: ${TELEGRAM_OPS_BOT_TOKEN}
+    routes:
+      default: ops
+```
+
+<Info>
+See the [Multi-Channel Bots guide](/docs/features/multi-channel-bots) for complete setup instructions including the onboard wizard flow and validation with `praisonai doctor`.
+</Info>
 
 ---
 
@@ -1712,9 +1751,59 @@ platforms:
 </Tabs>
 
 <Tip>
-  Set `ack_emoji: ""` (default) to disable ack reactions.
+  Onboard-generated configs enable `⏳` / `✅` by default. Set `ack_emoji: ""` to opt out.
   Currently wired for Telegram (which supports native message reactions).
 </Tip>
+
+---
+
+## Long-Running Agent Feedback
+
+RAG-enabled agents commonly take 20–30 seconds to answer (vector search + tool calls + LLM). PraisonAI Telegram bots give users continuous feedback throughout, with no extra code on your side.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.bots import BotConfig
+from praisonai.bots import Bot
+
+agent = Agent(name="cfo", instructions="Answer finance questions using the company knowledge base.")
+
+# Defaults shown for clarity — you get all this without setting anything.
+bot = Bot("telegram", agent=agent, config=BotConfig(
+    typing_indicator=True,   # renews every 4s
+    ack_emoji="⏳",          # instant reaction at T+0
+    done_emoji="✅",         # swaps in when the reply lands
+))
+bot.run()
+```
+
+### What the user sees
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User
+    participant B as 🤖 Bot
+    participant A as 🧠 Agent
+
+    U->>B: "What is our Q1 burn rate?"
+    B->>U: React ⏳ (instant)
+    B->>U: "typing…" bubble
+    Note over B,A: agent.chat() — 20–30s
+    loop every 4s
+        B->>U: Renew "typing…"
+    end
+    A-->>B: Response
+    B->>U: Send reply
+    B->>U: Swap ⏳ → ✅
+```
+
+### Why this matters
+
+| Before | After |
+|--------|-------|
+| One `send_action("typing")` at T+0 | Renewed every 4s for the full run |
+| Bubble vanishes at T+5s | Bubble persists until the reply is sent |
+| Users assume bot is broken, send duplicates | Users see continuous activity |
 
 ---
 

@@ -627,7 +627,11 @@ class AsyncAgentScheduler:
 def create_async_agent_scheduler(
     agent,
     task: str,
-    config: Optional[Dict[str, Any]] = None
+    config: Optional[Dict[str, Any]] = None,
+    on_success: Optional[Callable] = None,
+    on_failure: Optional[Callable] = None,
+    timeout: Optional[int] = None,
+    max_cost: Optional[float] = 1.00
 ) -> AsyncAgentScheduler:
     """
     Factory function to create async agent scheduler.
@@ -636,8 +640,20 @@ def create_async_agent_scheduler(
         agent: PraisonAI Agent instance
         task: Task description
         config: Optional configuration
+        on_success: Callback fired on successful execution
+        on_failure: Callback fired on failed execution
+        timeout: Per-run timeout (seconds)
+        max_cost: Budget limit (USD)
         
     Returns:
         Configured AsyncAgentScheduler instance
     """
-    return AsyncAgentScheduler(agent, task, config)
+    return AsyncAgentScheduler(
+        agent, 
+        task, 
+        config, 
+        on_success=on_success,
+        on_failure=on_failure,
+        timeout=timeout,
+        max_cost=max_cost
+    )
