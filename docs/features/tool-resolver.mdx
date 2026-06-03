@@ -69,6 +69,72 @@ print(f"Found {len(tool_classes)} tool classes")
 
 ---
 
+## Resolution Order
+
+Tools are resolved in a specific order, with the first match winning:
+
+```mermaid
+graph TB
+    Search[🔍 Tool Search] --> Step1{1. Local tools.py}
+    Step1 -->|Found| Success1[✅ Return tool]
+    Step1 -->|Not found| Step2{2. praisonaiagents.tools}
+    Step2 -->|Found| Success2[✅ Return tool]
+    Step2 -->|Not found| Step3{3. praisonai-tools package}
+    Step3 -->|Found| Success3[✅ Return tool] 
+    Step3 -->|Not found| Step4{4. Tool registry}
+    Step4 -->|Found| Success4[✅ Return tool]
+    Step4 -->|Not found| NotFound[❌ Tool not found]
+    
+    classDef step fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef notfound fill:#8B0000,stroke:#7C90A0,color:#fff
+    
+    class Step1,Step2,Step3,Step4 step
+    class Success1,Success2,Success3,Success4 success
+    class NotFound notfound
+```
+
+---
+
+## Registering Tools at Runtime
+
+Register custom tools through the `ToolRegistry` for YAML pipeline access:
+
+```python
+from praisonai import PraisonAI
+from praisonai.tool_registry import ToolRegistry
+
+def my_search(query: str) -> str:
+    """Custom search function."""
+    return f"results for {query}"
+
+praison = PraisonAI(agent_file="agents.yaml")
+praison.agents_generator.tool_registry.register_function("my_search", my_search)
+praison.run()
+```
+
+Then reference in your `agents.yaml`:
+
+```yaml
+roles:
+  researcher:
+    backstory: "You are a research specialist"
+    goal: "Find information using available tools"
+    tools:
+      - my_search  # Now resolvable through the registry
+```
+
+For bulk registration from a module:
+
+```python
+import my_tools_module
+
+# Register all public functions from a module
+praison.agents_generator.tool_registry.register_from_module(my_tools_module)
+```
+
+---
+
 ## How It Works
 
 ```mermaid
@@ -94,6 +160,60 @@ The resolver delegates to `_safe_loader.load_user_module` for consistent environ
 
 The wrapper now invokes `resolve()` once per YAML-referenced tool name, with results cached via the resolve cache to avoid repeated lookups.
 
+Directory mode iterates each `.py` file and unions the results using the same security gates and extraction logic.
+
+---
+
+## Multi-tenant usage
+
+`ToolResolver` resolves `tools.py` **eagerly at construction time** using `Path.resolve()`. The path captured is the CWD when the resolver was created — not the CWD when `resolve()` is called later. This makes behaviour predictable in multi-tenant gateways where each tenant has a different working directory.
+
+```python
+from praisonai.tool_resolver import ToolResolver, reset_default_resolver
+
+# Tenant A's request
+os.chdir("/tenants/a")
+resolver_a = ToolResolver()              # binds to /tenants/a/tools.py
+tools_a = resolver_a.get_local_callables()
+
+# Tenant B's request — must reset the process-wide default
+os.chdir("/tenants/b")
+reset_default_resolver()                 # clear the shared default
+resolver_b = ToolResolver()              # binds to /tenants/b/tools.py
+tools_b = resolver_b.get_local_callables()
+```
+
+<Warning>
+If you use the module-level helpers (`resolve()`, `resolve_many()`, `list_available()`, etc.) they share a single process-default `ToolResolver`. Call `reset_default_resolver()` between tenants or after `os.chdir()` — otherwise the first caller's `tools.py` will be served to everyone.
+</Warning>
+
+### When to call `reset_default_resolver()`
+
+| Situation | Call it? |
+|-----------|----------|
+| Single-tenant CLI | ❌ No |
+| Multi-tenant gateway switching CWDs per request | ✅ Yes, before each tenant |
+| Long-running server with hot-reload of tools | ✅ Yes, after tools change |
+| Test setup/teardown | ✅ Yes, in a fixture |
+| You always pass an explicit `tools_py_path` | ❌ No |
+
+```mermaid
+sequenceDiagram
+    participant Tenant A
+    participant Process
+    participant Tenant B
+
+    Tenant A->>Process: chdir(/tenants/a) + ToolResolver()
+    Note over Process: path bound to /tenants/a/tools.py
+    Tenant A->>Process: resolve("my_tool") → /tenants/a/tools.py
+
+    Tenant B->>Process: chdir(/tenants/b)
+    Tenant B->>Process: resolve("my_tool") ❌ still /tenants/a
+    Tenant B->>Process: reset_default_resolver()
+    Tenant B->>Process: resolve("my_tool") ✅ /tenants/b/tools.py
+```
+
+
 ---
 
 ## Two Flavours of tools.py
@@ -102,6 +222,7 @@ The wrapper now invokes `resolve()` once per YAML-referenced tool name, with res
 |----------------------|--------|----------------|
 | Plain Python functions | `get_local_callables()` | `List[Callable]` |
 | `praisonai_tools.BaseTool` / `praisonai.tools.BaseTool` / `langchain_community.tools.*` classes | `get_local_tool_classes()` | `Dict[str, ToolInstance]` (instantiated) |
+| A directory of *.py files (each may contain BaseTool subclasses) | `get_local_tool_classes_from_dir(tools_dir)` | `Dict[str, ToolInstance]` (merged across files) |
 
 ```mermaid
 graph TB
@@ -164,6 +285,10 @@ class WeatherTool(BaseTool):
 resolver = ToolResolver(tools_py_path="/abs/path/to/my_tools.py")
 ```
 
+<Note>
+The `tools/` directory case takes an explicit `tools_dir` argument and is not bound to the constructor's `tools_py_path`.
+</Note>
+
 ---
 
 ## Common Patterns
@@ -198,6 +323,18 @@ print(f"Functions: {[f.__name__ for f in functions]}")
 print(f"Tool classes: {list(tool_classes.keys())}")
 ```
 </Tab>
+
+<Tab title="Loading from tools/ Directory">
+```python
+from praisonai.tool_resolver import ToolResolver
+
+resolver = ToolResolver()
+tools = resolver.get_local_tool_classes_from_dir("./tools")
+
+print(f"Found {len(tools)} tools from directory")
+print(f"Tool names: {list(tools.keys())}")
+```
+</Tab>
 </Tabs>
 
 ---
@@ -223,12 +360,45 @@ resolver = ToolResolver(tools_py_path="./utils/tools.py")        # ✅
 
 ---
 
+## Per-Context Resolver (Multi-Project Safety)
+
+When you call `resolve_tool(name)` without passing a resolver, PraisonAI now uses a **context-local** default resolver instead of a single process-wide singleton. Each agent/task/request anchors to its own working directory.
+
+```python
+from praisonai.tool_resolver import resolve_tool, reset_default_resolver
+import os
+
+# Agent A in /project_a — resolver anchors to /project_a/tools.py
+os.chdir("/project_a")
+tool_a = resolve_tool("my_tool")
+
+# Agent B in /project_b in a different context — its resolver anchors to /project_b/tools.py
+os.chdir("/project_b")
+tool_b = resolve_tool("my_tool")  # picks up /project_b/tools.py, not /project_a/tools.py
+
+# Long-lived daemons switching projects can explicitly reset:
+reset_default_resolver()
+```
+
+### `reset_default_resolver()`
+
+| | |
+|---|---|
+| **When to call** | Daemons or IDE plugins that switch the working directory between projects |
+| **What it does** | Clears the cached `ToolResolver` in the current context so the next call re-anchors to the new CWD |
+| **Import** | `from praisonai.tool_resolver import reset_default_resolver` |
+
+---
+
 ## Caching Behaviour
+
+- **Per-context cache**: Each context caches its own tools.py content
+- **First call**: Loads and caches tools.py content
 
 The `ToolResolver` maintains two separate caches for performance:
 
 **Local `tools.py` cache**:
-- **First call**: Loads and caches tools.py content  
+- **First call**: Loads and caches tools.py content
 - **Subsequent calls**: Returns cached immutable view (`MappingProxyType`)
 - **Thread safety**: Uses `_local_tools_lock` for concurrent access
 
@@ -325,6 +495,9 @@ export PRAISONAI_ALLOW_LOCAL_TOOLS=true
 ## Related
 
 <CardGroup cols={2}>
+<Card title="ToolRegistry API Reference" icon="code" href="/docs/sdk/reference/praisonai/classes/ToolRegistry">
+  Complete API reference for ToolRegistry
+</Card>
 <Card title="Security Environment Variables" icon="shield-check" href="/docs/features/security-environment-variables">
   Environment variable security controls
 </Card>
