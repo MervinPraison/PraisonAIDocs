@@ -925,13 +925,10 @@ class WebSocketGateway:
     def _make_stream_relay(
         self, client_id: str, session: "GatewaySession"
     ) -> Callable:
-        """Create a StreamCallback that relays events to a WS client.
-        
-        The callback is synchronous (called from the LLM streaming thread)
-        and uses asyncio.run_coroutine_threadsafe to push events into the
-        gateway's event loop for WS delivery.
-        """
+        """Create a StreamCallback that relays events to a WS client."""
         gateway = self
+        # Capture the running loop while we are still on it.
+        loop = asyncio.get_running_loop()
 
         def _relay(event) -> None:
             try:
@@ -967,15 +964,13 @@ class WebSocketGateway:
                     target=client_id,
                 )
                 
-                # Thread-safe async send
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        gateway._send_to_client(client_id, gw_event.to_dict()),
-                        loop,
-                    )
-            except Exception as e:
-                logger.debug(f"Stream relay error (non-fatal): {e}")
+                # No get_event_loop() in the threaded callback.
+                asyncio.run_coroutine_threadsafe(
+                    gateway._send_to_client(client_id, gw_event.to_dict()),
+                    loop,
+                )
+            except Exception:
+                logger.warning("Stream relay error (non-fatal)", exc_info=True)
 
         return _relay
     
@@ -1653,6 +1648,7 @@ class WebSocketGateway:
                 allowed_users=list(_raw_allowed),
                 allowed_channels=list(_raw_channels),
                 mention_required=mention_required,
+                group_policy=group_policy,
                 auto_approve_tools=auto_approve_tools,
             )
             
@@ -1881,19 +1877,16 @@ class WebSocketGateway:
         gateway = self
 
         async def handle_message(update: Update, context: Any):
-            if not update.message:
-                return
+            # Import the shared security pipeline from telegram.py
+            from praisonai.bots.telegram import process_inbound_telegram_message
+            
+            # Use shared security pipeline for consistent enforcement
+            message = await process_inbound_telegram_message(update, bot)
+            if not message:
+                return  # Message was dropped by security checks
 
-            message_text = None
-            if update.message.voice or update.message.audio:
-                message_text = await bot._transcribe_audio(update)
-            elif update.message.text:
-                message_text = update.message.text
-
-            if not message_text:
-                return
-
-            user_id = str(update.message.from_user.id) if update.message.from_user else "unknown"
+            user_id = message.sender.user_id if message.sender else "unknown"
+            message_text = message.content
 
             # Determine routing context
             chat_type = update.message.chat.type if update.message.chat else "private"

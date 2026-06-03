@@ -621,5 +621,3 @@ def validate_yaml_tools(yaml_config: Dict[str, Any], resolver: Optional[ToolReso
     return (resolver or _get_default_resolver()).validate_yaml_tools(yaml_config)
 
 
-# Note: reset_default_resolver() is already defined above at line 545 using ContextVar.
-# This duplicate definition is removed to prevent override.
