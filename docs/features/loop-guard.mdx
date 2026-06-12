@@ -1,0 +1,316 @@
+---
+title: "Loop Guard"
+sidebarTitle: "Loop Guard"
+description: "Always-on idempotency-aware safety net for tool execution loops"
+icon: "shield-halved"
+---
+
+Loop Guard stops broken or misconfigured tools from burning tokens by counting per-turn calls and reacting differently to safe-to-repeat vs state-changing tools.
+
+```mermaid
+graph LR
+    subgraph "Loop Guard"
+        Call[🛠️ Tool Call] --> Classify{🔍 Classify}
+        Classify -->|Idempotent<br/>read/search/list| SoftLimits[📈 5 / 8 / 12]
+        Classify -->|Mutating<br/>write/exec/delete| HardLimits[📉 3 / 5 / 7]
+        SoftLimits --> Decide{Action?}
+        HardLimits --> Decide
+        Decide -->|Under| Allow[✅ Allow]
+        Decide -->|Warn| Warn[⚠️ Warn]
+        Decide -->|Block| Block[🛑 Block]
+        Decide -->|Halt| Halt[🔥 Halt]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef halt fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Call input
+    class Classify,SoftLimits,HardLimits,Decide process
+    class Warn warn
+    class Allow ok
+    class Block,Halt halt
+```
+
+## Quick Start
+
+<Steps>
+<Step title="It's already on">
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    instructions="You are a helpful assistant."
+)
+
+# Loop Guard is initialised automatically.
+# No flag needed — every Agent gets one.
+agent.start("Summarise the README")
+```
+
+</Step>
+
+<Step title="Tune the thresholds">
+
+For power users, you can customize thresholds after agent creation:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.escalation.loop_guard import LoopGuard, LoopGuardConfig
+
+agent = Agent(instructions="Polls a slow status endpoint")
+
+agent._loop_guard = LoopGuard(LoopGuardConfig(
+    idempotent_warn_threshold=10,
+    idempotent_block_threshold=20,
+    idempotent_halt_threshold=30,
+    max_time_per_turn=300.0,
+))
+```
+
+</Step>
+
+<Step title="Turn it off">
+
+<Warning>
+Disabling Loop Guard removes the safety net for misbehaving tools.
+</Warning>
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.escalation.loop_guard import LoopGuard, LoopGuardConfig
+
+agent = Agent(instructions="Agent without safety guard")
+
+agent._loop_guard = LoopGuard(LoopGuardConfig(enabled=False))
+```
+
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant LoopGuard
+    participant Tool
+
+    User->>Agent: Request
+    Agent->>LoopGuard: check() (pre-execution)
+    LoopGuard-->>Agent: Decision (ALLOW/WARN/BLOCK/HALT)
+    alt ALLOW or WARN
+        Agent->>Tool: Execute
+        Tool-->>Agent: Result
+        Agent->>LoopGuard: record() (post-execution)
+        LoopGuard->>LoopGuard: check() (post-execution)
+    else BLOCK
+        Agent-->>User: {"error": "[loop-guard] ...", "loop_blocked": True}
+    else HALT
+        Agent-->>User: ToolExecutionError (not retryable)
+    end
+```
+
+| Decision | Effect | User sees |
+|----------|--------|-----------|
+| `ALLOW` | Tool runs normally | Normal result |
+| `WARN` | Tool runs; warning logged | Result + `_loop_guard` warning metadata |
+| `BLOCK` | Tool execution replaced | `{"error": "[loop-guard] ...", "loop_blocked": True}` |
+| `HALT` | Non-retryable exception raised | `ToolExecutionError` propagates out |
+
+---
+
+## User Interaction Flow
+
+Here's what happens when an agent repeatedly calls the same tool:
+
+```mermaid
+graph TB
+    Start[Agent calls read_file 1st time] --> A1[✅ ALLOW - Normal execution]
+    A1 --> A2[Agent calls read_file 2nd time]
+    A2 --> A3[✅ ALLOW - Normal execution]
+    A3 --> A4[Agent calls read_file 5th time]
+    A4 --> W1[⚠️ WARN - Tool runs + warning attached]
+    W1 --> A5[Agent calls read_file 8th time]
+    A5 --> B1[🛑 BLOCK - Tool replaced with error]
+    B1 --> A6[Agent calls read_file 12th time]
+    A6 --> H1[🔥 HALT - ToolExecutionError raised]
+
+    classDef allow fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef block fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A1,A2,A3 allow
+    class W1 warn
+    class B1,H1 block
+```
+
+The agent experiences escalating resistance: warnings first, then blocked execution, then complete halt.
+
+---
+
+## Tool Classification
+
+Loop Guard categorizes tools into two buckets with different thresholds:
+
+```mermaid
+graph TB
+    Start[New custom tool] --> Q1{Does it change<br/>state on disk,<br/>DB, or remote?}
+    Q1 -->|No| Idempotent[✅ Idempotent bucket<br/>5 / 8 / 12 per turn]
+    Q1 -->|Yes| Mutating[🛑 Mutating bucket<br/>3 / 5 / 7 per turn]
+    Q1 -->|Unsure| Name{Tool name contains<br/>read/get/list/search/<br/>find/show/view/check?}
+    Name -->|Yes| Idempotent
+    Name -->|No| Mutating
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef strict fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Q1,Name question
+    class Idempotent good
+    class Mutating strict
+```
+
+**Idempotent tools** (safe to repeat): `read_file`, `list_files`, `search_files`, `web_search`, `get_memory`, `git_status`, `git_log`, `db_query`, etc.
+
+**Mutating tools** (state-changing): `write_file`, `edit_file`, `delete_file`, `execute_code`, `shell`, `git_commit`, `git_push`, `sql_insert`, `install_package`, etc.
+
+<Tip>
+If you can't move your tool into the explicit set, **name it well** — Loop Guard's heuristic looks for substrings like `read`, `get`, `list`, `search`, `find`, `show`, `view`, `check` (case-insensitive) to classify tools as idempotent.
+</Tip>
+
+---
+
+## Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | `bool` | `True` | Enable/disable Loop Guard entirely |
+| `idempotent_warn_threshold` | `int` | `5` | Warning threshold for idempotent tools |
+| `idempotent_block_threshold` | `int` | `8` | Block threshold for idempotent tools |
+| `idempotent_halt_threshold` | `int` | `12` | Halt threshold for idempotent tools |
+| `mutating_warn_threshold` | `int` | `3` | Warning threshold for mutating tools |
+| `mutating_block_threshold` | `int` | `5` | Block threshold for mutating tools |
+| `mutating_halt_threshold` | `int` | `7` | Halt threshold for mutating tools |
+| `max_time_per_turn` | `float` | `120.0` | Maximum seconds per turn before timeout |
+| `no_progress_warn` | `int` | `4` | Warning threshold for no-progress detection |
+| `no_progress_halt` | `int` | `8` | Halt threshold for no-progress detection |
+
+**GuardAction values**: `ALLOW`, `WARN`, `BLOCK`, `HALT`
+
+**LoopGuardDecision fields**: `action`, `code`, `message`, `metadata`
+
+---
+
+## What happens at each threshold
+
+| Decision | Pre-execution effect | Post-execution effect | User sees |
+|----------|---------------------|----------------------|-----------|
+| `ALLOW` | Tool runs normally | Counter incremented | Normal result |
+| `WARN` | Tool runs; warning logged | Warning appended/attached to result | `_loop_guard` key in dict result, or `[loop-guard] ...` suffix on string result |
+| `BLOCK` | Tool **not** executed | Counter still incremented | Tool result replaced with `{"error": "[loop-guard] ...", "loop_blocked": True}` |
+| `HALT` | `ToolExecutionError` raised, `is_retryable=False` | N/A | Exception propagates out of `agent.chat()` / `agent.start()` |
+
+---
+
+## Common Patterns
+
+### Polling a slow status endpoint
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.escalation.loop_guard import LoopGuard, LoopGuardConfig
+
+agent = Agent(instructions="Monitor deployment status")
+
+# Increase idempotent thresholds for polling scenarios
+agent._loop_guard = LoopGuard(LoopGuardConfig(
+    idempotent_warn_threshold=15,
+    idempotent_block_threshold=25,
+    idempotent_halt_threshold=40,
+    max_time_per_turn=300.0,  # 5 minute timeout
+))
+```
+
+### Strict mode for production database agents
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.escalation.loop_guard import LoopGuard, LoopGuardConfig
+
+agent = Agent(instructions="Manage user database")
+
+# Lower mutating thresholds for safety
+agent._loop_guard = LoopGuard(LoopGuardConfig(
+    mutating_warn_threshold=2,
+    mutating_block_threshold=3,
+    mutating_halt_threshold=4,
+))
+```
+
+### Observability with stats
+
+```python
+agent = Agent(instructions="Data processing agent")
+
+# Get statistics for dashboards
+stats = agent._loop_guard.get_stats()
+print(f"Turn elapsed: {stats['turn_elapsed']}s")
+print(f"Tool counts: {stats['tool_counts']}")
+```
+
+---
+
+## Relationship to Loop Detection
+
+Loop Guard and Loop Detection are **complementary features** with different purposes:
+
+| Feature | Opt-in? | Where | What it catches |
+|---------|---------|-------|----------------|
+| [Loop Detection](/docs/features/doom-loop-detection) | **Yes** — `loop_detection=True` | Identical-call, no-progress poll, ping-pong patterns |
+| **Loop Guard** | **No — always-on for every Agent** | Per-turn tool-call counts with idempotent-vs-mutating classification and graduated `warn`→`block`→`halt` responses |
+
+Loop Detection (opt-in) catches identical-argument / no-progress patterns at any frequency, while Loop Guard (always-on) catches high-frequency tool calls within a single turn regardless of argument variation. Use both for comprehensive protection.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+
+<Accordion title="Trust the defaults">
+The default thresholds (5/8/12 for idempotent, 3/5/7 for mutating) work well for most agents. Only customize when you have specific use cases like status polling or strict production environments.
+</Accordion>
+
+<Accordion title="Tune thresholds, not the on/off switch">
+Resist the urge to disable Loop Guard entirely. Instead, adjust thresholds to match your agent's workflow. A monitoring agent might need higher idempotent thresholds, but even monitoring agents can benefit from mutating tool limits.
+</Accordion>
+
+<Accordion title="Name custom tools so the heuristic works">
+If your custom tool isn't in the explicit `IDEMPOTENT_TOOLS` or `MUTATING_TOOLS` sets, name it descriptively. Tools named `check_status`, `read_config`, or `search_logs` will be classified as idempotent automatically.
+</Accordion>
+
+<Accordion title="Use get_stats() for observability">
+Monitor your agents' tool usage patterns with `agent._loop_guard.get_stats()`. High tool counts might indicate the agent is struggling with a task and needs different instructions or tools.
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card icon="triangle-exclamation" href="/docs/features/doom-loop-detection">
+  Loop Detection
+</Card>
+<Card icon="robot" href="/docs/features/escalation-pipeline">
+  Agent Autonomy
+</Card>
+</CardGroup>
