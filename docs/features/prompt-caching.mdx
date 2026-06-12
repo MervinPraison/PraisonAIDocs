@@ -5,23 +5,20 @@ description: "Reduce cost and latency with deterministic, cacheable context for 
 icon: "database"
 ---
 
-Prompt caching reuses the stable part of your system prompt across turns, so you pay full token cost only once instead of every message.
+Prompt caching optimizes LLM token costs by reusing stable context across conversation turns, paying full cost only once for unchanging prompt prefixes.
 
 ```mermaid
 graph LR
-    subgraph "Prompt Caching"
-        S[📋 Stable Prefix<br/>memory + tools<br/>sorted deterministically] --> B[⏸️ CACHE_BOUNDARY]
-        B --> D[💬 Dynamic Suffix<br/>user message + fresh tool results]
-        D --> R[⚡ Cached request<br/>pay only for delta]
+    subgraph "Prompt Caching Strategy"
+        S[📋 Stable Context<br/>system prompt + tools<br/>deterministic ordering] --> D[💬 Dynamic Content<br/>user message + fresh data]
+        D --> R[⚡ Cache Benefits<br/>reduced costs + latency]
     end
 
     classDef stable fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef boundary fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef dynamic fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
 
     class S stable
-    class B boundary
     class D dynamic
     class R result
 ```
@@ -29,7 +26,7 @@ graph LR
 ## Quick Start
 
 <Steps>
-<Step title="Simple usage (default deterministic behaviour, no opt-in)">
+<Step title="Use deterministic memory ordering">
 
 ```python
 from praisonaiagents import Agent
@@ -40,14 +37,15 @@ agent = Agent(
     memory=True,
 )
 
+# Memory results are sorted deterministically for cache consistency
 agent.start("What did we learn last week about prompt caching?")
 ```
 
-As of PR #1909 the memory layer now sorts results deterministically by default — multi-turn conversations automatically get cache-friendly prefixes on Anthropic/Google.
+Memory search results maintain consistent ordering to improve cache hit rates on Anthropic/Google models.
 
 </Step>
 
-<Step title="Explicit cache-optimised context (advanced)">
+<Step title="Manual prompt assembly for caching">
 
 ```python
 from praisonaiagents import Agent
@@ -55,13 +53,16 @@ from praisonaiagents.memory import Memory
 
 memory = Memory(config={"provider": "rag"})
 
-ctx = memory.build_cache_optimized_context(
+# Get consistent memory context
+context = memory.build_context_for_task(
     task_descr="Summarise our research notes",
     user_id="user_123",
     max_items=3,
+    include_in_output=True  # Force include for prompt assembly
 )
 
-system_prompt = ctx["stable_prefix"] + ctx["cache_boundary"] + "Latest user message goes here"
+# Construct cache-friendly prompt structure
+system_prompt = f"System instructions and tools\n\n{context}\n\nUser message: {{user_input}}"
 ```
 
 </Step>
@@ -79,30 +80,30 @@ sequenceDiagram
     participant LLM as Anthropic/Google
 
     User->>Agent: Turn 1 message
-    Agent->>Memory: build_cache_optimized_context()
-    Memory-->>Agent: stable_prefix + CACHE_BOUNDARY
-    Agent->>LLM: stable_prefix [cache write] + dynamic suffix
+    Agent->>Memory: build_context_for_task()
+    Memory-->>Agent: deterministic memory context
+    Agent->>LLM: stable_context + user_message [cache write]
     LLM-->>Agent: Response (full token cost)
 
-    User->>Agent: Turn 2 message
-    Agent->>Memory: build_cache_optimized_context()
-    Memory-->>Agent: SAME stable_prefix + CACHE_BOUNDARY
-    Agent->>LLM: stable_prefix [cache hit] + new dynamic suffix
+    User->>Agent: Turn 2 message  
+    Agent->>Memory: build_context_for_task()
+    Memory-->>Agent: SAME deterministic memory context
+    Agent->>LLM: stable_context + new_user_message [cache hit]
     LLM-->>Agent: Response (pay only for delta — fast + cheap)
 ```
 
-| Component | Before PR #1909 | After PR #1909 |
-|-----------|-----------------|----------------|
-| Memory search results | Returned in DB / similarity order — varies turn-to-turn | Sorted by `(timestamp_desc, sha256(content))` — byte-stable |
-| Tool schemas | Insertion / dict order — process-dependent | Sorted alphabetically by `function.name` |
-| Cache boundary | None | `CACHE_BOUNDARY = "\n\n\n\n"` marker available |
-| Cache hit on Anthropic/Google | Almost never | Every turn where the underlying data hasn't changed |
+| Component | Caching Behavior |
+|-----------|------------------|
+| Memory search results | Returned in deterministic order based on content hashing and timestamps |
+| Tool schemas | Consistent ordering for reproducible prompts |
+| Context structure | Stable system prompt + memory + dynamic user input |
+| Cache effectiveness | High hit rates when underlying data is unchanged |
 
 ---
 
 ## Configuration Options
 
-The `build_cache_optimized_context()` method provides these parameters:
+The `build_context_for_task()` method provides these parameters for cache-optimized context:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -110,12 +111,9 @@ The `build_cache_optimized_context()` method provides these parameters:
 | `user_id` | `Optional[str]` | `None` | Optional user ID for personalised memory |
 | `additional` | `str` | `""` | Additional context to include in search |
 | `max_items` | `int` | `3` | Maximum items per memory category |
-| `include_cache_boundary` | `bool` | `True` | Include the cache boundary marker in the returned dict |
-| `include_in_output` | `Optional[bool]` | `None` (treated as `True` here) | Whether to include memory content in output |
+| `include_in_output` | `Optional[bool]` | `None` | Whether to include memory content in output (set to `True` for manual prompt assembly) |
 
-**Returns:** `Dict[str, str]` with keys:
-- `stable_prefix` — deterministically ordered context string (safe to send as a long-TTL cached prefix)
-- `cache_boundary` — the `CACHE_BOUNDARY` marker string (empty string if `include_cache_boundary=False`)
+**Returns:** `str` — deterministically ordered context string combining relevant memories
 
 ---
 
@@ -141,36 +139,30 @@ agent.start("What are the cost savings?")  # Cache hit on Anthropic/Google
 
 ### Manual prompt assembly for custom LLM calls
 
-Use `build_cache_optimized_context()` directly with the returned `stable_prefix` + `cache_boundary` + dynamic suffix pattern.
+Use `build_context_for_task()` with explicit output control for manual prompt construction.
 
 ```python
 from praisonaiagents.memory import Memory
 
 memory = Memory(config={"provider": "rag"})
 
-ctx = memory.build_cache_optimized_context(
+context = memory.build_context_for_task(
     task_descr="Analyse user feedback",
     max_items=5,
+    include_in_output=True  # Force memory content inclusion
 )
 
-# Construct prompt with clear boundary
-system_prompt = (
-    ctx["stable_prefix"] + 
-    ctx["cache_boundary"] + 
-    f"Current user message: {user_input}"
-)
+# Construct cache-friendly prompt structure
+system_prompt = f"""System: You are an AI assistant.
+
+{context}
+
+User: {user_input}"""
 ```
 
-### Sorted tool schemas for custom provider calls
+### Tool schema consistency
 
-Use `get_sorted_tool_schemas()` for users who hand-roll tool lists.
-
-```python
-from praisonaiagents.tools.base import get_sorted_tool_schemas
-
-schemas = get_sorted_tool_schemas([my_tool_a, my_tool_z, my_tool_m])
-# schemas are now alphabetically sorted by function name
-```
+Tools are ordered consistently to maintain prompt cache effectiveness across invocations.
 
 ---
 
@@ -178,20 +170,20 @@ schemas = get_sorted_tool_schemas([my_tool_a, my_tool_z, my_tool_m])
 
 <AccordionGroup>
 
-<Accordion title="Keep memory writes in batches between turns">
-Every write invalidates the cached prefix. Batch memory updates at end-of-turn rather than mid-turn.
+<Accordion title="Keep memory writes batched between turns">
+Minimize memory updates during conversation turns to maintain cache consistency. Update memories at conversation boundaries.
 </Accordion>
 
-<Accordion title="Put per-turn content AFTER the cache boundary">
-The boundary marker signals to your LLM call code where the long-TTL cache write ends.
+<Accordion title="Structure prompts for caching">
+Place stable system content (instructions, tools, static memory) before dynamic content (user messages, fresh data).
 </Accordion>
 
-<Accordion title="Use `max_items` consistently">
-Varying `max_items` between turns changes the prefix and misses the cache.
+<Accordion title="Use consistent parameters">
+Varying `max_items` or other context parameters between turns changes the context and reduces cache effectiveness.
 </Accordion>
 
-<Accordion title="Sort custom tool lists">
-If you bypass the default tool pipeline, run `get_sorted_tool_schemas()` so your schema list is stable.
+<Accordion title="Maintain deterministic ordering">
+The framework automatically ensures consistent ordering for memory search results and tool schemas to optimize cache hits.
 </Accordion>
 
 </AccordionGroup>
