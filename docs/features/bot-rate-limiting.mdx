@@ -1,0 +1,263 @@
+---
+title: "Bot Rate Limiting"
+sidebarTitle: "Bot Rate Limiting"
+description: "Throttle outbound bot messages to messaging platforms like Telegram, Discord, and Slack"
+icon: "gauge"
+---
+
+Bot Rate Limiting prevents messaging platform 429 errors by throttling outbound messages to channels, respecting platform-specific limits and per-channel delays.
+
+```mermaid
+graph LR
+    subgraph "Bot Rate Limiting Flow"
+        B[🤖 Bot] --> L{⚖️ RateLimiter}
+        L -->|Token Available| Send[📤 Send Message]
+        L -->|Rate Limited| Wait[⏳ Sleep Outside Lock]
+        Wait --> L
+        Send --> P[🔌 Platform API]
+        P --> C1[💬 Channel 1]
+        P --> C2[💬 Channel 2]
+        P --> C3[💬 Channel 3]
+    end
+    
+    classDef bot fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef limiter fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef send fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef platform fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef channel fill:#6366F1,stroke:#7C90A0,color:#fff
+    
+    class B bot
+    class L limiter
+    class Send send
+    class P platform
+    class C1,C2,C3 channel
+    class Wait limiter
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Simple Usage">
+Use the default rate limiter for general messaging bots.
+
+```python
+from praisonai.bots._rate_limit import RateLimiter
+
+# Default: 1 message/sec, burst 5, 1s per-channel delay
+limiter = RateLimiter()
+
+# Bot adapters call this before sending
+await limiter.acquire(channel_id="telegram-chat-12345")
+```
+</Step>
+
+<Step title="Platform-Specific Configuration">
+Use platform presets for optimal compliance with API limits.
+
+```python
+from praisonai.bots._rate_limit import RateLimiter
+
+# Telegram: 25 msg/sec, 30 burst, 0.05s per-channel
+telegram_limiter = RateLimiter.for_platform("telegram")
+
+# Discord: 1 msg/sec, 5 burst, 1s per-channel  
+discord_limiter = RateLimiter.for_platform("discord")
+
+# Slack: 1 msg/sec, 1 burst, 1s per-channel
+slack_limiter = RateLimiter.for_platform("slack")
+
+# WhatsApp: 50 msg/sec, 80 burst, 0.1s per-channel
+whatsapp_limiter = RateLimiter.for_platform("whatsapp")
+```
+</Step>
+
+<Step title="Custom Configuration">
+Fine-tune rate limits for specific platform policies or custom requirements.
+
+```python
+from praisonai.bots._rate_limit import RateLimiter, RateLimitConfig
+
+limiter = RateLimiter(RateLimitConfig(
+    messages_per_second=2.0,  # Global rate
+    burst_size=10,            # Burst capacity
+    per_channel_delay=1.5,    # Min delay per channel
+))
+
+await limiter.acquire(channel_id="custom-channel-456")
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Bot1 as Bot (Channel A)
+    participant Bot2 as Bot (Channel B)
+    participant Limiter as RateLimiter
+    participant Lock as Global Lock
+    participant API as Platform API
+    
+    Bot1->>Limiter: acquire("channel-A")
+    Bot2->>Limiter: acquire("channel-B")
+    
+    par Phase 1: Reserve Tokens (Under Lock)
+        Limiter->>Lock: Acquire
+        Limiter->>Limiter: Check global tokens
+        Limiter->>Limiter: Check channel-A last send
+        Limiter->>Limiter: Reserve token, update bookkeeping
+        Lock->>Limiter: Release
+    and 
+        Limiter->>Lock: Acquire
+        Limiter->>Limiter: Check global tokens
+        Limiter->>Limiter: Check channel-B last send
+        Limiter->>Limiter: Reserve token, update bookkeeping
+        Lock->>Limiter: Release
+    end
+    
+    par Phase 2: Sleep Outside Lock (Concurrent)
+        Limiter-->>Bot1: Sleep 0.5s (channel delay)
+        Limiter-->>Bot2: Sleep 0.2s (no delay needed)
+    end
+    
+    par Concurrent Sends
+        Bot1->>API: Send to Channel A
+        Bot2->>API: Send to Channel B
+    end
+```
+
+The rate limiter uses a two-phase approach:
+
+| Phase | Description | Benefits |
+|-------|-------------|----------|
+| **Reserve** | Under global lock: check tokens, reserve capacity, update channel tracking | Thread-safe bookkeeping |
+| **Sleep** | Outside lock: actual delay based on computed wait time | Multiple channels can sleep concurrently |
+
+---
+
+## Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `messages_per_second` | `float` | `1.0` | Token refill rate for the global token bucket. |
+| `burst_size` | `int` | `5` | Max tokens that can accumulate (burst capacity). |
+| `per_channel_delay` | `float` | `1.0` | Minimum seconds between two sends to the same channel. |
+
+### Platform Presets
+
+| Platform | messages_per_second | burst_size | per_channel_delay | Notes |
+|----------|---------------------|------------|-------------------|--------|
+| **Telegram** | 25.0 | 30 | 0.05 | ~30 msg/sec to different users |
+| **Discord** | 1.0 | 5 | 1.0 | 5 messages per 5 seconds per channel |
+| **Slack** | 1.0 | 1 | 1.0 | 1 message per second per channel |
+| **WhatsApp** | 50.0 | 80 | 0.1 | ~80 msg/sec Cloud API limit |
+
+---
+
+## Memory Management
+
+Per-channel state is tracked in an LRU cache capped at **4096 channels**. If a bot serves more channels than that, the least-recently-used channels fall out of the cache and their `per_channel_delay` window resets. This bounds memory for long-running bots.
+
+```python
+# Memory usage stays bounded even with many channels
+for channel_id in range(10000):  # 10k channels
+    await limiter.acquire(f"channel-{channel_id}")
+    # Internal cache automatically evicts old entries at 4096 limit
+```
+
+---
+
+## Concurrency Design
+
+The global lock is held only long enough to reserve a token and update bookkeeping — the actual sleep happens outside the lock. Multiple channels can be rate-limited concurrently without serialising on one mutex.
+
+**Before PR #1870** (serialized):
+```python
+# Old behavior: sleep INSIDE lock - channels wait in line
+async with self._lock:
+    # check tokens, check channel timing
+    await asyncio.sleep(delay)  # BLOCKS other channels
+```
+
+**After PR #1870** (concurrent):
+```python
+# New behavior: sleep OUTSIDE lock - channels sleep in parallel
+async with self._lock:
+    # check tokens, check channel timing, compute delay
+    pass  # lock released immediately
+await asyncio.sleep(delay)  # Multiple channels sleep concurrently
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Use Platform Presets">
+Start with `RateLimiter.for_platform()` instead of custom configs. Platform presets are tuned for each API's documented limits and real-world behavior.
+
+```python
+# Good: use tested platform preset
+limiter = RateLimiter.for_platform("discord")
+
+# Risky: custom config might hit undocumented limits
+limiter = RateLimiter(RateLimitConfig(messages_per_second=10.0))
+```
+</Accordion>
+
+<Accordion title="Share Limiters Across Bot Instances">
+Create one rate limiter per platform and share it across all bot instances to respect global rate limits.
+
+```python
+# Good: shared limiter
+telegram_limiter = RateLimiter.for_platform("telegram")
+
+bot1 = TelegramBot(rate_limiter=telegram_limiter)
+bot2 = TelegramBot(rate_limiter=telegram_limiter)
+
+# Bad: separate limiters bypass global limits
+bot1 = TelegramBot(rate_limiter=RateLimiter.for_platform("telegram"))
+bot2 = TelegramBot(rate_limiter=RateLimiter.for_platform("telegram"))
+```
+</Accordion>
+
+<Accordion title="Monitor Rate Limit Logs">
+The rate limiter logs debug messages when applying delays. Monitor these to tune your configuration.
+
+```python
+import logging
+logging.getLogger("praisonai.bots._rate_limit").setLevel(logging.DEBUG)
+
+# Log output:
+# DEBUG:praisonai.bots._rate_limit:Rate limit: waiting 0.750s for channel telegram-chat-123
+```
+</Accordion>
+
+<Accordion title="Handle Platform-Specific Burst Patterns">
+Some platforms allow bursts followed by longer delays. The `burst_size` parameter accommodates this pattern.
+
+```python
+# WhatsApp allows rapid bursts then enforces stricter limits
+whatsapp_limiter = RateLimiter(RateLimitConfig(
+    messages_per_second=10.0,  # Sustained rate
+    burst_size=50,             # Initial burst capacity
+    per_channel_delay=0.1      # Quick per-channel recovery
+))
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Rate Limiter (LLM)" icon="gauge-high" href="/features/rate-limiter">
+  Rate limiting for LLM API calls (different from bot message rate limiting)
+</Card>
+<Card title="Messaging Bots" icon="message-circle" href="/features/messaging-bots">
+  Build bots for Telegram, Discord, Slack, and WhatsApp platforms
+</Card>
+</CardGroup>
