@@ -67,16 +67,25 @@ compactor = ContextCompactor(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `max_tokens` | `int` | `8000` | Maximum context tokens |
-| `strategy` | `str` | `"summarize"` | Compaction strategy |
+| `target_tokens` | `int` | `None` | Target tokens after compaction |
+| `strategy` | `CompactionStrategy` | `TRUNCATE` | Compaction strategy enum |
+| `preserve_system` | `bool` | `True` | Keep system messages |
 | `preserve_recent` | `int` | `5` | Recent messages to preserve |
+| `config` | `CompactionConfig` | `None` | Optional config object override |
+| `llm_summarize_fn` | `Callable` | `None` | Async function for LLM summarization |
+| `tool_pruner` | `ToolResultPrunerProtocol` | `None` | Custom tool result pruner |
+| `message_formatter` | `MessageFormatterProtocol` | `None` | Custom message formatter |
+| `summary_builder` | `SummaryBuilderProtocol` | `None` | Custom summary builder |
 
 #### Methods
 
 | Method | Description |
 |--------|-------------|
-| `compact(messages)` | Compact messages to fit budget |
-| `should_compact(messages)` | Check if compaction needed |
-| `get_token_count(messages)` | Count tokens in messages |
+| `compact(messages, focus_topic=None)` | Compact messages with optional focus topic (sync) |
+| `compact_async(messages, focus_topic=None)` | Compact messages with optional focus topic (async) |
+| `needs_compaction(messages)` | Check if compaction needed (includes anti-thrashing) |
+| `count_total_tokens(messages)` | Count total tokens in messages |
+| `get_stats(messages)` | Get detailed statistics about messages and compaction state |
 
 ### CompactionConfig
 
@@ -121,6 +130,11 @@ print(SUMMARY_TEMPLATE)
 | `compaction_prefix` | `str` | `COMPACTION_PREFIX` | Anti-injection framing prepended to summaries |
 | `structured_template` | `bool` | `True` | Use organized section template for summaries |
 | `iterative_update` | `bool` | `True` | Merge previous summary on re-compaction |
+| `min_savings_pct` | `float` | `10.0` | Skip compaction if projected saving < N% (0–100) |
+| `max_consecutive_low_savings` | `int` | `2` | Abort after N low-savings attempts (anti-thrashing) |
+| `tool_prune_before_summarise` | `bool` | `True` | Deduplicate tool results before summarisation |
+| `max_tool_result_size` | `int` | `500` | Max size for a single tool result before pruning |
+| `enable_iterative_summary` | `bool` | `True` | Build on previous summaries instead of starting fresh |
 
 ### CompactionStrategy
 
@@ -151,14 +165,144 @@ print(result.messages)
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
-| `messages` | `list` | Compacted messages |
 | `original_tokens` | `int` | Original token count |
 | `compacted_tokens` | `int` | Final token count |
 | `messages_removed` | `int` | Number of messages removed |
 | `messages_kept` | `int` | Number of messages kept |
 | `strategy_used` | `CompactionStrategy` | Strategy that was applied |
+| `summary` | `str` | Summary text (if generated) |
+| `savings_pct` | `float` | Percentage of tokens saved (computed via `calculate_savings_pct()`) |
+| `tool_results_pruned` | `int` | Number of tool results pruned in pre-pass |
+| `previous_summary_reused` | `bool` | True when iterative summary feature was used |
+| `was_skipped_due_to_low_savings` | `bool` | True when anti-thrashing protection aborted |
+
+#### Methods
+
+| Method | Description |
+|--------|-------------|
+| `calculate_savings_pct()` | Calculate savings percentage: `(original - compacted) / original * 100` |
+| `to_dict()` | Export all fields as dictionary including new PR #1910 fields |
 
 **Note:** Compacted messages may include `_compacted=True`, `_anti_injection=True`, and `_original_count=N` metadata flags.
+
+---
+
+## Protocols
+
+New protocol interfaces for extending compaction behavior (added in PR #1910).
+
+### ToolResultPrunerProtocol
+
+Protocol for custom tool result pruning logic.
+
+```python
+from praisonaiagents.compaction import ToolResultPrunerProtocol
+from typing import List, Dict, Tuple
+
+class CustomPruner:
+    def prune(self, messages: List[Dict], max_tool_result_size: int = 500) -> Tuple[List[Dict], int]:
+        """
+        Prune tool results from messages.
+        
+        Args:
+            messages: List of message dictionaries
+            max_tool_result_size: Maximum size for tool results
+            
+        Returns:
+            Tuple of (processed_messages, pruned_count)
+        """
+        processed = []
+        pruned_count = 0
+        
+        for msg in messages:
+            if msg.get("role") == "tool" and len(msg.get("content", "")) > max_tool_result_size:
+                # Custom pruning logic
+                pruned_count += 1
+            processed.append(msg)
+            
+        return processed, pruned_count
+```
+
+### MessageFormatterProtocol
+
+Protocol for custom message formatting before LLM summarization.
+
+```python
+from praisonaiagents.compaction import MessageFormatterProtocol
+from typing import List, Dict
+
+class CustomFormatter:
+    def format_for_summary(self, messages: List[Dict]) -> str:
+        """
+        Format messages for LLM summarization.
+        
+        Args:
+            messages: List of message dictionaries
+            
+        Returns:
+            Formatted string for summarization
+        """
+        formatted = []
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            formatted.append(f"{i+1}. [{role}]: {content[:200]}...")
+        
+        return "\n".join(formatted)
+```
+
+### SummaryBuilderProtocol
+
+Protocol for custom structured summary building.
+
+```python
+from praisonaiagents.compaction import SummaryBuilderProtocol
+from typing import List, Dict
+
+class CustomSummaryBuilder:
+    def build_structured_summary(self, messages: List[Dict]) -> str:
+        """
+        Build a structured summary from messages.
+        
+        Args:
+            messages: List of message dictionaries
+            
+        Returns:
+            Structured summary string
+        """
+        return "## Custom Summary Format\nKey points extracted..."
+    
+    def merge_summaries(self, previous: str, current: str) -> str:
+        """
+        Merge previous and current summaries for iterative updates.
+        
+        Args:
+            previous: Previous summary content
+            current: Current summary content
+            
+        Returns:
+            Merged summary
+        """
+        return f"{current}\n\n[Previous]: {previous[:200]}..."
+```
+
+### Injecting Custom Protocols
+
+```python
+from praisonaiagents.compaction import ContextCompactor
+
+compactor = ContextCompactor(max_tokens=8000)
+
+# Inject custom implementations
+compactor.tool_pruner = CustomPruner()
+compactor.message_formatter = CustomFormatter()
+compactor.summary_builder = CustomSummaryBuilder()
+
+# Now compactor uses your custom logic
+result = compactor.compact(messages)
+```
+
+---
 
 ## Usage Examples
 
@@ -175,9 +319,43 @@ messages = [
     # ... many more messages
 ]
 
-if compactor.should_compact(messages):
-    result = compactor.compact(messages)
-    messages = result.messages
+if compactor.needs_compaction(messages):
+    # Sync compaction
+    compacted, result = compactor.compact(messages)
+    
+    # With focus topic
+    compacted, result = compactor.compact(messages, focus_topic="error handling")
+    
+    print(f"Saved {result.savings_pct:.1f}% tokens")
+    print(f"Tool results pruned: {result.tool_results_pruned}")
+```
+
+### Async Compaction with LLM
+
+```python
+import asyncio
+from praisonaiagents.compaction import ContextCompactor
+
+async def llm_summarize(prompt):
+    # Your LLM call here
+    return "Summary of the conversation..."
+
+compactor = ContextCompactor(
+    max_tokens=4000,
+    llm_summarize_fn=llm_summarize
+)
+
+async def main():
+    # Async compaction with focus
+    compacted, result = await compactor.compact_async(
+        messages,
+        focus_topic="database optimization"
+    )
+    
+    print(f"Previous summary reused: {result.previous_summary_reused}")
+    print(f"Anti-thrashing triggered: {result.was_skipped_due_to_low_savings}")
+
+asyncio.run(main())
 ```
 
 ### With Agent
