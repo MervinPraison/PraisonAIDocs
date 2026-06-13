@@ -425,7 +425,6 @@ class PraisonAI:
             
             # Handle backends command
             elif args.command == "backends":
-                from rich import print
                 subcommand = unknown_args[0] if unknown_args and not unknown_args[0].startswith('-') else None
                 
                 if subcommand == "list" or subcommand is None:
@@ -959,6 +958,7 @@ class PraisonAI:
         parser.add_argument("--expand-prompt", action="store_true", help="Expand short prompt into detailed prompt (works with any command)")
         parser.add_argument("--expand-tools", type=str, help="Tools for prompt expander (e.g., 'internet_search' or path to tools.py)")
         parser.add_argument("--tools", "-t", type=str, help="Path to tools.py file for research agent")
+        parser.add_argument("--toolset", type=str, help="Named toolset groups (comma-separated, e.g., web,files,research)")
         parser.add_argument("--no-tools", action="store_true", help="Disable default built-in tools (for models that don't support tool calling)")
         parser.add_argument("--no-acp", action="store_true", help="Disable ACP tools (agentic file operations with plan/approve/apply)")
         parser.add_argument("--no-lsp", action="store_true", help="Disable LSP tools (code intelligence: symbols, definitions, references)")
@@ -988,6 +988,7 @@ class PraisonAI:
         # Memory arguments
         parser.add_argument("--memory", action="store_true", help="Enable file-based memory for agent")
         parser.add_argument("--user-id", type=str, help="User ID for memory isolation")
+        parser.add_argument("--message-steering", action="store_true", help="Enable real-time message steering for agents during execution")
         
         # Session management arguments
         parser.add_argument("--auto-save", type=str, metavar="NAME", help="Auto-save session with given name after each run")
@@ -1093,6 +1094,16 @@ class PraisonAI:
         # P8/G11: Tool timeout - prevent slow tools from blocking
         parser.add_argument("--tool-timeout", type=int, default=60,
                           help="Timeout in seconds for each tool call (default: 60)")
+        
+        # Tool retry policy - handle transient failures with exponential backoff
+        parser.add_argument("--tool-retry-attempts", type=int, default=3,
+                          help="Maximum retry attempts for tool failures (default: 3)")
+        parser.add_argument("--tool-retry-delay", type=int, default=1000,
+                          help="Initial retry delay in milliseconds (default: 1000)")
+        parser.add_argument("--tool-retry-backoff", type=float, default=2.0,
+                          help="Retry backoff multiplier (default: 2.0)")
+        parser.add_argument("--tool-retry-on", type=str, default="timeout,rate_limit,connection_error",
+                          help="Error types to retry (comma-separated, default: timeout,rate_limit,connection_error)")
         
         # Tool Approval - control tool execution approval
         parser.add_argument("--trust", action="store_true", help="Auto-approve all tool executions (skip approval prompts)")
@@ -2140,25 +2151,49 @@ class PraisonAI:
             except Exception as e:
                 print(f"[yellow]Warning: Failed to load tools from {tools_path}: {e}[/yellow]")
         else:
-            # Treat as comma-separated tool names
-            try:
-                from praisonaiagents.tools import TOOL_MAPPINGS
-                import praisonaiagents.tools as tools_module
-                
-                tool_names = [t.strip() for t in tools_path.split(',')]
-                for tool_name in tool_names:
-                    if tool_name in TOOL_MAPPINGS:
-                        try:
-                            tool = getattr(tools_module, tool_name)
-                            tools_list.append(tool)
-                        except Exception as e:
-                            print(f"[yellow]Warning: Failed to load tool '{tool_name}': {e}[/yellow]")
+            # Comma-separated names: use the unified resolver so CLI == YAML == Python
+            from ..tool_resolver import ToolResolver
+            resolver = ToolResolver()
+            tool_names = [t.strip() for t in tools_path.split(',') if t.strip()]
+            for tool_name in tool_names:
+                try:
+                    tool = resolver.resolve(tool_name, instantiate=True)
+                    if tool is not None:
+                        tools_list.append(tool)
                     else:
                         print(f"[yellow]Warning: Unknown tool '{tool_name}'[/yellow]")
-                if tools_list:
-                    print(f"[cyan]Loaded {len(tools_list)} built-in tools[/cyan]")
-            except ImportError:
-                print("[yellow]Warning: Could not import tools module[/yellow]")
+                except Exception as e:
+                    print(f"[yellow]Warning: Failed to load tool '{tool_name}': {e}[/yellow]")
+            if tools_list:
+                print(f"[cyan]Loaded {len(tools_list)} tools[/cyan]")
+        
+        return tools_list
+    
+    def _load_toolsets(self, toolset_names: list) -> list:
+        """
+        Load tools from named toolset groups.
+        
+        Args:
+            toolset_names: List of toolset names to resolve
+            
+        Returns:
+            List of tool functions from all toolsets
+        """
+        tools_list = []
+        if not toolset_names:
+            return tools_list
+        
+        try:
+            from ..tool_resolver import resolve_toolsets
+            tools_list = resolve_toolsets(toolset_names)
+            
+            if tools_list:
+                print(f"[cyan]Loaded {len(tools_list)} tools from toolsets: {', '.join(toolset_names)}[/cyan]")
+            else:
+                print(f"[yellow]Warning: No tools found for toolsets: {', '.join(toolset_names)}[/yellow]")
+                
+        except Exception as e:
+            print(f"[yellow]Warning: Failed to load toolsets {toolset_names}: {e}[/yellow]")
         
         return tools_list
 
@@ -4112,6 +4147,22 @@ Do NOT add any explanations or formatting."""
         tool_timeout = getattr(self.args, 'tool_timeout', None)
         if tool_timeout is not None:
             cli_config['tool_timeout'] = tool_timeout
+        
+        # Extract --tool-retry-* flags for retry policy
+        retry_attempts = getattr(self.args, 'tool_retry_attempts', 3)
+        retry_delay = getattr(self.args, 'tool_retry_delay', 1000)
+        retry_backoff = getattr(self.args, 'tool_retry_backoff', 2.0)
+        retry_on_str = getattr(self.args, 'tool_retry_on', "timeout,rate_limit,connection_error")
+        retry_on = set(error_type.strip() for error_type in retry_on_str.split(',') if error_type.strip())
+        
+        if retry_attempts > 1:  # Only create retry policy if retries are enabled
+            from praisonaiagents.tools.retry import RetryPolicy
+            cli_config['tool_retry_policy'] = RetryPolicy(
+                max_attempts=retry_attempts,
+                initial_delay_ms=retry_delay,
+                backoff_factor=retry_backoff,
+                retry_on=retry_on
+            )
             
         # Extract --planning-tools flag
         planning_tools = getattr(self.args, 'planning_tools', None)
@@ -4327,10 +4378,22 @@ Do NOT add any explanations or formatting."""
                         existing_tools = agent_config.get('tools', [])
                         if isinstance(existing_tools, list):
                             existing_tools.extend(tools_list)
+                            agent_config["tools"] = existing_tools
                         else:
-                            existing_tools = tools_list
-                        agent_config['tools'] = existing_tools
-                        print(f"[bold cyan]Tools loaded: {len(tools_list)} tool(s) available for agent[/bold cyan]")
+                            agent_config["tools"] = tools_list
+                
+                # Load toolsets if specified (--toolset flag)
+                if getattr(self.args, 'toolset', None):
+                    toolset_names = [name.strip() for name in self.args.toolset.split(',') if name.strip()]
+                    toolset_tools = self._load_toolsets(toolset_names) if toolset_names else []
+                    if toolset_tools:
+                        existing_tools = agent_config.get('tools', [])
+                        if isinstance(existing_tools, list):
+                            existing_tools.extend(toolset_tools)
+                            agent_config["tools"] = existing_tools
+                        else:
+                            agent_config["tools"] = toolset_tools
+                        print(f"[bold cyan]Toolsets loaded: {len(toolset_tools)} tool(s) from {self.args.toolset}[/bold cyan]")
                 
                 # Planning Mode
                 if getattr(self.args, 'planning', False):
@@ -4357,6 +4420,22 @@ Do NOT add any explanations or formatting."""
                 tool_timeout = getattr(self.args, 'tool_timeout', 60)
                 if tool_timeout and tool_timeout > 0:
                     agent_config["tool_timeout"] = tool_timeout
+                
+                # Tool retry policy - handle transient failures with exponential backoff
+                retry_attempts = getattr(self.args, 'tool_retry_attempts', 3)
+                retry_delay = getattr(self.args, 'tool_retry_delay', 1000)
+                retry_backoff = getattr(self.args, 'tool_retry_backoff', 2.0)
+                retry_on_str = getattr(self.args, 'tool_retry_on', "timeout,rate_limit,connection_error")
+                retry_on = set(error_type.strip() for error_type in retry_on_str.split(',') if error_type.strip())
+                
+                if retry_attempts > 1:  # Only create retry policy if retries are enabled
+                    from praisonaiagents.tools.retry import RetryPolicy
+                    agent_config["tool_retry_policy"] = RetryPolicy(
+                        max_attempts=retry_attempts,
+                        initial_delay_ms=retry_delay,
+                        backoff_factor=retry_backoff,
+                        retry_on=retry_on
+                    )
                 
                 # Memory
                 if getattr(self.args, 'memory', False):
@@ -4396,6 +4475,11 @@ Do NOT add any explanations or formatting."""
                         print("[bold cyan]Claude Memory Tool enabled - Claude will autonomously manage memories[/bold cyan]")
                     else:
                         print("[yellow]Warning: --claude-memory requires an Anthropic model (--llm anthropic/...)[/yellow]")
+                
+                # Message Steering
+                if getattr(self.args, 'message_steering', False):
+                    agent_config["message_steering"] = True
+                    print("[bold cyan]Message steering enabled - agent can receive guidance during execution[/bold cyan]")
                 
                 # ===== NEW CLI FEATURES INTEGRATION =====
                 
