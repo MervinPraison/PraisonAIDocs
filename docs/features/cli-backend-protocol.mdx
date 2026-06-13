@@ -86,22 +86,21 @@ praisonai backends list
 ```mermaid
 sequenceDiagram
     participant User
-    participant CLI as CLI/YAML
-    participant Resolver as resolve_cli_backend
-    participant Factory as Backend Factory
+    participant Loader as YAML/Python loader
+    participant Validator as Framework check
+    participant Resolver as resolve_cli_backend_config
     participant Backend as ClaudeCodeBackend
-    participant Process as claude CLI
     participant Agent
 
-    User->>CLI: Request with --cli-backend
-    CLI->>Resolver: resolve_cli_backend(id, overrides)
-    Resolver->>Factory: Create backend instance
-    Factory->>Backend: ClaudeCodeBackend()
-    Agent->>Backend: execute(prompt)
-    Backend->>Process: subprocess call
-    Process-->>Backend: JSONL response
-    Backend-->>Agent: CliBackendResult
-    Agent-->>User: Final response
+    User->>Loader: cli_backend = "claude-code" (or dict)
+    Loader->>Validator: framework == "praisonai"?
+    alt framework is praisonai
+        Validator->>Resolver: pass-through
+        Resolver->>Backend: instantiate (or use cached)
+        Backend-->>Agent: ready to delegate turns
+    else any other framework
+        Validator-->>User: ValueError (fast fail)
+    end
 ```
 
 | Step | Component | Purpose |
@@ -138,11 +137,95 @@ graph TB
 | Shape | Example | Behavior |
 |-------|---------|----------|
 | Omitted | _(field absent)_ | No backend used; Agent uses normal LLM client. No warning logged. |
-| String | `cli_backend: claude-code` | Resolves via `resolve_cli_backend("claude-code")` |
-| Dict | `cli_backend: {id: claude-code, overrides: {timeout_ms: 60000}}` | Resolves via `resolve_cli_backend("claude-code", overrides={...})` |
-| Dict missing `id` | `cli_backend: {overrides: {...}}` | Returns `None` + logged warning. **Does not raise.** |
-| Unknown id | `cli_backend: nope` | Returns `None` + logged warning. **Does not raise.** |
-| Invalid type (e.g. `123`) | `cli_backend: 123` | Returns `None` + logged warning. **Does not raise.** |
+| String | `cli_backend: claude-code` | Resolves via `resolve_cli_backend("claude-code")`. |
+| Dict | `cli_backend: {id: claude-code, overrides: {timeout_ms: 60000}}` | Resolves via `resolve_cli_backend("claude-code", overrides={...})`. |
+| Empty string | `cli_backend: ""` | **Raises** `ValueError("cli_backend string cannot be empty")`. |
+| Dict missing `id` | `cli_backend: {overrides: {...}}` | **Raises** `ValueError("cli_backend dict must contain an 'id' field")`. |
+| `overrides` not a dict | `cli_backend: {id: claude-code, overrides: "bad"}` | **Raises** `ValueError("cli_backend.overrides must be a dict")`. |
+| Invalid type | `cli_backend: 123` | **Raises** `ValueError("cli_backend must be string, dict, or instance, got: int")`. |
+| Unknown id | `cli_backend: nope` | Returns `None` + logged warning. (Registry lookup, unchanged.) |
+
+---
+
+## Framework Compatibility
+
+`cli_backend` only works with `framework: praisonai`.
+
+```mermaid
+graph TB
+    Q{Which framework?}
+    Q -->|praisonai| OK[✅ cli_backend takes effect]
+    Q -->|crewai / autogen / ag2| FAIL[❌ ValueError at config validation]
+    
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    
+    class Q question
+    class OK success
+    class FAIL error
+```
+
+| `framework` value | `cli_backend` behaviour |
+|-------------------|-------------------------|
+| `praisonai` (default) | Resolved and used to delegate every agent turn. |
+| `crewai`, `autogen`, `autogen_v4`, `ag2` | **Raises** `ValueError: cli_backend requires framework='praisonai', but framework='<x>' was specified`. Validation runs before any agent starts, so no partial run is performed. |
+
+<Note>
+This is a behaviour change in PR #1797 — previously `cli_backend` was silently ignored under non-praisonai frameworks. Now it fails loudly at config-load time.
+</Note>
+
+---
+
+## Using `cli_backend` in Python
+
+```python
+from praisonaiagents import Agent
+
+# 1. String form — same as YAML
+agent = Agent(
+    name="Refactorer",
+    instructions="Refactor Python files cleanly",
+    cli_backend="claude-code",
+)
+
+agent.start("Refactor utils.py")
+```
+
+```python
+# 2. Dict form with overrides — now works in Python too (PR #1797)
+agent = Agent(
+    name="Refactorer",
+    instructions="Refactor Python files cleanly",
+    cli_backend={
+        "id": "claude-code",
+        "overrides": {"timeout_ms": 60000},
+    },
+)
+```
+
+```python
+# 3. Pre-resolved instance — full control
+from praisonai.cli_backends import resolve_cli_backend
+
+backend = resolve_cli_backend("claude-code", overrides={"timeout_ms": 60000})
+
+agent = Agent(
+    name="Refactorer",
+    cli_backend=backend,
+)
+```
+
+| Shape | Example | When to use |
+|-------|---------|-------------|
+| `str` | `cli_backend="claude-code"` | Quickest path. Matches YAML idiom. |
+| `dict` | `cli_backend={"id": "claude-code", "overrides": {...}}` | Need timeout / args / model overrides. |
+| instance | `cli_backend=resolve_cli_backend("claude-code", overrides=...)` | Pre-resolved once, reused across agents. |
+| `callable` | `cli_backend=my_factory` | Factory function returning a backend. |
+
+<Note>
+YAML and Python now accept the exact same shapes (was previously YAML-only for dict).
+</Note>
 
 ---
 
@@ -251,6 +334,10 @@ cli_backend:
     timeout_ms: 60000  # 1 minute instead of 5
 ```
 Rather than monkey-patching, use the overrides system for custom timeouts.
+</Accordion>
+
+<Accordion title="Use framework: praisonai">
+The `cli_backend` field requires `framework: praisonai` (the default). PraisonAI now validates this up front — if you try to use it with `crewai`, `autogen`, `autogen_v4`, or `ag2`, you'll get a `ValueError` immediately, before any agent runs.
 </Accordion>
 
 <Accordion title="Don't combine with --external-agent">

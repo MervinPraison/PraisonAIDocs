@@ -136,10 +136,13 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                     agent_tools = details.get('tools', [])
                     agent_tool_list = [tools_dict[t] for t in agent_tools if t in tools_dict]
                 
+                # Extract toolsets from YAML config
+                agent_toolsets = details.get('toolsets', [])
+                
                 # Resolve per-agent LLM model
                 agent_model = self._resolve_agent_model(details, model_name)
                 
-                # Create basic agent
+                # Create basic agent (pass both tools and toolsets)
                 agent = PraisonAgent(
                     name=role_filled,
                     role=role_filled,
@@ -149,6 +152,7 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                     llm=agent_model,
                     allow_delegation=details.get('allow_delegation', False),
                     tools=agent_tool_list,
+                    toolsets=agent_toolsets,
                 )
                 
                 if agent_callback:
@@ -212,13 +216,9 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             response = team.start()
             result = f"### PraisonAI Output ###\n{response}" if response else "### PraisonAI Output ###\nTask completed."
             
-            # AgentOps integration if available
-            if is_available("agentops"):
-                import agentops
-                try:
-                    agentops.end_session("Success")
-                except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
-                    logger.warning(f"agentops.end_session failed: {e}")
+            # Close observability session
+            from ..observability.hooks import finalize_observability
+            finalize_observability(self.name, status="Success")
             
             logger.info("PraisonAI execution completed")
             return result
@@ -315,10 +315,13 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                     agent_tools = details.get('tools', [])
                     agent_tool_list = [tools_dict[t] for t in agent_tools if t in tools_dict]
                 
+                # Extract toolsets from YAML config
+                agent_toolsets = details.get('toolsets', [])
+                
                 # Resolve per-agent LLM model
                 agent_model = self._resolve_agent_model(details, model_name)
                 
-                # Create basic agent
+                # Create basic agent (pass both tools and toolsets)
                 agent = PraisonAgent(
                     name=role_filled,
                     role=role_filled,
@@ -328,6 +331,7 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                     llm=agent_model,
                     allow_delegation=details.get('allow_delegation', False),
                     tools=agent_tool_list,
+                    toolsets=agent_toolsets,
                 )
                 
                 if agent_callback:
@@ -392,13 +396,9 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
             response = await team.astart()
             result = f"### PraisonAI Output ###\n{response}" if response else "### PraisonAI Output ###\nTask completed."
             
-            # AgentOps integration if available
-            if is_available("agentops"):
-                import agentops
-                try:
-                    agentops.end_session("Success")
-                except Exception as e:  # noqa: BLE001 -- agentops errors must not crash the caller
-                    logger.warning(f"agentops.end_session failed: {e}")
+            # Close observability session
+            from ..observability.hooks import finalize_observability
+            finalize_observability(self.name, status="Success")
             
             logger.info("PraisonAI async execution completed")
             return result

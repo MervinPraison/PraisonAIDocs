@@ -1,36 +1,40 @@
 ---
 title: "Async Crew Kickoff"
 sidebarTitle: "Async Crew Kickoff"
-description: "Run a PraisonAI crew from inside a running event loop without asyncio.run()"
+description: "Run PraisonAI crews with native async execution — no thread offload required"
 icon: "play"
 ---
 
-Run a PraisonAI crew from inside a running event loop — FastAPI, Jupyter, Discord bots — without `asyncio.run()`.
+Run PraisonAI crews with native async execution from FastAPI, Jupyter, Discord bots, and other event loop contexts.
 
 ```mermaid
 graph LR
-    subgraph "Async Crew Flow"
+    subgraph "Native Async Flow"
         A[📋 Async Caller] --> B[🧠 praisonai.arun]
-        B --> C[⚡ asyncio.to_thread]
-        C --> D[✅ Result]
+        B --> C[⚡ AgentsGenerator.agenerate_crew_and_kickoff]
+        C --> D[🔧 FrameworkAdapter.arun]
+        D --> E[🚀 AgentTeam.astart]
+        E --> F[✅ Result]
     end
     
     classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef adapter fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef native fill:#10B981,stroke:#7C90A0,color:#fff
     classDef output fill:#10B981,stroke:#7C90A0,color:#fff
     
     class A input
-    class B process
-    class C adapter
-    class D output
+    class B,C process
+    class D adapter
+    class E native
+    class F output
 ```
 
 ## Quick Start
 
 <Steps>
 <Step title="FastAPI Route">
-The headline use case — running crews inside FastAPI routes without blocking the event loop:
+Native async execution — no worker threads, true cooperative multitasking:
 
 ```python
 from fastapi import FastAPI
@@ -46,7 +50,7 @@ async def run_crew():
 </Step>
 
 <Step title="Jupyter Notebook">
-Works in Jupyter cells where `asyncio.run()` would fail:
+Works directly in async cells without blocking:
 
 ```python
 import praisonai
@@ -66,19 +70,35 @@ sequenceDiagram
     participant User
     participant praisonai
     participant AgentsGenerator
+    participant FrameworkAdapter
+    participant AgentTeam
     participant Result
     
     User->>praisonai: await arun(agent_file)
-    praisonai->>AgentsGenerator: asyncio.to_thread(run)
-    AgentsGenerator-->>AgentsGenerator: generate_crew_and_kickoff()
+    praisonai->>AgentsGenerator: agenerate_crew_and_kickoff()
+    AgentsGenerator->>FrameworkAdapter: arun(config, llm_config, topic)
+    FrameworkAdapter->>AgentTeam: astart() 
+    AgentTeam-->>FrameworkAdapter: native async result
+    FrameworkAdapter-->>AgentsGenerator: result
     AgentsGenerator-->>praisonai: result
     praisonai-->>User: result
 ```
 
-| Function | Method | When Used |
-|----------|--------|-----------|
-| **Sync** | `praisonai.run()` | Plain scripts, CLI usage |
-| **Async** | `praisonai.arun()` | FastAPI, Jupyter, event loop contexts |
+<Info>
+**Sync/Async Parity:** As of PR #1870, sync and async kickoff paths share the same prep logic (AutoGen version selection, AgentOps init, cli_backend validation), so behavior is identical between `generate_crew_and_kickoff()` and `agenerate_crew_and_kickoff()`.
+</Info>
+
+### What's actually async
+
+| Adapter | Async path | Notes |
+|---------|------------|-------|
+| `praisonai` (praisonaiagents) | Native — `AgentTeam.astart()` | True cooperative async |
+| `crewai` | Thread offload (default fallback) | Until CrewAI exposes async |
+| `autogen` / `ag2` | Thread offload (default fallback) | Adapter-specific implementation |
+
+### Workflow mode
+
+YAML files with `process: workflow` also run natively async via `YAMLWorkflowParser` + `workflow.astart()` — no extra configuration needed.
 
 ---
 
@@ -91,25 +111,6 @@ sequenceDiagram
 | `tools` | `list` | `None` | Additional tools to make available |
 | `agent_yaml` | `str` | `None` | Direct YAML content as string |
 | `cli_config` | `dict` | `None` | CLI configuration overrides |
-
----
-
-## When to use which
-
-```mermaid
-graph TB
-    A{Running inside an event loop?} 
-    A -->|Yes - FastAPI, Jupyter, async framework| B[Use praisonai.arun]
-    A -->|No - Plain script, CLI| C[Use praisonai.run]
-    
-    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef async fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef sync fill:#189AB4,stroke:#7C90A0,color:#fff
-    
-    class A decision
-    class B async
-    class C sync
-```
 
 ---
 
@@ -142,7 +143,7 @@ import asyncio
 import praisonai
 
 async def run_multiple_crews():
-    # Run all crews concurrently
+    # Run all crews concurrently with true async
     results = await asyncio.gather(
         praisonai.arun(agent_file="research.yaml"),
         praisonai.arun(agent_file="analysis.yaml"),
@@ -157,18 +158,24 @@ async def run_multiple_crews():
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Prefer async entry point over wrapping sync">
-Use `praisonai.arun()` instead of wrapping the sync version:
+<Accordion title="Cancellation and timeouts propagate">
+Under native async, `asyncio.CancelledError` and `asyncio.wait_for` now actually cancel SDK work instead of being trapped behind a worker thread:
 
 ```python
 import asyncio
 import praisonai
 
-# ✅ Good - proper async entry point
-result = await praisonai.arun(agent_file="agents.yaml")
-
-# ❌ Avoid - wrapping sync call (this won't work inside event loop)
-# result = asyncio.run(praisonai.run(agent_file="agents.yaml"))
+async def cancelable_crew():
+    try:
+        # This will properly cancel if timeout is reached
+        result = await asyncio.wait_for(
+            praisonai.arun(agent_file="agents.yaml"),
+            timeout=30.0
+        )
+        return result
+    except asyncio.TimeoutError:
+        print("Crew execution timed out and was cancelled")
+        return None
 ```
 </Accordion>
 
@@ -179,7 +186,7 @@ When running multiple crews, use `asyncio.gather` for parallel execution:
 import asyncio
 import praisonai
 
-# ✅ Concurrent execution
+# ✅ Concurrent execution with native async
 crew1_task = praisonai.arun(agent_file="crew1.yaml")
 crew2_task = praisonai.arun(agent_file="crew2.yaml")
 results = await asyncio.gather(crew1_task, crew2_task)
@@ -190,14 +197,14 @@ result2 = await praisonai.arun(agent_file="crew2.yaml")
 ```
 </Accordion>
 
-<Accordion title="Framework auto-detection works in async mode">
-All supported frameworks work transparently with async execution:
+<Accordion title="Framework detection works transparently">
+All supported frameworks work with async execution — praisonai-native uses true async, others fall back to thread offload automatically:
 
 ```python
 import praisonai
 
-# Works with any framework - auto-detected or explicit
-result = await praisonai.arun(agent_file="agents.yaml", framework="crewai")
+# Native async for praisonai, thread offload for crewai
+result = await praisonai.arun(agent_file="agents.yaml", framework="praisonai")
 ```
 </Accordion>
 
@@ -228,8 +235,8 @@ async def safe_crew_run():
 ## Related
 
 <CardGroup cols={2}>
-<Card title="Async Bridge" icon="link" href="/docs/features/async-bridge">
-  Lower-level async utilities and bridging functions
+<Card title="YAML Template Variables" icon="code" href="/docs/features/yaml-template-variables">
+  Use {topic} placeholders safely alongside JSON literals
 </Card>
 <Card title="Framework Adapter Plugins" icon="puzzle-piece" href="/docs/features/framework-adapter-plugins">
   Custom framework adapters with async support
