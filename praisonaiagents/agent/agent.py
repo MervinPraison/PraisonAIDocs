@@ -22,6 +22,7 @@ from .session_manager import SessionManagerMixin
 from .async_safety import AsyncSafeState
 from .unified_execution_mixin import UnifiedExecutionMixin
 from .sandbox_mixin import SandboxMixin
+from .message_steering import SteeringMixin
 
 # Module-level logger for thread safety errors and debugging
 logger = get_logger(__name__)
@@ -242,7 +243,7 @@ def _get_default_server_registry() -> ServerRegistry:
 
 if TYPE_CHECKING:
     from ..approval.protocols import ApprovalConfig, ApprovalProtocol
-    from ..config.feature_configs import LearnConfig, MemoryConfig
+    from ..config.feature_configs import LearnConfig, MemoryConfig, ToolConfig
     from ..context.models import ContextConfig
     from ..context.manager import ContextManager
     from ..knowledge.knowledge import Knowledge
@@ -252,11 +253,12 @@ if TYPE_CHECKING:
     from .handoff import Handoff, HandoffConfig, HandoffResult
     from ..rag.models import RAGResult, ContextPack
     from ..eval.results import EvaluationLoopResult
+    from ..tools.retry import RetryPolicy
 
 # Import structured error from central errors module
 from ..errors import BudgetExceededError
 
-class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
+class Agent(SteeringMixin, SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
     _agent_counter_lock = threading.Lock()
@@ -523,6 +525,7 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
         auth: Optional[str] = None,  # Subscription auth provider: "claude-code", "codex", etc.
         # Tools
         tools: Optional[List[Any]] = None,
+        toolsets: Optional[List[str]] = None,  # Named toolset groups to resolve
         allow_delegation: bool = False,  # Deprecated: use handoffs= instead
         allow_code_execution: Optional[bool] = False,  # Deprecated: use execution=ExecutionConfig(code_execution=True)
         code_execution_mode: Literal["safe", "unsafe"] = "safe",  # Deprecated: use execution=ExecutionConfig(code_mode="safe")
@@ -550,13 +553,13 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
         hooks: Optional[Union[List[Any], Dict[str, Any], 'HooksConfig']] = None,
         skills: Optional[Union[List[str], str, Dict[str, Any], 'SkillsConfig']] = None,
         approval: Optional[Union[bool, str, Dict[str, Any], 'ApprovalConfig', 'ApprovalProtocol']] = None,
-        tool_timeout: Optional[int] = None,  # P8/G11: Timeout in seconds for each tool call
-        parallel_tool_calls: bool = False,  # Gap 2: Enable parallel execution of batched LLM tool calls
+        tool_config: Optional[Union[bool, 'ToolConfig']] = None,  # Tool execution configuration (timeout, retry, parallel)
         learn: Optional[Union[bool, str, Dict[str, Any], 'LearnConfig']] = None,  # Continuous learning (peer to memory)
         backend: Optional[Any] = None,  # External managed agent backend (e.g., ManagedAgentIntegration)
         cli_backend: Optional[Union[str, Any]] = None,  # CLI backend for delegating turns (e.g., "claude-code")
         interrupt_controller: Optional['InterruptController'] = None,  # G2: Cooperative cancellation
         tool_search: Optional[Union[bool, str, Dict[str, Any], 'ToolSearchConfig']] = False,  # Progressive tool disclosure
+        message_steering: Optional[Union[bool, 'MessageSteeringProtocol']] = False,  # Real-time message steering during execution
         sandbox: Optional[Union[bool, 'SandboxConfig']] = None,  # Sandbox for safe code execution
     ):
         """Initialize an Agent instance.
@@ -645,10 +648,10 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
                 - LearnConfig: Custom configuration
                 Learning is a first-class citizen, peer to memory. It captures patterns,
                 preferences, and insights from interactions to improve future responses.
-            parallel_tool_calls: Enable parallel execution of batched LLM tool calls (default False).
-                When True and LLM returns multiple tool calls in a single response, they execute
-                concurrently instead of sequentially. Provides ~3x speedup for I/O-bound tools.
-                Maintains backward compatibility with False default.
+            tool_config: Tool execution configuration. Accepts:
+                - bool: True enables defaults, False disables
+                - ToolConfig: Custom configuration for timeout, retry policy, parallel execution
+                Consolidates tool timeout, retry policy, and parallel execution settings.
             backend: External managed agent backend for hybrid execution. Accepts:
                 - ManagedAgentIntegration: External managed agent service
                 - None: Use local execution (default)
@@ -688,6 +691,7 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
             - auto_save → memory=MemoryConfig(auto_save=)
             - rate_limiter → execution=ExecutionConfig(rate_limiter=)
             - verification_hooks → autonomy=AutonomyConfig(verification_hooks=)
+            - Use tool_config=ToolConfig(...) for tool execution configuration
         """
         # Add check at start if memory is requested
         if memory is not None:
@@ -798,8 +802,7 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
                 alternative="use 'execution=ExecutionConfig(rate_limiter=obj)' instead",
                 stacklevel=3
             )
-        # Note: parallel_tool_calls is NOT deprecated - it's a new Gap 2 feature
-        # Both direct parameter and ExecutionConfig.parallel_tool_calls are supported
+        # Note: parallel_tool_calls moved to tool_config pattern
         if verification_hooks is not None:
             warn_deprecated_param(
                 "verification_hooks",
@@ -975,8 +978,8 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
                 allow_code_execution = True
             if _exec_config.code_mode != "safe":
                 code_execution_mode = _exec_config.code_mode
-            # Get parallel_tool_calls from ExecutionConfig, fall back to parameter
-            parallel_tool_calls = getattr(_exec_config, 'parallel_tool_calls', parallel_tool_calls)
+            # Get parallel_tool_calls from ExecutionConfig
+            parallel_tool_calls = getattr(_exec_config, 'parallel_tool_calls', False)
             # Budget guard extraction
             _max_budget = getattr(_exec_config, 'max_budget', None)
             _on_budget_exceeded = getattr(_exec_config, 'on_budget_exceeded', 'stop') or 'stop'
@@ -984,7 +987,8 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
             max_iter, max_rpm, max_execution_time, max_retry_limit = 20, None, None, 2
             _max_budget = None
             _on_budget_exceeded = 'stop'
-            # Keep parallel_tool_calls parameter value when no ExecutionConfig provided
+            # Default to False when no ExecutionConfig provided
+            parallel_tool_calls = False
             # (already set from parameter, no need to override)
         
         # ─────────────────────────────────────────────────────────────────────
@@ -1473,6 +1477,11 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
         
         # Initialize autonomy features (agent-centric escalation/doom-loop)
         self._init_autonomy(autonomy, verification_hooks=verification_hooks)
+        
+        # Initialize loop guard for all execution modes (not just autonomous)
+        # Provides idempotency-aware guardrails for tool execution loops
+        from ..escalation.loop_guard import LoopGuard, LoopGuardConfig
+        self._loop_guard = LoopGuard(LoopGuardConfig(enabled=True))
 
         # If instructions are provided, use them to set role, goal, and backstory
         if instructions:
@@ -1506,8 +1515,14 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
             self.self_reflect = True if self_reflect is None else self_reflect
         
         self.instructions = instructions
+        
+        # Resolve tool_config for tool execution settings
+        _tool_config = Agent._resolve_tool_config(
+            tool_config=tool_config
+        )
+        
         # Gap 2: Store parallel tool calls setting for ToolCallExecutor selection
-        self.parallel_tool_calls = parallel_tool_calls
+        self.parallel_tool_calls = _tool_config.parallel if _tool_config else parallel_tool_calls
         # G2: Store interrupt controller for cooperative cancellation
         self.interrupt_controller = interrupt_controller
         # Check for model name in environment variable if not provided
@@ -1564,6 +1579,7 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
                     if auth:
                         llm_config['auth'] = auth
                     llm_config['metrics'] = metrics
+                    llm_config['max_iter'] = max_iter
                     self.llm_instance = LLM(**llm_config)
                     self.llm = llm.get('model', Agent._get_default_model())
                 else:
@@ -1575,6 +1591,7 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
                         api_key=api_key,
                         auth=auth,
                         metrics=metrics,
+                        max_iter=max_iter,
                         web_search=web_search,
                         web_fetch=web_fetch,
                         prompt_caching=prompt_caching,
@@ -1602,6 +1619,7 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
                 # Add metrics parameter
                 llm = llm.copy()
                 llm['metrics'] = metrics
+                llm['max_iter'] = max_iter
                 self.llm_instance = LLM(**llm)  # Pass all dict items as kwargs
                 self._using_custom_llm = True
                 self.llm = llm.get('model', Agent._get_default_model())
@@ -1625,6 +1643,7 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
                 llm_params['web_fetch'] = web_fetch
                 llm_params['prompt_caching'] = prompt_caching
                 llm_params['claude_memory'] = claude_memory
+                llm_params['max_iter'] = max_iter
                 self.llm_instance = LLM(**llm_params)
                 self._using_custom_llm = True
                 self.llm = llm
@@ -1657,6 +1676,32 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
                 self.tools = list(tools)
         else:
             self.tools = tools or []
+        
+        # Handle toolsets parameter - resolve named toolset groups
+        if toolsets:
+            try:
+                from ..toolsets import resolve_toolsets
+                toolset_tool_names = resolve_toolsets(toolsets)
+                # Remove duplicates with existing tools
+                existing_tool_names = set()
+                for tool in self.tools:
+                    name = getattr(tool, 'name', getattr(tool, '__name__', str(tool)))
+                    existing_tool_names.add(name)
+                
+                unique_tool_names = [name for name in toolset_tool_names if name not in existing_tool_names]
+                toolset_tools = self._resolve_tool_names(unique_tool_names)
+                self.tools.extend(toolset_tools)
+                logging.debug(f"Resolved toolsets {toolsets} to {len(toolset_tools)} tools: {[getattr(t, '__name__', str(t)) for t in toolset_tools]}")
+            except (ValueError, KeyError) as e:
+                raise ValueError(
+                    f"Agent '{getattr(self, 'display_name', 'unknown')}' failed to resolve toolsets {toolsets}: {e}. "
+                    "Verify names with praisonaiagents.toolsets.list_toolsets()."
+                ) from e
+            except ImportError as e:
+                raise ImportError(
+                    f"Agent '{getattr(self, 'display_name', 'unknown')}' failed to import toolsets module: {e}. "
+                    "Ensure praisonaiagents is properly installed."
+                ) from e
         
         # Inject default tools for autonomy mode (after self.tools is initialized)
         # ONLY inject if caller didn't provide tools - avoid duplicates with CLI/wrapper tools
@@ -1693,6 +1738,7 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
         self.max_execution_time = max_execution_time
         self._memory_instance = None
         self._init_memory(memory, user_id)
+        self._init_message_steering(message_steering)
         self.verbose = verbose
         self._has_explicit_output_config = _has_explicit_output  # Track if user set output mode
         self.tool_output_limit = tool_output_limit  # Configurable tool output limit
@@ -1717,6 +1763,9 @@ class Agent(SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandler
         self.embedder_config = embedder_config
         self.knowledge = knowledge
         self.use_system_prompt = use_system_prompt
+        
+        # Store ExecutionConfig for context compaction policy access
+        self.execution = _exec_config
         # Async-safe chat_history with dual-lock protection
         self.__chat_history_state = AsyncSafeState([])
         
@@ -1872,8 +1921,14 @@ Your Goal: {self.goal}
         self._pending_approvals = {}
         self._approvals_lock = asyncio.Lock()
         
+        # Store the resolved tool_config for cloning (resolved earlier in __init__)
+        self._tool_config = _tool_config
+        
         # P8/G11: Tool timeout - prevent slow tools from blocking
-        self._tool_timeout = tool_timeout
+        self._tool_timeout = _tool_config.timeout if _tool_config else None
+        
+        # Store tool retry policy for tool execution with exponential backoff
+        self._tool_retry_policy = _tool_config.retry_policy if _tool_config else None
         
         # Cache for system prompts and formatted tools with eager thread-safe lock
         # Use OrderedDict for LRU behavior
@@ -1989,6 +2044,19 @@ Your Goal: {self.goal}
         # Sandbox configuration - initialize SandboxMixin
         super().__init__(sandbox=sandbox)
 
+    @staticmethod
+    def _resolve_tool_config(tool_config):
+        """Resolve tool_config parameter with backward compatibility."""
+        # Import here to avoid circular imports
+        from ..config.feature_configs import ToolConfig, resolve_tools
+        
+        # Handle the new consolidated parameter
+        if tool_config is not None:
+            resolved_config = resolve_tools(tool_config)
+            return resolved_config
+        
+        return None
+
     def __deepcopy__(self, memo: dict) -> "Agent":
         """Custom deepcopy that creates fresh threading primitives.
 
@@ -2065,9 +2133,8 @@ Your Goal: {self.goal}
             'learn': getattr(self, '_learn_config', None),
             'tool_search': getattr(self, '_tool_search_config', None),
             
-            # Tool configuration
-            'tool_timeout': getattr(self, '_tool_timeout', None),
-            'parallel_tool_calls': getattr(self, 'parallel_tool_calls', False),
+            # Tool configuration - use consolidated config when available  
+            'tool_config': getattr(self, '_tool_config', None),
             
             # CLI backend
             'cli_backend': getattr(self, '_cli_backend', None),
@@ -4245,33 +4312,95 @@ Summary:"""
         
         return ""
     
-    def store_memory(self, content: str, memory_type: str = "short_term", **kwargs: Any) -> None:
+    def store_memory(self, content: str, memory_type: str = "short_term", action: str = "add", **kwargs: Any) -> None:
         """
         Store content in memory.
         
         Args:
             content: Content to store
             memory_type: Type of memory (short_term, long_term, entity, episodic)
+            action: Type of operation ("add", "replace", "remove")
             **kwargs: Additional arguments for the memory method
         """
         if not self._memory_instance:
             return
         
-        # Use protocol names first (store_*), fallback to legacy names (add_*)
-        if memory_type == "short_term":
-            if hasattr(self._memory_instance, 'store_short_term'):
-                self._memory_instance.store_short_term(content, **kwargs)
-            elif hasattr(self._memory_instance, 'add_short_term'):
-                self._memory_instance.add_short_term(content, **kwargs)
-        elif memory_type == "long_term":
-            if hasattr(self._memory_instance, 'store_long_term'):
-                self._memory_instance.store_long_term(content, **kwargs)
-            elif hasattr(self._memory_instance, 'add_long_term'):
-                self._memory_instance.add_long_term(content, **kwargs)
-        elif memory_type == "entity" and hasattr(self._memory_instance, 'add_entity'):
-            self._memory_instance.add_entity(content, **kwargs)
-        elif memory_type == "episodic" and hasattr(self._memory_instance, 'add_episodic'):
-            self._memory_instance.add_episodic(content, **kwargs)
+        # Validate memory_type
+        supported_types = ["short_term", "long_term", "entity", "episodic"]
+        if memory_type not in supported_types:
+            raise ValueError(f"Unsupported memory_type '{memory_type}'. Supported: {supported_types}")
+        
+        # Perform the actual storage operation first
+        storage_success = False
+        try:
+            if action == "add":
+                # Use protocol names first (store_*), fallback to legacy names (add_*)
+                if memory_type == "short_term":
+                    if hasattr(self._memory_instance, 'store_short_term'):
+                        self._memory_instance.store_short_term(content, **kwargs)
+                        storage_success = True
+                    elif hasattr(self._memory_instance, 'add_short_term'):
+                        self._memory_instance.add_short_term(content, **kwargs)
+                        storage_success = True
+                elif memory_type == "long_term":
+                    if hasattr(self._memory_instance, 'store_long_term'):
+                        self._memory_instance.store_long_term(content, **kwargs)
+                        storage_success = True
+                    elif hasattr(self._memory_instance, 'add_long_term'):
+                        self._memory_instance.add_long_term(content, **kwargs)
+                        storage_success = True
+                elif memory_type == "entity" and hasattr(self._memory_instance, 'add_entity'):
+                    self._memory_instance.add_entity(content, **kwargs)
+                    storage_success = True
+                elif memory_type == "episodic" and hasattr(self._memory_instance, 'add_episodic'):
+                    self._memory_instance.add_episodic(content, **kwargs)
+                    storage_success = True
+            elif action == "replace":
+                # For replace operations - look for replace_ or update_ methods
+                method_name = f"replace_{memory_type}" if hasattr(self._memory_instance, f'replace_{memory_type}') else f"update_{memory_type}"
+                if hasattr(self._memory_instance, method_name):
+                    getattr(self._memory_instance, method_name)(content, **kwargs)
+                    storage_success = True
+                else:
+                    raise ValueError(f"Memory provider does not support 'replace' for {memory_type}")
+            elif action == "remove":
+                # For remove operations - look for remove_ or delete_ methods  
+                method_name = f"remove_{memory_type}" if hasattr(self._memory_instance, f'remove_{memory_type}') else f"delete_{memory_type}"
+                if hasattr(self._memory_instance, method_name):
+                    getattr(self._memory_instance, method_name)(content, **kwargs)
+                    storage_success = True
+                else:
+                    raise ValueError(f"Memory provider does not support 'remove' for {memory_type}")
+            else:
+                raise ValueError(f"Unsupported action '{action}'. Supported: add, replace, remove")
+                
+            if not storage_success:
+                raise ValueError(f"Memory provider does not support {memory_type} storage")
+                
+        except Exception as e:
+            logging.warning(f"[{self.name}] Memory storage failed: {e}")
+            raise
+        
+        # Only call on_memory_write hook AFTER successful storage
+        if storage_success:
+            try:
+                metadata = kwargs.get('metadata', None)
+                # Try async version first if in async context, fallback to sync
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    # In async context - prefer async hook if available
+                    if hasattr(self._memory_instance, 'aon_memory_write'):
+                        # Schedule async hook without blocking (fire and forget)
+                        asyncio.create_task(self._memory_instance.aon_memory_write(action, memory_type, content, metadata))
+                    elif hasattr(self._memory_instance, 'on_memory_write'):
+                        self._memory_instance.on_memory_write(action, memory_type, content, metadata)
+                except RuntimeError:
+                    # Not in async context - use sync hook
+                    if hasattr(self._memory_instance, 'on_memory_write'):
+                        self._memory_instance.on_memory_write(action, memory_type, content, metadata)
+            except Exception as e:
+                logging.warning(f"[{self.name}] Memory on_memory_write hook failed: {e}")
     
     def _display_memory_info(self):
         """Display memory information to user in a friendly format."""

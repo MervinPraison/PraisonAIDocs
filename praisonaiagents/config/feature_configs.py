@@ -38,6 +38,11 @@ from enum import Enum
 # Import AutonomyConfig from canonical location (no circular dep)
 from ..agent.autonomy import AutonomyConfig
 
+# TYPE_CHECKING import to avoid circular dependency
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ..compaction.strategy import CompactionStrategy
+
 
 class MemoryBackend(str, Enum):
     """Memory storage backends."""
@@ -720,6 +725,9 @@ class ExecutionConfig:
     # Retry settings
     max_retry_limit: int = 2
     
+    # Tool call limits (loop protection)
+    max_tool_calls_per_turn: int = 10
+    
     # Code execution (consolidated from allow_code_execution + code_execution_mode)
     code_execution: bool = False
     code_mode: str = "safe"  # "safe" or "unsafe"
@@ -732,12 +740,17 @@ class ExecutionConfig:
     rate_limiter: Optional[Any] = None
 
     # Context compaction: automatically compact chat_history when approaching token limit.
-    # Opt-in only (safe default: False). Uses existing praisonaiagents.compaction module.
-    # Usage: Agent(execution=ExecutionConfig(context_compaction=True, max_context_tokens=8000))
-    context_compaction: bool = False
+    # DEFAULT CHANGED: Previously False, now True (with deprecation warning period).
+    # Usage: Agent(execution=ExecutionConfig(context_compaction=False))  # to disable
+    # Or: Agent(execution=ExecutionConfig(context_compaction=my_policy))  # custom policy
+    context_compaction: Union[bool, "ContextCompactionPolicy"] = False  # Keep False during deprecation period
 
     # Token limit before compaction triggers. None = auto-detect from model metadata.
     max_context_tokens: Optional[int] = None
+    
+    # Compaction strategy to use when context_compaction is enabled.
+    # Defaults to TRUNCATE for backward compatibility.
+    compaction_strategy: Optional["CompactionStrategy"] = None
 
     # Token budget guard — hard dollar limit per agent run.
     # None = disabled (zero overhead). Float = max USD spend.
@@ -752,6 +765,39 @@ class ExecutionConfig:
     # Default False preserves existing behavior for backward compatibility
     parallel_tool_calls: bool = False
 
+    def __post_init__(self) -> None:
+        """Post-initialization processing with deprecation warnings."""
+        # Handle context_compaction serialization round-trip
+        if isinstance(self.context_compaction, dict):
+            from ..context.policy import ContextCompactionPolicy
+            self.context_compaction = ContextCompactionPolicy.from_dict(
+                self.context_compaction
+            )
+        
+        # Emit deprecation warning for default behavior change
+        # Only warn if context_compaction was not explicitly set (i.e., using the default False)
+        import warnings
+        import inspect
+        frame = inspect.currentframe()
+        try:
+            # Check if this is being called from user code (not internal)
+            caller_frame = frame.f_back
+            if (caller_frame and 
+                not any(path_part in caller_frame.f_code.co_filename 
+                       for path_part in ['praisonaiagents', 'test_', '__pycache__'])):
+                # This is being called from user code
+                if self.context_compaction is False:
+                    warnings.warn(
+                        "ExecutionConfig.context_compaction will default to True in the next "
+                        "release for proactive context overflow protection. To disable, explicitly "
+                        "set context_compaction=False. To use the new default early, set "
+                        "context_compaction=True.",
+                        DeprecationWarning,
+                        stacklevel=3
+                    )
+        finally:
+            del frame
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -762,11 +808,100 @@ class ExecutionConfig:
             "code_execution": self.code_execution,
             "code_mode": self.code_mode,
             "code_sandbox_mode": self.code_sandbox_mode,
-            "context_compaction": self.context_compaction,
+            "context_compaction": (
+                self.context_compaction.to_dict() 
+                if hasattr(self.context_compaction, 'to_dict') 
+                else self.context_compaction
+            ),
             "max_context_tokens": self.max_context_tokens,
+            "compaction_strategy": self.compaction_strategy.value if self.compaction_strategy and hasattr(self.compaction_strategy, 'value') else (str(self.compaction_strategy) if self.compaction_strategy else None),
             "max_budget": self.max_budget,
             "parallel_tool_calls": self.parallel_tool_calls,
         }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ExecutionConfig":
+        """Create ExecutionConfig from dictionary."""
+        # Handle context_compaction policy restoration
+        context_compaction = data.get("context_compaction", False)
+        if isinstance(context_compaction, dict):
+            from ..context.policy import ContextCompactionPolicy
+            context_compaction = ContextCompactionPolicy.from_dict(context_compaction)
+        
+        return cls(
+            max_iter=data.get("max_iter", 20),
+            max_rpm=data.get("max_rpm", None),
+            max_execution_time=data.get("max_execution_time", None),
+            max_retry_limit=data.get("max_retry_limit", 2),
+            code_execution=data.get("code_execution", False),
+            code_mode=data.get("code_mode", "safe"),
+            code_sandbox_mode=data.get("code_sandbox_mode", "docker"),
+            context_compaction=context_compaction,
+            max_context_tokens=data.get("max_context_tokens", None),
+            max_budget=data.get("max_budget", None),
+            parallel_tool_calls=data.get("parallel_tool_calls", False),
+        )
+
+
+@dataclass  
+class ToolConfig:
+    """
+    Configuration for tool execution behavior.
+    
+    Configuration for tool execution behavior including timeout, retry policy, and parallel execution.
+    
+    Usage:
+        # Simple enable with defaults
+        Agent(tool_config=ToolConfig())
+        
+        # With custom settings
+        Agent(tool_config=ToolConfig(
+            timeout=60,
+            retry_policy=RetryPolicy(max_attempts=5),
+            parallel=True,
+        ))
+        
+        # With timeout only
+        Agent(tool_config=ToolConfig(timeout=30))
+    """
+    # Tool execution timeout in seconds  
+    timeout: Optional[int] = None
+    
+    # Retry policy for tool execution with exponential backoff
+    retry_policy: Optional[Any] = None  # RetryPolicy instance
+    
+    # Enable parallel execution of batched LLM tool calls
+    parallel: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "timeout": self.timeout,
+            "retry_policy": (
+                self.retry_policy.to_dict()
+                if hasattr(self.retry_policy, 'to_dict')
+                else self.retry_policy
+            ),
+            "parallel": self.parallel,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ToolConfig":
+        """Create ToolConfig from dictionary."""
+        retry_policy = data.get("retry_policy")
+        if isinstance(retry_policy, dict):
+            try:
+                from ..tools.retry import RetryPolicy
+                retry_policy = RetryPolicy.from_dict(retry_policy)
+            except ImportError:
+                # Keep as dict if RetryPolicy not available
+                pass
+                
+        return cls(
+            timeout=data.get("timeout"),
+            retry_policy=retry_policy,
+            parallel=data.get("parallel", False),
+        )
 
 
 @dataclass
@@ -954,8 +1089,8 @@ class MultiAgentOutputConfig:
     # Verbosity level (0=silent, 1=minimal, 2+=verbose)
     verbose: int = 0
     
-    # Streaming output
-    stream: bool = True
+    # Streaming output - False by default for sync multi-agent compatibility
+    stream: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -1114,6 +1249,7 @@ HooksParam = Union[List[Any], HooksConfig]
 SkillsParam = Union[List[str], SkillsConfig]
 AutonomyParam = Union[bool, Dict[str, Any], "AutonomyConfig"]
 ToolSearchParam = Union[bool, str, Dict[str, Any], ToolSearchConfig]
+ToolParam = Union[bool, ToolConfig]  # bool = defaults, ToolConfig = custom
 
 
 # =============================================================================
@@ -1380,6 +1516,19 @@ def resolve_tool_search(value: ToolSearchParam) -> Optional[ToolSearchConfig]:
     return value
 
 
+def resolve_tools(value: ToolParam) -> Optional[ToolConfig]:
+    """Resolve tools= parameter following precedence ladder."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        return ToolConfig()
+    if isinstance(value, dict):
+        return ToolConfig.from_dict(value)
+    if isinstance(value, ToolConfig):
+        return value
+    return value
+
+
 __all__ = [
     # Enums
     "MemoryBackend",
@@ -1400,6 +1549,7 @@ __all__ = [
     "WebConfig",
     "OutputConfig",
     "ExecutionConfig",
+    "ToolConfig",
     "TemplateConfig",
     "CachingConfig",
     "HooksConfig",
@@ -1426,7 +1576,8 @@ __all__ = [
     "HooksParam",
     "SkillsParam",
     "AutonomyParam",
-    "ToolSearchParam",
+    "ToolSearchParam", 
+    "ToolParam",
     # Precedence ladder resolvers
     "resolve_memory",
     "resolve_knowledge",
@@ -1439,4 +1590,5 @@ __all__ = [
     "resolve_caching",
     "resolve_autonomy",
     "resolve_tool_search",
+    "resolve_tools",
 ]

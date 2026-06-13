@@ -203,7 +203,9 @@ agent = Agent(sandbox=config)
 | **Performance** | ✅ Fastest |
 
 <Warning>
-Subprocess sandbox provides minimal isolation. Never use with untrusted code.
+- **POSIX (Linux/macOS)**: Subprocess now blocks host env leakage, enforces `memory_mb`/`max_processes`/`max_open_files` via `setrlimit`, truncates output at `max_output_size`, and terminates the whole process group on timeout.
+- **Windows**: Still weaker — `setrlimit` and process-group kill are unavailable; the sandbox warns at runtime.
+- **Untrusted code**: Remains a Docker/E2B job, but the gap is now smaller.
 </Warning>
 </Tab>
 
@@ -333,6 +335,112 @@ All backend imports are lazy-loaded. Importing the top-level package will not tr
 
 ---
 
+## What SecurityPolicy actually controls in subprocess
+
+| Setting | Effect on subprocess child |
+|---------|----------------------------|
+| `allow_network=False` | Strips `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` from child env |
+| `allow_network=True` | Passes proxy vars through from host |
+| `max_output_size` | Truncates stdout/stderr; appends `[OUTPUT TRUNCATED]` |
+| `allow_file_write` | Controls file write permissions (implementation varies by backend) |
+| `allow_subprocess` | Controls subprocess creation (implementation varies by backend) |
+| `blocked_paths` | Prevents access to specified paths |
+| `blocked_commands` | Blocks execution of specified shell commands |
+| `blocked_imports` | Prevents importing specified Python modules |
+
+---
+
+## Resource limits in practice
+
+<Tabs>
+<Tab title="Linux / macOS">
+POSIX `setrlimit` mapping enforces hard limits:
+
+```python
+from praisonaiagents import ResourceLimits
+
+limits = ResourceLimits(
+    memory_mb=512,        # → RLIMIT_AS 
+    max_processes=10,     # → RLIMIT_NPROC
+    max_open_files=50,    # → RLIMIT_NOFILE
+    timeout_seconds=30    # Wall clock timeout (separate)
+)
+```
+
+When limits are exceeded:
+- Memory: Process is killed by the kernel 
+- Processes: `fork()` fails with EAGAIN
+- Files: `open()` fails with EMFILE
+- Timeout: Whole process group killed with SIGKILL
+
+</Tab>
+<Tab title="Windows">
+Resource limits are not available on Windows. The subprocess warns at runtime:
+
+```
+WARNING: Resource limits not supported on Windows - sandbox isolation is weaker
+```
+
+Only timeout handling works:
+- Timeout: Process leader is killed (not process group)
+- Memory/processes/files: No enforcement
+
+For Windows users requiring resource limits, use Docker backend instead.
+</Tab>
+</Tabs>
+
+---
+
+## Timeout handling
+
+```mermaid
+graph TB
+    subgraph "Timeout Response"
+        A[⏰ Timeout Triggered] --> B{🖥️ OS?}
+        B -->|POSIX| C[💀 killpg(SIGKILL)]
+        B -->|Windows| D[💀 proc.kill()]
+        C --> E[🧹 Process Group Dead]
+        D --> F[⚠️ Leader Only Dead]
+    end
+    
+    classDef timeout fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef result fill:#8B0000,stroke:#7C90A0,color:#fff
+    
+    class A timeout
+    class B decision
+    class C,D,E,F result
+```
+
+On POSIX the whole process group is killed (`killpg(SIGKILL)`); on Windows only the leader is killed.
+
+---
+
+## Subprocess execution flow
+
+```mermaid
+graph TB
+    subgraph "Subprocess Execution Flow"
+        A[📨 Request] --> B[🔍 Policy Check]
+        B --> C[🏠 Build Minimal Env]
+        C --> D[⚖️ Apply setrlimit]
+        D --> E[🚀 Exec Process]
+        E --> F[📊 Monitor Output]
+        F --> G[✂️ Truncate Output]
+        G --> H[✅ Return Result]
+    end
+    
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class A request
+    class B,C,D,E,F,G process
+    class H result
+```
+
+---
+
 ## Security Pre-checks
 
 Static code analysis warns about potentially dangerous patterns before execution:
@@ -396,6 +504,24 @@ result = await agent.execute_code(
 )
 # Warnings are stored in result.metadata["security_warnings"]
 ```
+
+### Path Traversal Protection
+
+`DockerSandbox` and `SubprocessSandbox` validate every path passed to
+`write_file`, `read_file`, and `list_files`. Paths that resolve outside
+the sandbox root — via `../`, absolute paths, or symlink escapes — are
+rejected:
+
+```python
+# Inside an agent's sandbox
+sandbox.write_file("../../../etc/passwd", "x")   # returns False, logs warning
+sandbox.read_file("/etc/shadow")                  # returns None
+sandbox.list_files("../..")                       # returns []
+```
+
+Blocked attempts are logged as
+`Path traversal attempt blocked: <path>`. This is in addition to the
+container/OS isolation the sandbox already provides — defense in depth.
 
 ---
 
@@ -647,6 +773,10 @@ SSH backend prevents both remote process leaks and temp file accumulation:
 
   <Accordion title="Use context managers for persistence">
     For multiple operations on the same sandbox, use `async with SandboxManager(config) as sandbox:` to reuse the environment efficiently.
+  </Accordion>
+
+  <Accordion title="File system boundaries are enforced">
+    Filesystem boundaries are enforced — write_file/read_file/list_files reject paths that escape the sandbox root, even before the backend's isolation kicks in.
   </Accordion>
 </AccordionGroup>
 
