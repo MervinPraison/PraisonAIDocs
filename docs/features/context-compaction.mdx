@@ -5,6 +5,8 @@ description: "Automatic context window management with anti-injection framing fo
 icon: "compress"
 ---
 
+<Note>Looking for the proactive policy-based system added in PR #1828? See [Context Compaction Policy](/features/context-compaction-policy). This page documents the reactive `CompactionConfig` system used inside `Agent(context=...)`.</Note>
+
 Context compaction automatically manages context window size while preventing models from treating summarized history as active instructions.
 
 ```mermaid
@@ -30,6 +32,24 @@ graph LR
 ## Quick Start
 
 <Steps>
+<Step title="Agent-Centric Quick Start">
+```python
+from praisonaiagents import Agent, ExecutionConfig
+from praisonaiagents.compaction.strategy import CompactionStrategy
+
+agent = Agent(
+    name="LongChat",
+    instructions="You are a helpful assistant.",
+    execution=ExecutionConfig(
+        context_compaction=True,
+        compaction_strategy=CompactionStrategy.LLM_SUMMARIZE,
+    )
+)
+
+agent.start("Let's chat for hours — I'll handle the context.")
+```
+</Step>
+
 <Step title="Simple Usage">
 ```python
 from praisonaiagents import Agent
@@ -60,6 +80,377 @@ agent = Agent(
 ```
 </Step>
 </Steps>
+
+---
+
+## Anti-Thrashing Protection
+
+Prevents endless compaction cycles in long-running agents by tracking savings effectiveness and giving up when returns diminish.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Compactor
+    participant AntiThresh
+    
+    Agent->>Compactor: needs_compaction()
+    Compactor->>AntiThresh: Check savings streak
+    AntiThresh->>AntiThresh: Count < max_consecutive_low_savings?
+    AntiThresh-->>Compactor: Continue or abort
+    
+    Note over AntiThresh: Savings < min_savings_pct → streak++
+    Note over AntiThresh: Good savings → streak = 0
+    
+    alt Streak too high
+        Compactor-->>Agent: Skip compaction (thrashing)
+    else Continue
+        Compactor->>Compactor: Perform compaction
+        Compactor-->>Agent: Return compacted messages
+    end
+```
+
+<Steps>
+<Step title="Default Protection">
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="LongRunner",
+    instructions="Research assistant for extended sessions.",
+    context=True  # Anti-thrashing enabled by default
+)
+
+agent.start("Begin a complex research project...")
+```
+</Step>
+
+<Step title="Custom Thresholds">
+```python
+from praisonaiagents import Agent, CompactionConfig
+
+agent = Agent(
+    name="CustomThresh",
+    context=CompactionConfig(
+        min_savings_pct=20.0,             # Require at least 20% savings
+        max_consecutive_low_savings=1,    # Give up after 1 failed attempt
+    ),
+)
+```
+</Step>
+</Steps>
+
+### How Anti-Thrashing Works
+
+1. **Savings Tracking**: Each compaction calculates `(original_tokens - compacted_tokens) / original_tokens * 100`
+2. **Streak Counter**: Increments when savings < `min_savings_pct`, resets on good savings
+3. **Circuit Breaker**: Stops compaction when `streak >= max_consecutive_low_savings`
+4. **Reset Trigger**: New messages arriving resets the protection state
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `min_savings_pct` | `float` | `10.0` | Minimum savings percentage required (0-100) |
+| `max_consecutive_low_savings` | `int` | `2` | Max failed attempts before giving up |
+
+**Note**: Values < 1.0 for `min_savings_pct` are auto-scaled (e.g., `0.15` becomes `15.0`).
+
+---
+
+## Iterative Summarisation
+
+Builds upon previous summaries instead of starting fresh, preserving context across multiple compaction cycles.
+
+```mermaid
+graph TB
+    subgraph "Iterative Summary Flow"
+        NewMsgs[📝 New Messages] --> Check{📋 Previous Summary?}
+        Check -->|No| FirstTime[🎯 Summarize All]
+        Check -->|Yes| OnlyNew[⚡ Summarize New Only]
+        OnlyNew --> Merge[🔄 Merge with Previous]
+        FirstTime --> Store[💾 Store Summary]
+        Merge --> Store
+        Store --> Result[✅ Combined Context]
+    end
+    
+    classDef new fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class NewMsgs new
+    class Check,OnlyNew,Merge,FirstTime process
+    class Store,Result output
+```
+
+<Steps>
+<Step title="Enable Iterative Mode">
+```python
+from praisonaiagents import Agent, CompactionConfig
+
+agent = Agent(
+    name="Researcher",
+    instructions="Conduct deep research over many turns.",
+    context=CompactionConfig(
+        enable_iterative_summary=True,  # Default behavior
+        max_tokens=8000,
+    ),
+)
+
+agent.start("Investigate consensus algorithms in distributed systems...")
+```
+</Step>
+
+<Step title="Disable for Fresh Summaries">
+```python
+from praisonaiagents import Agent, CompactionConfig
+
+agent = Agent(
+    name="FreshSummary",
+    context=CompactionConfig(
+        enable_iterative_summary=False,  # Always start from scratch
+    ),
+)
+```
+</Step>
+</Steps>
+
+### Iterative vs Fresh Summaries
+
+| Mode | Behavior | Best For |
+|------|----------|----------|
+| **Iterative** (default) | Builds on previous summaries with `[Previous Summary] → [New Activity]` markers | Long research sessions, ongoing projects |
+| **Fresh** | Summarizes entire conversation history each time | Short sessions, topic switches |
+
+---
+
+## Tool-Result Pruning
+
+Deduplicates and truncates verbose tool outputs before summarization, significantly reducing token waste.
+
+```mermaid
+graph LR
+    subgraph "Tool Pruning Pre-pass"
+        Tools[🛠️ Tool Results] --> Prune[✂️ Prune Large Results]
+        Prune --> Dedup[🔄 Deduplicate]
+        Dedup --> Truncate[📏 Truncate to Max Size]
+        Truncate --> Strategy[📊 Apply Strategy]
+        Strategy --> Output[✅ Compacted]
+    end
+    
+    classDef tools fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class Tools tools
+    class Prune,Dedup,Truncate,Strategy process
+    class Output output
+```
+
+<Steps>
+<Step title="Default Pruning">
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="ToolUser",
+    instructions="Use tools extensively for research.",
+    context=True   # Tool pruning enabled by default
+)
+
+# Large tool outputs are automatically pruned before summarization
+```
+</Step>
+
+<Step title="Custom Tool Pruning">
+```python
+from praisonaiagents import Agent, CompactionConfig
+
+agent = Agent(
+    name="CustomPrune",
+    context=CompactionConfig(
+        tool_prune_before_summarise=True,
+        max_tool_result_size=250,  # Smaller limit for aggressive pruning
+    ),
+)
+```
+</Step>
+</Steps>
+
+### Custom Tool Pruner
+
+```python
+from praisonaiagents import Agent, CompactionConfig
+from praisonaiagents.compaction import ToolResultPrunerProtocol
+
+class MyToolPruner:
+    def prune(self, messages, max_tool_result_size=500):
+        """Custom pruning logic for domain-specific tools."""
+        processed = []
+        pruned_count = 0
+        
+        for msg in messages:
+            if msg.get("role") == "tool":
+                content = msg.get("content", "")
+                if len(content) > max_tool_result_size:
+                    # Keep critical data, truncate verbose parts
+                    msg["content"] = self._smart_truncate(content, max_tool_result_size)
+                    pruned_count += 1
+            processed.append(msg)
+        
+        return processed, pruned_count
+    
+    def _smart_truncate(self, content, max_size):
+        # Custom logic here
+        return content[:max_size] + "... [truncated]"
+
+agent = Agent(
+    name="CustomToolAgent",
+    context=CompactionConfig(tool_prune_before_summarise=True),
+)
+agent.compactor.tool_pruner = MyToolPruner()
+```
+
+---
+
+## Focused Summarisation
+
+Biases summarization toward specific topics using the `focus_topic` parameter, preserving relevant content while compacting the rest.
+
+<Steps>
+<Step title="Research Agent with Focus">
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Researcher", 
+    instructions="Conduct deep research on technical topics.",
+    context=True
+)
+
+# During a long research session, focus on specific aspects
+compacted, result = agent.compactor.compact(
+    messages, 
+    focus_topic="consensus algorithms"
+)
+
+print(f"Preserved {result.savings_pct:.1f}% of context focused on consensus algorithms")
+```
+</Step>
+
+<Step title="Async Compaction with Focus">
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="AsyncResearcher",
+    context=True
+)
+
+# Async version for LLM-powered summarization
+compacted, result = await agent.compactor.compact_async(
+    messages,
+    focus_topic="data pipeline optimization"
+)
+```
+</Step>
+</Steps>
+
+### How Focus Topic Works
+
+1. **Content Matching**: Text matching the focus topic is preserved verbatim
+2. **LLM Emphasis**: When using LLM summarization, adds `Focus especially on: {focus_topic}.`
+3. **Structured Paths**: Marks focused content with `*FOCUS*` markers in structured summaries
+
+### Focus Topic Use Cases
+
+| Scenario | Focus Topic | Benefit |
+|----------|-------------|---------|
+| Code Review | `"security vulnerabilities"` | Preserves security discussions |
+| Research Session | `"performance benchmarks"` | Keeps performance data intact |
+| Planning Meeting | `"delivery milestones"` | Maintains timeline information |
+
+---
+
+## Pluggable Protocols
+
+Inject custom implementations for tool pruning, message formatting, and summary building through protocol interfaces.
+
+<Tabs>
+<Tab title="Tool Result Pruner">
+```python
+from praisonaiagents.compaction import ToolResultPrunerProtocol
+from typing import List, Dict, Tuple
+
+class CustomToolPruner:
+    def prune(self, messages: List[Dict], max_tool_result_size: int = 500) -> Tuple[List[Dict], int]:
+        """Custom tool result pruning logic."""
+        processed = []
+        pruned_count = 0
+        
+        for msg in messages:
+            if self._is_tool_result(msg) and self._should_prune(msg, max_tool_result_size):
+                msg = self._prune_tool_result(msg, max_tool_result_size)
+                pruned_count += 1
+            processed.append(msg)
+        
+        return processed, pruned_count
+
+# Inject into compactor
+agent.compactor.tool_pruner = CustomToolPruner()
+```
+</Tab>
+
+<Tab title="Message Formatter">
+```python
+from praisonaiagents.compaction import MessageFormatterProtocol
+
+class CustomMessageFormatter:
+    def format_for_summary(self, messages: List[Dict]) -> str:
+        """Custom message formatting for LLM summarization."""
+        formatted_lines = []
+        
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            timestamp = msg.get("timestamp", "")
+            
+            # Add custom context
+            formatted_lines.append(f"[{i+1}] {timestamp} {role}: {content[:200]}")
+        
+        return "\n".join(formatted_lines)
+
+# Inject into compactor  
+agent.compactor.message_formatter = CustomMessageFormatter()
+```
+</Tab>
+
+<Tab title="Summary Builder">
+```python
+from praisonaiagents.compaction import SummaryBuilderProtocol
+
+class CustomSummaryBuilder:
+    def build_structured_summary(self, messages: List[Dict]) -> str:
+        """Build domain-specific structured summary."""
+        return f"""
+## Current Research Phase
+{self._extract_phase(messages)}
+
+## Key Findings
+{self._extract_findings(messages)}
+
+## Next Steps
+{self._extract_next_steps(messages)}
+"""
+    
+    def merge_summaries(self, previous: str, current: str) -> str:
+        """Merge previous and current summaries."""
+        return f"{current}\n\n[Previous Context]: {previous[:300]}..."
+
+# Inject into compactor
+agent.compactor.summary_builder = CustomSummaryBuilder()
+```
+</Tab>
+</Tabs>
 
 ---
 
@@ -141,6 +532,46 @@ agent = Agent(
     )
 )
 ```
+
+### LLM-Powered Summarization
+
+LLM_SUMMARIZE uses the agent's own LLM to summarise older turns, preserving identifiers, file paths, URLs, error messages, and the user's intent verbatim.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant LLM
+    
+    User->>Agent: Long conversation continues...
+    Agent->>Agent: Token limit hit
+    Agent->>LLM: Summarise older messages
+    Note over LLM: temperature=0.3, preserves:<br/>• File paths<br/>• IDs & hashes<br/>• URLs & task refs<br/>• Error messages<br/>• Tool outputs<br/>• User requests
+    LLM-->>Agent: Structured summary
+    Agent->>Agent: Replace old messages with summary
+    Agent->>LLM: Continue with summary + recent messages
+    LLM-->>Agent: Response
+    Agent-->>User: Final response
+```
+
+```python
+from praisonaiagents import Agent, ExecutionConfig
+from praisonaiagents.compaction.strategy import CompactionStrategy
+
+agent = Agent(
+    name="SmartSummarizer",
+    instructions="You are a helpful assistant.",
+    execution=ExecutionConfig(
+        context_compaction=True,
+        compaction_strategy=CompactionStrategy.LLM_SUMMARIZE,
+        max_context_tokens=4000,
+    )
+)
+```
+
+<Note>
+**Fallback behavior:** If the LLM call fails, fallback to naive summarization. If invoked from a sync context that's already inside an event loop, it also falls back to naive — async callers (achat) get full LLM summarization.
+</Note>
 
 ### Intelligent Conversation Compaction
 
@@ -291,6 +722,27 @@ agent = Agent(
 
 ## Configuration Options
 
+### Strategies Available
+
+| Strategy | Value | Description |
+|----------|-------|-------------|
+| `TRUNCATE` | `"truncate"` | Drop oldest messages (default, fastest). |
+| `SLIDING` | `"sliding"` | Sliding-window over recent messages. |
+| `SUMMARIZE` | `"summarize"` | Naive flat textual summary of older messages. |
+| `SMART` | `"smart"` | Heuristic selection of which messages to keep. |
+| `LLM_SUMMARIZE` | `"llm_summarize"` | **New.** Uses the agent's LLM to produce a high-quality structured summary. |
+| `PRUNE` | `"prune"` | Removes old tool outputs while keeping the conversation. |
+
+### ExecutionConfig Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `context_compaction` | `bool` | `False` | Enable automatic compaction of `chat_history` before each LLM call. Zero overhead when `False`. |
+| `max_context_tokens` | `Optional[int]` | `None` (auto-detect from model) | Token limit before compaction triggers. |
+| `compaction_strategy` | `Optional[CompactionStrategy]` | `None` (resolves to `TRUNCATE`) | Which strategy to use when compaction runs. |
+
+### CompactionConfig Options
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | `bool` | `True` | Enable context compaction |
@@ -302,6 +754,20 @@ agent = Agent(
 | `compaction_prefix` | `str` | `COMPACTION_PREFIX` | Anti-injection framing prepended to summaries |
 | `structured_template` | `bool` | `True` | Use organized section template for summaries |
 | `iterative_update` | `bool` | `True` | Merge previous summary on re-compaction |
+| `min_savings_pct` | `float` | `10.0` | Skip compaction if projected saving < N% (0–100 scale) |
+| `max_consecutive_low_savings` | `int` | `2` | Abort after N low-savings attempts (anti-thrashing) |
+| `tool_prune_before_summarise` | `bool` | `True` | Deduplicate tool results before summarisation |
+| `max_tool_result_size` | `int` | `500` | Max size for a single tool result before pruning |
+| `enable_iterative_summary` | `bool` | `True` | Build on previous summaries instead of starting fresh |
+
+**Note**: `min_savings_pct` values < 1.0 are auto-scaled (e.g., `0.15` becomes `15.0`).
+
+### Two Ways to Configure Compaction
+
+| Path | When to use |
+|------|-------------|
+| `Agent(context=True)` / `Agent(context=CompactionConfig(...))` | You want fine-grained control over the compaction algorithm itself (anti-injection prefix, structured template, iterative updates). |
+| `Agent(execution=ExecutionConfig(context_compaction=True, compaction_strategy=...))` | You want simple, agent-centric enablement, especially for LLM-powered summarization. **Recommended for LLM_SUMMARIZE.** |
 
 ### Choose Your Configuration
 
@@ -311,105 +777,273 @@ graph TB
     DefaultOK -->|Yes| Simple["context=True"]
     DefaultOK -->|No| Customize["Need customization?"]
     
-    Customize --> PrefixCustom{"Custom framing?"}
+    Customize --> QualityChoice{"Need high-quality summary<br/>that preserves IDs/paths/errors?"}
+    QualityChoice -->|Yes| LLMSummarize["compaction_strategy=CompactionStrategy.LLM_SUMMARIZE"]
+    QualityChoice -->|No| AntiThresh{"Anti-thrashing needed?"}
+    AntiThresh -->|Yes| ThreshConfig["min_savings_pct + max_consecutive_low_savings"]
+    AntiThresh -->|No| ToolPrune{"Tool pruning needed?"}
+    
+    ToolPrune -->|Yes| ToolConfig["tool_prune_before_summarise + max_tool_result_size"]
+    ToolPrune -->|No| PrefixCustom{"Custom framing?"}
+    
     PrefixCustom -->|Yes| CustomPrefix["Set compaction_prefix"]
-    PrefixCustom -->|No| TemplateChoice{"Structured template?"}
+    PrefixCustom -->|No| IterativeChoice{"Iterative summaries?"}
     
-    TemplateChoice -->|No| FlatSummary["structured_template=False"]
-    TemplateChoice -->|Yes| IterativeChoice{"Iterative updates?"}
-    
-    IterativeChoice -->|No| NoIterative["iterative_update=False"]
+    IterativeChoice -->|No| NoIterative["enable_iterative_summary=False"]
     IterativeChoice -->|Yes| FullConfig["CompactionConfig(...)"]
+    
+    ThreshConfig --> FullConfig
+    ToolConfig --> FullConfig
+    CustomPrefix --> FullConfig
+    LLMSummarize --> FullConfig
     
     classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef config fill:#10B981,stroke:#7C90A0,color:#fff
     
-    class DefaultOK,Customize,PrefixCustom,TemplateChoice,IterativeChoice decision
-    class Simple,CustomPrefix,FlatSummary,NoIterative,FullConfig config
+    class DefaultOK,Customize,QualityChoice,AntiThresh,ToolPrune,PrefixCustom,IterativeChoice decision
+    class Simple,LLMSummarize,ThreshConfig,ToolConfig,CustomPrefix,NoIterative,FullConfig config
+```
+
+---
+
+## Inspecting Results
+
+The new `CompactionResult` provides detailed metrics about compaction operations and their effectiveness.
+
+```python
+from praisonaiagents import Agent, CompactionConfig
+
+agent = Agent(
+    name="Inspector",
+    context=CompactionConfig(
+        min_savings_pct=15.0,
+        tool_prune_before_summarise=True,
+        enable_iterative_summary=True
+    )
+)
+
+# Perform compaction and inspect results
+compacted, result = agent.compactor.compact(messages, focus_topic="database optimization")
+
+# New result fields from PR #1910
+print(f"Savings percentage: {result.savings_pct:.1f}%")
+print(f"Tool results pruned: {result.tool_results_pruned}")
+print(f"Previous summary reused: {result.previous_summary_reused}")
+print(f"Skipped due to low savings: {result.was_skipped_due_to_low_savings}")
+
+# Calculate savings percentage manually
+savings_pct = result.calculate_savings_pct()
+print(f"Manual calculation: {savings_pct:.1f}%")
+
+# Export full metrics
+metrics = result.to_dict()
+print(f"All metrics: {metrics}")
+```
+
+### New CompactionResult Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `savings_pct` | `float` | Percentage of tokens saved (computed via `calculate_savings_pct()`) |
+| `tool_results_pruned` | `int` | Number of tool results that were pruned in the pre-pass |
+| `previous_summary_reused` | `bool` | True when iterative summary feature was used |
+| `was_skipped_due_to_low_savings` | `bool` | True when anti-thrashing protection aborted compaction |
+
+### Monitoring Compaction Health
+
+```python
+# Monitor compaction across multiple turns
+def monitor_compaction_health(agent):
+    stats = agent.compactor.get_stats(agent.conversation_history)
+    config_info = stats['compaction_config']
+    
+    print(f"Current utilization: {stats['utilization']:.1%}")
+    print(f"Anti-injection enabled: {config_info['anti_injection_enabled']}")
+    print(f"Has previous summary: {config_info['has_previous_summary']}")
+    
+    # Check if agent is struggling with compaction
+    if stats['utilization'] > 0.95:
+        print("⚠️  Near token limit - consider increasing max_tokens")
+    
+    return stats
+
+# Usage
+health = monitor_compaction_health(agent)
 ```
 
 ---
 
 ## User Interaction Flow
 
-How anti-injection framing helps in real scenarios:
-
-**Scenario:** User changes topic after long conversation
-
-1. **Long conversation** about Python development (gets compacted)
-2. **User says:** "Actually, let's discuss JavaScript instead"
-3. **Without framing:** Model might continue Python discussion
-4. **With framing:** Model focuses only on JavaScript request
+Real-world example showing how the new features work together in a long research session:
 
 ```python
-from praisonaiagents import Agent
+from praisonaiagents import Agent, CompactionConfig
 
-# Long-running agent with anti-injection protection
+# Research agent with all new protections
 agent = Agent(
-    name="TopicSwitcher",
-    instructions="You adapt to topic changes instantly.",
-    context=True  # Anti-injection enabled
+    name="DeepResearcher",
+    instructions="Conduct thorough research on complex technical topics.",
+    context=CompactionConfig(
+        # Anti-thrashing protection  
+        min_savings_pct=15.0,
+        max_consecutive_low_savings=2,
+        
+        # Tool output optimization
+        tool_prune_before_summarise=True,
+        max_tool_result_size=400,
+        
+        # Iterative context building
+        enable_iterative_summary=True,
+    )
 )
 
-# After 50+ messages about Python...
-response = agent.start("Let's switch to JavaScript now")
-# Agent focuses on JavaScript, not Python context
+# Extended research session
+session_log = []
+
+# Phase 1: Initial research
+response1 = agent.start("Research distributed database consensus algorithms")
+session_log.append("Phase 1: Broad research on consensus algorithms")
+
+# Phase 2: Focus shift (lots of tool outputs)
+response2 = agent.start("Focus specifically on Raft algorithm implementations")
+compacted, result = agent.compactor.compact(
+    agent.conversation_history, 
+    focus_topic="Raft algorithm"
+)
+
+print(f"Tool outputs pruned: {result.tool_results_pruned}")
+print(f"Previous research reused: {result.previous_summary_reused}")
+print(f"Saved {result.savings_pct:.1f}% tokens with Raft focus")
+
+# Phase 3: Deep dive continues...
+response3 = agent.start("Compare Raft with PBFT consensus mechanisms")
+
+# Anti-thrashing protects against diminishing returns
+if result.was_skipped_due_to_low_savings:
+    print("⚠️  Compaction temporarily disabled - conversation reached natural compression limit")
 ```
+
+### How This Helps Long Research Sessions
+
+1. **Hours 1-2**: Agent builds initial knowledge about distributed systems
+2. **Hours 3-4**: Tool pruning keeps large documentation snippets manageable  
+3. **Hours 5-6**: Focus topic preserves critical Raft algorithm details
+4. **Hours 7+**: Anti-thrashing prevents compaction overhead when context stabilizes
+
+The agent maintains research continuity while efficiently managing token usage.
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="When should I customize the prefix?">
-Customize `compaction_prefix` when:
-- Your agents need domain-specific safety instructions
-- You want stronger or gentler framing language
-- Integration with existing prompt templates requires specific format
+<Accordion title="How do I tune anti-thrashing for my workload?">
+Adjust thresholds based on your agent's usage pattern:
 
+**For cost-sensitive workloads:**
 ```python
 context=CompactionConfig(
-    compaction_prefix="[CLINICAL NOTES] Previous session summary for reference. Focus on current patient interaction."
+    min_savings_pct=25.0,             # Require significant savings
+    max_consecutive_low_savings=1,    # Give up quickly
 )
 ```
-</Accordion>
 
-<Accordion title="What if I want the old flat summary back?">
-Disable structured templates to return to simple format:
-
+**For quality-focused workloads:**
 ```python
-context=CompactionConfig(structured_template=False)
+context=CompactionConfig(
+    min_savings_pct=5.0,              # Accept smaller savings
+    max_consecutive_low_savings=3,    # Try harder before giving up
+)
 ```
 
-This gives you the old `"[role]: content..."` format without sections.
+Monitor `result.was_skipped_due_to_low_savings` to see if protection is triggering.
 </Accordion>
 
-<Accordion title="How do I know compaction happened?">
-Check message metadata and stats:
+<Accordion title="When should I write a custom ToolResultPrunerProtocol?">
+Write a custom tool pruner when:
+- Your tools generate domain-specific outputs that need special handling
+- Default size limits don't match your tool output patterns
+- You need to preserve specific data types (IDs, timestamps, etc.)
 
 ```python
-# Check compacted messages
-for msg in conversation_history:
-    if msg.get("_compacted"):
-        print(f"Compacted {msg['_original_count']} messages")
-        if msg.get("_anti_injection"):
-            print("Anti-injection framing applied")
-
-# Check configuration status
-stats = compactor.get_stats(messages)
-config_info = stats['compaction_config']
-print(f"Anti-injection: {config_info['anti_injection_enabled']}")
-print(f"Structured template: {config_info['structured_template']}")
+class DatabaseToolPruner:
+    def prune(self, messages, max_tool_result_size=500):
+        # Always preserve SQL query results' structure
+        # Truncate log entries more aggressively
+        # Keep error messages intact
+        pass
 ```
+</Accordion>
+
+<Accordion title="Iterative summaries vs. fresh summaries — which do I want?">
+**Use iterative summaries (default) when:**
+- Agent runs for hours/days with context continuity
+- Research sessions with building knowledge
+- Project management with evolving requirements
+
+**Use fresh summaries when:**
+- Frequent topic switches in conversations
+- Agent handles independent requests
+- You prefer simpler mental models
+
+```python
+# Fresh summaries for topic-switching agents
+context=CompactionConfig(enable_iterative_summary=False)
+```
+</Accordion>
+
+<Accordion title="What does focus_topic actually do?">
+Focus topic preserves content in three ways:
+
+1. **Exact matches** are preserved verbatim with `*FOCUS*` markers
+2. **LLM summarization** gets explicit instructions: `"Focus especially on: {focus_topic}."`
+3. **Structured summaries** emphasize focused content in relevant sections
+
+Best used for:
+- Long research sessions ("machine learning optimization")
+- Debugging sessions ("authentication errors")
+- Feature development ("payment integration")
 </Accordion>
 
 <Accordion title="Best practices for long-running agents">
-- Keep `iterative_update=True` (default) for context preservation
+- Keep `enable_iterative_summary=True` (default) for context preservation
+- Use `focus_topic` when discussing specific technical areas
+- Monitor `result.tool_results_pruned` to track tool output efficiency  
+- Set appropriate `min_savings_pct` based on your cost tolerance
 - Use structured templates for better organization
-- Monitor compaction stats to tune `max_tokens` limits
-- Test topic changes to verify anti-injection works
+- Test topic changes to verify anti-injection works properly
 </Accordion>
 </AccordionGroup>
+
+---
+
+### Hooks
+
+> `BEFORE_COMPACTION` and `AFTER_COMPACTION` hook events now fire consistently around every compaction (both sync and async). See [Hooks](/docs/features/hooks#compaction-events).
+
+## Policy vs. CompactionConfig — which should I use?
+
+```mermaid
+graph TB
+    A[What do you need?] --> B[Overflow prevention<br/>before LLM calls]
+    A --> C[Message-history compaction<br/>after overflow]
+    A --> D[Both systems together]
+    
+    B --> E[ContextCompactionPolicy<br/>via execution=...]
+    C --> F[CompactionConfig<br/>via Agent context=...]
+    D --> G[Both compatible<br/>Execution → Context]
+    
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef policy fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef both fill:#10B981,stroke:#7C90A0,color:#fff
+    
+    class A decision
+    class E,F policy
+    class G both
+```
+
+**ContextCompactionPolicy** is the proactive gate that runs before LLM calls. **CompactionConfig** runs after when compaction is actually needed. Both are compatible — `execution.context_compaction` is the proactive gate, `Agent(context=...)` runs after.
 
 ---
 

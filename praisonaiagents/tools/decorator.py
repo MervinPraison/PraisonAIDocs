@@ -27,9 +27,11 @@ Usage:
 import inspect
 import functools
 import logging
+import copy
 from typing import Any, Callable, Dict, Optional, Union, get_type_hints
 
 from .base import BaseTool
+from .schema import annotation_to_json_schema, get_parameter_requirements
 
 # Lazy load injected module functions to reduce import time
 _injected_module = None
@@ -68,13 +70,17 @@ class FunctionTool(BaseTool):
         name: Optional[str] = None,
         description: Optional[str] = None,
         version: str = "1.0.0",
-        availability: Optional[Callable[[], tuple[bool, str]]] = None
+        availability: Optional[Callable[[], tuple[bool, str]]] = None,
+        dynamic_schema_overrides: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+        retry_policy: Optional[Any] = None
     ):
         self._func = func
         self.name = name or func.__name__
         self.description = description or func.__doc__ or f"Tool: {self.name}"
         self.version = version
         self._availability = availability
+        self._schema_override = dynamic_schema_overrides
+        self.retry_policy = retry_policy
         
         # Detect injected parameters
         self._injected_params = get_injected_params(func)
@@ -127,12 +133,13 @@ class FunctionTool(BaseTool):
                 if is_injected_type(param_type):
                     continue
                 
-                json_type = BaseTool._python_type_to_json(param_type)
+                # Use new schema utility for proper type handling
+                prop_schema = annotation_to_json_schema(param_type)
                 
-                schema["properties"][param_name] = {"type": json_type}
+                schema["properties"][param_name] = prop_schema
                 
-                # Check if required (no default value)
-                if param.default is inspect.Parameter.empty:
+                # Check if required using improved logic  
+                if get_parameter_requirements(sig, param_name):
                     schema["required"].append(param_name)
         except Exception as e:
             logging.debug(f"Could not generate schema for {func.__name__}: {e}")
@@ -153,6 +160,31 @@ class FunctionTool(BaseTool):
         # Inject state for any Injected parameters
         kwargs = inject_state_into_kwargs(kwargs, self._injected_params)
         return self._func(*args, **kwargs)
+    
+    def get_schema(self) -> Dict[str, Any]:
+        """Get OpenAI-compatible function schema for this tool.
+        
+        Applies dynamic schema overrides if present.
+        """
+        # Build base schema directly to avoid double override from parent
+        base_schema = {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": copy.deepcopy(self.parameters)
+            }
+        }
+        
+        # Apply dynamic override if present
+        if self._schema_override is not None:
+            try:
+                return self._schema_override(base_schema)
+            except Exception as e:
+                logging.warning(f"Dynamic schema override failed for tool '{self.name}': {e}")
+                return base_schema
+        
+        return base_schema
     
     def check_availability(self) -> tuple[bool, str]:
         """Check if this tool is currently available to run.
@@ -176,7 +208,9 @@ def tool(
     name: Optional[str] = None,
     description: Optional[str] = None,
     version: str = "1.0.0",
-    availability: Optional[Callable[[], tuple[bool, str]]] = None
+    availability: Optional[Callable[[], tuple[bool, str]]] = None,
+    dynamic_schema_overrides: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    retry_policy: Optional[Any] = None
 ) -> Union[FunctionTool, Callable[[Callable], FunctionTool]]:
     """Decorator to convert a function into a tool.
     
@@ -194,6 +228,10 @@ def tool(
         @tool(availability=lambda: (bool(os.getenv("API_KEY")), "API_KEY missing"))
         def my_func(x: str) -> str:
             return x
+            
+        @tool(retry_policy=RetryPolicy(max_attempts=5))
+        def my_func(x: str) -> str:
+            return x
     
     Args:
         func: The function to wrap (when used without parentheses)
@@ -201,6 +239,8 @@ def tool(
         description: Override description (default: function docstring)
         version: Tool version (default: "1.0.0")
         availability: Function that returns (is_available, reason) tuple
+        dynamic_schema_overrides: Function to dynamically modify tool schema at runtime
+        retry_policy: RetryPolicy for tool execution with exponential backoff
     
     Returns:
         FunctionTool instance that wraps the function
@@ -211,7 +251,9 @@ def tool(
             name=name,
             description=description,
             version=version,
-            availability=availability
+            availability=availability,
+            dynamic_schema_overrides=dynamic_schema_overrides,
+            retry_policy=retry_policy
         )
         
         # Validate the tool at creation time for early error detection
@@ -222,13 +264,23 @@ def tool(
             logging.warning(f"Tool validation warning for {tool_instance.name}: {e}")
         
         # Register with global registry if available
+        # Note: Don't pass dynamic_schema_overrides again since FunctionTool already handles it
         try:
-            from .registry import get_registry
+            logging.debug(f"Attempting to import registry for tool {tool_instance.name}")
+            from praisonaiagents.tools.registry import get_registry
+            logging.debug("Successfully imported get_registry")
             registry = get_registry()
+            logging.debug(f"Got registry: {registry}, type: {type(registry)}")
             if registry:
+                logging.debug(f"Registering tool {tool_instance.name}")
                 registry.register(tool_instance)
-        except ImportError:
-            pass  # Registry not yet available
+                logging.debug(f"Tool {tool_instance.name} registered successfully")
+            else:
+                logging.warning(f"Registry is None for tool {tool_instance.name}")
+        except ImportError as e:
+            logging.warning(f"Import error during registration: {e}")
+        except Exception as e:
+            logging.warning(f"Failed to register tool {tool_instance.name}: {e}")
         
         return tool_instance
     
@@ -292,11 +344,14 @@ def _schema_from_function(func: Callable) -> Dict[str, Any]:
                 continue
             
             param_type = hints.get(param_name, Any)
-            json_type = BaseTool._python_type_to_json(param_type)
             
-            properties[param_name] = {"type": json_type}
+            # Use new schema utility for proper type handling
+            prop_schema = annotation_to_json_schema(param_type)
             
-            if param.default is inspect.Parameter.empty:
+            properties[param_name] = prop_schema
+            
+            # Check if required using improved logic
+            if get_parameter_requirements(sig, param_name):
                 required.append(param_name)
     except Exception as e:
         logging.debug(f"Could not generate schema for {name}: {e}")
