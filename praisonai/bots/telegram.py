@@ -24,10 +24,17 @@ from praisonaiagents.bots import (
     BotUser,
     BotChannel,
     MessageType,
+    PlatformCapabilities,
 )
 
 from .media import split_media_from_output, is_audio_file
-from ._commands import format_status, format_help, handle_stop_command
+from ._commands import (
+    format_status, 
+    format_help, 
+    handle_stop_command,
+    CommandAccessPolicy,
+    get_command_registry
+)
 from ._session import BotSessionManager
 from ._debounce import InboundDebouncer
 from ._ack import AckReactor
@@ -35,6 +42,8 @@ from ._unknown_user import UnknownUserHandler, BotContext
 from ._pairing_ui import PairingUIBuilder, PairingCallbackHandler
 from ._streaming import StreamingConfig, StreamingMode, DraftStreamer
 from ._rate_limit import RateLimiter
+from ._resilience import deliver_with_retry, BackoffPolicy, TELEGRAM_BACKOFF
+from ._dlq import OutboundDLQ
 from ..gateway.unicode_utils import safe_error_message, safe_log_message, extract_root_cause_from_error
 from ..gateway.pairing import PairingStore
 
@@ -84,6 +93,9 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         self._agent = agent
         self.config = config or BotConfig(token=token)
         
+        # Initialize command access policy
+        self._init_command_access_policy()
+        
         # Initialize streaming config based on BotConfig
         if self.config.streaming:
             self._streaming_config = StreamingConfig(
@@ -119,10 +131,27 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
             except ImportError:
                 logger.warning("Run control not available, falling back to basic session management")
         
+        # Extract reset policy from config
+        reset_policy = None
+        if hasattr(self.config, 'session') and self.config.session:
+            if hasattr(self.config.session, 'reset') and self.config.session.reset:
+                from ._reset_policy import SessionResetPolicy
+                reset_policy = SessionResetPolicy.from_dict(self.config.session.reset.model_dump())
+        
+        # Support backward compatibility with max_history at channel level
+        max_history = 100
+        if hasattr(self.config, 'max_history') and self.config.max_history is not None:
+            max_history = self.config.max_history
+        elif hasattr(self.config, 'session') and self.config.session:
+            if hasattr(self.config.session, 'max_history') and self.config.session.max_history is not None:
+                max_history = self.config.session.max_history
+        
         self._session: BotSessionManager = BotSessionManager(
+            max_history=max_history,
             store=_store,
             platform="telegram",
             run_control=run_control,
+            reset_policy=reset_policy,
         )
         self._debouncer: InboundDebouncer = InboundDebouncer(
             debounce_ms=self.config.debounce_ms,
@@ -144,6 +173,31 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         # Resilience
         self._monitor = None  # Lazy: ConnectionMonitor
         self._stop_event: Optional[asyncio.Event] = None
+        
+        # Outbound resilience configuration
+        outbound_resilience = getattr(self.config, 'outbound_resilience', None)
+        if outbound_resilience and getattr(outbound_resilience, 'enabled', True):
+            # Use configured values
+            self._outbound_backoff: BackoffPolicy = BackoffPolicy(
+                initial_ms=getattr(outbound_resilience, 'initial_ms', 1000),
+                max_ms=getattr(outbound_resilience, 'max_ms', 10000),
+                factor=getattr(outbound_resilience, 'factor', 1.5),
+                max_attempts=getattr(outbound_resilience, 'max_attempts', 3),
+                jitter=getattr(outbound_resilience, 'jitter', 0.25)
+            )
+            # Initialize outbound DLQ if path is configured
+            outbound_dlq_path = getattr(outbound_resilience, 'dlq_path', None)
+            self._outbound_dlq: Optional[OutboundDLQ] = None
+            if outbound_dlq_path:
+                try:
+                    self._outbound_dlq = OutboundDLQ(path=outbound_dlq_path)
+                    logger.info(f"Outbound DLQ initialized at {outbound_dlq_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize outbound DLQ: {e}")
+        else:
+            # Default resilience settings
+            self._outbound_backoff = BackoffPolicy(initial_ms=1000, max_ms=10000, factor=1.5, max_attempts=3)
+            self._outbound_dlq = None
     
     
     def configure_streaming(self, config: StreamingConfig) -> None:
@@ -163,6 +217,27 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         """Enable auto-TTS for responses."""
         self._auto_tts = enabled
     
+    def _init_command_access_policy(self):
+        """Initialize command access policy from config."""
+        # Parse admin users from config
+        admin_users = set()
+        if hasattr(self.config, 'admin_users') and self.config.admin_users:
+            admin_users = set(user.strip() for user in self.config.admin_users.split(',') if user.strip())
+        
+        # Parse user allowed commands from config  
+        user_allowed_commands = None
+        if hasattr(self.config, 'user_allowed_commands') and self.config.user_allowed_commands:
+            user_allowed_commands = set(cmd.strip() for cmd in self.config.user_allowed_commands.split(',') if cmd.strip())
+        
+        # Create command access policy
+        self._command_policy = CommandAccessPolicy(
+            admin_users=admin_users,
+            user_allowed_commands=user_allowed_commands
+        )
+        
+        # Get the global command registry
+        self._command_registry = get_command_registry()
+    
     @property
     def is_running(self) -> bool:
         return self._is_running
@@ -174,6 +249,39 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
     @property
     def bot_user(self) -> Optional[BotUser]:
         return self._bot_user
+    
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        """Telegram supports all features."""
+        return {
+            "live_edit": True,
+            "reactions": True,
+            "typing": True,
+            "text_limit": 4096,
+            "edit_rate_limit": 1.0,
+            "reaction_rate_limit": 0.5,
+        }
+    
+    @property
+    def platform_capabilities(self) -> PlatformCapabilities:
+        """Return Telegram platform capabilities."""
+        return self.default_capabilities()
+    
+    @classmethod
+    def default_capabilities(cls) -> PlatformCapabilities:
+        """Default Telegram platform capabilities."""
+        return PlatformCapabilities(
+            max_message_length=4096,
+            length_unit="utf16",  # Telegram uses UTF-16 for length calculation
+            supports_edit=True,  # Telegram supports message editing
+            supports_typing=True,
+            markdown_dialect="telegram_markdown_v2",
+            needs_rate_limit=True,
+            edit_interval_ms=1000,  # Telegram rate limits edits
+            max_files_per_message=1,
+            max_file_size_mb=50,  # Telegram supports up to 50MB for bots
+            supported_file_types=["image/*", "audio/*", "video/*", "application/*"],
+        )
     
     async def start(self) -> None:
         """Start the Telegram bot."""
@@ -414,21 +522,35 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                 return
 
             command = message.command
+            user_id = message.sender.user_id if message.sender else "unknown"
             
-            if command and command in self._command_handlers:
-                handler = self._command_handlers[command]
-                try:
-                    if asyncio.iscoroutinefunction(handler):
-                        await handler(message)
-                    else:
-                        handler(message)
-                except Exception as e:
-                    logger.error(f"Command handler error: {e}")
+            if command:
+                # Check command permissions
+                if not self._command_policy.can_run(user_id, command):
+                    await update.message.reply_text(f"⛔ You are not permitted to run /{command}")
+                    return
+                
+                # Handle custom registered commands
+                if command in self._command_handlers:
+                    handler = self._command_handlers[command]
+                    try:
+                        if asyncio.iscoroutinefunction(handler):
+                            await handler(message)
+                        else:
+                            handler(message)
+                    except Exception as e:
+                        logger.error(f"Command handler error: {e}")
         
         async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not update.message:
                 return
-            if not await process_inbound_telegram_message(update, self):
+            message = await process_inbound_telegram_message(update, self)
+            if not message:
+                return
+            user_id = message.sender.user_id if message.sender else "unknown"
+            # Check command permissions
+            if not self._command_policy.can_run(user_id, "status"):
+                await update.message.reply_text("⛔ You are not permitted to run /status")
                 return
             await update.message.reply_text(self._format_status())
         
@@ -439,15 +561,24 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
             if not message:
                 return
             user_id = message.sender.user_id if message.sender else "unknown"
+            # Check command permissions
+            if not self._command_policy.can_run(user_id, "new"):
+                await update.message.reply_text("⛔ You are not permitted to run /new")
+                return
             self._session.reset(user_id)
             await update.message.reply_text("Session reset. Starting fresh conversation.")
         
         async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not update.message:
                 return
-            if not await process_inbound_telegram_message(update, self):
+            message = await process_inbound_telegram_message(update, self)
+            if not message:
                 return
-            await update.message.reply_text(self._format_help())
+            user_id = message.sender.user_id if message.sender else "unknown"
+            # Help is always allowed (in ALWAYS_ALLOWED set)
+            # Use instance method to include custom commands
+            help_text = self._format_help_with_permissions(user_id)
+            await update.message.reply_text(help_text)
         
         async def handle_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not update.message:
@@ -456,13 +587,30 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
             if not message:
                 return
             user_id = message.sender.user_id if message.sender else "unknown"
+            # Check command permissions
+            if not self._command_policy.can_run(user_id, "stop"):
+                await update.message.reply_text("⛔ You are not permitted to run /stop")
+                return
             response = handle_stop_command(self._session, user_id)
+            await update.message.reply_text(response)
+        
+        async def handle_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message:
+                return
+            message = await process_inbound_telegram_message(update, self)
+            if not message:
+                return
+            user_id = message.sender.user_id if message.sender else "unknown"
+            username = message.sender.username if message.sender else None
+            # Whoami is always allowed (in ALWAYS_ALLOWED set)
+            response = self._command_registry.format_whoami(user_id, username, self._command_policy)
             await update.message.reply_text(response)
         
         self._application.add_handler(CommandHandler("status", handle_status))
         self._application.add_handler(CommandHandler("new", handle_new))
         self._application.add_handler(CommandHandler("help", handle_help))
         self._application.add_handler(CommandHandler("stop", handle_stop))
+        self._application.add_handler(CommandHandler("whoami", handle_whoami))
         
         for command in self._command_handlers:
             self._application.add_handler(CommandHandler(command, handle_command))
@@ -621,7 +769,20 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         if thread_id:
             kwargs["message_thread_id"] = int(thread_id)
         
-        sent = await self._application.bot.send_message(**kwargs)
+        # Use retry wrapper for reliable delivery
+        send_kwargs = dict(kwargs)  # Copy to avoid closure issues
+        sent = await deliver_with_retry(
+            lambda: self._application.bot.send_message(**send_kwargs),
+            policy=self._outbound_backoff,
+            platform="telegram",
+            parked_store=self._outbound_dlq,
+            reply_data={
+                "channel_id": channel_id,
+                "reply_text": text,
+                "thread_id": thread_id or "",
+                "reply_to": reply_to or "",
+            }
+        )
         
         return BotMessage(
             message_id=str(sent.message_id),
@@ -645,14 +806,41 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
             kwargs = {"chat_id": chat_id, "text": text}
             if reply_to:
                 kwargs["reply_to_message_id"] = reply_to
-            await self._application.bot.send_message(**kwargs)
+            
+            # Use retry wrapper for reliable delivery
+            # Create a lambda that captures kwargs properly
+            send_kwargs = dict(kwargs)  # Copy to avoid closure issues
+            await deliver_with_retry(
+                lambda: self._application.bot.send_message(**send_kwargs),
+                policy=self._outbound_backoff,
+                platform="telegram",
+                parked_store=self._outbound_dlq,
+                reply_data={
+                    "channel_id": str(chat_id),
+                    "reply_text": text,
+                    "reply_to": str(reply_to) if reply_to else "",
+                }
+            )
         else:
             chunks = chunk_message(text, max_length=max_len, preserve_fences=True)
             for i, chunk in enumerate(chunks):
                 kwargs = {"chat_id": chat_id, "text": chunk}
                 if i == 0 and reply_to:
                     kwargs["reply_to_message_id"] = reply_to
-                await self._application.bot.send_message(**kwargs)
+                
+                # Use retry wrapper for each chunk
+                send_kwargs = dict(kwargs)  # Copy to avoid closure issues
+                await deliver_with_retry(
+                    lambda: self._application.bot.send_message(**send_kwargs),
+                    policy=self._outbound_backoff,
+                    platform="telegram",
+                    parked_store=self._outbound_dlq,
+                    reply_data={
+                        "channel_id": str(chat_id),
+                        "reply_text": chunk,
+                        "reply_to": str(reply_to) if reply_to and i == 0 else "",
+                    }
+                )
     
     async def _transcribe_audio(self, update) -> Optional[str]:
         """Download and transcribe voice/audio message."""
@@ -719,12 +907,30 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                 try:
                     with open(media_path, "rb") as f:
                         if audio_as_voice:
-                            await self._application.bot.send_voice(
-                                chat_id=chat_id, voice=f
+                            # Use retry wrapper for voice messages with proper seek
+                            async def send_voice():
+                                f.seek(0)  # Reset file position before each attempt
+                                return await self._application.bot.send_voice(
+                                    chat_id=chat_id, voice=f
+                                )
+                            await deliver_with_retry(
+                                send_voice,
+                                policy=self._outbound_backoff,
+                                platform="telegram",
+                                parked_store=None,  # Don't DLQ media for now (complex replay)
                             )
                         else:
-                            await self._application.bot.send_audio(
-                                chat_id=chat_id, audio=f
+                            # Use retry wrapper for audio messages with proper seek
+                            async def send_audio():
+                                f.seek(0)  # Reset file position before each attempt
+                                return await self._application.bot.send_audio(
+                                    chat_id=chat_id, audio=f
+                                )
+                            await deliver_with_retry(
+                                send_audio,
+                                policy=self._outbound_backoff,
+                                platform="telegram",
+                                parked_store=None,  # Don't DLQ media for now (complex replay)
                             )
                 except Exception as e:
                     logger.error(f"Failed to send audio: {e}")
@@ -793,6 +999,47 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                 chat_id=int(channel_id),
                 action="typing",
             )
+    
+    async def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        """Add a reaction to a message."""
+        if not self._application:
+            return False
+        
+        try:
+            from telegram import ReactionTypeEmoji
+            await self._application.bot.set_message_reaction(
+                chat_id=int(channel_id),
+                message_id=int(message_id),
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to add reaction: {e}")
+            return False
+    
+    async def remove_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        """Remove a reaction from a message.
+        
+        Note: Telegram's setMessageReaction API is set-based - it replaces all bot reactions.
+        To remove a specific emoji, we would need to fetch current reactions and filter out
+        the target. Since there's no getMessageReactions API, we'll clear all bot reactions
+        as a simpler approach (the bot typically has only one reaction anyway).
+        """
+        if not self._application:
+            return False
+        
+        try:
+            # Telegram API: send empty reaction list to remove all bot reactions
+            # This is a known limitation - we can't selectively remove individual reactions
+            await self._application.bot.set_message_reaction(
+                chat_id=int(channel_id),
+                message_id=int(message_id),
+                reaction=[],
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to remove reaction: {e}")
+            return False
     
     async def get_user(self, user_id: str) -> Optional[BotUser]:
         """Get user information."""
@@ -891,6 +1138,36 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         """Format /help response."""
         extra = {cmd: "Custom command" for cmd in self._command_handlers}
         return format_help(self._agent, self.platform, extra)
+    
+    def _format_help_with_permissions(self, user_id: str) -> str:
+        """Format /help response with permission filtering and custom commands."""
+        # Get allowed commands for this user
+        all_commands = self._command_registry.get_command_names() | set(self._command_handlers.keys())
+        
+        if self._command_policy:
+            allowed = self._command_policy.get_allowed_commands(user_id, all_commands)
+        else:
+            allowed = all_commands
+        
+        agent_name = self._agent.name if self._agent else "No agent"
+        model = getattr(self._agent, "llm", "default") if self._agent else "default"
+        
+        lines = ["Available Commands"]
+        
+        # Built-in commands from registry
+        for cmd in sorted(allowed):
+            if cmd in self._command_registry.get_all_commands():
+                cmd_info = self._command_registry.get_command(cmd)
+                desc = cmd_info.get("description", "No description")
+                lines.append(f"/{cmd} - {desc}")
+            elif cmd in self._command_handlers:
+                # Custom commands
+                lines.append(f"/{cmd} - Custom command")
+        
+        lines.append(f"\nAgent: {agent_name}")
+        lines.append(f"Model: {model}")
+        
+        return "\n".join(lines)
     
     def _convert_update_to_message(self, update, override_text: Optional[str] = None) -> BotMessage:
         """Convert Telegram Update to BotMessage."""

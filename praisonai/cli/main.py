@@ -6,55 +6,9 @@ import warnings
 import os
 import json
 
-# Warning filter support - now opt-in only (no global mutation at import)
-import atexit
-
-_SUPPRESSED_PATTERNS = (
-    "Pydantic serializer warnings",
-    "PydanticSerializationUnexpectedValue",
-    "Expected ",  # Narrowed from just "Expected" to avoid false positives
-    "StreamingChoices",
-    "serialized value may not be as expected",
-    "duckduckgo_search",
-)
-
-_installed = False
-_original_showwarning = None
-_original_filters = None
-
-def install_warning_filters() -> None:
-    """Install PraisonAI's noise filters. Idempotent. CLI-only."""
-    global _installed, _original_showwarning, _original_filters
-    if _installed:
-        return
-    _original_showwarning = warnings.showwarning
-    _original_filters = list(warnings.filters)
-
-    # Install filterwarnings for common patterns
-    for pattern in _SUPPRESSED_PATTERNS:
-        warnings.filterwarnings("ignore", message=f".*{pattern}.*")
-    warnings.filterwarnings("ignore", category=UserWarning, module="pydantic.*")
-
-    def _filtered_showwarning(message, category, filename, lineno, file=None, line=None):
-        msg_str = str(message)
-        if any(pattern in msg_str for pattern in _SUPPRESSED_PATTERNS):
-            return
-        if category is UserWarning and "pydantic" in filename.lower():
-            return
-        _original_showwarning(message, category, filename, lineno, file, line)
-
-    warnings.showwarning = _filtered_showwarning
-    atexit.register(_uninstall_warning_filters)
-    _installed = True
-
-def _uninstall_warning_filters() -> None:
-    """Restore original warnings behavior on exit."""
-    global _installed, _original_filters, _original_showwarning
-    if _installed and _original_showwarning is not None:
-        warnings.showwarning = _original_showwarning
-        if _original_filters is not None:
-            warnings.filters[:] = _original_filters
-        _installed = False
+# Re-export warning filter functions from the lightweight module
+# This maintains backward compatibility for any external importers
+from ._warnings import install_warning_filters, _uninstall_warning_filters, _SUPPRESSED_PATTERNS
 
 # Suppress crewai RuntimeWarning about module loading order (only in non-debug mode)
 # This warning is harmless and occurs when running as `python -m praisonai.cli.main`
@@ -158,27 +112,31 @@ def _get_agents_generator():
     from praisonai.agents_generator import AgentsGenerator
     return AgentsGenerator
 
-# Optional module imports with availability checks
-GRADIO_AVAILABLE = False
-CALL_MODULE_AVAILABLE = False
-CREWAI_AVAILABLE = False
-AUTOGEN_AVAILABLE = False
-PRAISONAI_AVAILABLE = False
-TRAIN_AVAILABLE = False
-
 # Use centralized availability detection
 from .._framework_availability import is_available
 
+# Define real module-level constants for internal use (prevents NameError)
+# These are evaluated on-demand for dynamic behavior
 GRADIO_AVAILABLE = is_available("gradio")
+CREWAI_AVAILABLE = is_available("crewai")
+AUTOGEN_AVAILABLE = is_available("autogen")
+PRAISONAI_AVAILABLE = is_available("praisonaiagents")
+TRAIN_AVAILABLE = is_available("unsloth")
+
+# Handle CALL_MODULE_AVAILABLE with exception guard
 try:
     import importlib.util
     CALL_MODULE_AVAILABLE = importlib.util.find_spec("praisonai.api.call") is not None
 except (ModuleNotFoundError, AttributeError):
     CALL_MODULE_AVAILABLE = False
-CREWAI_AVAILABLE = is_available("crewai")
-AUTOGEN_AVAILABLE = is_available("autogen")
-PRAISONAI_AVAILABLE = is_available("praisonaiagents")
-TRAIN_AVAILABLE = is_available("unsloth")
+
+# Module-level __getattr__ for backward compatibility with external access
+def __getattr__(name):
+    # For external backward compatibility, return the actual module-level values
+    if name in {"GRADIO_AVAILABLE", "CREWAI_AVAILABLE", "AUTOGEN_AVAILABLE",
+                "PRAISONAI_AVAILABLE", "TRAIN_AVAILABLE", "CALL_MODULE_AVAILABLE"}:
+        return globals()[name]
+    raise AttributeError(name)
 
 # Lazy import helpers for optional dependencies (defined after availability flags)
 def _get_call_module():
@@ -187,7 +145,8 @@ def _get_call_module():
     Raises:
         ImportError: If praisonai.api.call is not installed
     """
-    if not CALL_MODULE_AVAILABLE:
+    import importlib.util
+    if not importlib.util.find_spec("praisonai.api.call"):
         raise ImportError(
             "Call feature is not installed. Install with: pip install \"praisonai[call]\""
         )
@@ -362,12 +321,19 @@ class PraisonAI:
         original_agent_file = self.agent_file
         
         # Parse args - this returns both args and unknown_args
+        preserved_args = getattr(self, 'args', None)
         parse_result = self.parse_args()
         if isinstance(parse_result, tuple):
             args, unknown_args = parse_result
         else:
             args = parse_result
             unknown_args = []
+        
+        # Preserve project session flags set by ``praison run`` before parse_args()
+        if preserved_args and getattr(preserved_args, 'cli_project_sessions', False):
+            for attr in ('auto_save', 'resume_session', 'cli_project_sessions'):
+                if hasattr(preserved_args, attr):
+                    setattr(args, attr, getattr(preserved_args, attr))
         
         # Store args for use in handle_direct_prompt
         self.args = args
@@ -619,7 +585,9 @@ class PraisonAI:
             return
 
         if getattr(args, 'call', False):
-            if not CALL_MODULE_AVAILABLE:
+            import importlib.util
+            call_available = importlib.util.find_spec("praisonai.api.call") is not None
+            if not call_available:
                 print("[red]ERROR: Call feature is not installed. Install with:[/red]")
                 print("\npip install \"praisonai[call]\"\n")
                 return
@@ -1266,7 +1234,8 @@ class PraisonAI:
 
         # Handle both command and flag versions for call
         if args.command == 'call' or args.call:
-            if not CALL_MODULE_AVAILABLE:
+            import importlib.util
+            if not importlib.util.find_spec("praisonai.api.call"):
                 print("[red]ERROR: Call feature is not installed. Install with:[/red]")
                 print("\npip install \"praisonai[call]\"\n")
                 sys.exit(1)
@@ -1293,7 +1262,8 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'call':
-                if not CALL_MODULE_AVAILABLE:
+                import importlib.util
+                if not importlib.util.find_spec("praisonai.api.call"):
                     print("[red]ERROR: Call feature is not installed. Install with:[/red]")
                     print("\npip install \"praisonai[call]\"\n")
                     sys.exit(1)
@@ -4243,6 +4213,15 @@ Do NOT add any explanations or formatting."""
         handoff_detect_cycles = getattr(self.args, 'handoff_detect_cycles', None)
         if handoff_detect_cycles is not None:
             cli_config['handoff_detect_cycles'] = handoff_detect_cycles
+
+        if getattr(self.args, 'cli_project_sessions', False):
+            from .state.project_sessions import build_cli_memory_config
+            memory_cfg = build_cli_memory_config(
+                getattr(self.args, 'resume_session', None),
+                getattr(self.args, 'auto_save', None),
+            )
+            if memory_cfg is not None:
+                cli_config['memory'] = memory_cfg
             
         return cli_config
 
@@ -4509,6 +4488,16 @@ Do NOT add any explanations or formatting."""
                     else:
                         agent_config["memory"] = True
                     print("[bold cyan]Memory enabled - agent will remember context across sessions[/bold cyan]")
+                elif getattr(self.args, 'cli_project_sessions', False) and (
+                    getattr(self.args, 'resume_session', None) or getattr(self.args, 'auto_save', None)
+                ):
+                    from .state.project_sessions import build_cli_memory_config
+                    agent_config["memory"] = build_cli_memory_config(
+                        getattr(self.args, 'resume_session', None),
+                        getattr(self.args, 'auto_save', None),
+                    )
+                    session_label = agent_config['memory'].auto_save or agent_config['memory'].session_id
+                    print(f"[bold cyan]Project session enabled - session '{session_label}'[/bold cyan]")
                 elif getattr(self.args, 'auto_save', None):
                     from praisonaiagents import MemoryConfig
                     agent_config["memory"] = MemoryConfig(auto_save=self.args.auto_save)
@@ -4519,6 +4508,23 @@ Do NOT add any explanations or formatting."""
                         agent_config["memory"] = True  # History requires memory
                     # Note: history_in_context param removed - history loading now via context= param
                     print(f"[bold cyan]History enabled - loading context from last {self.args.history} session(s)[/bold cyan]")
+
+                # CLI session continuity from `praison run --continue/--session`
+                # Only apply for resume sessions, not plain --auto-save
+                _resume_id = getattr(self.args, 'resume_session', None)
+                if _resume_id:
+                    _auto_save_id = getattr(self.args, 'auto_save', None)
+                    from praisonai.cli.utils.project import build_cli_memory_config
+                    _session_cfg = build_cli_memory_config(
+                        session_id=_resume_id,
+                        auto_save=_auto_save_id,
+                    )
+                    if _session_cfg:
+                        agent_config["memory"] = _session_cfg
+                        print(
+                            f"[bold cyan]Session continuity enabled - "
+                            f"session '{_session_cfg.session_id}'[/bold cyan]"
+                        )
                 
                 # Claude Memory Tool (Anthropic only)
                 if getattr(self.args, 'claude_memory', False):
@@ -4792,6 +4798,13 @@ Do NOT add any explanations or formatting."""
                 flow.display_workflow_start("Direct Prompt", ["DirectAgent"])
             
             agent = PraisonAgent(**agent_config)
+
+            if hasattr(self, 'args') and getattr(self.args, 'cli_project_sessions', False):
+                session_id = getattr(self.args, 'resume_session', None) or getattr(self.args, 'auto_save', None)
+                auto_save = getattr(self.args, 'auto_save', None)
+                if session_id:
+                    from .state.project_sessions import apply_cli_session_continuity
+                    apply_cli_session_continuity(agent, session_id, auto_save=auto_save)
             
             # AutoRag - Automatic RAG retrieval decision
             if hasattr(self, 'args') and getattr(self.args, 'auto_rag', False):

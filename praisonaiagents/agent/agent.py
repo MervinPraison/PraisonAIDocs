@@ -1427,7 +1427,7 @@ class Agent(SteeringMixin, SandboxMixin, UnifiedExecutionMixin, ToolExecutionMix
             # String could be LLM prompt - passthrough for later processing
             _guardrails_config = guardrails
         else:
-            from .._resolver_helpers import resolve_guardrails as _resolve_guardrails
+            from ..config.param_resolver import resolve_guardrails as _resolve_guardrails
             _guardrails_config = _resolve_guardrails(
                 value=guardrails,
                 config_class=GuardrailConfig,
@@ -2043,7 +2043,7 @@ Your Goal: {self.goal}
                 "cli_backend",
                 since="1.0.0",
                 removal="2.0.0",
-                alternative="use 'runtime=' instead for model-scoped runtime configuration",
+                alternative="use 'runtime=' instead for model-scoped runtime configuration. For migration assistance, run: praisonai doctor fix --execute",
                 stacklevel=3
             )
             self._cli_backend = self._resolve_cli_backend(cli_backend)

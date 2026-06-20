@@ -116,6 +116,7 @@ _LAZY_COMMANDS: Dict[str, Tuple[str, str, str]] = {
     "config": (".commands.config", "app", "Configuration management"),
     "traces": (".commands.traces", "app", "Trace collection management"),
     "env": (".commands.environment", "app", "Environment and diagnostics"),
+    "auth": (".commands.auth", "app", "Credential management"),
     "session": (".commands.session", "app", "Session management"),
     "completion": (".commands.completion", "app", "Shell completion scripts"),
     "version": (".commands.version", "app", "Version information"),
@@ -153,6 +154,8 @@ _LAZY_COMMANDS: Dict[str, Tuple[str, str, str]] = {
     "rag": (".commands.rag", "app", "RAG commands (legacy - use index/query instead)"),
     "deploy": (".commands.deploy", "app", "Deployment management"),
     "agents": (".commands.agents", "app", "Agent management"),
+    "agent": (".commands.agent", "app", "Custom agent definitions management"),
+    "command": (".commands.command", "app", "Custom command definitions management"),
     "skills": (".commands.skills", "app", "Skill management"),
     "eval": (".commands.eval", "app", "Evaluation and testing"),
     "templates": (".commands.templates", "app", "Template management"),
@@ -163,6 +166,7 @@ _LAZY_COMMANDS: Dict[str, Tuple[str, str, str]] = {
     "publish": (".commands.publish", "app", "Package publishing"),
     "hooks": (".commands.hooks", "app", "Hook management"),
     "rules": (".commands.rules", "app", "Rules management"),
+    "permissions": (".commands.permissions", "permissions", "Tool approval and permission management"),
     "registry": (".commands.registry", "app", "Registry management"),
     "package": (".commands.package", "app", "Package management"),
     "endpoints": (".commands.endpoints", "app", "API endpoint management"),
@@ -618,7 +622,7 @@ def main_callback(
         mode = OutputMode.TEXT
     
     # Install warning filters for CLI usage only
-    from .main import install_warning_filters
+    from ._warnings import install_warning_filters
     install_warning_filters()
     
     # Create run context

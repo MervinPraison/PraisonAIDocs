@@ -135,9 +135,26 @@ class WhatsAppBot(ChatCommandMixin, MessageHookMixin):
             _store = get_default_session_store()
         except Exception:
             _store = None
+        # Extract reset policy from config
+        reset_policy = None
+        if hasattr(self.config, 'session') and self.config.session:
+            if hasattr(self.config.session, 'reset') and self.config.session.reset:
+                from ._reset_policy import SessionResetPolicy
+                reset_policy = SessionResetPolicy.from_dict(self.config.session.reset.model_dump())
+        
+        # Support backward compatibility with max_history at channel level
+        max_history = 100
+        if hasattr(self.config, 'max_history') and self.config.max_history is not None:
+            max_history = self.config.max_history
+        elif hasattr(self.config, 'session') and self.config.session:
+            if hasattr(self.config.session, 'max_history') and self.config.session.max_history is not None:
+                max_history = self.config.session.max_history
+        
         self._session_mgr = BotSessionManager(
+            max_history=max_history,
             store=_store,
             platform="whatsapp",
+            reset_policy=reset_policy,
         )
         self._message_handlers: List[Callable] = []
         self._runner: Any = None
@@ -206,6 +223,18 @@ class WhatsAppBot(ChatCommandMixin, MessageHookMixin):
     @property
     def bot_user(self) -> Optional[BotUser]:
         return self._bot_user
+    
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        """WhatsApp has limited capabilities."""
+        return {
+            "live_edit": False,  # WhatsApp doesn't support message editing
+            "reactions": False,  # WhatsApp reactions are limited/not available via API
+            "typing": False,  # No typing indicator API
+            "text_limit": 4096,
+            "edit_rate_limit": 0,
+            "reaction_rate_limit": 0,
+        }
 
     # ── Agent management ────────────────────────────────────────────
 
@@ -938,6 +967,14 @@ class WhatsAppBot(ChatCommandMixin, MessageHookMixin):
     async def send_typing(self, channel_id: str) -> None:
         """WhatsApp doesn't have a typing indicator API."""
         pass
+    
+    async def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        """WhatsApp reactions are not fully supported via API."""
+        return False
+    
+    async def remove_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        """WhatsApp reactions are not fully supported via API."""
+        return False
 
     async def get_user(self, user_id: str) -> Optional[BotUser]:
         """Get user info (limited in WhatsApp API)."""

@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     from ._webhook_approval import WebhookApproval
     from ._http_approval import HTTPApproval
     from ._streaming import StreamingConfig, StreamingMode, DraftStreamer
+    from ._outbox import OutboundQueue, OutboundEntry
+    from ._delivery import DurableDelivery, deliver_with_retry
+    from ._durable_adapter import DurableAdapterMixin
 
 def __getattr__(name: str):
     """Lazy loading of bot components."""
@@ -102,6 +105,25 @@ def __getattr__(name: str):
     if name == "DraftStreamer":
         from ._streaming import DraftStreamer
         return DraftStreamer
+    # Outbound delivery components
+    if name == "OutboundQueue":
+        from ._outbox import OutboundQueue
+        return OutboundQueue
+    if name == "OutboundEntry":
+        from ._outbox import OutboundEntry
+        return OutboundEntry
+    if name == "DurableDelivery":
+        from ._delivery import DurableDelivery
+        return DurableDelivery
+    if name == "deliver_with_retry":
+        from ._delivery import deliver_with_retry
+        return deliver_with_retry
+    if name == "deliver_chunked":
+        from ._delivery import deliver_chunked
+        return deliver_chunked
+    if name == "DurableAdapterMixin":
+        from ._durable_adapter import DurableAdapterMixin
+        return DurableAdapterMixin
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -110,10 +132,13 @@ __all__ = [
     "BotSessionManager",
     "InboundDLQ", "DLQEntry",
     "InboundJournal", "JournalEntry",
+    "OutboundQueue", "OutboundEntry",
+    "DurableDelivery", "deliver_with_retry", "deliver_chunked",
+    "DurableAdapterMixin",
     "SlackApproval", "TelegramApproval", "DiscordApproval",
     "WebhookApproval", "HTTPApproval",
     # Streaming
     "StreamingConfig", "StreamingMode", "DraftStreamer",
     # W1
-    "mirror_to_session", "BotSessionManager",
+    "mirror_to_session",
 ]

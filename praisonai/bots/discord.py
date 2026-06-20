@@ -22,6 +22,7 @@ from praisonaiagents.bots import (
     BotUser,
     BotChannel,
     MessageType,
+    PlatformCapabilities,
 )
 
 from ._commands import format_status, format_help, handle_stop_command
@@ -90,9 +91,26 @@ class DiscordBot(ChatCommandMixin, MessageHookMixin):
             _store = get_default_session_store()
         except Exception:
             _store = None
+        # Extract reset policy from config
+        reset_policy = None
+        if hasattr(self.config, 'session') and self.config.session:
+            if hasattr(self.config.session, 'reset') and self.config.session.reset:
+                from ._reset_policy import SessionResetPolicy
+                reset_policy = SessionResetPolicy.from_dict(self.config.session.reset.model_dump())
+        
+        # Support backward compatibility with max_history at channel level
+        max_history = 100
+        if hasattr(self.config, 'max_history') and self.config.max_history is not None:
+            max_history = self.config.max_history
+        elif hasattr(self.config, 'session') and self.config.session:
+            if hasattr(self.config.session, 'max_history') and self.config.session.max_history is not None:
+                max_history = self.config.session.max_history
+        
         self._session: BotSessionManager = BotSessionManager(
+            max_history=max_history,
             store=_store,
             platform="discord",
+            reset_policy=reset_policy,
         )
         self._debouncer: InboundDebouncer = InboundDebouncer(
             debounce_ms=self.config.debounce_ms,
@@ -118,6 +136,39 @@ class DiscordBot(ChatCommandMixin, MessageHookMixin):
     @property
     def bot_user(self) -> Optional[BotUser]:
         return self._bot_user
+    
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        """Discord supports edit, reactions, and typing."""
+        return {
+            "live_edit": True,
+            "reactions": True,
+            "typing": True,
+            "text_limit": 2000,  # Discord message limit
+            "edit_rate_limit": 1.0,
+            "reaction_rate_limit": 0.25,  # Discord has generous rate limits
+        }
+    
+    @property
+    def platform_capabilities(self) -> PlatformCapabilities:
+        """Return Discord platform capabilities."""
+        return self.default_capabilities()
+    
+    @classmethod
+    def default_capabilities(cls) -> PlatformCapabilities:
+        """Default Discord platform capabilities."""
+        return PlatformCapabilities(
+            max_message_length=2000,  # Discord's limit for regular messages
+            length_unit="codepoints",
+            supports_edit=True,  # Discord supports message editing
+            supports_typing=True,
+            markdown_dialect="discord_markdown",
+            needs_rate_limit=False,  # Discord.py handles rate limiting
+            edit_interval_ms=500,  # Discord is less restrictive on edits
+            max_files_per_message=10,
+            max_file_size_mb=8,  # Default Discord limit (varies by boost level)
+            supported_file_types=["*"],  # Discord supports most file types
+        )
     
     async def start(self) -> None:
         """Start the Discord bot."""
@@ -420,6 +471,36 @@ class DiscordBot(ChatCommandMixin, MessageHookMixin):
             channel = self._client.get_channel(int(channel_id))
             if channel:
                 await channel.trigger_typing()
+    
+    async def add_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        """Add a reaction to a message."""
+        if not self._client:
+            return False
+        
+        try:
+            channel = self._client.get_channel(int(channel_id))
+            if channel:
+                message = await channel.fetch_message(int(message_id))
+                await message.add_reaction(emoji)
+                return True
+        except Exception as e:
+            logger.debug(f"Failed to add reaction: {e}")
+        return False
+    
+    async def remove_reaction(self, channel_id: str, message_id: str, emoji: str) -> bool:
+        """Remove a reaction from a message."""
+        if not self._client:
+            return False
+        
+        try:
+            channel = self._client.get_channel(int(channel_id))
+            if channel:
+                message = await channel.fetch_message(int(message_id))
+                await message.remove_reaction(emoji, self._client.user)
+                return True
+        except Exception as e:
+            logger.debug(f"Failed to remove reaction: {e}")
+        return False
     
     async def get_user(self, user_id: str) -> Optional[BotUser]:
         """Get user information."""

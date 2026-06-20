@@ -17,6 +17,7 @@ from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -30,6 +31,7 @@ from typing import (
 if TYPE_CHECKING:
     from praisonai.gateway.pairing import PairedChannel
     from ..agent import Agent
+    from ..bots.presentation import MessagePresentation
 
 
 class EventType(str, Enum):
@@ -149,6 +151,7 @@ class GatewayMessage:
         timestamp: Message creation time
         metadata: Additional message metadata
         reply_to: ID of message being replied to (optional)
+        presentation: Optional interactive presentation (buttons, menus, etc.)
     """
     
     content: Union[str, Dict[str, Any]]
@@ -158,10 +161,11 @@ class GatewayMessage:
     timestamp: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
     reply_to: Optional[str] = None
+    presentation: Optional["MessagePresentation"] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
-        return {
+        data = {
             "content": self.content,
             "sender_id": self.sender_id,
             "session_id": self.session_id,
@@ -170,10 +174,20 @@ class GatewayMessage:
             "metadata": self.metadata,
             "reply_to": self.reply_to,
         }
+        if self.presentation is not None:
+            data["presentation"] = self.presentation.to_dict()
+        return data
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GatewayMessage":
         """Create from dictionary."""
+        from ..bots.presentation import MessagePresentation
+        
+        presentation = None
+        raw_presentation = data.get("presentation")
+        if isinstance(raw_presentation, dict):
+            presentation = MessagePresentation.from_dict(raw_presentation)
+        
         return cls(
             content=data.get("content", ""),
             sender_id=data.get("sender_id", "unknown"),
@@ -182,6 +196,7 @@ class GatewayMessage:
             timestamp=data.get("timestamp", time.time()),
             metadata=data.get("metadata", {}),
             reply_to=data.get("reply_to"),
+            presentation=presentation,
         )
 
 
@@ -683,6 +698,126 @@ class DeliveryGuaranteeProtocol(Protocol):
     async def purge_acknowledged(self, max_age_seconds: int = 86400) -> int:
         """Remove old acknowledged messages from the store.
         
+        Returns:
+            Number of messages purged
+        """
+        ...
+
+
+@runtime_checkable
+class OutboundDeliveryProtocol(Protocol):
+    """Protocol for durable outbound message delivery.
+    
+    Ensures messages sent to external channels (Telegram, Slack, Discord, etc.)
+    are persisted before sending and can be retried on failure. This provides
+    crash-safe at-least-once delivery for channel replies.
+    
+    Example usage (implementation in praisonai wrapper):
+        from praisonai.bots import OutboundQueue
+        
+        outbox = OutboundQueue(path="~/.praisonai/state/outbox.sqlite")
+        
+        # Enqueue before sending
+        key = await outbox.enqueue(
+            idempotency_key="msg-123",
+            target_channel="telegram:12345",
+            payload={"text": "Hello", "metadata": {...}}
+        )
+        
+        # Attempt delivery
+        success = await deliver_with_retry(adapter, channel_id, payload)
+        
+        # Mark as sent only if successful
+        if success:
+            await outbox.mark_sent(key)
+        
+        # On restart, drain pending messages
+        await outbox.drain(delivery_handler)
+    """
+    
+    async def enqueue(
+        self,
+        idempotency_key: str,
+        target: str,
+        payload: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Persist an outbound message for delivery.
+        
+        Args:
+            idempotency_key: Unique key to prevent duplicate sends
+            target: Target channel identifier (e.g., "telegram:12345")
+            payload: Message payload to deliver
+            metadata: Optional metadata for tracking/routing
+            
+        Returns:
+            Unique entry key for tracking this message
+        """
+        ...
+    
+    async def mark_sent(self, key: str) -> bool:
+        """Mark a message as successfully sent.
+        
+        Args:
+            key: The entry key returned by enqueue()
+            
+        Returns:
+            True if marked successfully, False if not found
+        """
+        ...
+    
+    async def mark_failed(
+        self,
+        key: str,
+        error: str,
+        permanent: bool = False,
+    ) -> bool:
+        """Mark a message as failed.
+        
+        Args:
+            key: The entry key returned by enqueue()
+            error: Error description
+            permanent: If True, won't retry this message
+            
+        Returns:
+            True if marked successfully, False if not found
+        """
+        ...
+    
+    async def drain(
+        self,
+        sender: Callable[[str, Dict[str, Any]], Awaitable[bool]],
+        limit: Optional[int] = None,
+    ) -> tuple[int, int]:
+        """Process pending messages.
+        
+        Called on startup to retry unsent messages. Messages are processed
+        oldest-first to maintain order.
+        
+        Args:
+            sender: Async function that attempts delivery. Should return
+                    True on success, False to retry later.
+            limit: Optional max messages to process
+            
+        Returns:
+            Tuple of (succeeded, failed) counts
+        """
+        ...
+    
+    def pending_count(self) -> int:
+        """Get count of pending messages awaiting delivery."""
+        ...
+    
+    def size(self) -> int:
+        """Get total number of messages in queue."""
+        ...
+    
+    async def purge_old(self, max_age_seconds: int = 86400 * 7) -> int:
+        """Remove old sent messages.
+        
+        Args:
+            max_age_seconds: Age threshold for removal
+            
         Returns:
             Number of messages purged
         """

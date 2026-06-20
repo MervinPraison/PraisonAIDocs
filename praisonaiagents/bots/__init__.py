@@ -24,6 +24,19 @@ if TYPE_CHECKING:
         HealthResult,
         EmailProtocol,
         EmailInbox,
+        SupportsPresentation,
+        PlatformCapabilities,
+    )
+    from .presentation import (
+        MessagePresentation,
+        PresentationBlock,
+        PresentationButton,
+        PresentationAction,
+        SelectOption,
+        PresentationLimits,
+        ActionType,
+        ButtonStyle,
+        BlockType,
     )
 from .protocols import (
     BotProtocol,
@@ -41,6 +54,19 @@ from .protocols import (
     HealthResult,
     EmailProtocol,
     EmailInbox,
+    SupportsPresentation,
+    PlatformCapabilities,
+)
+from .presentation import (
+    MessagePresentation,
+    PresentationBlock,
+    PresentationButton,
+    PresentationAction,
+    SelectOption,
+    PresentationLimits,
+    ActionType,
+    ButtonStyle,
+    BlockType,
 )
 from .config import BotConfig, BotOSConfig
 
@@ -62,4 +88,15 @@ __all__ = [
     "HealthResult",
     "EmailProtocol",
     "EmailInbox",
+    "MessagePresentation",
+    "PresentationBlock",
+    "PresentationButton",
+    "PresentationAction",
+    "SelectOption",
+    "PresentationLimits",
+    "SupportsPresentation",
+    "ActionType",
+    "ButtonStyle",
+    "BlockType",
+    "PlatformCapabilities",
 ]
