@@ -1,0 +1,230 @@
+---
+title: "Gateway Flow Control"
+sidebarTitle: "Flow Control"
+description: "Bounded inboxes and slow-consumer disconnect keep one misbehaving client from degrading the gateway"
+icon: "gauge-high"
+---
+
+Flow control bounds per-session inboxes and disconnects slow consumers so a single misbehaving client can't degrade the whole gateway.
+
+```mermaid
+graph LR
+    subgraph "Gateway Flow Control"
+        Client[👤 Client] --> Inbox{📥 Inbox Full?}
+        Inbox -->|No| Queue[✅ Queue Message]
+        Inbox -->|Yes| Reject[⚠️ inbox_full error]
+        Queue --> Agent[🤖 Agent]
+        Agent --> Buffer{📤 Buffer Full?}
+        Buffer -->|No| Send[✅ Send to Client]
+        Buffer -->|Yes, droppable| Drop[💧 Drop Event]
+        Buffer -->|Yes, critical| Close[🔌 Close 1013]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Client,Agent input
+    class Inbox,Buffer decision
+    class Queue,Send success
+    class Reject,Drop,Close error
+```
+
+## Quick Start
+
+<Steps>
+
+<Step title="Defaults work out of the box">
+Flow control is enabled by default — no configuration needed. Every session gets a 256-message inbox and the gateway disconnects clients whose transport buffer exceeds 1 MB.
+
+```python
+from praisonaiagents import Agent, GatewayConfig
+
+agent = Agent(
+    name="assistant",
+    instructions="You help users with tasks"
+)
+```
+</Step>
+
+<Step title="Tune the limits">
+Adjust thresholds to match your workload.
+
+```python
+from praisonaiagents import Agent, GatewayConfig, SessionConfig
+
+config = GatewayConfig(
+    max_buffered_bytes=4 * 1024 * 1024,
+    session_config=SessionConfig(
+        max_inbox=512,
+    )
+)
+
+agent = Agent(
+    name="assistant",
+    instructions="You help users with tasks"
+)
+```
+</Step>
+
+</Steps>
+
+---
+
+## How It Works
+
+Two checks protect the gateway from overload:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway
+    participant Agent
+
+    Client->>Gateway: Send message
+    alt Inbox not full
+        Gateway->>Agent: Route message
+        Agent->>Gateway: Response
+        alt Buffer not full
+            Gateway-->>Client: Deliver response
+        else Droppable event (presence/typing/status)
+            Gateway->>Gateway: Silently drop
+        else Critical event
+            Gateway-->>Client: Close 1013 "slow consumer"
+        end
+    else Inbox full
+        Gateway-->>Client: Error — inbox_full
+    end
+```
+
+| Event type | When buffer is full |
+|------------|---------------------|
+| `presence` | Silently dropped |
+| `typing` | Silently dropped |
+| `status` | Silently dropped |
+| All other types | Connection closed with code `1013` |
+
+---
+
+## Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `max_inbox` | `int` | `256` | Maximum queued messages per session. `0` = unlimited. Negative values raise `ValueError`. |
+| `max_buffered_bytes` | `int` | `1048576` | Maximum buffered bytes before a slow consumer is disconnected. `0` = disable slow-consumer checks. Negative values raise `ValueError`. |
+
+`max_inbox` is set on `SessionConfig`; `max_buffered_bytes` is set on `GatewayConfig`.
+
+```python
+from praisonaiagents import GatewayConfig, SessionConfig
+
+config = GatewayConfig(
+    max_buffered_bytes=1024 * 1024,
+    session_config=SessionConfig(
+        max_inbox=256,
+    )
+)
+```
+
+These options are also available in `gateway.yaml`:
+
+```yaml
+gateway:
+  max_buffered_bytes: 1048576
+  session_config:
+    max_inbox: 256
+```
+
+---
+
+## Client-Side Error Contract
+
+When the inbox is full, the gateway sends this JSON frame before rejecting the message:
+
+```json
+{
+  "type": "error",
+  "code": "inbox_full",
+  "message": "Message queue is full. Please wait for current messages to be processed."
+}
+```
+
+When the transport buffer exceeds `max_buffered_bytes` for a critical event, the gateway closes the WebSocket with:
+
+- **Code:** `1013` (Try Again Later)
+- **Reason:** `slow consumer`
+
+Clients should reconnect and resume from the last known message.
+
+---
+
+## Common Patterns
+
+**Chat-heavy workloads** — Tighten the inbox to shed load early and fail fast:
+
+```python
+from praisonaiagents import GatewayConfig, SessionConfig
+
+config = GatewayConfig(
+    max_buffered_bytes=512 * 1024,
+    session_config=SessionConfig(max_inbox=64)
+)
+```
+
+**Long-running tools** — Loosen both limits to avoid spurious disconnections during slow AI responses:
+
+```python
+from praisonaiagents import GatewayConfig, SessionConfig
+
+config = GatewayConfig(
+    max_buffered_bytes=8 * 1024 * 1024,
+    session_config=SessionConfig(max_inbox=1024)
+)
+```
+
+**Local development** — Disable slow-consumer checks so network hiccups don't interrupt debugging:
+
+```python
+from praisonaiagents import GatewayConfig, SessionConfig
+
+config = GatewayConfig(
+    max_buffered_bytes=0,
+    session_config=SessionConfig(max_inbox=0)
+)
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Never set max_inbox=0 in production">
+    An unlimited inbox (`max_inbox=0`) lets a slow or malicious client queue messages indefinitely, eventually exhausting gateway memory. Reserve it for local testing only.
+  </Accordion>
+
+  <Accordion title="Size max_buffered_bytes against your payload">
+    A typical chat message is a few kilobytes. Set `max_buffered_bytes` to at least 10× your largest expected event payload. For file-transfer or streaming use cases, increase to 4–8 MB.
+  </Accordion>
+
+  <Accordion title="Handle inbox_full on the client side">
+    When your client receives `{"code": "inbox_full"}`, pause new sends and retry with exponential backoff (e.g., 1 s → 2 s → 4 s). Do not flood the gateway with immediate retries.
+  </Accordion>
+
+  <Accordion title="React to a 1013 slow-consumer close">
+    On receiving WebSocket close code `1013`, reconnect after a short delay and replay any messages that were in-flight. The gateway preserves session state during the `resume_window` (default 24 h), so conversation context is not lost.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Gateway" icon="tower-broadcast" href="/features/gateway">
+    Full gateway configuration and YAML reference
+  </Card>
+  <Card title="Gateway Error Handling" icon="triangle-alert" href="/features/gateway-error-handling">
+    Error handling patterns for the gateway
+  </Card>
+</CardGroup>
