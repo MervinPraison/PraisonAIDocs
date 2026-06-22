@@ -1,0 +1,498 @@
+---
+title: "Gateway Client"
+sidebarTitle: "Gateway Client"
+description: "Reconnecting WebSocket client with protocol negotiation, exponential backoff, and gap detection"
+icon: "plug"
+---
+
+`GatewayClient` is a reconnecting WebSocket client that handles version negotiation, exponential backoff with jitter, and event-sequence gap detection — so your integration stays connected without you writing the socket loop.
+
+```mermaid
+graph LR
+    subgraph "Gateway Client"
+        App[👤 Your App] --> Client[🔌 GatewayClient]
+        Client -->|join + min/max version| GW[🗼 Gateway]
+        GW -->|joined + cursor + sequence| Client
+        Client -->|events with sequence| App
+        Client -->|on disconnect| Backoff[⏱ Backoff + Jitter]
+        Backoff -->|re-join with last cursor| GW
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class App input
+    class Client process
+    class GW output
+    class Backoff agent
+```
+
+## Quick Start
+
+<Steps>
+
+<Step title="Simplest Usage">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="my-agent",
+        reconnect=True
+    )
+
+    await client.connect()
+
+    async for event in client.events():
+        print(f"Event: {event.type}, Data: {event.data}")
+
+asyncio.run(main())
+```
+</Step>
+
+<Step title="With Backoff Tuning">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient, BackoffConfig
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="my-agent",
+        reconnect=True,
+        backoff=BackoffConfig(
+            initial=1.0,
+            max=30.0,
+            multiplier=2.0,
+            jitter=0.2
+        )
+    )
+
+    await client.connect()
+
+    async for event in client.events():
+        print(f"Event: {event.type}")
+
+asyncio.run(main())
+```
+</Step>
+
+<Step title="With Gap and State Callbacks">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient, BackoffConfig
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="my-agent",
+        reconnect=True,
+    )
+
+    def on_gap(expected: int, received: int):
+        print(f"Gap detected: expected {expected}, got {received}")
+        asyncio.create_task(client.resync())
+
+    def on_state_change(state: str):
+        print(f"Connection state changed: {state}")
+
+    client.on_gap = on_gap
+    client.on_state_change = on_state_change
+
+    await client.connect()
+
+    async for event in client.events():
+        print(f"Event: {event.type}")
+
+asyncio.run(main())
+```
+</Step>
+
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant App as Your App
+    participant Client as GatewayClient
+    participant GW as Gateway
+
+    App->>Client: connect()
+    Client->>GW: join (min_version=1, max_version=1, agent_id)
+    GW-->>Client: joined (protocol_version, cursor, sequence, presence, health)
+    Client-->>App: state = "connected"
+
+    loop Events
+        GW-->>Client: event (sequence=N)
+        Client-->>App: yield event
+    end
+
+    GW--xClient: disconnect
+    Client-->>App: on_state_change("reconnecting")
+    Note over Client: backoff delay (initial * multiplier^attempts + jitter)
+    Client->>GW: join (session_id, since=cursor)
+    GW-->>Client: joined (resumed=true, replayed events)
+    Client-->>App: state = "connected"
+```
+
+| Stage | What happens |
+|-------|--------------|
+| **Connect** | TCP/WS opened; `join` includes `min_version`, `max_version`, optional `agent_id`, `token` |
+| **Negotiate** | Server picks `min(client_max, MAX_PROTOCOL_VERSION)` or rejects with `version_unsupported` |
+| **Stream** | Each event carries a monotonic `sequence`; client tracks `_expected_sequence` |
+| **Drop** | `on_state_change("reconnecting")` fires; backoff with jitter (`initial * multiplier^attempts`, clamped to `max`) |
+| **Resume** | Re-`join` with `session_id` + `since=cursor`; server replays from cursor; `presence` + `health` returned |
+| **Gap** | If received `sequence` ≠ expected, `on_gap(expected, received)` fires; caller can `await client.resync()` |
+
+---
+
+## Configuration Options
+
+**`GatewayClient` constructor:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `url` | `str` | — | WebSocket URL (e.g. `ws://localhost:8765`) |
+| `agent_id` | `str` | — | Agent ID to join as |
+| `token` | `Optional[str]` | `None` | Auth token, appended as `?token=` query param |
+| `reconnect` | `bool` | `True` | Auto-reconnect on disconnect |
+| `backoff` | `Optional[BackoffConfig]` | `BackoffConfig()` | Backoff configuration |
+| `max_reconnect_attempts` | `Optional[int]` | `None` (infinite) | Max reconnect attempts before giving up |
+
+**`BackoffConfig` fields:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `initial` | `float` | `1.0` | Initial delay in seconds |
+| `max` | `float` | `30.0` | Maximum delay in seconds |
+| `multiplier` | `float` | `2.0` | Backoff multiplier per attempt |
+| `jitter` | `float` | `0.2` | Random jitter factor (0–1) |
+
+**Connection states** (from `ConnectionState`):
+
+| State | Meaning |
+|-------|---------|
+| `disconnected` | No active connection |
+| `connecting` | Attempting initial connection |
+| `connected` | Joined and streaming events |
+| `reconnecting` | Waiting before next retry |
+
+**Callbacks** (set as attributes on the client instance):
+
+| Attribute | Signature | When it fires |
+|-----------|-----------|---------------|
+| `on_gap` | `Callable[[int, int], None]` | A monotonic sequence gap is detected (`expected`, `received`) |
+| `on_state_change` | `Callable[[str], None]` | Connection state changes |
+
+---
+
+## Protocol Version Negotiation
+
+The client and server negotiate a protocol version during the `join` handshake.
+
+- Constants in `protocols.py`: `PROTOCOL_VERSION = 1`, `MIN_PROTOCOL_VERSION = 1`, `MAX_PROTOCOL_VERSION = 1`.
+- Client sends `min_version` and `max_version` in the `join` message.
+- Server replies in `joined` with `protocol_version`, `server_min_version`, `server_max_version`.
+
+```mermaid
+graph LR
+    subgraph "Version Negotiation"
+        C[Client] -->|min=1, max=1| S[Server]
+        S -->|protocol_version=1| C
+        S -->|version_unsupported| Err[ValueError raised]
+        S -->|invalid_protocol_hello| Err2[ConnectionError raised]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class C input
+    class S process
+    class Err,Err2 agent
+```
+
+<Warning>
+`version_unsupported` is a **permanent error**. When the server returns `{"type": "error", "code": "version_unsupported"}`, `GatewayClient.connect()` raises `ValueError` and **does not retry**. Wrap your `connect()` call in a `try/except ValueError` and do not loop on this error.
+</Warning>
+
+Invalid `min_version`/`max_version` fields (non-integer, or `min > max`) produce `code: "invalid_protocol_hello"` and raise `ConnectionError`.
+
+---
+
+## Gap Detection
+
+Every event carries a monotonic `sequence` field; the client tracks `_expected_sequence` and fires `on_gap` when there's a mismatch.
+
+```python
+from praisonaiagents.gateway import GatewayEvent
+
+# Events from the server carry sequence numbers:
+# event.sequence = 1, 2, 3, ...
+# If the client receives sequence=5 when expecting 4, on_gap(4, 5) fires.
+```
+
+<Warning>
+`on_gap` is a **synchronous** `Callable[[int, int], None]`. You cannot `await` inside it. To call `client.resync()` from within the callback, schedule it as a task:
+
+```python
+def on_gap(expected: int, received: int):
+    asyncio.create_task(client.resync())
+
+client.on_gap = on_gap
+```
+</Warning>
+
+`client.resync()` resets the cursor to 0 and reconnects, triggering a full state reload from the server.
+
+---
+
+## Resume Snapshot
+
+When reconnecting with a stored `session_id` and `since=cursor`, the server replies with a single `joined` payload that restores full client state in one round trip.
+
+The `joined` payload includes:
+
+| Field | Description |
+|-------|-------------|
+| `session_id` | Session identifier |
+| `cursor` | Current event cursor position |
+| `resumed` | `True` if this is a reconnection |
+| `sequence` | Current sequence number (aligned with replay) |
+| `protocol_version` | Negotiated protocol version |
+| `server_min_version` | Server's minimum supported version |
+| `server_max_version` | Server's maximum supported version |
+| `presence` | List of presence dicts for all connected clients |
+| `health` | Gateway health dict |
+
+This means a reconnecting client learns current presence and health **without extra requests** — one round trip restores all state.
+
+---
+
+## Common Patterns
+
+<Tabs>
+
+<Tab title="Basic Reconnecting Consumer">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="consumer",
+        reconnect=True,
+    )
+
+    await client.connect()
+
+    async for event in client.events():
+        print(f"{event.type}: {event.data}")
+
+asyncio.run(main())
+```
+</Tab>
+
+<Tab title="Gap Handler with Resync">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+
+THRESHOLD = 5  # Force resync if more than 5 events are missed
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="consumer",
+        reconnect=True,
+    )
+
+    def on_gap(expected: int, received: int):
+        missed = received - expected
+        if missed > THRESHOLD:
+            print(f"Large gap ({missed} events), forcing resync")
+            asyncio.create_task(client.resync())
+        else:
+            print(f"Small gap ({missed} events), continuing")
+
+    client.on_gap = on_gap
+
+    await client.connect()
+
+    async for event in client.events():
+        print(f"{event.type}: {event.data}")
+
+asyncio.run(main())
+```
+</Tab>
+
+<Tab title="Capped Retries">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="batch-job",
+        reconnect=True,
+        max_reconnect_attempts=5,
+    )
+
+    try:
+        await client.connect()
+        async for event in client.events():
+            print(f"{event.type}: {event.data}")
+    except Exception as e:
+        print(f"Connection failed after 5 attempts: {e}")
+    finally:
+        await client.disconnect()
+
+asyncio.run(main())
+```
+</Tab>
+
+<Tab title="Authenticated">
+```python
+import asyncio
+import os
+from praisonai.gateway import GatewayClient
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="secure-agent",
+        token=os.environ["GATEWAY_TOKEN"],
+        reconnect=True,
+    )
+
+    await client.connect()
+
+    async for event in client.events():
+        print(f"{event.type}: {event.data}")
+
+asyncio.run(main())
+```
+</Tab>
+
+</Tabs>
+
+---
+
+## Network Blip: What Users See
+
+When a network blip occurs, the client handles reconnection silently — users see no errors and events resume from the cursor automatically.
+
+```mermaid
+graph LR
+    subgraph "Network Blip Recovery"
+        U[👤 User] -->|sends message| Bot[🤖 Bot]
+        Bot --> GW[🗼 Gateway]
+        GW -->|event seq=42| C[🔌 Client]
+        GW -.- x[ ] -.->|network drops| C
+        C -->|backoff 1s| Retry[🔄 Reconnect]
+        Retry -->|join since=42| GW
+        GW -->|replay seq 43..N| C
+        C --> Bot
+        Bot -->|response| U
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class U input
+    class Bot,C process
+    class GW output
+    class Retry agent
+```
+
+The bot keeps responding because:
+1. Events are buffered until the cursor is confirmed
+2. The `since=cursor` on reconnect replays any events delivered while offline
+3. Users see continuous responses with no error messages
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+
+<Accordion title="Pick a backoff that matches your network">
+The defaults (`initial=1.0`, `max=30.0`, `multiplier=2.0`) suit residential and cellular networks. For LAN-only deployments with fast recovery, tighten `initial` to `0.1` and `max` to `5.0`.
+
+```python
+from praisonai.gateway import BackoffConfig
+
+lan_backoff = BackoffConfig(initial=0.1, max=5.0, multiplier=2.0, jitter=0.1)
+```
+</Accordion>
+
+<Accordion title="Treat version_unsupported as a permanent failure">
+`connect()` raises `ValueError` on `version_unsupported` and stops retrying. Wrap it and alert your ops team — this means the server and client are incompatible and need a coordinated upgrade.
+
+```python
+try:
+    await client.connect()
+except ValueError as e:
+    # Permanent — do not loop, alert immediately
+    alert_ops(f"Protocol mismatch: {e}")
+    raise
+```
+</Accordion>
+
+<Accordion title="Wire on_gap to your replay or snapshot path">
+If your app already has its own snapshot mechanism, prefer it over `resync()`. A targeted snapshot is faster than a full cursor reset.
+
+```python
+def on_gap(expected: int, received: int):
+    if received - expected > 100:
+        # Large gap — use app-level snapshot
+        asyncio.create_task(app.load_snapshot())
+    else:
+        # Small gap — let cursor replay handle it
+        pass
+```
+</Accordion>
+
+<Accordion title="Pin max_reconnect_attempts in batch jobs">
+Long-running batch jobs should not retry forever on a dead gateway. Set `max_reconnect_attempts` so the job fails fast and can be requeued.
+
+```python
+client = GatewayClient(
+    url="ws://localhost:8765",
+    agent_id="batch-processor",
+    max_reconnect_attempts=3,
+)
+```
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Gateway" icon="tower-broadcast" href="/features/gateway">
+    WebSocket control plane for multi-agent coordination
+  </Card>
+  <Card title="Gateway Overview" icon="map" href="/features/gateway-overview">
+    Architecture and deployment patterns
+  </Card>
+  <Card title="Session Persistence" icon="clock" href="/features/session-persistence">
+    How sessions survive across processes
+  </Card>
+  <Card title="Push Notifications" icon="bell" href="/features/push-notifications">
+    Channel-based pub/sub and delivery guarantees
+  </Card>
+</CardGroup>
