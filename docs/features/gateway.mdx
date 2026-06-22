@@ -28,7 +28,7 @@ graph LR
 ```
 
 <Tip>
-Need automatic reconnect, version negotiation, and gap detection on the client side? See [Gateway Client](/features/gateway-client).
+Reconnecting after a disconnect? See [Resume Integrity](#resume-integrity) — the `joined` ack now signals when you must take a snapshot instead of trusting partial replay. For automatic reconnect, version negotiation, and gap detection on the client side, see [Gateway Client](/features/gateway-client).
 </Tip>
 
 ## Quick Start
@@ -321,14 +321,265 @@ event = GatewayEvent(
 )
 ```
 
-| Event Type | Description |
-|------------|-------------|
-| `MESSAGE` | Text message between parties |
-| `CONNECT` | Client/agent connected |
-| `DISCONNECT` | Client/agent disconnected |
-| `ERROR` | Error notification |
-| `HEARTBEAT` | Keep-alive ping |
-| `BROADCAST` | Message to all clients |
+| Event Type | Description | Session-tracked |
+|------------|-------------|----------------|
+| `MESSAGE` | Text message between parties | ✅ |
+| `CONNECT` | Client/agent connected | |
+| `DISCONNECT` | Client/agent disconnected | |
+| `ERROR` | Error notification | ✅ |
+| `HEARTBEAT` | Keep-alive ping | |
+| `BROADCAST` | Message to all clients | |
+| `TOKEN_STREAM` | Streaming token from agent | ✅ |
+| `TOOL_CALL_STREAM` | Streaming tool call from agent | ✅ |
+| `STREAM_END` | End of agent streaming response | ✅ |
+| `response` | Final agent response | ✅ |
+
+Session-tracked events carry a top-level `seq` field and a `cursor` field, enabling gap detection and resume. `token_stream` and `tool_call_stream` became session-tracked in PR #2155.
+
+---
+
+## Resume Integrity
+
+When the gateway's event buffer has rolled past your last cursor, the `joined` ack now tells you so — and hands you a full snapshot instead of a partial replay — so a reconnecting client can never silently miss events.
+
+```mermaid
+graph TB
+    Join[📨 join + since=N] --> Check{🔍 N < oldest_cursor?}
+    Check -->|No, in buffer| Replay[📜 joined + replay events N+1..head]
+    Check -->|Yes, trimmed| Resync[⚠ joined + resync_required=true]
+    Resync --> Snapshot[📦 snapshot with full state]
+    Replay --> Done[✅ Client up to date]
+    Snapshot --> Done
+
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef happy fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Join request
+    class Check decision
+    class Replay,Done happy
+    class Resync,Snapshot warn
+```
+
+### How the Resume Contract Works
+
+Two paths from a single `{"type": "join", "agent_id": "support", "since": N}` message:
+
+<Tabs>
+<Tab title="Happy Path (since in buffer)">
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway
+
+    Client->>Gateway: {"type": "join", "agent_id": "support", "since": N}
+    Gateway-->>Client: {"type": "joined", "cursor": HEAD, "oldest_cursor": OLDEST, "resync_required": false, "sequence": ..., ...}
+    Gateway-->>Client: {"type": "replay", "event": {...}, "seq": N+1}
+    Gateway-->>Client: {"type": "replay", "event": {...}, "seq": N+2}
+    Note over Client,Gateway: Client is now up to date
+```
+</Tab>
+<Tab title="Resync Path (buffer trimmed)">
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway
+
+    Client->>Gateway: {"type": "join", "agent_id": "support", "since": N}
+    Gateway-->>Client: {"type": "joined", "cursor": HEAD, "oldest_cursor": OLDEST, "resync_required": true, ...}
+    Gateway-->>Client: {"type": "snapshot", "state": {session_id, agent_id, state, messages, event_cursor}}
+    Note over Client: Discard local state. Rebuild from state.messages + state.event_cursor
+```
+</Tab>
+</Tabs>
+
+### `joined` Ack — Wire Fields
+
+The `joined` frame confirms session setup and signals whether replay or resync is required:
+
+| Field | Type | New in #2155 | Description |
+|-------|------|:---:|-------------|
+| `type` | `"joined"` | | Frame type |
+| `session_id` | `str` | | Session UUID — pass back on next reconnect |
+| `agent_id` | `str` | | Agent the client joined |
+| `resumed` | `bool` | | `true` if an existing session was resumed |
+| `cursor` | `int` | | Current head cursor on the server |
+| `oldest_cursor` | `int` | ✅ | Oldest event still in the replay buffer |
+| `resync_required` | `bool` | ✅ | `true` when `since < oldest_cursor` — drop local state |
+| `sequence` | `int` \| `null` | | Sequence aligned with replay events |
+| `protocol_version` | `int` | | Negotiated protocol version |
+| `server_min_version` | `int` | | Server minimum supported version |
+| `server_max_version` | `int` | | Server maximum supported version |
+| `presence` | `list[dict]` | | Presence snapshot |
+| `health` | `dict` | | Gateway health |
+
+### `snapshot` Frame — Wire Fields
+
+Sent immediately after `joined` when `resync_required=true`. Contains the full authoritative session state:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | `"snapshot"` | Frame type |
+| `state.session_id` | `str` | Session UUID |
+| `state.agent_id` | `str` | Agent ID |
+| `state.state` | `dict` | Free-form session state |
+| `state.messages` | `list[dict]` | Full message history (`content`, `sender_id`, `session_id`, `message_id`, `timestamp`, `metadata`) |
+| `state.event_cursor` | `int` | Current event cursor — use as your next `since` |
+
+### Top-Level `seq` on Every Event
+
+Every outbound frame of the following types carries a top-level `seq` field (monotonic, same value as the nested `cursor`):
+
+- `response`
+- `message`
+- `stream_end`
+- `error`
+- `token_stream` *(session-tracked since #2155)*
+- `tool_call_stream` *(session-tracked since #2155)*
+
+Use `seq` for cheap mid-stream gap detection without digging into `event.data.cursor`:
+
+```python
+from praisonai.gateway import GatewayClient
+
+async def on_event(event: dict) -> None:
+    global last_seq
+    expected = last_seq + 1
+    if event["seq"] != expected:
+        await client.resync(since=last_seq)
+    last_seq = event["seq"]
+```
+
+### `since` Validation
+
+The `since` field must be an integer. Non-integer values are now rejected immediately:
+
+```json
+{"type": "error", "message": "Invalid 'since' cursor. Must be an integer."}
+```
+
+The join request is dropped after this error. This catches off-by-string-type bugs (e.g., passing `"42"` instead of `42`) before they cause silent replay failures.
+
+### User Interaction Flow
+
+> *Your Telegram bot stays connected through a 20-minute commute on flaky LTE. The session ID survives. On reconnect, normally the gateway just streams the dozen messages that arrived while you were offline. But if the buffer rolled (very long disconnect + busy session), the gateway sends a one-shot `snapshot` instead of a partial replay — your client UI rebuilds from authoritative state in a single round trip. Either way, no message is silently missed.*
+
+### Best Practices
+
+<AccordionGroup>
+  <Accordion title="Don't trust resumed: true alone — check resync_required">
+    Old clients that only read `resumed` will silently diverge from gateway state if the buffer rolls. `resync_required` is the explicit signal that you must drop local state and rebuild from the snapshot.
+
+    ```python
+    from praisonai.gateway import GatewayClient
+
+    async def on_joined(ack: dict) -> None:
+        if ack.get("resync_required"):
+            apply_snapshot(await receive_snapshot())
+        # Only trust local state when resync_required is False
+    ```
+  </Accordion>
+
+  <Accordion title="Persist event_cursor from the snapshot as your next since">
+    After applying a snapshot, save `state.event_cursor` as your next `since` value. Using the old pre-snapshot cursor will cause another resync on the next reconnect.
+
+    ```python
+    from praisonai.gateway import GatewayClient
+
+    def apply_snapshot(snapshot: dict) -> None:
+        state = snapshot["state"]
+        local_state = state["state"]
+        messages = state["messages"]
+        last_cursor = state["event_cursor"]  # Persist this!
+    ```
+  </Accordion>
+
+  <Accordion title="Use the top-level seq for cheap mid-stream gap detection">
+    `seq` is cheaper to check than digging into `event.data.cursor`. Both carry the same monotonic cursor value, but `seq` sits at the envelope level.
+  </Accordion>
+
+  <Accordion title="Raise max_messages if your sessions are bursty">
+    The default buffer is `max_messages=1000` (from `config.py`), and the gateway keeps at most `max_messages * 2 = 2000` events before trimming. High-volume sessions will trigger more resyncs. Increase it in `SessionConfig` to reduce resync frequency.
+
+    ```python
+    from praisonaiagents import GatewayConfig, SessionConfig
+
+    config = GatewayConfig(
+        session_config=SessionConfig(max_messages=5000)
+    )
+    ```
+
+    <Note>Resync is safe and automatic — it's not an error. It just costs one extra round trip to deliver a full state snapshot instead of a partial replay.</Note>
+  </Accordion>
+</AccordionGroup>
+
+### Common Patterns
+
+<Tabs>
+<Tab title="Polite Reconnect">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+
+async def connect_with_resume(agent_id: str, session_id: str = None, last_cursor: int = None):
+    client = GatewayClient(host="127.0.0.1", port=8765)
+    await client.connect()
+
+    join_msg = {"type": "join", "agent_id": agent_id}
+    if session_id:
+        join_msg["session_id"] = session_id
+    if last_cursor is not None:
+        join_msg["since"] = last_cursor
+
+    await client.send(join_msg)
+    ack = await client.receive()
+
+    if ack["resync_required"]:
+        snapshot = await client.receive()
+        return handle_snapshot(snapshot["state"])
+    else:
+        async for event in client.replay():
+            process_event(event)
+```
+</Tab>
+<Tab title="Snapshot-Aware Client">
+```python
+from praisonai.gateway import GatewayClient
+
+local_messages = []
+last_cursor = 0
+
+async def on_joined(ack: dict, client: GatewayClient) -> None:
+    global local_messages, last_cursor
+
+    if ack.get("resync_required"):
+        snapshot_frame = await client.receive()
+        state = snapshot_frame["state"]
+        local_messages = state["messages"]
+        last_cursor = state["event_cursor"]
+    else:
+        last_cursor = ack["cursor"]
+```
+</Tab>
+<Tab title="Gap-Driven Resync">
+```python
+from praisonai.gateway import GatewayClient
+
+last_seq = 0
+
+async def on_event(event: dict, client: GatewayClient) -> None:
+    global last_seq
+    seq = event.get("seq")
+    if seq is not None:
+        expected = last_seq + 1
+        if seq != expected:
+            await client.send({"type": "join", "since": last_seq})
+            return
+        last_seq = seq
+```
+</Tab>
+</Tabs>
 
 ---
 
@@ -508,6 +759,12 @@ praisonai gateway channels --config gateway.yaml
   </Card>
   <Card title="Sessions" icon="clock" href="/concepts/sessions">
     Manage conversation state
+  </Card>
+  <Card title="Resume Integrity" icon="shield-check" href="/features/gateway#resume-integrity">
+    Handle reconnect, resync, and snapshot
+  </Card>
+  <Card title="Push Notifications" icon="bell" href="/features/push-notifications">
+    Real-time channel-based pub/sub
   </Card>
   <Card title="Gateway Client" icon="plug" href="/features/gateway-client">
     Reconnecting WebSocket client with backoff and gap detection
