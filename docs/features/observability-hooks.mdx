@@ -1,31 +1,32 @@
 ---
 title: "Observability Hooks"
 sidebarTitle: "Observability Hooks"
-description: "Centralized observability init (AgentOps and future providers) for PraisonAI and custom adapters"
+description: "Centralized observability init and finalize (AgentOps and future providers) for PraisonAI and custom adapters"
 icon: "webhook"
 ---
 
-Observability Hooks provide a centralized entry point for initializing observability providers (AgentOps, future Langfuse, W&B) in PraisonAI and custom framework adapters.
+Observability Hooks provide a centralized entry and exit point for observability providers (AgentOps, future Langfuse, W&B) in PraisonAI and custom framework adapters.
 
 ```mermaid
 graph LR
     A[🚀 Orchestrator] --> B[🪝 init_observability]
-    B --> C[📈 AgentOps]
-    B -.future.-> D[📊 Langfuse]
-    B -.future.-> E[📉 W&B]
+    B --> C[📈 AgentOps session start]
+    C --> D[🤖 Agent run]
+    D --> E[🪝 finalize_observability]
+    E --> F[✅ AgentOps session end]
 
     classDef orch fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef hook fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef now fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef future fill:#189AB4,stroke:#7C90A0,color:#fff,stroke-dasharray: 5 5
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef run fill:#189AB4,stroke:#7C90A0,color:#fff
 
     class A orch
-    class B hook
-    class C now
-    class D,E future
+    class B,E hook
+    class D run
+    class C,F result
 ```
 
-`praisonai.observability.hooks.init_observability(framework_tag, *, tags=None)` is now a **public hook**, called automatically by the orchestrator and intended to be called by custom framework adapters' `setup()` method.
+`praisonai.observability.hooks.init_observability(framework_tag, *, tags=None)` and `finalize_observability(_framework_tag, *, status="Success")` are **public hooks**. The orchestrator calls both automatically; custom framework adapters should mirror the same pattern in `setup()` and at run end.
 
 ---
 
@@ -40,7 +41,7 @@ export AGENTOPS_API_KEY=xxx
 ```python
 from praisonai.agents_generator import AgentsGenerator
 
-# init_observability is called for you, with framework_tag = resolved adapter name
+# init_observability and finalize_observability are called for you
 gen = AgentsGenerator("agents.yaml", "crewai", config_list=[...])
 gen.generate_crew_and_kickoff()
 ```
@@ -57,6 +58,28 @@ class MyAdapter(BaseFrameworkAdapter):
     def setup(self, *, framework_tag: str) -> None:
         # Add extra tags for this run
         init_observability(framework_tag, tags=["tenant=acme", "experiment=foo"])
+```
+</Step>
+
+<Step title="Pair init with finalize in custom adapters">
+```python
+from praisonai.framework_adapters.base import BaseFrameworkAdapter
+from praisonai.observability.hooks import init_observability, finalize_observability
+
+class MyAdapter(BaseFrameworkAdapter):
+    name = "myframework"
+
+    def setup(self, *, framework_tag: str) -> None:
+        init_observability(framework_tag, tags=["tenant=acme"])
+
+    def run(self, ...):
+        try:
+            result = my_framework.execute(...)
+            finalize_observability(self.name, status="Success")
+            return result
+        except Exception:
+            finalize_observability(self.name, status="Failure")
+            raise
 ```
 </Step>
 
@@ -81,22 +104,61 @@ if AGENTOPS_AVAILABLE:
 - **Failure mode:** `ImportError` (no agentops) is logged at `DEBUG`; any other exception is logged at `WARNING` and never propagated
 - **`AGENTOPS_AVAILABLE`** module-level boolean for code that wants to short-circuit instrumentation entirely
 
+`finalize_observability(_framework_tag, *, status="Success")` closes observability sessions symmetrically:
+
+- **Auto-call site:** built-in adapters call `finalize_observability(self.name, status=...)` at the end of `run()`/`arun()` (both success and exception paths for AutoGen v0.4 and AG2)
+- **AgentOps end guard:** `agentops.end_session(...)` only fires if `agentops` is importable
+- **Failure mode:** `ImportError` returns silently; any other exception is logged at `WARNING` and never propagated
+- **Why symmetric calls matter:** without `finalize_observability`, AgentOps dashboard sessions stay stuck "in progress"
+
 The hook also leaves room for future providers (the source already has placeholder comments for `_init_langfuse` and `_init_wandb`), so users may want to know the surface area.
+
+```mermaid
+sequenceDiagram
+    participant Orch as Orchestrator
+    participant Hook as observability.hooks
+    participant Adapter as Framework Adapter
+    participant AOps as AgentOps
+
+    Orch->>Hook: init_observability(adapter.name)
+    Hook->>AOps: agentops.init(...)
+    Orch->>Adapter: adapter.run(...)
+    Adapter-->>Orch: result
+    Adapter->>Hook: finalize_observability(adapter.name, status="Success")
+    Hook->>AOps: agentops.end_session("Success")
+```
 
 ---
 
 ## Configuration
+
+### `init_observability`
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `framework_tag` | `str` | required | Primary tag (e.g. `"crewai"`, `"autogen_v4"`). Becomes the first entry in `default_tags` passed to `agentops.init`. |
 | `tags` | `list[str] \| None` | `None` | Extra tags appended after `framework_tag`. |
 
+### `finalize_observability`
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `_framework_tag` | `str` | required | Framework name for context (reserved for future observability providers — currently unused, but pass `framework_tag` for forward-compat). |
+| `status` | `str` (keyword-only) | `"Success"` | Session status passed to `agentops.end_session(...)`. Conventional values: `"Success"`, `"Failure"`. |
+
 ---
 
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Always pair init with finalize">
+The orchestrator auto-handles both hooks for built-in adapters. Custom adapters that bypass the orchestrator must call `finalize_observability` in `try`/`except` blocks to avoid stuck telemetry sessions on the AgentOps dashboard.
+</Accordion>
+
+<Accordion title="Status convention">
+Use `status="Success"` for the happy path and `status="Failure"` in `except` blocks. The string is passed verbatim to `agentops.end_session(...)`; future providers may map other values.
+</Accordion>
+
 <Accordion title="Use for run-scoped tags only">
 The orchestrator calls `init_observability(adapter.name)` once per run. If you call it again from `setup()`, you'll re-init with your tags (last call wins for AgentOps). Use this for run-scoped tags only:
 
