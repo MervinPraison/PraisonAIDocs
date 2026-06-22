@@ -16,6 +16,10 @@ PraisonAI Agents provides automatic session persistence with zero configuration.
 **Released in PR #1709** — Earlier versions could silently drop the latest messages when `update_session_metadata()` ran concurrently with `add_message()` across processes or store instances. Upgrade to pick up the fix.
 </Info>
 
+<Info>
+**Released in PR #2102** — Earlier versions of the gateway session-resume path used the **first** `session_data` system message it found, which was the empty snapshot written at session create. Reconnecting always restored an empty history. Resume now iterates all system messages and keeps the latest snapshot. Also: `WebSocketGateway.stop()` previously called `session.close()` directly, bypassing persistence; it now goes through `close_session()`, so graceful shutdown (SIGTERM) persists in-flight sessions identically to a WebSocket disconnect.
+</Info>
+
 ## Quick Start
 
 ```python
@@ -305,23 +309,78 @@ This caches the system prompt, reducing token costs for repeated conversations.
 
 ## Bot Session Persistence
 
-Bots now use the **same session store** as agents. Each user gets a persistent session that survives bot restarts:
+Bots use the **same session store** as agents. Each user gets a persistent session that survives bot restarts.
+
+Configure via `bot.yaml`:
+
+```yaml
+channels:
+  telegram:
+    token: ${TELEGRAM_TOKEN}
+    session:
+      max_history: 50
+      reset:
+        mode: idle
+        idle_minutes: 30
+```
+
+Run your bot:
 
 ```python
-from praisonaiagents.session import get_default_session_store
+from praisonaiagents import Agent
+from praisonai.bots import TelegramBot
 
-# BotSessionManager with persistent store
-from praisonai.bots._session import BotSessionManager
-
-mgr = BotSessionManager(
-    store=get_default_session_store(),
-    platform="telegram",
+bot = TelegramBot(
+    token="YOUR_BOT_TOKEN",
+    agent=Agent(name="Assistant", instructions="Help users."),
 )
-
-# Each user gets a unique session key: bot_telegram_{user_id}
-response = await mgr.chat(agent, "user123", "Hello!")
-# Session persisted to ~/.praisonai/sessions/bot_telegram_user123.json
+bot.run()
 ```
+
+### max_history Resolution
+
+When a bot starts, it resolves `max_history` using this precedence ladder:
+
+```mermaid
+graph TB
+    A[channel-level max_history in YAML] -->|set?| D[Use channel max_history]
+    A -->|not set| B[session.max_history in YAML]
+    B -->|set?| E[Use session.max_history]
+    B -->|not set| C[Default: 100]
+
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef fallback fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,B config
+    class C fallback
+    class D,E result
+```
+
+### Bot Session Configuration
+
+Configure these settings in your `bot.yaml` under each channel:
+
+| Setting | YAML key | Type | Default | Description |
+|---|---|---|---|---|
+| Per-channel history limit | `max_history` | `int` | `100` | Highest precedence. Caps messages kept per user. |
+| Session-scoped history limit | `session.max_history` | `int` | `100` | Used when `max_history` is not set. |
+| Session reset mode | `session.reset.mode` | `string` | `"none"` | `none`, `idle`, `daily`, or `both`. |
+| Idle reset threshold | `session.reset.idle_minutes` | `int` | `60` | Minutes of inactivity before reset (when mode includes `idle`). |
+| Daily reset hour | `session.reset.at_hour` | `int` | — | Hour (0–23) for daily reset (required when mode includes `daily`). |
+
+<Note>
+`max_history` at the channel level takes precedence over `session.max_history`. Use `session.max_history` for new configs — it is the preferred form.
+</Note>
+
+### Session Reset Policies
+
+| Mode | Behavior |
+|---|---|
+| `none` | Sessions never auto-reset (default). |
+| `idle` | Resets after `idle_minutes` of inactivity. |
+| `daily` | Resets once per day at `at_hour` (0–23). |
+| `both` | Resets on idle **or** on daily schedule, whichever comes first. |
 
 <Note>
 Without a `store` parameter, `BotSessionManager` falls back to in-memory-only mode for backward compatibility.
