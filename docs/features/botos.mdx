@@ -7,7 +7,9 @@ icon: "robot"
 
 ```mermaid
 flowchart TB
-    BotOS[BotOS Orchestrator] --> B1[Bot - Telegram]
+    Supervisor[Channel Supervisor] --> Monitor[Health Monitor]
+    Monitor --> BotOS[BotOS Orchestrator]
+    BotOS --> B1[Bot - Telegram]
     BotOS --> B2[Bot - Discord]
     BotOS --> B3[Bot - Slack]
     BotOS --> B4[Bot - Custom]
@@ -16,12 +18,15 @@ flowchart TB
     B3 --> Agent
     B4 --> Agent
 
-    style BotOS fill:#8B0000,color:#fff
-    style B1 fill:#189AB4,color:#fff
-    style B2 fill:#189AB4,color:#fff
-    style B3 fill:#189AB4,color:#fff
-    style B4 fill:#189AB4,color:#fff
-    style Agent fill:#8B0000,color:#fff
+    classDef supervisor fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef botos fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef bot fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Supervisor,Monitor supervisor
+    class BotOS botos
+    class B1,B2,B3,B4 bot
+    class Agent agent
 ```
 
 BotOS lets you deploy your AI agent to **multiple messaging platforms** with just a few lines of code. One agent brain, many channels.
@@ -250,6 +255,123 @@ bot.run()
 Smart defaults only apply to plain `Agent` instances. `AgentTeam` and `AgentFlow` are left untouched — they already have their own configuration.
 </Note>
 
+## Auto-Recovery & Health Monitoring
+
+Every `BotOS` instance is supervised by default — crashed bots are restarted with backoff, and proactive health checks catch hung connections before users notice.
+
+```mermaid
+sequenceDiagram
+    participant BotOS
+    participant Supervisor
+    participant Bot
+    participant Platform
+
+    BotOS->>Supervisor: run(bot)
+    Supervisor->>Bot: start()
+    Bot->>Platform: connect
+    Note over Bot,Platform: crash or stale socket
+    Supervisor->>Bot: restart (backoff)
+    Bot->>Platform: reconnect
+```
+
+Supervision is on automatically — no extra arguments needed:
+
+```python
+from praisonai.bots import BotOS
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", instructions="Be helpful.")
+botos = BotOS(agent=agent, platforms=["telegram", "discord"])
+botos.run()  # supervised by default
+```
+
+Tune the health monitor when you need tighter sweeps or restart caps:
+
+```python
+from praisonai.bots import BotOS
+from praisonai.gateway.health_monitor import HealthMonitorConfig
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", instructions="Be helpful.")
+
+botos = BotOS(
+    agent=agent,
+    platforms=["telegram"],
+    health_monitor=HealthMonitorConfig(interval=120, max_restarts_per_hour=20),
+)
+```
+
+Opt out when an external supervisor (systemd, Kubernetes) owns restarts:
+
+```python
+botos = BotOS(agent=agent, platforms=["telegram"], enable_supervision=False)
+```
+
+```yaml
+# botos.yaml
+agent:
+  name: assistant
+  instructions: Be helpful.
+platforms:
+  telegram:
+    token: ${TELEGRAM_BOT_TOKEN}
+  discord:
+    token: ${DISCORD_BOT_TOKEN}
+health:
+  interval: 300
+  startup_grace: 60
+  max_restarts_per_hour: 10
+supervision:
+  enabled: true   # default; set false to opt out
+```
+
+## Operator Controls
+
+When supervision is enabled, use Python API controls (BotOS has no CLI for these):
+
+```python
+botos.pause_bot("telegram")      # stop processing; returns False if supervision disabled
+botos.resume_bot("telegram")     # restart from pause
+botos.reconnect_bot("telegram")  # full reset + reconnect
+```
+
+```mermaid
+graph TD
+    Start([Which control?]) --> Question{Bot state?}
+    Question -->|RUNNING, temporary issue| Pause[pause_bot]
+    Question -->|FAILED, need reset| Reconnect[reconnect_bot]
+    Question -->|PAUSED, issue resolved| Resume[resume_bot]
+
+    classDef action fill:#189AB4,stroke:#7C90A0,color:#fff
+    class Pause,Resume,Reconnect action
+```
+
+## Aggregated Health
+
+```python
+import asyncio
+from praisonai.bots import BotOS
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", instructions="Be helpful.")
+botos = BotOS(agent=agent, platforms=["telegram", "discord"])
+
+async def check():
+    health_by_platform = await botos.health()
+    # {"telegram": HealthResult(...), "discord": HealthResult(...)}
+    print(health_by_platform["telegram"].ok)
+    print(health_by_platform["telegram"].reason)
+    print(health_by_platform["telegram"].last_activity)
+
+    status = botos.get_supervisor_status()
+    # supervisor + health-monitor snapshot for /healthz or metrics
+    return status
+
+asyncio.run(check())
+```
+
+Plug `await botos.health()` into a `/healthz` endpoint or Prometheus exporter — one dict per platform, no custom wiring per adapter.
+
 ## Unified Per-User Session
 
 Link multiple platforms so one human gets one conversation across all channels:
@@ -443,6 +565,12 @@ botos.run()
 <ParamField path="identity_resolver" type="IdentityResolverProtocol">
   Cross-platform identity resolver for unified sessions.
 </ParamField>
+<ParamField path="health_monitor" type="HealthMonitorConfig">
+  Proactive health sweep settings (`interval`, `startup_grace`, `stale_after`, `max_restarts_per_hour`).
+</ParamField>
+<ParamField path="enable_supervision" type="bool" default="True">
+  Run each bot through `ChannelSupervisor` with auto-recovery. Set `False` when an external supervisor owns restarts.
+</ParamField>
 
 **Methods:**
 - `botos.run()` — Start all bots (sync, blocks)
@@ -452,6 +580,11 @@ botos.run()
 - `botos.remove_bot("platform")` — Remove a bot
 - `botos.list_bots()` — List platform names
 - `botos.get_bot("platform")` — Get a bot by platform
+- `await botos.health()` — Aggregated `Dict[str, HealthResult]` across all bots
+- `botos.get_supervisor_status()` — Supervisor + health-monitor snapshot
+- `botos.pause_bot("platform")` — Pause a supervised bot
+- `botos.resume_bot("platform")` — Resume a paused bot
+- `botos.reconnect_bot("platform")` — Force reconnect and reset error state
 - `await botos.deliver(target, text, origin=None)` — Proactive outbound delivery (see [Proactive Delivery](/docs/features/proactive-delivery))
 - `botos.configure_channels(config)` — Set home channels and aliases
 - `botos.delivery_router` — Direct access to `DeliveryRouter` and `ChannelDirectory`
