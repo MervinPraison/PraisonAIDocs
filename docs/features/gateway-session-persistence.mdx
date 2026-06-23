@@ -1,0 +1,211 @@
+---
+title: "Gateway Session Persistence"
+sidebarTitle: "Session Persistence"
+description: "Persistent gateway sessions that survive restarts, with reconnect and event replay"
+icon: "database"
+---
+
+Persistent sessions keep conversation state alive across gateway restarts and let clients resume mid-conversation with event replay.
+
+```mermaid
+graph LR
+    A[Active session] --> B[Disconnect]
+    B --> C[Persisted store]
+    C --> D[Reconnect + since cursor]
+    D --> E[Rehydrate + replay]
+
+    classDef active fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef resume fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef cfg fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class A active
+    class B store
+    class C store
+    class D,E resume
+```
+
+## Quick Start
+
+<Steps>
+
+<Step title="Enable persistence">
+
+```yaml
+gateway:
+  host: "127.0.0.1"
+  port: 8765
+  session:
+    persist: true
+```
+
+```bash
+praisonai gateway start --config gateway.yaml
+```
+
+Default storage: `~/.praisonai/sessions/`
+
+</Step>
+
+<Step title="Resume as a client">
+
+```python
+import asyncio
+import json
+import websockets
+
+async def resume(session_id: str, since: int):
+    async with websockets.connect("ws://127.0.0.1:8765") as ws:
+        await ws.send(json.dumps({
+            "type": "join",
+            "agent_id": "assistant",
+            "session_id": session_id,
+            "since": since,
+        }))
+        while True:
+            msg = json.loads(await ws.recv())
+            if msg.get("type") == "joined" and msg.get("resumed"):
+                print("Resumed at cursor", msg.get("cursor"))
+            if msg.get("type") == "replay":
+                print("Replay:", msg.get("event"))
+
+asyncio.run(resume("abc-123", 42))
+```
+
+</Step>
+
+<Step title="Full configuration">
+
+```yaml
+gateway:
+  session:
+    persist: true
+    persist_path: ~/.praisonai/sessions/
+    resume_window: 86400
+    timeout: 3600
+    max_messages: 1000
+```
+
+</Step>
+
+</Steps>
+
+## How it works
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant S as SessionStore
+
+    C->>G: join (new session)
+    G->>C: joined + cursor events
+    C->>G: leave / disconnect
+    G->>S: persist session + TTL
+    C->>G: join (session_id, since)
+    G->>S: load session
+    G->>C: joined (resumed=true)
+    G->>C: replay events
+```
+
+| Role | Responsibility |
+|------|----------------|
+| Client | Track highest `cursor`; send `since` on reconnect |
+| Gateway | Rehydrate sessions; emit replay frames |
+| SessionStore | Persist state to disk |
+| TTL cleanup | Hourly purge of expired sessions |
+
+## Reconnect protocol
+
+**Client join (resume):**
+
+```json
+{ "type": "join", "agent_id": "assistant", "session_id": "abc-123", "since": 42 }
+```
+
+**Server joined:**
+
+```json
+{ "type": "joined", "session_id": "abc-123", "agent_id": "assistant", "resumed": true, "cursor": 57 }
+```
+
+**Replay frames:**
+
+```json
+{ "type": "replay", "event": { "...": "..." } }
+```
+
+<Note>
+Every `response`, `message`, `stream_end`, and `error` frame includes a monotonic `cursor`. Track the highest value for the next reconnect.
+</Note>
+
+## Configuration options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `persist` | `bool` | `false` | Enable persistent session storage |
+| `persist_path` | `str` | `~/.praisonai/sessions/` | Storage directory |
+| `resume_window` | `int` | `86400` | Seconds a detached session stays resumable (24 h) |
+| `timeout` | `int` | `3600` | Active session expiry in seconds |
+| `max_messages` | `int` | `1000` | History cap per session |
+
+## Common patterns
+
+**Python override:**
+
+```python
+from praisonai.gateway.server import WebSocketGateway
+from praisonaiagents.session.store import DefaultSessionStore
+
+gateway = WebSocketGateway(
+    port=8765,
+    session_store=DefaultSessionStore("./sessions"),
+)
+```
+
+**Choosing `resume_window`:** minutes for ephemeral chat, 24 h for support bots, up to 7 days for long tasks.
+
+```mermaid
+graph TB
+    Q{Need survive restart?}
+    Q -->|Yes| P[persist: true]
+    Q -->|No| D[In-memory only]
+    P --> R{Frequent reconnects?}
+    R -->|Yes| W[Tune resume_window]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    class Q q
+```
+
+## Best practices
+
+<AccordionGroup>
+
+<Accordion title="Always send since on reconnect">
+Without `since`, the client may miss events between disconnect and resume.
+</Accordion>
+
+<Accordion title="Match resume_window to user behaviour">
+Too short loses conversations; too long grows disk usage.
+</Accordion>
+
+<Accordion title="Back up persist_path">
+Session files should be included in normal backup rotation.
+</Accordion>
+
+<Accordion title="One gateway per persist_path">
+Do not share storage between two gateway processes — see Gateway Overview single-instance guidance.
+</Accordion>
+
+</AccordionGroup>
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Gateway Overview" icon="tower-broadcast" href="/docs/features/gateway-overview">
+    Gateway setup and configuration
+  </Card>
+  <Card title="Bot vs Gateway" icon="code-compare" href="/docs/concepts/bot-vs-gateway">
+    When to use gateway vs direct bots
+  </Card>
+</CardGroup>
