@@ -104,6 +104,10 @@ class WhatsAppBot(ChatCommandMixin, MessageHookMixin):
         self._phone_number_id = phone_number_id or os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
         self._agent = agent
         self.config = config or BotConfig(token=self._token)
+        
+        # Initialize allow_silence from config
+        self._allow_silence = getattr(self.config, 'allow_silence', False)
+        
         self._verify_token = verify_token or os.environ.get("WHATSAPP_VERIFY_TOKEN", "")
         self._app_secret = app_secret or os.environ.get("WHATSAPP_APP_SECRET", "")
         self._webhook_port = webhook_port
@@ -130,31 +134,11 @@ class WhatsAppBot(ChatCommandMixin, MessageHookMixin):
         self._is_running = False
         self._started_at: Optional[float] = None
         self._bot_user: Optional[BotUser] = None
-        try:
-            from praisonaiagents.session import get_default_session_store
-            _store = get_default_session_store()
-        except Exception:
-            _store = None
-        # Extract reset policy from config
-        reset_policy = None
-        if hasattr(self.config, 'session') and self.config.session:
-            if hasattr(self.config.session, 'reset') and self.config.session.reset:
-                from ._reset_policy import SessionResetPolicy
-                reset_policy = SessionResetPolicy.from_dict(self.config.session.reset.model_dump())
-        
-        # Support backward compatibility with max_history at channel level
-        max_history = 100
-        if hasattr(self.config, 'max_history') and self.config.max_history is not None:
-            max_history = self.config.max_history
-        elif hasattr(self.config, 'session') and self.config.session:
-            if hasattr(self.config.session, 'max_history') and self.config.session.max_history is not None:
-                max_history = self.config.session.max_history
-        
-        self._session_mgr = BotSessionManager(
-            max_history=max_history,
-            store=_store,
-            platform="whatsapp",
-            reset_policy=reset_policy,
+        # Use helper to build session manager
+        from ._session import build_session_manager
+        self._session_mgr = build_session_manager(
+            self.config,
+            platform="whatsapp"
         )
         self._message_handlers: List[Callable] = []
         self._runner: Any = None

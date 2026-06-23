@@ -77,6 +77,8 @@ class BotSessionManager:
         run_control: Optional[Any] = None,
         run_timeout: float = 300.0,  # 5 minutes default timeout
         reset_policy: Optional[SessionResetPolicy] = None,
+        channel_directory: Optional[Any] = None,
+        inject_session_context: bool = True,
     ) -> None:
         self._histories: Dict[str, List[Dict[str, Any]]] = {}
         self._locks = LockMap()
@@ -98,6 +100,9 @@ class BotSessionManager:
         # When set, messages are journaled before agent processing for
         # crash recovery and webhook redelivery protection.
         self._ingress_journal = ingress_journal
+        # Platform awareness: channel directory and injection flag
+        self._channel_directory = channel_directory
+        self._inject_session_context = inject_session_context
         self._last_journal_key = None  # Store key for delayed completion
         # Run control for in-flight message handling
         self._run_control = run_control
@@ -269,7 +274,38 @@ class BotSessionManager:
             from praisonaiagents.session.context import (
                 set_session_context as _set_ctx,
                 clear_session_context as _clear_ctx,
+                Origin,
+                ReachableTarget,
             )
+            
+            # Build enriched context if platform awareness is enabled
+            origin = None
+            reachable_targets = None
+            
+            if self._inject_session_context:
+                # Detect chat type and build origin
+                from .delivery import detect_chat_type
+                chat_type = detect_chat_type(self._platform, chat_id)
+                origin = Origin(
+                    platform=self._platform,
+                    chat_type=chat_type,
+                    display_name=chat_id,  # Use chat_id as display_name since chat_name is not available
+                    thread_id=thread_id,
+                )
+                
+                # Get reachable targets from channel directory
+                if self._channel_directory:
+                    targets_data = self._channel_directory.describe_targets()
+                    reachable_targets = [
+                        ReachableTarget(
+                            name=t['name'],
+                            platform=t['platform'],
+                            channel_id=t['channel_id'],
+                            kind=t['kind'],
+                        )
+                        for t in targets_data
+                    ]
+            
             ctx_token = _set_ctx(
                 platform=self._platform,
                 chat_id=chat_id,
@@ -277,6 +313,8 @@ class BotSessionManager:
                 user_id=user_id,
                 user_name=user_name,
                 unified_user_id=self._storage_key(user_id),
+                origin=origin,
+                reachable_targets=reachable_targets,
             )
         except Exception:  # pragma: no cover — defensive
             _clear_ctx = None  # type: ignore[assignment]
@@ -798,3 +836,57 @@ class BotSessionManager:
     def get_user_ids(self) -> List[str]:
         """List user IDs with active sessions."""
         return list(self._histories.keys())
+
+
+def build_session_manager(config, platform: str, *, run_control=None) -> BotSessionManager:
+    """Build a BotSessionManager with standard configuration from a BotConfig.
+    
+    This helper extracts the common session manager setup logic that's duplicated
+    across all bot adapters, including:
+    - Session store acquisition
+    - Reset policy extraction
+    - Backward-compatible max_history resolution
+    
+    Args:
+        config: BotConfig instance with session configuration
+        platform: Platform identifier (e.g., "telegram", "slack")
+        run_control: Optional run control for Telegram (keyword-only)
+    
+    Returns:
+        Configured BotSessionManager instance
+    """
+    # Try to get the default session store
+    try:
+        from praisonaiagents.session import get_default_session_store
+    except ImportError:
+        # Module not available, fallback to in-memory
+        store = None
+    else:
+        try:
+            store = get_default_session_store()
+        except Exception as exc:
+            logger.warning(
+                "Default session store unavailable; falling back to in-memory store: %s",
+                exc,
+            )
+            store = None
+    
+    # Extract reset policy from config
+    reset_policy = None
+    if getattr(config, "session", None) and getattr(config.session, "reset", None):
+        reset_policy = SessionResetPolicy.from_dict(config.session.reset.model_dump())
+    
+    # Support backward compatibility with max_history at channel level
+    max_history = 100
+    if getattr(config, "max_history", None) is not None:
+        max_history = config.max_history
+    elif getattr(config, "session", None) and getattr(config.session, "max_history", None) is not None:
+        max_history = config.session.max_history
+    
+    return BotSessionManager(
+        max_history=max_history,
+        store=store,
+        platform=platform,
+        reset_policy=reset_policy,
+        run_control=run_control,
+    )
