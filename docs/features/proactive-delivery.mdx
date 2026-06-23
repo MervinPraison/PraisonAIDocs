@@ -114,6 +114,7 @@ sequenceDiagram
 | `<platform>` | Platform's `home_channel` | `deliver("telegram", text)` |
 | `<platform>:<id>` | Explicit channel | `deliver("telegram:123456", text)` |
 | `<alias>` | Friendly name from directory | `deliver("ops-alerts", text)` |
+| `<platform>:<id>` | Observed channel from traffic or adapter refresh | Surfaced in `describe_targets()` as `kind: "observed"` |
 
 Resolution order: `origin` → `platform:channel_id` → bare platform name → alias. Platform names win over aliases — do not name an alias the same as a platform.
 
@@ -167,6 +168,121 @@ botos.delivery_router.directory.add_alias("ops-alerts", "telegram", "123456")
 botos.delivery_router.directory.set_home_channel("telegram", "123456")
 ```
 
+## Persistence
+
+Home and observed channels auto-persist to `~/.praisonai/state/channel_directory.json` and reload on start — reachable targets survive restarts.
+
+```python
+from pathlib import Path
+from praisonai.bots.delivery import ChannelDirectory
+
+# Default paths — channels survive restarts automatically
+directory = ChannelDirectory()
+directory.set_home_channel("telegram", "123456")
+directory.observe_channel("discord", "555")
+
+# Restart your process — channels are still reachable
+directory2 = ChannelDirectory()
+# telegram:home and discord:555 are immediately available
+```
+
+Custom paths for multi-tenant or containerised deployments:
+
+```python
+directory = ChannelDirectory(
+    persist_path=Path("/var/lib/myapp/dir.json"),
+    aliases_path=Path("/var/lib/myapp/aliases.json"),
+)
+```
+
+| Arg | Type | Default | Description |
+|---|---|---|---|
+| `persist_path` | `Optional[Path]` | `~/.praisonai/state/channel_directory.json` | Home + observed channels. Atomic write via temp file + `os.replace`. |
+| `aliases_path` | `Optional[Path]` | `~/.praisonai/state/channel_aliases.json` | Hand-editable alias overlay re-applied on every load + refresh. |
+
+<Note>
+Persistence is best-effort — failures are logged and never raised. Your bot keeps running even if the state directory is read-only.
+</Note>
+
+```mermaid
+graph LR
+    subgraph "Lifecycle"
+        Start([Start]) --> Load[Load channel_directory.json]
+        Load --> Overlay[Apply channel_aliases.json]
+        Overlay --> Ready([Ready])
+        Ready --> Traffic[Observe traffic]
+        Traffic --> Save[Persist]
+        Save --> Ready
+        Ready --> Refresh[refresh_from_adapters]
+        Refresh --> Overlay2[Re-apply overlay]
+        Overlay2 --> Save
+    end
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef io fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ready fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start,Ready start
+    class Traffic,Refresh process
+    class Load,Overlay,Overlay2,Save io
+```
+
+## Pre-Naming Channels (Alias Overlay)
+
+Drop a JSON file at `~/.praisonai/state/channel_aliases.json` to pre-name channels before they produce any traffic.
+
+```json
+{
+  "engineering": { "platform": "discord", "channel_id": "555" },
+  "ops": "slack:C111"
+}
+```
+
+Both long form and shorthand (`"platform:channel_id"`) are accepted. Invalid entries are skipped with a warning.
+
+With the overlay in place, the agent can deliver to `"engineering"` even without prior messages from that channel:
+
+```python
+from praisonai.bots.delivery import ChannelDirectory
+
+directory = ChannelDirectory()
+# engineering and ops are already reachable — no traffic needed
+await botos.deliver("engineering", "Deploy complete")
+```
+
+Editing the file and calling `refresh_directory()` (or restarting) honours alias deletions. Aliases added in code via `add_alias()` are never pruned by the overlay.
+
+## Refreshing from Live Adapters
+
+`refresh_directory()` enumerates every configured adapter and merges their channels into the directory — channels the agent has never been messaged from become reachable immediately.
+
+```python
+# Gateway background loop — call this periodically
+botos.delivery_router.refresh_directory()
+```
+
+Lower-level API for direct adapter access:
+
+```python
+from praisonai.bots.delivery import ChannelDirectory
+
+directory = ChannelDirectory()
+directory.refresh_from_adapters({
+    "discord": discord_bot,
+    "slack": slack_bot,
+})
+```
+
+Adapter contract: adapters must expose `list_channels()` returning an iterable of objects with a `.id` attribute (or plain strings). Adapters without `list_channels` are silently skipped; adapter errors are caught and logged, never raised.
+
+**User flow this enables:**
+
+1. User asks the agent: *"Post a summary to the engineering channel."*
+2. The agent has never received traffic from that channel.
+3. Because the gateway's background `refresh_directory()` already enumerated the Discord adapter, `"engineering"` is in the directory.
+4. `deliver("engineering", summary)` succeeds.
+
 ## Common Patterns
 
 ### Scheduled digest to a named channel
@@ -180,6 +296,19 @@ await botos.deliver("ops-alerts", summary)
 
 ```python
 await botos.deliver("slack:C123ABC", "FYI: deploy complete")
+```
+
+### Periodic refresh in a gateway loop
+
+```python
+import asyncio
+
+async def background_refresh(botos, interval=300):
+    while True:
+        botos.delivery_router.refresh_directory()
+        await asyncio.sleep(interval)
+
+asyncio.create_task(background_refresh(botos))
 ```
 
 ## Best Practices
@@ -199,6 +328,14 @@ Platform-name lookup wins; the alias becomes unreachable by bare name.
 
 <Accordion title="Handle the bool return">
 `deliver()` returns `False` on resolution or send failure — log and retry as appropriate.
+</Accordion>
+
+<Accordion title="Use the alias overlay for pre-production setup">
+Pre-populate `channel_aliases.json` before deploying — channels become reachable without needing to send a message first.
+</Accordion>
+
+<Accordion title="Call refresh_directory() on a background loop">
+Adapters enumerate live channels; a 5-minute refresh keeps the directory current without hammering APIs.
 </Accordion>
 </AccordionGroup>
 
