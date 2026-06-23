@@ -156,8 +156,7 @@ Framework adapters must implement the `FrameworkAdapter` protocol:
 |--------|----------|-------------|
 | `name` | ✅ | Unique framework identifier |
 | `is_available()` | ✅ | Check framework dependencies |
-| `resolve()` | ❌ | Pick the concrete adapter variant from YAML config (default returns `self`) |
-| `resolve_variant(config, registry)` | ❌ | Lower-level variant hook; family adapters may override when config-driven routing is needed |
+| `resolve(*, config=None)` | ❌ | Pick the concrete adapter variant from YAML config (keyword-only `config`; default returns `self`) |
 | `resolve_alias()` | ❌ | Return the concrete adapter name to dispatch to (string). Default returns `self.name`. Override when your adapter is a router that picks a sibling adapter at runtime by name. |
 | `setup(*, framework_tag)` | ❌ | Framework-specific pre-run hooks (default no-op) |
 | `run(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ✅ | Execute framework logic (all four trailing kwargs are validated at registration time — see Troubleshooting) |
@@ -175,8 +174,12 @@ missing keyword-only parameters ['agent_callback', 'cli_config', 'task_callback'
 Adapters that fail validation also report `registry.is_available("<name>") == False` instead of raising — so a broken plugin will simply disappear from the available-framework list rather than crashing the CLI.
 
 <Note>
-`resolve_alias()` (added in PR #2086) and `resolve_variant(config, registry)` (added in PR #1988) are **both** present on the Protocol. Use `resolve_variant` when your family decision depends on YAML config keys; use `resolve_alias` when it depends on environment / runtime state. They are not mutually exclusive — `AutoGenFamilyAdapter` uses `resolve_alias` internally inside its own `resolve(config=...)` override.
+`resolve_alias()` (PR #2086) and `resolve(*, config=None)` (PR #2070) serve different roles. Use `resolve(*, config=...)` when variant selection depends on YAML keys such as `autogen_version`. Use `resolve_alias()` when routing depends on environment or runtime state. Family adapters may combine both.
 </Note>
+
+<Warning>
+**Migrating from `resolve_variant`:** If you authored a custom framework adapter against PR #1988 (`resolve_variant(config, registry)`), rename your method to `resolve` and drop the `registry` parameter. The orchestrator calls `adapter.resolve(config=config)`. Accept `config` as keyword-only: `*, config=None`. Instantiate sibling adapters directly (e.g. `AutoGenV4Adapter()`) rather than calling `registry.create(...)`.
+</Warning>
 
 **Single authoritative `arun()` (PR #1857):** The Protocol declares `arun()` once; `BaseFrameworkAdapter` provides a single default that offloads `run()` to a worker thread via `asyncio.to_thread`. Sync-only adapters (crewai, autogen v0.2) inherit this and need do nothing. Native-async adapters override `arun()`. Earlier revisions of the codebase declared `arun()` twice on both the Protocol and the base class; those duplicate declarations have been removed and there is now exactly one default to override.
 
@@ -262,16 +265,39 @@ Key points:
 
 After the existing "Adapter protocol" section, two new optional methods were added in PR #1763:
 
-**`resolve()`** — pick a concrete variant.
+**`resolve(*, config=None)`** — pick a concrete variant (PR #2070).
 
 ```python
-def resolve(self) -> "FrameworkAdapter":
-    """Pick the concrete adapter variant.
-    
-    Default implementation returns self. Override if your adapter is a
-    'family' (e.g. multiple SDK versions) and you want to pick at runtime.
+def resolve(self, *, config: Optional[Dict[str, Any]] = None) -> "FrameworkAdapter":
+    """Pick the concrete adapter variant (e.g. autogen v0.2 vs v0.4).
+
+    Args:
+        config: YAML configuration that may contain version preferences
+
+    Returns:
+        The resolved adapter instance (self or a different adapter)
     """
     return self
+```
+
+**Worked example — `AutoGenAdapter.resolve`:** the orchestrator passes YAML config; the adapter instantiates siblings directly:
+
+```python
+def resolve(self, *, config: Optional[Dict[str, Any]] = None) -> "BaseFrameworkAdapter":
+    version = "auto"
+    if config and config.get("autogen_version"):
+        version = str(config["autogen_version"]).lower()
+    else:
+        version = os.environ.get("AUTOGEN_VERSION", "auto").lower()
+
+    v4_adapter = AutoGenV4Adapter()  # direct instantiation — no registry.create()
+    v2_adapter = self
+
+    if version == "v0.4" and v4_adapter.is_available():
+        return v4_adapter
+    elif version == "v0.2" and v2_adapter.is_available():
+        return v2_adapter
+    # ... auto-detect and fallback ...
 ```
 
 **`setup(*, framework_tag)`** — pre-run hook.
