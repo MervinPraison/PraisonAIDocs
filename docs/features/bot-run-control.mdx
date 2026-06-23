@@ -56,6 +56,10 @@ While the bot is working, send `/stop` to cancel the current task. The bot respo
 
 ## How It Works
 
+<Note>
+Fixed in [PR #1980](https://github.com/MervinPraison/PraisonAI/pull/1980) (release after 2026-06-19): earlier releases wired the interrupt controller to the wrong attribute, so `/stop` and `busy_mode="interrupt"` silently had no effect. Queued follow-ups were surfaced in metadata but never drained — upgrade to pick up the fix.
+</Note>
+
 ```mermaid
 sequenceDiagram
     participant User
@@ -79,9 +83,11 @@ sequenceDiagram
     Bot-->>User: "✅ task cancelled"
     
     Agent-->>Bot: processing complete
-    Bot->>RunControl: next_pending()
-    RunControl-->>Bot: "actually focus on AI"
-    Bot->>Agent: start new task
+    loop Drain pending queue
+        Bot->>RunControl: next_pending()
+        RunControl-->>Bot: queued message (or none)
+        Bot->>Agent: start new task
+    end
 ```
 
 When `run_timeout` is exceeded (default 300 seconds), `BotSessionManager` raises `BotRunTimeout` and cancels the in-flight run. Timeout failures are **not** pushed to the DLQ, so slow agents do not retry in a loop.
@@ -139,6 +145,22 @@ bot = TelegramBot(
 | `busy_ack` | `str` | `"⏳ {action} — will be considered next"` | Template for busy acknowledgment. `{action}` is replaced with `"noted"` (queued) or `"added to pending request"` (merged). |
 | `run_timeout` | `float` | `300.0` | Maximum seconds a single agent run may take before it is cancelled with `BotRunTimeout`. Set to `0` or a negative value to disable. Applies to both streaming (`agent.astart`) and non-streaming (`agent.chat`) paths. |
 
+### Run metadata
+
+`chat_with_run_control` returns `{"response": str, "metadata": dict}`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_control` | `bool` | Always `True` when run control was active. |
+| `decision` | `str` | Initial decision: `"RUN_NOW"`, `"QUEUED"`, or `"INTERRUPTED"`. |
+| `completed` | `bool` | `True` after the run and drain loop finish cleanly. |
+| `run_generation` | `int` | Generation counter for race protection. |
+| `pending_processed` | `list[str]` | Queued follow-ups drained after the initial run (each truncated to 100 chars). Present only when at least one was processed. |
+| `interrupted` | `bool` | `True` if the run was cancelled mid-way. |
+| `reason` | `str` | Cancellation reason (when `interrupted` is `True`). |
+
+Queue drain implemented in [PR #1980](https://github.com/MervinPraison/PraisonAI/pull/1980).
+
 ### Programmatic cancellation
 
 `BotSessionManager` exposes cancellation for admin hooks or custom integrations:
@@ -183,7 +205,7 @@ agent = Agent(
 bot = TelegramBot(
     token="YOUR_TOKEN",
     agent=agent,
-    busy_mode="queue",  # Preserves work, processes follow-ups in order
+    busy_mode="queue",  # Preserves work — all follow-ups drained in order after each run
     busy_ack="📚 Research noted — {action}. Will incorporate after analysis."
 )
 
