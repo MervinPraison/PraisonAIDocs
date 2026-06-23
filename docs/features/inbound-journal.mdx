@@ -52,6 +52,10 @@ agent = Agent(name="Support Bot", instructions="Help users with their questions"
 </Step>
 </Steps>
 
+<Note>
+You don't need to call `complete()` yourself when using `BotSessionManager.chat()` — successful chats mark the journal entry as completed automatically. You only need to call `complete()` manually if you're driving `InboundJournal` directly without `BotSessionManager`.
+</Note>
+
 ---
 
 ## How It Works
@@ -70,9 +74,15 @@ sequenceDiagram
         Adapter->>Journal: claim(key)
         Adapter->>Agent: chat(prompt)
         Agent-->>Adapter: response
-        Adapter->>Platform: send reply
         Adapter->>Journal: complete(key)
-    else Duplicate redelivery
+        Adapter->>Platform: send reply
+    else Redelivery — prior attempt still pending or stale-claimed
+        Journal-->>Adapter: same key (retry)
+        Adapter->>Agent: chat(prompt)
+        Agent-->>Adapter: response
+        Adapter->>Journal: complete(key)
+        Adapter->>Platform: send reply
+    else Redelivery — already completed or actively claimed
         Journal-->>Adapter: None
         Adapter-->>Platform: 200 OK (silent skip)
     end
@@ -80,9 +90,9 @@ sequenceDiagram
 
 | Stage | Purpose | What happens |
 |-------|---------|-------------|
-| **receive** | Deduplication | Returns key for new messages, None for duplicates |
-| **claim** | Crash protection | Marks entry as being processed |
-| **complete** | Cleanup | Marks successful processing |
+| **receive** | Deduplication & retry | Returns a key for new messages, retries pending or stale-claimed duplicates, returns `None` only for already-completed or actively-claimed entries |
+| **claim** | Crash protection | Marks the entry as being processed (auto-released on stale timeout) |
+| **complete** | Cleanup | Marks successful processing — `BotSessionManager.chat()` calls this for you automatically |
 
 ---
 
@@ -283,7 +293,10 @@ journal = InboundJournal(
 )
 
 session = BotSessionManager(platform="telegram", ingress_journal=journal)
-# Duplicate webhooks now return empty string and skip agent execution
+# Behaviour on duplicate webhook deliveries:
+#   - already completed      → skipped (no agent call)
+#   - actively being handled → skipped (another worker has the claim)
+#   - prior attempt still pending or stale-claimed → retried automatically
 ```
 
 ### Pattern 2: Crash recovery + replay loop on startup
@@ -301,6 +314,10 @@ print(f"Replayed {replayed_count} stale entries from previous crash")
 
 session = BotSessionManager(platform="discord", ingress_journal=journal)
 ```
+
+<Tip>
+After PR #1989, redelivery of a still-pending message also retries automatically — you no longer need to wait for a restart plus `replay()` to recover from a mid-flight crash if the platform redelivers the same `message_id`. `replay()` is still the right call on startup to recover any orphaned claims.
+</Tip>
 
 ### Pattern 3: Combining with InboundDLQ for full durability stack
 
@@ -374,6 +391,19 @@ await session.chat(..., account=ACCOUNT)
 
 # ❌ Bad: changing account breaks deduplication
 await session.chat(..., account=f"bot_{random.randint(1,100)}")
+```
+</Accordion>
+
+<Accordion title="Set claim_timeout below the platform's redelivery window">
+Platforms redeliver webhooks at fixed intervals (Telegram retries within seconds, Slack waits ~3s before its first retry, etc.). Set `claim_timeout` **shorter** than your platform's redelivery window so that a crashed worker's claim becomes stale before the next redelivery arrives — that's what enables automatic recovery without a restart.
+
+```python
+# Slack retries after 3s; 30s leaves room for normal processing
+# while ensuring a crashed claim is stale on the next redelivery
+journal = InboundJournal(
+    path="~/.praisonai/slack-journal.sqlite",
+    claim_timeout=30,
+)
 ```
 </Accordion>
 </AccordionGroup>
