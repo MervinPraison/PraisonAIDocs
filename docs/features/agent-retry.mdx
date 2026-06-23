@@ -1,0 +1,287 @@
+---
+title: "Agent Retry"
+sidebarTitle: "Agent Retry"
+description: "Automatically retry LLM API calls with jittered exponential backoff"
+icon: "clock-rotate-left"
+---
+
+Agent retry automatically re-runs failed LLM calls with jittered exponential backoff so transient rate limits, overloads, and network blips don't break your agent.
+
+```mermaid
+graph LR
+    Call[📨 LLM Call] --> Try{🔄 Attempt}
+    Try -->|Success| Done[✅ Return]
+    Try -->|Retryable LLMError| Wait[⏱️ Jittered Backoff]
+    Wait --> Hook[🪝 OnRetry Hook]
+    Hook --> Try
+    Try -->|Non-retryable / Max attempts| Fail[❌ Raise]
+
+    classDef call fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Call call
+    class Try,Wait,Hook process
+    class Done success
+    class Fail fail
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Enable with True (simplest)">
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Researcher",
+    instructions="Research topics on the web",
+    retry=True,
+)
+agent.start("Find recent papers on diffusion models")
+```
+
+`retry=True` enables retry with sensible defaults: 3 retries, 5 s → 10 s → 20 s exponential schedule, capped at 120 s, with 50% additive jitter.
+</Step>
+
+<Step title="Tune with a dict (no extra import)">
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Researcher",
+    instructions="Research topics on the web",
+    retry={
+        "max_retries": 5,
+        "base_delay": 2.0,
+        "max_delay": 60.0,
+        "jitter_ratio": 0.3,
+    },
+)
+agent.start("Find recent papers on diffusion models")
+```
+</Step>
+
+<Step title="Full control with RetryBackoffConfig">
+```python
+from praisonaiagents import Agent, RetryBackoffConfig
+
+agent = Agent(
+    name="Researcher",
+    instructions="Research topics on the web",
+    retry=RetryBackoffConfig(
+        base_delay=2.0,
+        max_delay=60.0,
+        jitter_ratio=0.3,
+        max_retries=5,
+    ),
+)
+agent.start("Find recent papers on diffusion models")
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant LLM
+    participant Hook
+
+    User->>Agent: agent.start(prompt)
+    Agent->>LLM: Chat completion request
+    LLM-->>Agent: ❌ LLMError (rate_limit, is_retryable=True)
+    Agent->>Agent: Calculate jittered delay
+    Agent->>Hook: Fire OnRetry (attempt, delay_seconds)
+    Agent->>Agent: Sleep(delay)
+    Agent->>LLM: Retry request
+    LLM-->>Agent: ✅ Response
+    Agent-->>User: Return result
+```
+
+| Aspect | Detail |
+|--------|--------|
+| **What gets retried** | Only `LLMError` where `is_retryable=True` (rate limits, overloads) |
+| **What does NOT get retried** | Auth errors, invalid requests, non-retryable `LLMError`, any other exception |
+| **Total attempts** | `max_retries + 1` (default: 4 total) |
+| **Backoff schedule** | `min(base_delay × 2^attempt, max_delay) + uniform(0, jitter_ratio × delay)` |
+| **Interruption** | Raises `RuntimeError("Agent interrupted during retry backoff")` immediately |
+
+---
+
+## Configuration Options
+
+```mermaid
+graph TB
+    subgraph "retry= accepts three forms"
+        Bool["retry=True<br/>Uses defaults"]
+        Dict["retry={...}<br/>Dict of fields"]
+        Cfg["retry=RetryBackoffConfig(...)<br/>Full control"]
+    end
+
+    classDef form fill:#6366F1,stroke:#7C90A0,color:#fff
+    class Bool,Dict,Cfg form
+```
+
+### RetryBackoffConfig Fields
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `base_delay` | `float` | `5.0` | Base delay in seconds for the first retry. |
+| `max_delay` | `float` | `120.0` | Upper cap on any single backoff (after jitter). |
+| `jitter_ratio` | `float` | `0.5` | Adds `uniform(0, jitter_ratio × delay)` on top of exponential delay. Set `0.0` to disable jitter. |
+| `max_retries` | `int` | `3` | Maximum number of retries (so up to 4 total attempts by default). |
+
+**Validation** — the constructor raises `ValueError` if:
+- `base_delay <= 0`
+- `max_delay < base_delay`
+- `jitter_ratio` outside `[0, 1]`
+- `max_retries < 0`
+
+### Precedence
+
+```python
+# Bool — enable with defaults
+agent = Agent(name="A", instructions="...", retry=True)
+
+# Dict — constructed from field names
+agent = Agent(name="A", instructions="...", retry={"max_retries": 5, "base_delay": 2.0})
+
+# RetryBackoffConfig — used directly
+from praisonaiagents import Agent, RetryBackoffConfig
+
+agent = Agent(
+    name="A",
+    instructions="...",
+    retry=RetryBackoffConfig(max_retries=5, base_delay=2.0),
+)
+
+# None (default) — no retry
+agent = Agent(name="A", instructions="...")
+```
+
+---
+
+## Common Patterns
+
+### Rate-limit friendly long jobs
+
+```python
+from praisonaiagents import Agent, RetryBackoffConfig
+
+agent = Agent(
+    name="Batch Processor",
+    instructions="Process a large batch of documents",
+    retry=RetryBackoffConfig(
+        base_delay=1.0,
+        max_delay=300.0,
+        jitter_ratio=0.5,
+        max_retries=10,
+    ),
+)
+agent.start("Summarise all 500 documents in the queue")
+```
+
+### Strict mode — fail fast
+
+```python
+from praisonaiagents import Agent, RetryBackoffConfig
+
+agent = Agent(
+    name="Fast Checker",
+    instructions="Quick health check",
+    retry=RetryBackoffConfig(max_retries=1),
+)
+```
+
+### Reproducible tests — disable jitter
+
+```python
+from praisonaiagents import Agent, RetryBackoffConfig
+
+agent = Agent(
+    name="Test Agent",
+    instructions="Deterministic for testing",
+    retry=RetryBackoffConfig(jitter_ratio=0.0),
+)
+```
+
+### Observe retries with a hook
+
+```python
+from praisonaiagents import Agent, RetryBackoffConfig
+from praisonaiagents.hooks import HookRegistry, HookEvent
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.ON_RETRY)
+def on_retry(event):
+    print(
+        f"[retry] attempt {event.attempt + 1}/{event.max_retries} "
+        f"in {event.delay_seconds:.1f}s: {event.error_message[:80]}"
+    )
+
+agent = Agent(
+    name="API Caller",
+    instructions="Call the API",
+    retry=RetryBackoffConfig(max_retries=5),
+    hooks=registry,
+)
+agent.start("Fetch the latest data")
+```
+
+The `OnRetry` hook receives:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `attempt` | `int` | Current attempt number (0-based) |
+| `max_retries` | `int` | Configured max retries |
+| `delay_seconds` | `float` | Seconds the agent will sleep before the next attempt |
+| `error_message` | `str` | String representation of the failing `LLMError` |
+| `operation` | `str` | `"llm_request"` (sync) or `"async_llm_request"` (async) |
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Start with retry=True, tune later">
+The defaults (`base_delay=5.0`, `max_delay=120.0`, `jitter_ratio=0.5`, `max_retries=3`) are well-suited to most OpenAI and Anthropic rate-limit patterns. Start with `retry=True` and only tune when you observe systematic timeouts or excessive waiting.
+</Accordion>
+
+<Accordion title="Don't disable jitter in production">
+Setting `jitter_ratio=0.0` creates a deterministic schedule that is useful for tests but dangerous in production. When many agents share the same API key and all retry at the same second, they hammer the endpoint simultaneously — exactly what jitter prevents. Keep `jitter_ratio` at `0.3` or higher in production.
+</Accordion>
+
+<Accordion title="Cap max_delay for user-facing flows">
+A 120-second wait is acceptable for background batch jobs but not when a human is waiting for a response. For interactive agents, set `max_delay` to something like `20.0` or `30.0`, and keep `max_retries` low (`1`–`2`).
+</Accordion>
+
+<Accordion title="Use the OnRetry hook for observability, not control flow">
+The `OnRetry` hook is the right place to log metrics and send alerts. Retries are best-effort — if all attempts fail, the original `LLMError` propagates to your caller. Build your resilience strategy around catching that exception in your application code, not inside the hook.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Tool Retry Policy" icon="wrench" href="/features/tool-retry-policy">
+  Retry **tool** calls — a different surface from LLM call retry.
+</Card>
+<Card title="Structured LLM Errors" icon="circle-alert" href="/features/structured-llm-errors">
+  Which `LLMError` categories are classified as retryable.
+</Card>
+<Card title="Hook Events" icon="webhook" href="/features/hook-events">
+  The `OnRetry` event and all other lifecycle hooks.
+</Card>
+<Card title="Agent Retry Strategies" icon="rotate-right" href="/best-practices/agent-retry-strategies">
+  Strategy guidance for production retry patterns.
+</Card>
+</CardGroup>
