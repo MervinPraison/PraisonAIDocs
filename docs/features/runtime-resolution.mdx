@@ -1,44 +1,44 @@
 ---
 title: "Runtime Resolution"
 sidebarTitle: "Runtime Resolution"
-description: "Resolve handoff target runtimes at turn-time so sub-agents always run on their current model"
+description: "General runtime-resolution subsystem for resolving agent runtimes at turn-time"
 icon: "rotate"
 ---
 
-Handoffs resolve the target agent's runtime at the moment of execution — if you change a sub-agent's model between turns, the next handoff uses the new model automatically.
+The runtime-resolution subsystem maps agent and model references to concrete runtime instances at turn-time, enabling dynamic model switching and custom routing logic.
+
+<Warning>
+**Handoffs no longer use this subsystem.** As of [PR #2178](https://github.com/MervinPraison/PraisonAI/pull/2178), handoffs always delegate directly to `agent.chat()` / `agent.achat()`. The runtime-resolution layer is used by other parts of the SDK for agent-level runtime configuration. If you came here for handoff execution behaviour, see [Agent Handoffs](/docs/features/handoffs).
+</Warning>
 
 ```mermaid
 graph LR
-    subgraph "Turn-time Runtime Resolution"
-        A[🤖 Parent Agent] --> B{🔄 Handoff}
-        B --> C[🔍 Resolve Runtime]
-        C --> D[(Cache)]
-        D -->|hit| E[✅ Execute]
-        D -->|miss| F[🏗️ Create Runtime]
+    subgraph "Runtime Resolution"
+        A[🤖 Agent] --> B[🔍 Resolve Runtime]
+        B --> C[(Cache)]
+        C -->|hit| E[✅ Execute]
+        C -->|miss| F[🏗️ Create Runtime]
+        F --> C
         F --> E
-        C -->|error| G[⚡ Fallback chat]
-        G --> E
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef cache fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef fallback fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class A agent
-    class B,C,F process
-    class D cache
+    class B,F process
+    class C cache
     class E success
-    class G fallback
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="Swap a sub-agent model mid-conversation">
+<Step title="Swap an agent model mid-conversation">
 
-Create agents with handoffs and update the target model at any time — the next handoff automatically picks up the change.
+Update the target model at any time — the next invocation automatically picks up the change because `agent.chat()` reads the live `llm` value.
 
 ```python
 from praisonaiagents import Agent
@@ -59,7 +59,7 @@ writer = Agent(
 # Swap the researcher to a different model at any point
 researcher.llm = "claude-3-sonnet"
 
-# The next handoff automatically uses claude-3-sonnet for the researcher
+# The next invocation automatically uses claude-3-sonnet for the researcher
 writer.start("Research and write about ocean currents")
 ```
 
@@ -129,33 +129,32 @@ agent.start("Hello!")
 
 ## How It Works
 
-Every handoff call reads the target agent's current `llm` (or `model`) attribute **at invocation time**, not at construction time.
+The subsystem reads the agent's current `llm` (or `model`) attribute **at invocation time**, not at construction time.
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant ParentAgent
-    participant Handoff
-    participant Resolver
-    participant TargetRuntime
+    participant Agent
+    participant RuntimeSubsystem
+    participant Cache
 
-    User->>ParentAgent: start("Research and write...")
-    ParentAgent->>Handoff: transfer to Researcher
-    Handoff->>Resolver: resolve_runtime(agent_id, current_llm, session_ctx)
-    Resolver->>Resolver: check TTL cache
+    User->>Agent: start("Research and write...")
+    Agent->>RuntimeSubsystem: resolve(agent_id, current_llm)
+    RuntimeSubsystem->>Cache: check TTL cache
     alt cache hit (< 5 min)
-        Resolver-->>Handoff: cached runtime
+        Cache-->>RuntimeSubsystem: cached runtime
     else cache miss or expired
-        Resolver->>TargetRuntime: create LLMRuntimeWrapper
-        TargetRuntime-->>Resolver: runtime instance
-        Resolver-->>Handoff: cached & returned
+        RuntimeSubsystem->>RuntimeSubsystem: create LLMRuntimeWrapper
+        RuntimeSubsystem->>Cache: store & return
     end
-    Handoff->>TargetRuntime: execute(prompt)
-    TargetRuntime-->>ParentAgent: response
-    ParentAgent-->>User: final answer
+    RuntimeSubsystem-->>Agent: runtime instance
+    Agent->>Agent: agent.chat(prompt)
+    Agent-->>User: response
 ```
 
-**Fallback on error:** If runtime resolution raises any exception, the handoff silently falls back to calling `target_agent.chat()` / `target_agent.achat()`. Handoffs never fail because of a resolver problem.
+<Note>
+Handoffs always execute via `agent.chat()` / `agent.achat()` directly — they do not call into this subsystem. Runtime resolution is used for agent-level model configuration and caching, not for handoff execution.
+</Note>
 
 ---
 
@@ -163,14 +162,14 @@ sequenceDiagram
 
 ### `SessionContext`
 
-Passed to `resolve_runtime` to scope caching and track handoff depth.
+Passed to `resolve_runtime` to scope caching and track depth.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `session_id` | `str` | — | Required. Used as the first segment of the cache key |
 | `timestamp` | `float` | `time.time()` if `<= 0` | Session start time |
-| `parent_agent_id` | `Optional[str]` | `None` | Name of the agent that triggered the handoff |
-| `handoff_depth` | `int` | `0` | Current handoff nesting depth |
+| `parent_agent_id` | `Optional[str]` | `None` | Name of the agent that triggered resolution |
+| `handoff_depth` | `int` | `0` | Current nesting depth |
 
 ### Cache constants
 
@@ -228,7 +227,7 @@ print(f"Active runtimes: {total} across {len(cache)} sessions")
 
 <AccordionGroup>
 <Accordion title="Change llm before starting a new turn">
-Runtime re-resolution happens at the boundary of each handoff invocation. Changing `agent.llm` is effective immediately for the next handoff call — no restart needed.
+Model re-resolution happens at each invocation boundary. Changing `agent.llm` is effective immediately for the next call — no restart needed.
 </Accordion>
 
 <Accordion title="Use clear_runtime_cache after credential rotation">
@@ -236,11 +235,11 @@ The 5-minute TTL means old runtimes may linger after you rotate API keys. Call `
 </Accordion>
 
 <Accordion title="Implement supports_model narrowly in custom resolvers">
-Return `False` from `supports_model` for models you do not handle. The built-in `DefaultRuntimeResolver` acts as the final fallback, so raising `False` simply delegates back to it.
+Return `False` from `supports_model` for models you do not handle. The built-in `DefaultRuntimeResolver` acts as the final fallback, so returning `False` simply delegates back to it.
 </Accordion>
 
-<Accordion title="Handoffs never fail due to resolver errors">
-The fallback to `agent.chat()` / `agent.achat()` is unconditional. If your custom resolver is buggy or a model is unavailable, the handoff still completes using the agent's default execution path.
+<Accordion title="Handoffs execute via agent.chat() — not this subsystem">
+If you need to change how a handoff target executes, configure the target agent itself (instructions, tools, llm). The target agent's full `chat()` pipeline runs on every handoff — this subsystem is not in that path.
 </Accordion>
 </AccordionGroup>
 
@@ -300,16 +299,16 @@ class AgentRuntimeProtocol(RuntimeProtocol):
 ## Related
 
 <CardGroup cols={2}>
-<Card icon="handshake" href="/docs/features/handoffs">
-  Agent-to-agent delegation
+<Card title="Agent Handoffs" icon="handshake" href="/docs/features/handoffs">
+  Agent-to-agent delegation — handoffs always use agent.chat()
 </Card>
-<Card icon="sliders" href="/docs/configuration/handoff-config">
+<Card title="HandoffConfig reference" icon="sliders" href="/docs/configuration/handoff-config">
   HandoffConfig reference
 </Card>
-<Card icon="shield-check" href="/docs/features/handoff-tool-policy">
+<Card title="Secure tool boundaries during handoff" icon="shield-check" href="/docs/features/handoff-tool-policy">
   Secure tool boundaries during handoff
 </Card>
-<Card icon="filter" href="/docs/features/handoff-filters">
+<Card title="Filter context passed during handoff" icon="filter" href="/docs/features/handoff-filters">
   Filter context passed during handoff
 </Card>
 </CardGroup>
