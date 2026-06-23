@@ -1,126 +1,176 @@
 ---
 title: "Model Fallback"
 sidebarTitle: "Model Fallback"
-description: "Keep your agent answering when a model is overloaded by automatically falling back to alternates"
+description: "Understand how PraisonAI detects model failures and routes to alternate models"
 icon: "shield-check"
 ---
 
-Model Fallback keeps your agent answering by automatically retrying on alternate models when the primary model is overloaded or unavailable.
+Model Fallback keeps your agent resilient by detecting when a model is overloaded or unavailable, then routing to an alternate model.
 
 ```mermaid
 graph LR
     subgraph "Model Fallback"
         User[User] --> Agent[Agent]
-        Agent --> Primary[gpt-4o]
-        Primary -->|503 / overloaded| FB1[claude-3-5-sonnet]
-        FB1 -->|still failing| FB2[gpt-4o-mini]
-        FB2 --> Reply[Reply]
+        Agent --> Primary[Primary Model]
+        Primary -->|503 / overloaded| Classifier[Error Classifier]
+        Classifier -->|should_fallback_model = true| Alt[Alternate Model]
+        Alt --> Reply[Reply]
         Primary -->|ok| Reply
     end
 
     classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef primary fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef fallback fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef classifier fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef reply fill:#10B981,stroke:#7C90A0,color:#fff
 
     class User user
     class Agent agent
     class Primary primary
-    class FB1,FB2 fallback
-    class Reply reply
+    class Classifier classifier
+    class Alt,Reply reply
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="One-line resilience">
+<Step title="Run with a primary model">
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.config import LLMConfig
 
 agent = Agent(
     instructions="You are a helpful assistant",
-    llm=LLMConfig(
-        model="gpt-4o",
-        fallback_models=["claude-3-5-sonnet", "gpt-4o-mini"],
-    ),
+    llm="gpt-4o",
 )
 agent.start("Summarise today's news")
 ```
 </Step>
 
-<Step title="Cross-provider chain">
-Use LiteLLM-style prefixes when mixing providers:
+<Step title="Add a fallback via a second Agent">
+When the primary model fails, instantiate an agent with an alternate model and retry:
 
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.config import LLMConfig
 
-agent = Agent(
-    llm=LLMConfig(
-        model="openai/gpt-4o",
-        fallback_models=["anthropic/claude-3-5-sonnet", "openai/gpt-4o-mini"],
-    ),
-)
+def run_with_fallback(prompt: str) -> str:
+    models = ["gpt-4o", "claude-3-5-sonnet-20241022", "gpt-4o-mini"]
+    for model in models:
+        try:
+            agent = Agent(instructions="You are a helpful assistant", llm=model)
+            return agent.start(prompt)
+        except Exception:
+            continue
+    raise RuntimeError("All models failed")
+
+result = run_with_fallback("Summarise today's news")
 ```
 </Step>
 </Steps>
 
+---
+
 ## How It Works
 
-On transient errors (503, timeout, model overloaded), the agent retries the **same turn** against the next model in `fallback_models`. Successful calls stay on the primary model.
+The SDK classifies every LLM error into categories. Transient errors (503, timeout, overloaded) set `should_fallback_model=True`, signalling that the agent should try a different model.
 
 ```mermaid
 sequenceDiagram
     participant User
     participant Agent
     participant Primary as Primary LLM
-    participant Fallback as Fallback LLM
+    participant Classifier as Error Classifier
 
     User->>Agent: prompt
     Agent->>Primary: chat completion
     Primary-->>Agent: 503 overloaded
-    Note over Agent: error classifier: should_fallback_model
-    Agent->>Fallback: retry same messages
-    Fallback-->>Agent: response
-    Agent-->>User: reply
+    Agent->>Classifier: classify_llm_error()
+    Classifier-->>Agent: should_fallback_model=True
+    Agent-->>User: LLMError (retry with alternate model)
 ```
+
+| Error type | Category | Action |
+|------------|----------|--------|
+| 503 / service unavailable | `TRANSIENT` | `should_fallback_model=True` |
+| 429 / rate limit | `RATE_LIMIT` | Exponential backoff, same model |
+| Context window exceeded | `CONTEXT_LIMIT` | Context compression, same model |
+| Bad API key | `AUTH` | Surface error immediately |
+
+---
 
 ## Configuration Options
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `model` | `str` | — (required) | Primary model name |
-| `fallback_models` | `Optional[List[str]]` | `None` | Ordered fallback chain |
-| `base_url` | `Optional[str]` | `None` | Custom endpoint (Ollama, etc.) |
-| `api_key` | `Optional[str]` | `None` | API key (falls back to env vars) |
-| `auth` | `Optional[Dict[str, str]]` | `None` | Extra auth headers |
+Configure each Agent with its own model and credentials:
 
-Pass via `Agent(llm=LLMConfig(...))` or `Agent(model=LLMConfig(...))`. See [LLM Config](/configuration/llm-config) for endpoint and auth details.
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `llm` | `str \| dict` | `"gpt-4o-mini"` | Model name or dict with `model`, `base_url`, `api_key` |
+| `model` | `str \| dict` | `None` | Alias for `llm` |
+| `base_url` | `str` | `None` | Custom endpoint (Ollama, vLLM, proxies) |
+| `api_key` | `str` | `None` | API key (falls back to env vars) |
+
+Use [LiteLLM-style prefixes](https://docs.litellm.ai/docs/providers) when mixing providers: `anthropic/claude-3-5-sonnet-20241022`, `openai/gpt-4o`.
+
+---
 
 ## Common Patterns
 
-**Cost degradation** — primary is capable; fallbacks get cheaper: `["gpt-4o", "gpt-4o-mini"]`.
+**Cross-provider resilience** — mix OpenAI and Anthropic so one provider outage does not block the agent:
 
-**Cross-provider resilience** — mix OpenAI and Anthropic so one provider outage does not block the agent.
+```python
+from praisonaiagents import Agent
 
-**Custom gateway** — combine `base_url` with fallbacks when your proxy fronts multiple models.
+FALLBACK_CHAIN = [
+    "openai/gpt-4o",
+    "anthropic/claude-3-5-sonnet-20241022",
+    "openai/gpt-4o-mini",
+]
 
-```mermaid
-graph TB
-    Q{Need resilience on provider outages?}
-    Q -->|No| Plain[Agent model=str]
-    Q -->|Yes| Q2{Different providers?}
-    Q2 -->|Yes| Cross[Cross-provider chain]
-    Q2 -->|No| Cost[Cost-degradation chain]
-
-    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
-
-    class Q,Q2 question
-    class Plain,Cross,Cost answer
+def resilient_agent(prompt: str) -> str:
+    for model in FALLBACK_CHAIN:
+        try:
+            return Agent(instructions="You are a helpful assistant", llm=model).start(prompt)
+        except Exception:
+            continue
+    raise RuntimeError("All models failed")
 ```
+
+**Cost degradation** — try capable model first, fall back to cheaper one:
+
+```python
+from praisonaiagents import Agent
+
+def cost_aware_agent(prompt: str) -> str:
+    for model in ["gpt-4o", "gpt-4o-mini"]:
+        try:
+            return Agent(instructions="You are a helpful assistant", llm=model).start(prompt)
+        except Exception:
+            continue
+    raise RuntimeError("All models failed")
+```
+
+**Custom gateway with fallback** — combine `base_url` with provider fallback:
+
+```python
+from praisonaiagents import Agent
+
+def gateway_agent(prompt: str) -> str:
+    configs = [
+        {"model": "gpt-4o", "base_url": "https://my-proxy.example.com/v1"},
+        {"model": "gpt-4o", "base_url": None},  # direct OpenAI
+    ]
+    for cfg in configs:
+        try:
+            return Agent(
+                instructions="You are a helpful assistant",
+                llm=cfg["model"],
+                base_url=cfg["base_url"],
+            ).start(prompt)
+        except Exception:
+            continue
+    raise RuntimeError("All endpoints failed")
+```
+
+---
 
 ## Best Practices
 
@@ -142,6 +192,8 @@ LiteLLM-style names (`anthropic/...`, `openai/...`) route credentials correctly 
 </Accordion>
 </AccordionGroup>
 
+---
+
 ## Related
 
 <CardGroup cols={2}>
@@ -150,11 +202,5 @@ LiteLLM-style names (`anthropic/...`, `openai/...`) route credentials correctly 
 </Card>
 <Card title="Models" icon="microchip" href="/models">
   Choosing models for agents.
-</Card>
-<Card title="Model Router" icon="route" href="/features/model-router">
-  Dynamic model selection policies.
-</Card>
-<Card title="Rate Limiter" icon="gauge" href="/features/rate-limiter">
-  Throttle requests before they fail.
 </Card>
 </CardGroup>
