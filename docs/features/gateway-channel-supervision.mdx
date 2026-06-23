@@ -131,6 +131,124 @@ The supervision system tracks four distinct channel states:
 | `PAUSED` | Manually paused by operator | ❌ No | resume, reconnect |
 | `STOPPED` | Clean shutdown or initial state | ❌ No | Automatic restart |
 
+<Note>
+Proactive health monitoring can move a channel from `RUNNING` into a restart cycle without a raised exception — for example when transport activity goes stale (`stale-socket`) or a probe fails (`disconnected`).
+</Note>
+
+---
+
+## Proactive Health Monitoring
+
+The health monitor periodically asks each channel "Are you really alive?" and restarts the ones that aren't, without waiting for an exception to be raised.
+
+```mermaid
+graph LR
+    Timer[⏱️ Timer] --> Health[bot.health]
+    Health --> Eval[evaluate_channel_health]
+    Eval --> Reason[HealthReason]
+    Reason -->|recoverable| Restart[supervisor reconnect]
+    Reason -->|healthy| OK[✅ no action]
+
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef action fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Timer,Health,Eval process
+    class Reason decision
+    class Restart action
+    class OK ok
+```
+
+### Enable via YAML
+
+```yaml
+gateway:
+  host: 127.0.0.1
+  port: 8765
+  health:
+    interval: 300            # seconds between sweeps (default 300)
+    startup_grace: 60        # grace window after start (default 60)
+    stale_after: 120         # no transport activity → stale-socket (default 120)
+    max_restarts_per_hour: 10
+    enabled: true            # default true
+```
+
+### Enable via Python
+
+```python
+from praisonai.gateway.health_monitor import HealthMonitorConfig
+from praisonai.gateway.supervisor import ChannelSupervisor
+
+health_config = HealthMonitorConfig(interval=120, stale_after=180)
+supervisor = ChannelSupervisor(health_config=health_config)
+```
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `interval` | `float` | `300.0` | Seconds between health sweeps |
+| `startup_grace` | `float` | `60.0` | Seconds after start before checks count |
+| `stale_after` | `float` | `120.0` | Seconds without transport activity → `stale-socket` |
+| `max_restarts_per_hour` | `int` | `10` | Hard cap on restart attempts per channel per hour |
+| `enabled` | `bool` | `True` | Whether monitoring is enabled |
+
+### HealthReason values
+
+| Reason | Recoverable | When it fires |
+|--------|-------------|---------------|
+| `healthy` | No | All checks pass |
+| `not-running` | No | `health.is_running` is false |
+| `startup-grace` | No | `uptime_seconds < startup_grace` |
+| `disconnected` | Yes | `health.probe` exists and `probe.ok` is false |
+| `stale-socket` | Yes | No transport activity for `stale_after` seconds |
+| `stuck` | Yes | Channel wedged (supervisor-detected) |
+| `busy` | No | Channel busy (non-fatal) |
+| `error` | Yes | `health.error` set or `health.ok` is false |
+
+Decision order in `evaluate_channel_health()`:
+
+```mermaid
+graph TB
+    A[not is_running?] -->|yes| NR[not-running]
+    A -->|no| B[uptime < startup_grace?]
+    B -->|yes| SG[startup-grace]
+    B -->|no| C[health.error set?]
+    C -->|yes| E[error]
+    C -->|no| D[probe fails?]
+    D -->|yes| DC[disconnected]
+    D -->|no| F[last_activity stale?]
+    F -->|yes| SS[stale-socket]
+    F -->|no| G[not health.ok?]
+    G -->|yes| E2[error]
+    G -->|no| H[healthy]
+
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#189AB4,stroke:#7C90A0,color:#fff
+    class A,B,C,D,F,G check
+    class NR,SG,E,DC,SS,E2,H result
+```
+
+### Restart guard-rails
+
+- **Startup grace** — no restarts during the first `startup_grace` seconds after connect
+- **5-minute cooldown** — implicit cooldown after every restart (logged as `restart cooldown active`)
+- **`max_restarts_per_hour`** — when the cap is hit, a warning is logged and the restart is skipped
+
+```
+WARNING: channel telegram: max restarts per hour (10) reached, skipping restart
+```
+
+### Suspend / resume monitoring
+
+For planned maintenance, suspend health checks on a channel without stopping supervision:
+
+```python
+monitor.suspend_channel("telegram")   # skip health sweeps
+monitor.resume_channel("telegram")    # resume sweeps
+```
+
 ---
 
 ## Operator Controls
@@ -255,6 +373,7 @@ The enhanced health endpoint includes supervision status for each channel:
         "telegram": {
           "platform": "telegram",
           "running": true,
+          "last_activity": 1672531500,
           "supervision": {
             "state": "running",
             "last_error": null,
@@ -262,6 +381,15 @@ The enhanced health endpoint includes supervision status for each channel:
             "next_retry_at": null,
             "total_recoveries": 3,
             "manual_pause": false
+          },
+          "health_monitor": {
+            "enabled": true,
+            "running": true,
+            "interval": 300,
+            "last_check": 1672531200,
+            "suspended": false,
+            "restart_count": 1,
+            "can_restart": true
           }
         },
         "discord": {
@@ -289,6 +417,10 @@ Key supervision fields:
 - `next_retry_at`: Unix timestamp of next retry attempt (if scheduled)
 - `total_recoveries`: Count of successful recoveries from errors
 - `manual_pause`: Whether channel is manually paused by operator
+- `last_activity`: Unix timestamp of last transport activity (used for `stale-socket` detection)
+- `health_monitor.enabled`: Whether proactive monitoring is active
+- `health_monitor.restart_count`: Restarts in the current hour
+- `health_monitor.can_restart`: Whether guard-rails allow another restart
 
 ---
 
@@ -310,6 +442,14 @@ The `/health` endpoint is designed for integration with Prometheus, Datadog, or 
 <Accordion title="Recovering from FAILED state">
 Channels in `FAILED` state require manual intervention. Use `reconnect` (not `resume`) to reset the error state and attempt a fresh connection. Always investigate the `last_error` to address root cause issues before reconnecting.
 </Accordion>
+
+<Accordion title="Tuning interval and stale_after for chatty vs quiet channels">
+Low-traffic channels need a larger `stale_after` (e.g. 600s) to avoid false `stale-socket` restarts. Chatty channels can use the default 120s.
+</Accordion>
+
+<Accordion title="When to set max_restarts_per_hour low">
+When the upstream API is rate-limited, restart storms make the problem worse. Lower the cap (e.g. 3) so the guard-rail surfaces the issue in logs instead of hammering the API.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -322,5 +462,8 @@ Channels in `FAILED` state require manual intervention. Use `reconnect` (not `re
 </Card>
 <Card title="Gateway Error Handling" icon="triangle-exclamation" href="/docs/features/gateway-error-handling">
   Error handling strategies for gateway bots
+</Card>
+<Card title="BotOS" icon="robot" href="/docs/features/botos">
+  Multi-platform orchestrator with the same supervision and health monitoring
 </Card>
 </CardGroup>
