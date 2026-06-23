@@ -1,0 +1,244 @@
+---
+title: "Runtime Preflight"
+sidebarTitle: "Runtime Preflight"
+description: "Validate multi-agent team YAML for runtime compatibility before AgentTeam.start()"
+icon: "shield-check"
+---
+
+Validate team YAML for runtime compatibility, handoffs, and installed frameworks **without LLM calls or API keys**. Run this as a preflight step before `AgentTeam.start()` or a workflow run.
+
+```mermaid
+graph LR
+    YAML[team.yaml] --> Doctor[doctor runtime --team]
+    Doctor --> Pass[Pass — exit 0]
+    Doctor --> Fail[Fail — exit 1 with remediation]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef err fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class YAML input
+    class Doctor tool
+    class Pass ok
+    class Fail err
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Define your team">
+```yaml
+# agents.yaml
+framework: praisonai
+roles:
+  researcher:
+    role: Researcher
+    handoff:
+      to: writer
+  writer:
+    role: Writer
+```
+</Step>
+
+<Step title="Run preflight (no API keys required)">
+```bash
+praisonai doctor runtime --team agents.yaml
+```
+</Step>
+
+<Step title="Start the team when checks pass">
+```python
+from praisonaiagents import Agent, AgentTeam, Task
+
+researcher = Agent(name="researcher", instructions="Research topics")
+writer = Agent(name="writer", instructions="Write content")
+task = Task(description="Research and write", agent=researcher)
+
+team = AgentTeam(agents=[researcher, writer], tasks=[task])
+team.start()  # safe to run after preflight passes
+```
+</Step>
+</Steps>
+
+## How It Works
+
+`praisonai doctor runtime --team` parses your team YAML and checks:
+
+- Known runtime IDs and installed packages
+- Required capabilities (handoffs, tools, `cli_backend`, etc.)
+- Handoff target existence and compatibility
+- Mixed-runtime warnings across the team
+
+```mermaid
+graph TD
+    A[Agent runtime: field] -->|set| UseAgent[Use agent runtime ID]
+    A -->|unset| B{framework: autogen?}
+    B -->|no| UseFW[Use framework value]
+    B -->|yes| C{autogen_version / AUTOGEN_VERSION}
+    C -->|v0.4| V4[autogen_v4 if installed]
+    C -->|v0.2| V2[autogen if installed]
+    C -->|auto default| Auto[autogen_v4 else autogen]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decide fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef runtime fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class B,C decide
+    class UseAgent,UseFW,V4,V2,Auto runtime
+```
+
+**Resolution order** (mirrors the framework):
+
+1. Agent-level `runtime:` wins.
+2. Otherwise falls back to top-level `framework:` (default `praisonai`).
+3. When `framework: autogen`, version comes from `autogen_version:` or `$AUTOGEN_VERSION`:
+   - `v0.4` → `autogen_v4` (if available)
+   - `v0.2` → `autogen`
+   - `auto` (default) → prefers `autogen_v4` if installed, else `autogen`
+
+## Runtime Capability Matrix
+
+| Runtime ID | Display Name | Handoff support | Tool loop |
+|------------|--------------|-----------------|-----------|
+| `praisonai` | PraisonAI Agents | Yes | Yes |
+| `crewai` | CrewAI | No | Yes |
+| `autogen` | AutoGen v0.2 | No | Yes |
+| `autogen_v4` | AutoGen v0.4 | Yes | Yes |
+| `ag2` | AG2 (AutoGen Next) | No | Yes |
+
+Capability names referenced by the checker: `agent_creation`, `tool_execution`, `handoff_support`, `context_sharing`, `cli_backend`, `sequential_execution`, `hierarchical_execution`, `group_chat`.
+
+## Configuration
+
+### CLI flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--team` | string | Team YAML file to validate |
+| `--workflow` | string | Workflow YAML file to validate (placeholder — returns SKIP) |
+| `--json` | flag | Emit JSON for CI integration |
+| `--deep` | flag | Enable deeper probes (accepted; runtime checks do not branch on it today) |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | No issues found |
+| `1` | Issues detected (or team file missing) — non-zero blocks CI |
+| `2` | Internal error |
+
+```bash
+# Basic team validation
+praisonai doctor runtime --team agents.yaml
+
+# JSON output for CI
+praisonai doctor runtime --team team.yaml --json
+
+# Workflow placeholder (returns SKIP — not yet implemented)
+praisonai doctor runtime --workflow workflow.yaml
+```
+
+## What the Checker Detects
+
+| Check ID prefix | What it catches | Severity |
+|-----------------|-----------------|----------|
+| `runtime.yaml_parse` | YAML file fails to parse | CRITICAL |
+| `runtime.unknown_runtime.{role}` | Agent's `runtime:` value isn't a known runtime ID | HIGH |
+| `runtime.unavailable.{role}` | Runtime package not installed in current env | HIGH |
+| `runtime.missing_capabilities.{role}` | Agent needs a capability the runtime doesn't provide | HIGH |
+| `runtime.handoff_unsupported.{role}` | Agent has `handoff:` but runtime doesn't support handoffs | HIGH |
+| `runtime.handoff_target_missing.{role}` | Handoff target role name doesn't exist in the YAML | HIGH |
+| `runtime.handoff_target_incompatible.{role}` | Handoff target uses a runtime that may not support tool loops | MEDIUM |
+| `runtime.mixed_runtimes` | Multiple runtimes in one team — informational warning | MEDIUM |
+| `runtime.mixed_handoff_incompatible` | Mixed runtime team has handoffs routed through incompatible runtimes | HIGH |
+
+## Common Patterns
+
+### Good team YAML (passes)
+
+```yaml
+framework: praisonai
+roles:
+  researcher:
+    role: Researcher
+    handoff:
+      to: writer
+  writer:
+    role: Writer
+```
+
+### Bad team YAML (multiple failures)
+
+```yaml
+framework: crewai
+roles:
+  researcher:
+    role: Researcher
+    handoff:
+      to: ghost   # handoff_target_missing AND handoff_unsupported (crewai)
+  writer:
+    runtime: autogen
+    role: Writer
+    # mixed_runtimes + mixed_handoff_incompatible
+```
+
+### CI integration
+
+```yaml
+- name: Runtime preflight
+  run: |
+    pip install praisonai
+    praisonai doctor runtime --team agents.yaml --json
+```
+
+### Programmatic API
+
+```python
+from praisonai.cli.features.doctor.checks.runtime_checks import lint_runtime_team
+
+results = lint_runtime_team("agents.yaml")
+for r in results:
+    print(r.id, r.status, r.message)
+# Empty list means no issues
+```
+
+<Note>
+The same `praisonai doctor runtime` command also handles legacy `cli_backend` migration (`--fix`, `--execute`). See [Runtime Config Migration](/docs/features/doctor-runtime-migration) for migration flags.
+</Note>
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Run preflight before every team deploy">
+Add `praisonai doctor runtime --team agents.yaml` to CI and local scripts before `AgentTeam.start()` or `praisonai workflow run`.
+</Accordion>
+
+<Accordion title="Use --json in CI pipelines">
+JSON output integrates cleanly with GitHub Actions and other CI systems — exit code `1` blocks the pipeline when compatibility issues are found.
+</Accordion>
+
+<Accordion title="Prefer a single runtime for handoff teams">
+Only `praisonai` and `autogen_v4` support handoffs. Mixed-runtime teams with handoffs through `crewai`, `autogen`, or `ag2` fail preflight.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Doctor CLI" icon="stethoscope" href="/docs/cli/doctor">
+  Full reference for praisonai doctor subcommands and check categories
+</Card>
+<Card title="AgentTeam" icon="users" href="/docs/concepts/agentteam">
+  Multi-agent orchestration with AgentTeam and Task
+</Card>
+<Card title="PraisonAI Agents Framework" icon="robot" href="/docs/framework/praisonaiagents">
+  Framework options including handoffs and runtime selection
+</Card>
+<Card title="Runtime Config Migration" icon="arrow-right-arrow-left" href="/docs/features/doctor-runtime-migration">
+  Migrate legacy cli_backend fields with praisonai doctor runtime --fix
+</Card>
+</CardGroup>
