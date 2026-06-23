@@ -107,11 +107,12 @@ def with_injection_context(state: AgentState):
 
 
 def is_injected_type(annotation: Any) -> bool:
-    """Check if a type annotation is Injected[T]."""
+    """Check if a type annotation is Injected or Injected[T]."""
+    if annotation is Injected:
+        return True
     origin = get_origin(annotation)
     if origin is Injected:
         return True
-    # Handle string annotations
     if isinstance(annotation, str) and 'Injected' in annotation:
         return True
     return False
