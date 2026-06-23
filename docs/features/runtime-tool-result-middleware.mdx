@@ -1,38 +1,39 @@
 ---
-title: "Runtime Tool Result Middleware"
-sidebarTitle: "Runtime Middleware"
-description: "Normalize tool results from plugin harnesses into a standard shape before hooks and memory see them"
+title: "Plugin Harness Runtime"
+sidebarTitle: "Plugin Harness Runtime"
+description: "Use PreparedTurnContext to standardize agent execution across plugin harnesses and CLI backends"
 icon: "shuffle"
 ---
 
-Runtime tool result middleware converts vendor-shaped tool outputs from plugin harnesses into a standard format before hooks and memory adapters run.
+Plugin harnesses receive a single `PreparedTurnContext` object — the same plan used by the native runtime — eliminating scattered tool assembly and prompt building.
 
 ```mermaid
 graph LR
-    H[Plugin Harness] --> T[Tool Execution]
-    T --> M[Middleware]
-    M --> N[Normalized Result]
-    N --> Hook[Hooks]
-    Hook --> Mem[Memory]
+    A[Agent] --> B[Context Builder]
+    B --> C[PreparedTurnContext]
+    C --> D[Plugin Harness]
+    C --> E[CLI Backend]
+    D --> F[Response]
+    E --> F
 
-    classDef harness fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef middleware fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef normalized fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef downstream fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef builder fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef context fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef harness fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class H harness
-    class T tool
-    class M middleware
-    class N normalized
-    class Hook,Mem downstream
+    class A agent
+    class B builder
+    class C context
+    class D,E harness
+    class F result
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="Default (zero config)">
-The native `praisonai` runtime needs no middleware — results pass straight to hooks:
+<Step title="Native runtime (zero config)">
+The built-in runtime prepares context automatically — no setup needed:
 
 ```python
 from praisonaiagents import Agent
@@ -42,156 +43,151 @@ agent.start("What is 2 + 2?")
 ```
 </Step>
 
-<Step title="Register harness middleware">
-Implement `normalize`, register once, then set `agent._runtime_id`:
+<Step title="Custom plugin harness">
+Implement `run_turn`, receive a `PreparedTurnContext`, return a string:
 
 ```python
-from typing import Any
-from praisonaiagents import Agent, tool
+import asyncio
+from praisonaiagents import Agent
 from praisonaiagents.runtime import (
-    MiddlewareContext,
-    NormalizedToolResult,
-    register_middleware,
+    PreparedTurnContext,
+    RuntimeMode,
 )
+from praisonaiagents.runtime.context_builder import default_context_builder
 
 
-class MyHarnessMiddleware:
-    @property
-    def runtime_id(self) -> str:
-        return "my_plugin_harness"
+class MyHarness:
+    async def run_turn(self, context: PreparedTurnContext) -> str:
+        prompt = [m for m in context.transcript.messages if m.get("role") == "user"][-1]["content"]
+        model = context.model_ref.model_id
+        tools = [t.name for t in context.tools]
+        return f"[{model}] Handled '{prompt}' with tools: {tools}"
 
-    def normalize(self, result: Any, tool_name: str, ctx: MiddlewareContext) -> NormalizedToolResult:
-        if isinstance(result, dict) and result.get("status") == "error":
-            return NormalizedToolResult(
-                content=None,
-                success=False,
-                error_message=result.get("message"),
-                metadata={"vendor": "my_harness"},
-                raw_result=result,
-            )
-        return NormalizedToolResult(content=result.get("data", result), raw_result=result)
+    def supports_runtime_mode(self, mode: RuntimeMode) -> bool:
+        return mode in {RuntimeMode.SYNC, RuntimeMode.ASYNC}
 
 
-register_middleware("my_plugin_harness", MyHarnessMiddleware())
-
-@tool
-def lookup(query: str) -> dict:
-    """Look up data."""
-    return {"status": "ok", "data": f"Results for {query}"}
-
-agent = Agent(name="assistant", tools=[lookup])
-agent._runtime_id = "my_plugin_harness"  # triggers middleware lookup
-agent.start("Look up Python tutorials")
+agent = Agent(name="assistant", instructions="Be helpful")
+context = default_context_builder.build_context(agent=agent, prompt="Hello")
+harness = MyHarness()
+result = asyncio.run(harness.run_turn(context))
+print(result)
 ```
 </Step>
 </Steps>
 
 ## How It Works
 
-Middleware runs in `tool_execution.py` **before** the `AFTER_TOOL` hook fires.
-
 ```mermaid
 sequenceDiagram
-    participant Tool
-    participant Middleware
-    participant Hook as AFTER_TOOL Hook
-    participant Memory
+    participant Agent
+    participant Builder as Context Builder
+    participant Context as PreparedTurnContext
+    participant Harness as Plugin Harness
 
-    Tool->>Middleware: raw vendor result
-    Middleware->>Middleware: normalize(result, tool_name, ctx)
-    Middleware->>Hook: NormalizedToolResult
-    Hook->>Memory: consistent payload
+    Agent->>Builder: build_context(agent, prompt)
+    Builder->>Context: assemble tools, transcript, model ref
+    Context->>Harness: run_turn(context)
+    Harness-->>Agent: response string
 ```
 
-When `agent._runtime_id` is missing or equals `"praisonai"`, middleware is bypassed entirely (zero allocation).
+The context is **frozen** — harnesses read it but cannot mutate it, making multi-agent use safe.
 
 ## Configuration Options
 
-### MiddlewareContext
+### PreparedTurnContext fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `model_ref` | `ModelReference` | Resolved model ID, provider, temperature, capabilities |
+| `tools` | `list[ToolSchema]` | Normalized tool schemas (name, description, parameters, callable) |
+| `transcript` | `TranscriptWindow` | Messages history and system prompt |
+| `delivery` | `DeliveryChannels` | Streaming emitter and callback configuration |
+| `correlation` | `SessionCorrelation` | `session_id` and `turn_id` for metrics/tracing |
+| `runtime_mode` | `RuntimeMode` | `SYNC`, `ASYNC`, `STREAM`, or `ASYNC_STREAM` |
+
+### ModelReference fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `tool_name` | `str` | — (required) | Name of the tool that was executed |
-| `runtime_id` | `str` | — (required) | Runtime that produced the result |
-| `agent_id` | `Optional[str]` | `None` | Agent name, if known |
-| `session_id` | `Optional[str]` | `None` | Session id, if known |
-| `execution_time_ms` | `float` | `0.0` | Tool execution time |
-| `timestamp` | `float` | `time.time()` | When the result was produced |
-| `metadata` | `Dict[str, Any]` | `{}` | Free-form context for middleware decisions |
+| `model_id` | `str` | required | Model identifier (e.g. `"gpt-4o"`) |
+| `provider` | `str` | required | Provider name |
+| `supports_streaming` | `bool` | `False` | Whether model supports streaming |
+| `supports_tools` | `bool` | `False` | Whether model supports tool calls |
+| `max_tokens` | `Optional[int]` | `None` | Token limit |
+| `temperature` | `Optional[float]` | `None` | Sampling temperature |
 
-### NormalizedToolResult
+### AgentRuntimeConfig fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `content` | `Any` | — (required) | The actual tool result |
-| `success` | `bool` | `True` | Whether the tool succeeded |
-| `error_message` | `Optional[str]` | `None` | Error text when `success=False` |
-| `metadata` | `Dict[str, Any]` | `{}` | Vendor/exec metadata for downstream consumers |
-| `execution_time_ms` | `float` | `0.0` | Execution time in ms |
-| `timestamp` | `float` | `time.time()` | When normalized |
-| `raw_result` | `Optional[Any]` | `None` | Original vendor object for debugging |
+| `runtime` | `Optional[str]` | `None` | Runtime identifier (e.g. `"praisonai"`) |
+| `config_overrides` | `dict` | `{}` | Runtime-specific overrides |
+| `provider_default` | `Optional[str]` | `None` | Provider-level default runtime |
+| `enable_auto_selection` | `bool` | `True` | Auto-select runtime when not specified |
 
-## Registry API
+## Runtime Resolution Order
 
-| Method | Signature | Purpose |
-|--------|-----------|---------|
-| `register` | `(runtime_id, middleware) -> None` | Register middleware for a runtime |
-| `unregister` | `(runtime_id) -> bool` | Remove middleware |
-| `get_middleware` | `(runtime_id) -> RuntimeToolResultMiddleware` | Look up; returns `PassThroughMiddleware` if not registered |
-| `has_middleware` | `(runtime_id) -> bool` | Check registration |
-| `list_runtimes` | `() -> list[str]` | List registered runtime ids |
-| `clear` | `() -> None` | Drop all registrations (testing) |
+```mermaid
+graph TB
+    A[per-model runtime] --> B[per-provider default]
+    B --> C[auto-selection]
+    C --> D[built-in default: praisonai]
+    D --> E[legacy cli_backend ⚠️ deprecated]
 
-Module helpers: `register_middleware`, `get_middleware`, `get_default_middleware_registry()`.
+    classDef active fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef legacy fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class A active
+    class B,C,D step
+    class E legacy
+```
 
 ## Common Patterns
 
-**Error handling** — set `success=False` and fill `error_message`; failed tools surface as `"Tool Error: <message>"` to the agent.
+**Read the prompt from transcript:**
+```python
+user_msgs = [m for m in context.transcript.messages if m.get("role") == "user"]
+prompt = user_msgs[-1]["content"] if user_msgs else ""
+```
 
-**Rich metadata** — attach vendor, version, cache hit, or region in `metadata` for observability hooks.
+**Stream using prepared delivery channels:**
+```python
+if context.delivery.has_streaming() and context.delivery.stream_emitter:
+    from praisonaiagents.streaming.events import StreamEvent, StreamEventType
+    await context.delivery.stream_emitter.emit_async(
+        StreamEvent(type=StreamEventType.DELTA_TEXT, content="chunk")
+    )
+```
 
-**Conditional normalization** — branch on `tool_name` prefix (e.g. `search_` vs `db_`) inside `normalize()`.
-
-## User Interaction Flow
-
-```mermaid
-graph LR
-    U[User prompt] --> A[Agent]
-    A --> V[Vendor tool]
-    V --> M[Middleware]
-    M --> H[Hook records event]
-    H --> R[Consistent result to user]
-
-    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef agent fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef vendor fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef mw fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef hook fill:#10B981,stroke:#7C90A0,color:#fff
-
-    class U user
-    class A agent
-    class V vendor
-    class M mw
-    class H,R hook
+**Record metrics with correlation IDs:**
+```python
+metrics = {
+    "session_id": context.correlation.session_id,
+    "turn_id": context.correlation.turn_id,
+    "model": context.model_ref.model_id,
+    "tools": len(context.tools),
+}
 ```
 
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Keep normalize() allocation-light">
-Middleware runs on the hot path after every tool call. Avoid heavy imports or deep copies inside `normalize()`.
+<Accordion title="Never mutate PreparedTurnContext">
+The context is a frozen dataclass. Create your own state objects for anything mutable during harness execution.
 </Accordion>
 
-<Accordion title="Always set raw_result">
-Preserve the original vendor object in `raw_result` so hooks and debugging can inspect the pre-normalised payload.
+<Accordion title="Check supports_runtime_mode before run_turn">
+Declare which `RuntimeMode` values your harness supports and check before executing to avoid unexpected failures.
 </Accordion>
 
-<Accordion title="Do not raise from normalize()">
-Middleware failures are caught and logged; tool execution continues with the raw result.
+<Accordion title="Use correlation IDs for all metrics">
+Always use `context.correlation.session_id` and `context.correlation.turn_id` so traces from different harnesses align.
 </Accordion>
 
-<Accordion title="Skip middleware for native praisonai">
-Do not register middleware for `"praisonai"` — the core runtime bypasses it for zero overhead.
+<Accordion title="Prefer default_context_builder">
+Use `default_context_builder.build_context(agent, prompt)` instead of constructing `PreparedTurnContext` manually — it handles tool normalization, system prompt assembly, and model resolution.
 </Accordion>
 </AccordionGroup>
 
@@ -199,10 +195,10 @@ Do not register middleware for `"praisonai"` — the core runtime bypasses it fo
 
 <CardGroup cols={2}>
 <Card title="Hooks" icon="webhook" href="/concepts/hooks">
-  Hooks receive the normalised payload via `AfterToolInput`.
+  Hooks fire after tool execution and receive consistent payloads regardless of harness.
 </Card>
 <Card title="Managed Runtime Protocol" icon="server" href="/features/managed-runtime-protocol">
-  Remote agent loops on managed infrastructure — a different runtime concept.
+  Remote agent loops on managed infrastructure.
 </Card>
 <Card title="Agent Runtime Protocol" icon="plug" href="/features/agent-runtime-protocol">
   Pluggable agent execution runtimes (turn/stream abstraction).
