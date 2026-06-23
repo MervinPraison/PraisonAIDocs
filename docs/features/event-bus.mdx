@@ -16,6 +16,10 @@ The Event Bus provides a typed, publish-subscribe event system for PraisonAI Age
 - **Event History** - Optional event history tracking
 - **Global Default Bus** - Shared bus instance for application-wide events
 
+<Note>
+The Event Bus is **zero-cost when no one is listening**. `publish()` and `publish_async()` return immediately without taking a lock, generating a `uuid4`, or recording history if there are no subscribers. Wrap expensive payload construction in a `has_subscribers` check to skip that work too.
+</Note>
+
 ## Installation
 
 The Event Bus is included in the core `praisonaiagents` package:
@@ -27,7 +31,7 @@ pip install praisonaiagents
 ## Quick Start
 
 ```python
-from praisonaiagents.bus import EventBus, Event, EventType
+from praisonaiagents.bus import EventBus, EventType
 
 # Create an event bus
 bus = EventBus()
@@ -36,13 +40,14 @@ bus = EventBus()
 def on_message(event):
     print(f"Received: {event.data}")
 
-bus.subscribe(on_message, event_type=EventType.MESSAGE_CREATED)
+bus.subscribe(on_message, event_types=EventType.MESSAGE_CREATED)
 
 # Publish an event
-bus.publish(Event(
-    type=EventType.MESSAGE_CREATED,
-    data={"text": "Hello, World!"}
-))
+bus.publish(
+    EventType.MESSAGE_CREATED,
+    data={"text": "Hello, World!"},
+    source="demo",
+)
 ```
 
 ## Event Types
@@ -75,19 +80,42 @@ The following event types are available:
 class EventBus:
     def subscribe(
         self,
-        callback: Callable[[Event], None],
-        event_type: Optional[EventType] = None
+        callback: Callable[[Event], Any],
+        event_types: Optional[Union[str, List[str], Set[str]]] = None,
     ) -> str:
         """Subscribe to events. Returns subscription ID."""
     
     def unsubscribe(self, subscription_id: str) -> bool:
         """Unsubscribe from events."""
     
-    def publish(self, event: Event) -> None:
+    def publish(
+        self,
+        event_type: Union[str, EventType],
+        data: Optional[Dict[str, Any]] = None,
+        source: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Event:
         """Publish an event to all subscribers."""
     
-    async def publish_async(self, event: Event) -> None:
+    def publish_event(self, event: Event) -> Event:
+        """Publish a pre-constructed Event object."""
+    
+    async def publish_async(
+        self,
+        event_type: Union[str, EventType],
+        data: Optional[Dict[str, Any]] = None,
+        source: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Event:
         """Publish an event asynchronously."""
+    
+    @property
+    def has_subscribers(self) -> bool:
+        """True if there are any subscribers (lock-free, O(1))."""
+    
+    @property
+    def subscriber_count(self) -> int:
+        """Number of subscribers (takes the lock)."""
     
     def get_history(self, limit: int = 100) -> List[Event]:
         """Get recent event history."""
@@ -111,7 +139,7 @@ class Event:
 
 ```python
 import asyncio
-from praisonaiagents.bus import EventBus, Event, EventType
+from praisonaiagents.bus import EventBus, EventType
 
 bus = EventBus()
 
@@ -119,39 +147,71 @@ async def async_handler(event):
     await asyncio.sleep(0.1)
     print(f"Async received: {event.data}")
 
-bus.subscribe(async_handler, event_type=EventType.TOOL_COMPLETED)
+bus.subscribe(async_handler, event_types=EventType.TOOL_COMPLETED)
 
 # Publish asynchronously
-await bus.publish_async(Event(
-    type=EventType.TOOL_COMPLETED,
-    data={"tool": "bash", "result": "success"}
-))
+await bus.publish_async(
+    EventType.TOOL_COMPLETED,
+    data={"tool": "bash", "result": "success"},
+)
 ```
 
 ### Global Event Bus
 
 ```python
-from praisonaiagents.bus import get_default_bus, Event, EventType
+from praisonaiagents.bus import get_default_bus, EventType
 
 # Get the global bus instance
 bus = get_default_bus()
 
 # All components can share this bus
-bus.publish(Event(type=EventType.CUSTOM, data={"action": "startup"}))
+bus.publish(EventType.CUSTOM, data={"action": "startup"})
 ```
 
 ### Event History
 
 ```python
+from praisonaiagents.bus import EventBus, EventType
+
 bus = EventBus(history_size=1000)
 
 # Publish some events
 for i in range(10):
-    bus.publish(Event(type=EventType.CUSTOM, data={"index": i}))
+    bus.publish(EventType.CUSTOM, data={"index": i})
 
 # Get recent history
 history = bus.get_history(limit=5)
 print(f"Last 5 events: {len(history)}")
+```
+
+### Guard expensive payloads with `has_subscribers`
+
+When your agent builds a heavy payload (summaries, embeddings, large dicts), check `has_subscribers` first so you skip that work when nothing is listening:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.bus import get_default_bus, EventType
+
+bus = get_default_bus()
+
+def expensive_summarise(text: str) -> str:
+    return text[:200]  # stand-in for a costly call
+
+def on_memory_event(event):
+    print(event.data)
+
+bus.subscribe(on_memory_event, event_types=EventType.CUSTOM)
+
+text = "Long agent transcript..."
+if bus.has_subscribers:
+    payload = {
+        "memory_type": "long_term",
+        "snippet": expensive_summarise(text),
+    }
+    bus.publish(EventType.CUSTOM, payload, source="memory")
+
+agent = Agent(name="Observer", instructions="You observe events.")
+agent.start("Say hello briefly.")
 ```
 
 ## Integration with Agents
@@ -167,12 +227,12 @@ bus = get_default_bus()
 # Monitor agent activity
 bus.subscribe(
     lambda e: print(f"Agent started: {e.data}"),
-    event_type=EventType.AGENT_STARTED
+    event_types=EventType.AGENT_STARTED,
 )
 
 bus.subscribe(
     lambda e: print(f"Tool used: {e.data}"),
-    event_type=EventType.TOOL_COMPLETED
+    event_types=EventType.TOOL_COMPLETED,
 )
 
 # Agent will emit events during execution
