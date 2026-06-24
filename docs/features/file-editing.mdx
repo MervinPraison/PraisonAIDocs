@@ -19,6 +19,7 @@ graph LR
         HC -->|Yes| W[💾 Preserve LF/CRLF/BOM]
         HC -->|No| STALE[⚠️ Stale file error]
         W --> D[📋 Return diff]
+        D --> DIAG[🩺 Post-edit diagnostics]
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -31,7 +32,10 @@ graph LR
     class R,E,W step
     class C,HC check
     class AMB,STALE warn
-    class H,D ok
+    class H ok
+    class D,DIAG diag
+
+    classDef diag fill:#6366F1,stroke:#7C90A0,color:#fff
 ```
 
 ## Quick Start
@@ -335,6 +339,120 @@ sequenceDiagram
 
 ---
 
+## Post-edit Diagnostics
+
+After a successful edit, `edit_file` and `apply_patch` can run a lightweight checker on the modified file and append concise diagnostics to the tool result — so the agent sees the problem and fixes it in the same loop.
+
+```mermaid
+graph LR
+    subgraph "Edit → Verify → Fix (single loop)"
+        A[🤖 Agent] --> E[✏️ edit_file]
+        E --> S{✅ Success?}
+        S -->|Yes| D[🩺 Run checker]
+        D --> P{Problems?}
+        P -->|No| OK[Plain success]
+        P -->|Yes| FB[Success + Diagnostics block]
+        FB --> A2[🤖 Agent re-edits]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class A,A2 agent
+    class E,D step
+    class S,P check
+    class OK ok
+    class FB warn
+```
+
+### Agent Quick Start
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Self-correcting Editor",
+    instructions=(
+        "Edit code precisely. If a Diagnostics section appears in the tool "
+        "result, fix the reported problems in your next edit."
+    ),
+    tools=["edit_file", "apply_patch", "read_file"],
+)
+
+agent.start("In src/calc.py, replace `total = a + b` with `total = a + b + c`.")
+```
+
+When a `Diagnostics` block appears, the agent self-corrects in the next turn — no separate "run the linter" task required.
+
+### Three modes
+
+```mermaid
+graph TB
+    Q[Which mode?]
+    Q --> M1{Want backward-compatible<br/>silent-on-clean output?}
+    M1 -->|Yes| AUTO[auto — default]
+    M1 -->|No| M2{Want diagnostics<br/>even for clean edits?}
+    M2 -->|Yes| ON[on]
+    M2 -->|No| OFF[off — zero overhead]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q,M1,M2 q
+    class AUTO,ON,OFF pick
+```
+
+| Mode | When the `Diagnostics` block appears | Use when |
+|---|---|---|
+| `"auto"` (default) | Only when the checker reports problems | You want zero noise on clean edits and a self-correction hint on broken ones |
+| `"on"` | Always when a checker is available (shows `no problems found` on clean) | You want positive confirmation in logs/traces |
+| `"off"` | Never | You're in a sandbox with no checkers, or want absolute minimum overhead |
+
+### Configure the mode
+
+```python
+from praisonaiagents.tools.edit_tools import create_edit_tools
+
+edit_tools = create_edit_tools(post_edit_diagnostics="on")  # or "auto" / "off"
+```
+
+### Which checker runs?
+
+The first installed candidate for the file extension is used. Nothing installed → diagnostics are silently skipped and the tool returns the plain success string.
+
+| Extension | Checkers (in order) |
+|---|---|
+| `.py`, `.pyi` | `ruff` → `py_compile` (stdlib, always available) |
+| `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs` | `eslint` → `tsc` (TS only) |
+| `.json` | stdlib JSON parser |
+| anything else | (no checker — silent) |
+
+### Output format
+
+```
+Success: Made 1 replacement(s) in src/calc.py
+
+Diff:
+@@ -1 +1 @@
+-total = a + b
++total = a + b + c
+
+Diagnostics (ruff):
+src/calc.py:1:18: F821 Undefined name `c`
+```
+
+### Guarantees
+
+- **Backward compatible** — `auto` mode keeps the success string unchanged when the edit is clean.
+- **Never breaks an edit** — a missing, slow, or crashing checker is silently skipped (logged at `DEBUG`).
+- **Bounded** — 10-second timeout per file; output capped at 2000 characters and truncated cleanly beyond that.
+- **Sandbox-safe** — `eslint` runs with `--no-config-lookup` so workspace-controlled configs/plugins cannot execute code; `tsc` runs per-file without a `tsconfig.json`.
+- **Zero overhead in `off` mode** — all imports are deferred.
+
+---
+
 ## Configuration Options
 
 ### File Editing Functions
@@ -355,6 +473,12 @@ sequenceDiagram
 |---|---|---|---|
 | `replace_all` | `bool` | `False` | Required when `old_string` matches more than once |
 | `expected_hash` | `Optional[str]` | `None` | SHA-256 hex digest from the last `read_file`; aborts if the file changed |
+
+### Constructor Parameters (`EditTools` / `create_edit_tools`)
+
+| Parameter | Type | Default | Purpose |
+|---|---|---|---|
+| `post_edit_diagnostics` | `str` (`"auto"` \| `"on"` \| `"off"`) | `"auto"` | Run a per-file checker after a successful edit and append concise diagnostics. See [Post-edit Diagnostics](#post-edit-diagnostics). Invalid values fall back to `"auto"`. |
 
 ```python
 # Single unique match
@@ -481,6 +605,10 @@ The patch hunk format uses `@@` to separate hunks and `===` to separate old from
 
 <Accordion title="Workspace Security">
 File operations respect workspace boundaries. Paths outside the workspace are rejected to prevent directory traversal.
+</Accordion>
+
+<Accordion title="Post-edit diagnostics mode">
+Leave `post_edit_diagnostics` at its default (`"auto"`). When the checker reports problems, the tool result includes a `Diagnostics (<tool>):` block — instruct the agent to fix the reported issues in its next edit. Switch to `"on"` if you want positive `no problems found` confirmations in traces, or `"off"` if you're in a sandbox with no checkers available.
 </Accordion>
 </AccordionGroup>
 

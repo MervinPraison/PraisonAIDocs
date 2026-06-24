@@ -7,6 +7,25 @@ icon: "users-rectangle"
 
 Cross-platform sessions let one user keep a single conversation across every messaging platform.
 
+<Tabs>
+<Tab title="Recommended (with pairing)">
+```python
+from praisonai.bots import BotOS, StoreBackedIdentityResolver
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", instructions="Be helpful.")
+
+# Reuses ~/.praisonai/identity.json + the gateway pairing store.
+resolver = StoreBackedIdentityResolver.from_env()
+
+BotOS(
+    agent=agent,
+    platforms=["telegram", "whatsapp", "discord", "slack"],
+    identity_resolver=resolver,
+).run()
+```
+</Tab>
+<Tab title="Explicit links only">
 ```python
 from praisonai.bots import BotOS
 from praisonaiagents import Agent
@@ -24,6 +43,8 @@ BotOS(
     identity_resolver=resolver,
 ).run()
 ```
+</Tab>
+</Tabs>
 
 ```mermaid
 graph LR
@@ -80,17 +101,14 @@ await bot.start()
 ```
 </Step>
 
-<Step title="Two platforms, one user">
+<Step title="Two platforms, one user (recommended)">
 ```python
-from praisonai.bots import BotOS
+from praisonai.bots import BotOS, StoreBackedIdentityResolver
 from praisonaiagents import Agent
-from praisonaiagents.session import FileIdentityResolver
 
 agent = Agent(name="assistant", instructions="Be helpful.")
 
-resolver = FileIdentityResolver()
-resolver.link("telegram", "12345", "alice")
-resolver.link("discord", "snowflake-1", "alice")
+resolver = StoreBackedIdentityResolver.from_env()
 
 botos = BotOS(
     agent=agent,
@@ -128,13 +146,125 @@ botos = BotOS(
 
 ```mermaid
 graph TB
-    Q{Single process<br/>or production?} -->|tests / single proc| IM[InMemoryIdentityResolver]
-    Q -->|production| FI[FileIdentityResolver]
+    Q{What do you need?} -->|tests / single proc| IM[InMemoryIdentityResolver]
+    Q -->|production + paired users| SB[StoreBackedIdentityResolver<br/>⭐ recommended]
+    Q -->|production, no pairing| FI[FileIdentityResolver]
     Q -->|multi-process / multi-host| Custom[Custom IdentityResolverProtocol<br/>SQLite / Redis / DB]
 
     classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef star fill:#10B981,stroke:#7C90A0,color:#fff
     class IM,FI,Custom opt
+    class SB star
 ```
+
+---
+
+## StoreBackedIdentityResolver
+
+`StoreBackedIdentityResolver` extends the core `FileIdentityResolver` with a read-through to the gateway pairing store, so users who have already paired share a session out of the box.
+
+```mermaid
+graph TB
+    Start[📨 Incoming message<br/>platform + user_id] --> L1{Explicit link?}
+    L1 -->|Yes| Out[👤 canonical id]
+    L1 -->|No| L2{Paired with<br/>non-empty label?}
+    L2 -->|Yes| Out
+    L2 -->|No| Fallback[🪪 platform:user_id]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decide fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef neutral fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class L1,L2 decide
+    class Out good
+    class Fallback neutral
+```
+
+**Resolution order:**
+1. **Explicit link** registered via `link()` (highest priority)
+2. **Pairing-store label** for `(user_id, platform)` when the channel is paired and carries a non-empty `label`
+3. **`f"{platform}:{user_id}"`** — safe per-platform fallback (no merging)
+
+```python
+from praisonai.bots import StoreBackedIdentityResolver
+
+# Defaults: ~/.praisonai/identity.json + gateway pairing store
+resolver = StoreBackedIdentityResolver.from_env()
+
+# Override paths
+resolver = StoreBackedIdentityResolver.from_env(
+    path="/etc/praisonai/identity.json",
+    store_dir="/var/lib/praisonai/gateway",
+)
+
+# Direct construction with an existing pairing store
+from praisonai.gateway.pairing import PairingStore
+resolver = StoreBackedIdentityResolver(
+    path="~/.praisonai/identity.json",
+    pairing_store=PairingStore(),
+    use_pairing_label=True,   # default
+)
+```
+
+### link_paired() — Promote Paired Users to Explicit Links
+
+```python
+# After channels have been paired with non-empty labels via the pairing CLI:
+count = resolver.link_paired()
+print(f"Materialised {count} paired channels into explicit links.")
+```
+
+Useful when the pairing store is volatile or about to be rotated — this pins the canonical-id mapping into the resolver's own JSON file.
+
+<Tip>
+If you already use `praisonai pairing approve <platform> <code> --label <canonical>`, switching to `StoreBackedIdentityResolver.from_env()` is a one-line upgrade: paired users immediately share one session across all their channels, with no separate `praisonai identity link` calls required. Run `praisonai identity import` once to pin those mappings into the explicit link map.
+</Tip>
+
+---
+
+## CLI: praisonai identity
+
+Four subcommands manage identity links from the command line.
+
+| Command | Purpose |
+|---|---|
+| `praisonai identity link <platform> <user_id> <canonical>` | Map a `(platform, user_id)` to a canonical identity |
+| `praisonai identity unlink <platform> <user_id>` | Remove a mapping |
+| `praisonai identity list [canonical]` | Show all links, or links for a single canonical id |
+| `praisonai identity import` | Materialise paired channels as explicit identity links |
+
+Each subcommand accepts:
+
+| Option | Default | Description |
+|---|---|---|
+| `--path` | `~/.praisonai/identity.json` (or `$PRAISONAI_IDENTITY_PATH`) | Override the link-map JSON path |
+| `--store-dir` | gateway default | Override the pairing store directory |
+
+```bash
+# Link Alice's Telegram + WhatsApp identities to one canonical id
+praisonai identity link telegram 12345 alice
+praisonai identity link whatsapp "+44123456789" alice
+
+# Inspect
+praisonai identity list alice
+# Links for alice:
+#   telegram:12345
+#   whatsapp:+44123456789
+
+# Or list every mapping
+praisonai identity list
+
+# Unlink one channel
+praisonai identity unlink telegram 12345
+
+# Promote paired channels (labelled via `praisonai pairing approve ... --label`) into explicit links
+praisonai identity import
+# ✅ Imported 3 identity link(s) from pairing store
+```
+
+---
 
 ## SessionContext for Tools
 
@@ -224,8 +354,18 @@ Without a resolver, the legacy `bot_{platform}_{user_id}` storage key is preserv
 
 <AccordionGroup>
 
-<Accordion title="Use FileIdentityResolver by default">
-For production single-host bots, `FileIdentityResolver` provides persistent storage with atomic writes and proper file permissions.
+<Accordion title="Use StoreBackedIdentityResolver for production (with pairing)">
+For production wrapper deployments, use `StoreBackedIdentityResolver.from_env()` — it picks up paired channels automatically and falls back to the same safe `platform:user_id` default. Plain `FileIdentityResolver` is the right choice only when you do not use the pairing system.
+
+```python
+from praisonai.bots import StoreBackedIdentityResolver
+
+resolver = StoreBackedIdentityResolver.from_env()
+```
+</Accordion>
+
+<Accordion title="Use FileIdentityResolver for explicit-only links">
+For production single-host bots without pairing integration, `FileIdentityResolver` provides persistent storage with atomic writes and proper file permissions.
 
 ```python
 from praisonaiagents.session import FileIdentityResolver
@@ -283,5 +423,11 @@ Multi-platform bot orchestrator
 </Card>
 <Card title="Messaging Bots" icon="message-circle" href="/features/messaging-bots">
 Platform-specific bot guides
+</Card>
+<Card title="Bot Pairing" icon="handshake" href="/features/bot-pairing">
+Secure unknown-user onboarding
+</Card>
+<Card title="Unknown-User Pairing" icon="user-check" href="/features/bot-unknown-user-pairing">
+Inline-button approval for bots
 </Card>
 </CardGroup>

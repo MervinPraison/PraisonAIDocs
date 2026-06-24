@@ -1,0 +1,305 @@
+---
+title: "Bot Lifecycle Hooks"
+sidebarTitle: "Bot Lifecycle Hooks"
+description: "Observe and control your messaging bot's gateway, session, and schedule lifecycle"
+icon: "webhook"
+---
+
+Bot lifecycle hooks let you watch your bot start and stop, see every user session begin and end, and react when scheduled jobs fire — without changing your agent code.
+
+```mermaid
+graph LR
+    GS[🚀 GATEWAY_START] --> SS[📥 SESSION_START]
+    SS --> MR[💬 MESSAGE_RECEIVED]
+    MR --> BA[🤖 BEFORE_AGENT]
+    BA --> AA[✅ AFTER_AGENT]
+    AA --> MS[📤 MESSAGE_SENT]
+    MS --> SE[📴 SESSION_END]
+    SE --> GStop[🛑 GATEWAY_STOP]
+    SCH[⏰ SCHEDULE_TRIGGER] -.-> BA
+
+    classDef gateway fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef session fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef message fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef schedule fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class GS,GStop gateway
+    class SS,SE session
+    class MR,MS message
+    class BA,AA agent
+    class SCH schedule
+```
+
+## Quick Start
+
+<Steps>
+
+<Step title="Register a SESSION_START hook">
+```python
+import os
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.SESSION_START)
+def on_session_start(event_data):
+    print(f"New session: {event_data.session_id} on {event_data.session_name}")
+    return HookResult.allow()
+```
+</Step>
+
+<Step title="Pass the registry to your agent and bot">
+```python
+from praisonai.bots import TelegramBot
+
+agent = Agent(
+    name="MyBot",
+    instructions="You are a helpful assistant.",
+    hooks=registry
+)
+
+bot = TelegramBot(
+    token=os.getenv("TELEGRAM_BOT_TOKEN"),
+    agent=agent
+)
+
+import asyncio
+asyncio.run(bot.start())
+```
+
+Running this bot now prints a line whenever a user opens a new session.
+</Step>
+
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Platform
+    participant Bot
+    participant BotSessionManager
+    participant HookRunner
+    participant Agent
+
+    User->>Platform: Send message
+    Platform->>Bot: Incoming message
+    Bot->>BotSessionManager: chat(message)
+    BotSessionManager->>HookRunner: SESSION_START (once per session lifetime)
+    BotSessionManager->>HookRunner: MESSAGE_RECEIVED
+    BotSessionManager->>Agent: agent.chat()
+    Agent->>HookRunner: BEFORE_AGENT
+    Agent->>HookRunner: AFTER_AGENT
+    BotSessionManager->>HookRunner: MESSAGE_SENT
+    User->>Platform: /new command
+    Platform->>BotSessionManager: reset()
+    BotSessionManager->>HookRunner: SESSION_END (reason=clear)
+```
+
+<Note>
+`BEFORE_AGENT` and `AFTER_AGENT` are fired by `agent.chat()` itself — the gateway does **not** re-fire them to avoid double-dispatch to plugins.
+</Note>
+
+---
+
+## Events Fired by the Bot Runtime
+
+| Event | When | Input Type | Key Fields |
+|-------|------|------------|------------|
+| `GATEWAY_START` | `BotOS.start()` | `GatewayStartInput` | `platforms`, `bot_count` |
+| `GATEWAY_STOP` | `BotOS.stop()` | `GatewayStopInput` | `platforms`, `bot_count`, `reason` |
+| `SESSION_START` | First message per user (once per session lifetime) | `SessionStartInput` | `session_id`, `agent_name`, `source`, `session_name` |
+| `SESSION_END` | `/new` reset, policy auto-reset, stale reap, `reset_all` | `SessionEndInput` | `session_id`, `agent_name`, `reason` |
+| `SCHEDULE_TRIGGER` | Scheduled job runs in `BotOS._execute_schedule_job` | `ScheduleTriggerInput` | `job_name`, `job_id`, `message` |
+| `MESSAGE_RECEIVED` | Incoming message from platform | `MessageReceivedInput` | `platform`, `content`, `sender_id` |
+| `MESSAGE_SENDING` | Before bot sends a reply | `MessageSendingInput` | `platform`, `content`, `channel_id` |
+| `MESSAGE_SENT` | After bot successfully sends a reply | `MessageSentInput` | `platform`, `content`, `message_id` |
+
+**`SESSION_END` reason values:**
+- `clear` — user sent `/new`
+- `policy` — policy auto-reset triggered
+- `stale` — session reaped due to inactivity
+- `clear_all` — `reset_all` called (clears all sessions)
+
+---
+
+## Common Patterns
+
+### Audit Log
+
+Log every gateway and session event to a file with timestamps.
+
+```python
+import os
+import datetime
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+from praisonai.bots import TelegramBot
+
+registry = HookRegistry()
+LOG_FILE = "bot_audit.log"
+
+def _log(msg: str) -> None:
+    ts = datetime.datetime.utcnow().isoformat()
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{ts}] {msg}\n")
+
+@registry.on(HookEvent.GATEWAY_START)
+def audit_gateway_start(event_data):
+    _log(f"GATEWAY_START platforms={event_data.platforms} bots={event_data.bot_count}")
+    return HookResult.allow()
+
+@registry.on(HookEvent.SESSION_START)
+def audit_session_start(event_data):
+    _log(f"SESSION_START session={event_data.session_id} platform={event_data.session_name}")
+    return HookResult.allow()
+
+@registry.on(HookEvent.SESSION_END)
+def audit_session_end(event_data):
+    _log(f"SESSION_END session={event_data.session_id} reason={event_data.reason}")
+    return HookResult.allow()
+
+@registry.on(HookEvent.GATEWAY_STOP)
+def audit_gateway_stop(event_data):
+    _log(f"GATEWAY_STOP platforms={event_data.platforms} reason={event_data.reason}")
+    return HookResult.allow()
+
+agent = Agent(name="AuditBot", instructions="Be helpful.", hooks=registry)
+bot = TelegramBot(token=os.getenv("TELEGRAM_BOT_TOKEN"), agent=agent)
+
+import asyncio
+asyncio.run(bot.start())
+```
+
+### Per-User Usage Counter
+
+Increment a counter when a session starts, persist it when the session ends.
+
+```python
+import os
+from collections import defaultdict
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+from praisonai.bots import TelegramBot
+
+registry = HookRegistry()
+session_counts: dict = defaultdict(int)
+
+@registry.on(HookEvent.SESSION_START)
+def count_session(event_data):
+    session_counts[event_data.agent_name] += 1
+    print(f"[{event_data.agent_name}] total sessions: {session_counts[event_data.agent_name]}")
+    return HookResult.allow()
+
+@registry.on(HookEvent.SESSION_END)
+def persist_count(event_data):
+    print(f"Session {event_data.session_id} ended ({event_data.reason}), "
+          f"total for {event_data.agent_name}: {session_counts[event_data.agent_name]}")
+    return HookResult.allow()
+
+agent = Agent(name="CounterBot", instructions="Be helpful.", hooks=registry)
+bot = TelegramBot(token=os.getenv("TELEGRAM_BOT_TOKEN"), agent=agent)
+
+import asyncio
+asyncio.run(bot.start())
+```
+
+### Scheduled-Job Observability
+
+Push a metric every time a scheduled job fires.
+
+```python
+import os
+import urllib.request
+import json
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+from praisonai.bots import BotOS, TelegramBot
+
+registry = HookRegistry()
+METRICS_ENDPOINT = os.getenv("METRICS_ENDPOINT", "http://localhost:9091/metrics")
+
+@registry.on(HookEvent.SCHEDULE_TRIGGER)
+def track_schedule(event_data):
+    payload = json.dumps({
+        "job_name": event_data.job_name,
+        "job_id": event_data.job_id,
+        "agent": event_data.agent_name,
+        "message_preview": event_data.message[:100] if event_data.message else "",
+    }).encode()
+    try:
+        req = urllib.request.Request(
+            METRICS_ENDPOINT,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=2)
+    except Exception:
+        pass
+    return HookResult.allow()
+
+agent = Agent(name="ScheduleBot", instructions="Run scheduled tasks.", hooks=registry)
+botos = BotOS(
+    bots=[TelegramBot(token=os.getenv("TELEGRAM_BOT_TOKEN"), agent=agent)]
+)
+
+import asyncio
+asyncio.run(botos.start())
+```
+
+---
+
+## Configuration / HookResult
+
+Returning `HookResult.deny("reason")` from a gateway or session lifecycle hook is **best-effort** for these events: `BotOS` emits them but does not gate startup or shutdown on the result.
+
+Treat lifecycle hooks as observability points, not policy gates. For policy enforcement (e.g. blocking tool calls or LLM requests), use `BEFORE_TOOL` or `BEFORE_LLM` hooks and link to your guardrail logic.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+
+<Accordion title="Keep lifecycle hooks lightweight">
+Gateway and session hooks may run inside an async event loop. Avoid blocking I/O or heavy computation — use fire-and-forget coroutines or thread pools for slow operations.
+</Accordion>
+
+<Accordion title="Don't raise from a hook">
+Emission is wrapped in `try/except` inside the bot runtime, but unhandled exceptions from your hook function are logged at `debug` level and swallowed. Return `HookResult.allow()` even on internal errors to avoid silent failures.
+</Accordion>
+
+<Accordion title="Use agent_name to disambiguate multiple agents">
+When one `BotOS` runs multiple bots (each with a different agent), the `agent_name` field on every event identifies which agent the event belongs to. Key your per-agent metrics on `event_data.agent_name`.
+</Accordion>
+
+<Accordion title="Key per-user state on session_id, not platform user IDs">
+Platform user IDs differ between Telegram, Discord, Slack, and WhatsApp. Use `session_id` from `SessionStartInput` / `SessionEndInput` as the stable key for per-user state across platforms.
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Hook Events Reference" icon="list" href="/docs/features/hook-events">
+    Complete event reference with all input types and fields
+  </Card>
+  <Card title="BotOS" icon="robot" href="/docs/concepts/bot-os">
+    Multi-platform bot orchestrator that emits these lifecycle hooks
+  </Card>
+  <Card title="Hooks" icon="webhook" href="/docs/concepts/hooks">
+    Hook system concepts: registries, decisions, and matchers
+  </Card>
+  <Card title="Session Management" icon="users" href="/docs/concepts/session-management">
+    How per-user sessions are managed across platforms
+  </Card>
+</CardGroup>
