@@ -47,11 +47,13 @@ def confirm_action(_args=None) -> MessagePresentation:
                 label="Deploy",
                 action=PresentationAction(type="command", command="/deploy confirm"),
                 style="primary",
+                priority=10,
             ),
             PresentationButton(
                 label="Cancel",
                 action=PresentationAction(type="command", command="/deploy cancel"),
                 style="danger",
+                priority=9,
             ),
         ]),
     ])
@@ -114,19 +116,20 @@ sequenceDiagram
 
     Agent->>Gateway: GatewayMessage(presentation=...)
     Gateway->>Renderer: render_presentation(target, presentation)
-    Renderer->>Renderer: truncate to channel limits
+    Renderer->>Renderer: adapt_presentation(limits)
+    Note over Renderer: priority truncation,<br/>label/option caps,<br/>select→buttons, web_app→url
     Renderer->>Channel: Native widget
     Channel->>User: Interactive message
     User->>Channel: Button click
     Channel->>Gateway: Command callback
 ```
 
-| Channel | Native rendering | Fallback |
-|---------|------------------|----------|
-| Telegram | Inline keyboard | Plain text |
-| Slack | Block Kit | Plain text |
-| Discord | Components | Plain text |
-| WhatsApp | Plain text only | — |
+| Channel | Native rendering | If unsupported |
+|---------|------------------|----------------|
+| Telegram | Inline keyboard | `select` → button column |
+| Slack | Block Kit | `web_app` action → URL button |
+| Discord | Components | `web_app` action → URL button |
+| WhatsApp | Plain text only | All interactive → plain text |
 
 ## Block Types
 
@@ -138,7 +141,125 @@ sequenceDiagram
 | Divider | `make_divider()` | Visual separator |
 | Context | `make_context(content)` | Smaller hint text |
 
-Higher `priority` on `PresentationButton` survives when renderers trim to channel limits.
+Channel renderers always run `adapt_presentation()` first. Buttons over the per-channel cap are dropped lowest-`priority` first, so high-priority actions like `Confirm` or `Deny` survive on Discord and Slack.
+
+## Channel Adaptation
+
+`adapt_presentation()` runs automatically inside every renderer — you can also call it yourself to preview what a channel will receive.
+
+```mermaid
+graph TB
+    P[MessagePresentation] --> A[adapt_presentation\nlimits]
+    A --> T1[Truncate by priority]
+    A --> T2[Truncate labels]
+    A --> T3[select → buttons]
+    A --> T4[web_app → URL]
+    T1 --> N[Native widget]
+    T2 --> N
+    T3 --> N
+    T4 --> N
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef step fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class P input
+    class A process
+    class T1,T2,T3,T4 step
+    class N output
+```
+
+```python
+from praisonaiagents.bots import (
+    MessagePresentation,
+    PresentationBlock,
+    PresentationButton,
+    PresentationLimits,
+    adapt_presentation,
+)
+
+buttons = [PresentationButton(label=f"opt {i}", priority=i) for i in range(12)]
+presentation = MessagePresentation([PresentationBlock.make_buttons(buttons)])
+
+adapted = adapt_presentation(presentation, PresentationLimits.slack())
+# adapted.blocks[0].buttons → highest-priority 5 survive (opt 7..opt 11)
+```
+
+The input `presentation` is never mutated — `adapt_presentation()` always returns a new `MessagePresentation`.
+
+## Channel Limits
+
+`max_buttons` is per-row capacity; total button cap is `max_buttons × max_button_rows`.
+
+| Channel | Max buttons (per row) | Max button rows | Total cap | Max button label | Max options | Max option label | Supports select | Supports web_app |
+|---------|----------------------|-----------------|-----------|------------------|-------------|------------------|-----------------|-----------------|
+| Telegram | 8 | 100 | 800 | 64 | 0 (none) | — | No | Yes |
+| Slack | 5 | 1 | 5 | 75 | 100 | 75 | Yes | No |
+| Discord | 5 | 5 | 25 | 80 | 25 | 100 | Yes | No |
+
+<Note>
+Telegram has no native select menu (`supports_select=False`). Any `select` block is automatically converted to a column of callback buttons by `adapt_presentation()`.
+</Note>
+
+## Capability Degradation
+
+When a channel lacks a capability, `adapt_presentation()` gracefully degrades to the next best option.
+
+**`select` → buttons on Telegram:**
+
+```python
+from praisonaiagents.bots import (
+    MessagePresentation,
+    PresentationBlock,
+    PresentationLimits,
+    SelectOption,
+    adapt_presentation,
+)
+
+# Telegram has supports_select=False — adapt_presentation converts
+# select options into a button column with bounded callback payloads.
+block = PresentationBlock.make_select(
+    options=[
+        SelectOption(label="Staging", value="staging"),
+        SelectOption(label="Production", value="prod"),
+    ],
+    action_id="env",
+)
+presentation = MessagePresentation([block])
+adapted = adapt_presentation(presentation, PresentationLimits.telegram())
+# → on Telegram, becomes two callback buttons:
+#   [{label: "Staging", callback: "select:env:staging"},
+#    {label: "Production", callback: "select:env:prod"}]
+```
+
+**`web_app` → URL button on Slack/Discord:**
+
+```python
+from praisonaiagents.bots import (
+    MessagePresentation,
+    PresentationBlock,
+    PresentationButton,
+    PresentationAction,
+    PresentationLimits,
+    ActionType,
+    adapt_presentation,
+)
+
+# Slack has supports_web_apps=False — adapt_presentation degrades a
+# web_app action to a plain URL button so the link still works.
+button = PresentationButton(
+    label="Open App",
+    action=PresentationAction(type=ActionType.WEB_APP, web_app_url="https://example.com"),
+)
+presentation = MessagePresentation([PresentationBlock.make_buttons([button])])
+adapted = adapt_presentation(presentation, PresentationLimits.slack())
+# → on Slack, becomes a URL button to https://example.com
+```
+
+<Note>
+For long `action_id`/`value` combinations, callback payloads are kept under 64 bytes using a SHA1 hash (16-hex truncation) so distinct options remain distinct after truncation.
+</Note>
 
 ## Approval Prompts
 
@@ -151,6 +272,10 @@ Text-keyword backends (`TelegramApproval`, `SlackApproval`, `DiscordApproval`) r
 <AccordionGroup>
 <Accordion title="Use factory methods for blocks">
 `PresentationBlock.make_text()` and `make_buttons()` are the agent-friendly path — fewer field mistakes than raw dataclass construction.
+</Accordion>
+
+<Accordion title="Set high priority on destructive or critical actions">
+When a channel forces truncation, `adapt_presentation()` drops the lowest-priority buttons first. Give `Confirm` / `Deny` / `Cancel` high priority so they always reach the user.
 </Accordion>
 
 <Accordion title="Set button priority for destructive actions">
@@ -174,5 +299,8 @@ The built-in helper wires standard Allow/Deny buttons consistently across Telegr
   </Card>
   <Card title="Bot Gateway" icon="server" href="/docs/features/bot-gateway">
     Multi-channel gateway server
+  </Card>
+  <Card title="Bot Platform Capabilities" icon="sliders" href="/docs/features/bot-platform-capabilities">
+    `PresentationLimits` governs interactive widgets; `PlatformCapabilities` governs message length, chunking, and editing.
   </Card>
 </CardGroup>
