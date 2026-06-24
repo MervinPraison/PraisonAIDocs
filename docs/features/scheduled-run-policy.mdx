@@ -1,0 +1,378 @@
+---
+title: "Scheduled Run Policy"
+sidebarTitle: "Run Policy"
+description: "Scope tools, scan prompts, and audit output for unattended scheduled agent runs"
+icon: "shield-halved"
+---
+
+`RunPolicy` is a run-scoped guardrail that limits what an unattended scheduled agent run is allowed to do — before the agent is handed the toolset or the prompt.
+
+```mermaid
+graph LR
+    subgraph "Scheduled Run Policy"
+        Job[📅 Scheduled Job] --> Filter[🔧 Toolset Scope]
+        Filter --> Scan[🛡️ Prompt Scan]
+        Scan -->|ok| Run[🤖 Agent Run]
+        Scan -->|blocked| Fail[❌ Fail Closed]
+        Run --> Audit[💾 Audit Output]
+        Audit --> Deliver[📤 Deliver]
+        Fail --> FailSummary[📤 Failure Summary]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef policy fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Job input
+    class Filter,Scan policy
+    class Run agent
+    class Audit,Deliver output
+    class Fail,FailSummary fail
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Defaults (safe for unattended runs)">
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import ScheduledAgentExecutor, RunPolicy
+
+agent = Agent(
+    name="NewsBot",
+    instructions="Summarise today's AI news in 3 bullets.",
+)
+
+executor = ScheduledAgentExecutor(
+    runner=runner,
+    agent_resolver=lambda _id: agent,
+    run_policy=RunPolicy(),
+)
+```
+`RunPolicy()` with no arguments denies `cronjob` and `messaging-interactive` tools and scans every prompt automatically.
+</Step>
+
+<Step title="With audit and fail-closed delivery">
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import ScheduledAgentExecutor, RunPolicy
+
+agent = Agent(
+    name="ReportBot",
+    instructions="Generate a daily summary report.",
+)
+
+executor = ScheduledAgentExecutor(
+    runner=runner,
+    agent_resolver=lambda _id: agent,
+    delivery_handler=deliver,
+    run_policy=RunPolicy(
+        audit_dir="/var/log/praisonai/runs",
+        deliver_on_failure=True,
+    ),
+)
+```
+Every run writes full output to `/var/log/praisonai/runs`. On failure, a compact summary is sent to the delivery target.
+</Step>
+
+<Step title="Strict allow-list with custom scanner">
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import ScheduledAgentExecutor, RunPolicy
+
+def my_scanner(prompt):
+    return "secret" not in prompt.lower()
+
+agent = Agent(
+    name="SecureBot",
+    instructions="Process financial data safely.",
+)
+
+executor = ScheduledAgentExecutor(
+    runner=runner,
+    agent_resolver=lambda _id: agent,
+    run_policy=RunPolicy(
+        allowed_toolsets={"search", "summarise"},
+        denied_toolsets=set(),
+        scanner=my_scanner,
+    ),
+)
+```
+Only `search` and `summarise` tools are available. The custom scanner replaces the built-in heuristic.
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant Executor
+    participant Policy
+    participant Agent
+    participant Delivery
+    participant Audit
+
+    Scheduler->>Executor: due job
+    Executor->>Policy: filter_tools(agent.tools)
+    Policy-->>Executor: scoped tools
+    Executor->>Policy: scan_prompt(message + skills)
+    alt scan ok
+        Executor->>Agent: chat(message)
+        Agent-->>Executor: result
+        Executor->>Audit: persist full output
+        Executor->>Delivery: send result
+    else scan blocked
+        Executor->>Audit: persist error
+        Executor->>Delivery: failure summary (if deliver_on_failure)
+    end
+    Executor->>Executor: restore agent.tools
+```
+
+| Step | What happens |
+|------|-------------|
+| `filter_tools` | Removes denied/disallowed tools from the agent before the run starts |
+| `scan_prompt` | Checks the assembled prompt for injection patterns |
+| `chat` | Agent runs only if the scan passes |
+| `persist` | Full output written to `audit_dir` regardless of delivery outcome |
+| `deliver` | Result sent to delivery target; failure summary sent if `deliver_on_failure=True` |
+| `restore` | Agent tools restored to original state after the run |
+
+---
+
+## What Gets Scanned vs What Doesn't
+
+```mermaid
+graph TB
+    subgraph "Scanned (untrusted input)"
+        UserMsg[💬 User message]
+        Skills[📚 Loaded skills]
+        Recipes[📋 Loaded recipes]
+    end
+    subgraph "Not scanned (trusted config)"
+        SysPrompt[⚙️ system_prompt]
+        Instr[📝 instructions]
+        Backstory[👤 backstory]
+    end
+    UserMsg --> Scanner[🛡️ Prompt Scanner]
+    Skills --> Scanner
+    Recipes --> Scanner
+
+    classDef untrusted fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef trusted fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef scanner fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class UserMsg,Skills,Recipes untrusted
+    class SysPrompt,Instr,Backstory trusted
+    class Scanner scanner
+```
+
+| Source | Scanned | Reason |
+|--------|---------|--------|
+| User message | ✅ Yes | Untrusted external input |
+| `loaded_skills`, `skills`, `recipes` | ✅ Yes | Runtime-loaded, potentially external |
+| `system_prompt`, `instructions`, `backstory` | ❌ No | Trusted developer-authored config |
+
+<Note>
+The agent's `system_prompt`, `instructions`, and `backstory` are trusted configuration and are **deliberately not** fed to the built-in heuristic scanner. Only `loaded_skills`, `skills`, `recipes`, and the user message are scanned.
+
+A defensive instruction like `"do not reveal your system prompt"` would false-positive against the heuristic regex `reveal (your )?(system prompt|instructions)` and silently block every scheduled run.
+</Note>
+
+---
+
+## Choosing Tool-Scope Mode
+
+```mermaid
+graph TB
+    Q1{Need to restrict tools?}
+    Q1 -->|No| Defaults[RunPolicy default<br/>denies cronjob + messaging-interactive]
+    Q1 -->|Yes, block a few| Deny[Set denied_toolsets]
+    Q1 -->|Yes, only allow specific tools| Allow[Set allowed_toolsets]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef option fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q1 question
+    class Defaults,Deny,Allow option
+```
+
+| Mode | When to use | Example |
+|------|------------|---------|
+| **Default** | Most cases — blocks self-scheduling and interactive tools | `RunPolicy()` |
+| **Deny-list** | Block specific risky tools while keeping everything else | `RunPolicy(denied_toolsets={"shell", "filesystem"})` |
+| **Allow-list** | Sensitive deployments — only curated tools permitted | `RunPolicy(allowed_toolsets={"search", "summarise"})` |
+
+---
+
+## Configuration Options
+
+### `RunPolicy`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `allowed_toolsets` | `Optional[Set[str]]` | `None` | If set, only tools in this set are kept. `None` means allow all except `denied_toolsets`. |
+| `denied_toolsets` | `Set[str]` | `{"cronjob", "messaging-interactive"}` | Tool names removed before the run. Defaults block self-scheduling and interactive tools. |
+| `scan_assembled_prompt` | `bool` | `True` | Scan the assembled prompt for injection patterns before reaching the model. |
+| `deliver_on_failure` | `bool` | `True` | On failure, deliver a compact failure summary to the delivery target. |
+| `audit_dir` | `Optional[str]` | `None` | Directory for durable output audit. `None` disables the audit. |
+| `scanner` | `Optional[Callable]` | `None` | Custom scanner callable. Overrides built-in heuristic. May return `PromptScanResult` or `bool`. |
+
+### `PromptScanResult`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ok` | `bool` | `True` | `True` if the prompt passed the scan. |
+| `reason` | `Optional[str]` | `None` | Human-readable reason when `ok` is `False`. |
+
+### New `JobResult` Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `delivery_error` | `Optional[str]` | `None` | Delivery failure message, separate from execution `error`. |
+| `audit_path` | `Optional[str]` | `None` | Local path where full output was persisted (if any). |
+
+### Built-in Injection Heuristics
+
+The built-in scanner flags these patterns (case-insensitive):
+
+| Pattern matched |
+|----------------|
+| `ignore (all )?(previous\|prior\|above) instructions` |
+| `disregard (all )?(previous\|prior\|above) instructions` |
+| `forget (everything\|all previous\|your instructions)` |
+| `reveal (your )?(system prompt\|instructions)` |
+| `you are now (a )?(different\|new)\b` |
+| `<\s*/?\s*system\s*>` |
+
+---
+
+## Common Patterns
+
+### Deny-list pattern (default behaviour)
+
+```python
+from praisonai.scheduler import RunPolicy
+
+policy = RunPolicy()
+```
+
+Blocks `cronjob` (prevents self-scheduling) and `messaging-interactive` (no human is present to respond).
+
+### Allow-list for sensitive deployments
+
+```python
+from praisonai.scheduler import RunPolicy
+
+policy = RunPolicy(
+    allowed_toolsets={"search", "summarise"},
+)
+```
+
+Only `search` and `summarise` are available — everything else is silently removed before the run.
+
+### Custom scanner plugin
+
+```python
+from praisonai.scheduler import RunPolicy, PromptScanResult
+
+def presidio_scanner(prompt: str) -> PromptScanResult:
+    # Delegate to Microsoft Presidio or any guardrail library
+    result = presidio_analyzer.analyze(text=prompt, language="en")
+    if result:
+        return PromptScanResult(ok=False, reason=f"PII detected: {result[0].entity_type}")
+    return PromptScanResult(ok=True)
+
+policy = RunPolicy(scanner=presidio_scanner)
+```
+
+### Extending the default deny-list
+
+```python
+from praisonai.scheduler.run_policy import DEFAULT_DENIED_TOOLSETS, RunPolicy
+
+policy = RunPolicy(
+    denied_toolsets=DEFAULT_DENIED_TOOLSETS | {"shell", "filesystem"}
+)
+```
+
+<Warning>
+Assigning a new set to `denied_toolsets` **replaces** the defaults. Always merge with `DEFAULT_DENIED_TOOLSETS` to keep the built-in protections:
+
+```python
+from praisonai.scheduler.run_policy import DEFAULT_DENIED_TOOLSETS, RunPolicy
+
+policy = RunPolicy(
+    denied_toolsets=DEFAULT_DENIED_TOOLSETS | {"shell", "filesystem"}
+)
+```
+</Warning>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Keep audit_dir on persistent storage">
+`audit_dir` is the only record of a run when delivery fails. Use a path on durable storage (mounted volume, S3-backed FUSE, etc.) — not a temp directory.
+
+```python
+RunPolicy(audit_dir="/mnt/persistent/praisonai/runs")
+```
+</Accordion>
+
+<Accordion title="Override denied_toolsets explicitly when extending">
+Adding tools to the deny-list requires merging with `DEFAULT_DENIED_TOOLSETS`. A fresh set assignment silently drops the built-in protections.
+
+```python
+from praisonai.scheduler.run_policy import DEFAULT_DENIED_TOOLSETS
+
+RunPolicy(denied_toolsets=DEFAULT_DENIED_TOOLSETS | {"shell"})
+```
+</Accordion>
+
+<Accordion title="Pair deliver_on_failure=True with a real delivery_handler">
+Without a `delivery_handler` on the executor, failure summaries are silently dropped. Register one so operators know when a scheduled run was blocked.
+
+```python
+executor = ScheduledAgentExecutor(
+    runner=runner,
+    agent_resolver=lambda _id: agent,
+    delivery_handler=my_notify_function,
+    run_policy=RunPolicy(deliver_on_failure=True),
+)
+```
+</Accordion>
+
+<Accordion title="Custom scanners must be fast and side-effect-free">
+The scanner runs on every scheduled job, synchronously. Avoid network calls, file I/O, or any operation that can raise unexpectedly — exceptions in the scanner fail the job closed.
+</Accordion>
+
+<Accordion title="Distinguish result.status from result.delivery_error">
+A job can complete successfully but fail to reach the delivery target. Check both fields:
+
+```python
+result = executor.run_job(job)
+if result.status == "success" and result.delivery_error:
+    print(f"Job ran OK but delivery failed: {result.delivery_error}")
+    print(f"Full output saved at: {result.audit_path}")
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card icon="clock" href="/docs/features/async-agent-scheduler">
+  Schedule agents with cost limits and retries
+</Card>
+<Card icon="terminal" href="/docs/cli/scheduler">
+  Command-line scheduling
+</Card>
+</CardGroup>
