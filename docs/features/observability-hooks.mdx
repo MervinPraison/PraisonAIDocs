@@ -10,23 +10,27 @@ Observability Hooks provide a centralized entry and exit point for observability
 ```mermaid
 graph LR
     A[🚀 Orchestrator] --> B[🪝 init_observability]
-    B --> C[📈 AgentOps session start]
-    C --> D[🤖 Agent run]
-    D --> E[🪝 finalize_observability]
-    E --> F[✅ AgentOps session end]
+    B --> D[🤖 Agent run]
+    D -->|success| ES[finalize: Success]:::success
+    D -->|exception| EF[finalize: Failure]:::failure
+    ES --> F[✅ AgentOps session end]
+    EF --> F
 
     classDef orch fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef hook fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef failure fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef run fill:#189AB4,stroke:#7C90A0,color:#fff
 
     class A orch
-    class B,E hook
+    class B hook
     class D run
-    class C,F result
+    class ES success
+    class EF failure
+    class F success
 ```
 
-`praisonai.observability.hooks.init_observability(framework_tag, *, tags=None)` and `finalize_observability(_framework_tag, *, status="Success")` are **public hooks**. The orchestrator calls both automatically; custom framework adapters should mirror the same pattern in `setup()` and at run end.
+`praisonai.observability.hooks.init_observability(framework_tag, *, tags=None)` and `finalize_observability(_framework_tag, *, status=...)` are **public hooks**. The orchestrator calls both automatically; custom framework adapters should use `observability_session()` as the recommended pattern.
 
 ---
 
@@ -64,6 +68,22 @@ class MyAdapter(BaseFrameworkAdapter):
 <Step title="Pair init with finalize in custom adapters">
 ```python
 from praisonai.framework_adapters.base import BaseFrameworkAdapter
+from praisonai.observability.hooks import observability_session
+
+class MyAdapter(BaseFrameworkAdapter):
+    name = "myframework"
+
+    def run(self, *args, **kwargs):
+        with observability_session(self.name, tags=["tenant=acme"]):
+            return my_framework.execute(...)
+```
+
+`observability_session` calls `init_observability` on entry and `finalize_observability` on exit. Status is derived from `sys.exc_info()` automatically, so success/failure is tagged correctly with no boilerplate.
+
+<AccordionGroup>
+<Accordion title="Alternative: manual try/except pattern">
+```python
+from praisonai.framework_adapters.base import BaseFrameworkAdapter
 from praisonai.observability.hooks import init_observability, finalize_observability
 
 class MyAdapter(BaseFrameworkAdapter):
@@ -72,15 +92,19 @@ class MyAdapter(BaseFrameworkAdapter):
     def setup(self, *, framework_tag: str) -> None:
         init_observability(framework_tag, tags=["tenant=acme"])
 
-    def run(self, ...):
+    def run(self, *args, **kwargs):
         try:
             result = my_framework.execute(...)
-            finalize_observability(self.name, status="Success")
             return result
         except Exception:
-            finalize_observability(self.name, status="Failure")
             raise
+        finally:
+            import sys
+            status = "Failure" if sys.exc_info()[0] is not None else "Success"
+            finalize_observability(self.name, status=status)
 ```
+</Accordion>
+</AccordionGroup>
 </Step>
 
 <Step title="Branch on availability">
@@ -104,9 +128,9 @@ if is_agentops_available():
 - **Failure mode:** `ImportError` (no agentops) is logged at `DEBUG`; any other exception is logged at `WARNING` and never propagated
 - **`is_agentops_available()`** lazy function — prefer over the removed eager `AGENTOPS_AVAILABLE` constant in this module
 
-`finalize_observability(_framework_tag, *, status="Success")` closes observability sessions symmetrically:
+`finalize_observability(_framework_tag, *, status=...)` closes observability sessions symmetrically:
 
-- **Auto-call site:** built-in adapters call `finalize_observability(self.name, status=...)` at the end of `run()`/`arun()` (both success and exception paths for AutoGen v0.4 and AG2)
+- **Auto-call site:** built-in adapters (`praisonai_adapter`, `crewai_adapter`, AutoGen v0.4, AG2) now wrap `run()`/`arun()` in a `try: ... finally:` block. `finalize_observability(self.name, status=status)` is called from that `finally`, with `status` derived from `sys.exc_info()`. AgentOps sessions are tagged `"Success"` on the happy path and `"Failure"` whenever an exception is propagating (including `KeyboardInterrupt`, LLM errors, rate limits, cancellation).
 - **AgentOps end guard:** `agentops.end_session(...)` only fires if `agentops` is importable
 - **Failure mode:** `ImportError` returns silently; any other exception is logged at `WARNING` and never propagated
 - **Why symmetric calls matter:** without `finalize_observability`, AgentOps dashboard sessions stay stuck "in progress"
@@ -123,9 +147,12 @@ sequenceDiagram
     Orch->>Hook: init_observability(adapter.name)
     Hook->>AOps: agentops.init(...)
     Orch->>Adapter: adapter.run(...)
-    Adapter-->>Orch: result
-    Adapter->>Hook: finalize_observability(adapter.name, status="Success")
-    Hook->>AOps: agentops.end_session("Success")
+    alt success
+        Adapter-->>Hook: finalize_observability(adapter.name, status="Success")
+    else exception / KeyboardInterrupt / rate-limit
+        Adapter-->>Hook: finalize_observability(adapter.name, status="Failure")
+    end
+    Hook->>AOps: agentops.end_session(status)
 ```
 
 ---
@@ -146,17 +173,86 @@ sequenceDiagram
 | `_framework_tag` | `str` | required | Framework name for context (reserved for future observability providers — currently unused, but pass `framework_tag` for forward-compat). |
 | `status` | `str` (keyword-only) | `"Success"` | Session status passed to `agentops.end_session(...)`. Conventional values: `"Success"`, `"Failure"`. |
 
+### `observability_session`
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `framework_tag` | `str` | required | Framework tag passed to `init_observability` and `finalize_observability`. |
+| `tags` | `list[str] \| None` | `None` | Extra tags forwarded to `init_observability`. |
+
+Returns a context manager (`ContextManager[None]`). Status is auto-derived from `sys.exc_info()` — no `status` kwarg needed.
+
+### `discover_observability_sinks`
+
+| Signature | Returns | Description |
+|---|---|---|
+| `() -> list[Callable]` | List of factory callables | Returns entry-point-registered sink factories. Lazy + best-effort: broken plugins are logged at `DEBUG` and never break a run. |
+
+---
+
+## Third-party sink plugins
+
+Third-party packages can register an observability sink factory under the `praisonai.observability_sinks` entry-point group. PraisonAI discovers them lazily via `discover_observability_sinks()` — broken plugins are logged at `DEBUG` and never break a run.
+
+```mermaid
+graph LR
+    A[🔌 Plugin Package] -->|registers| B[praisonai.observability_sinks entry point]
+    B -->|discovered by| C[discover_observability_sinks]:::tool
+    C -->|returns| D[sink factory callables]:::process
+    D -->|called| E[✅ Active Sinks]:::success
+
+    classDef plugin fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A plugin
+    class B plugin
+    class C tool
+    class D process
+    class E success
+```
+
+### Register a sink (plugin authors)
+
+```toml
+# pyproject.toml in your plugin package
+[project.entry-points."praisonai.observability_sinks"]
+my_sink = "my_package.sinks:my_sink_factory"
+```
+
+Your factory is a zero-arg (or framework-tag-aware) callable that returns a sink implementing the core SDK's `TraceSinkProtocol`.
+
+### Discover registered sinks
+
+```python
+from praisonai.observability.hooks import discover_observability_sinks
+
+for factory in discover_observability_sinks():
+    sink = factory()
+    ...
+```
+
 ---
 
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Always pair init with finalize">
-The orchestrator auto-handles both hooks for built-in adapters. Custom adapters that bypass the orchestrator must call `finalize_observability` in `try`/`except` blocks to avoid stuck telemetry sessions on the AgentOps dashboard.
+<Accordion title="Use observability_session for custom adapters">
+`observability_session` is the recommended pattern for custom adapters. It guarantees `finalize_observability` always runs — on success and on any failure — with the correct status derived from `sys.exc_info()`. This prevents AgentOps/other sessions from being orphaned in an "in progress" state on error, `KeyboardInterrupt`, or rate-limit paths.
+
+```python
+from praisonai.observability.hooks import observability_session
+
+class MyAdapter(BaseFrameworkAdapter):
+    def run(self, *args, **kwargs):
+        with observability_session(self.name, tags=["tenant=acme"]):
+            return my_framework.execute(...)
+```
 </Accordion>
 
 <Accordion title="Status convention">
-Use `status="Success"` for the happy path and `status="Failure"` in `except` blocks. The string is passed verbatim to `agentops.end_session(...)`; future providers may map other values.
+Use `status="Success"` for the happy path and `status="Failure"` in exception cases. The string is passed verbatim to `agentops.end_session(...)`; future providers may map other values. When using `observability_session`, status is derived automatically.
 </Accordion>
 
 <Accordion title="Use for run-scoped tags only">
@@ -211,5 +307,8 @@ def init_observability(framework_tag, *, tags=None):
 </Card>
 <Card title="Framework Adapter Plugins" icon="puzzle-piece" href="/docs/features/framework-adapter-plugins">
   How to create custom framework adapters
+</Card>
+<Card title="Custom Tracing" icon="plug" href="/docs/observability/custom-tracing">
+  ContextTraceSink protocol and third-party sink plugins
 </Card>
 </CardGroup>
