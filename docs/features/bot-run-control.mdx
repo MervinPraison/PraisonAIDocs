@@ -60,6 +60,10 @@ While the bot is working, send `/stop` to cancel the current task. The bot respo
 Fixed in [PR #1980](https://github.com/MervinPraison/PraisonAI/pull/1980) (release after 2026-06-19): earlier releases wired the interrupt controller to the wrong attribute, so `/stop` and `busy_mode="interrupt"` silently had no effect. Queued follow-ups were surfaced in metadata but never drained — upgrade to pick up the fix.
 </Note>
 
+<Note>
+STEER mode is fully wired as of [PR #2244](https://github.com/MervinPraison/PraisonAI/pull/2244) (release after 2026-06-24). Earlier releases declared `busy_mode="steer"` but silently fell back to queue mode. Upgrade to use real mid-run steering.
+</Note>
+
 ```mermaid
 sequenceDiagram
     participant User
@@ -90,6 +94,24 @@ sequenceDiagram
     end
 ```
 
+**STEER lane** — when `busy_mode="steer"` and the agent has `message_steering=True`:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Bot
+    participant RunControl
+    participant Agent
+
+    User->>Bot: "focus on the API section"
+    Bot->>RunControl: submit() (busy_mode=steer)
+    RunControl->>Agent: agent.steer("focus on the API section", priority=30)
+    Agent-->>RunControl: msg_id
+    RunControl-->>Bot: STEERED
+    Bot-->>User: "🧭 Steering the current task with your new guidance"
+    Note over Agent: current turn folds in the<br/>new guidance — partial progress preserved
+```
+
 When `run_timeout` is exceeded (default 300 seconds), `BotSessionManager` raises `BotRunTimeout` and cancels the in-flight run. Timeout failures are **not** pushed to the DLQ, so slow agents do not retry in a loop.
 
 ---
@@ -118,7 +140,38 @@ graph TB
 |------|-------------|----------|
 | `queue` | Research bots, task completion important | Messages queued, processed in order after current task |
 | `interrupt` | Interactive chat, latest intent matters | Cancels current task, starts new one immediately |
-| `steer` | Real-time collaboration (experimental) | Injects messages into running task (fallback to queue) |
+| `steer` | Real-time guidance while the agent is mid-task | Injects the new message into the running turn via `agent.steer()`; falls back to `queue` only if the agent has `message_steering` disabled |
+
+---
+
+## How STEER Mode Works
+
+```mermaid
+graph TB
+    Msg[👤 Mid-run message] --> Live{🔍 Live agent<br/>registered?}
+    Live -->|No| FB1[📝 Fallback: QUEUE]
+    Live -->|Yes| ME{🧠 message_steering<br/>enabled?}
+    ME -->|No| FB2[📝 Fallback: QUEUE]
+    ME -->|Yes| Steer[🧭 agent.steer<br/>priority=30]
+    Steer --> Inject[✅ STEERED — folded<br/>into current turn]
+
+    classDef msg fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef fallback fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    class Msg msg
+    class Live,ME decision
+    class FB1,FB2 fallback
+    class Steer proc
+    class Inject ok
+```
+
+- Enable steering on the agent with `message_steering=True`.
+- Set the bot's `busy_mode="steer"`.
+- Mid-run messages are injected into the live turn at `SteeringPriority.INTERRUPT` (priority `30`); the agent picks them up before its next tool-loop step.
+
+Custom integrators embedding `chat_with_run_control()` must call `register_agent(...)` on **every** fresh and pending run inside the drain loop — not only the first run — so STEER always has a live agent handle.
 
 ---
 
@@ -152,12 +205,20 @@ bot = TelegramBot(
 | Field | Type | Description |
 |-------|------|-------------|
 | `run_control` | `bool` | Always `True` when run control was active. |
-| `decision` | `str` | Initial decision: `"RUN_NOW"`, `"QUEUED"`, or `"INTERRUPTED"`. |
+| `decision` | `str` | Initial decision: `"RUN_NOW"`, `"QUEUED"`, `"INTERRUPTED"`, or `"STEERED"`. |
 | `completed` | `bool` | `True` after the run and drain loop finish cleanly. |
 | `run_generation` | `int` | Generation counter for race protection. |
 | `pending_processed` | `list[str]` | Queued follow-ups drained after the initial run (each truncated to 100 chars). Present only when at least one was processed. |
 | `interrupted` | `bool` | `True` if the run was cancelled mid-way. |
+| `steered` | `bool` | `True` if the mid-run message was injected into the live agent's steering queue (only set when `decision == "STEERED"`). |
 | `reason` | `str` | Cancellation reason (when `interrupted` is `True`). |
+
+**Acknowledgment messages:**
+
+| Decision | Default ack |
+|----------|-------------|
+| `INTERRUPTED` | `"⚠️ Previous task cancelled, starting your new request"` |
+| `STEERED` | `"🧭 Steering the current task with your new guidance"` |
 
 Queue drain implemented in [PR #1980](https://github.com/MervinPraison/PraisonAI/pull/1980).
 
@@ -231,6 +292,38 @@ import asyncio
 asyncio.run(bot.start())
 ```
 
+### Real-Time Steering Bot (Steer Mode)
+```python
+from praisonaiagents import Agent
+from praisonai.bots import TelegramBot
+
+agent = Agent(
+    name="researcher",
+    instructions="Research topics deeply and write structured reports.",
+    message_steering=True,  # Required for busy_mode="steer" to actually steer
+)
+
+bot = TelegramBot(
+    token="YOUR_TOKEN",
+    agent=agent,
+    busy_mode="steer",
+    busy_ack="🧭 Steering the current task with your new guidance",
+)
+
+import asyncio
+asyncio.run(bot.start())
+```
+
+Example user flow:
+
+```
+User: research solar trends and write a 500-word summary
+Bot:  (working — gathering sources…)
+User: actually, focus on the EU market only
+Bot:  🧭 Steering the current task with your new guidance
+Bot:  ✅ EU Solar Market Trends Summary [...] (partial progress preserved)
+```
+
 ### Using /stop Mid-Task
 When a bot is processing a long request:
 
@@ -253,7 +346,7 @@ Use **queue mode** for bots that do important work users shouldn't lose — rese
 
 Use **interrupt mode** for conversational bots where the latest message reflects user intent — chat assistants, Q&A bots, real-time helpers.
 
-Use **steer mode** (experimental) for collaborative scenarios where users provide guidance during long tasks. Currently falls back to queue mode.
+Use **steer mode** when you want users to nudge the agent mid-task ("focus on the API section instead", "also include market size") without losing the partial progress already made. The agent must be created with `message_steering=True`; otherwise STEER safely falls back to queue.
 </Accordion>
 
 <Accordion title="How /stop Finds the Right Cancel Path">
@@ -283,5 +376,8 @@ If you embed `BotSessionManager.chat_with_run_control()` in a custom bot, attach
   </Card>
   <Card title="Messaging Bots" icon="message-circle" href="/docs/features/messaging-bots">
     Complete guide to Telegram, Discord, Slack bots
+  </Card>
+  <Card title="Message Steering" icon="compass" href="/docs/features/message-steering">
+    Enable `message_steering=True` on the agent so STEER mode can inject mid-run guidance
   </Card>
 </CardGroup>
