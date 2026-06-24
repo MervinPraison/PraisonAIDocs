@@ -1,24 +1,26 @@
 ---
 title: "File Editing"
 sidebarTitle: "File Editing"
-description: "Precise, conflict-safe find-and-replace across files, scoped to a workspace"
+description: "Precise, conflict-safe find-and-replace across files, safe by default against concurrent edits"
 icon: "file-pen"
 ---
 
-File editing tools provide secure, workspace-scoped file operations with **precise, conflict-safe** find-and-replace. Ambiguous matches fail loudly instead of editing the wrong occurrence, and a content-hash check prevents lost-update conflicts when files change between read and edit. A fuzzy matching ladder makes first-try edits succeed even when `old_string` drifts from the file by whitespace, indentation, or line endings.
+File editing tools provide secure, workspace-scoped file operations with **precise, conflict-safe** find-and-replace that's **safe by default**. Ambiguous matches fail loudly instead of editing the wrong occurrence. Read-modify-write on the same file is automatically serialised across parallel tools and multi-agent teams, and writes abort with a clear error if the file changed on disk since it was last read — no extra parameters required. A fuzzy matching ladder makes first-try edits succeed even when `old_string` drifts from the file by whitespace, indentation, or line endings.
 
 ```mermaid
 graph LR
-    subgraph "Precise Edit Flow"
+    subgraph "Safe-by-Default Edit Flow"
         A[🤖 Agent] --> R[📖 read_file]
-        R --> H[#️⃣ content + hash]
+        R --> H[#️⃣ record hash]
         H --> E[✏️ edit_file]
-        E --> C{🔍 Match unique?}
-        C -->|Yes| HC{🛡️ Hash matches?}
-        C -->|No| AMB[⚠️ Ambiguous match error]
+        E --> L[🔒 per-file lock]
+        L --> C{🔍 Match unique?}
+        C -->|Yes| HC{🛡️ Hash unchanged?}
+        C -->|No| AMB[⚠️ Ambiguous match]
         HC -->|Yes| W[💾 Preserve LF/CRLF/BOM]
-        HC -->|No| STALE[⚠️ Stale file error]
+        HC -->|No| STALE[⚠️ File changed — re-read or force=True]
         W --> D[📋 Return diff]
+        D --> DIAG[🩺 Post-edit diagnostics]
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -28,44 +30,50 @@ graph LR
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
 
     class A agent
-    class R,E,W step
+    class R,E,W,L step
     class C,HC check
     class AMB,STALE warn
-    class H,D ok
+    class H ok
+    class D,DIAG diag
+
+    classDef diag fill:#6366F1,stroke:#7C90A0,color:#fff
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="Simple precise edit">
+<Step title="Agent edits a file safely (no boilerplate)">
 
 ```python
 from praisonaiagents import Agent
 
 agent = Agent(
     name="Code Editor",
-    instructions="Edit code precisely. If a match is ambiguous, add more context.",
-    tools=["edit_file", "search_files", "read_file"]
+    instructions="Edit code precisely. Re-read files before retrying after a stale error.",
+    tools=["read_file", "edit_file", "search_files"],
 )
 
 agent.start("In src/user.js, replace getUserName() with getUserEmail().")
+# read_file records a hash; edit_file is auto-serialised and stale-aborted
+# with no extra params from the agent.
 ```
 
 </Step>
 
-<Step title="Conflict-safe read → edit">
+<Step title="Direct SDK use (automatic protection)">
 
 ```python
 from praisonaiagents.tools.edit_tools import read_file, edit_file
 
-content, file_hash = read_file("src/user.js")
+read_file("src/user.js")  # arms the automatic staleness guard
 
 edit_file(
     "src/user.js",
     old_string="def getUserName(self):",
     new_string="def getUserEmail(self):",
-    expected_hash=file_hash,
 )
+# Aborts with "file changed since it was read" if anything modifies the file
+# between the read and the edit. No expected_hash needed.
 ```
 
 </Step>
@@ -94,6 +102,7 @@ edit_file(
 sequenceDiagram
     participant A as 🤖 Agent
     participant R as 📖 read_file
+    participant Reg as 🗂️ Registry
     participant W as 📁 Workspace
     participant F as 📄 File
     participant E as ✏️ edit_file
@@ -102,12 +111,13 @@ sequenceDiagram
     R->>W: validate containment
     W-->>R: ✅ allowed
     R->>F: read bytes
-    F-->>R: content
-    R-->>A: (content, sha256)
-    A->>E: edit_file(path, old, new, expected_hash=sha256)
+    R->>Reg: record hash
+    R-->>A: content
+    A->>E: edit_file(path, old, new)
     E->>F: re-read + hash
-    F-->>E: current content
-    E->>E: fuzzy ladder + ambiguity & hash checks
+    E->>Reg: get recorded hash
+    Note over E: automatic staleness check
+    E->>E: fuzzy ladder + ambiguity check
     E->>F: write preserved LF/CRLF/BOM
     E-->>A: success + unified diff
 ```
@@ -115,12 +125,12 @@ sequenceDiagram
 | Operation | Risk Level | Workspace Required | Purpose |
 |-----------|------------|-------------------|---------|
 | **search_files** | Low | No | Find patterns in files |
-| **read_file** *(edit_tools)* | Low | No | Read content + SHA-256 hash for staleness checks |
-| **read_file** *(file_tools)* | Low | No | Plain read returning a string |
+| **read_file** *(edit_tools)* | Low | No | Read content + SHA-256 hash; **records hash into the shared staleness registry** |
+| **read_file** *(file_tools)* | Low | No | Plain read; **also records hash so a later `write_file` engages the staleness guard** |
 | **list_files** | Low | No | Directory listings |
-| **edit_file** | High | Recommended | Precise find-and-replace with fuzzy ladder, ambiguity & staleness guards |
-| **write_file** | High | Recommended | Create/overwrite files |
-| **apply_patch** | High | Recommended | Atomic multi-file Add/Update/Delete with rollback |
+| **edit_file** | High | Recommended | Precise find-and-replace; **automatic per-file lock + staleness guard**; `force=True` to override |
+| **write_file** | High | Recommended | Create/overwrite; **automatic per-file lock + staleness guard on existing files**; `force=True` to override |
+| **apply_patch** | High | Recommended | Atomic multi-file Add/Update/Delete with rollback; **per-path locks across the whole patch**; staleness guard on Update **and** Delete; `force=True` to override |
 
 <Warning>
 Two modules export `read_file` with different signatures:
@@ -128,8 +138,106 @@ Two modules export `read_file` with different signatures:
 - `from praisonaiagents.tools.file_tools import read_file` → `read_file(filepath, encoding='utf-8') -> str`
 - `from praisonaiagents.tools.edit_tools import read_file` → `read_file(filepath) -> Tuple[str, str]`
 
-Use **edit_tools** when passing `expected_hash` to `edit_file`.
+Either flavour records the hash into the shared registry, so reading via `file_tools.read_file` still arms the automatic staleness guard for a later `edit_file` or `apply_patch` on the same path.
 </Warning>
+
+---
+
+## Safe by Default: Concurrency & Staleness
+
+Every read-modify-write on the same file is serialised by a per-file lock, and every write checks whether the file changed since it was last read — both run automatically across `FileTools`, `EditTools`, and `apply_patch`.
+
+### Per-File Locking
+
+```mermaid
+graph TB
+    subgraph "Per-File Lock — same path serialises, different paths parallel"
+        A1[Agent A: edit_file file.py] --> L1[🔒 lock(file.py)]
+        A2[Agent B: edit_file file.py] -.waits.-> L1
+        A3[Agent C: edit_file other.py] --> L2[🔒 lock(other.py)]
+        L1 --> W1[✏️ A writes]
+        W1 --> R1[🔓 release]
+        R1 --> A2W[✏️ B writes]
+        L2 --> W3[✏️ C writes in parallel]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef lock fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A1,A2,A3 agent
+    class L1,L2 lock
+    class W1,A2W,W3,R1 ok
+```
+
+### Automatic Staleness Guard
+
+```mermaid
+sequenceDiagram
+    participant A as 🤖 Agent
+    participant R as 📖 read_file
+    participant Reg as 🗂️ Registry
+    participant Ext as 🌐 External writer
+    participant E as ✏️ edit_file
+    participant F as 📄 File
+
+    A->>R: read_file(path)
+    R->>F: read bytes
+    R->>Reg: record hash
+    R-->>A: content
+    Ext->>F: external change
+    A->>E: edit_file(path, old, new)
+    E->>F: re-read + hash
+    E->>Reg: get recorded hash
+    Note over E: recorded ≠ current
+    E-->>A: ⚠️ Error: file changed — re-read or force=True
+```
+
+### Which Override Do I Need?
+
+```mermaid
+graph TB
+    Q[Edit is failing with a staleness error]
+    Q --> Q1{Did the file legitimately change?}
+    Q1 -->|Yes — I want the new content| READ[Re-read, then edit again]
+    Q1 -->|No — I want to overwrite anyway| Q2{Do I have a known-good hash?}
+    Q2 -->|Yes| HASH[Pass expected_hash=hash]
+    Q2 -->|No| FORCE[Pass force=True]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Q,Q1,Q2 q
+    class READ,HASH ok
+    class FORCE warn
+```
+
+### Precedence Ladder
+
+| Mechanism | When it fires | How to bypass |
+|---|---|---|
+| Explicit `expected_hash` | Always when supplied | Pass a matching hash, or omit it and rely on the automatic guard |
+| Automatic staleness guard | Only when a prior `read_file` recorded a hash for the path | `force=True` (or pass `expected_hash` explicitly) |
+| Per-file lock | Always (cannot be bypassed) | n/a — serialises but never refuses |
+
+The precedence order is: **`expected_hash` > `force=True` > automatic last-read-hash guard**.
+
+### `force=True` Examples
+
+```python
+from praisonaiagents.tools.edit_tools import edit_file, apply_patch
+from praisonaiagents.tools.file_tools import FileTools
+
+# 1. Intentional blind edit
+edit_file("rollback.txt", "v2", "v1", force=True)
+
+# 2. Force an entire patch (overrides Update & Delete staleness; per-file lock still applies)
+apply_patch(patch_text, force=True)
+
+# 3. Force a blind write through FileTools
+FileTools().write_file("out.log", "snapshot", force=True)
+```
 
 ---
 
@@ -331,7 +439,123 @@ sequenceDiagram
 | Hunk not found | `Error: Hunk not found in '<path>': '<preview>'` |
 | Ambiguous hunk | `Error: Ambiguous hunk in '<path>': '<preview>' matches N locations` |
 | UTF-16 file | `Error: Cannot update '<path>': UTF-16 encoding is not supported. Please convert the file to UTF-8.` |
+| Automatic staleness — Update | `Error: Cannot update '{path}': file changed since it was read - re-read before editing (or pass force=True to override).` |
+| Automatic staleness — Delete | `Error: Cannot delete '{path}': file changed since it was read - re-read before editing (or pass force=True to override).` |
 | Success | `Success: Applied patch to N file(s)\n\n<combined diff>` |
+
+---
+
+## Post-edit Diagnostics
+
+After a successful edit, `edit_file` and `apply_patch` can run a lightweight checker on the modified file and append concise diagnostics to the tool result — so the agent sees the problem and fixes it in the same loop.
+
+```mermaid
+graph LR
+    subgraph "Edit → Verify → Fix (single loop)"
+        A[🤖 Agent] --> E[✏️ edit_file]
+        E --> S{✅ Success?}
+        S -->|Yes| D[🩺 Run checker]
+        D --> P{Problems?}
+        P -->|No| OK[Plain success]
+        P -->|Yes| FB[Success + Diagnostics block]
+        FB --> A2[🤖 Agent re-edits]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class A,A2 agent
+    class E,D step
+    class S,P check
+    class OK ok
+    class FB warn
+```
+
+### Agent Quick Start
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Self-correcting Editor",
+    instructions=(
+        "Edit code precisely. If a Diagnostics section appears in the tool "
+        "result, fix the reported problems in your next edit."
+    ),
+    tools=["edit_file", "apply_patch", "read_file"],
+)
+
+agent.start("In src/calc.py, replace `total = a + b` with `total = a + b + c`.")
+```
+
+When a `Diagnostics` block appears, the agent self-corrects in the next turn — no separate "run the linter" task required.
+
+### Three modes
+
+```mermaid
+graph TB
+    Q[Which mode?]
+    Q --> M1{Want backward-compatible<br/>silent-on-clean output?}
+    M1 -->|Yes| AUTO[auto — default]
+    M1 -->|No| M2{Want diagnostics<br/>even for clean edits?}
+    M2 -->|Yes| ON[on]
+    M2 -->|No| OFF[off — zero overhead]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q,M1,M2 q
+    class AUTO,ON,OFF pick
+```
+
+| Mode | When the `Diagnostics` block appears | Use when |
+|---|---|---|
+| `"auto"` (default) | Only when the checker reports problems | You want zero noise on clean edits and a self-correction hint on broken ones |
+| `"on"` | Always when a checker is available (shows `no problems found` on clean) | You want positive confirmation in logs/traces |
+| `"off"` | Never | You're in a sandbox with no checkers, or want absolute minimum overhead |
+
+### Configure the mode
+
+```python
+from praisonaiagents.tools.edit_tools import create_edit_tools
+
+edit_tools = create_edit_tools(post_edit_diagnostics="on")  # or "auto" / "off"
+```
+
+### Which checker runs?
+
+The first installed candidate for the file extension is used. Nothing installed → diagnostics are silently skipped and the tool returns the plain success string.
+
+| Extension | Checkers (in order) |
+|---|---|
+| `.py`, `.pyi` | `ruff` → `py_compile` (stdlib, always available) |
+| `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs` | `eslint` → `tsc` (TS only) |
+| `.json` | stdlib JSON parser |
+| anything else | (no checker — silent) |
+
+### Output format
+
+```
+Success: Made 1 replacement(s) in src/calc.py
+
+Diff:
+@@ -1 +1 @@
+-total = a + b
++total = a + b + c
+
+Diagnostics (ruff):
+src/calc.py:1:18: F821 Undefined name `c`
+```
+
+### Guarantees
+
+- **Backward compatible** — `auto` mode keeps the success string unchanged when the edit is clean.
+- **Never breaks an edit** — a missing, slow, or crashing checker is silently skipped (logged at `DEBUG`).
+- **Bounded** — 10-second timeout per file; output capped at 2000 characters and truncated cleanly beyond that.
+- **Sandbox-safe** — `eslint` runs with `--no-config-lookup` so workspace-controlled configs/plugins cannot execute code; `tsc` runs per-file without a `tsconfig.json`.
+- **Zero overhead in `off` mode** — all imports are deferred.
 
 ---
 
@@ -341,12 +565,12 @@ sequenceDiagram
 
 | Function | Args | Returns | Notes |
 |----------|------|---------|-------|
-| `edit_file` | `filepath`, `old_string`, `new_string`, `replace_all=False`, `expected_hash=None` | `str` | High-risk; fuzzy ladder + fails on ambiguous match unless `replace_all=True` |
-| `apply_patch` | `patch: str` | `str` | High-risk; atomic multi-file Add/Update/Delete with rollback |
-| `read_file` *(edit_tools)* | `filepath` | `Tuple[str, str]` | `(content, sha256_hex)` for staleness checks |
-| `read_file` *(file_tools)* | `filepath`, `encoding='utf-8'` | `str` | Simple read, no hash |
+| `edit_file` | `filepath`, `old_string`, `new_string`, `replace_all=False`, `expected_hash=None`, `force=False` | `str` | High-risk; fuzzy ladder + fails on ambiguous match unless `replace_all=True`; **automatic per-file lock + staleness guard** |
+| `apply_patch` | `patch: str`, `force=False` | `str` | High-risk; atomic multi-file Add/Update/Delete with rollback; **per-path locks + staleness guard on Update and Delete** |
+| `read_file` *(edit_tools)* | `filepath` | `Tuple[str, str]` | `(content, sha256_hex)`; **records hash into shared registry** |
+| `read_file` *(file_tools)* | `filepath`, `encoding='utf-8'` | `str` | Simple read; **also records hash into shared registry** |
 | `search_files` | `directory`, `pattern`, `file_pattern='*'` | JSON string | Case-insensitive substring search |
-| `write_file` | `filepath`, `content` | `bool` | Full overwrite |
+| `write_file` | `filepath`, `content`, `encoding='utf-8'`, `force=False` | `bool` | Full overwrite; **automatic per-file lock + staleness guard on existing files** |
 | `list_files` | `directory` | `list[dict]` | Directory listing |
 
 ### Edit Parameters
@@ -354,18 +578,28 @@ sequenceDiagram
 | Parameter | Type | Default | Purpose |
 |---|---|---|---|
 | `replace_all` | `bool` | `False` | Required when `old_string` matches more than once |
-| `expected_hash` | `Optional[str]` | `None` | SHA-256 hex digest from the last `read_file`; aborts if the file changed |
+| `expected_hash` | `Optional[str]` | `None` | SHA-256 hex digest from the last `read_file`; aborts if the file changed (takes priority over the automatic guard) |
+| `force` | `bool` | `False` | Bypass the **automatic** staleness guard for an intentional blind write. An explicit `expected_hash` is still honoured even when `force=True`. |
+
+### Constructor Parameters (`EditTools` / `create_edit_tools`)
+
+| Parameter | Type | Default | Purpose |
+|---|---|---|---|
+| `post_edit_diagnostics` | `str` (`"auto"` \| `"on"` \| `"off"`) | `"auto"` | Run a per-file checker after a successful edit and append concise diagnostics. See [Post-edit Diagnostics](#post-edit-diagnostics). Invalid values fall back to `"auto"`. |
 
 ```python
-# Single unique match
+# Single unique match — guard fires automatically after a prior read
 edit_file("config.py", "DEBUG = False", "DEBUG = True")
 
 # Multiple matches — replace_all required
 edit_file("styles.css", "color: blue", "color: green", replace_all=True)
 
-# Conflict-safe flow
+# Explicit hash (most precise — takes priority over automatic guard)
 content, h = read_file("config.py")
 edit_file("config.py", "DEBUG = False", "DEBUG = True", expected_hash=h)
+
+# Intentional blind write — skip the staleness check
+edit_file("rollback.txt", "v2", "v1", force=True)
 ```
 
 ### Error Messages
@@ -374,7 +608,12 @@ edit_file("config.py", "DEBUG = False", "DEBUG = True", expected_hash=h)
 |---|---|
 | File not found | `Error: File not found: {filepath}` |
 | UTF-16 encoding | `Error: UTF-16 encoding is not supported. Please convert the file to UTF-8.` |
-| Stale hash | `Error: File has been modified since last read. Please re-read the file before editing. Expected hash: {expected_hash[:8]}..., Current hash: {current_hash[:8]}...` |
+| Explicit `expected_hash` mismatch | `Error: File has been modified since last read. Please re-read the file before editing. Expected hash: {expected_hash[:8]}..., Current hash: {current_hash[:8]}...` |
+| Automatic staleness — `edit_file` | `Error: File changed since it was read - re-read before editing (or pass force=True to override). Recorded hash: {recorded[:8]}..., Current hash: {current[:8]}...` |
+| Automatic staleness — `apply_patch` Update | `Error: Cannot update '{path}': file changed since it was read - re-read before editing (or pass force=True to override).` |
+| Automatic staleness — `apply_patch` Delete | `Error: Cannot delete '{path}': file changed since it was read - re-read before editing (or pass force=True to override).` |
+| `write_file` stale refusal | (logger error; tool returns `False`) `Refusing to write {filepath}: file changed since it was read - re-read before writing (or pass force=True)` |
+| `write_file` verify-read failure | (logger error; tool returns `False`) `Refusing to write {filepath}: could not verify staleness: {err}` |
 | Empty `old_string` | `Error: old_string must be non-empty` |
 | String not found | `Error: String not found in file: '{preview}'` |
 | Ambiguous match | `Error: Ambiguous match - '{preview}' occurs {N} times. Please provide more surrounding context to make the match unique, or use replace_all=True to replace all occurrences.` |
@@ -397,12 +636,11 @@ If a file contains mixed line endings, any CRLF present causes the file to be no
 ```python
 from praisonaiagents.tools.edit_tools import read_file, edit_file
 
-content, h = read_file("src/utils.js")
+read_file("src/utils.js")
 edit_file(
     "src/utils.js",
     "function oldFunction(",
     "function newFunction(",
-    expected_hash=h,
 )
 ```
 
@@ -420,6 +658,27 @@ edit_file(
 ### Surviving Concurrent Edits
 
 ```python
+from praisonaiagents.tools.edit_tools import read_file, edit_file
+
+# Automatic — the recorded read hash makes the edit safe.
+read_file("config.py")
+result = edit_file("config.py", "DEBUG = False", "DEBUG = True")
+# If anything changed config.py between the read and the edit, the result is
+# the staleness error; re-read and retry, or pass force=True for an intentional
+# blind write.
+
+# Same protection for write_file:
+from praisonaiagents.tools.file_tools import FileTools
+ft = FileTools()
+ft.read_file("config.json")
+ft.write_file("config.json", '{"debug": true}')  # refuses if config.json moved on us
+```
+
+If you already have a trusted hash:
+
+```python
+from praisonaiagents.tools.edit_tools import read_file, edit_file
+
 content, h = read_file("config.py")
 # ... another process may edit the file here ...
 result = edit_file("config.py", "DEBUG = False", "DEBUG = True", expected_hash=h)
@@ -451,16 +710,24 @@ from src.auth import AccountService
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Read before you edit — the guard is automatic">
+Any `read_file` call (via `edit_tools` or `file_tools`) arms the automatic staleness guard for the next write or edit on that path. The guard fires without any extra parameters; just read first and the protection is in place.
+</Accordion>
+
+<Accordion title="Use force=True only for intentional blind overwrites">
+`force=True` bypasses the automatic staleness guard on `edit_file`, `apply_patch`, and `write_file` — but the per-file lock still applies. It's not a "skip all safety" flag; it only allows the write to proceed when the file changed since the last read. Use it for deliberate rollbacks or idempotent snapshots, not as a routine escape from proper read-before-write discipline.
+</Accordion>
+
+<Accordion title="Same path = same lock, different paths = parallel">
+The per-file lock is keyed on the **canonical** path, so two callers that resolve to the same file always serialise — regardless of which module or agent they use. Different files proceed in parallel, so unrelated edits in a multi-agent run are never unnecessarily blocked.
+</Accordion>
+
 <Accordion title="Search Before Edit">
 Use `search_files` to locate patterns before editing so you know scope and can craft a unique `old_string`.
 </Accordion>
 
 <Accordion title="Use the returned diff for verification">
 `edit_file` returns a bounded unified diff (10 lines max, 200 chars per line) so you rarely need a second read.
-</Accordion>
-
-<Accordion title="Pass expected_hash when files might change">
-Long-running agents, parallel sessions, or human edits during a run benefit from the staleness guard.
 </Accordion>
 
 <Accordion title="Make old_string unique">
@@ -482,6 +749,10 @@ The patch hunk format uses `@@` to separate hunks and `===` to separate old from
 <Accordion title="Workspace Security">
 File operations respect workspace boundaries. Paths outside the workspace are rejected to prevent directory traversal.
 </Accordion>
+
+<Accordion title="Post-edit diagnostics mode">
+Leave `post_edit_diagnostics` at its default (`"auto"`). When the checker reports problems, the tool result includes a `Diagnostics (<tool>):` block — instruct the agent to fix the reported issues in its next edit. Switch to `"on"` if you want positive `no problems found` confirmations in traces, or `"off"` if you're in a sandbox with no checkers available.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -490,7 +761,7 @@ File operations respect workspace boundaries. Paths outside the workspace are re
 
 <CardGroup cols={2}>
 <Card title="Workspace" icon="folder-lock" href="/docs/features/workspace">
-  How workspace containment secures file operations
+  How workspace containment secures file operations — the per-file lock complements workspace boundaries
 </Card>
 <Card title="Bot Default Tools" icon="toolbox" href="/docs/features/bot-default-tools">
   File tools included in default bot toolsets

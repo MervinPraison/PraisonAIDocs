@@ -82,13 +82,27 @@ sequenceDiagram
     participant Client
     participant Gateway
 
-    Client->>Gateway: hello (agent_id, protocol_min/max)
-    alt success
-        Gateway-->>Client: hello_ok (protocol, features, policy, session_id)
-    else version mismatch
-        Gateway-->>Client: hello_error (protocol_unsupported, next: upgrade_client)
-    else unknown agent
-        Gateway-->>Client: hello_error (agent_not_found, next: check_agent_id)
+    Client->>Gateway: WS upgrade
+    alt rate limited
+        Gateway-->>Client: hello_error (rate_limited, wait_then_retry, retry_after_seconds)
+        Gateway-->>Client: close 4008
+    else origin denied
+        Gateway-->>Client: hello_error (origin_not_allowed, do_not_retry)
+        Gateway-->>Client: close 4003
+    else auth missing
+        Gateway-->>Client: hello_error (auth_required, reauthenticate)
+        Gateway-->>Client: close 4003
+    else accepted
+        Client->>Gateway: hello (agent_id, protocol_min/max)
+        alt success
+            Gateway-->>Client: hello_ok (protocol, features, policy, session_id)
+        else version too old
+            Gateway-->>Client: hello_error (protocol_unsupported, upgrade_client)
+        else version too new
+            Gateway-->>Client: hello_error (protocol_unsupported, downgrade_client)
+        else unknown agent
+            Gateway-->>Client: hello_error (agent_not_found, do_not_retry)
+        end
     end
 ```
 
@@ -146,19 +160,54 @@ Base `methods`: `message`, `leave` only (`abort` is not implemented). Base `even
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `code` | `ConnectErrorCode` | Structured error code |
-| `message` | `str` | Human-readable explanation |
-| `next_action` | `Optional[str]` | Suggested next step |
+| `code` | `ConnectErrorCode` | Structured, machine-readable error code |
+| `message` | `str` | Human-readable explanation (display only) |
+| `next_step` | `Optional[ConnectRecoveryStep]` | Machine-readable recovery hint |
+| `retry_after_seconds` | `Optional[int]` | Backoff hint, only meaningful with `wait_then_retry` |
+| `next_action` | `Optional[str]` | **Deprecated** free-text hint; prefer `next_step` |
+
+<Note>
+Wire frame also includes a legacy `next` key for backward compatibility — it mirrors `next_action` (or falls back to `next_step.value`). The `next_step`, `retry_after_seconds`, and `next` keys are **omitted entirely** when no recovery hint is set — they are never `null`.
+</Note>
+
+Example wire frame (rate-limited):
+
+```json
+{
+  "type": "hello_error",
+  "code": "rate_limited",
+  "message": "Too many connection attempts",
+  "next_step": "wait_then_retry",
+  "retry_after_seconds": 30,
+  "next": "wait_then_retry"
+}
+```
 
 ### ConnectErrorCode
 
-| Code | Meaning | Typical `next_action` |
-|------|---------|----------------------|
-| `auth_required` | Authentication required but missing | — |
-| `auth_unauthorized` | Invalid credentials or wrong agent for session | `start_new_session` |
-| `protocol_unsupported` | Client/server version mismatch | `upgrade_client` or `use_older_client` |
-| `pairing_required` | Client must complete pairing first | `pair_device` |
-| `agent_not_found` | Unknown `agent_id` | `check_agent_id` |
+| Code | Meaning | Typical `next_step` |
+|------|---------|---------------------|
+| `auth_required` | Authentication missing on a non-loopback bind | `reauthenticate` |
+| `auth_unauthorized` | Invalid credentials or wrong agent for session | `reauthenticate` |
+| `protocol_unsupported` | Client/server version mismatch | `upgrade_client` or `downgrade_client` |
+| `pairing_required` | Client must complete pairing first | `repair` |
+| `agent_not_found` | Unknown `agent_id` | `do_not_retry` |
+| `rate_limited` | Too many connection attempts | `wait_then_retry` (+ `retry_after_seconds`) |
+| `origin_not_allowed` | Origin not in allowed list (CSWSH defence) | `do_not_retry` |
+| `configuration_error` | Server is misconfigured (e.g. external bind with no allowlist) | `do_not_retry` |
+
+### ConnectRecoveryStep
+
+Machine-readable recovery hint. Clients branch on `(code, next_step)` instead of parsing `message`.
+
+| Value | Meaning |
+|-------|--------|
+| `reauthenticate` | Obtain fresh credentials, then reconnect |
+| `repair` | Re-run device pairing, then reconnect |
+| `upgrade_client` | Client protocol too old — update the client |
+| `downgrade_client` | Client protocol newer than server — use an older client |
+| `wait_then_retry` | Back off (`retry_after_seconds`), then reconnect |
+| `do_not_retry` | Terminal — reconnecting will not help |
 
 ---
 
@@ -203,8 +252,23 @@ Requesting `streaming` without handling `token_stream` events wastes bandwidth a
 Resume cleanly after disconnect and process `replay` envelopes before sending new messages.
 </Accordion>
 
-<Accordion title="Branch on code and next from hello_error">
-Use structured `ConnectErrorCode` values for graceful UX instead of parsing free-text errors.
+<Accordion title="Branch on (code, next_step) from hello_error">
+Use the structured `(code, next_step)` pair instead of parsing `message`. The legacy `next` key is still emitted for older clients but new code should branch on `next_step`.
+
+```python
+if frame.get("type") == "hello_error":
+    step = frame.get("next_step")
+    if step == "wait_then_retry":
+        await asyncio.sleep(frame.get("retry_after_seconds", 1))
+        await reconnect()
+    elif step == "reauthenticate":
+        await refresh_credentials()
+        await reconnect()
+    elif step in ("do_not_retry", "upgrade_client", "downgrade_client", "repair"):
+        surface_to_user(frame["message"])
+    else:
+        await reconnect()  # default: try again
+```
 </Accordion>
 
 </AccordionGroup>
