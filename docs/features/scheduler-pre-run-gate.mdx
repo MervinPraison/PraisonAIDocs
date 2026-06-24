@@ -1,0 +1,305 @@
+---
+title: "Scheduler Pre-Run Gate"
+sidebarTitle: "Pre-Run Gate"
+description: "Skip scheduled model turns when a cheap deterministic check says there's nothing to do"
+icon: "filter"
+---
+
+Run a cheap shell check before each scheduled tick — skip the model turn (and any delivery ping) when there's nothing to do.
+
+```mermaid
+graph LR
+    Tick[⏰ Tick due] --> Gate{🚦 pre_run?}
+    Gate -->|exit 0 + output| Run[🤖 Run model + context]
+    Gate -->|exit 0 empty| RunPlain[🤖 Run model]
+    Gate -->|non-zero / timeout| Skip[⏭️ Skip — 0 tokens]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef run fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef skip fill:#8B0000,stroke:#7C90A0,color:#fff
+    class Tick input
+    class Gate gate
+    class Run,RunPlain run
+    class Skip skip
+```
+
+## Quick Start
+
+<Steps>
+<Step title="YAML (simplest)">
+Add `pre_run` to your `agents.yaml` schedule block. The agent only runs when the script exits 0 with output.
+
+```yaml
+schedule:
+  every: 300
+  pre_run: scripts/new_mail.sh
+  message: "Summarise these new emails and flag anything important."
+```
+</Step>
+
+<Step title="Python">
+Set `pre_run` directly on a `ScheduleJob`.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.scheduler import ScheduleJob, Schedule
+
+agent = Agent(
+    name="InboxWatcher",
+    instructions="Summarise new emails and flag anything important.",
+)
+
+job = ScheduleJob(
+    name="inbox-watch",
+    schedule=Schedule(kind="every", every_seconds=300),
+    pre_run="scripts/new_mail.sh",
+    message="Summarise these new emails and flag anything important.",
+)
+```
+</Step>
+
+<Step title="CLI">
+Pass `--pre-run` when adding a scheduled job.
+
+```bash
+praisonai schedule add "inbox-watch" \
+  -s "*/5m" \
+  -m "Summarise new emails" \
+  --pre-run "scripts/new_mail.sh" \
+  --deliver telegram
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant Gate as ShellConditionGate
+    participant Agent
+
+    loop Every tick
+        Scheduler->>Gate: asyncio.to_thread(run pre_run cmd)
+        alt exit 0 + stdout
+            Gate-->>Scheduler: run=True, context=stdout
+            Scheduler->>Agent: agent.chat(message + context)
+            Agent-->>Scheduler: result → deliver
+        else exit 0, no stdout
+            Gate-->>Scheduler: run=True, context=None
+            Scheduler->>Agent: agent.chat(message)
+            Agent-->>Scheduler: result → deliver
+        else non-zero exit or timeout
+            Gate-->>Scheduler: run=False, reason=stderr
+            Scheduler->>Scheduler: record skipped — 0 tokens spent
+        end
+    end
+```
+
+The gate runs in `asyncio.to_thread` so a slow check does not block other scheduled ticks. If the gate itself raises an exception, the executor falls back to running the agent (defensive default).
+
+---
+
+## Configuration Options
+
+### `ScheduleJob` fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pre_run` | `Optional[str]` | `None` | Shell command run before each tick. Set via YAML `schedule.pre_run` or `--pre-run` |
+| `condition` | `Optional[str]` | `None` | Advisory natural-language label (round-tripped, **not** enforced by the default gate) |
+
+### `ScheduledAgentExecutor` parameter
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `condition_resolver` | `None \| False \| callable` | `None` | `None` = auto shell gate when `pre_run` set; `False` = gating disabled; callable `(job) → gate \| None` = custom resolver |
+
+### `ShellConditionGate` options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `timeout` | `float` | `30.0` | Seconds before the gate is treated as a skip |
+| `_MAX_CONTEXT_CHARS` | `int` | `8000` | Cap on captured stdout appended as context |
+| `_MAX_REASON_CHARS` | `int` | `500` | Cap on stderr surfaced in the skip reason |
+
+### Gate decision table
+
+| Gate command exit | stdout | Decision | What happens |
+|-------------------|--------|----------|--------------|
+| `0` | non-empty | `run=True`, `context=stdout` | Model runs, stdout appended to message |
+| `0` | empty | `run=True`, `context=None` | Model runs with original message only |
+| non-zero | — | `run=False` | Tick recorded as `skipped` — no tokens, no delivery |
+| timeout (>`timeout`s) | — | `run=False` | Same as skipped |
+| gate raises | — | falls back to `run=True` | Model runs (defensive) |
+
+<Warning>
+`pre_run` executes an arbitrary host shell command on every tick. It is **not** exposed through the agent-callable `schedule_add` tool — accepting it from an LLM would allow a prompt-injected agent to persist server-side command execution. Configure `pre_run` only via CLI, YAML, or Python.
+</Warning>
+
+---
+
+## Pre-Run Gate vs RunPolicy
+
+Two complementary gates apply on every tick when both are configured:
+
+```mermaid
+graph LR
+    Tick[⏰ Tick] --> PreRun{pre_run gate}
+    PreRun -->|skip| Skip[⏭️ 0 tokens]
+    PreRun -->|run| Policy{RunPolicy}
+    Policy -->|blocked| Blocked[🔒 safety block]
+    Policy -->|allowed| Model[🤖 Model runs]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef run fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef skip fill:#8B0000,stroke:#7C90A0,color:#fff
+    class Tick input
+    class PreRun,Policy gate
+    class Model run
+    class Skip,Blocked skip
+```
+
+| Gate | Purpose | When to configure |
+|------|---------|-------------------|
+| **Pre-run gate** (`pre_run`) | **Efficiency** — should a run happen at all? | When most ticks have nothing to do |
+| **RunPolicy** | **Safety** — what is an unattended run allowed to do? | Always in production unattended runs |
+
+---
+
+## Common Patterns
+
+### Inbox watcher
+
+Only fire when new mail arrives — cuts 288 daily runs to just the count of mail bursts.
+
+```yaml
+schedule:
+  every: 300
+  pre_run: scripts/new_mail.sh
+  message: "Summarise these new emails and flag anything important."
+```
+
+`scripts/new_mail.sh` exits 0 and prints new messages when mail is present; exits non-zero when the inbox is quiet.
+
+### CI babysitter
+
+Alert a channel only when a build breaks.
+
+```bash
+praisonai schedule add "ci-watch" \
+  -s "*/5m" \
+  -m "Summarise the CI failure and suggest a fix" \
+  --pre-run "scripts/ci_failed.sh" \
+  --deliver telegram
+```
+
+### Custom Python gate
+
+Use a callable resolver for richer logic than a shell exit code.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.scheduler import ScheduleJob, Schedule
+from praisonai.scheduler.executor import ScheduledAgentExecutor
+
+class MyPythonGate:
+    def check(self, job):
+        import requests
+        r = requests.get("https://api.example.com/has-work")
+        return r.json().get("pending", 0) > 0
+
+agent = Agent(name="WorkProcessor", instructions="Process pending work items.")
+
+job = ScheduleJob(
+    name="work-processor",
+    schedule=Schedule(kind="every", every_seconds=60),
+    message="Process all pending work items.",
+)
+
+executor = ScheduledAgentExecutor(
+    runner=runner,
+    agent_resolver=lambda _: agent,
+    condition_resolver=lambda job: MyPythonGate(),
+)
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Keep the gate cheap and deterministic">
+The gate runs on every tick. Aim for under 1 second — a fast file check, an API ping, or a database row count. Avoid heavy computation.
+
+```bash
+# Good — fast local check
+scripts/new_mail.sh
+
+# Avoid — slow network calls without caching
+scripts/fetch_all_data_and_analyse.sh
+```
+</Accordion>
+
+<Accordion title="Always set a sensible timeout">
+The default `timeout=30.0` is conservative. A runaway gate stalls that tick's slot. Set it to match your gate's expected worst case.
+
+```python
+from praisonai.scheduler.condition_gate import ShellConditionGate
+
+gate = ShellConditionGate(timeout=5.0)
+```
+</Accordion>
+
+<Accordion title="Use stdout to seed the prompt">
+The same check that gates the run can feed it the data — the gate's stdout is automatically appended to the message.
+
+```bash
+#!/bin/bash
+# scripts/new_mail.sh
+# Prints new mail subjects if any, exits non-zero if inbox empty
+NEW=$(mail -H 2>/dev/null | head -20)
+if [ -z "$NEW" ]; then exit 1; fi
+echo "$NEW"
+```
+
+The agent then receives: `"Summarise these new emails... <new mail subjects>"`.
+</Accordion>
+
+<Accordion title="Don't put secrets in pre_run">
+The `pre_run` string is stored verbatim in the job record. Use environment variables or a secrets manager instead of inline credentials.
+
+```bash
+# Good — use environment variable
+scripts/check_api.sh
+
+# Avoid — secret visible in job record
+curl -H "Authorization: Bearer mysecrettoken" https://api.example.com/check
+```
+</Accordion>
+
+<Accordion title="pre_run is CLI/YAML/Python-only — never LLM-callable">
+The agent-callable `schedule_add` tool deliberately does not accept `pre_run`. This prevents a prompt-injected agent from persisting arbitrary shell commands on the host. Always configure `pre_run` through the CLI, YAML, or Python code.
+</Accordion>
+
+<Accordion title="Understand skipped vs failed">
+A gate returning non-zero records the tick as `skipped` (not `failed`) — this is expected normal operation when there's nothing to do. Check your run history with `praisonai schedule logs` to see skip rates.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Async Agent Scheduler" icon="clock" href="/docs/features/async-agent-scheduler">
+  The scheduler this gate plugs into
+</Card>
+<Card title="Schedule CLI" icon="terminal" href="/docs/cli/schedule">
+  CLI surface — where `--pre-run` and `--condition` are configured
+</Card>
+</CardGroup>
