@@ -405,6 +405,59 @@ class Handoff:
             # In intersect mode, empty list means no tools allowed - this is the security boundary
             return effective_tools
     
+    @staticmethod
+    def _extract_model_ref(agent: 'Agent') -> str:
+        """Extract a model reference string from an agent configuration."""
+        llm = getattr(agent, 'llm', None) or getattr(agent, 'model', None)
+        if isinstance(llm, str):
+            return llm
+        if llm is not None:
+            for attr in ('model', 'model_name', 'model_ref'):
+                value = getattr(llm, attr, None)
+                if isinstance(value, str) and value:
+                    return value
+        return 'gpt-4o-mini'
+
+    def _execute_with_runtime_resolution(
+        self, 
+        source_agent: 'Agent', 
+        prompt: str, 
+        effective_tools: Optional[List[Any]], 
+        context: Dict[str, Any]
+    ) -> str:
+        """Execute handoff through the target agent's full chat pipeline."""
+        target_model_ref = self._extract_model_ref(self.agent)
+        logger.debug(
+            "Handoff to %s via agent.chat (model=%s, depth=%s)",
+            getattr(self.agent, 'name', 'unknown'),
+            target_model_ref,
+            _get_handoff_depth(),
+        )
+        return self.agent.chat(prompt, tools=effective_tools)
+    
+    async def _execute_with_runtime_resolution_async(
+        self, 
+        source_agent: 'Agent', 
+        prompt: str, 
+        effective_tools: Optional[List[Any]], 
+        context: Dict[str, Any]
+    ) -> str:
+        """Execute handoff through the target agent's full async chat pipeline."""
+        target_model_ref = self._extract_model_ref(self.agent)
+        logger.debug(
+            "Async handoff to %s via agent chat (model=%s, depth=%s)",
+            getattr(self.agent, 'name', 'unknown'),
+            target_model_ref,
+            _get_handoff_depth(),
+        )
+        async_chat = getattr(self.agent, 'achat', None)
+        if callable(async_chat) and inspect.iscoroutinefunction(async_chat):
+            return await async_chat(prompt, tools=effective_tools)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, lambda: self.agent.chat(prompt, tools=effective_tools)
+        )
+    
     def _check_safety(self, source_agent: 'Agent') -> None:
         """
         Check safety constraints before handoff.
@@ -569,8 +622,10 @@ class Handoff:
             # Compute effective tools based on tool policy
             effective_tools = self._compute_effective_tools(source_agent)
             
-            # Execute with tool boundary enforcement
-            response = self.agent.chat(full_prompt, tools=effective_tools)
+            # Resolve runtime at turn-time instead of using construction-time pin
+            response = self._execute_with_runtime_resolution(
+                source_agent, full_prompt, effective_tools, kwargs
+            )
             
             result = HandoffResult(
                 success=True,
@@ -675,13 +730,10 @@ class Handoff:
                 # Compute effective tools based on tool policy
                 effective_tools = self._compute_effective_tools(source_agent)
                 
-                # Execute with tool boundary enforcement - check for async chat method
-                if hasattr(self.agent, 'achat'):
-                    response = await self.agent.achat(full_prompt, tools=effective_tools)
-                else:
-                    # Run sync chat in executor with tool constraint
-                    loop = asyncio.get_event_loop()
-                    response = await loop.run_in_executor(None, lambda: self.agent.chat(full_prompt, tools=effective_tools))
+                # Resolve runtime at turn-time for async execution
+                response = await self._execute_with_runtime_resolution_async(
+                    source_agent, full_prompt, effective_tools, kwargs
+                )
                 
                 result = HandoffResult(
                     success=True,
@@ -817,7 +869,10 @@ class Handoff:
                     # Compute effective tools based on tool policy
                     effective_tools = self._compute_effective_tools(source_agent)
                     
-                    response = self.agent.chat(prompt, tools=effective_tools)
+                    # Resolve runtime at turn-time for tool function execution
+                    response = self._execute_with_runtime_resolution(
+                        source_agent, prompt, effective_tools, kwargs
+                    )
                     
                     result = HandoffResult(
                         success=True,

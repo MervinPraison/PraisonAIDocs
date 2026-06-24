@@ -18,6 +18,7 @@ from .protocols import (
     GatewayEvent,
     GatewayMessage,
     EventType,
+    OperatorScope,
     # Push protocols and dataclasses
     PushChannelProtocol,
     PresenceProtocol,
@@ -28,6 +29,10 @@ from .protocols import (
     # Home channel and delivery protocols
     HomeChannelRegistryProtocol,
     DeliveryResolverProtocol,
+    # Agent-facing outbound messaging
+    OutboundMessengerProtocol,
+    DeliveryResult,
+    TargetInfo,
     # Protocol version negotiation
     PROTOCOL_VERSION,
     MIN_PROTOCOL_VERSION,
@@ -97,6 +102,7 @@ __all__ = [
     "GatewayEvent",
     "GatewayMessage",
     "EventType",
+    "OperatorScope",
     # Push protocols (always available)
     "PushChannelProtocol",
     "PresenceProtocol",
@@ -107,6 +113,10 @@ __all__ = [
     # Home channel and delivery protocols
     "HomeChannelRegistryProtocol",
     "DeliveryResolverProtocol",
+    # Agent-facing outbound messaging
+    "OutboundMessengerProtocol",
+    "DeliveryResult",
+    "TargetInfo",
     # Protocol version negotiation
     "PROTOCOL_VERSION",
     "MIN_PROTOCOL_VERSION",

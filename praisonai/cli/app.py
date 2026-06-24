@@ -113,6 +113,7 @@ class OutputFormat(str, Enum):
 # Command registry for lazy loading
 _LAZY_COMMANDS: Dict[str, Tuple[str, str, str]] = {
     # Core commands
+    "init": (".commands.init", "app", "Initialise the .praisonai/ project convention"),
     "config": (".commands.config", "app", "Configuration management"),
     "traces": (".commands.traces", "app", "Trace collection management"),
     "env": (".commands.environment", "app", "Environment and diagnostics"),
@@ -185,6 +186,7 @@ _LAZY_COMMANDS: Dict[str, Tuple[str, str, str]] = {
     "bot": (".commands.bot", "app", "Messaging bots with full agent capabilities"),
     "gateway": (".commands.gateway", "app", "Multi-bot WebSocket gateway server"),
     "pairing": (".commands.pairing", "app", "Manage bot user pairing"),
+    "identity": (".commands.identity", "app", "Manage cross-platform user identity links"),
     "browser": (".commands.browser", "app", "Browser control for agent automation"),
     "plugins": (".commands.plugins", "app", "Plugin management and inspection"),
     "sandbox": (".commands.sandbox", "app", "Sandbox container management"),
@@ -705,6 +707,7 @@ def get_output_controller() -> OutputController:
 # Command name to module mapping for lazy loading
 _COMMAND_GROUPS = {
     # Core commands
+    "init": ".commands.init",
     "config": ".commands.config",
     "traces": ".commands.traces", 
     "env": ".commands.environment",
@@ -768,6 +771,7 @@ _COMMAND_GROUPS = {
     "bot": ".commands.bot",
     "gateway": ".commands.gateway",
     "pairing": ".commands.pairing",
+    "identity": ".commands.identity",
     "browser": ".commands.browser",
     "plugins": ".commands.plugins",
     "sandbox": ".commands.sandbox",

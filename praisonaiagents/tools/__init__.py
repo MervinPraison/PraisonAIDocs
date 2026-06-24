@@ -180,6 +180,10 @@ TOOL_MAPPINGS = {
     'schedule_list': ('.schedule_tools', None),
     'schedule_remove': ('.schedule_tools', None),
     'schedule_tools': ('.schedule_tools', None),
+
+    # Proactive messaging (agent-facing gateway delivery)
+    'send_message': ('.messaging_tools', None),
+    'messaging_tools': ('.messaging_tools', None),
     
     # AST-Grep Tools (structural code search/rewrite)
     'ast_grep_search': ('.ast_grep_tool', None),
@@ -196,6 +200,11 @@ TOOL_MAPPINGS = {
     # Learning Tools (active categorized knowledge store/search)
     'store_learning': ('.learning', None),
     'search_learning': ('.learning', None),
+
+    # Session Tools (cross-session conversation recall - Issue #2184)
+    'session_search': ('.session_tools', None),
+    'create_session_tools': ('.session_tools', None),
+    'SessionTools': ('.session_tools', 'SessionTools'),
 
     # Email Tools (AgentMail-based send/read/list/reply/create)
     'send_email': ('.email_tools', None),
@@ -318,7 +327,7 @@ def __getattr__(name: str) -> Any:
     module_path, class_name = TOOL_MAPPINGS[name]
     
     # Return class itself (not instance) for TavilyTools, YouTools, ExaTools, Crawl4AITools
-    if name in ('TavilyTools', 'YouTools', 'ExaTools', 'Crawl4AITools'):
+    if name in ('TavilyTools', 'YouTools', 'ExaTools', 'Crawl4AITools', 'SessionTools'):
         module = import_module(module_path, __package__)
         return getattr(module, class_name)
     
@@ -344,16 +353,18 @@ def __getattr__(name: str) -> Any:
             'github_create_branch', 'github_commit_and_push', 'github_create_pull_request',
             'jira_watch_issue', 'jira_watch_project', 'jira_get_issue_info', 'jira_search_issues',
             'schedule_add', 'schedule_list', 'schedule_remove',
+            'send_message',
             'ast_grep_search', 'ast_grep_rewrite', 'ast_grep_scan', 'is_ast_grep_available', 'get_ast_grep_tools',
             'store_memory', 'search_memory',
             'store_learning', 'search_learning',
+            'session_search', 'create_session_tools',
             'send_email', 'list_emails', 'read_email', 'reply_email', 'list_inboxes', 'create_inbox',
             'smtp_send_email', 'smtp_read_inbox',
             'create_cli_clarify_handler', 'create_bot_clarify_handler',
             'clarify'
         ]:
             return getattr(module, name)
-        if name in ['file_tools', 'spider_tools', 'python_tools', 'shell_tools', 'cot_tools', 'tavily_tools', 'youdotcom_tools', 'exa_tools', 'crawl4ai_tools', 'skill_tools', 'github_tools', 'jira_tools', 'schedule_tools', 'ast_grep_tools', 'email_tools']:
+        if name in ['file_tools', 'spider_tools', 'python_tools', 'shell_tools', 'cot_tools', 'tavily_tools', 'youdotcom_tools', 'exa_tools', 'crawl4ai_tools', 'skill_tools', 'github_tools', 'jira_tools', 'schedule_tools', 'messaging_tools', 'ast_grep_tools', 'email_tools']:
             return module  # Returns the callable module
         return getattr(module, name)
     else:
