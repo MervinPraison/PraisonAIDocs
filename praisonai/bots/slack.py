@@ -27,7 +27,17 @@ from praisonaiagents.bots import (
 )
 
 from .media import split_media_from_output, is_audio_file
-from ._commands import format_status, format_help, handle_stop_command
+from ._commands import (
+    format_status, 
+    format_help, 
+    handle_stop_command,
+    handle_model_command,
+    handle_usage_command,
+    handle_compress_command,
+    handle_queue_command,
+    handle_learn_command,
+    build_command_access_policy,
+)
 from ._session import BotSessionManager
 from ._debounce import InboundDebouncer
 from ._ack import AckReactor
@@ -102,6 +112,10 @@ class SlackBot(ChatCommandMixin, MessageHookMixin):
         self._message_handlers: List[Callable] = []
         self._command_handlers: Dict[str, Callable] = {}
         self._started_at: Optional[float] = None
+
+        # Per-command authorization, shared with Telegram/Discord so privileged
+        # commands (e.g. /learn) can be restricted consistently across channels.
+        self._command_policy = build_command_access_policy(self.config)
         
         # Use helper to build session manager
         from ._session import build_session_manager
@@ -221,6 +235,18 @@ class SlackBot(ChatCommandMixin, MessageHookMixin):
                     return
             
             text = event.get("text", "").strip()
+            # Per-command authorization: privileged commands (e.g. /learn) can be
+            # restricted to admins independent of the channel/pairing allow gate,
+            # consistent with Telegram and Discord.
+            if text.startswith("/"):
+                command_name = text[1:].split(maxsplit=1)[0].lower() if len(text) > 1 else ""
+                cmd_user_id = event.get("user", "unknown")
+                if command_name and not self._command_policy.can_run(cmd_user_id, command_name):
+                    await say(
+                        text=f"⛔ You are not permitted to run /{command_name}",
+                        thread_ts=event.get("ts"),
+                    )
+                    return
             if text == "/status":
                 await say(text=self._format_status(), thread_ts=event.get("ts"))
                 return
@@ -235,6 +261,36 @@ class SlackBot(ChatCommandMixin, MessageHookMixin):
             elif text == "/stop":
                 user_id = event.get("user", "unknown")
                 response = handle_stop_command(self._session, user_id)
+                await say(text=response, thread_ts=event.get("ts"))
+                return
+            elif text.split(maxsplit=1)[:1] == ["/model"]:
+                user_id = event.get("user", "unknown")
+                parts = text.split(maxsplit=1)
+                model_name = parts[1] if len(parts) > 1 else None
+                response = handle_model_command(self._session, user_id, model_name, self._agent)
+                await say(text=response, thread_ts=event.get("ts"))
+                return
+            elif text == "/usage":
+                user_id = event.get("user", "unknown")
+                response = handle_usage_command(self._session, user_id, self._agent)
+                await say(text=response, thread_ts=event.get("ts"))
+                return
+            elif text == "/compress":
+                user_id = event.get("user", "unknown")
+                response = handle_compress_command(self._session, user_id, self._agent)
+                await say(text=response, thread_ts=event.get("ts"))
+                return
+            elif text.split(maxsplit=1)[:1] == ["/queue"]:
+                user_id = event.get("user", "unknown")
+                parts = text.split(maxsplit=1)
+                message_text = parts[1] if len(parts) > 1 else None
+                response = handle_queue_command(self._session, user_id, message_text)
+                await say(text=response, thread_ts=event.get("ts"))
+                return
+            elif text.split(maxsplit=1)[:1] == ["/learn"]:
+                parts = text.split(maxsplit=1)
+                request = parts[1] if len(parts) > 1 else None
+                response = handle_learn_command(self._agent, request)
                 await say(text=response, thread_ts=event.get("ts"))
                 return
             
@@ -393,6 +449,13 @@ class SlackBot(ChatCommandMixin, MessageHookMixin):
             @self._app.command(f"/{command}")
             async def handle_command(ack, command_data, respond, cmd=command, hdlr=handler):
                 await ack()
+                # Per-command authorization for registered slash commands, mirroring
+                # the message-event gate so privileged commands can't bypass policy.
+                if not self._command_policy.can_run(
+                    command_data.get("user_id", ""), cmd
+                ):
+                    await respond(f"⛔ You are not permitted to run /{cmd}")
+                    return
                 bot_message = BotMessage(
                     message_id=command_data.get("trigger_id", ""),
                     content=command_data.get("text", ""),
@@ -764,16 +827,7 @@ class SlackBot(ChatCommandMixin, MessageHookMixin):
 
     async def health(self):
         """Get detailed health status of the Slack bot."""
-        from praisonaiagents.bots import HealthResult
-        probe_result = await self.probe()
-        uptime = (time.time() - self._started_at) if self._started_at else None
-        session_count = len(self._session._histories) if hasattr(self._session, '_histories') else 0
-        return HealthResult(
-            ok=self._is_running and probe_result.ok, platform="slack",
-            is_running=self._is_running, uptime_seconds=uptime,
-            probe=probe_result, sessions=session_count,
-            error=probe_result.error if not probe_result.ok else None,
-        )
+        return await self._default_health()
 
     def _format_status(self) -> str:
         """Format /status response."""
