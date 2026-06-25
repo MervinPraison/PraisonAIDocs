@@ -66,9 +66,12 @@ Documentation MUST reflect SDK ground truth.
 | Memory | `praisonaiagents/memory/` | `docs/concepts/memory.mdx` |
 | Knowledge | `praisonaiagents/knowledge/` | `docs/concepts/knowledge.mdx` |
 
-In **PraisonAIDocs**, “SDK Location” paths are under **repo root** `praisonaiagents/` (not `src/`).
+In **PraisonAIDocs**, "SDK Location" paths are under **repo root** `praisonaiagents/` (not `src/`).
 
 **Reference folders (check these for any doc proposal, edit, or new page):** repo-root `praisonaiagents/` and `praisonai/`. Synced daily via `update_repos.sh` / `.github/workflows/update-repos.yml`. Reject or correct proposals that conflict with code there; do not document behaviour absent from those trees (use TS/Rust paths below when documenting those SDKs).
+
+> [!IMPORTANT]
+> **§1.4 vs §1.8 Precedence:** The "Docs Location" column above describes the **current canonical location** of existing pages — it is not a directive to create new pages in `docs/concepts/`. For **new** feature pages, always default to `docs/features/` (per §1.8). For **edits to existing** `docs/concepts/` pages, explicit per-file human approval is required before any AI agent may make changes (per §1.8). AI agents following the SDK-First Documentation Cycle (§1.2) that encounter a `docs/concepts/` mapping in this table should document the feature in `docs/features/` instead, unless a human has explicitly approved edits to the specific concept page.
 
 ### 1.5 Multi-SDK Reference
 
