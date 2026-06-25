@@ -1,0 +1,322 @@
+---
+title: "Gateway Inbound Hooks"
+sidebarTitle: "Gateway Hooks"
+description: "Trigger agents from external services via authenticated POST /hooks/<path>"
+icon: "webhook"
+---
+
+Inbound hooks expose a `POST /hooks/<path>` endpoint on the gateway — point any external service (GitHub Actions, Linear, Gmail push, Sentry alerts) at it and the gateway runs an agent and delivers the reply to a configured channel.
+
+```mermaid
+graph LR
+    S[External Service] --> P[POST /hooks/gmail]
+    P --> A[Auth check]
+    A --> D[Dedup / Idempotency]
+    D --> T[Template render]
+    T --> G[Agent.start]
+    G --> C[Delivery channel]
+    C --> U[User]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class S input
+    class P,A,D,T process
+    class G agent
+    class C,U result
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Define a hook and start the gateway">
+```python
+from praisonai.gateway import Gateway
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="triage",
+    instructions="Triage the inbound alert and summarise the action needed."
+)
+
+gw = Gateway(agents=[agent])
+gw.register_hook({
+    "path": "alerts",
+    "agent": "triage",
+    "auth": "my-shared-secret",
+    "deliver_to": "telegram:123456789",
+    "message": "Alert from {{ payload.source }}: {{ payload.title }}",
+})
+gw.start()
+```
+</Step>
+
+<Step title="Point your external service at the hook URL">
+```bash
+curl -X POST https://your-gateway/hooks/alerts \
+  -H "Authorization: Bearer my-shared-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"source": "Sentry", "title": "NullPointerException in prod"}'
+```
+</Step>
+
+<Step title="The agent replies to Telegram automatically">
+No polling, no webhook handler code — the gateway does it all.
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Ext as External Service
+    participant GW as Gateway /hooks/alerts
+    participant Dedup as Idempotency Store
+    participant Tmpl as Template Engine
+    participant Agent
+    participant Chan as Delivery Channel
+
+    Ext->>GW: POST (Authorization: Bearer token)
+    GW->>GW: Auth check
+    alt invalid token
+        GW-->>Ext: HTTP 401
+    end
+    GW->>Dedup: reserve idempotency key
+    alt duplicate
+        Dedup-->>GW: already in-flight
+        GW-->>Ext: HTTP 200 (no-op)
+    end
+    GW->>Tmpl: render session_key + message from payload
+    Tmpl-->>GW: rendered strings
+    GW->>Agent: start(rendered message)
+    Agent-->>GW: reply
+    GW->>Dedup: commit key (success)
+    GW->>Chan: deliver reply
+    Chan-->>Ext: HTTP 200
+```
+
+---
+
+## Three Ways to Register a Hook
+
+<Tabs>
+<Tab title="Python">
+```python
+from praisonai.gateway import Gateway
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="email-triager",
+    instructions="Triage the email and decide on an action."
+)
+
+gw = Gateway(agents=[agent])
+
+gw.register_hook({
+    "path": "gmail",
+    "agent": "email-triager",
+    "action": "agent",
+    "auth": "shared-secret",
+    "session_key": "hook:gmail:{from}",
+    "idempotency_key": "{message_id}",
+    "deliver_to": "telegram:123456789",
+    "message": "New mail from {{ payload.from }}: {{ payload.subject }}",
+})
+
+gw.start()
+```
+</Tab>
+
+<Tab title="YAML (gateway.yaml)">
+```yaml
+hooks:
+  - path: gmail
+    agent: email-triager
+    action: agent
+    auth: shared-secret
+    session_key: "hook:gmail:{from}"
+    idempotency_key: "{message_id}"
+    deliver_to: telegram:123456789
+    message: "New mail from {{ payload.from }}: {{ payload.subject }}"
+```
+
+Start the gateway pointing at the config:
+
+```bash
+praisonai gateway start --config gateway.yaml
+```
+</Tab>
+
+<Tab title="CLI">
+```bash
+praisonai gateway hooks add \
+  --path gmail \
+  --agent email-triager \
+  --deliver-to telegram:123456789 \
+  --message "New mail from {from}: {subject}"
+
+praisonai gateway hooks list
+
+praisonai gateway hooks remove gmail
+```
+</Tab>
+</Tabs>
+
+---
+
+## HookConfig Options
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `path` | `str` | required | URL segment after `/hooks/`. `"gmail"` exposes `POST /hooks/gmail`. Must be non-empty. |
+| `agent` | `str` | `None` | Agent name/id to run. Falls back to the gateway's first registered agent. |
+| `action` | `str` | `"agent"` | `"agent"` runs a new turn; `"wake"` nudges an existing session without a new message. |
+| `auth` | `str` | `None` | Bearer token required on inbound requests. Falls back to the gateway's global `auth_token`. |
+| `session_key` | `str` | `None` | Template for the session id, e.g. `"hook:gmail:{message_id}"`. Defaults to `"hook:{path}"`. |
+| `idempotency_key` | `str` | `None` | Template for the dedup key. When unset, hashes the entire payload. |
+| `deliver_to` | `str` | `None` | `platform:target` delivery spec, e.g. `"telegram:123456789"`. Omit to skip outbound delivery. |
+| `message` | `str` | `None` | Template for the message built from the payload and sent to the agent. |
+| `enabled` | `bool` | `True` | Whether the hook is active. `false` returns 404. |
+| `metadata` | `dict` | `{}` | Free-form key/value pairs passed to the agent context. |
+
+---
+
+## Templating
+
+Both `{{ payload.x }}` (Jinja-style) and `{x}` (format-string style) are accepted:
+
+```yaml
+message: "New mail from {{ payload.from }}: {{ payload.subject }}"
+session_key: "hook:gmail:{message_id}"
+```
+
+Rules:
+- The leading `payload.` is optional — `{{ payload.from }}` and `{from}` resolve identically.
+- Missing keys render as empty strings — the template never raises on partial payloads.
+- Single-pass substitution — a payload value containing `{...}` is never re-expanded (injection-safe).
+
+---
+
+## Actions
+
+**`"agent"` (default)** — runs a full agent turn with the rendered message as the user input:
+
+```yaml
+action: agent
+message: "Triage: {{ payload.title }}"
+```
+
+**`"wake"`** — nudges an existing session (triggers proactive delivery or a scheduled check-in) without injecting a new user message:
+
+```yaml
+action: wake
+session_key: "daily:{{ payload.user_id }}"
+```
+
+---
+
+## Idempotency & Retries
+
+The gateway deduplicates concurrent and retried deliveries:
+
+1. When `idempotency_key` is set, the key is rendered from the payload and hashed as `SHA-256(path + "\x00" + rendered_key)`.
+2. When unset, the entire payload is JSON-canonicalized and hashed.
+3. The key is **reserved in-flight** atomically — concurrent identical POSTs dedup across the await boundary.
+4. The key is **committed only after a successful agent run** — transient failures remain retryable.
+
+<Note>
+External services that retry on timeout (e.g. GitHub webhooks, Linear) are safe to point directly at inbound hooks without additional dedup logic on your side.
+</Note>
+
+---
+
+## Security
+
+<Warning>
+`Authorization: Bearer <token>` is the only accepted form. The `?token=` query-parameter path was removed because it leaks the shared secret into access logs.
+</Warning>
+
+| Behaviour | Detail |
+|---|---|
+| Auth required | 401 on missing or invalid `Authorization: Bearer` header |
+| Per-hook auth | `auth` field on the hook overrides the gateway's global `auth_token` |
+| Malformed JSON | 400 response, no agent run |
+| Missing agent | 500 when the hook names an agent that isn't registered (no silent fallback to another agent) |
+| Disabled hook | 404 when `enabled: false` |
+
+---
+
+## End-to-End Example: Gmail → Triage Agent → Telegram
+
+```yaml
+hooks:
+  - path: gmail
+    agent: email-triager
+    action: agent
+    auth: ${GMAIL_HOOK_SECRET}
+    session_key: "gmail:{message_id}"
+    idempotency_key: "{message_id}"
+    deliver_to: telegram:123456789
+    message: |
+      From: {{ payload.from }}
+      Subject: {{ payload.subject }}
+      Snippet: {{ payload.snippet }}
+      
+      Triage this email and suggest a one-line action.
+```
+
+1. Gmail push subscription fires `POST /hooks/gmail` with the email payload.
+2. Gateway verifies the bearer token from `$GMAIL_HOOK_SECRET`.
+3. Session key `gmail:<message_id>` scopes the conversation to this email thread.
+4. The rendered message is sent to the `email-triager` agent.
+5. The agent's reply is delivered to Telegram chat `123456789`.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Always set an idempotency_key for event-driven sources">
+External webhooks retry on timeout. Without an `idempotency_key`, a slow agent run followed by a timeout retry will run the agent twice. Use a message or event id from the payload.
+</Accordion>
+
+<Accordion title="Use per-hook auth tokens, not the global token">
+Set a distinct `auth` secret per hook so you can rotate individual secrets without restarting the gateway or changing the global token.
+</Accordion>
+
+<Accordion title="Set session_key to scope conversations">
+Without `session_key`, all deliveries to a hook share the same session (`hook:<path>`). Use a payload field like `{user_id}` or `{message_id}` to isolate conversations by sender or thread.
+</Accordion>
+
+<Accordion title="Test locally with curl before connecting a real service">
+```bash
+curl -X POST http://localhost:8765/hooks/gmail \
+  -H "Authorization: Bearer my-shared-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"from": "alice@example.com", "subject": "Hello", "message_id": "test-001"}'
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Webhook Verification" icon="shield-check" href="/docs/features/webhook-verification">
+  HMAC signature verification for outbound bot webhooks (different surface)
+</Card>
+<Card title="Proactive Delivery" icon="send" href="/docs/features/proactive-delivery">
+  Delivery routing — the channel:target format used in deliver_to
+</Card>
+<Card title="Gateway Overview" icon="server" href="/docs/features/gateway-overview">
+  Gateway configuration, channels, and multi-bot mode
+</Card>
+<Card title="Gateway CLI" icon="terminal" href="/docs/features/gateway-cli">
+  All gateway CLI commands including hooks add / list / remove
+</Card>
+</CardGroup>
