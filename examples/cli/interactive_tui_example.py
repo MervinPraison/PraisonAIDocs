@@ -2,7 +2,7 @@
 Interactive TUI Example for PraisonAI CLI.
 
 Rich terminal interface with completions and history.
-Docs: https://docs.praison.ai/cli/interactive-tui
+Docs: https://praison.ai/docs/cli/interactive-tui
 """
 
 from praisonai.cli.features import InteractiveTUIHandler

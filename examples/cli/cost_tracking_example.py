@@ -2,7 +2,7 @@
 Cost Tracking Example for PraisonAI CLI.
 
 Real-time token usage and cost monitoring.
-Docs: https://docs.praison.ai/cli/cost-tracking
+Docs: https://praison.ai/docs/cli/cost-tracking
 """
 
 from praisonai.cli.features import CostTrackerHandler

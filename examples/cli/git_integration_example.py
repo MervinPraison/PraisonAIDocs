@@ -2,7 +2,7 @@
 Git Integration Example for PraisonAI CLI.
 
 Auto-commit with AI messages, diff viewing, undo.
-Docs: https://docs.praison.ai/cli/git-integration
+Docs: https://praison.ai/docs/cli/git-integration
 """
 
 from praisonai.cli.features import GitIntegrationHandler

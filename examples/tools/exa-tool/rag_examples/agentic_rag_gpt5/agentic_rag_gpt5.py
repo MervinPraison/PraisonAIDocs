@@ -41,7 +41,7 @@ with st.sidebar:
     st.info("⚠️ Knowledge base functionality is temporarily disabled due to compatibility issues.")
     new_url = st.text_input(
         "Add URL",
-        placeholder="https://docs.praisonai.com/introduction",
+        placeholder="https://praison.ai/docs/introduction",
         help="Enter a URL to add to the knowledge base (currently disabled)"
     )
     
@@ -54,7 +54,7 @@ if openai_key:
     @st.cache_resource(show_spinner="📚 Loading knowledge base...")
     def load_knowledge() -> list:
         """Load and initialize the knowledge base with default URL"""
-        return ["https://docs.praisonai.com/introduction/agents.md"]  # Default URL
+        return ["https://praison.ai/docs/introduction/agents.md"]  # Default URL
 
     # Initialize agent (cached to avoid reloading)
     @st.cache_resource(show_spinner="🤖 Loading agent...")

@@ -6,8 +6,8 @@ This example demonstrates the new workflow auto-generation features:
 - Multiple workflow patterns (sequential, parallel, routing, orchestrator-workers, evaluator-optimizer)
 - Pattern recommendation based on task keywords
 
-Documentation: https://docs.praison.ai/features/autoagents
-CLI Reference: https://docs.praison.ai/nocode/auto
+Documentation: https://praison.ai/docs/features/autoagents
+CLI Reference: https://praison.ai/docs/nocode/auto
 """
 
 from praisonai.auto import AutoGenerator, WorkflowAutoGenerator
@@ -128,5 +128,5 @@ praisonai workflow auto "Customer support routing" --pattern routing --output su
 print("\n" + "=" * 60)
 print("✅ AutoAgents Workflow Patterns Demo Complete!")
 print("=" * 60)
-print("\nDocumentation: https://docs.praison.ai/features/autoagents")
-print("CLI Reference: https://docs.praison.ai/nocode/auto")
+print("\nDocumentation: https://praison.ai/docs/features/autoagents")
+print("CLI Reference: https://praison.ai/docs/nocode/auto")

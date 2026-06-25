@@ -93,7 +93,7 @@ An agentic RAG application built with the PraisonAI Agents framework, featuring 
 - Current sources are displayed as numbered list
 
 ### Default Knowledge
-- Starts with PraisonAI documentation: `https://docs.praisonai.com/introduction/agents.md`
+- Starts with PraisonAI documentation: `https://praison.ai/docs/introduction/agents.md`
 - Expandable with any web-based documentation
 
 ## 🎨 UI Features

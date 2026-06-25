@@ -270,5 +270,5 @@ See `examples/python/scheduled_agents/` for:
 
 ## 🔗 Related
 
-- Main PraisonAI docs: [docs.praison.ai](https://docs.praison.ai)
+- Main PraisonAI docs: [praison.ai/docs](https://praison.ai/docs)
 - PraisonAI Agents: [github.com/MervinPraison/PraisonAI](https://github.com/MervinPraison/PraisonAI)

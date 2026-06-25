@@ -2,7 +2,7 @@
 Repository Map Example for PraisonAI CLI.
 
 Intelligent codebase mapping with symbol extraction.
-Docs: https://docs.praison.ai/cli/repo-map
+Docs: https://praison.ai/docs/cli/repo-map
 """
 
 from praisonai.cli.features import RepoMapHandler

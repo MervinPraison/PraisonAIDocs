@@ -257,9 +257,9 @@ Edit `agents.yaml` to customize your agent's behavior.
 
 ## Documentation
 
-- [PraisonAI Documentation](https://docs.praison.ai)
-- [Agent Configuration](https://docs.praison.ai/agents)
-- [Tools Reference](https://docs.praison.ai/tools)
+- [PraisonAI Documentation](https://praison.ai/docs)
+- [Agent Configuration](https://praison.ai/docs/agents)
+- [Tools Reference](https://praison.ai/docs/tools)
 """
         
         readme_path = os.path.join(project_dir, "README.md")

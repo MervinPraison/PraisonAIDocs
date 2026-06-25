@@ -4,8 +4,8 @@ AutoAgents Example
 AutoAgents automatically creates and manages AI agents based on high-level instructions.
 It features dynamic agent count based on task complexity.
 
-Documentation: https://docs.praison.ai/features/autoagents
-CLI Reference: https://docs.praison.ai/nocode/auto
+Documentation: https://praison.ai/docs/features/autoagents
+CLI Reference: https://praison.ai/docs/nocode/auto
 
 New Features:
 - Dynamic agent count (1-4 based on task complexity)
