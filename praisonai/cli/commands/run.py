@@ -63,6 +63,195 @@ def _parse_permissions(allow: Optional[List[str]], deny: Optional[List[str]], pe
     
     return config if config else None
 
+
+def _mcp_server_to_command(server: dict) -> Optional[tuple]:
+    """Convert a resolved MCP server config entry to a (command, env) pair.
+
+    Supports the project ``config.yaml`` schema where a server is declared as
+    either ``command: ["npx", "-y", "@playwright/mcp"]`` (list) or
+    ``command: "npx -y @playwright/mcp"`` (string), with optional ``args`` and
+    ``env`` keys. Remote servers and disabled servers return None.
+
+    Returns:
+        Tuple of (command_string, env_string) suitable for ``args.mcp`` /
+        ``args.mcp_env``, or None if the server cannot be expressed that way.
+    """
+    if not isinstance(server, dict):
+        return None
+    if server.get("enabled") is False:
+        return None
+    # Only local (stdio) servers map to the command-string CLI path.
+    if server.get("type") == "remote" or server.get("url"):
+        return None
+
+    command = server.get("command")
+    args = server.get("args") or []
+
+    import shlex
+
+    if isinstance(command, list):
+        parts = [str(p) for p in command]
+    elif isinstance(command, str) and command:
+        parts = shlex.split(command)
+    else:
+        return None
+
+    if args:
+        parts = parts + [str(a) for a in args]
+    if not parts:
+        return None
+
+    # Quote each token so values with spaces/metacharacters survive the
+    # downstream ``shlex.split`` in the MCP handler.
+    command_str = " ".join(shlex.quote(part) for part in parts)
+
+    env = server.get("env") or {}
+    env_str = None
+    if isinstance(env, dict) and env:
+        # The downstream parser splits env on commas, so a comma inside a value
+        # would corrupt it. Skip such entries with a warning rather than
+        # silently producing wrong env vars.
+        safe_pairs = []
+        for k, v in env.items():
+            v_str = str(v)
+            if "," in v_str:
+                import warnings
+                warnings.warn(
+                    f"MCP env var '{k}' contains a comma and cannot be passed "
+                    "via the command-string CLI path; skipping it.",
+                    stacklevel=2,
+                )
+                continue
+            safe_pairs.append(f"{k}={v_str}")
+        if safe_pairs:
+            env_str = ",".join(safe_pairs)
+
+    return command_str, env_str
+
+
+def _resolve_mcp_from_config(config) -> Optional[tuple]:
+    """Pick the first enabled local MCP server from resolved config.
+
+    The CLI ``--mcp`` flag accepts a single server command, so when wiring
+    project config we surface the first enabled stdio server.
+
+    Returns:
+        Tuple of (command_string, env_string) or None.
+    """
+    mcp = getattr(config, "mcp", None) or {}
+    if not isinstance(mcp, dict):
+        return None
+    servers = mcp.get("servers") or {}
+    if not isinstance(servers, dict):
+        return None
+
+    selected = None
+    enabled_local = []
+    for name, server in servers.items():
+        result = _mcp_server_to_command(server)
+        if result:
+            enabled_local.append(name)
+            if selected is None:
+                selected = result
+
+    # The CLI command-string path supports a single server. Warn so a user who
+    # declared several enabled local servers knows only the first is wired.
+    if len(enabled_local) > 1:
+        import warnings
+        warnings.warn(
+            "Multiple enabled local MCP servers found in config "
+            f"({', '.join(enabled_local)}); only '{enabled_local[0]}' will be "
+            "used via the run command path.",
+            stacklevel=2,
+        )
+
+    return selected
+
+
+def _permissions_from_config(config) -> Optional[dict]:
+    """Convert a resolved ``permissions`` config section to a pattern->action dict.
+
+    Supports both the rule-list form::
+
+        permissions:
+          default: ask
+          rules:
+            - { pattern: "bash:git *", action: allow }
+
+    and a flat ``pattern: action`` mapping. The flat mapping mirrors the format
+    produced by ``_parse_permissions`` (used by ``--allow``/``--deny`` and
+    ``--permissions``), so both paths converge on the same structure.
+    """
+    permissions = getattr(config, "permissions", None) or {}
+    if not isinstance(permissions, dict) or not permissions:
+        return None
+
+    result: dict = {}
+
+    rules = permissions.get("rules")
+    if isinstance(rules, list):
+        for rule in rules:
+            if isinstance(rule, dict):
+                pattern = rule.get("pattern")
+                action = rule.get("action")
+                if pattern and action in ("allow", "deny", "ask"):
+                    result[pattern] = action
+
+    default = permissions.get("default")
+    if default in ("allow", "deny", "ask"):
+        result["*"] = default
+
+    # Allow a flat pattern->action mapping alongside the structured form.
+    for key, value in permissions.items():
+        if key in ("rules", "default"):
+            continue
+        if isinstance(value, str) and value in ("allow", "deny", "ask"):
+            result[key] = value
+
+    return result or None
+
+
+def _apply_config_defaults(
+    mcp: Optional[str],
+    mcp_env: Optional[str],
+    permissions_config: Optional[dict],
+) -> tuple:
+    """Layer resolved project config under explicit CLI flags.
+
+    MCP servers and permission policy declared in ``.praisonai/config.yaml`` are
+    surfaced here so any ``praisonai run`` in the directory inherits them. CLI
+    flags always take precedence (they are passed in already-resolved and only
+    config-derived values fill the gaps).
+
+    Returns:
+        Tuple of (mcp, mcp_env, permissions_config) with config defaults applied.
+    """
+    try:
+        config = resolve_config()
+    except (ValueError, OSError):
+        return mcp, mcp_env, permissions_config
+
+    # MCP: only fill in if no explicit --mcp flag was given.
+    if not mcp:
+        resolved_mcp = _resolve_mcp_from_config(config)
+        if resolved_mcp:
+            mcp, config_env = resolved_mcp
+            if not mcp_env and config_env:
+                mcp_env = config_env
+
+    # Permissions: merge config rules underneath CLI-provided rules.
+    config_perms = _permissions_from_config(config)
+    if config_perms:
+        if permissions_config:
+            merged = dict(config_perms)
+            merged.update(permissions_config)  # CLI flags override config
+            permissions_config = merged
+        else:
+            permissions_config = config_perms
+
+    return mcp, mcp_env, permissions_config
+
+
 @app.callback(invoke_without_command=True)
 def run_main(
     ctx: typer.Context,
@@ -186,6 +375,9 @@ def run_main(
             output.print_error(f"Agent '{agent}' not found")
             raise typer.Exit(1)
         
+        # Invocation-level permission flags override per-agent definition.
+        invocation_permissions = _parse_permissions(allow, deny, permissions, permission_default)
+
         # Run with custom agent
         _run_custom_agent(
             agent_config,
@@ -199,6 +391,10 @@ def run_main(
             toolset=toolset,
             max_tokens=max_tokens,
             output_mode=output_mode,
+            approval=approval,
+            approve_all_tools=approve_all_tools,
+            approval_timeout=approval_timeout,
+            invocation_permissions=invocation_permissions,
             continue_session=continue_session,
             session=session,
             fork=fork,
@@ -215,6 +411,9 @@ def run_main(
         
         # Run the interpolated command as a prompt
         permissions_config = _parse_permissions(allow, deny, permissions, permission_default)
+        mcp_command, mcp_env, permissions_config = _apply_config_defaults(
+            None, None, permissions_config
+        )
         _run_prompt(
             prompt,
             model=model,
@@ -231,6 +430,8 @@ def run_main(
             approval_timeout=approval_timeout,
             no_rules=no_rules,
             permissions_config=permissions_config,
+            mcp=mcp_command,
+            mcp_env=mcp_env,
             continue_session=continue_session,
             session=session,
             fork=fork,
@@ -267,9 +468,11 @@ def run_main(
         return
     
     # Emit start event
+    from ..output.event_bridge import SCHEMA_VERSION
     output.emit_start(
         message=f"Starting run: {target[:50]}..." if len(target) > 50 else f"Starting run: {target}",
         data={
+            "schema_version": SCHEMA_VERSION,
             "target": target,
             "model": model,
             "framework": framework,
@@ -331,6 +534,9 @@ def run_main(
     else:
         # Run as prompt
         permissions_config = _parse_permissions(allow, deny, permissions, permission_default)
+        mcp_command, mcp_env, permissions_config = _apply_config_defaults(
+            None, None, permissions_config
+        )
         _run_prompt(
             target,
             model=model,
@@ -347,6 +553,8 @@ def run_main(
             approval_timeout=approval_timeout,
             no_rules=no_rules,
             permissions_config=permissions_config,
+            mcp=mcp_command,
+            mcp_env=mcp_env,
             continue_session=continue_session,
             session=session,
             fork=fork,
@@ -476,6 +684,8 @@ def _run_prompt(
     approval_timeout: Optional[str] = None,
     no_rules: bool = False,
     permissions_config: Optional[dict] = None,
+    mcp: Optional[str] = None,
+    mcp_env: Optional[str] = None,
     continue_session: bool = False,
     session: Optional[str] = None,
     fork: bool = False,
@@ -565,8 +775,21 @@ def _run_prompt(
             agent = Agent(**agent_config)
             if session_id or auto_save_name:
                 apply_cli_session_continuity(agent, session_id or auto_save_name, auto_save=auto_save_name)
-            result = agent.start(prompt)
-            
+
+            # Bridge per-step agent events into the structured output stream
+            # so `--output stream-json` surfaces tool/text events, not just
+            # start/result. No-op in non-JSON modes.
+            from ..output.event_bridge import attach_bridge, detach_bridge
+            bridge = attach_bridge(agent, output)
+            if bridge is not None:
+                bridge.emit_agent_message(agent_config.get("name"))
+            try:
+                result = agent.start(prompt)
+            finally:
+                detach_bridge(agent, bridge)
+
+            if bridge is not None:
+                bridge.emit_run_result(result, ok=True)
             output.emit_result(
                 message="Prompt completed",
                 data={"result": str(result) if result else None}
@@ -612,8 +835,8 @@ def _run_prompt(
         args.image = None
         args.image_generate = False
         args.telemetry = False
-        args.mcp = None
-        args.mcp_env = None
+        args.mcp = mcp
+        args.mcp_env = mcp_env
         args.fast_context = None
         args.handoff = None
         args.auto_memory = False
@@ -639,7 +862,11 @@ def _run_prompt(
         if result and not output.is_json_mode:
             print(result)
     
+    except typer.Exit:
+        raise
     except Exception as e:
+        from ..output.event_bridge import StreamEventBridge
+        StreamEventBridge(output).emit_run_error(str(e))
         output.emit_error(message=str(e))
         output.print_error(str(e))
         raise typer.Exit(1)
@@ -758,6 +985,10 @@ def _run_custom_agent(
     toolset: Optional[str] = None,
     max_tokens: int = 16000,
     output_mode: Optional[str] = None,
+    approval: Optional[str] = None,
+    approve_all_tools: bool = False,
+    approval_timeout: Optional[str] = None,
+    invocation_permissions: Optional[dict] = None,
     continue_session: bool = False,
     session: Optional[str] = None,
     fork: bool = False,
@@ -776,6 +1007,40 @@ def _run_custom_agent(
         # Add verbose flag
         if verbose:
             agent_config["verbose"] = verbose
+        
+        # Resolve per-agent permissions (from definition) layered with
+        # invocation flags. Precedence: invocation flags > agent definition.
+        agent_permissions = agent_config.pop("permissions", None) or {}
+        merged_permissions = dict(agent_permissions)
+        if invocation_permissions:
+            merged_permissions.update(invocation_permissions)
+        
+        if merged_permissions:
+            from praisonai.cli.features.approval import resolve_approval_config
+            # Preserve promptable `ask` rules: only fall back to non-interactive
+            # when there is no interactive approval path. An explicit --approval
+            # flag or any `ask` rule keeps the backend interactive so the user
+            # can be prompted (e.g. the `review` preset's "ask before shell").
+            has_ask_rules = any(
+                str(action).strip().lower() == "ask"
+                for action in merged_permissions.values()
+            )
+            # Default to a console backend so deny/ask rules are enforced even
+            # when no explicit --approval flag is passed.
+            agent_config["approval"] = resolve_approval_config(
+                approval or "console",
+                all_tools=approve_all_tools,
+                timeout=approval_timeout,
+                non_interactive=approval is None and not has_ask_rules,
+                permissions_config=merged_permissions,
+            )
+        elif approval:
+            from praisonai.cli.features.approval import resolve_approval_config
+            agent_config["approval"] = resolve_approval_config(
+                approval,
+                all_tools=approve_all_tools,
+                timeout=approval_timeout,
+            )
         
         # Handle session continuity
         session_id = None
@@ -821,8 +1086,19 @@ def _run_custom_agent(
         
         # Create and run agent
         agent = Agent(**agent_config)
-        result = agent.start(prompt)
-        
+
+        # Bridge per-step agent events into the structured output stream.
+        from ..output.event_bridge import attach_bridge, detach_bridge
+        bridge = attach_bridge(agent, output)
+        if bridge is not None:
+            bridge.emit_agent_message(agent_config.get("name"))
+        try:
+            result = agent.start(prompt)
+        finally:
+            detach_bridge(agent, bridge)
+
+        if bridge is not None:
+            bridge.emit_run_result(result, ok=True)
         output.emit_result(
             message="Agent completed",
             data={"result": str(result) if result else None}
@@ -831,7 +1107,11 @@ def _run_custom_agent(
         if result and not output.is_json_mode:
             print(result)
     
+    except typer.Exit:
+        raise
     except Exception as e:
+        from ..output.event_bridge import StreamEventBridge
+        StreamEventBridge(output).emit_run_error(str(e))
         output.emit_error(message=str(e))
         output.print_error(str(e))
         raise typer.Exit(1)

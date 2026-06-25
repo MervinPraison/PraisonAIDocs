@@ -2,7 +2,7 @@
 Autonomy Modes Example for PraisonAI CLI.
 
 Control AI autonomy: suggest, auto_edit, full_auto.
-Docs: https://praison.ai/docs/cli/autonomy-modes
+Docs: https://docs.praison.ai/cli/autonomy-modes
 """
 
 from praisonai.cli.features import AutonomyModeHandler

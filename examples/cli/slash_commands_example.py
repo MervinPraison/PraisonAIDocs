@@ -2,7 +2,7 @@
 Slash Commands Example for PraisonAI CLI.
 
 Demonstrates interactive slash commands like /help, /cost, /model.
-Docs: https://praison.ai/docs/cli/slash-commands
+Docs: https://docs.praison.ai/cli/slash-commands
 """
 
 from praisonai.cli.features import SlashCommandHandler

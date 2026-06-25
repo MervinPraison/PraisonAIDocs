@@ -34,7 +34,7 @@ class PraisonAIAgentComponent(Component):
 
     display_name: str = "Agent"
     description: str = "Create a PraisonAI agent with tools, memory, handoffs, knowledge, and guardrails."
-    documentation: str = "https://praison.ai/docs"
+    documentation: str = "https://docs.praison.ai"
     icon: str = "bot"
     name: str = "PraisonAIAgent"
 

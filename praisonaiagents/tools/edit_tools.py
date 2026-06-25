@@ -12,24 +12,49 @@ import hashlib
 import difflib
 from typing import List, Optional, Tuple
 from ..approval import require_approval
+from . import _file_locks
 
 logger = logging.getLogger(__name__)
 
 # Minimum similarity ratio for an accepted block-anchor (fuzzy) match.
 _BLOCK_ANCHOR_THRESHOLD = 0.7
 
+# Maximum characters of diagnostics output appended to a tool result.
+_DIAGNOSTICS_MAX_CHARS = 2000
+
+# Seconds before a diagnostics subprocess is abandoned.
+_DIAGNOSTICS_TIMEOUT = 10
+
 
 class EditTools:
     """Tools for file editing and patching operations."""
     
-    def __init__(self, workspace=None):
+    def __init__(self, workspace=None, post_edit_diagnostics: str = "auto"):
         """Initialize EditTools with optional workspace containment.
         
         Args:
             workspace: Optional Workspace instance for path containment
+            post_edit_diagnostics: When to run a lightweight, language-appropriate
+                check on a file after a successful edit/patch and append the
+                results to the tool output. One of:
+                - ``"auto"`` (default): run a checker if one is available, but
+                  only append a ``Diagnostics`` section when problems are found
+                  (so clean edits return the plain success string — backward
+                  compatible).
+                - ``"on"``: always append a ``Diagnostics`` section when a
+                  checker is available, even if it reports no problems.
+                - ``"off"``: never run diagnostics (zero overhead).
+                Checkers are auto-detected by file type and silently skipped
+                when unavailable; a missing linter never fails the edit.
         """
         self._workspace = workspace
         self._file_cache = {}  # Cache for staleness checking
+        mode = (post_edit_diagnostics or "auto")
+        if isinstance(mode, str):
+            mode = mode.lower()
+        if mode not in ("auto", "on", "off"):
+            mode = "auto"
+        self._post_edit_diagnostics = mode
     
     def _validate_path(self, filepath: str) -> str:
         """Validate and resolve a file path within workspace constraints."""
@@ -116,7 +141,127 @@ class EditTools:
             diff_lines.append(line)
         
         return ''.join(diff_lines) if diff_lines else "No changes detected"
-    
+
+    # ------------------------------------------------------------------
+    # Post-edit diagnostics
+    #
+    # After a successful mutation we optionally run a lightweight, language
+    # appropriate check on the single modified file and surface concise
+    # diagnostics so an agent can self-correct within the same loop.  All
+    # imports are deferred and any failure is swallowed: a missing or broken
+    # checker must never turn a successful edit into a failure.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _diagnostics_command(safe_path: str) -> Optional[Tuple[str, List[str]]]:
+        """Resolve a (tool_name, argv) checker for ``safe_path`` by extension.
+
+        Returns ``None`` when no checker is available for the file type or none
+        of the candidate executables are installed.  Lazy-imports ``shutil``.
+        """
+        import shutil
+
+        ext = os.path.splitext(safe_path)[1].lower()
+        # Ordered candidates per extension: first installed executable wins.
+        candidates: List[Tuple[str, List[str]]] = []
+        if ext in (".py", ".pyi"):
+            if shutil.which("ruff"):
+                # Restrict to error-class rules (pyflakes/syntax) so that
+                # stylistically-imperfect-but-valid edits do not flood output;
+                # this keeps behaviour close to a syntax gate. ``--no-cache``
+                # avoids polluting the workspace.
+                candidates.append((
+                    "ruff",
+                    ["ruff", "check", "--quiet", "--no-cache",
+                     "--select", "E9,F63,F7,F82", safe_path],
+                ))
+            # py_compile is always available via the running interpreter and
+            # catches syntax errors with zero third-party dependencies.
+            import sys
+            candidates.append(("py_compile", [sys.executable, "-m", "py_compile", safe_path]))
+        elif ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+            if shutil.which("eslint"):
+                # ``--no-config-lookup`` prevents ESLint from discovering and
+                # executing repository-controlled config/plugins (arbitrary code
+                # execution risk in untrusted workspaces).
+                candidates.append((
+                    "eslint",
+                    ["eslint", "--no-config-lookup", safe_path],
+                ))
+            if shutil.which("tsc") and ext in (".ts", ".tsx"):
+                # Per-file invocation without a project ``tsconfig.json``: relax
+                # project-config coupling so a single valid file does not report
+                # spurious "no inputs"/missing-lib errors.
+                candidates.append((
+                    "tsc",
+                    ["tsc", "--noEmit", "--skipLibCheck", "--allowJs",
+                     "--target", "ESNext", "--moduleResolution", "node",
+                     safe_path],
+                ))
+        elif ext == ".json":
+            # Validate JSON with the stdlib; emitted via a tiny inline check.
+            import sys
+            candidates.append((
+                "json",
+                [sys.executable, "-c",
+                 "import json,sys;json.load(open(sys.argv[1]))", safe_path],
+            ))
+
+        for tool_name, argv in candidates:
+            exe = argv[0]
+            if os.path.isabs(exe) or shutil.which(exe):
+                return tool_name, argv
+        return None
+
+    def _run_diagnostics(self, safe_path: str, display_path: str) -> str:
+        """Run a checker on ``safe_path`` and return a bounded diagnostics block.
+
+        Returns an empty string when diagnostics are disabled, no checker is
+        available, or (in ``auto`` mode) the checker reports no problems.  Any
+        exception is logged and swallowed so the edit result is never lost.
+        """
+        if self._post_edit_diagnostics == "off":
+            return ""
+        try:
+            resolved = self._diagnostics_command(safe_path)
+            if resolved is None:
+                return ""
+            tool_name, argv = resolved
+
+            import subprocess
+            try:
+                proc = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=_DIAGNOSTICS_TIMEOUT,
+                    cwd=os.path.dirname(safe_path) or None,
+                )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                logger.debug("Diagnostics skipped for %s: %s", display_path, e)
+                return ""
+
+            output = (proc.stdout or "") + (proc.stderr or "")
+            output = output.strip()
+            # Replace absolute paths with the display path for cleaner output.
+            if output and safe_path != display_path:
+                output = output.replace(safe_path, display_path)
+
+            has_problems = proc.returncode != 0 or bool(output)
+            if not has_problems:
+                if self._post_edit_diagnostics == "on":
+                    return f"\n\nDiagnostics ({tool_name}): no problems found"
+                return ""
+
+            if not output:
+                output = f"check failed (exit code {proc.returncode})"
+            if len(output) > _DIAGNOSTICS_MAX_CHARS:
+                output = output[:_DIAGNOSTICS_MAX_CHARS] + "\n... (diagnostics truncated)"
+            return f"\n\nDiagnostics ({tool_name}):\n{output}"
+        except Exception as e:  # never let diagnostics break a successful edit
+            logger.debug("Diagnostics error for %s: %s", display_path, e)
+            return ""
+
     # ------------------------------------------------------------------
     # Fuzzy matching ladder
     #
@@ -274,8 +419,15 @@ class EditTools:
 
     @require_approval(risk_level="high")
     def edit_file(self, filepath: str, old_string: str, new_string: str, 
-                  replace_all: bool = False, expected_hash: Optional[str] = None) -> str:
+                  replace_all: bool = False, expected_hash: Optional[str] = None,
+                  force: bool = False) -> str:
         """Edit a file by replacing text using precise find-and-replace.
+        
+        The entire read-modify-write runs under a per-file lock, so concurrent
+        edits to the same path (parallel tools / multi-agent teams) serialise
+        instead of corrupting the file.  By default the edit also aborts if the
+        file changed on disk since it was last read via this tool, preventing
+        silent clobbering of externally-modified files.
         
         Args:
             filepath: Path to the file to edit
@@ -283,6 +435,8 @@ class EditTools:
             new_string: Replacement text
             replace_all: Whether to replace all occurrences (default: first only)
             expected_hash: Optional SHA256 hash of expected content for staleness check
+            force: Bypass the automatic staleness guard for an intentional
+                blind write (an explicit ``expected_hash`` is still honoured)
             
         Returns:
             Success message with diff or error description
@@ -293,88 +447,109 @@ class EditTools:
             if not os.path.exists(safe_path):
                 return f"Error: File not found: {filepath}"
             
-            # Detect BOM and read file content
-            with open(safe_path, 'rb') as f:
-                raw_bytes = f.read()
-            
-            # Check for UTF-8 BOM only (we don't support UTF-16)
-            bom = b''
-            if raw_bytes.startswith(b'\xef\xbb\xbf'):  # UTF-8 BOM
-                bom = b'\xef\xbb\xbf'
-                raw_bytes = raw_bytes[3:]
-            elif raw_bytes.startswith(b'\xff\xfe') or raw_bytes.startswith(b'\xfe\xff'):
-                # UTF-16 BOM detected - not supported
-                return "Error: UTF-16 encoding is not supported. Please convert the file to UTF-8."
-            
-            # Decode content (UTF-8 only)
-            content = raw_bytes.decode('utf-8')
-            
-            # Detect line endings
-            line_ending = self._detect_line_ending(content)
-            
-            # Staleness check
-            if expected_hash is not None:
+            # Serialise the whole read-modify-write on this canonical path so
+            # concurrent edits/writes cannot interleave and corrupt the file.
+            with _file_locks.get_lock(safe_path):
+                # Detect BOM and read file content
+                with open(safe_path, 'rb') as f:
+                    raw_bytes = f.read()
+                
+                # Check for UTF-8 BOM only (we don't support UTF-16)
+                bom = b''
+                if raw_bytes.startswith(b'\xef\xbb\xbf'):  # UTF-8 BOM
+                    bom = b'\xef\xbb\xbf'
+                    raw_bytes = raw_bytes[3:]
+                elif raw_bytes.startswith(b'\xff\xfe') or raw_bytes.startswith(b'\xfe\xff'):
+                    # UTF-16 BOM detected - not supported
+                    return "Error: UTF-16 encoding is not supported. Please convert the file to UTF-8."
+                
+                # Decode content (UTF-8 only)
+                content = raw_bytes.decode('utf-8')
+                
+                # Detect line endings
+                line_ending = self._detect_line_ending(content)
+                
                 current_hash = self._compute_content_hash(content)
-                if current_hash != expected_hash:
-                    return (f"Error: File has been modified since last read. "
-                           f"Please re-read the file before editing. "
-                           f"Expected hash: {expected_hash[:8]}..., "
-                           f"Current hash: {current_hash[:8]}...")
-            
-            # Cache the current content hash for future staleness checks
-            self._file_cache[safe_path] = self._compute_content_hash(content)
-            
-            # Validation
-            if old_string == "":
-                return "Error: old_string must be non-empty"
-            
-            # Locate the target using the fuzzy matching ladder.  Exact
-            # substring matches are preferred and behave exactly as before;
-            # fuzzy strategies only engage when an exact match is not found.
-            spans = self._find_spans(content, old_string)
-            
-            if not spans:
-                preview = old_string[:50] + ("..." if len(old_string) > 50 else "")
-                return f"Error: String not found in file: '{preview}'"
-            
-            occurrences = len(spans)
-            
-            # Check for ambiguous match
-            if occurrences > 1 and not replace_all:
-                preview = old_string[:30] + ("..." if len(old_string) > 30 else "")
-                return (f"Error: Ambiguous match - '{preview}' occurs {occurrences} times. "
-                       f"Please provide more surrounding context to make the match unique, "
-                       f"or use replace_all=True to replace all occurrences.")
-            
-            # Perform replacement using located spans (apply right-to-left so
-            # earlier offsets remain valid as we splice in new_string).
-            if replace_all:
-                new_content = content
-                for start, end in sorted(spans, reverse=True):
-                    new_content = new_content[:start] + new_string + new_content[end:]
-                replacements = occurrences
-            else:
-                start, end = spans[0]
-                new_content = content[:start] + new_string + content[end:]
-                replacements = 1
-            
-            # Generate diff
-            diff = self._render_diff(content, new_content, filepath)
-            
-            # Normalize line endings for the new content
-            if line_ending == '\r\n':
-                new_content = new_content.replace('\r\n', '\n').replace('\n', '\r\n')
-            
-            # Write updated content back with BOM if present
-            with open(safe_path, 'wb') as f:
-                if bom:
-                    f.write(bom)
-                f.write(new_content.encode('utf-8'))
-            
-            # Update cache with new content hash
-            self._file_cache[safe_path] = self._compute_content_hash(new_content)
-            
-            return f"Success: Made {replacements} replacement(s) in {filepath}\n\nDiff:\n{diff}"
+                
+                # Explicit staleness check (caller-supplied hash takes priority).
+                if expected_hash is not None:
+                    if current_hash != expected_hash:
+                        return (f"Error: File has been modified since last read. "
+                               f"Please re-read the file before editing. "
+                               f"Expected hash: {expected_hash[:8]}..., "
+                               f"Current hash: {current_hash[:8]}...")
+                # Automatic staleness guard: if a prior read recorded a hash for
+                # this path, abort when the on-disk content has since changed.
+                elif not force:
+                    recorded = _file_locks.get_read_hash(safe_path)
+                    if recorded is not None and recorded != current_hash:
+                        return (f"Error: File changed since it was read - "
+                               f"re-read before editing (or pass force=True to override). "
+                               f"Recorded hash: {recorded[:8]}..., "
+                               f"Current hash: {current_hash[:8]}...")
+                
+                # Cache the current content hash for future staleness checks
+                self._file_cache[safe_path] = current_hash
+                _file_locks.record_read_hash(safe_path, current_hash)
+                
+                # Validation
+                if old_string == "":
+                    return "Error: old_string must be non-empty"
+                
+                # Locate the target using the fuzzy matching ladder.  Exact
+                # substring matches are preferred and behave exactly as before;
+                # fuzzy strategies only engage when an exact match is not found.
+                spans = self._find_spans(content, old_string)
+                
+                if not spans:
+                    preview = old_string[:50] + ("..." if len(old_string) > 50 else "")
+                    return f"Error: String not found in file: '{preview}'"
+                
+                occurrences = len(spans)
+                
+                # Check for ambiguous match
+                if occurrences > 1 and not replace_all:
+                    preview = old_string[:30] + ("..." if len(old_string) > 30 else "")
+                    return (f"Error: Ambiguous match - '{preview}' occurs {occurrences} times. "
+                           f"Please provide more surrounding context to make the match unique, "
+                           f"or use replace_all=True to replace all occurrences.")
+                
+                # Perform replacement using located spans (apply right-to-left so
+                # earlier offsets remain valid as we splice in new_string).
+                if replace_all:
+                    new_content = content
+                    for start, end in sorted(spans, reverse=True):
+                        new_content = new_content[:start] + new_string + new_content[end:]
+                    replacements = occurrences
+                else:
+                    start, end = spans[0]
+                    new_content = content[:start] + new_string + content[end:]
+                    replacements = 1
+                
+                # Generate diff
+                diff = self._render_diff(content, new_content, filepath)
+                
+                # Normalize line endings for the new content
+                if line_ending == '\r\n':
+                    new_content = new_content.replace('\r\n', '\n').replace('\n', '\r\n')
+                
+                # Write updated content back with BOM if present
+                with open(safe_path, 'wb') as f:
+                    if bom:
+                        f.write(bom)
+                    f.write(new_content.encode('utf-8'))
+                
+                # Update caches with the new content hash so a follow-up edit
+                # in the same session is not flagged as stale.  Hash the exact
+                # on-disk form (CRLF preserved) so a subsequent binary read of
+                # the same file produces an identical hash and is not falsely
+                # flagged as stale.
+                new_hash = self._compute_content_hash(new_content)
+                self._file_cache[safe_path] = new_hash
+                _file_locks.record_read_hash(safe_path, new_hash)
+                
+                result = f"Success: Made {replacements} replacement(s) in {filepath}\n\nDiff:\n{diff}"
+                return result + self._run_diagnostics(safe_path, filepath)
             
         except Exception as e:
             error_msg = f"Error editing file {filepath}: {str(e)}"
@@ -463,7 +638,7 @@ class EditTools:
         return ops
 
     @require_approval(risk_level="high")
-    def apply_patch(self, patch: str) -> str:
+    def apply_patch(self, patch: str, force: bool = False) -> str:
         """Apply a structured multi-file patch atomically.
 
         The patch may Add, Update, and Delete multiple files in a single
@@ -473,12 +648,20 @@ class EditTools:
         the filesystem is left in its original state.  BOM and CRLF line
         endings are preserved on Update, matching ``edit_file``.
 
+        Every affected path is locked for the duration of validate+commit, so
+        a concurrent edit/write to any of those files serialises rather than
+        racing.  Updated files are also checked against their last-read hash by
+        default; pass ``force=True`` to bypass that staleness guard.
+
         Args:
             patch: Structured patch text (see ``_parse_patch`` for format).
+            force: Bypass the automatic staleness guard on Update operations.
 
         Returns:
             Combined success message with diffs, or an error description.
         """
+        import contextlib
+
         try:
             try:
                 ops = self._parse_patch(patch)
@@ -488,6 +671,24 @@ class EditTools:
             if not ops:
                 return "Error: Patch contains no operations"
 
+            # Acquire per-path locks for every affected file up front, in a
+            # stable (sorted) order to avoid deadlock when two patches share
+            # files.  Held across validate+commit so no concurrent edit/write
+            # can interleave with this atomic patch.
+            lock_paths = sorted({self._validate_path(op["path"]) for op in ops})
+            with contextlib.ExitStack() as stack:
+                for lp in lock_paths:
+                    stack.enter_context(_file_locks.get_lock(lp))
+                return self._apply_patch_locked(ops, force)
+
+        except Exception as e:
+            error_msg = f"Error applying patch: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+
+    def _apply_patch_locked(self, ops, force: bool) -> str:
+        """Validate and commit ``ops`` while holding the per-path locks."""
+        try:
             # Phase 1: validate every operation and compute new content.
             # Each planned entry: (kind, safe_path, display, encoded_bytes,
             # diff, content_hash). encoded_bytes is None for deletes.
@@ -506,6 +707,21 @@ class EditTools:
                 elif op["op"] == "delete":
                     if not os.path.exists(safe_path):
                         return f"Error: Cannot delete '{op['path']}': file not found"
+                    # Automatic staleness guard: don't silently delete a file
+                    # that changed on disk since it was last read via these tools.
+                    if not force:
+                        recorded = _file_locks.get_read_hash(safe_path)
+                        if recorded is not None:
+                            with open(safe_path, 'rb') as f:
+                                raw_bytes = f.read()
+                            try:
+                                original, _ = self._decode_with_bom(raw_bytes)
+                            except ValueError as e:
+                                return f"Error: Cannot delete '{op['path']}': {e}"
+                            if recorded != self._compute_content_hash(original):
+                                return (f"Error: Cannot delete '{op['path']}': file changed "
+                                       f"since it was read - re-read before editing "
+                                       f"(or pass force=True to override).")
                     planned.append(("delete", safe_path, op["path"], None, "", None))
 
                 elif op["op"] == "update":
@@ -518,6 +734,15 @@ class EditTools:
                         original, bom = self._decode_with_bom(raw_bytes)
                     except ValueError as e:
                         return f"Error: Cannot update '{op['path']}': {e}"
+                    # Automatic staleness guard: abort if the file changed on
+                    # disk since it was last read via these tools.
+                    if not force:
+                        original_hash = self._compute_content_hash(original)
+                        recorded = _file_locks.get_read_hash(safe_path)
+                        if recorded is not None and recorded != original_hash:
+                            return (f"Error: Cannot update '{op['path']}': file changed "
+                                   f"since it was read - re-read before editing "
+                                   f"(or pass force=True to override).")
                     line_ending = self._detect_line_ending(original)
                     updated = original
                     for old_block, new_block in op["hunks"]:
@@ -534,9 +759,13 @@ class EditTools:
                         start, end = spans[0]
                         updated = updated[:start] + new_block + updated[end:]
                     encoded = self._encode_preserving(updated, line_ending, bom)
+                    # Hash the exact on-disk form (CRLF preserved, BOM stripped)
+                    # so a subsequent binary read of this file produces an
+                    # identical hash and is not falsely flagged as stale.
+                    on_disk_form = encoded[len(bom):].decode('utf-8')
                     planned.append(("update", safe_path, op["path"], encoded,
                                     self._render_diff(original, updated, op["path"]),
-                                    self._compute_content_hash(updated)))
+                                    self._compute_content_hash(on_disk_form)))
 
             # Phase 2: commit all operations atomically.  Writes are staged to
             # temp files in the same directory and swapped in with os.replace;
@@ -553,6 +782,7 @@ class EditTools:
                         os.replace(safe_path, backup)
                         applied.append(("delete", safe_path, backup))
                         self._file_cache.pop(safe_path, None)
+                        _file_locks.clear_read_hash(safe_path)
                         messages.append(f"Deleted {display}")
                     else:
                         os.makedirs(os.path.dirname(safe_path) or ".", exist_ok=True)
@@ -576,8 +806,10 @@ class EditTools:
                             raise
                         applied.append(("write", safe_path, backup))
                         self._file_cache[safe_path] = content_hash
+                        _file_locks.record_read_hash(safe_path, content_hash)
                         verb = "Added" if kind == "add" else "Updated"
-                        messages.append(f"{verb} {display}\n{diff}")
+                        diagnostics = self._run_diagnostics(safe_path, display)
+                        messages.append(f"{verb} {display}\n{diff}{diagnostics}")
             except Exception:
                 # Roll back in reverse order to restore the original state.
                 for entry in reversed(applied):
@@ -627,19 +859,26 @@ class EditTools:
             if not os.path.exists(safe_path):
                 return f"Error: File not found: {filepath}", ""
             
-            # Read in binary mode to match edit_file behavior
-            with open(safe_path, 'rb') as f:
-                raw_bytes = f.read()
-            
-            # Strip UTF-8 BOM if present (matching edit_file logic)
-            if raw_bytes.startswith(b'\xef\xbb\xbf'):
-                raw_bytes = raw_bytes[3:]
-            
-            # Decode content (UTF-8 only, matching edit_file)
-            content = raw_bytes.decode('utf-8')
-            
-            content_hash = self._compute_content_hash(content)
-            self._file_cache[safe_path] = content_hash
+            # Serialise with concurrent writers on this path so the read (and
+            # the hash it records) reflects a stable, fully-written file rather
+            # than content observed mid-write.
+            with _file_locks.get_lock(safe_path):
+                # Read in binary mode to match edit_file behavior
+                with open(safe_path, 'rb') as f:
+                    raw_bytes = f.read()
+                
+                # Strip UTF-8 BOM if present (matching edit_file logic)
+                if raw_bytes.startswith(b'\xef\xbb\xbf'):
+                    raw_bytes = raw_bytes[3:]
+                
+                # Decode content (UTF-8 only, matching edit_file)
+                content = raw_bytes.decode('utf-8')
+                
+                content_hash = self._compute_content_hash(content)
+                self._file_cache[safe_path] = content_hash
+                # Record the read hash in the shared registry so a later
+                # edit/write to this path engages the staleness guard by default.
+                _file_locks.record_read_hash(safe_path, content_hash)
             
             return content, content_hash
             
@@ -718,7 +957,8 @@ _edit_tools = EditTools()
 
 @require_approval(risk_level="high")
 def edit_file(filepath: str, old_string: str, new_string: str, 
-              replace_all: bool = False, expected_hash: Optional[str] = None) -> str:
+              replace_all: bool = False, expected_hash: Optional[str] = None,
+              force: bool = False) -> str:
     """Edit a file by replacing text using precise find-and-replace.
     
     Args:
@@ -727,25 +967,28 @@ def edit_file(filepath: str, old_string: str, new_string: str,
         new_string: Replacement text
         replace_all: Whether to replace all occurrences (default: first only)
         expected_hash: Optional SHA256 hash of expected content for staleness check
+        force: Bypass the automatic staleness guard for an intentional blind write
         
     Returns:
         Success message with diff or error description
     """
-    return _edit_tools.edit_file(filepath, old_string, new_string, replace_all, expected_hash)
+    return _edit_tools.edit_file(filepath, old_string, new_string, replace_all,
+                                 expected_hash, force)
 
 
 @require_approval(risk_level="high")
-def apply_patch(patch: str) -> str:
+def apply_patch(patch: str, force: bool = False) -> str:
     """Apply a structured multi-file patch atomically (Add/Update/Delete).
 
     Args:
         patch: Structured patch text with ``*** Add File:``,
             ``*** Update File:`` and ``*** Delete File:`` sections.
+        force: Bypass the automatic staleness guard on Update operations.
 
     Returns:
         Combined success message with diffs or an error description.
     """
-    return _edit_tools.apply_patch(patch)
+    return _edit_tools.apply_patch(patch, force)
 
 
 def read_file(filepath: str) -> Tuple[str, str]:
@@ -775,13 +1018,15 @@ def search_files(directory: str, pattern: str,
     return _edit_tools.search_files(directory, pattern, file_pattern)
 
 
-def create_edit_tools(workspace=None) -> EditTools:
+def create_edit_tools(workspace=None, post_edit_diagnostics: str = "auto") -> EditTools:
     """Create EditTools instance with optional workspace containment.
     
     Args:
         workspace: Optional Workspace instance for path containment
+        post_edit_diagnostics: Diagnostics mode ("auto"|"on"|"off"); see
+            ``EditTools.__init__`` for details.
         
     Returns:
         EditTools instance configured with workspace
     """
-    return EditTools(workspace=workspace)
+    return EditTools(workspace=workspace, post_edit_diagnostics=post_edit_diagnostics)

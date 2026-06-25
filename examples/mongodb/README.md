@@ -306,7 +306,7 @@ client = MongoClient(connection_string, tls=True)
 
 For additional support:
 
-- [PraisonAI Documentation](https://praison.ai/docs)
+- [PraisonAI Documentation](https://docs.praisonai.com)
 - [MongoDB Documentation](https://docs.mongodb.com)
 - [MongoDB Atlas Vector Search](https://docs.atlas.mongodb.com/atlas-vector-search/)
 

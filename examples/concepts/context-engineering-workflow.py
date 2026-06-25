@@ -191,7 +191,7 @@ class ContextEngineeringWorkflow:
             feature_request=feature_request,
             context_analysis=codebase_analysis,
             documentation_links=[
-                "https://praison.ai/docs/",
+                "https://docs.praisonai.com/",
                 "https://pydantic-docs.helpmanual.io/",
                 "https://fastapi.tiangolo.com/"
             ]
