@@ -47,6 +47,32 @@ class ConnectErrorCode(str, Enum):
     PROTOCOL_UNSUPPORTED = "protocol_unsupported"
     PAIRING_REQUIRED = "pairing_required"
     AGENT_NOT_FOUND = "agent_not_found"
+    RATE_LIMITED = "rate_limited"
+    ORIGIN_NOT_ALLOWED = "origin_not_allowed"
+    CONFIGURATION_ERROR = "configuration_error"
+
+
+class ConnectRecoveryStep(str, Enum):
+    """Machine-readable recovery hint for a connection rejection.
+
+    Clients branch on ``(code, next_step)`` to implement deterministic,
+    uniform reconnect behaviour without parsing free-text reasons:
+
+        REAUTHENTICATE: Obtain fresh credentials, then reconnect.
+        REPAIR:         Re-run the device pairing flow, then reconnect.
+        UPGRADE_CLIENT: The client protocol is too old; update the client.
+        DOWNGRADE_CLIENT: The client protocol is newer than the server
+            supports; use an older client or wait for a server upgrade.
+        WAIT_THEN_RETRY: Back off (see ``retry_after_seconds``) then reconnect.
+        DO_NOT_RETRY:   The rejection is terminal; reconnecting will not help.
+    """
+
+    REAUTHENTICATE = "reauthenticate"
+    REPAIR = "repair"
+    UPGRADE_CLIENT = "upgrade_client"
+    DOWNGRADE_CLIENT = "downgrade_client"
+    WAIT_THEN_RETRY = "wait_then_retry"
+    DO_NOT_RETRY = "do_not_retry"
 
 
 class EventType(str, Enum):
@@ -179,16 +205,55 @@ class HelloResult:
 
 @dataclass
 class HelloError:
-    """Error response for failed handshake.
-    
+    """Structured connect-rejection envelope.
+
+    Emitted from *every* connection rejection path — both pre-handshake
+    transport checks (auth/origin/rate-limit) and handshake negotiation —
+    so clients can implement deterministic reconnect logic by branching on
+    ``(code, next_step)`` instead of string-matching close reasons.
+
     Attributes:
-        code: Structured error code
-        message: Human-readable error message
-        next_action: Suggested next action (e.g., "upgrade_client", "pair_device")
+        code: Structured, machine-readable error code.
+        message: Human-readable error message (display only).
+        next_step: Machine-readable recovery hint telling the client what to
+            do next (re-authenticate, re-pair, upgrade, wait then retry, ...).
+        retry_after_seconds: Optional backoff hint (rate limiting / transient
+            unavailability). Only meaningful with ``WAIT_THEN_RETRY``.
+        next_action: Deprecated free-text hint, retained for backward
+            compatibility. Prefer ``next_step``.
     """
     code: ConnectErrorCode
     message: str
+    next_step: Optional[ConnectRecoveryStep] = None
+    retry_after_seconds: Optional[int] = None
     next_action: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize to a ``hello_error`` wire frame.
+
+        The ``next`` key is preserved for backward compatibility with existing
+        clients; ``next_step`` and ``retry_after_seconds`` are the structured
+        recovery fields new clients should branch on.
+        """
+        frame: Dict[str, Any] = {
+            "type": "hello_error",
+            "code": self.code.value,
+            "message": self.message,
+        }
+        if self.next_step is not None:
+            frame["next_step"] = self.next_step.value
+        if self.retry_after_seconds is not None:
+            frame["retry_after_seconds"] = self.retry_after_seconds
+        # Backward-compatible legacy field: fall back to next_step's value.
+        # Omitted entirely when there is no recovery hint so clients using
+        # strict schema validation or ``if frame["next"]`` are not tripped by
+        # an explicit ``null``.
+        legacy_next = self.next_action
+        if legacy_next is None and self.next_step is not None:
+            legacy_next = self.next_step.value
+        if legacy_next is not None:
+            frame["next"] = legacy_next
+        return frame
 
 
 @dataclass
@@ -946,6 +1011,181 @@ class OutboundDeliveryProtocol(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Inbound route binding (Issue #2225)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RouteBinding:
+    """A single declarative inbound-routing rule.
+
+    A binding maps a set of optional inbound conditions to a handling agent.
+    Bindings are evaluated most-specific-first so operators get deterministic,
+    debuggable routing across a fleet of agents behind one gateway.
+
+    All condition fields are optional; ``None`` means "do not constrain on this
+    field". A binding matches a set of :class:`RouteFacts` only when *every*
+    non-``None`` condition equals the corresponding fact.
+
+    Attributes:
+        agent: The agent id to route to when this binding matches.
+        chat_type: Chat type ("dm" | "group" | "channel").
+        peer: Sender/user id (most specific).
+        role: Role / guild-role membership of the sender.
+        channel_id: Specific chat/channel id.
+        account: Receiving bot account (for multi-account channels).
+        priority: Higher wins; ties are broken by specificity then order.
+    """
+
+    agent: str
+    chat_type: Optional[str] = None
+    peer: Optional[str] = None
+    role: Optional[str] = None
+    channel_id: Optional[str] = None
+    account: Optional[str] = None
+    priority: int = 0
+
+    # Specificity weights — exact peer beats role/channel beats account
+    # beats chat-type. Higher means more specific.
+    _SPECIFICITY = {
+        "peer": 16,
+        "role": 8,
+        "channel_id": 8,
+        "account": 4,
+        "chat_type": 2,
+    }
+
+    @property
+    def specificity(self) -> int:
+        """Sum of weights for the conditions this binding constrains on."""
+        score = 0
+        for field_name, weight in self._SPECIFICITY.items():
+            if getattr(self, field_name) is not None:
+                score += weight
+        return score
+
+    def matches(self, facts: "RouteFacts") -> bool:
+        """Return True if every constrained condition equals the facts."""
+        if self.peer is not None and str(self.peer) != str(facts.peer):
+            return False
+        if self.channel_id is not None and str(self.channel_id) != str(facts.channel_id):
+            return False
+        if self.account is not None and str(self.account) != str(facts.account):
+            return False
+        if self.chat_type is not None and self.chat_type != facts.chat_type:
+            return False
+        if self.role is not None:
+            expected_role = str(self.role)
+            if expected_role not in [str(role) for role in (facts.roles or [])]:
+                return False
+        return True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RouteBinding":
+        """Create a binding from a YAML/dict mapping.
+
+        Accepts ``agent`` (required). Unknown keys are ignored so the shape
+        can evolve without breaking older configs.
+        """
+        return cls(
+            agent=data.get("agent", "default"),
+            chat_type=data.get("chat_type"),
+            peer=_as_opt_str(data.get("peer")),
+            role=data.get("role"),
+            channel_id=_as_opt_str(data.get("channel_id")),
+            account=_as_opt_str(data.get("account")),
+            priority=int(data.get("priority", 0) or 0),
+        )
+
+
+@dataclass
+class RouteFacts:
+    """Inbound facts extracted from a message, used to resolve a binding.
+
+    Attributes:
+        chat_type: Normalised chat type ("dm" | "group" | "channel" | "default").
+        peer: Sender/user id.
+        roles: Roles/guild-role memberships of the sender.
+        channel_id: The chat/channel id the message arrived in.
+        account: The receiving bot account (multi-account channels).
+    """
+
+    chat_type: str = "default"
+    peer: Optional[str] = None
+    roles: List[str] = field(default_factory=list)
+    channel_id: Optional[str] = None
+    account: Optional[str] = None
+
+
+@dataclass
+class RouteMatch:
+    """Result of resolving a route.
+
+    Attributes:
+        agent: The resolved agent id.
+        binding: The binding that matched, or ``None`` when the fallback was used.
+        reason: Short human-readable explanation for logging/debugging.
+    """
+
+    agent: str
+    binding: Optional[RouteBinding] = None
+    reason: str = ""
+
+
+def _as_opt_str(value: Any) -> Optional[str]:
+    """Coerce a value to a string, preserving ``None``."""
+    if value is None:
+        return None
+    return str(value)
+
+
+def resolve_route(
+    bindings: List[RouteBinding],
+    facts: RouteFacts,
+    default_agent: str = "default",
+) -> RouteMatch:
+    """Resolve the handling agent from priority-ordered bindings.
+
+    Bindings are evaluated most-specific-first: the matching binding with the
+    highest ``priority`` wins; ties are broken by specificity (exact peer →
+    role/channel → account → chat-type), then by declaration order.
+
+    Args:
+        bindings: Candidate route bindings (any order).
+        facts: Inbound facts extracted from the message.
+        default_agent: Agent id to fall back to when nothing matches.
+
+    Returns:
+        A :class:`RouteMatch` with the selected agent and matched binding.
+    """
+    best: Optional[RouteBinding] = None
+    best_key: tuple = ()
+    for idx, binding in enumerate(bindings):
+        if not binding.matches(facts):
+            continue
+        # Higher priority wins, then higher specificity, then earlier order.
+        key = (binding.priority, binding.specificity, -idx)
+        if best is None or key > best_key:
+            best = binding
+            best_key = key
+
+    if best is not None:
+        return RouteMatch(
+            agent=best.agent,
+            binding=best,
+            reason=(
+                f"matched binding (priority={best.priority}, "
+                f"specificity={best.specificity})"
+            ),
+        )
+
+    return RouteMatch(
+        agent=default_agent,
+        binding=None,
+        reason="no binding matched; using default",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Auth Mode protocols and helpers (bind-aware authentication posture)
 # ---------------------------------------------------------------------------
 
@@ -1340,6 +1580,116 @@ class OutboundMessengerProtocol(Protocol):
     def list_targets(self) -> List["TargetInfo"]:
         """List the targets currently reachable from this runtime."""
         ...
+
+
+# ---------------------------------------------------------------------------
+# Outbound send-policy guard (Issue #2226)
+#
+# ``send_message`` lets the model choose where to deliver. Because the target
+# is model-controlled, poisoned inbound content (prompt injection) can steer an
+# agent into delivering to a channel the operator never intended. The router
+# only fails on *unresolvable* targets — a reachability check, not an
+# authorisation one. This policy seam sits in core, *before* dispatch, so every
+# messenger implementation is constrained, not just one adapter. Absent a
+# policy, today's behaviour is preserved (allow-all).
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SendDecision:
+    """Closed decision shape for an outbound send-policy evaluation.
+
+    Attributes:
+        allow: Whether the send to the requested target is permitted.
+        reason: Optional model-readable explanation (used in the
+            :class:`DeliveryResult` detail when denied).
+    """
+
+    allow: bool
+    reason: str = ""
+
+
+@runtime_checkable
+class SendPolicyProtocol(Protocol):
+    """Protocol for authorising agent-initiated proactive sends.
+
+    Implementations decide whether an agent may deliver to a model-chosen
+    ``target``. The hook is evaluated inside the ``send_message`` path before
+    the messenger dispatches, so a denied send returns a clean, model-readable
+    :class:`DeliveryResult` (``ok=False``) rather than delivering.
+
+    A concrete, config-driven implementation (:class:`SendPolicy`) is provided
+    for the common allow/deny case; richer back-ends may live in plugins.
+    """
+
+    def evaluate(
+        self,
+        target: str,
+        *,
+        agent_id: str = "",
+        session_id: str = "",
+        origin: Optional[str] = None,
+    ) -> SendDecision:
+        """Return a :class:`SendDecision` for the requested ``target``."""
+        ...
+
+
+class SendPolicy:
+    """A lightweight allow/deny send-policy with an optional default-deny posture.
+
+    This is the config-driven default referenced by ``send_policy`` blocks in
+    ``gateway.yaml`` and the ``Bot(..., send_policy=...)`` Python surface. It is
+    intentionally minimal (no heavy dependencies) and lives in core so the
+    built-in ``send_message`` path is always interceptable.
+
+    Matching is exact against the symbolic target token (e.g. ``"origin"``,
+    ``"slack:#ops"``, or a friendly alias). With ``default="deny"`` only listed
+    targets are permitted; with ``default="allow"`` all targets are permitted
+    except those in ``deny``.
+
+    Example::
+
+        # default-deny: only the conversation origin and an ops alias allowed
+        SendPolicy(default="deny", allow=["origin", "ops-alerts"])
+        # default-allow: everything permitted except an exec channel
+        SendPolicy(default="allow", deny=["slack:#exec"])
+    """
+
+    def __init__(
+        self,
+        default: str = "allow",
+        allow: Optional[List[str]] = None,
+        deny: Optional[List[str]] = None,
+    ):
+        default = (default or "allow").lower()
+        if default not in ("allow", "deny"):
+            raise ValueError(
+                f"send_policy default must be 'allow' or 'deny', got {default!r}"
+            )
+        self.default = default
+        self.allow = list(allow or [])
+        self.deny = list(deny or [])
+
+    def evaluate(
+        self,
+        target: str,
+        *,
+        agent_id: str = "",
+        session_id: str = "",
+        origin: Optional[str] = None,
+    ) -> SendDecision:
+        if target in self.deny:
+            return SendDecision(
+                allow=False,
+                reason=f"target '{target}' is denied by send_policy",
+            )
+        if self.default == "deny":
+            if target in self.allow:
+                return SendDecision(allow=True)
+            return SendDecision(
+                allow=False,
+                reason=f"target '{target}' is not permitted by send_policy",
+            )
+        return SendDecision(allow=True)
 
 
 # ---------------------------------------------------------------------------

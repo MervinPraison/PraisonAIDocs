@@ -32,7 +32,12 @@ from ._commands import (
     format_status, 
     format_help, 
     handle_stop_command,
-    CommandAccessPolicy,
+    handle_model_command,
+    handle_usage_command,
+    handle_compress_command,
+    handle_queue_command,
+    handle_learn_command,
+    build_command_access_policy,
     get_command_registry
 )
 from ._session import BotSessionManager
@@ -207,23 +212,14 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         self._auto_tts = enabled
     
     def _init_command_access_policy(self):
-        """Initialize command access policy from config."""
-        # Parse admin users from config
-        admin_users = set()
-        if hasattr(self.config, 'admin_users') and self.config.admin_users:
-            admin_users = set(user.strip() for user in self.config.admin_users.split(',') if user.strip())
-        
-        # Parse user allowed commands from config  
-        user_allowed_commands = None
-        if hasattr(self.config, 'user_allowed_commands') and self.config.user_allowed_commands:
-            user_allowed_commands = set(cmd.strip() for cmd in self.config.user_allowed_commands.split(',') if cmd.strip())
-        
-        # Create command access policy
-        self._command_policy = CommandAccessPolicy(
-            admin_users=admin_users,
-            user_allowed_commands=user_allowed_commands
-        )
-        
+        """Initialize command access policy from config.
+
+        Uses the shared :func:`build_command_access_policy` builder so every
+        adapter (Telegram, Slack, Discord) parses ``admin_users`` /
+        ``user_allowed_commands`` identically and can't silently diverge.
+        """
+        self._command_policy = build_command_access_policy(self.config)
+
         # Get the global command registry
         self._command_registry = get_command_registry()
     
@@ -692,11 +688,93 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
             response = self._command_registry.format_whoami(user_id, username, self._command_policy)
             await update.message.reply_text(response)
         
+        async def handle_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message or not update.message.text:
+                return
+            message = await process_inbound_telegram_message(update, self)
+            if not message:
+                return
+            user_id = message.sender.user_id if message.sender else "unknown"
+            # Check command permissions
+            if not self._command_policy.can_run(user_id, "model"):
+                await update.message.reply_text("⛔ You are not permitted to run /model")
+                return
+            # Extract model name from command
+            parts = update.message.text.split(maxsplit=1)
+            model_name = parts[1] if len(parts) > 1 else None
+            response = handle_model_command(self._session, user_id, model_name, self._agent)
+            await update.message.reply_text(response)
+        
+        async def handle_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message:
+                return
+            message = await process_inbound_telegram_message(update, self)
+            if not message:
+                return
+            user_id = message.sender.user_id if message.sender else "unknown"
+            # Check command permissions
+            if not self._command_policy.can_run(user_id, "usage"):
+                await update.message.reply_text("⛔ You are not permitted to run /usage")
+                return
+            response = handle_usage_command(self._session, user_id, self._agent)
+            await update.message.reply_text(response)
+        
+        async def handle_compress(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message:
+                return
+            message = await process_inbound_telegram_message(update, self)
+            if not message:
+                return
+            user_id = message.sender.user_id if message.sender else "unknown"
+            # Check command permissions
+            if not self._command_policy.can_run(user_id, "compress"):
+                await update.message.reply_text("⛔ You are not permitted to run /compress")
+                return
+            response = handle_compress_command(self._session, user_id, self._agent)
+            await update.message.reply_text(response)
+        
+        async def handle_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message or not update.message.text:
+                return
+            message = await process_inbound_telegram_message(update, self)
+            if not message:
+                return
+            user_id = message.sender.user_id if message.sender else "unknown"
+            # Check command permissions
+            if not self._command_policy.can_run(user_id, "queue"):
+                await update.message.reply_text("⛔ You are not permitted to run /queue")
+                return
+            # Extract message text from command
+            parts = update.message.text.split(maxsplit=1)
+            message_text = parts[1] if len(parts) > 1 else None
+            response = handle_queue_command(self._session, user_id, message_text)
+            await update.message.reply_text(response)
+
+        async def handle_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.message or not update.message.text:
+                return
+            message = await process_inbound_telegram_message(update, self)
+            if not message:
+                return
+            user_id = message.sender.user_id if message.sender else "unknown"
+            if not self._command_policy.can_run(user_id, "learn"):
+                await update.message.reply_text("⛔ You are not permitted to run /learn")
+                return
+            parts = update.message.text.split(maxsplit=1)
+            request = parts[1] if len(parts) > 1 else None
+            response = handle_learn_command(self._agent, request)
+            await update.message.reply_text(response)
+
         self._application.add_handler(CommandHandler("status", handle_status))
         self._application.add_handler(CommandHandler("new", handle_new))
         self._application.add_handler(CommandHandler("help", handle_help))
         self._application.add_handler(CommandHandler("stop", handle_stop))
         self._application.add_handler(CommandHandler("whoami", handle_whoami))
+        self._application.add_handler(CommandHandler("model", handle_model))
+        self._application.add_handler(CommandHandler("usage", handle_usage))
+        self._application.add_handler(CommandHandler("compress", handle_compress))
+        self._application.add_handler(CommandHandler("queue", handle_queue))
+        self._application.add_handler(CommandHandler("learn", handle_learn))
         
         for command in self._command_handlers:
             self._application.add_handler(CommandHandler(command, handle_command))
@@ -1220,19 +1298,7 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
 
     async def health(self):
         """Get detailed health status of the Telegram bot."""
-        from praisonaiagents.bots import HealthResult
-        probe_result = await self.probe()
-        uptime = (time.time() - self._started_at) if self._started_at else None
-        session_count = len(self._session._histories) if hasattr(self._session, '_histories') else 0
-        return HealthResult(
-            ok=self._is_running and probe_result.ok,
-            platform="telegram",
-            is_running=self._is_running,
-            uptime_seconds=uptime,
-            probe=probe_result,
-            sessions=session_count,
-            error=probe_result.error if not probe_result.ok else None,
-        )
+        return await self._default_health()
 
     def _format_status(self) -> str:
         """Format /status response."""

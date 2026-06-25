@@ -2,7 +2,7 @@
 Sandbox Execution Example for PraisonAI CLI.
 
 Secure isolated command execution (--sandbox flag).
-Docs: https://praison.ai/docs/cli/sandbox-execution
+Docs: https://docs.praison.ai/cli/sandbox-execution
 """
 
 from praisonai.cli.features import SandboxExecutorHandler

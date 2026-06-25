@@ -245,7 +245,7 @@ st.markdown(
     <div style='text-align: center; color: gray;'>
         Built with PraisonAI Agents + MCP • 
         <a href='https://github.com/MervinPraison/PraisonAI' target='_blank'>GitHub</a> • 
-        <a href='https://praison.ai/docs' target='_blank'>Documentation</a>
+        <a href='https://docs.praisonai.com' target='_blank'>Documentation</a>
     </div>
     """, 
     unsafe_allow_html=True

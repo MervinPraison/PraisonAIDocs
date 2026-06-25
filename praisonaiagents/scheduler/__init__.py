@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from .parser import parse_schedule
     from .runner import ScheduleRunner
     from .loop import ScheduleLoop
-    from .protocols import ScheduleStoreProtocol
+    from .protocols import ScheduleStoreProtocol, JobConditionProtocol, GateResult
 
 _module_cache = {}
 
@@ -69,10 +69,30 @@ def __getattr__(name: str):
         _module_cache[name] = ConfigYamlScheduleStore
         return ConfigYamlScheduleStore
 
-    if name == "ScheduleStoreProtocol":
-        from .protocols import ScheduleStoreProtocol
-        _module_cache[name] = ScheduleStoreProtocol
-        return ScheduleStoreProtocol
+    if name in ("ScheduleStoreProtocol", "JobConditionProtocol", "GateResult"):
+        from .protocols import (
+            ScheduleStoreProtocol,
+            JobConditionProtocol,
+            GateResult,
+        )
+        _module_cache["ScheduleStoreProtocol"] = ScheduleStoreProtocol
+        _module_cache["JobConditionProtocol"] = JobConditionProtocol
+        _module_cache["GateResult"] = GateResult
+        return _module_cache[name]
+
+    if name in ("Blueprint", "BlueprintSlot", "BlueprintStoreProtocol"):
+        from .blueprint_defs import Blueprint, BlueprintSlot, BlueprintStoreProtocol
+        _module_cache["Blueprint"] = Blueprint
+        _module_cache["BlueprintSlot"] = BlueprintSlot
+        _module_cache["BlueprintStoreProtocol"] = BlueprintStoreProtocol
+        return _module_cache[name]
+
+    if name in ("Suggestion", "SuggestionStore", "MAX_PENDING_CAP"):
+        from .suggestion_store import Suggestion, SuggestionStore, MAX_PENDING_CAP
+        _module_cache["Suggestion"] = Suggestion
+        _module_cache["SuggestionStore"] = SuggestionStore
+        _module_cache["MAX_PENDING_CAP"] = MAX_PENDING_CAP
+        return _module_cache[name]
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -88,4 +108,12 @@ __all__ = [
     "ScheduleRunner",
     "ScheduleLoop",
     "ScheduleStoreProtocol",
+    "JobConditionProtocol",
+    "GateResult",
+    "Blueprint",
+    "BlueprintSlot",
+    "BlueprintStoreProtocol",
+    "Suggestion",
+    "SuggestionStore",
+    "MAX_PENDING_CAP",
 ]

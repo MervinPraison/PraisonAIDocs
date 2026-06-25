@@ -25,7 +25,17 @@ from praisonaiagents.bots import (
     PlatformCapabilities,
 )
 
-from ._commands import format_status, format_help, handle_stop_command
+from ._commands import (
+    format_status, 
+    format_help, 
+    handle_stop_command,
+    handle_model_command,
+    handle_usage_command,
+    handle_compress_command,
+    handle_queue_command,
+    handle_learn_command,
+    build_command_access_policy,
+)
 from ._session import BotSessionManager
 from ._debounce import InboundDebouncer
 from ._ack import AckReactor
@@ -89,6 +99,10 @@ class DiscordBot(ChatCommandMixin, MessageHookMixin):
         self._message_handlers: List[Callable] = []
         self._command_handlers: Dict[str, Callable] = {}
         self._started_at: Optional[float] = None
+
+        # Per-command authorization, shared with Telegram/Slack so privileged
+        # commands (e.g. /learn) can be restricted consistently across channels.
+        self._command_policy = build_command_access_policy(self.config)
         # Use helper to build session manager
         from ._session import build_session_manager
         self._session: BotSessionManager = build_session_manager(
@@ -228,6 +242,16 @@ class DiscordBot(ChatCommandMixin, MessageHookMixin):
             
             if bot_message.is_command:
                 command = bot_message.command
+                # Per-command authorization: privileged commands (e.g. /learn)
+                # can be restricted to admins independent of the channel/pairing
+                # allow gate, consistent with Telegram and Slack.
+                if command and not self._command_policy.can_run(
+                    str(message.author.id), command
+                ):
+                    await message.reply(
+                        f"⛔ You are not permitted to run /{command}"
+                    )
+                    return
                 if command == "status":
                     await message.reply(self._format_status())
                     return
@@ -242,6 +266,39 @@ class DiscordBot(ChatCommandMixin, MessageHookMixin):
                 elif command == "stop":
                     user_id = str(message.author.id)
                     response = handle_stop_command(self._session, user_id)
+                    await message.reply(response)
+                    return
+                elif command == "model":
+                    user_id = str(message.author.id)
+                    # Extract model name from message
+                    parts = bot_message.text.split(maxsplit=1)
+                    model_name = parts[1] if len(parts) > 1 else None
+                    response = handle_model_command(self._session, user_id, model_name, self._agent)
+                    await message.reply(response)
+                    return
+                elif command == "usage":
+                    user_id = str(message.author.id)
+                    response = handle_usage_command(self._session, user_id, self._agent)
+                    await message.reply(response)
+                    return
+                elif command == "compress":
+                    user_id = str(message.author.id)
+                    response = handle_compress_command(self._session, user_id, self._agent)
+                    await message.reply(response)
+                    return
+                elif command == "queue":
+                    user_id = str(message.author.id)
+                    # Extract message text from command
+                    parts = bot_message.text.split(maxsplit=1)
+                    message_text = parts[1] if len(parts) > 1 else None
+                    response = handle_queue_command(self._session, user_id, message_text)
+                    await message.reply(response)
+                    return
+                elif command == "learn":
+                    # Extract request text from command
+                    parts = bot_message.text.split(maxsplit=1)
+                    request = parts[1] if len(parts) > 1 else None
+                    response = handle_learn_command(self._agent, request)
                     await message.reply(response)
                     return
                 elif command and command in self._command_handlers:
@@ -550,16 +607,7 @@ class DiscordBot(ChatCommandMixin, MessageHookMixin):
 
     async def health(self):
         """Get detailed health status of the Discord bot."""
-        from praisonaiagents.bots import HealthResult
-        probe_result = await self.probe()
-        uptime = (time.time() - self._started_at) if self._started_at else None
-        session_count = len(self._session._histories) if hasattr(self._session, '_histories') else 0
-        return HealthResult(
-            ok=self._is_running and probe_result.ok, platform="discord",
-            is_running=self._is_running, uptime_seconds=uptime,
-            probe=probe_result, sessions=session_count,
-            error=probe_result.error if not probe_result.ok else None,
-        )
+        return await self._default_health()
 
     def _format_status(self) -> str:
         """Format /status response."""

@@ -24,6 +24,7 @@ from .async_safety import AsyncSafeState
 from .unified_execution_mixin import UnifiedExecutionMixin
 from .sandbox_mixin import SandboxMixin
 from .message_steering import SteeringMixin
+from .skill_review import SkillReviewMixin
 
 # Module-level logger for thread safety errors and debugging
 logger = get_logger(__name__)
@@ -207,6 +208,7 @@ if TYPE_CHECKING:
     from ..rag.models import RAGResult, ContextPack
     from ..eval.results import EvaluationLoopResult
     from ..tools.retry import RetryPolicy
+    from ..skills.protocols import SkillReviewProtocol
 
 # Import structured error from central errors module
 from ..errors import BudgetExceededError
@@ -214,7 +216,7 @@ from ..errors import BudgetExceededError
 # Import retry configuration
 from .retry_utils import RetryBackoffConfig
 
-class Agent(SteeringMixin, SandboxMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
+class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
     _agent_counter_lock = threading.Lock()
@@ -540,6 +542,7 @@ class Agent(SteeringMixin, SandboxMixin, UnifiedExecutionMixin, ToolExecutionMix
         caching: Optional[Union[bool, str, Dict[str, Any], 'CachingConfig']] = None,
         hooks: Optional[Union[List[Any], Dict[str, Any], 'HooksConfig']] = None,
         skills: Optional[Union[List[str], str, Dict[str, Any], 'SkillsConfig']] = None,
+        self_improve: Optional[Union[bool, 'SkillReviewProtocol']] = False,  # Autonomous skill self-improvement loop (off by default)
         approval: Optional[Union[bool, str, Dict[str, Any], 'ApprovalConfig', 'ApprovalProtocol']] = None,
         tool_config: Optional[Union[bool, 'ToolConfig']] = None,  # Tool execution configuration (timeout, retry, parallel)
         learn: Optional[Union[bool, str, Dict[str, Any], 'LearnConfig']] = None,  # Continuous learning (peer to memory)
@@ -587,6 +590,14 @@ class Agent(SteeringMixin, SandboxMixin, UnifiedExecutionMixin, ToolExecutionMix
             reflection: Self-reflection. Accepts:
                 - bool: True enables with defaults
                 - ReflectionConfig: Custom configuration
+            self_improve: Autonomous skill self-improvement loop (off by default).
+                After each task, runs a guarded review pass restricted to the
+                ``skill_manage`` tool that asks the agent to capture a reusable
+                technique as a new/patched skill. Accepts:
+                - bool: True enables with the default review policy, False disables
+                - SkillReviewProtocol: Custom review policy
+                This is distinct from ``reflection`` (which is answer-quality
+                retry) — it captures durable capability across runs.
             guardrails: Output validation. Accepts:
                 - bool: True enables with defaults
                 - Callable: Validation function
@@ -2015,6 +2026,18 @@ Your Goal: {self.goal}
         self._skill_manager = None  # Lazy loaded
         self._skills_initialized = False
 
+        # Autonomous skill self-improvement loop (issue #2231). Off by default;
+        # when enabled, a guarded review pass restricted to skill_manage runs
+        # after each task. A SkillReviewProtocol instance customises the policy.
+        if self_improve is True or self_improve is False or self_improve is None:
+            self._self_improve = bool(self_improve)
+            self._self_improve_policy = None
+        else:
+            # Custom policy object implementing SkillReviewProtocol.
+            self._self_improve = True
+            self._self_improve_policy = self_improve
+        self._in_skill_review = False
+
         # Database persistence (lazy - no imports until used)
         self._db = db
         self._session_id = session_id
@@ -2182,6 +2205,12 @@ Your Goal: {self.goal}
             'skills': getattr(self, '_skills_config', None),
             'approval': getattr(self, '_approval_config', None),
             'learn': getattr(self, '_learn_config', None),
+            # Autonomous skill self-improvement: forward the custom policy when
+            # set, else the opt-in boolean, so clones keep the same behavior.
+            'self_improve': (
+                getattr(self, '_self_improve_policy', None)
+                or getattr(self, '_self_improve', False)
+            ),
             'tool_search': getattr(self, '_tool_search_config', None),
             # Tool configuration - use consolidated config when available  
             'tool_config': getattr(self, '_tool_config', None),
@@ -4195,6 +4224,129 @@ Summary:"""
                 
         return filtered_tools
     
+    def add_mcp_server(self, name: str, mcp: Any) -> Any:
+        """
+        Attach an MCP server to a live agent at runtime.
+
+        Connects the MCP server (discovering its tools), tracks it by name, and
+        appends it to ``self.tools`` so its tools become available on the next
+        turn of the same run — no agent rebuild required. New MCP tools flow
+        through the existing tool-execution and approval paths automatically.
+
+        Args:
+            name: Unique name for this MCP server (used by ``remove_mcp_server``).
+            mcp: An ``MCP`` instance (e.g. ``MCP("npx -y @notionhq/notion-mcp-server")``).
+
+        Returns:
+            The attached ``MCP`` instance.
+
+        Example:
+            ```python
+            from praisonaiagents.mcp import MCP
+            agent.add_mcp_server("notion", MCP("npx -y @notionhq/notion-mcp-server"))
+            # tools live on the next turn
+            ```
+        """
+        if not name:
+            raise ValueError("add_mcp_server requires a non-empty name")
+
+        if not hasattr(self, "_mcp_servers"):
+            self._mcp_servers = {}
+
+        if name in self._mcp_servers:
+            raise ValueError(
+                f"MCP server '{name}' is already attached. "
+                "Call remove_mcp_server() first to replace it."
+            )
+
+        # Ensure self.tools is a mutable list we can append to
+        if not isinstance(self.tools, list):
+            self.tools = list(self.tools) if self.tools else []
+
+        self._mcp_servers[name] = mcp
+        self.tools.append(mcp)
+        self.refresh_tools()
+        logging.debug(f"Attached MCP server '{name}' with runtime tools")
+        return mcp
+
+    def remove_mcp_server(self, name: str) -> bool:
+        """
+        Disconnect and deregister a previously attached MCP server.
+
+        Removes the server's tools from ``self.tools`` and shuts the connection
+        down cleanly (no leaked background loops). Tools disappear on the next
+        turn.
+
+        Args:
+            name: The name used in ``add_mcp_server``.
+
+        Returns:
+            True if a server was removed, False if no server by that name existed.
+        """
+        servers = getattr(self, "_mcp_servers", None)
+        if not servers or name not in servers:
+            return False
+
+        mcp = servers.pop(name)
+
+        if isinstance(self.tools, list):
+            self.tools = [t for t in self.tools if t is not mcp]
+
+        # Best-effort clean shutdown of the MCP connection
+        try:
+            if hasattr(mcp, "shutdown"):
+                mcp.shutdown()
+        except Exception as e:
+            logging.warning(f"MCP server '{name}' shutdown failed: {e}")
+
+        self.refresh_tools()
+        logging.debug(f"Removed MCP server '{name}'")
+        return True
+
+    def refresh_tools(self) -> List[Any]:
+        """
+        Re-derive the live toolset from ``self.tools``.
+
+        Per-turn tool assembly already reads from ``self.tools`` directly, so
+        tools added/removed via ``add_mcp_server``/``remove_mcp_server`` are
+        picked up automatically on the next turn. This method clears any cached
+        tool definitions so callers (or an MCP ``tools/list_changed`` event) can
+        force an immediate refresh, and returns the current toolset.
+
+        Returns:
+            The current list of tools/MCP instances on the agent.
+        """
+        # Invalidate any cached tool definitions if such a cache exists
+        for cache_attr in ("_cached_tool_definitions", "_tool_definitions_cache"):
+            if hasattr(self, cache_attr):
+                try:
+                    setattr(self, cache_attr, None)
+                except Exception:
+                    pass
+        return self.tools
+
+    def list_mcp_servers(self) -> List[str]:
+        """Return the names of MCP servers currently attached at runtime."""
+        return list(getattr(self, "_mcp_servers", {}).keys())
+
+    def _shutdown_runtime_mcp_servers(self) -> None:
+        """Shut down all runtime-attached MCP servers, guarding each individually.
+
+        Used by both ``close()`` and ``aclose()`` so a single failing
+        ``shutdown()`` never aborts cleanup of the remaining servers. The
+        registry is always cleared afterwards.
+        """
+        servers = getattr(self, "_mcp_servers", None)
+        if not servers:
+            return
+        for name, server in list(servers.items()):
+            try:
+                if hasattr(server, "shutdown"):
+                    server.shutdown()
+            except Exception as e:
+                logger.warning(f"Runtime MCP server '{name}' cleanup failed: {e}")
+        servers.clear()
+
     def _model_supports_web_search(self) -> bool:
         """
         Check if the agent's model supports native web search via LiteLLM.
@@ -5615,6 +5767,9 @@ Answer:"""
         except Exception as e:
             logger.warning(f"MCP cleanup failed: {e}")
 
+        # Runtime-attached MCP servers cleanup (each guarded individually)
+        self._shutdown_runtime_mcp_servers()
+
         # Server registry cleanup
         try:
             self._cleanup_server_registrations()
@@ -5663,7 +5818,10 @@ Answer:"""
                     elif hasattr(client, 'close'):
                         client.close()
                 self._mcp_clients.clear()
-            
+
+            # Runtime-attached MCP servers cleanup (each guarded individually)
+            self._shutdown_runtime_mcp_servers()
+
             # Clean up server registrations and tasks
             self._cleanup_server_registrations()
             

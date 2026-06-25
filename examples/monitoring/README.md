@@ -222,7 +222,7 @@ You can customize monitoring by:
 
 ## 📚 Further Reading
 
-- [PraisonAI Documentation](https://praison.ai/docs)
+- [PraisonAI Documentation](https://docs.praisonai.com)
 - [Performance Monitoring Guide](../../../src/praisonai-agents/praisonaiagents/telemetry/README.md)
 - [API Reference](../../../src/praisonai-agents/praisonaiagents/telemetry/__init__.py)
 

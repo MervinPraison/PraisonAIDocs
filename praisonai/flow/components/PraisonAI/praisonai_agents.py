@@ -31,7 +31,7 @@ class PraisonAIAgentsComponent(Component):
 
     display_name: str = "Agent Team"
     description: str = "Orchestrate multiple PraisonAI agents for complex workflows."
-    documentation: str = "https://praison.ai/docs"
+    documentation: str = "https://docs.praison.ai"
     icon: str = "bot"
     name: str = "PraisonAIAgents"
 
