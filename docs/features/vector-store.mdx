@@ -31,8 +31,8 @@ graph LR
 ## Quick Start
 
 <Steps>
-<Step title="Agent with Knowledge">
-The simplest way to use a vector store is through an agent's `knowledge` parameter — PraisonAI handles indexing and retrieval automatically.
+<Step title="Agent with Knowledge (in-memory)">
+The simplest way to use a vector store is through an agent's `knowledge` parameter — PraisonAI handles indexing and retrieval automatically using the in-memory backend.
 
 ```python
 from praisonaiagents import Agent
@@ -47,41 +47,134 @@ agent.start("How do I configure authentication?")
 ```
 </Step>
 
-<Step title="Direct API Usage">
-Access the in-memory store directly to add and query vectors.
+<Step title="Agent with a Persistent Backend">
+Point the agent at a Chroma collection so data survives process restarts. The `vector_store` block inside the knowledge config selects the provider and its connection details.
 
 ```python
-from praisonaiagents.knowledge.vector_store import get_vector_store_registry
+from praisonaiagents import Agent, Knowledge
 
-store = get_vector_store_registry().get("memory")
+knowledge = Knowledge(config={
+    "vector_store": {
+        "provider": "chroma",
+        "config": {
+            "collection_name": "my_docs",
+            "path": "./chroma_db"
+        }
+    }
+})
 
-store.add(
-    texts=["PraisonAI builds agentic systems"],
-    embeddings=[[0.1, 0.2, 0.3]],
-    metadatas=[{"source": "readme"}],
+agent = Agent(
+    name="Researcher",
+    instructions="Answer using the indexed documents",
+    knowledge=["docs/manual.pdf"],
+    knowledge_config=knowledge.config
 )
 
-results = store.query(embedding=[0.1, 0.2, 0.3], top_k=5)
-for r in results:
-    print(r.text, r.score)
+agent.start("How do I configure authentication?")
 ```
 </Step>
 
-<Step title="Register a Custom Store">
-Swap in any vector database by registering a factory function.
+<Step title="Agent with Memory + Vector Store">
+Use `Memory` with a `vector_store` block to persist conversation history across sessions. This is the right path when you need the agent to remember past interactions.
 
 ```python
-from praisonaiagents.knowledge.vector_store import get_vector_store_registry
+from praisonaiagents import Agent
+from praisonaiagents.memory.memory import Memory
 
-def make_my_store(config=None, namespace=None):
-    return MyStore(config=config, namespace=namespace)
+memory = Memory(config={
+    "provider": "mem0",
+    "config": {
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "host": "localhost",
+                "port": 6333
+            }
+        },
+        "embedder": {
+            "provider": "openai",
+            "config": {"model": "text-embedding-3-small"}
+        }
+    }
+})
 
-get_vector_store_registry().register("my_store", make_my_store)
+agent = Agent(
+    name="Assistant",
+    instructions="Help the user and remember our past conversations",
+    memory=memory
+)
 
-store = get_vector_store_registry().get("my_store")
+agent.start("What did we discuss last time?")
+```
+</Step>
+
+<Step title="Agent with RetrievalConfig">
+`RetrievalConfig` is the unified surface for RAG pipelines — it replaces the older `knowledge_config` and `rag_config` parameters and adds reranking, hybrid search, and citation support.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.rag.retrieval_config import RetrievalConfig
+
+retrieval = RetrievalConfig(
+    vector_store_provider="chroma",
+    vector_store_config={"path": "./chroma_db"},
+    collection_name="product_docs",
+    top_k=5,
+    rerank=True,
+    citations=True
+)
+
+agent = Agent(
+    name="SupportBot",
+    instructions="Answer product questions with cited sources",
+    knowledge=["docs/product-guide.pdf"],
+    retrieval_config=retrieval
+)
+
+agent.start("What are the system requirements?")
 ```
 </Step>
 </Steps>
+
+---
+
+## Choose a Backend
+
+Pick the right backend for your deployment scenario.
+
+```mermaid
+graph TB
+    Start([🚀 Starting Out?]) --> Q1{Need persistence?}
+
+    Q1 -->|No| DevTest[Dev / Test]
+    Q1 -->|Yes| Q2{Single process?}
+
+    Q2 -->|Yes| SingleProc[Single Process]
+    Q2 -->|No| Q3{Cloud-scale?}
+
+    Q3 -->|No| MultiProc[Multi Process]
+    Q3 -->|Yes| Cloud[Cloud Scale]
+
+    DevTest --> Memory["🧠 memory\n(InMemoryVectorStore)"]
+    SingleProc --> Chroma["🟣 chroma / chromadb\n(local file)"]
+    SingleProc --> LanceDB["🟡 lancedb\n(local file)"]
+    MultiProc --> Qdrant["🔵 qdrant\n(self-hosted)"]
+    MultiProc --> Faiss["🟢 faiss\n(shared mount)"]
+    Cloud --> Pinecone["☁️ pinecone"]
+    Cloud --> Weaviate["☁️ weaviate"]
+    Cloud --> Milvus["☁️ milvus"]
+    Cloud --> MongoDB["🍃 mongodb\n(Atlas Vector Search)"]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef tier fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef backend fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1,Q2,Q3 question
+    class DevTest,SingleProc,MultiProc,Cloud tier
+    class Memory,Chroma,LanceDB,Qdrant,Faiss,Pinecone,Weaviate,Milvus,MongoDB backend
+```
 
 ---
 
@@ -102,6 +195,35 @@ sequenceDiagram
     Agent->>VS: query(vector, top_k=5)
     VS-->>Agent: Top matches
     Agent-->>User: Answer grounded in matches
+```
+
+### User-Interaction Flow
+
+A non-developer asking a question ends up routed through the agent, into the store, and back — with a "no match" fallback.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Embed as Embedder
+    participant VS as Vector Store
+    participant LLM
+
+    User->>Agent: "How do I reset my password?"
+    Agent->>Embed: Embed query
+    Embed-->>Agent: Query vector
+    Agent->>VS: query(vector, top_k=5, min_score=0.6)
+    alt Matches found
+        VS-->>Agent: [VectorRecord, ...]
+        Agent->>LLM: Prompt + retrieved context
+        LLM-->>Agent: Grounded answer
+        Agent-->>User: Answer with citations
+    else No match (score < threshold)
+        VS-->>Agent: []
+        Agent->>LLM: Prompt only (no context)
+        LLM-->>Agent: General answer
+        Agent-->>User: Answer (no citation)
+    end
 ```
 
 ---
@@ -131,6 +253,33 @@ sequenceDiagram
 | `delete(ids, namespace, filter, delete_all)` | Remove vectors; returns count deleted |
 | `count(namespace)` | Number of stored vectors |
 | `get(ids, namespace)` | Retrieve vectors by ID |
+
+### Where to Configure
+
+Each agent entry point wires the vector store differently — pick the one that matches your use case.
+
+| Entry point | SDK file | When to use |
+|---|---|---|
+| `Agent(knowledge=[...])` | `praisonaiagents/knowledge/knowledge.py` | Read-only docs, simple grounding |
+| `Knowledge(config={"vector_store": ...})` | `praisonaiagents/knowledge/knowledge.py` | Pick a specific backend for knowledge indexing |
+| `Memory(config={"config": {"vector_store": ...}})` | `praisonaiagents/memory/memory.py` | Long-term memory across sessions |
+| `RetrievalConfig(vector_store_provider=...)` | `praisonaiagents/rag/retrieval_config.py` | Unified RAG with reranking / hybrid / citations |
+| `get_vector_store_registry().get(name)` | `praisonaiagents/knowledge/vector_store.py` | Direct, low-level access |
+
+### RetrievalConfig Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `vector_store_provider` | `str` | `"chroma"` | Backend name |
+| `vector_store_config` | `Dict[str, Any]` | `{}` | Provider-specific config |
+| `collection_name` | `Optional[str]` | `None` | Collection / index name |
+| `persist_path` | `str` | project data dir | Storage path |
+| `top_k` | `int` | `5` | Number of chunks to retrieve |
+| `min_score` | `float` | `0.0` | Minimum relevance threshold |
+| `rerank` | `bool` | `False` | Rerank results for better relevance |
+| `hybrid` | `bool` | `False` | Dense + keyword hybrid retrieval |
+| `citations` | `bool` | `True` | Include source citations |
+| `citations_mode` | `CitationsMode` | `APPEND` | `append`, `inline`, or `hidden` |
 
 ---
 
@@ -201,6 +350,110 @@ store.delete(filter={"chapter": 1})
 store.delete(namespace="user:alice", delete_all=True)
 ```
 
+### Plug in a Custom Backend End-to-End
+
+Implement `VectorStoreProtocol`, register the factory, and use it from an agent — no other changes required.
+
+```python
+import uuid
+from typing import Any, Dict, List, Optional
+from praisonaiagents.knowledge.vector_store import (
+    VectorRecord,
+    get_vector_store_registry,
+)
+from praisonaiagents import Agent
+
+
+class MyStore:
+    """Minimal in-process store — replace the dict with your real backend."""
+
+    name = "my_store"
+
+    def __init__(self, config=None, namespace=None):
+        self._data: Dict[str, VectorRecord] = {}
+
+    def add(
+        self,
+        texts: List[str],
+        embeddings: List[List[float]],
+        metadatas: Optional[List[Dict[str, Any]]] = None,
+        ids: Optional[List[str]] = None,
+        namespace: Optional[str] = None,
+    ) -> List[str]:
+        ids = ids or [str(uuid.uuid4()) for _ in texts]
+        for i, (text, emb) in enumerate(zip(texts, embeddings)):
+            record = VectorRecord(
+                id=ids[i],
+                text=text,
+                embedding=emb,
+                metadata=(metadatas[i] if metadatas else {}),
+            )
+            self._data[ids[i]] = record
+        return ids
+
+    def query(
+        self,
+        embedding: List[float],
+        top_k: int = 10,
+        namespace: Optional[str] = None,
+        filter: Optional[Dict[str, Any]] = None,
+    ) -> List[VectorRecord]:
+        import math
+
+        def cosine(a, b):
+            dot = sum(x * y for x, y in zip(a, b))
+            na = math.sqrt(sum(x * x for x in a))
+            nb = math.sqrt(sum(x * x for x in b))
+            return dot / (na * nb) if na and nb else 0.0
+
+        scored = []
+        for record in self._data.values():
+            if filter and not all(record.metadata.get(k) == v for k, v in filter.items()):
+                continue
+            score = cosine(embedding, record.embedding)
+            scored.append(VectorRecord(**{**record.__dict__, "score": score}))
+
+        scored.sort(key=lambda r: r.score or 0, reverse=True)
+        return scored[:top_k]
+
+    def delete(
+        self,
+        ids: Optional[List[str]] = None,
+        namespace: Optional[str] = None,
+        filter: Optional[Dict[str, Any]] = None,
+        delete_all: bool = False,
+    ) -> int:
+        if delete_all:
+            count = len(self._data)
+            self._data.clear()
+            return count
+        removed = 0
+        for rid in (ids or []):
+            if rid in self._data:
+                del self._data[rid]
+                removed += 1
+        return removed
+
+    def count(self, namespace: Optional[str] = None) -> int:
+        return len(self._data)
+
+    def get(self, ids: List[str], namespace: Optional[str] = None) -> List[VectorRecord]:
+        return [self._data[i] for i in ids if i in self._data]
+
+
+# Register once at startup
+get_vector_store_registry().register("my_store", MyStore)
+
+# Use it from an agent via the low-level API
+store = get_vector_store_registry().get("my_store")
+store.add(
+    texts=["Hello from my custom store"],
+    embeddings=[[0.1, 0.2, 0.3]],
+)
+results = store.query(embedding=[0.1, 0.2, 0.3], top_k=1)
+print(results[0].text)
+```
+
 ---
 
 ## Best Practices
@@ -221,6 +474,14 @@ Use namespaces to isolate data by user, project, or run — `"user:alice"`, `"pr
 <Accordion title="Registering custom backends">
 Any object that satisfies `VectorStoreProtocol` can be registered. Implement the five methods (`add`, `query`, `delete`, `count`, `get`) and a `name` attribute, then call `registry.register("my_backend", factory)`. The registry caches instances per `name:namespace` key, so the factory is called only once per combination.
 </Accordion>
+
+<Accordion title="When to upgrade from in-memory">
+Switch away from `InMemoryVectorStore` when you hit any of these triggers:
+- **Persistence** — data must survive process restart (use Chroma local or LanceDB).
+- **Multi-process** — more than one worker reads and writes the same index (use Qdrant or Faiss on a shared mount).
+- **Scale-out** — index exceeds available RAM or you need SLA-backed uptime (use Pinecone, Weaviate, Milvus, or MongoDB Atlas Vector Search).
+- **Citations and reranking** — switch to `RetrievalConfig` with `rerank=True` and `citations=True`; pair with a persistent backend for reproducible results.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -233,5 +494,11 @@ Any object that satisfies `VectorStoreProtocol` can be registered. Implement the
 </Card>
 <Card title="Store Types" icon="database" href="/docs/concepts/store-types">
   Compare vector, graph, and relational storage backends
+</Card>
+<Card title="Knowledge Backends" icon="server" href="/docs/features/knowledge-backends">
+  Configure Chroma, Pinecone, Qdrant and other providers
+</Card>
+<Card title="RAG" icon="magnifying-glass" href="/docs/features/rag">
+  Retrieval-augmented generation pipeline and RetrievalConfig
 </Card>
 </CardGroup>
