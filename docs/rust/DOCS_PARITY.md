@@ -4,6 +4,8 @@
 
 This report compares **Rust SDK feature categories** against **Rust documentation** (docs/rust/).
 
+> **Note (2026-06-26):** Python SDK agent-centric feature pages (planning, reflection, memory, web, autonomy) were added to `docs/features/` (issue #946). Rust SDK parity is unchanged — see undocumented categories below for gaps to address.
+
 ## Summary
 
 | Metric | Count |

@@ -4,6 +4,8 @@
 
 This report compares **TypeScript/JavaScript SDK feature categories** against **TypeScript/JavaScript documentation** (docs/js/).
 
+> **Note (2026-06-26):** Python SDK agent-centric feature pages (planning, reflection, memory, web, autonomy) were added to `docs/features/` (issue #946). JS SDK parity is unchanged — see undocumented categories below for gaps to address.
+
 ## Summary
 
 | Metric | Count |
