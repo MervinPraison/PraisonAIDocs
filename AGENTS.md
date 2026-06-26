@@ -220,12 +220,12 @@ icon: "icon-name"
 
 {/* Link to auto-generated SDK reference - DO NOT duplicate SDK parameters here */}
 {/* TypeScript: /docs/sdk/reference/typescript/{classes,modules,functions}/ */}
-{/* Rust: /docs/sdk/reference/rust/{structs,modules,functions}/ */}
+{/* Rust: /docs/sdk/reference/rust/{classes,modules,functions}/ */}
 
 <Card title="[Feature] API Reference" icon="code" href="/docs/sdk/reference/typescript/classes/[FeatureConfig]">
   TypeScript configuration options
 </Card>
-<Card title="[Feature] Rust Reference" icon="code" href="/docs/sdk/reference/rust/structs/[FeatureConfig]">
+<Card title="[Feature] Rust Reference" icon="code" href="/docs/sdk/reference/rust/classes/[FeatureConfig]">
   Rust configuration options
 </Card>
 
