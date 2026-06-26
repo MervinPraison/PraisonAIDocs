@@ -118,16 +118,22 @@ CLI flags always win. Config fills the gaps.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `command` | `list[str]` or `str` | — | Local (stdio) server launch command. List form preferred. |
-| `args` | `list[str]` | `[]` | Extra args appended to `command`. |
-| `env` | `dict[str, str]` | `{}` | Env vars for the server process. Values containing `,` are skipped on the command-string CLI path. |
+| `command` | `list[str]` or `str` | — | Local (stdio) server launch command. List form preferred. Required for local servers; ignored for remote. |
+| `args` | `list[str]` | `[]` | Extra args appended to `command`. Local servers only. |
+| `env` | `dict[str, str]` | `{}` | Env vars for the server process. Local servers only. |
 | `enabled` | `bool` | `true` | Set `false` to declare-but-not-wire a server. |
-| `type` | `"remote"` | — | Marks a remote server; skipped by the `run` command-string path. |
-| `url` | `str` | — | Remote endpoint; presence implies remote. |
+| `type` | `"remote"` | — | Marks a remote server. Optional — a non-empty `url` also implies remote. |
+| `url` | `str` | — | Remote endpoint (HTTP-stream, SSE, or WebSocket). Presence implies remote. |
+| `headers` | `dict[str, str]` | `{}` | HTTP headers for remote servers. **Ignored** for legacy SSE URLs ending in `/sse` (a warning is printed). |
+| `timeout` | `int` (milliseconds) | `30000` | Per-server connect timeout. Converted to seconds before being passed to the SDK `MCP(...)`. |
 
 <Note>
-Only **one** enabled local (stdio) server is wired through `praisonai run`. If multiple enabled local servers are declared, a warning is emitted and the first is used. Remote servers (`type: remote` or a `url` field) are skipped by the run path but still work for other integrations.
+`praisonai run` wires **every enabled server** under `mcp.servers.*` — multiple local (stdio) servers and remote (`url:` / `type: remote`) servers are all aggregated and exposed to the agent. Servers with `enabled: false` are skipped silently. If `--mcp "<command>"` is also given on the command line, its tools are **added on top of** the config servers, not in place of them.
 </Note>
+
+<Warning>
+Local stdio commands declared in config are run through the same allowlist as `--mcp`. The executable basename must be in `ALLOWED_MCP_COMMANDS` (e.g. `npx`, `node`, `python`, `uvx`, `deno`, `bun`), and inline-eval flags (`python -c`, `node -e`, `deno eval`, `bun -e`) are rejected. A rejected server is logged and skipped — the rest of the run continues.
+</Warning>
 
 ### `permissions`
 
@@ -165,7 +171,7 @@ permissions:
 ```mermaid
 graph TB
     subgraph "What wins"
-        A[⚡ --mcp flag] -->|overrides| B[config mcp.servers]
+        A[⚡ --mcp flag] -->|merges alongside| B[config mcp.servers]
         C[⚡ --allow / --deny] -->|merges on top of| D[config permissions]
         E[⚡ --permissions file] -->|loads first, then CLI flags win| D
     end
@@ -177,7 +183,7 @@ graph TB
     class B,D cfg
 ```
 
-- `--mcp`, if present, replaces the config MCP server entirely.
+- `--mcp` is **additive**: its single ad-hoc server is wired alongside every enabled server in `mcp.servers.*`. To exclude a config server from a specific run, set `enabled: false` in the YAML for that invocation (or use a separate `.praisonai/config.yaml` directory).
 - `--allow` / `--deny` / `--permissions` are merged **on top of** config rules — CLI wins per-pattern.
 - `--permission-default` sets the fallback action, overriding `permissions.default` from config.
 
@@ -202,6 +208,64 @@ mcp:
 praisonai run "List all Python files in the project"
 ```
 
+### Wire several MCP servers at once
+
+```mermaid
+graph LR
+    CFG[📄 config.yaml] --> RUN[▶️ praisonai run]
+    RUN --> S1[🖥️ playwright\nstdio]
+    RUN --> S2[🖥️ postgres\nstdio]
+    RUN --> S3[🌐 docs\nremote]
+    S1 --> AGT[🤖 Agent]
+    S2 --> AGT
+    S3 --> AGT
+
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef run fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef stdio fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef remote fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class CFG config
+    class RUN run
+    class S1,S2 stdio
+    class S3 remote
+    class AGT agent
+```
+
+```yaml
+# .praisonai/config.yaml
+agent:
+  model: gpt-4o-mini
+
+mcp:
+  servers:
+    playwright:
+      command: ["npx", "-y", "@playwright/mcp"]
+
+    postgres:
+      command: ["npx", "-y", "@modelcontextprotocol/server-postgres"]
+      env:
+        DATABASE_URL: "${DATABASE_URL}"
+
+    docs:
+      type: remote
+      url: "https://mcp.example.com/docs"
+      headers:
+        Authorization: "Bearer ${DOCS_API_TOKEN}"
+      timeout: 15000        # milliseconds
+```
+
+```bash
+praisonai run "Open the staging URL, query the orders table, and link to the matching docs section"
+```
+
+All three servers are wired in one run — Playwright + Postgres locally, and the remote docs MCP over HTTP.
+
+<Warning>
+Legacy SSE endpoints (URLs ending in `/sse`) cannot forward custom `headers` — the SDK's `SSEMCPClient` doesn't support them. PraisonAI prints a warning and connects without the headers. If the server needs authentication, switch to the HTTP-stream transport (URL **not** ending in `/sse`) or move the credential into a server-side proxy.
+</Warning>
+
 ### CI-safe defaults
 
 ```yaml
@@ -220,10 +284,10 @@ All tool calls are denied unless explicitly allowed — safe for unattended CI r
 
 ### Mix with CLI flags
 
-Config gives the base; flags override per-run:
+Config gives the base; flags add on top:
 
 ```bash
-# Override MCP server for this run only
+# Add an extra MCP server on top of config servers for this run
 praisonai run "Scrape the homepage" --mcp "npx -y @playwright/mcp"
 
 # Add an extra allow rule on top of config
