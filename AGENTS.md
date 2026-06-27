@@ -85,7 +85,17 @@ PraisonAI has three SDK implementations. Use these paths as source of truth:
 - ⚠️ Stub documentation (< 50 lines, needs content)
 - ❌ Undocumented categories (needs documentation)
 
-### 1.5 TypeScript SDK Structure
+**PraisonAIDocs mirror paths** — `praisonai-package/` does not exist in this repo. Use these mappings when working from PraisonAIDocs:
+
+| SDK | PraisonAI repo path | PraisonAIDocs mirror path |
+|-----|---------------------|--------------------------|
+| **Python** | `praisonai-package/src/praisonai-agents/` | `praisonaiagents/` (repo root) |
+| **TypeScript/JS** | `praisonai-package/src/praisonai-ts/src/` | _(not mirrored — read from upstream `MervinPraison/PraisonAI`)_ |
+| **Rust** | `praisonai-package/src/praisonai-rust/src/` | _(not mirrored — read from upstream `MervinPraison/PraisonAI`)_ |
+
+For TS/Rust SDK source when working in PraisonAIDocs: `gh repo clone MervinPraison/PraisonAI /tmp/PraisonAI --depth=1`
+
+### 1.6 TypeScript SDK Structure
 
 ```
 praisonai-ts/src/
@@ -97,7 +107,7 @@ praisonai-ts/src/
 └── index.ts          # Main exports
 ```
 
-### 1.6 Rust SDK Structure
+### 1.7 Rust SDK Structure
 
 ```
 praisonai-rust/src/
@@ -109,7 +119,7 @@ praisonai-rust/src/
 └── lib.rs            # Main exports
 ```
 
-### 1.7 Auto-Managed Documentation Sections
+### 1.8 Auto-Managed Documentation Sections
 
 > [!WARNING]
 > **DO NOT manually edit** the following sections in `docs.json`:
@@ -124,9 +134,11 @@ cd praisonai-package
 python3 src/praisonai/scripts/generate_docs_parity.py --copy-docs
 ```
 
-**Full command for agents:**
+**Full command for agents (run from a sibling clone of the PraisonAI repo — this script lives there, not in PraisonAIDocs):**
 ```bash
-/usr/bin/python3 /Users/praison/praisonai-package/src/praisonai/scripts/generate_docs_parity.py --copy-docs
+# Run from the PraisonAI repo (sibling clone of PraisonAIDocs):
+cd ../PraisonAI/praisonai-package
+python3 src/praisonai/scripts/generate_docs_parity.py --copy-docs
 ```
 
 This command:
@@ -134,7 +146,7 @@ This command:
 2. Generates `DOCS_PARITY.md` reports
 3. Copies reports to `docs/features/`, `docs/js/`, `docs/rust/`
 
-### 1.8 Folder Placement Rules
+### 1.9 Folder Placement Rules
 
 > [!CAUTION]
 > **AI agents MUST follow these rules strictly. Violations will cause PRs to be rejected.**
@@ -159,7 +171,7 @@ CRITICAL RULES FOR AI AGENTS:
 7. When reviewing PRs: flag any files in docs/concepts/ as violations
 ```
 
-### 1.9 AI Agent Behavioral Rules
+### 1.10 AI Agent Behavioral Rules
 
 ```
 MANDATORY for all AI agents working on this repository:
