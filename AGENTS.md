@@ -1,5 +1,7 @@
 # PraisonAI Documentation Agent Instructions
 
+> **Section renumbering (2026-06):** Former §1.5–§1.9 are now §1.6–§1.10. Grep old issue references against git history if a link looks stale.
+
 This file contains the exact instructions, principles, and patterns for AI agents to create documentation pages for PraisonAI. Follow these instructions precisely to produce consistent, high-quality documentation.
 
 --- 
