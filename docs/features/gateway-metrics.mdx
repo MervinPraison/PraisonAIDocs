@@ -1,0 +1,244 @@
+---
+title: "Gateway Metrics"
+sidebarTitle: "Gateway Metrics"
+description: "Prometheus-format message-flow metrics from the PraisonAI gateway"
+icon: "chart-line"
+---
+
+Scrape `GET /metrics` on the PraisonAI gateway to feed Prometheus — counters and gauges for every hop of the message flow, zero new dependencies.
+
+```mermaid
+graph LR
+    Inbound[📨 Inbound] --> Gateway[🛰️ Gateway]
+    Gateway --> Agent[🤖 Agent]
+    Agent --> Outbound[📤 Outbound]
+    Gateway -. counters .-> Metrics[(📊 /metrics)]
+    Outbound -. gauges .-> Metrics
+    Metrics --> Prom[Prometheus]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    class Agent agent
+    class Gateway,Outbound tool
+    class Metrics,Prom ok
+    class Inbound warn
+```
+
+## Quick Start
+
+<Steps>
+  <Step title="Start the gateway with auth_token set">
+    ```yaml
+    gateway:
+      host: "0.0.0.0"
+      port: 8765
+      auth_token: ${PRAISONAI_GATEWAY_AUTH_TOKEN}
+    ```
+    ```bash
+    export PRAISONAI_GATEWAY_AUTH_TOKEN=secret
+    praisonai gateway start --config gateway.yaml
+    ```
+  </Step>
+
+  <Step title="Scrape the metrics endpoint">
+    ```bash
+    curl -sH "Authorization: Bearer $PRAISONAI_GATEWAY_AUTH_TOKEN" \
+      http://localhost:8765/metrics
+    ```
+  </Step>
+
+  <Step title="Read the Prometheus exposition output">
+    ```
+    # HELP channel_restarts_total Total channel restarts performed by supervision.
+    # TYPE channel_restarts_total counter
+    channel_restarts_total{channel="telegram"} 2.0
+    # HELP messages_dispatched_total Total inbound messages dispatched to an agent run.
+    # TYPE messages_dispatched_total counter
+    messages_dispatched_total 184.0
+    # HELP messages_inbound_total Total inbound messages received by the gateway.
+    # TYPE messages_inbound_total counter
+    messages_inbound_total 187.0
+    # HELP outbound_failed_total Total outbound messages that failed delivery.
+    # TYPE outbound_failed_total counter
+    outbound_failed_total{channel="discord"} 1.0
+    # HELP outbound_sent_total Total outbound messages successfully delivered.
+    # TYPE outbound_sent_total counter
+    outbound_sent_total{channel="telegram"} 184.0
+    # HELP active_sessions Current number of active gateway sessions.
+    # TYPE active_sessions gauge
+    active_sessions 5.0
+    # HELP channel_recoveries Total supervision recoveries per channel.
+    # TYPE channel_recoveries gauge
+    channel_recoveries{channel="telegram"} 2.0
+    ```
+  </Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Scraper
+    participant Gateway as Gateway /metrics
+    participant Auth as _check_auth
+    participant Refresh as _refresh_metric_gauges
+    participant Registry as GatewayMetrics
+
+    Scraper->>Gateway: GET /metrics
+    Gateway->>Auth: token check
+    Auth-->>Gateway: 200 OK
+    Gateway->>Refresh: sample live gauges
+    Refresh->>Registry: set_gauge("active_sessions", ...)
+    Refresh->>Registry: set_gauge("channel_recoveries", ...)
+    Gateway->>Registry: render_prometheus()
+    Registry-->>Gateway: text/plain; version=0.0.4
+    Gateway-->>Scraper: Prometheus exposition
+```
+
+Gauges are sampled on every scrape — not pushed on a timer. The `/metrics` endpoint calls `_refresh_metric_gauges()` before rendering, so `active_sessions` and `channel_recoveries` always reflect the live gateway state.
+
+---
+
+## Configuration Options
+
+### Authentication
+
+The `/metrics` endpoint uses the same `_check_auth` gate as other operational endpoints (e.g. `/info`).
+
+| Method | How |
+|--------|-----|
+| **Cookie session** | Active browser session |
+| **Loopback bypass** | Requests from `127.0.0.1` / `::1` bypass token check |
+| **Bearer token** | `Authorization: Bearer <token>` header |
+| **Query param** | `?token=<token>` (deprecated) |
+
+Returns `401` if token is required but missing; `403` on token mismatch.
+
+<Note>
+If `auth_token` is not set in the gateway config, the endpoint is open to all callers. Set `auth_token` before binding to non-loopback addresses.
+</Note>
+
+### Counters
+
+| Name | Help |
+|------|------|
+| `messages_inbound_total` | Total inbound messages received by the gateway. |
+| `messages_dispatched_total` | Total inbound messages dispatched to an agent run. |
+| `messages_duplicate_total` | Total inbound messages dropped as duplicates. |
+| `outbound_sent_total` | Total outbound messages successfully delivered. |
+| `outbound_failed_total` | Total outbound messages that failed delivery. |
+| `approval_pending_total` | Total approval requests created. |
+| `approval_decided_total` | Total approval requests decided (allowed or denied). |
+| `channel_errors_total` | Total channel errors observed by supervision. |
+| `channel_restarts_total` | Total channel restarts performed by supervision. |
+
+### Gauges
+
+| Name | Help |
+|------|------|
+| `outbox_depth` | Current number of messages pending outbound delivery. |
+| `approval_pending` | Current number of approvals awaiting a decision. |
+| `active_sessions` | Current number of active gateway sessions. |
+| `channel_recoveries` | Total supervision recoveries per channel. |
+
+**Labels:** Counters and gauges accept an arbitrary `labels` dict (string→string). Channel-scoped metrics use `labels={"channel": <name>}`. Labels are rendered as sorted, deterministic `name{a="b",c="d"} value`.
+
+---
+
+## Common Patterns
+
+### Recording a custom counter
+
+```python
+from praisonai.gateway.server import WebSocketGateway
+
+gateway = WebSocketGateway.from_config_file("gateway.yaml")
+
+gateway.record_metric("messages_inbound_total", labels={"channel": "telegram"})
+```
+
+### Fetching a JSON snapshot in tests
+
+```python
+snap = gateway.metrics_snapshot()
+# {"counters": {"messages_inbound_total{channel=\"telegram\"}": 1.0, ...},
+#  "gauges":   {"active_sessions": 5.0, ...}}
+```
+
+### Prometheus scrape config
+
+```yaml
+scrape_configs:
+  - job_name: praisonai-gateway
+    metrics_path: /metrics
+    bearer_token: ${PRAISONAI_GATEWAY_AUTH_TOKEN}
+    static_configs:
+      - targets: ["gateway.internal:8765"]
+```
+
+### Using `GatewayMetrics` directly
+
+```python
+from praisonai.bots import GatewayMetrics
+
+metrics = GatewayMetrics()
+
+metrics.inc("messages_inbound_total", labels={"channel": "telegram"})
+metrics.set_gauge("active_sessions", 5.0)
+
+print(metrics.counter_value("messages_inbound_total", labels={"channel": "telegram"}))
+print(metrics.render_prometheus())
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Set auth_token before binding to non-loopback">
+    Always configure `auth_token` in `gateway.yaml` when your gateway binds to `0.0.0.0` or a public address. Without it, `/metrics` is open to the network.
+  </Accordion>
+
+  <Accordion title="Use a scrape interval of 5s or longer">
+    Gauges are sampled on each scrape. Scraping more frequently than every 5 seconds wastes resources without adding useful resolution — gateway state changes at human timescales.
+  </Accordion>
+
+  <Accordion title="Alert on outbound_failed_total and channel_restarts_total">
+    These two counters surface delivery problems immediately. Configure Prometheus alerting rules on their rates:
+    ```yaml
+    - alert: GatewayOutboundFailures
+      expr: rate(outbound_failed_total[5m]) > 0
+      for: 1m
+    - alert: GatewayChannelRestarts
+      expr: rate(channel_restarts_total[5m]) > 0.1
+      for: 2m
+    ```
+  </Accordion>
+
+  <Accordion title="Don't depend on push frequency for gauges">
+    `active_sessions`, `outbox_depth`, and `approval_pending` are point-in-time samples taken at scrape time — they are not time-averaged. Use them as snapshots, not as rate inputs.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card icon="shield" href="/features/gateway-bind-aware-auth" title="Bind-Aware Auth">
+    The same `_check_auth` / loopback model used by `/metrics` — understand how token auth and loopback bypass work together.
+  </Card>
+  <Card icon="link" href="/features/correlation-ids" title="Correlation IDs">
+    Join ingress, session, and agent-run logs on one stable id per message.
+  </Card>
+  <Card icon="server" href="/features/bot-gateway" title="Gateway Server">
+    Multi-bot WebSocket gateway — the host that exposes `/metrics`.
+  </Card>
+  <Card icon="layout-grid" href="/features/botos" title="BotOS">
+    The full bot operating system layer above the gateway.
+  </Card>
+</CardGroup>
