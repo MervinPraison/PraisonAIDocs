@@ -5,7 +5,7 @@ description: "Store and query embeddings with a pluggable, namespace-aware backe
 icon: "database"
 ---
 
-Store and retrieve text embeddings using a simple, pluggable backend — no external infrastructure needed to get started.
+Store and retrieve text embeddings so your agent can recall relevant content instantly.
 
 ```mermaid
 graph LR
@@ -17,7 +17,7 @@ graph LR
         Sim --> Results[✅ Top K]
     end
 
-    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef output fill:#10B981,stroke:#7C90A0,color:#fff
@@ -32,7 +32,7 @@ graph LR
 
 <Steps>
 <Step title="Agent with Knowledge">
-The simplest way to use a vector store is through an agent's `knowledge` parameter — PraisonAI handles indexing and retrieval automatically.
+Give your agent a knowledge base — it automatically indexes and searches it for every question.
 
 ```python
 from praisonaiagents import Agent
@@ -47,7 +47,26 @@ agent.start("How do I configure authentication?")
 ```
 </Step>
 
-<Step title="Direct API Usage">
+<Step title="Choose a Persistent Backend">
+Switch to a database backend so knowledge survives restarts.
+
+```python
+from praisonaiagents import Agent, KnowledgeConfig
+
+agent = Agent(
+    name="Researcher",
+    instructions="Answer using the indexed documents",
+    knowledge=KnowledgeConfig(
+        sources=["docs/manual.pdf"],
+        vector_store={"provider": "chroma"},
+    )
+)
+
+agent.start("How do I configure authentication?")
+```
+</Step>
+
+<Step title="Direct Registry Usage">
 Access the in-memory store directly to add and query vectors.
 
 ```python
@@ -66,22 +85,34 @@ for r in results:
     print(r.text, r.score)
 ```
 </Step>
-
-<Step title="Register a Custom Store">
-Swap in any vector database by registering a factory function.
-
-```python
-from praisonaiagents.knowledge.vector_store import get_vector_store_registry
-
-def make_my_store(config=None, namespace=None):
-    return MyStore(config=config, namespace=namespace)
-
-get_vector_store_registry().register("my_store", make_my_store)
-
-store = get_vector_store_registry().get("my_store")
-```
-</Step>
 </Steps>
+
+---
+
+## Which Backend Should I Use?
+
+```mermaid
+graph TB
+    Start([🤔 Which backend?]) --> Q1{Data must survive\nrestarts?}
+
+    Q1 -->|No| Memory["✅ memory\n(built-in, zero setup)"]
+    Q1 -->|Yes| Q2{Deployment scale?}
+
+    Q2 -->|Single host| Q3{Already on Postgres?}
+    Q3 -->|Yes| PG["✅ pgvector\n(see Database docs)"]
+    Q3 -->|No| Local["✅ chroma / lancedb\n(file-based, easy setup)"]
+
+    Q2 -->|Cloud / managed| Cloud["✅ pinecone / weaviate\n(serverless, auto-scale)"]
+    Q2 -->|Self-hosted, GPU| GPU["✅ qdrant / milvus\n(high performance)"]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef answer fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1,Q2,Q3 question
+    class Memory,PG,Local,Cloud,GPU answer
+```
 
 ---
 
@@ -98,9 +129,9 @@ sequenceDiagram
 
     User->>Agent: "How do I deploy?"
     Agent->>Embed: Embed question
-    Embed-->>Agent: Vector
+    Embed-->>Agent: Vector [0.1, 0.2, ...]
     Agent->>VS: query(vector, top_k=5)
-    VS-->>Agent: Top matches
+    VS-->>Agent: Top 5 matching records
     Agent-->>User: Answer grounded in matches
 ```
 
@@ -136,6 +167,99 @@ sequenceDiagram
 
 ## Common Patterns
 
+### Plug into an Agent's Knowledge
+
+Wire a registered custom store into an agent via `KnowledgeConfig`.
+
+```python
+from praisonaiagents import Agent, KnowledgeConfig
+from praisonaiagents.knowledge.vector_store import get_vector_store_registry
+
+class MyStore:
+    name = "my_store"
+
+    def __init__(self, config=None, namespace=None):
+        self._data = {}
+
+    def add(self, texts, embeddings, metadatas=None, ids=None, namespace=None):
+        import uuid
+        ids = ids or [str(uuid.uuid4()) for _ in texts]
+        for i, (text, emb) in enumerate(zip(texts, embeddings)):
+            self._data[ids[i]] = {"text": text, "embedding": emb}
+        return ids
+
+    def query(self, embedding, top_k=10, namespace=None, filter=None):
+        from praisonaiagents.knowledge.vector_store import VectorRecord
+        return [VectorRecord(id=k, text=v["text"], embedding=v["embedding"]) for k, v in list(self._data.items())[:top_k]]
+
+    def delete(self, ids=None, namespace=None, filter=None, delete_all=False):
+        return 0
+
+    def count(self, namespace=None):
+        return len(self._data)
+
+    def get(self, ids, namespace=None):
+        from praisonaiagents.knowledge.vector_store import VectorRecord
+        return [VectorRecord(id=k, text=self._data[k]["text"], embedding=self._data[k]["embedding"]) for k in ids if k in self._data]
+
+get_vector_store_registry().register("my_store", MyStore)
+
+agent = Agent(
+    name="Assistant",
+    instructions="Answer questions using the knowledge base",
+    knowledge=KnowledgeConfig(
+        sources=["docs/manual.pdf"],
+        vector_store={"provider": "my_store"},
+    )
+)
+```
+
+### Custom Backend: Minimum Viable Adapter
+
+Any class with these five methods and a `name` attribute works as a drop-in backend.
+
+```python
+from praisonaiagents.knowledge.vector_store import (
+    get_vector_store_registry,
+    VectorRecord,
+    VectorStoreProtocol,
+)
+from typing import Any, Dict, List, Optional
+import uuid
+
+class DictVectorStore:
+    name = "dict_store"
+
+    def __init__(self, config=None, namespace=None):
+        self._records: Dict[str, VectorRecord] = {}
+
+    def add(self, texts, embeddings, metadatas=None, ids=None, namespace=None) -> List[str]:
+        metadatas = metadatas or [{} for _ in texts]
+        ids = ids or [str(uuid.uuid4()) for _ in texts]
+        for text, emb, meta, id_ in zip(texts, embeddings, metadatas, ids):
+            self._records[id_] = VectorRecord(id=id_, text=text, embedding=emb, metadata=meta)
+        return ids
+
+    def query(self, embedding, top_k=10, namespace=None, filter=None) -> List[VectorRecord]:
+        return list(self._records.values())[:top_k]
+
+    def delete(self, ids=None, namespace=None, filter=None, delete_all=False) -> int:
+        if delete_all:
+            n = len(self._records); self._records.clear(); return n
+        removed = [self._records.pop(i) for i in (ids or []) if i in self._records]
+        return len(removed)
+
+    def count(self, namespace=None) -> int:
+        return len(self._records)
+
+    def get(self, ids, namespace=None) -> List[VectorRecord]:
+        return [self._records[i] for i in ids if i in self._records]
+
+assert isinstance(DictVectorStore(), VectorStoreProtocol)
+get_vector_store_registry().register("dict_store", DictVectorStore)
+store = get_vector_store_registry().get("dict_store")
+```
+
 ### Filter by Metadata
 
 Narrow query results to records that match specific metadata fields.
@@ -167,17 +291,8 @@ from praisonaiagents.knowledge.vector_store import get_vector_store_registry
 
 store = get_vector_store_registry().get("memory")
 
-store.add(
-    texts=["Alice's note"],
-    embeddings=[[0.1, 0.2]],
-    namespace="user:alice",
-)
-
-store.add(
-    texts=["Bob's note"],
-    embeddings=[[0.3, 0.4]],
-    namespace="user:bob",
-)
+store.add(texts=["Alice's note"], embeddings=[[0.1, 0.2]], namespace="user:alice")
+store.add(texts=["Bob's note"], embeddings=[[0.3, 0.4]], namespace="user:bob")
 
 alice_results = store.query(embedding=[0.1, 0.2], namespace="user:alice")
 ```
@@ -191,13 +306,8 @@ from praisonaiagents.knowledge.vector_store import get_vector_store_registry
 
 store = get_vector_store_registry().get("memory")
 
-# Delete by ID
 store.delete(ids=["record-123"])
-
-# Delete by metadata filter
 store.delete(filter={"chapter": 1})
-
-# Clear an entire namespace
 store.delete(namespace="user:alice", delete_all=True)
 ```
 
@@ -207,19 +317,23 @@ store.delete(namespace="user:alice", delete_all=True)
 
 <AccordionGroup>
 <Accordion title="When to use the in-memory store">
-`InMemoryVectorStore` (registered as `"memory"`) is ideal for development, testing, and short-lived agents. It requires no external dependencies and resets on process restart. Switch to a persistent backend (Chroma, Pinecone, pgvector) when you need data to survive restarts or to scale beyond a single process.
+`InMemoryVectorStore` (registered as `"memory"`) is ideal for development, testing, and short-lived agents. It requires no external dependencies and resets on process restart. Switch to a persistent backend when you need data to survive restarts or to scale beyond a single process.
+</Accordion>
+
+<Accordion title="When to upgrade from memory to a persistent backend">
+Upgrade when any of these apply: data must survive a process restart, multiple processes need the same store, you have more than ~100k vectors, you need filtered queries at scale, or you are running in a multi-user environment. Chroma and LanceDB are good first steps — they write to disk with no server required.
 </Accordion>
 
 <Accordion title="Namespace strategy">
-Use namespaces to isolate data by user, project, or run — `"user:alice"`, `"project:docs-v2"`, `"run:abc123"`. A well-chosen namespace strategy lets you share a single store instance while keeping data strictly separated, and makes bulk deletion straightforward.
+Use namespaces to isolate data by user, project, or run — `"user:alice"`, `"project:docs-v2"`, `"run:abc123"`. A well-chosen namespace strategy lets you share a single store instance while keeping data strictly separated, and makes bulk deletion straightforward with `delete_all=True`.
 </Accordion>
 
 <Accordion title="Cosine similarity and vector normalisation">
-`InMemoryVectorStore` ranks results by cosine similarity. Cosine similarity measures angle, not magnitude, so two vectors pointing in the same direction score `1.0` regardless of length. If your embedding model already normalises output vectors (most do), results will be reliable. If it does not, normalise manually before calling `add` and `query` to avoid misleading scores.
+`InMemoryVectorStore` ranks results by cosine similarity. Cosine similarity measures angle, not magnitude, so two vectors pointing in the same direction score `1.0` regardless of length. If your embedding model already normalises output vectors (most do), results will be reliable. If not, normalise manually before calling `add` and `query` to avoid misleading scores. Mismatched embedding lengths return score `0.0`.
 </Accordion>
 
 <Accordion title="Registering custom backends">
-Any object that satisfies `VectorStoreProtocol` can be registered. Implement the five methods (`add`, `query`, `delete`, `count`, `get`) and a `name` attribute, then call `registry.register("my_backend", factory)`. The registry caches instances per `name:namespace` key, so the factory is called only once per combination.
+Any object that satisfies `VectorStoreProtocol` can be registered. Implement the five methods (`add`, `query`, `delete`, `count`, `get`) and a `name` attribute, then call `registry.register("my_backend", factory)`. The registry caches instances per `name:namespace` key, so the factory is called only once per combination. Failures during initialization are logged and return `None` rather than raising.
 </Accordion>
 </AccordionGroup>
 

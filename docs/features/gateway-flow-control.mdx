@@ -14,7 +14,7 @@ graph LR
         Inbox -->|No| Queue[✅ Queue Message]
         Inbox -->|Yes| Reject[⚠️ inbox_full error]
         Queue --> Agent[🤖 Agent]
-        Agent --> Buffer{📤 Buffer Full?}
+        Agent --> Buffer{📤 Byte / Frame ceiling exceeded?}
         Buffer -->|No| Send[✅ Send to Client]
         Buffer -->|Yes, droppable| Drop[💧 Drop Event]
         Buffer -->|Yes, critical| Close[🔌 Close 1013]
@@ -36,7 +36,7 @@ graph LR
 <Steps>
 
 <Step title="Defaults work out of the box">
-Flow control is enabled by default — no configuration needed. Every session gets a 256-message inbox and the gateway disconnects clients whose transport buffer exceeds 1 MB.
+Flow control is enabled by default — no configuration needed. Every session gets a 256-message inbox and the gateway disconnects clients whose transport buffer exceeds 1 MB or whose outbound frame queue exceeds 1000 frames.
 
 ```python
 from praisonaiagents import Agent, GatewayConfig
@@ -56,6 +56,7 @@ from praisonaiagents import Agent, GatewayConfig, SessionConfig
 
 config = GatewayConfig(
     max_buffered_bytes=4 * 1024 * 1024,
+    max_queued_frames=2000,            # NEW: frame-count ceiling
     session_config=SessionConfig(
         max_inbox=512,
     )
@@ -86,17 +87,19 @@ sequenceDiagram
     alt Inbox not full
         Gateway->>Agent: Route message
         Agent->>Gateway: Response
-        alt Buffer not full
+        alt Buffer not full (bytes and frames)
             Gateway-->>Client: Deliver response
         else Droppable event (presence/typing/status)
             Gateway->>Gateway: Silently drop
-        else Critical event
-            Gateway-->>Client: Close 1013 "slow consumer"
+        else Critical event — byte or frame ceiling exceeded
+            Gateway-->>Client: Close 1013 "slow_consumer"
         end
     else Inbox full
         Gateway-->>Client: Error — inbox_full
     end
 ```
+
+A frame is rejected when *either* ceiling would be exceeded, or a single frame already exceeds `max_buffered_bytes` on its own.
 
 | Event type | When buffer is full |
 |------------|---------------------|
@@ -112,15 +115,17 @@ sequenceDiagram
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `max_inbox` | `int` | `256` | Maximum queued messages per session. `0` = unlimited. Negative values raise `ValueError`. |
-| `max_buffered_bytes` | `int` | `1048576` | Maximum buffered bytes before a slow consumer is disconnected. `0` = disable slow-consumer checks. Negative values raise `ValueError`. |
+| `max_buffered_bytes` | `int` | `1048576` | Maximum buffered bytes before a slow consumer is disconnected. `0` = disable the byte ceiling. Negative values raise `ValueError`. |
+| `max_queued_frames` | `int` | `1000` | Maximum queued outbound frames per client. `0` = unlimited frame count (byte ceiling still applies). Negative values raise `ValueError`. |
 
-`max_inbox` is set on `SessionConfig`; `max_buffered_bytes` is set on `GatewayConfig`.
+`max_inbox` is set on `SessionConfig`; `max_buffered_bytes` and `max_queued_frames` are set on `GatewayConfig`.
 
 ```python
 from praisonaiagents import GatewayConfig, SessionConfig
 
 config = GatewayConfig(
     max_buffered_bytes=1024 * 1024,
+    max_queued_frames=1000,
     session_config=SessionConfig(
         max_inbox=256,
     )
@@ -132,6 +137,7 @@ These options are also available in `gateway.yaml`:
 ```yaml
 gateway:
   max_buffered_bytes: 1048576
+  max_queued_frames: 1000      # frame-count ceiling
   session_config:
     max_inbox: 256
 ```
@@ -150,12 +156,22 @@ When the inbox is full, the gateway sends this JSON frame before rejecting the m
 }
 ```
 
-When the transport buffer exceeds `max_buffered_bytes` for a critical event, the gateway closes the WebSocket with:
+When either transport ceiling is exceeded for a critical event, the gateway closes the WebSocket with:
 
 - **Code:** `1013` (Try Again Later)
-- **Reason:** `slow consumer`
+- **Reason:** `"slow_consumer"` (the value of `GatewayCloseCode.SLOW_CONSUMER`)
 
-Clients should reconnect and resume from the last known message.
+Use the typed enum from Python clients:
+
+```python
+from praisonaiagents.gateway import GatewayCloseCode
+
+if close.reason == GatewayCloseCode.SLOW_CONSUMER.value:
+    # reconnect and resume from the last known message
+    ...
+```
+
+Clients should reconnect and resume from the last known message. The gateway preserves session state during the `resume_window` (default 24 h), so conversation context is not lost.
 
 ---
 
@@ -180,6 +196,17 @@ from praisonaiagents import GatewayConfig, SessionConfig
 config = GatewayConfig(
     max_buffered_bytes=8 * 1024 * 1024,
     session_config=SessionConfig(max_inbox=1024)
+)
+```
+
+**Stream-heavy workloads** — Lower `max_queued_frames` to shed load on backpressure earlier:
+
+```python
+from praisonaiagents import GatewayConfig
+
+config = GatewayConfig(
+    max_buffered_bytes=4 * 1024 * 1024,
+    max_queued_frames=200,           # eager eviction for chatty streams
 )
 ```
 
@@ -212,7 +239,11 @@ config = GatewayConfig(
   </Accordion>
 
   <Accordion title="React to a 1013 slow-consumer close">
-    On receiving WebSocket close code `1013`, reconnect after a short delay and replay any messages that were in-flight. The gateway preserves session state during the `resume_window` (default 24 h), so conversation context is not lost.
+    On receiving WebSocket close code `1013` with reason `"slow_consumer"`, reconnect after a short delay and replay any messages that were in-flight. The gateway preserves session state during the `resume_window` (default 24 h), so conversation context is not lost.
+  </Accordion>
+
+  <Accordion title="Disable one ceiling without the other">
+    Set `max_queued_frames=0` to bound only by bytes (good for large but infrequent payloads); set `max_buffered_bytes=0` to bound only by frame count.
   </Accordion>
 </AccordionGroup>
 
