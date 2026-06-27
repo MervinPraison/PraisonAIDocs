@@ -7,6 +7,10 @@ icon: "shield-check"
 
 Durable Delivery persists every outbound bot message to a SQLite outbox so retries, restarts, and platform outages never drop a reply.
 
+<Note>
+This page covers **outbound** durability (`DurableDelivery` / `OutboundQueue`). For **inbound** durability — which is now on by default for all gateway/bot runs — see [Inbound Journal](/docs/features/inbound-journal) and [Inbound DLQ](/docs/features/inbound-dlq).
+</Note>
+
 ```mermaid
 graph LR
     subgraph "Durable Outbound Delivery"
@@ -115,7 +119,105 @@ sequenceDiagram
     end
 ```
 
-Each message moves through statuses: `pending` → `sending` → `sent` (or `failed` / `permanent_failure`). On startup, stale `sending` entries are reset to `pending` automatically so crashes never leave orphaned rows.
+Each message moves through statuses: `pending` → `sending` → `sent` (or `failed` / `permanent_failure`).
+
+### State Machine
+
+The outbox tracks six statuses: `pending`, `sending`, `recovered`, `sent`, `failed`, and `permanent_failure`.
+
+On restart, stale `sending` entries transition to **`recovered`** instead of `pending`. This preserves the information that the send was in-flight when the crash occurred.
+
+```
+status = 'sending'  (crash)  ──►  status = 'recovered'  (on restart)
+```
+
+`recovered` entries are retryable like `pending`, but when a reconciler is supplied to `drain()`, they are offered to it first — allowing adapters that can check the platform to confirm delivery and avoid re-sending an already-delivered message (**effectively-once**). Without a reconciler, `recovered` entries are re-sent as normal (at-least-once, unchanged behaviour).
+
+<Note>
+Status-update writes (`mark_sent`, `mark_failed`, `_claim_entry`) now call `conn.commit()`. Without this, a terminal status could be lost on a crash, causing an already-delivered message to be redelivered. This is a reliability fix — no API change is required.
+</Note>
+
+---
+
+## Effectively-Once Delivery
+
+Adapters that can confirm whether a prior send actually landed can upgrade durable delivery from at-least-once to effectively-once.
+
+```mermaid
+sequenceDiagram
+    participant Adapter as 🤖 Adapter
+    participant Queue as 💾 OutboundQueue
+    participant Provider as 📱 Platform
+
+    Note over Queue: status = 'sending'
+    Adapter--xProvider: 💥 crash mid-send
+    Note over Queue: on restart → 'recovered'
+    Adapter->>Queue: drain_pending() (with reconciler)
+    Queue->>Adapter: reconciler(entry)
+    Adapter->>Provider: was_delivered(idempotency_key)
+    alt Provider says delivered
+        Provider-->>Adapter: True
+        Adapter-->>Queue: True → mark_sent (NO resend)
+    else Provider says not delivered
+        Provider-->>Adapter: False
+        Queue->>Provider: resend
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef queue fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef platform fill:#189AB4,stroke:#7C90A0,color:#fff
+```
+
+<Steps>
+<Step title="Declare the capability">
+Set `reconciles_unknown_send=True` on `PlatformCapabilities`:
+
+```python
+from praisonaiagents.bots import PlatformCapabilities
+
+class MyAdapter(DurableAdapterMixin):
+    platform_capabilities = PlatformCapabilities(
+        reconciles_unknown_send=True,
+    )
+```
+</Step>
+
+<Step title="Implement was_delivered">
+Add an async method that checks the platform for a prior send:
+
+```python
+async def was_delivered(self, idempotency_key: str) -> bool:
+    status = await my_provider.get_message_status(idempotency_key)
+    return status == "sent"
+```
+</Step>
+
+<Step title="Call drain_pending() at startup">
+`DurableDelivery` auto-wires the reconciler from the adapter's capability — no extra configuration required:
+
+```python
+from praisonaiagents.bots import PlatformCapabilities
+from praisonai.bots._adapter_base import DurableAdapterMixin
+
+
+class AcmeAdapter(DurableAdapterMixin):
+    platform_capabilities = PlatformCapabilities(
+        reconciles_unknown_send=True,
+    )
+
+    async def was_delivered(self, idempotency_key: str) -> bool:
+        status = await acme_client.messages.lookup(idempotency_key)
+        return status.delivered
+
+    async def send_message(self, channel_id: str, content: str) -> None:
+        await acme_client.messages.send(channel_id, content)
+
+
+# DurableDelivery picks up the reconciler automatically.
+succeeded, failed = await adapter.drain_outbox()
+```
+</Step>
+</Steps>
 
 ---
 
@@ -159,6 +261,24 @@ SQLite-backed outbox. All parameters after `path` are keyword-only.
 | `ttl_seconds` | `int` | `604800` (7 days) | Sent entries older than this are evicted. |
 | `max_attempts` | `int` | `5` | Max delivery attempts before marking permanent failure. |
 | `backoff` | `BackoffPolicy` | `BackoffPolicy()` | Retry backoff configuration. |
+
+#### `OutboundQueue.drain()` signature
+
+```python
+async def drain(
+    self,
+    sender: Callable[[str, Dict[str, Any]], Awaitable[bool]],
+    limit: Optional[int] = None,
+    *,
+    reconciler: Optional[Callable[[OutboundEntry], Awaitable[bool]]] = None,
+) -> Tuple[int, int]:
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `sender` | `async callable` | _(required)_ | Async callable that sends the message. |
+| `limit` | `int \| None` | `None` | Max entries to drain in this call. |
+| `reconciler` | `async callable \| None` | `None` | Called only for `recovered` entries. Returns `True` → mark sent without re-dispatch (effectively-once). Returns `False` → re-send as normal. Raises → falls back to re-send (logged at WARNING). |
 
 ```python
 from praisonai.bots import OutboundQueue
@@ -291,6 +411,14 @@ The drain replays oldest messages first, respects backoff delays between attempt
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Set reconciles_unknown_send=True only if you can answer the question reliably">
+  A flaky `was_delivered` that returns `False` for an already-delivered message will cause a duplicate send. A reconciler that raises falls back to at-least-once re-send (safe, but logged at WARNING). Only opt in when your platform provides a reliable message-status API.
+</Accordion>
+
+<Accordion title="Don't rely on supports_idempotency_token alone for dedupe">
+  `supports_idempotency_token=True` is informational only — the outbox does not currently forward the token on resend. Adapters relying on provider-side deduplication should also set `reconciles_unknown_send=True` to get effectively-once delivery.
+</Accordion>
+
 <Accordion title="Always set platform= for accurate error classification">
 The `is_recoverable_error()` function checks platform-specific patterns (e.g., Telegram's HTTP 409 conflict, rate-limit "retry after" responses) when a platform name is provided. Without it, only generic patterns are checked and some transient errors may be misclassified as permanent.
 

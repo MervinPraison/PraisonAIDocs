@@ -85,6 +85,47 @@ sequenceDiagram
 
 ## Environment Variables
 
+### PRAISONAI_TOOL_SAFETY
+
+Controls whether dangerous built-in tools (shell exec, file delete/move/copy, code execution) are gated by the approval system.
+
+**Default**: unset → `default` preset active (blocks destructive ops in CI, asks on TTY)
+
+```bash
+# Disable all tool gating (restore pre-4.6.27 behaviour)
+export PRAISONAI_TOOL_SAFETY=off
+
+# Equivalent accepted values: off, full, none, 0, false
+PRAISONAI_TOOL_SAFETY=off praisonai code "Clean up logs"
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| unset | `default` preset — denies destructive ops in CI, asks on TTY |
+| `off` / `full` / `none` / `0` / `false` | Bypass all gating (trust the LLM) |
+| `safe` / `read_only` | Block all tools in `DEFAULT_DANGEROUS_TOOLS` |
+| `default` | Explicit default (same as unset) |
+
+<Note>
+`--dangerously-skip-approval` on `praisonai code` automatically exports `PRAISONAI_TOOL_SAFETY=off` so that child processes inherit the bypass.
+</Note>
+
+**Usage Example**:
+```python
+from praisonaiagents import Agent
+
+# Equivalent to PRAISONAI_TOOL_SAFETY=off — tool gating disabled
+agent = Agent(
+    name="Trusted Coder",
+    instructions="Run any tool needed",
+    tools=["shell", "write_file", "delete_file"],
+    approval="bypass",
+)
+agent.start("Clean up temp files")
+```
+
+---
+
 ### PRAISONAI_ALLOW_LOCAL_TOOLS
 
 Controls automatic loading of `tools.py` files from the current working directory.
@@ -108,12 +149,17 @@ unset PRAISONAI_ALLOW_LOCAL_TOOLS
 - Generic CLI `_load_tools(tools_path)`
 - HTTP API: `praisonai.api.call.import_tools_from_file` (raises `ValueError` if disabled)
 - Path-traversal guard: files outside the current working directory are refused even when `PRAISONAI_ALLOW_LOCAL_TOOLS=true`
+- `praisonaiagents.workflows.workflows.AgentFlow` (SDK-level: skips `tools.py` next to the workflow class when unset)
 
 <Note>
 Even when `PRAISONAI_ALLOW_LOCAL_TOOLS=true`, the loader refuses any path outside the current working directory. This is a deliberate defence-in-depth layer for HTTP-API callers (`praisonai.api.call.import_tools_from_file`) where the path can come from network input. Move the `tools.py` you want to load into your CWD if you hit `Refusing to exec ... outside working directory.` in the logs.
 </Note>
 
-`PRAISONAI_ALLOW_LOCAL_TOOLS` accepts only `true` (case-insensitive). Values like `1`, `yes`, or `on` are **not** truthy for this variable (unlike `PRAISONAI_ALLOW_TEMPLATE_TOOLS`).
+`PRAISONAI_ALLOW_LOCAL_TOOLS` accepts only `true` (case-insensitive) in the **wrapper** (`praisonai`). Values like `1`, `yes`, or `on` are **not** truthy for the wrapper (unlike `PRAISONAI_ALLOW_TEMPLATE_TOOLS`).
+
+<Note>
+**Truthy-value inconsistency across surfaces:** The wrapper (`praisonai`) accepts only `true`; the SDK's `AgentFlow` (`praisonaiagents.workflows.workflows`) accepts `true`, `1`, or `yes`; the SDK's recipe path in `workflows.py` accepts `true`, `1`, `yes`, or `on`. If you rely on `PRAISONAI_ALLOW_LOCAL_TOOLS=1`, the wrapper will reject it even though the SDK's AgentFlow will accept it. This is the SDK's actual behavior — set `true` to be safe across all surfaces.
+</Note>
 
 **Usage Example**:
 ```python
@@ -137,6 +183,7 @@ agent.start("Calculate using local tools")
 | Env var unset, HTTP API (`api/call.py`) | raised exception | `ValueError("Local tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.")` |
 | Path outside CWD, env var **set** | logger.warning | `Refusing to exec <path>: outside working directory.` |
 | Path outside CWD via HTTP API, env var **set** | raised exception | `LocalToolsDisabled("Refusing to exec <path>: outside working directory.")` |
+| Env var unset, SDK `AgentFlow` with `tools.py` present | logger.debug | `Skipping tools.py load for <class>: set PRAISONAI_ALLOW_LOCAL_TOOLS=true` |
 
 ### PRAISONAI_ALLOW_TEMPLATE_TOOLS
 
@@ -174,6 +221,143 @@ registry = create_tool_registry_with_overrides(
     include_defaults=True
 )
 ```
+
+### PRAISONAI_ALLOW_PLUGIN_DISCOVERY
+
+Controls automatic discovery and loading of plugins from `.praisonai/plugins/` (project-level) and `~/.praisonai/plugins/` (user-level) directories.
+
+**Security Risk**: Remote Code Execution (RCE) via malicious third-party plugins discovered on `sys.path`.
+
+```bash
+# Enable plugin auto-discovery
+export PRAISONAI_ALLOW_PLUGIN_DISCOVERY=true
+
+# Disable (default - secure)
+unset PRAISONAI_ALLOW_PLUGIN_DISCOVERY
+```
+
+**Default**: unset → discovery skipped silently (debug log only)  
+**Accepted truthy values**: `true`, `1`, `yes` (case-insensitive, whitespace-stripped). `on` is **not** accepted.
+
+**Affected Component**: `praisonaiagents.plugins.manager.PluginManager.discover_and_load_plugins`
+
+**Default behavior when unset**: `discover_and_load_plugins()` is a no-op and returns `0`. A `logger.debug` message fires: `Plugin auto-discovery disabled; set PRAISONAI_ALLOW_PLUGIN_DISCOVERY=true`.
+
+**Usage Example**:
+```python
+import os
+os.environ["PRAISONAI_ALLOW_PLUGIN_DISCOVERY"] = "true"
+
+from praisonaiagents import Agent
+from praisonaiagents.plugins.manager import PluginManager
+
+manager = PluginManager()
+loaded = manager.discover_and_load_plugins()
+print(f"Loaded {loaded} plugins")
+
+agent = Agent(
+    name="Plugin User",
+    instructions="Use discovered plugins to help"
+)
+agent.start("Run task with plugins")
+```
+
+**Workaround when off**: Register plugins explicitly without enabling discovery:
+```python
+from praisonaiagents.plugins.manager import PluginManager
+
+manager = PluginManager()
+manager.register_plugin("my_plugin", my_plugin_module)
+```
+
+### PRAISONAI_PROJECT_ROOT
+
+Sets the allowed root directory for agent output file writes. Writes outside this root are silently blocked.
+
+**Security Risk**: Path-traversal write outside the project tree (e.g. `output_file="../../etc/passwd"`).
+
+```bash
+# Set a specific project root
+export PRAISONAI_PROJECT_ROOT=/home/user/myproject
+
+# Default: current working directory at save time
+unset PRAISONAI_PROJECT_ROOT
+```
+
+**Default**: unset → `os.getcwd()` at save time  
+**Affected Component**: `praisonaiagents.agent.memory_mixin.MemoryMixin._save_output_to_file`
+
+**Silent-failure semantics**: When the output path resolves outside the project root, the save returns `False`, logs `Output file %r is outside project root %r; skipping save` at `logging.warning`, and prints `⚠️ Output path outside project root: <path>` to stdout. No exception is raised.
+
+**Usage Example**:
+```python
+import os
+os.environ["PRAISONAI_PROJECT_ROOT"] = "/home/user/myproject"
+
+from praisonaiagents import Agent
+
+# This saves successfully — path is within project root
+agent = Agent(
+    name="Writer",
+    instructions="Write a report",
+    output_file="report.md"
+)
+agent.start("Summarise the project")
+
+# This is blocked — path escapes the project root
+agent2 = Agent(
+    name="Writer",
+    instructions="Write a report",
+    output_file="../report.md"
+)
+agent2.start("Summarise the project")
+# Prints: ⚠️ Output path outside project root: ../report.md
+```
+
+### ALLOW_LOCAL_CRAWL
+
+Bypasses SSRF protection for loopback, private, link-local, multicast, and unspecified IP addresses in web crawl tools.
+
+**Security Risk**: Server-Side Request Forgery (SSRF) — agents fetching `http://169.254.169.254/...` (cloud metadata), `http://localhost:6379` (Redis), etc.
+
+```bash
+# Allow crawling local/private addresses
+export ALLOW_LOCAL_CRAWL=true
+
+# Disable (default - secure)
+unset ALLOW_LOCAL_CRAWL
+```
+
+**Default**: unset → loopback/private/link-local/multicast/unspecified IPs blocked; returns `{"error": "URL blocked by SSRF policy"}` per blocked URL  
+**Accepted truthy values**: `true` only — **exact, case-sensitive match**. This is stricter than other env vars on this page.
+
+**Affected Components**:
+- `praisonaiagents.tools.web_crawl_tools` (both `_crawl_with_crawl4ai` and `_crawl_with_httpx` via `_is_safe_crawl_url`)
+- `praisonaiagents.tools.url_safety.is_safe_http_url`
+
+**Usage Example**:
+```python
+import os
+
+# Without ALLOW_LOCAL_CRAWL — blocked
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Crawler",
+    instructions="Fetch the given URL"
+)
+result = agent.start("Crawl http://192.168.1.1/api/status")
+# Returns: {"error": "URL blocked by SSRF policy"}
+
+# With ALLOW_LOCAL_CRAWL=true — allowed
+os.environ["ALLOW_LOCAL_CRAWL"] = "true"
+result = agent.start("Crawl http://192.168.1.1/api/status")
+# Fetches and returns content
+```
+
+<Warning>
+`ALLOW_LOCAL_CRAWL` uses **exact** `"true"` matching (case-sensitive). `"True"`, `"TRUE"`, `"1"`, and `"yes"` are all rejected. This differs from the `PRAISONAI_*` variables on this page.
+</Warning>
 
 ### PRAISONAI_ALLOW_JOB_WORKFLOWS
 
@@ -272,6 +456,7 @@ export PRAISONAI_ALLOW_TEMPLATE_TOOLS=true
 export PRAISONAI_ALLOW_JOB_WORKFLOWS=true  
 export PRAISONAI_BROWSER_ALLOW_REMOTE=true
 export PRAISONAI_RUN_SYNC_TIMEOUT=30
+export PRAISONAI_TOOL_SAFETY=off   # disable tool gating in dev
 
 # Add to ~/.bashrc or ~/.zshrc for persistence
 echo 'export PRAISONAI_ALLOW_LOCAL_TOOLS=true' >> ~/.bashrc
@@ -440,6 +625,7 @@ These environment variables address the following security vulnerabilities:
 | **GHSA-xcmw-grxf-wjhj** | High | Implicit RCE via template/CWD tools.py autoload | `PRAISONAI_ALLOW_TEMPLATE_TOOLS` |
 | **GHSA-vc46-vw85-3wvm** | Critical | RCE via job workflow YAML | `PRAISONAI_ALLOW_JOB_WORKFLOWS` |  
 | **GHSA-8x8f-54wf-vv92** | Critical | WebSocket session hijacking | `PRAISONAI_BROWSER_ALLOW_REMOTE` |
+| pending | High | SSRF via web crawl to loopback/private addresses | `ALLOW_LOCAL_CRAWL` |
 
 **CVE IDs**: Pending assignment by GitHub Security Advisory system
 

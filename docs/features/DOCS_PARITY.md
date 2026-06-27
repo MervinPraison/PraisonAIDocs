@@ -1,6 +1,6 @@
 # Documentation Parity Tracker (Python)
 
-> **Categories:** 66 | **Documented:** 65 | **Parity:** 98.5%
+> **Categories:** 66 | **Documented:** 66 | **Parity:** 100%
 
 This report compares **Python SDK feature categories** against **Python documentation** (docs/concepts, docs/features, etc.).
 
@@ -9,16 +9,16 @@ This report compares **Python SDK feature categories** against **Python document
 | Metric | Count |
 |--------|-------|
 | Feature Categories | 66 |
-| **Documented Categories** | **65** |
-| **Undocumented Categories** | **1** |
-| **Parity** | **98.5%** |
+| **Documented Categories** | **66** |
+| **Undocumented Categories** | **0** |
+| **Parity** | **100%** |
 
 ## Documented Categories
 
 | Category | Features | Docs | Lines |
 |----------|----------|------|-------|
 | ✅ AGUI | 1 | 2 | 420 |
-| ✅ Agent | 20 | 42 | 11340 |
+| ✅ Agent | 21 | 42 | 11340 |
 | ✅ Agent-to-Agent (A2A) | 1 | 7 | 2880 |
 | ✅ Agent-to-User (A2U) | 1 | 3 | 575 |
 | ✅ Approval | 1 | 3 | 1344 |
@@ -78,16 +78,11 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Templates | 1 | 7 | 1411 |
 | ✅ Tools | 12 | 118 | 25895 |
 | ✅ Tracing | 3 | 2 | 139 |
+| ✅ Vector Store | 1 | 1 | 237 |
 | ✅ Video | 2 | 6 | 510 |
 | ✅ Vision | 2 | 1 | 283 |
 | ✅ Web | 3 | 7 | 1537 |
 | ✅ Workflows | 4 | 14 | 5893 |
-
-## Undocumented Categories (Need Documentation)
-
-| Category | Features |
-|----------|----------|
-| ❌ Vector Store | 1 |
 
 ---
 

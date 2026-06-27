@@ -112,6 +112,58 @@ def _get_agents_generator():
     from praisonai.agents_generator import AgentsGenerator
     return AgentsGenerator
 
+
+def _provider_preflight_message():
+    """Return a guidance message if no LLM provider credential is configured.
+
+    PraisonAI is provider-agnostic (OpenAI, Anthropic, Google/Gemini, Groq,
+    Cohere, Ollama, OpenRouter, plus 100+ via LiteLLM). Flows that call an LLM
+    immediately — such as ``praisonai --init`` — should fail with clear,
+    actionable guidance (pointing at ``praisonai setup``) instead of a raw stack
+    trace when the user has not configured any provider yet.
+
+    Returns:
+        A user-facing message string when no provider is configured, or ``None``
+        when a provider credential is available (so the caller proceeds). The
+        check itself never raises; on any unexpected error it returns ``None``
+        so it can never block a properly configured user.
+    """
+    try:
+        from praisonai.llm.credentials import (
+            inject_credentials_into_env,
+            is_configured,
+        )
+
+        # Mirror the runtime credential resolution so the gate cannot disagree
+        # with what generation actually does:
+        #   1. AutoGenerator resolves via env-only resolve_llm_endpoint(), so a
+        #      key stored via `praisonai setup` must be exported into the env
+        #      first or it never reaches the LLM call.
+        #   2. The runtime model honours MODEL_NAME / OPENAI_MODEL_NAME, so gate
+        #      on that exact model (not the inferred provider default) — a stale
+        #      OpenAI model override with only a non-OpenAI key must still be
+        #      caught here instead of failing later with a raw auth error.
+        inject_credentials_into_env()
+        import os as _os
+        runtime_model = _os.environ.get("MODEL_NAME") or _os.environ.get(
+            "OPENAI_MODEL_NAME"
+        )
+        if is_configured(model=runtime_model):
+            return None
+    except Exception:
+        return None  # never block on the check itself
+    return (
+        "No LLM provider is configured.\n\n"
+        "PraisonAI supports OpenAI, Anthropic, Google/Gemini, Groq, "
+        "Cohere, Ollama, OpenRouter and 100+ models via LiteLLM.\n\n"
+        "Easiest setup (interactive, no shell 'export' needed):\n"
+        "    praisonai setup\n\n"
+        "Or set a provider API key, for example:\n"
+        "    export OPENAI_API_KEY=...        # OpenAI\n"
+        "    export ANTHROPIC_API_KEY=...     # Anthropic Claude\n"
+        "    export GEMINI_API_KEY=...        # Google Gemini\n"
+    )
+
 # Use centralized availability detection
 from .._framework_availability import is_available
 
@@ -252,17 +304,8 @@ class PraisonAI:
         self._interactive_mode = False  # Flag for interactive TUI mode
         # Create config_list with AutoGen compatibility
         # Resolve LLM endpoint configuration from environment variables
-        from praisonai.llm.env import resolve_llm_endpoint
-        ep = resolve_llm_endpoint()
-        
-        self.config_list = [
-            {
-                'model': ep.model,
-                'base_url': ep.base_url,
-                'api_key': ep.api_key,
-                'api_type': 'openai'        # AutoGen expects this field
-            }
-        ]
+        from praisonai.llm.config import build_config_list
+        self.config_list = build_config_list()
         self.agent_file = agent_file
         self.framework = framework
         
@@ -742,6 +785,16 @@ class PraisonAI:
             self.topic = temp_topic
 
             self.agent_file = "agents.yaml"
+
+            # Pre-flight: ensure an LLM provider credential is configured before
+            # calling the LLM. Without this, a user with no API key (or a
+            # non-OpenAI key for an OpenAI-default model) gets a raw stack trace
+            # instead of clear, actionable guidance.
+            preflight = _provider_preflight_message()
+            if preflight:
+                print(preflight)
+                return preflight
+
             AutoGenerator = _get_auto_generator()
             generator = AutoGenerator(topic=self.topic, framework=self.framework, agent_file=self.agent_file)
             self.agent_file = generator.generate(merge=getattr(args, 'merge', False))
@@ -4641,20 +4694,29 @@ Do NOT add any explanations or formatting."""
                 if getattr(self.args, 'auto_memory', False):
                     print("[bold cyan]Auto Memory enabled - will extract and store memories[/bold cyan]")
                 
-                # MCP - Model Context Protocol tools
-                if getattr(self.args, 'mcp', None):
-                    from .features.mcp import MCPHandler
-                    mcp_handler = MCPHandler(verbose=getattr(self.args, 'verbose', False))
-                    mcp_tools = mcp_handler.create_mcp_tools(
-                        self.args.mcp,
-                        getattr(self.args, 'mcp_env', None)
+                # MCP - Model Context Protocol tools.
+                # Wire BOTH the ad-hoc single --mcp command string AND every
+                # enabled server from project config (local stdio *and*
+                # remote/URL), so multi-server and remote MCP setups are all
+                # available — not just the first stdio server.
+                mcp_command = getattr(self.args, 'mcp', None)
+                mcp_servers = getattr(self.args, 'mcp_servers', None) or []
+                if mcp_command or mcp_servers:
+                    # Single source of truth for MCP tool aggregation, shared
+                    # with the actions-mode run path (commands/run.py).
+                    from .commands.run import _build_mcp_tools
+                    aggregated_mcp_tools = _build_mcp_tools(
+                        mcp_command,
+                        getattr(self.args, 'mcp_env', None),
+                        mcp_servers,
+                        verbose=getattr(self.args, 'verbose', False),
                     )
-                    if mcp_tools:
+                    if aggregated_mcp_tools:
                         existing_tools = agent_config.get('tools', [])
                         if isinstance(existing_tools, list):
-                            existing_tools.extend(list(mcp_tools))
+                            existing_tools.extend(aggregated_mcp_tools)
                         else:
-                            existing_tools = list(mcp_tools)
+                            existing_tools = aggregated_mcp_tools
                         agent_config['tools'] = existing_tools
                 
                 # External Agent - Use external AI CLI tools with manager delegation
@@ -6892,14 +6954,6 @@ Provide a concise summary (max 200 words):"""
         """
         execution_queue = session_state['execution_queue']
         execution_queue.put({'prompt': prompt})
-    
-    def _process_interactive_prompt_async(self, prompt, tools_list, console, session_state=None):
-        """
-        DEPRECATED: This method is kept for backward compatibility.
-        Use _submit_prompt_to_worker instead for true non-blocking behavior.
-        """
-        # Just submit to worker queue - non-blocking
-        self._submit_prompt_to_worker(prompt, session_state)
     
     def _process_interactive_prompt(self, prompt, tools_list, console, show_profiling=False, session_state=None):
         """Process a prompt in interactive mode with streaming."""

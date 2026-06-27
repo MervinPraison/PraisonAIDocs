@@ -45,12 +45,19 @@ from .interactive import (
     InteractiveContext,
     InteractiveRegistry,
     InteractiveHandler,
+    InteractiveAuthorizer,
     encode_action,
     decode_callback,
     create_registry,
     get_registry,
     register_handler,
     unregister_handler,
+    make_reply_handler,
+    REPLY_NAMESPACE,
+)
+from .agent_reply import (
+    AgentReply,
+    extract_presentation,
 )
 from .config import BotConfig, BotOSConfig
 
@@ -88,10 +95,15 @@ __all__ = [
     "InteractiveContext",
     "InteractiveRegistry",
     "InteractiveHandler",
+    "InteractiveAuthorizer",
     "encode_action",
     "decode_callback",
     "create_registry",
     "get_registry",
     "register_handler",
     "unregister_handler",
+    "make_reply_handler",
+    "REPLY_NAMESPACE",
+    "AgentReply",
+    "extract_presentation",
 ]
