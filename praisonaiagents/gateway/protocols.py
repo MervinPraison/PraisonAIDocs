@@ -24,6 +24,7 @@ from typing import (
     Literal,
     Optional,
     Protocol,
+    Set,
     TypedDict,
     Union,
     runtime_checkable,
@@ -50,6 +51,23 @@ class ConnectErrorCode(str, Enum):
     RATE_LIMITED = "rate_limited"
     ORIGIN_NOT_ALLOWED = "origin_not_allowed"
     CONFIGURATION_ERROR = "configuration_error"
+
+
+class GatewayCloseCode(str, Enum):
+    """Structured, machine-readable reasons for a server-initiated close.
+
+    Distinct from :class:`ConnectErrorCode` (which describes why a *connection*
+    was rejected at/handshake time), these describe why an already-established
+    connection is being torn down by the server mid-session.
+
+    Codes:
+        SLOW_CONSUMER: The client's outbound buffer exceeded the gateway's
+            advertised ``max_buffered_bytes`` policy (a genuinely slow/stalled
+            consumer). The server evicts it so its backlog cannot grow without
+            bound or stall delivery to healthy clients.
+    """
+
+    SLOW_CONSUMER = "slow_consumer"
 
 
 class ConnectRecoveryStep(str, Enum):
@@ -1011,6 +1029,105 @@ class OutboundDeliveryProtocol(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Per-route, trust-tiered toolset scoping (Issue #2298)
+# ---------------------------------------------------------------------------
+
+# Conservative deny-list applied to ``trust: "untrusted"`` routes.  Inbound
+# content from strangers / generic webhooks is the framework's largest
+# prompt-injection surface, so dangerous tool *families* are never advertised
+# to the model on these routes (shell, file mutation, delegation,
+# self-scheduling).  Names are matched case-insensitively against substrings of
+# the tool name so deployments do not have to enumerate every concrete tool.
+UNTRUSTED_DENY_SUBSTRINGS: List[str] = [
+    "shell",
+    "exec",
+    "command",
+    "subprocess",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "rm_file",
+    "delegate",
+    "handoff",
+    "cronjob",
+    "schedule",
+]
+
+# Trust tiers, ordered from least to most privileged.
+TRUST_TIERS: List[str] = ["untrusted", "standard", "trusted"]
+
+
+@dataclass
+class ToolPolicy:
+    """Declarative, per-route scope applied to an agent's tool surface.
+
+    Mirrors the scheduler's ``RunPolicy.filter_tools`` contract (wrapper layer)
+    but lives in core so :class:`RouteBinding` can *declare* the scope without
+    importing any heavy wrapper code.  The wrapper inbound path applies it via a
+    small apply/restore helper, exactly as the scheduler already does for
+    unattended runs.
+
+    Attributes:
+        allow_tools: If set, only tools whose name is in this set are kept;
+            everything else is removed.  ``None`` means "allow all except
+            ``deny_tools`` / the trust deny-list".
+        deny_tools: Exact tool names removed before the run.
+        deny_substrings: Case-insensitive substrings; a tool whose name
+            contains any of them is removed (used by the ``untrusted`` tier).
+    """
+
+    allow_tools: Optional[Set[str]] = None
+    deny_tools: Set[str] = field(default_factory=set)
+    deny_substrings: List[str] = field(default_factory=list)
+
+    @property
+    def is_noop(self) -> bool:
+        """``True`` when the policy would never remove any tool."""
+        return (
+            self.allow_tools is None
+            and not self.deny_tools
+            and not self.deny_substrings
+        )
+
+    @staticmethod
+    def _tool_name(tool: Any) -> str:
+        """Best-effort name for a tool (matches Agent's own resolution)."""
+        name = getattr(tool, "name", None)
+        if isinstance(name, str) and name:
+            return name
+        dunder = getattr(tool, "__name__", None)
+        if isinstance(dunder, str) and dunder:
+            return dunder
+        if isinstance(tool, dict):
+            fn = tool.get("function")
+            if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+                return fn["name"]
+            top = tool.get("name")
+            if isinstance(top, str) and top:
+                return top
+        return str(tool)
+
+    def is_tool_allowed(self, tool: Any) -> bool:
+        """Return ``True`` if ``tool`` may be exposed on this route."""
+        name = self._tool_name(tool)
+        if name in self.deny_tools:
+            return False
+        lowered = name.lower()
+        for needle in self.deny_substrings:
+            if needle and needle.lower() in lowered:
+                return False
+        if self.allow_tools is not None and name not in self.allow_tools:
+            return False
+        return True
+
+    def filter_tools(self, tools: Optional[List[Any]]) -> List[Any]:
+        """Return a copy of ``tools`` with denied/disallowed tools removed."""
+        if not tools:
+            return []
+        return [tool for tool in tools if self.is_tool_allowed(tool)]
+
+
+# ---------------------------------------------------------------------------
 # Inbound route binding (Issue #2225)
 # ---------------------------------------------------------------------------
 
@@ -1034,6 +1151,13 @@ class RouteBinding:
         channel_id: Specific chat/channel id.
         account: Receiving bot account (for multi-account channels).
         priority: Higher wins; ties are broken by specificity then order.
+        trust: Optional trust tier ("untrusted" | "standard" | "trusted").
+            ``untrusted`` advertises a conservative, read-only-leaning toolset
+            to the model so dangerous tools are never offered on third-party /
+            stranger / generic-webhook routes (Issue #2298). ``None`` /
+            ``standard`` / ``trusted`` apply no tier deny-list.
+        allow_tools: If set, only these tool names are exposed on this route.
+        deny_tools: Tool names removed before the run on this route.
     """
 
     agent: str
@@ -1043,6 +1167,9 @@ class RouteBinding:
     channel_id: Optional[str] = None
     account: Optional[str] = None
     priority: int = 0
+    trust: Optional[str] = None
+    allow_tools: Optional[List[str]] = None
+    deny_tools: Optional[List[str]] = None
 
     # Specificity weights — exact peer beats role/channel beats account
     # beats chat-type. Higher means more specific.
@@ -1053,6 +1180,24 @@ class RouteBinding:
         "account": 4,
         "chat_type": 2,
     }
+
+    def __post_init__(self) -> None:
+        """Normalise ``trust`` so config typos cannot silently fail open.
+
+        Whitespace/case variants of a known tier (e.g. ``" Untrusted "``) are
+        canonicalised. Any *unknown* non-empty value is treated as the most
+        restrictive tier (``untrusted``) rather than as "no policy", so a
+        misconfigured route can never accidentally expose the full toolset.
+        """
+        if self.trust is None:
+            return
+        normalized = str(self.trust).strip().lower()
+        if not normalized:
+            self.trust = None
+        elif normalized in TRUST_TIERS:
+            self.trust = normalized
+        else:
+            self.trust = "untrusted"
 
     @property
     def specificity(self) -> int:
@@ -1079,6 +1224,29 @@ class RouteBinding:
                 return False
         return True
 
+    def tool_policy(self) -> Optional["ToolPolicy"]:
+        """Build the :class:`ToolPolicy` this binding declares, if any.
+
+        Returns ``None`` when the binding does not constrain the toolset, so
+        callers can cheaply skip the apply/restore dance for trusted routes.
+        The ``untrusted`` trust tier seeds a conservative substring deny-list;
+        explicit ``allow_tools`` / ``deny_tools`` layer on top of it.
+        """
+        deny_substrings: List[str] = []
+        if self.trust == "untrusted":
+            deny_substrings = list(UNTRUSTED_DENY_SUBSTRINGS)
+
+        allow = set(self.allow_tools) if self.allow_tools else None
+        deny = set(self.deny_tools) if self.deny_tools else set()
+
+        if allow is None and not deny and not deny_substrings:
+            return None
+        return ToolPolicy(
+            allow_tools=allow,
+            deny_tools=deny,
+            deny_substrings=deny_substrings,
+        )
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RouteBinding":
         """Create a binding from a YAML/dict mapping.
@@ -1094,6 +1262,9 @@ class RouteBinding:
             channel_id=_as_opt_str(data.get("channel_id")),
             account=_as_opt_str(data.get("account")),
             priority=int(data.get("priority", 0) or 0),
+            trust=_as_opt_str(data.get("trust")),
+            allow_tools=_as_opt_str_list(data.get("allow_tools")),
+            deny_tools=_as_opt_str_list(data.get("deny_tools")),
         )
 
 
@@ -1136,6 +1307,24 @@ def _as_opt_str(value: Any) -> Optional[str]:
     if value is None:
         return None
     return str(value)
+
+
+def _as_opt_str_list(value: Any) -> Optional[List[str]]:
+    """Coerce a YAML scalar or sequence into ``Optional[List[str]]``.
+
+    Accepts a single string (wrapped into a one-element list) or any iterable
+    of values; returns ``None`` for ``None``/empty so an absent key stays
+    unconstrained.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value] if value else None
+    try:
+        items = [str(v) for v in value]
+    except TypeError:
+        return [str(value)]
+    return items or None
 
 
 def resolve_route(
@@ -1690,6 +1879,156 @@ class SendPolicy:
                 reason=f"target '{target}' is not permitted by send_policy",
             )
         return SendDecision(allow=True)
+
+
+# ---------------------------------------------------------------------------
+# Gateway idle-dormancy / scale-to-zero (Issue #2332)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class IdleDecision:
+    """Result of an idle/quiesce evaluation.
+
+    Attributes:
+        idle: Whether the gateway is currently quiescent.
+        reason: Optional human-readable explanation (logged on quiesce).
+    """
+
+    idle: bool
+    reason: str = ""
+
+
+@runtime_checkable
+class GatewayIdlePolicyProtocol(Protocol):
+    """Protocol for gateway-process idle/scale-to-zero decisions.
+
+    Pure, import-free decision contract consumed by the wrapper's
+    ``BotOS`` run-loop. The wrapper supplies live facts (running turns,
+    last inbound timestamp, background-work flag) and the policy decides
+    whether the whole gateway may safely stand down. Concrete drivers
+    (suspend the compute host, stand transports down, register a wake
+    URL) live in the wrapper; this contract keeps the *decision* testable
+    in isolation without a live gateway.
+
+    A config-driven default (:class:`ScaleToZeroPolicy`) is provided for
+    the common "idle for N minutes with nothing in flight" case.
+    """
+
+    def should_arm(
+        self,
+        *,
+        transports_quiescable: bool,
+        wake_registered: bool,
+    ) -> bool:
+        """Return whether dormancy may be armed at all.
+
+        Implementations gate on whether transports can be cleanly stood
+        down and a wake path exists, so a gateway never quiesces into a
+        state it cannot resume from.
+        """
+        ...
+
+    def is_idle(
+        self,
+        *,
+        running_turns: int,
+        last_inbound_ts: float,
+        has_background_work: bool,
+        now: float,
+    ) -> IdleDecision:
+        """Return an :class:`IdleDecision` for the supplied facts."""
+        ...
+
+
+class ScaleToZeroPolicy:
+    """Config-driven idle policy for safe scale-to-zero.
+
+    The default referenced by ``scale_to_zero:`` blocks in ``gateway.yaml``
+    and the ``BotOS(..., idle_policy=...)`` Python surface. It is
+    intentionally minimal and dependency-free so the decision lives in
+    core and is provable in isolation; the wrapper owns the side effects
+    (suspend host, stand transports down, wake endpoint).
+
+    The gateway is considered idle only when *all* guards pass:
+
+    * no in-flight agent turn (``running_turns == 0``),
+    * no live background work (scheduled jobs, delegated subagents,
+      durable outbox drains — ``has_background_work`` is ``False``),
+    * no inbound message for at least ``idle_timeout_minutes``.
+
+    Example::
+
+        ScaleToZeroPolicy(idle_timeout_minutes=5,
+                          wake_url="https://my-bot.fly.dev/_wake")
+    """
+
+    def __init__(
+        self,
+        idle_timeout_minutes: float = 5.0,
+        wake_url: Optional[str] = None,
+        enabled: bool = True,
+    ):
+        if idle_timeout_minutes <= 0:
+            raise ValueError(
+                f"idle_timeout_minutes must be > 0, got {idle_timeout_minutes!r}"
+            )
+        self.idle_timeout_minutes = float(idle_timeout_minutes)
+        self.wake_url = wake_url
+        self.enabled = bool(enabled)
+
+    @property
+    def idle_timeout_seconds(self) -> float:
+        return self.idle_timeout_minutes * 60.0
+
+    def should_arm(
+        self,
+        *,
+        transports_quiescable: bool,
+        wake_registered: bool,
+    ) -> bool:
+        if not self.enabled:
+            return False
+        # Never arm into a state we cannot resume from.
+        return bool(transports_quiescable and wake_registered)
+
+    def is_idle(
+        self,
+        *,
+        running_turns: int,
+        last_inbound_ts: float,
+        has_background_work: bool,
+        now: float,
+    ) -> IdleDecision:
+        if not self.enabled:
+            return IdleDecision(idle=False, reason="scale_to_zero disabled")
+        if running_turns > 0:
+            return IdleDecision(
+                idle=False,
+                reason=f"{running_turns} agent turn(s) in flight",
+            )
+        if has_background_work:
+            return IdleDecision(
+                idle=False,
+                reason="background work in progress",
+            )
+        elapsed = now - last_inbound_ts
+        if elapsed < self.idle_timeout_seconds:
+            remaining = self.idle_timeout_seconds - elapsed
+            return IdleDecision(
+                idle=False,
+                reason=f"last inbound {elapsed:.0f}s ago; {remaining:.0f}s to idle",
+            )
+        return IdleDecision(
+            idle=True,
+            reason=f"idle for {elapsed:.0f}s with nothing in flight",
+        )
+
+
+# Backward-compatible alias. The canonical name follows the repo's
+# ``*Protocol`` suffix convention (e.g. ``SendPolicyProtocol``); the old
+# name is retained so existing imports keep working.
+GatewayIdlePolicy = GatewayIdlePolicyProtocol
 
 
 # ---------------------------------------------------------------------------
