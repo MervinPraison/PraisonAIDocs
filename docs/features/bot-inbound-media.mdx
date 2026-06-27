@@ -1,0 +1,283 @@
+---
+title: "Inbound Media"
+sidebarTitle: "Inbound Media"
+description: "Forward user photos and documents to your agent's vision capability across WhatsApp and Telegram"
+icon: "image"
+---
+
+Bot adapters forward inbound photos and documents to your agent's vision capability — validated, size-capped, and SSRF-safe.
+
+```mermaid
+graph LR
+    subgraph "Inbound Media Flow"
+        U[👤 User sends photo] --> P[📱 Platform]
+        P --> Bot[🤖 Bot Adapter]
+        Bot --> V[🛡️ Validator]
+        V --> A[🧠 Agent Vision]
+        A --> R[💬 Reply]
+    end
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef platform fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef security fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class U user
+    class P,Bot platform
+    class V security
+    class A,R agent
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Simple — works with any vision model">
+No configuration needed. Point a vision-capable agent at your bot.
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import TelegramBot
+
+agent = Agent(
+    name="vision-assistant",
+    instructions="Describe images and answer questions about them.",
+    llm="gpt-4o",
+)
+
+bot = TelegramBot(token="your-telegram-bot-token", agent=agent)
+
+import asyncio
+asyncio.run(bot.start())
+```
+
+Send the bot a photo (with or without a caption). The agent sees the image and responds.
+</Step>
+
+<Step title="With size limit">
+Cap media size for public-facing bots to avoid processing large files.
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import WhatsAppBot
+from praisonaiagents.bots import BotConfig
+
+agent = Agent(
+    name="assistant",
+    instructions="Help users with their images and questions.",
+    llm="gpt-4o",
+)
+
+bot = WhatsAppBot(
+    agent=agent,
+    config=BotConfig(
+        max_inbound_media_bytes=5 * 1024 * 1024,  # 5 MiB cap
+    ),
+)
+
+import asyncio
+asyncio.run(bot.start())
+```
+</Step>
+
+<Step title="Disable inbound media">
+Set `max_inbound_media_bytes=0` for text-only agents.
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import TelegramBot
+from praisonaiagents.bots import BotConfig
+
+agent = Agent(name="text-only", instructions="Answer text questions only.")
+
+bot = TelegramBot(
+    token="your-token",
+    agent=agent,
+    config=BotConfig(max_inbound_media_bytes=0),
+)
+
+import asyncio
+asyncio.run(bot.start())
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User
+    participant P as 📱 WhatsApp / Telegram
+    participant Bot as 🤖 Bot Adapter
+    participant M as 🛡️ cache_inbound_media()
+    participant A as 🧠 Agent Vision
+
+    U->>P: Photo + "What is this?"
+    P->>Bot: Media id / file reference
+    Bot->>P: Download raw bytes
+    P-->>Bot: File data
+    Bot->>M: Validate file
+    Note over M: 1. Size ≤ max_inbound_media_bytes<br/>2. Magic-byte content-type check<br/>3. SSRF-safe URL (no private IPs)
+    alt Validation passes
+        M-->>Bot: Cached local path
+        Bot->>A: chat("What is this?", attachments=[path])
+        A-->>Bot: Vision response
+        Bot-->>U: 📨 Reply
+    else File too large or invalid
+        M-->>Bot: Reject
+        Bot-->>U: (caption only, no attachment)
+    end
+```
+
+| Step | What happens |
+|------|-------------|
+| **Download** | WhatsApp: fetches via Graph API by media id. Telegram: uses `get_file()` → `download_to_drive()` |
+| **Size cap** | File rejected if size exceeds `max_inbound_media_bytes`. Default: 20 MiB |
+| **Magic-byte check** | File header bytes checked against declared content-type — prevents type confusion |
+| **SSRF guard** | URL must use `http`/`https` and resolve to a public IP — rejects loopback, link-local, and RFC-1918 ranges |
+| **Forward** | Validated path passed to `agent.chat(attachments=[path])` |
+
+---
+
+## Platform Coverage
+
+| Platform | Media types | Caption support |
+|----------|-------------|----------------|
+| **WhatsApp** (Cloud API) | Photos, documents | ✅ Caption forwarded as prompt |
+| **Telegram** | Photos, all documents | ✅ Caption forwarded as prompt |
+
+<Note>
+Telegram registers a `PHOTO | Document.ALL` handler — both photos and any document type (PDF, DOCX, etc.) flow through the same validation pipeline.
+</Note>
+
+---
+
+## Configuration
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `max_inbound_media_bytes` | `int` | `20971520` | Maximum file size in bytes. `0` = disable inbound media. |
+
+Set via `BotConfig`:
+
+```python
+from praisonaiagents.bots import BotConfig
+
+config = BotConfig(
+    max_inbound_media_bytes=10 * 1024 * 1024,  # 10 MiB
+)
+```
+
+Or via YAML:
+
+```yaml
+agent:
+  name: vision-bot
+  instructions: Describe images.
+  llm: gpt-4o
+
+platforms:
+  telegram:
+    token: ${TELEGRAM_BOT_TOKEN}
+    max_inbound_media_bytes: 10485760  # 10 MiB
+```
+
+---
+
+## Common Patterns
+
+### Photo + question (most common)
+
+The user sends a photo with a caption asking a question. The caption becomes the prompt; the image is the attachment.
+
+```
+User: [photo of a chart] → "What does this chart show?"
+Agent: "The chart shows quarterly revenue growth from Q1 to Q4..."
+```
+
+### Document analysis
+
+Send a PDF or Word document. The agent reads the content via vision.
+
+```
+User: [report.pdf] → "Summarize the key findings"
+Agent: "The report covers three main findings..."
+```
+
+### Oversized file rejected
+
+Files above `max_inbound_media_bytes` are silently dropped. Only the caption text is forwarded.
+
+```
+User: [50 MB video] → "Describe this"
+Agent: (receives only "Describe this", no attachment)
+```
+
+### Non-vision agent (backward compatible)
+
+If `agent.chat()` does not accept `attachments`, the adapter skips the file gracefully.
+
+```python
+agent = Agent(name="text-only", instructions="Answer text questions.")
+# Agent chat() has no attachments parameter — attachments are skipped automatically
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Set a tighter cap for public bots">
+The default 20 MiB is generous. For public-facing bots, set 2–5 MiB to reduce processing time and storage use.
+
+```python
+config = BotConfig(max_inbound_media_bytes=2 * 1024 * 1024)
+```
+</Accordion>
+
+<Accordion title="Disable with 0 for text-only agents">
+If your agent doesn't use vision, set `max_inbound_media_bytes=0`. Users still get a response — just from the caption text alone.
+
+```python
+config = BotConfig(max_inbound_media_bytes=0)
+```
+</Accordion>
+
+<Accordion title="Watch logs for SSRF rejects">
+The SSRF guard logs rejections at WARNING level. If you see unexpected rejections in production, check that the platform's media CDN URLs resolve to public IPs.
+
+```
+WARNING: SSRF guard rejected URL: https://internal-cdn.example.com/...
+```
+</Accordion>
+
+<Accordion title="Use gpt-4o or claude-3 for vision">
+Not all models support vision. Pass a vision-capable model to see image attachments.
+
+```python
+agent = Agent(llm="gpt-4o")          # OpenAI vision
+agent = Agent(llm="claude-3-7-sonnet-20250219")  # Anthropic vision
+agent = Agent(llm="gemini/gemini-2.0-flash")      # Google vision
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="WhatsApp Bot" icon="whatsapp" href="/docs/features/whatsapp-bot">
+  WhatsApp setup, Cloud API, Web mode, and message filtering
+</Card>
+<Card title="Messaging Bots" icon="robot" href="/docs/features/messaging-bots">
+  All supported platforms: Telegram, Discord, Slack, WhatsApp
+</Card>
+<Card title="Platform-Aware Agents" icon="satellite-dish" href="/docs/features/platform-aware-agents">
+  Session context, channel directory, and `BotSessionManager` parameters
+</Card>
+<Card title="Bot Streaming Replies" icon="message-pen" href="/docs/features/bot-streaming-replies">
+  Live streaming responses for Telegram, Slack, and Discord
+</Card>
+</CardGroup>
