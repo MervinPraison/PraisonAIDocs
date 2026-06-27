@@ -8,61 +8,87 @@ icon: "shield-check"
 Approval pauses an agent before it runs a risky tool and asks a human (or another channel) to allow or deny it.
 
 <Warning>
-**Behaviour change (PR #2122):** Approval is **enabled by default**. YAML configs that omitted the `approval` key previously got `enabled: false`; they now get the prompting policy. Set `approval: false` to keep the old behaviour.
+**Behaviour change (PR #2369):** Dangerous built-in tools (`execute_command`, `kill_process`, `execute_code`, `delete_file`, `move_file`, `copy_file`, and others) are now **gated by default**. Interactive sessions (TTY) ask before running; non-interactive sessions (CI/pipes) deny. Read-only tools are unaffected. See [What counts as dangerous](#what-counts-as-dangerous) below.
 </Warning>
 
 <Note>
-**Sync and Async Parity**: Approval checks now work uniformly in both sync and async tool execution paths. Previously, async calls bypassed approval prompts.
+**Earlier change (PR #2122):** Approval is enabled by default. YAML configs that omitted the `approval` key previously got `enabled: false`; they now get the prompting policy.
+</Note>
+
+<Note>
+**Sync and Async Parity**: Approval checks now work uniformly in both sync and async tool execution paths.
 </Note>
 
 ```mermaid
 graph LR
     Agent[🤖 Agent] --> Tool{🔧 Tool Call}
-    Tool -->|risky| Approve[🛡️ Approval]
-    Approve -->|✅ allow| Run[▶️ Execute]
-    Approve -->|❌ deny| Skip[⏹️ Skip]
+    Tool -->|risky| Gate{🛡️ TTY?}
+    Gate -->|Interactive| Ask[❓ Ask User]
+    Gate -->|Non-interactive| Deny[❌ Deny]
+    Ask -->|✅ allow| Run[▶️ Execute]
+    Ask -->|❌ deny| Skip[⏹️ Skip]
     Tool -->|safe| Run
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#EF4444,stroke:#7C90A0,color:#fff
 
     class Agent agent
-    class Tool,Approve gate
-    class Run,Skip ok
+    class Tool,Gate gate
+    class Run,Skip,Ask ok
+    class Deny bad
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="Simple Usage">
-Approval is on by default. To disable:
+<Step title="Default (safe, no setup needed)">
+Dangerous tools are gated automatically. Just run your agent — it will ask before doing anything destructive:
 
 ```python
 from praisonaiagents import Agent
 
-agent = Agent(name="Admin", instructions="Manage the server", approval=False)
-agent.start("Clean up old logs")
+agent = Agent(
+    name="Coder",
+    instructions="Refactor utils.py",
+    tools=["shell", "write_file"],
+    # approval is automatic: asks on a TTY, denies in CI
+)
+agent.start()
 ```
 </Step>
 
-<Step title="Per-tool approval">
+<Step title="Bypass safety (opt-out)">
+To restore the old unrestricted behaviour:
+
 ```python
+from praisonaiagents import Agent
+
 agent = Agent(
     name="Admin",
-    instructions="...",
-    approval={
-        "enabled": True,
-        "default_policy": "prompt",
-        "approve_tools": {"shell": "critical", "read_file": "low"},
-    },
+    instructions="Manage the server",
+    approval="bypass",   # run dangerous tools silently
 )
+agent.start("Clean up old logs")
+```
+
+Or via environment variable:
+
+```bash
+PRAISONAI_TOOL_SAFETY=off praisonai code
 ```
 </Step>
 
-<Step title="Pick Backend">
+<Step title="Deny silently (no prompts)">
+Block dangerous tools without prompting (useful for CI that should fail fast):
+
 ```python
-agent = Agent(name="Admin", instructions="...", approval="slack")
+agent = Agent(
+    name="Reviewer",
+    instructions="Review code only",
+    approval=False,    # deny dangerous tools silently
+)
 ```
 </Step>
 
@@ -82,6 +108,114 @@ agent = Agent(
 ```
 </Step>
 </Steps>
+
+---
+
+## What counts as dangerous
+
+The `DEFAULT_DANGEROUS_TOOLS` set (from `praisonaiagents/approval/registry.py`) determines which tools trigger approval:
+
+| Tool name | Risk level | Description |
+|-----------|-----------|-------------|
+| `execute_command` | critical | Runs arbitrary shell commands |
+| `kill_process` | critical | Terminates running processes |
+| `execute_code` | critical | Executes arbitrary code |
+| `acp_execute_command` | critical | ACP shell command execution |
+| `write_file` | high | Writes / creates a file |
+| `delete_file` | high | Deletes a file |
+| `move_file` | high | Moves / renames a file |
+| `copy_file` | high | Copies a file |
+| `acp_create_file` | high | ACP file creation |
+| `acp_edit_file` | high | ACP file edits |
+| `acp_delete_file` | high | ACP file deletion |
+| `execute_query` | high | Executes a database query |
+| `evaluate` | medium | Evaluates code expressions |
+| `crawl` | medium | Crawls web URLs |
+| `scrape_page` | medium | Scrapes a web page |
+
+Read-only tools (search, read_file, etc.) are **not** in this set and run without gating.
+
+---
+
+## Interactive vs non-interactive
+
+PraisonAI checks whether both `stdin` and `stdout` are TTYs to decide what to do when no `approval=` argument is passed:
+
+| Context | Result |
+|---------|--------|
+| Terminal (TTY) | **Ask** — `ConsoleBackend` prompts before each dangerous tool |
+| CI / piped / script | **Deny** — `default` permission preset blocks destructive ops |
+
+```mermaid
+graph TB
+    Start[🚀 Agent starts] --> Check{stdin AND stdout are TTY?}
+    Check -->|Yes| Ask[❓ ConsoleBackend asks user]
+    Check -->|No| Preset[🛡️ 'default' preset — deny destructive ops]
+    Ask -->|allow| Exec[▶️ Execute tool]
+    Ask -->|deny| Block[⛔ Skip tool]
+    Preset --> Block
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Check check
+    class Ask,Exec ok
+    class Block,Preset bad
+```
+
+The `default` preset specifically blocks: `execute_command`, `kill_process`, `execute_code`, `acp_execute_command`, `delete_file`, `move_file`, `copy_file`, `acp_delete_file`. Write and create operations (`write_file`, `acp_create_file`, `acp_edit_file`) still run — they are blocked only under the `safe` or `read_only` presets.
+
+---
+
+## Bypassing safety
+
+Three ways to restore unrestricted behaviour:
+
+```mermaid
+graph TB
+    Q{How are you running?}
+    Q -->|CLI one-off| CLI["praisonai code --dangerously-skip-approval"]
+    Q -->|Env / CI| ENV["PRAISONAI_TOOL_SAFETY=off praisonai code"]
+    Q -->|Python / YAML| PY["Agent(..., approval='bypass')"]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ans fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class CLI,ENV,PY ans
+```
+
+**1. CLI flag**
+
+```bash
+praisonai code --dangerously-skip-approval
+# also sets PRAISONAI_TOOL_SAFETY=off for any subprocess tree
+```
+
+**2. Environment variable**
+
+```bash
+PRAISONAI_TOOL_SAFETY=off praisonai code
+```
+
+Accepted "off" values: `off`, `full`, `none`, `0`, `false`.
+
+**3. Python / YAML**
+
+```python
+from praisonaiagents import Agent
+
+Agent(tools=["shell", "write_file"], approval="bypass")   # silent allow
+Agent(tools=["shell", "write_file"], approval=False)       # silent deny (no prompts)
+Agent(tools=["shell", "write_file"], approval="safe")      # block all dangerous tools
+Agent(tools=["shell", "write_file"], approval="read_only") # alias of "safe"
+Agent(tools=["shell", "write_file"], approval="full")      # no restrictions
+```
+
+---
 
 ## How users approve
 
@@ -211,16 +345,19 @@ Available non-console backends: `webhook`, `http`, `slack`, `telegram`, `discord
 
 <AccordionGroup>
 <Accordion title="Console approval">
-No env vars needed; you see the prompt directly in the terminal.
+No env vars needed; you see the prompt directly in the terminal. This is now the default when running in an interactive session.
 </Accordion>
 <Accordion title="Slack approval">
-Routes approval requests to a channel humans already watch.
+Routes approval requests to a channel humans already watch — great for CI pipelines that need human gating.
 </Accordion>
 <Accordion title="Set timeouts">
 Without a timeout, the agent blocks indefinitely waiting for a decision.
 </Accordion>
 <Accordion title="Use approve_level">
 `approve_level: high` lets safe tools run without prompts and only gates the dangerous ones.
+</Accordion>
+<Accordion title="Restore old behavior for trusted environments">
+Use `approval="bypass"` or `PRAISONAI_TOOL_SAFETY=off` when you control the environment fully and want the pre-4.6.27 unrestricted behaviour.
 </Accordion>
 </AccordionGroup>
 
@@ -232,5 +369,11 @@ All backend protocols (Slack, Telegram, Discord, Webhook, HTTP, Agent)
 </Card>
 <Card icon="terminal" href="/docs/cli/tool-approval">
 Full CLI flag reference
+</Card>
+<Card icon="shield-check" href="/docs/features/interactive-approval">
+Interactive terminal approval experience
+</Card>
+<Card icon="shield" href="/docs/features/permission-modes">
+Permission modes (plan, accept-edits, bypass)
 </Card>
 </CardGroup>

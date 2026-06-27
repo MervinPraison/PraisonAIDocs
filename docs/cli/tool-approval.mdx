@@ -5,7 +5,87 @@ description: "Control tool execution approval in PraisonAI CLI"
 icon: "shield-check"
 ---
 
-The PraisonAI CLI includes a safety system that requires human approval before executing potentially dangerous tools. This page explains how to control this behavior.
+PraisonAI asks before running anything dangerous: a fresh install on an interactive terminal will prompt you the first time a tool wants to touch your files or shell.
+
+```mermaid
+graph LR
+    A[👤 Agent calls<br/>shell/file tool] --> B{🖥️ Interactive<br/>terminal?}
+    B -->|Yes| C[🔒 Ask the user]
+    C -->|Approved| D[✅ Tool runs]
+    C -->|Denied| E[🚫 Tool denied]
+    B -->|No / pipe / CI| E
+    A -.->|PRAISONAI_TOOL_SAFETY=off<br/>or --dangerously-skip-approval| D
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef approved fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef ask fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef denied fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef bypass fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class B decision
+    class C ask
+    class D approved
+    class E denied
+```
+
+## Default Behaviour
+
+PraisonAI is **safe by default**: a fresh install on an interactive terminal asks before running dangerous tools (shell exec, file writes, code execution). Pipes, CI runners, and redirected I/O fall back to **deny by default** — dangerous tools never run unattended without an explicit policy.
+
+| Context | Default | What you see |
+|---------|---------|--------------|
+| Interactive terminal (TTY) | **Ask** | An approval prompt appears the first time a dangerous tool is called |
+| Pipe / CI / non-TTY | **Deny** | The dangerous tool is hard-denied before it runs |
+| `PRAISONAI_TOOL_SAFETY=off` set | **Bypass** | Legacy ungated behaviour; nothing is gated |
+| `approval=False` (Python) | **Deny** | Same as non-TTY: deny-by-default, no prompt |
+| `approval="bypass"` (Python) | **Bypass** | Same as `PRAISONAI_TOOL_SAFETY=off` |
+
+```python
+from praisonaiagents import Agent
+
+# Safe-by-default: on a TTY, asks; off-TTY, denies — no kwargs needed
+agent = Agent(name="Dev Agent", instructions="Help with file ops",
+              tools=["write_file", "execute_command"])
+agent.start("create a hello.txt file")
+```
+
+A session counts as interactive only when **both** `sys.stdin` and `sys.stdout` are TTYs. This avoids surprises in CI / Docker / scheduled-task contexts.
+
+## Bypassing the Prompt
+
+### Per-run bypass — `--dangerously-skip-approval`
+
+For one-off runs you trust completely:
+
+```bash
+praisonai code "rename src/ to lib/" --dangerously-skip-approval
+```
+
+This is identical to `--no-safe`. Both set `PRAISONAI_TOOL_SAFETY=off` for the subprocess and run dangerous tools without prompting.
+
+### Session-wide bypass — `PRAISONAI_TOOL_SAFETY=off`
+
+For a whole shell session:
+
+```bash
+export PRAISONAI_TOOL_SAFETY=off
+praisonai code "..."   # all calls in this shell skip the safe-default ask
+```
+
+Accepted values that bypass: `off`, `full`, `none`, `0`, `false` (case-insensitive). Any other value falls back to the `default` preset.
+
+### Python-level bypass — `approval="bypass"`
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Dev Agent", approval="bypass", tools=["write_file", "execute_command"])
+agent.start("task")
+```
+
+Use `approval=False` instead if you want **deny-by-default** without the prompt (CI-style behaviour from inside a TTY-attached process).
 
 ## Declarative Permissions
 
@@ -33,7 +113,7 @@ Certain tools are marked with risk levels and require approval before execution:
 | Risk Level | Tools | Default Behavior |
 |------------|-------|------------------|
 | **CRITICAL** | `execute_command`, `kill_process`, `execute_code` | Always prompts |
-| **HIGH** | `write_file`, `delete_file`, `move_file`, `copy_file` | Always prompts |
+| **HIGH** | `write_file`, `delete_file`, `move_file`, `copy_file`, `edit_file`, `apply_patch` | Always prompts |
 | **MEDIUM** | `evaluate`, `crawl`, `scrape_page` | Always prompts |
 | **LOW** | (none by default) | Always prompts |
 
@@ -90,6 +170,17 @@ All three surfaces use the same unified configuration:
 | `--approval-timeout <sec>` | `timeout: <sec>` | `timeout=<sec>` |
 | `--approve-level <level>` | `approve_level: <level>` | `approve_level="<level>"` |
 | `--guardrail "<text>"` | `guardrails: "<text>"` | `guardrails="<text>"` |
+
+---
+
+## `praisonai code` Safety Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--safe / --no-safe` | **`--safe` (ON)** | Safe mode ON by default. `--no-safe` sets `PRAISONAI_TOOL_SAFETY=off` and restores legacy ungated behaviour. |
+| `--dangerously-skip-approval` | OFF | Skip all approval prompts and run dangerous tools unguarded. Equivalent to `--no-safe`. |
+| `--trust` | OFF | Auto-approve all tool executions. |
+| `--approval <backend>` | — | Route approvals to a backend (`console`, `slack`, …). |
 
 ---
 
@@ -206,28 +297,22 @@ praisonai chat --approval discord
 
 ---
 
-## Default Behavior (No Flags)
-
-Without any flags, the CLI will prompt for approval on all dangerous tools:
-
-```bash
-praisonai "run a shell command to list files"
-```
-
-**Output:**
-```
-╭─ 🔒 Tool Approval Required ──────────────────────────────────────────────────╮
-│ Function: execute_command                                                    │
-│ Risk Level: CRITICAL                                                         │
-│ Arguments:                                                                   │
-│   command: ls -la                                                            │
-╰──────────────────────────────────────────────────────────────────────────────╯
-Do you want to execute this critical risk tool? [y/n] (n):
-```
-
 ## Programmatic Control
 
-You can also control approval behavior programmatically:
+```python
+from praisonaiagents import Agent
+
+# Safe-by-default (TTY = ask, non-TTY = deny)
+agent = Agent(name="Dev Agent", tools=["write_file", "execute_command"])
+
+# Deny-by-default without any prompt (CI-style)
+agent = Agent(name="CI Agent", approval=False, tools=["write_file"])
+
+# Full bypass — legacy ungated behaviour
+agent = Agent(name="Trusted Agent", approval="bypass", tools=["write_file"])
+```
+
+Custom approval callbacks:
 
 ```python
 from praisonaiagents.approval import (
@@ -237,13 +322,13 @@ from praisonaiagents.approval import (
     add_approval_requirement
 )
 
-# Option 1: Auto-approve all tools
+# Auto-approve all tools
 def auto_approve(function_name, arguments, risk_level):
     return ApprovalDecision(approved=True, reason="Auto-approved")
 
 set_approval_callback(auto_approve)
 
-# Option 2: Level-based approval
+# Level-based approval
 def level_approve(function_name, arguments, risk_level):
     levels = {"low": 1, "medium": 2, "high": 3, "critical": 4}
     if levels.get(risk_level, 4) <= levels["high"]:
@@ -252,12 +337,17 @@ def level_approve(function_name, arguments, risk_level):
 
 set_approval_callback(level_approve)
 
-# Option 3: Remove approval requirement for specific tool
+# Remove approval requirement for specific tool
 remove_approval_requirement("execute_command")
 
-# Option 4: Add approval requirement for custom tool
+# Add approval requirement for custom tool
+# Custom tools registered here are also honoured on the interactive ask path (ConsoleBackend)
 add_approval_requirement("my_dangerous_tool", risk_level="high")
 ```
+
+<Note>
+Custom tools registered via `add_approval_requirement(...)` are now gated on the interactive `ConsoleBackend` ask path, not just the deny path. Previously, registry-required custom tools were only blocked in non-interactive mode — that gap is now closed.
+</Note>
 
 ## Risk Level Reference
 
@@ -271,6 +361,8 @@ add_approval_requirement("my_dangerous_tool", risk_level="high")
 - `delete_file` - Delete files
 - `move_file` - Move/rename files
 - `copy_file` - Copy files
+- `edit_file` - Edit existing file content
+- `apply_patch` - Apply a patch/diff to files
 - `execute_query` - Database queries
 
 ### Medium Risk Tools
@@ -280,17 +372,39 @@ add_approval_requirement("my_dangerous_tool", risk_level="high")
 
 ## Best Practices
 
-<Tip>
-**For development/testing:** Use `--trust` for faster iteration when you're actively monitoring the AI's actions.
-</Tip>
+<AccordionGroup>
+<Accordion title="Use deny-by-default in CI">
+Set `approval=False` (or let the non-TTY default kick in automatically) so an agent run in CI never silently executes a destructive tool, even on a misconfigured runner that mistakenly attaches a TTY.
 
-<Tip>
-**For production scripts:** Use `--approve-level high` to allow file operations but still require approval for shell commands.
-</Tip>
+```python
+from praisonaiagents import Agent
 
-<Note>
-The approval system is designed to prevent accidental destructive actions. Consider your use case carefully before bypassing it.
-</Note>
+# Explicit deny-by-default for CI pipelines
+agent = Agent(name="CI Agent", approval=False, tools=["write_file", "execute_command"])
+agent.start("run tests and update report")
+```
+</Accordion>
+
+<Accordion title="Never set PRAISONAI_TOOL_SAFETY=off in a shared shell profile">
+`PRAISONAI_TOOL_SAFETY=off` is a per-session bypass intended for one-off trusted runs. Putting it in `~/.bashrc` or `~/.zshrc` re-introduces every safety gap that the safe-by-default system closed — any agent running in that shell will execute dangerous tools unguarded.
+</Accordion>
+
+<Accordion title="For development/testing: use --trust for faster iteration">
+When you're actively monitoring the AI's actions, `--trust` speeds up iteration by skipping prompts entirely.
+
+```bash
+praisonai "refactor utils.py" --trust
+```
+</Accordion>
+
+<Accordion title="For production scripts: use --approve-level high">
+Allow file operations but still require approval for shell commands:
+
+```bash
+praisonai "generate and save report" --approve-level high
+```
+</Accordion>
+</AccordionGroup>
 
 ## Related Features
 
