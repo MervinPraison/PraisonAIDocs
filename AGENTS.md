@@ -2,6 +2,8 @@
 
 This file contains the exact instructions, principles, and patterns for AI agents to create documentation pages for PraisonAI. Follow these instructions precisely to produce consistent, high-quality documentation.
 
+> **Backwards-compatibility note (added 2026-06-27):** Sections previously numbered 1.5 (TypeScript SDK Structure) through 1.9 are now numbered 1.6 through 1.10 respectively. The first `1.5 Multi-SDK Reference` section retains its number. See git history for the previous numbering.
+
 --- 
 
 ## 1. Documentation Creation Process
@@ -76,16 +78,16 @@ PraisonAI has three SDK implementations. Use these paths as source of truth:
 
 | SDK | Source Code Path | Documentation Path | Parity Tracker |
 |-----|------------------|-------------------|----------------|
-| **Python** | `praisonai-package/src/praisonai-agents/` | `docs/concepts/`, `docs/features/` | `docs/features/DOCS_PARITY.md` |
-| **TypeScript/JS** | `praisonai-package/src/praisonai-ts/src/` | `docs/js/` | `docs/js/DOCS_PARITY.md` |
-| **Rust** | `praisonai-package/src/praisonai-rust/src/` | `docs/rust/` | `docs/rust/DOCS_PARITY.md` |
+| **Python** | `praisonaiagents/` (repo root, synced daily — see `update_repos.sh`) | `docs/concepts/`, `docs/features/` | `docs/features/DOCS_PARITY.md` |
+| **TypeScript/JS** | `praisonai-package/src/praisonai-ts/src/` (external — read from `MervinPraison/PraisonAI` repo; not synced here) | `docs/js/` | `docs/js/DOCS_PARITY.md` |
+| **Rust** | `praisonai-package/src/praisonai-rust/src/` (external — read from `MervinPraison/PraisonAI` repo; not synced here) | `docs/rust/` | `docs/rust/DOCS_PARITY.md` |
 
 **Documentation Parity Trackers** show which features have documentation and which need docs:
 - ✅ Documented categories (real content)
 - ⚠️ Stub documentation (< 50 lines, needs content)
 - ❌ Undocumented categories (needs documentation)
 
-### 1.5 TypeScript SDK Structure
+### 1.6 TypeScript SDK Structure
 
 ```
 praisonai-ts/src/
@@ -97,7 +99,7 @@ praisonai-ts/src/
 └── index.ts          # Main exports
 ```
 
-### 1.6 Rust SDK Structure
+### 1.7 Rust SDK Structure
 
 ```
 praisonai-rust/src/
@@ -109,7 +111,7 @@ praisonai-rust/src/
 └── lib.rs            # Main exports
 ```
 
-### 1.7 Auto-Managed Documentation Sections
+### 1.8 Auto-Managed Documentation Sections
 
 > [!WARNING]
 > **DO NOT manually edit** the following sections in `docs.json`:
@@ -134,7 +136,7 @@ This command:
 2. Generates `DOCS_PARITY.md` reports
 3. Copies reports to `docs/features/`, `docs/js/`, `docs/rust/`
 
-### 1.8 Folder Placement Rules
+### 1.9 Folder Placement Rules
 
 > [!CAUTION]
 > **AI agents MUST follow these rules strictly. Violations will cause PRs to be rejected.**
@@ -159,7 +161,7 @@ CRITICAL RULES FOR AI AGENTS:
 7. When reviewing PRs: flag any files in docs/concepts/ as violations
 ```
 
-### 1.9 AI Agent Behavioral Rules
+### 1.10 AI Agent Behavioral Rules
 
 ```
 MANDATORY for all AI agents working on this repository:
