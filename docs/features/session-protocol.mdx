@@ -1,10 +1,21 @@
 ---
 title: "Session Store Protocol"
+sidebarTitle: "Session Protocol"
 description: "Swap session backends with a unified protocol interface"
 icon: "plug"
 ---
 
-The `SessionStoreProtocol` defines **five methods** that any session backend must implement. This lets you swap between JSON files, Redis, MongoDB, or your own custom store — without changing any agent or bot code.
+The `SessionStoreProtocol` defines the methods any session backend must implement — swap JSON files, Redis, or your own store without changing agent code.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Assistant",
+    memory={"session_id": "chat-123"},
+)
+agent.start("Hello!")
+```
 
 ```mermaid
 graph LR
@@ -117,7 +128,8 @@ class MyStore:
 ```
 
 <Tip>
-If your custom store backs onto shared storage (Redis, Postgres, S3, another file system), make `get_chat_history`, `get_session`, and `get_sessions_by_agent` read from that backing store on every call rather than caching in process memory. `DefaultSessionStore` guarantees this; downstream code such as `BotSessionManager._load_history` relies on it.
+If your custom store backs onto shared storage (Redis, Postgres, S3), reload from that backing store on every read — do not rely on in-process caches. `DefaultSessionStore` and `BotSessionManager._load_history` assume this.
+</Tip>
 
 ## update_session_metadata() API
 
@@ -169,21 +181,13 @@ store.update_session_metadata(
 
 ### Concurrency Safety
 
-In `DefaultSessionStore`, `update_session_metadata()` uses a cross-process file lock with locked reload-from-disk to ensure concurrent metadata updates and message appends are both preserved. This fixed a silent message-loss bug that affected multi-worker deployments before PR #1709.
-
-<Tip>
-If your custom store backs onto shared storage (Redis, Postgres, S3, another file system), make `get_chat_history` and `get_session` read from that backing store on every call rather than caching in process memory. `DefaultSessionStore` guarantees this; downstream code (e.g. `BotSessionManager._load_history`) relies on it.
-
-</Tip>
+In `DefaultSessionStore`, `update_session_metadata()` reloads under a cross-process file lock so concurrent metadata updates and message appends are both preserved.
 
 ## Built-in Implementations
 
 <CardGroup cols={2}>
   <Card icon="file" title="DefaultSessionStore">
-    JSON file-based persistence with atomic writes and file locking. Zero dependencies. All mutating methods *and* read methods reload from disk inside the file lock, so multiple processes can safely share one session directory.
-
-    JSON file-based persistence with atomic writes and file locking. Zero dependencies. All mutating methods reload from disk inside the file lock, so multiple processes can safely share one session directory.
-
+    JSON file-based persistence with atomic writes and file locking. Mutating and read methods reload from disk under lock so multiple processes can share one directory.
 
     ```python
     from praisonaiagents.session import DefaultSessionStore
@@ -195,12 +199,12 @@ If your custom store backs onto shared storage (Redis, Postgres, S3, another fil
     ```
   </Card>
   <Card icon="sitemap" title="HierarchicalSessionStore">
-    Extends `DefaultSessionStore` with session forking, snapshots, and revert.
+    Extends `DefaultSessionStore` with forking, snapshots, and revert.
 
     ```python
-    from praisonaiagents.session import HierarchicalSessionStore
+    from praisonaiagents.session import get_hierarchical_session_store
 
-    store = HierarchicalSessionStore()
+    store = get_hierarchical_session_store()
     parent = store.create_session(title="Main")
     child = store.fork_session(parent, from_message_index=5)
     ```
@@ -245,6 +249,7 @@ graph TD
 
 ## Building a Custom Store
 
+<AccordionGroup>
 <Accordion title="Full example: In-memory store for testing">
 ```python
 from typing import Any, Dict, List, Optional
@@ -298,6 +303,7 @@ history = store.get_chat_history("test")
 assert history == [{"role": "user", "content": "Hello"}]
 ```
 </Accordion>
+</AccordionGroup>
 
 ## Checkpoint Query Protocol
 
@@ -337,63 +343,41 @@ assert isinstance(store, CheckpointQueryProtocol)
 ### Checkpoint Usage
 
 ```python
-from praisonaiagents.session import HierarchicalSessionStore
+from praisonaiagents.session import get_hierarchical_session_store
 
-# Built-in checkpoint support
-store = HierarchicalSessionStore()
+store = get_hierarchical_session_store()
 
-# Create snapshot before risky operation
-checkpoint_id = store.snapshot_session("session-123", "Before complex task")
-
-# List available checkpoints
-checkpoints = store.list_checkpoints("session-123")
-for cp in checkpoints:
-    print(f"Checkpoint {cp['checkpoint_id']}: {cp['description']}")
-
-# Restore from checkpoint if needed
-store.restore_session("session-123", checkpoint_id)
+snapshot_id = store.create_snapshot("session-123", label="Before complex task")
+store.revert_to_snapshot("session-123", snapshot_id)
 ```
 
 ---
 
-## Architecture Overview
+## Best Practices
 
-```mermaid
-graph TB
-    subgraph "Core SDK (praisonaiagents)"
-        Proto[SessionStoreProtocol]
-        Default[DefaultSessionStore]
-        Hier[HierarchicalSessionStore]
-        Default -.->|implements| Proto
-        Hier -.->|implements| Proto
-    end
+<AccordionGroup>
+<Accordion title="Implement set_chat_history for idempotent saves">
+Without it, repeated `Session.save_state()` calls may duplicate messages via the `add_message` fallback.
+</Accordion>
 
-    subgraph "Wrapper (praisonai)"
-        BotMgr[BotSessionManager]
-        BotMgr -->|uses| Proto
-    end
+<Accordion title="Reload shared storage on every read">
+Redis, Postgres, and multi-worker file stores must not serve stale in-process caches.
+</Accordion>
 
-    subgraph "User Code"
-        Custom2[Custom Store]
-        Custom2 -.->|implements| Proto
-    end
+<Accordion title="Use runtime isinstance checks">
+`SessionStoreProtocol` is `@runtime_checkable` — verify custom stores with `isinstance(store, SessionStoreProtocol)`.
+</Accordion>
+</AccordionGroup>
 
-    classDef proto fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef impl fill:#2E8B57,stroke:#7C90A0,color:#fff
-    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+---
 
-    class Proto proto
-    class Default,Hier,BotMgr impl
-    class Custom2 user
-```
-
-## Next Steps
+## Related
 
 <CardGroup cols={2}>
-  <Card icon="floppy-disk" href="/docs/features/session-persistence">
-    Learn about session persistence details
+  <Card title="Session Persistence" icon="floppy-disk" href="/docs/features/session-persistence">
+    Automatic session save and restore
   </Card>
-  <Card icon="clock-rotate-left" href="/docs/features/sessions">
-    Sessions & remote agents overview
+  <Card title="Sessions Overview" icon="clock-rotate-left" href="/docs/features/sessions">
+    Sessions and remote agents
   </Card>
 </CardGroup>
