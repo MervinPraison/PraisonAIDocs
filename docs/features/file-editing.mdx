@@ -559,6 +559,127 @@ src/calc.py:1:18: F821 Undefined name `c`
 
 ---
 
+## Post-edit Formatting
+
+After a successful edit, `edit_file` and `apply_patch` can run a language-appropriate formatter on the modified file and persist the formatted result — keeping diffs clean without a separate formatting step.
+
+```mermaid
+graph LR
+    Edit[✏️ edit_file / apply_patch] --> Success{✅ edit OK?}
+    Success -->|yes| Format{🎨 post_edit_format?}
+    Format -->|off| Done[💾 file saved]
+    Format -->|auto/on| Detect[🔍 detect formatter]
+    Detect --> Run[⚙️ run formatter]
+    Run --> Refresh[🔁 refresh hash]
+    Refresh --> Done
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    class Edit input
+    class Success,Format,Detect,Run,Refresh process
+    class Done output
+```
+
+### Agent Quick Start
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.tools.edit_tools import create_edit_tools
+
+edit_tools = create_edit_tools(post_edit_format="auto")
+
+agent = Agent(
+    name="Code Editor",
+    instructions="Edit files cleanly and let the formatter tidy up afterward.",
+    tools=[edit_tools.edit_file, edit_tools.apply_patch],
+)
+
+agent.start("Refactor src/utils.py to use list comprehensions")
+```
+
+### Three modes
+
+```mermaid
+graph TB
+    Q[Which mode?]
+    Q --> M1{Default — no formatter overhead?}
+    M1 -->|Yes| OFF[off — default]
+    M1 -->|No| M2{Run formatter if available?}
+    M2 -->|Yes| AUTO[auto]
+    M2 -->|Always try| ON[on]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q,M1,M2 q
+    class OFF,AUTO,ON pick
+```
+
+| Mode | When the formatter runs | Use when |
+|---|---|---|
+| `"off"` (default) | Never — zero overhead, byte-for-byte identical to pre-existing behaviour | You don't need auto-formatting, or you run your own formatter in CI |
+| `"auto"` | If a formatter is detected for the file type; silently skipped otherwise | You want formatting when available but no errors when the tool is missing |
+| `"on"` | Same as `"auto"` — run a formatter if detected, skip silently otherwise | Alias for `"auto"`; both behave identically |
+
+A missing or failing formatter **never** turns a successful edit into a failure.
+
+### Configure the mode
+
+```python
+from praisonaiagents.tools.edit_tools import create_edit_tools
+
+# Enable auto-formatting for all edits
+edit_tools = create_edit_tools(post_edit_format="auto")
+
+# Pin a project-specific formatter per extension
+edit_tools = create_edit_tools(
+    post_edit_format="auto",
+    formatters={
+        ".py": ("black", ["black", "--quiet"]),
+        ".ts": ("local-prettier", ["./node_modules/.bin/prettier", "--write", "{path}"]),
+    },
+)
+```
+
+### Built-in formatter map
+
+| Extension(s) | Formatter (in preference order) | Notes |
+|---|---|---|
+| `.py`, `.pyi` | `ruff format` → `black` | Uses `ruff format --quiet --no-cache` if `ruff` on PATH; falls back to `black --quiet` |
+| `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.json`, `.css`, `.scss`, `.less`, `.html`, `.md`, `.yaml`, `.yml` | `prettier` | Run with `--no-config --no-editorconfig` — workspace JS/TS config is never loaded |
+| `.go` | `gofmt` | `gofmt -w` |
+| `.rs` | `rustfmt` | `rustfmt --quiet` |
+
+### Custom formatter overrides (`formatters`)
+
+Pass `formatters` as a dict mapping lowercase extension → `(tool_name, argv_template)`:
+
+```python
+edit_tools = create_edit_tools(
+    post_edit_format="auto",
+    formatters={
+        ".py": ("black", ["black", "--quiet"]),
+        # {path} placeholder is substituted; if absent, path is appended
+        ".ts": ("local-prettier", ["./node_modules/.bin/prettier", "--write", "{path}"]),
+    },
+)
+```
+
+- `argv_template` entries may include the literal `"{path}"` placeholder, which is replaced with the file path.
+- If no entry contains `"{path}"`, the path is appended to the end of the argv.
+- Unspecified extensions fall back to the built-in defaults.
+- Relative commands (e.g. `./node_modules/.bin/prettier`) resolve relative to the **edited file's directory**, not CWD.
+
+### Guarantees
+
+- **Default is unchanged** — `"off"` keeps byte-for-byte identical output to all prior versions.
+- **Never breaks an edit** — a missing, slow, or crashing formatter is silently skipped (logged at `DEBUG`).
+- **Bounded** — same 10-second timeout as diagnostics; timeouts are swallowed.
+- **Safe hash update** — the on-disk hash baseline is only refreshed when the formatter exits `0`. A partial write from a non-zero exit is never adopted as the new baseline.
+- **Security** — `prettier` runs with `--no-config --no-editorconfig` so workspace-controlled JS/TS configs cannot execute code.
+
+---
+
 ## Configuration Options
 
 ### File Editing Functions
@@ -586,6 +707,8 @@ src/calc.py:1:18: F821 Undefined name `c`
 | Parameter | Type | Default | Purpose |
 |---|---|---|---|
 | `post_edit_diagnostics` | `str` (`"auto"` \| `"on"` \| `"off"`) | `"auto"` | Run a per-file checker after a successful edit and append concise diagnostics. See [Post-edit Diagnostics](#post-edit-diagnostics). Invalid values fall back to `"auto"`. |
+| `post_edit_format` | `str` (`"off"` \| `"auto"` \| `"on"`) | `"off"` | Run a language-appropriate formatter after a successful edit and persist the result. See [Post-edit Formatting](#post-edit-formatting). Invalid values fall back to `"off"`. |
+| `formatters` | `Optional[dict]` | `None` | Override map: lowercase extension (e.g. `".py"`) → `(tool_name, argv_template)`. Unspecified extensions fall back to built-in defaults. |
 
 ```python
 # Single unique match — guard fires automatically after a prior read
@@ -752,6 +875,10 @@ File operations respect workspace boundaries. Paths outside the workspace are re
 
 <Accordion title="Post-edit diagnostics mode">
 Leave `post_edit_diagnostics` at its default (`"auto"`). When the checker reports problems, the tool result includes a `Diagnostics (<tool>):` block — instruct the agent to fix the reported issues in its next edit. Switch to `"on"` if you want positive `no problems found` confirmations in traces, or `"off"` if you're in a sandbox with no checkers available.
+</Accordion>
+
+<Accordion title="Post-edit formatting mode">
+Default is `"off"` — no overhead, identical output to pre-existing behaviour. Set `post_edit_format="auto"` when you want the agent's edits automatically tidied by your project's formatter. A missing or failing formatter never blocks a successful edit. Pin a project-specific formatter via `formatters` to override the built-in defaults (e.g. use `black` instead of `ruff format` for Python files).
 </Accordion>
 </AccordionGroup>
 
