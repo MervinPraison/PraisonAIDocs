@@ -4,9 +4,80 @@ description: "Thread-safe chat history and cache management"
 icon: "lock"
 ---
 
-# Thread-Safe Agent State
+PraisonAI protects chat history, caches, and session state when agents run from multiple threads or async tasks.
 
-PraisonAI Agents v0.5.0+ includes thread-safe management of chat history and caches; PR #1567 makes the underlying lock re-entrant and adds a per-event-loop async lock.
+```python
+from praisonaiagents import Agent
+import threading
+
+agent = Agent(name="Assistant", instructions="You are helpful.")
+
+def worker(prompt):
+    agent.chat(prompt)
+
+threads = [threading.Thread(target=worker, args=(f"Question {i}",)) for i in range(5)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+
+```mermaid
+graph LR
+    subgraph "Thread Safety"
+        T1[🧵 Thread 1] --> Lock[🔒 AsyncSafeState]
+        T2[🧵 Thread 2] --> Lock
+        Lock --> History[💬 chat_history]
+    end
+
+    classDef thread fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef lock fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef shared fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class T1,T2 thread
+    class Lock lock
+    class History shared
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Multi-threaded Chat">
+```python
+from praisonaiagents import Agent
+import threading
+
+agent = Agent(name="ThreadSafeAgent", instructions="You are helpful.")
+
+def worker(prompt):
+    response = agent.chat(prompt)
+    print(f"Response: {response[:50]}...")
+
+threads = [threading.Thread(target=worker, args=(f"Question {i}",)) for i in range(5)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+```
+</Step>
+
+<Step title="Async Concurrent Tasks">
+```python
+import asyncio
+from praisonaiagents import Agent
+
+agent = Agent(name="AsyncAgent")
+
+async def async_chat(prompt):
+    return agent.chat(prompt)
+
+async def main():
+    results = await asyncio.gather(*[async_chat(f"Question {i}") for i in range(5)])
+
+asyncio.run(main())
+```
+</Step>
+</Steps>
 
 <Warning>
 **Behaviour change in PR #1548**: `run_sync()` now raises `RuntimeError` when called from inside a running event loop. Previously it would auto-fallback to a background loop.
@@ -217,48 +288,35 @@ Reads inside the lock guarantee that a metadata merge picks up any messages anot
 **Behaviour change in PR #1709**: `FileLock.__enter__` now raises `IOError` instead of returning silently on lock-acquisition timeout. If you have custom code that uses `FileLock` directly from `praisonaiagents.session.store`, wrap it in a `try/except IOError` or raise the timeout via `DefaultSessionStore(lock_timeout=...)`.
 </Warning>
 
----
-
-## Related
-
-<CardGroup cols={2}>
-<Card title="Agent Cloning" icon="copy" href="/docs/features/agent-cloning">
-  Clone agents for channel isolation
-</Card>
-</CardGroup>
-
 ## Best Practices
 
-### Do: Use Agent Methods
-
+<AccordionGroup>
+<Accordion title="Use agent methods">
+Call `agent.chat()` or `agent.start()` — these acquire locks internally.
 ```python
-# Good - thread-safe
 response = agent.chat("Hello")
 ```
+</Accordion>
 
-### Don't: Bypass the Property Interface
-
+<Accordion title="Avoid direct list mutation">
+Do not append to `chat_history` directly; use agent methods or the locked setter.
 ```python
-# Bad - bypasses locks (direct list mutation)
+# Bad — bypasses locks
 agent.chat_history.append({"role": "user", "content": "Hello"})
 
-# Good - uses locked setter
-agent.chat_history = agent.chat_history + [{"role": "user", "content": "Hello"}]
-
-# Better - use agent methods
+# Good
 agent.chat("Hello")
 ```
+</Accordion>
 
-<Note>
-Reads and full replacements via `agent.chat_history = [...]` are now safe out-of-the-box. The wrapper is only needed for custom compound operations that require atomic read-modify-write sequences.
-</Note>
+<Accordion title="Clear history safely">
+Use `agent.clear_history()` rather than assigning an empty list from multiple threads.
+</Accordion>
 
-### Do: Clear History Safely
-
-```python
-# Good - use provided method
-agent.clear_history()  # Thread-safe
-```
+<Accordion title="Serialise mixed sync/async callers">
+Sync and async locks are independent since PR #1567 — add an external lock when both contexts mutate history.
+</Accordion>
+</AccordionGroup>
 
 ## Async Considerations
 
@@ -423,13 +481,14 @@ graph LR
 Each `BaseAutoGenerator` owns its own OpenAI client — no cross-instance sharing, no LRU eviction surprises.
 
 ```python
+import os
 from praisonai import PraisonAI
 
 # Each PraisonAI instance constructs its own auto-generator, which owns
 # a single OpenAI client. Two concurrent instances cannot evict each
 # other's client — even with identical API keys.
-team_a = PraisonAI(auto="Draft a marketing plan", api_key="sk-team-a")
-team_b = PraisonAI(auto="Draft a technical doc", api_key="sk-team-b")
+team_a = PraisonAI(auto="Draft a marketing plan", api_key=os.getenv("OPENAI_API_KEY"))
+team_b = PraisonAI(auto="Draft a technical doc", api_key=os.getenv("OPENAI_API_KEY"))
 
 team_a.run()  # safe to run in parallel threads
 team_b.run()
@@ -442,12 +501,13 @@ The client is created lazily on first structured-completion call. `__del__` was 
 For power users building generators directly:
 
 ```python
+import os
 from praisonai.auto import BaseAutoGenerator
 
 # Sync context manager
 with BaseAutoGenerator(config_list=[{
     "model": "gpt-4o-mini",
-    "api_key": "sk-...",
+    "api_key": os.getenv("OPENAI_API_KEY"),
     "base_url": None,
 }]) as gen:
     # _get_openai_client() is double-checked-locked; calling it from
@@ -457,7 +517,7 @@ with BaseAutoGenerator(config_list=[{
 # Async context manager
 async with BaseAutoGenerator(config_list=[{
     "model": "gpt-4o-mini",
-    "api_key": "sk-...",
+    "api_key": os.getenv("OPENAI_API_KEY"),
     "base_url": None,
 }]) as gen:
     result = await gen._astructured_completion(MyModel, messages=[...])
@@ -564,9 +624,15 @@ scheduler.stop()  # returns within ms, even if a backoff sleep was in progress
 
 This eliminated the singleton-config-bleed and first-caller-CWD-wins bugs while keeping `cleanup_runtime()` and convenience functions like `resolve_tool()` source-compatible.
 
+---
 
 ## Related
 
-- [Thread Safety CLI](/docs/cli/thread-safety)
-- [Lite Package](/docs/features/lite-package)
-- [Agent Module](/docs/sdk/praisonaiagents/agent/agent)
+<CardGroup cols={2}>
+<Card title="Agent Cloning" icon="copy" href="/docs/features/agent-cloning">
+  Clone agents for channel isolation
+</Card>
+<Card title="Rate Limiter" icon="gauge" href="/docs/features/rate-limiter">
+  Thread-safe rate limiting across agents
+</Card>
+</CardGroup>
