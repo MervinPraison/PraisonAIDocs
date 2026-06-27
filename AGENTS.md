@@ -59,14 +59,17 @@ Documentation MUST reflect SDK ground truth.
 
 | Content Type | SDK Location | Docs Location |
 |--------------|--------------|---------------|
-| Feature configs | `praisonaiagents/config/feature_configs.py` | `docs/concepts/*.mdx` |
-| Agent class | `praisonaiagents/agent/agent.py` | `docs/concepts/agents.mdx` |
-| MCP integration | `praisonaiagents/mcp/mcp.py` | `docs/concepts/mcp.mdx` |
-| Skills | `praisonaiagents/skills/` | `docs/concepts/skills.mdx` |
-| Memory | `praisonaiagents/memory/` | `docs/concepts/memory.mdx` |
-| Knowledge | `praisonaiagents/knowledge/` | `docs/concepts/knowledge.mdx` |
+| Feature configs | `praisonaiagents/config/feature_configs.py` | `docs/features/*.mdx` |
+| Agent class | `praisonaiagents/agent/agent.py` | `docs/features/` (new pages) or `docs/concepts/agents.mdx` (existing, human-only) |
+| MCP integration | `praisonaiagents/mcp/mcp.py` | `docs/features/` (new pages) or `docs/concepts/mcp.mdx` (existing, human-only) |
+| Skills | `praisonaiagents/skills/` | `docs/features/` (new pages) or `docs/concepts/skills.mdx` (existing, human-only) |
+| Memory | `praisonaiagents/memory/` | `docs/features/` (new pages) or `docs/concepts/memory.mdx` (existing, human-only) |
+| Knowledge | `praisonaiagents/knowledge/` | `docs/features/` (new pages) or `docs/concepts/knowledge.mdx` (existing, human-only) |
 
-In **PraisonAIDocs**, “SDK Location” paths are under **repo root** `praisonaiagents/` (not `src/`).
+> [!CAUTION]
+> **AI agents: always write new pages to `docs/features/`** — the `docs/concepts/*.mdx` paths listed above are existing human-approved pages (read-only for AI). See §1.9 (Folder Placement Rules) for the full rules.
+
+In **PraisonAIDocs**, "SDK Location" paths are under **repo root** `praisonaiagents/` (not `src/`).
 
 **Reference folders (check these for any doc proposal, edit, or new page):** repo-root `praisonaiagents/` and `praisonai/`. Synced daily via `update_repos.sh` / `.github/workflows/update-repos.yml`. Reject or correct proposals that conflict with code there; do not document behaviour absent from those trees (use TS/Rust paths below when documenting those SDKs).
 
@@ -74,18 +77,20 @@ In **PraisonAIDocs**, “SDK Location” paths are under **repo root** `praisona
 
 PraisonAI has three SDK implementations. Use these paths as source of truth:
 
+> **Path note:** Only the Python SDK is synced into this repo at `praisonaiagents/` (source of truth for Python docs). The TypeScript and Rust upstream paths below are in the separate `praisonai-package` submodule and are **not** present in this repo root — they are used only by the auto-generation scripts.
+
 | SDK | Source Code Path | Documentation Path | Parity Tracker |
 |-----|------------------|-------------------|----------------|
-| **Python** | `praisonai-package/src/praisonai-agents/` | `docs/concepts/`, `docs/features/` | `docs/features/DOCS_PARITY.md` |
-| **TypeScript/JS** | `praisonai-package/src/praisonai-ts/src/` | `docs/js/` | `docs/js/DOCS_PARITY.md` |
-| **Rust** | `praisonai-package/src/praisonai-rust/src/` | `docs/rust/` | `docs/rust/DOCS_PARITY.md` |
+| **Python** | Repo root `praisonaiagents/` (synced copy; upstream: `praisonai-package/src/praisonai-agents/`) | `docs/features/`, `docs/concepts/` (human-only) | `docs/features/DOCS_PARITY.md` |
+| **TypeScript/JS** | `praisonai-package/src/praisonai-ts/src/` (submodule only) | `docs/js/` | `docs/js/DOCS_PARITY.md` |
+| **Rust** | `praisonai-package/src/praisonai-rust/src/` (submodule only) | `docs/rust/` | `docs/rust/DOCS_PARITY.md` |
 
 **Documentation Parity Trackers** show which features have documentation and which need docs:
 - ✅ Documented categories (real content)
 - ⚠️ Stub documentation (< 50 lines, needs content)
 - ❌ Undocumented categories (needs documentation)
 
-### 1.5 TypeScript SDK Structure
+### 1.6 TypeScript SDK Structure
 
 ```
 praisonai-ts/src/
@@ -97,7 +102,7 @@ praisonai-ts/src/
 └── index.ts          # Main exports
 ```
 
-### 1.6 Rust SDK Structure
+### 1.7 Rust SDK Structure
 
 ```
 praisonai-rust/src/
@@ -109,7 +114,7 @@ praisonai-rust/src/
 └── lib.rs            # Main exports
 ```
 
-### 1.7 Auto-Managed Documentation Sections
+### 1.8 Auto-Managed Documentation Sections
 
 > [!WARNING]
 > **DO NOT manually edit** the following sections in `docs.json`:
@@ -124,17 +129,12 @@ cd praisonai-package
 python3 src/praisonai/scripts/generate_docs_parity.py --copy-docs
 ```
 
-**Full command for agents:**
-```bash
-/usr/bin/python3 /Users/praison/praisonai-package/src/praisonai/scripts/generate_docs_parity.py --copy-docs
-```
-
 This command:
 1. Scans SDK features and docs for all three SDKs
 2. Generates `DOCS_PARITY.md` reports
 3. Copies reports to `docs/features/`, `docs/js/`, `docs/rust/`
 
-### 1.8 Folder Placement Rules
+### 1.9 Folder Placement Rules
 
 > [!CAUTION]
 > **AI agents MUST follow these rules strictly. Violations will cause PRs to be rejected.**
@@ -159,7 +159,7 @@ CRITICAL RULES FOR AI AGENTS:
 7. When reviewing PRs: flag any files in docs/concepts/ as violations
 ```
 
-### 1.9 AI Agent Behavioral Rules
+### 1.10 AI Agent Behavioral Rules
 
 ```
 MANDATORY for all AI agents working on this repository:
