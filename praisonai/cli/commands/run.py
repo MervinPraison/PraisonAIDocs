@@ -129,43 +129,71 @@ def _mcp_server_to_command(server: dict) -> Optional[tuple]:
     return command_str, env_str
 
 
-def _resolve_mcp_from_config(config) -> Optional[tuple]:
-    """Pick the first enabled local MCP server from resolved config.
+def _collect_mcp_servers_from_config(config) -> List[dict]:
+    """Collect all enabled MCP servers from resolved config.
 
-    The CLI ``--mcp`` flag accepts a single server command, so when wiring
-    project config we surface the first enabled stdio server.
+    Returns a list of normalized server dicts (both local stdio and remote
+    URL servers). The structured list is handed to the core MCP client, which
+    already supports stdio, SSE, HTTP-stream and websocket transports — so a
+    project that declares multiple and/or remote servers gets every enabled
+    one wired, not just the first stdio one.
 
     Returns:
-        Tuple of (command_string, env_string) or None.
+        List of server config dicts (possibly empty).
     """
     mcp = getattr(config, "mcp", None) or {}
     if not isinstance(mcp, dict):
-        return None
+        return []
     servers = mcp.get("servers") or {}
     if not isinstance(servers, dict):
-        return None
+        return []
 
-    selected = None
-    enabled_local = []
+    collected: List[dict] = []
     for name, server in servers.items():
-        result = _mcp_server_to_command(server)
-        if result:
-            enabled_local.append(name)
-            if selected is None:
-                selected = result
+        if not isinstance(server, dict):
+            continue
+        if server.get("enabled") is False:
+            continue
+        entry = dict(server)
+        entry.setdefault("name", name)
+        collected.append(entry)
+    return collected
 
-    # The CLI command-string path supports a single server. Warn so a user who
-    # declared several enabled local servers knows only the first is wired.
-    if len(enabled_local) > 1:
-        import warnings
-        warnings.warn(
-            "Multiple enabled local MCP servers found in config "
-            f"({', '.join(enabled_local)}); only '{enabled_local[0]}' will be "
-            "used via the run command path.",
-            stacklevel=2,
-        )
 
-    return selected
+def _build_mcp_tools(
+    mcp: Optional[str],
+    mcp_env: Optional[str],
+    mcp_servers: Optional[List[dict]],
+    verbose: bool = False,
+) -> list:
+    """Build aggregated MCP tools from a command string and/or structured list.
+
+    Both the single ``--mcp`` command string (ad-hoc) and every enabled server
+    from project config (local stdio *and* remote/URL) are wired, so the run
+    path exposes all configured MCP servers to the agent — not just the first.
+
+    Returns:
+        A flat list of MCP tool callables (possibly empty).
+    """
+    tools: list = []
+    try:
+        from ..features.mcp import MCPHandler
+    except ImportError:
+        return tools
+
+    handler = MCPHandler(verbose=verbose)
+
+    if mcp:
+        mcp_instance = handler.create_mcp_tools(mcp, mcp_env)
+        if mcp_instance:
+            tools.extend(list(mcp_instance))
+
+    for server in mcp_servers or []:
+        mcp_instance = handler.create_mcp_from_server(server)
+        if mcp_instance:
+            tools.extend(list(mcp_instance))
+
+    return tools
 
 
 def _permissions_from_config(config) -> Optional[dict]:
@@ -223,21 +251,25 @@ def _apply_config_defaults(
     flags always take precedence (they are passed in already-resolved and only
     config-derived values fill the gaps).
 
+    All enabled MCP servers from config — multiple local stdio servers *and*
+    remote/URL servers — are collected into a structured list so the run path
+    can wire every one of them, not just the first stdio server.
+
     Returns:
-        Tuple of (mcp, mcp_env, permissions_config) with config defaults applied.
+        Tuple of (mcp, mcp_env, permissions_config, mcp_servers) with config
+        defaults applied. ``mcp_servers`` is a (possibly empty) list of
+        structured server config dicts.
     """
+    mcp_servers: List[dict] = []
     try:
         config = resolve_config()
     except (ValueError, OSError):
-        return mcp, mcp_env, permissions_config
+        return mcp, mcp_env, permissions_config, mcp_servers
 
-    # MCP: only fill in if no explicit --mcp flag was given.
-    if not mcp:
-        resolved_mcp = _resolve_mcp_from_config(config)
-        if resolved_mcp:
-            mcp, config_env = resolved_mcp
-            if not mcp_env and config_env:
-                mcp_env = config_env
+    # MCP: collect all enabled servers (local + remote) from config. The
+    # explicit single-string ``--mcp`` flag, when given, is wired separately
+    # via ``args.mcp`` and merged alongside these by the run handler.
+    mcp_servers = _collect_mcp_servers_from_config(config)
 
     # Permissions: merge config rules underneath CLI-provided rules.
     config_perms = _permissions_from_config(config)
@@ -249,7 +281,143 @@ def _apply_config_defaults(
         else:
             permissions_config = config_perms
 
-    return mcp, mcp_env, permissions_config
+    return mcp, mcp_env, permissions_config, mcp_servers
+
+
+def _checkpoints_auto_enabled() -> bool:
+    """Whether automatic run-checkpointing is enabled via project config.
+
+    Reads the ``checkpoints.auto`` key from the resolved project config
+    (stored under ``extra``). Defaults to ``True`` so interactive terminal
+    runs get an automatic safety net; opt out with ``--no-checkpoint`` or
+    ``checkpoints: {auto: false}``.
+    """
+    try:
+        config = resolve_config()
+    except (ValueError, OSError):
+        return True
+
+    checkpoints = (getattr(config, "extra", None) or {}).get("checkpoints")
+    if isinstance(checkpoints, dict) and "auto" in checkpoints:
+        return bool(checkpoints["auto"])
+    return True
+
+
+def _auto_checkpoint(label: str, *, no_checkpoint: bool, workspace_dir: Optional[str] = None) -> None:
+    """Create an automatic checkpoint of the workspace before a run.
+
+    ``workspace_dir`` defaults to the current directory but should be the
+    directory of the project being run (e.g. the directory containing a target
+    YAML file) so the checkpoint protects the files the run will actually
+    touch.
+
+    Best-effort and quiet: any failure (e.g. protected path, no git, no
+    changes) is swallowed so a checkpoint problem never blocks the run and the
+    auto-checkpoint never leaks into machine-readable run output.
+    """
+    if no_checkpoint or not _checkpoints_auto_enabled():
+        return
+
+    import asyncio
+    import os
+
+    output = get_output_controller()
+    try:
+        from ..features.checkpoints import CheckpointsHandler
+
+        handler = CheckpointsHandler(workspace_dir=workspace_dir or os.getcwd())
+        asyncio.run(handler.save(label, allow_empty=False, quiet=True))
+    except Exception as e:  # pragma: no cover - defensive, never block the run
+        if getattr(output, "is_verbose", False):
+            output.print_info(f"Auto-checkpoint skipped: {e}")
+
+
+def _restore_checkpoint(ref: str, workspace_dir: Optional[str] = None) -> None:
+    """Restore the workspace to a checkpoint reference ('last' or an id)."""
+    import asyncio
+    import os
+
+    from ..features.checkpoints import CheckpointsHandler
+
+    handler = CheckpointsHandler(workspace_dir=workspace_dir or os.getcwd())
+
+    async def _run() -> bool:
+        service = await handler._get_service()
+        checkpoints = await service.list_checkpoints(limit=100)
+        if not checkpoints:
+            handler._print_error("No checkpoints found to restore")
+            return False
+        if ref in ("last", "latest"):
+            target = checkpoints[0].id
+        else:
+            # Exact id/short_id first, then a unique prefix; reject ambiguous
+            # prefixes so we never restore the wrong workspace.
+            exact = [cp.id for cp in checkpoints if cp.id == ref or cp.short_id == ref]
+            if exact:
+                target = exact[0]
+            else:
+                prefix_matches = [cp.id for cp in checkpoints if cp.id.startswith(ref)]
+                if len(prefix_matches) == 1:
+                    target = prefix_matches[0]
+                elif len(prefix_matches) > 1:
+                    handler._print_error(f"Ambiguous checkpoint reference: {ref}")
+                    return False
+                else:
+                    handler._print_error(f"No checkpoint found for: {ref}")
+                    return False
+        return await handler.restore(target)
+
+    if not asyncio.run(_run()):
+        raise typer.Exit(1)
+
+
+def _try_attach_runtime(
+    prompt: str,
+    *,
+    model: Optional[str],
+    output_mode: Optional[str],
+    session_id: Optional[str],
+) -> bool:
+    """Forward a plain prompt to a warm runtime when one is running.
+
+    Returns True when the request was handled by the warm runtime (so the caller
+    should skip in-process execution), or False to fall back to the normal
+    in-process path. Any runtime error is treated as a transparent fall-back.
+
+    Only the simple text path is attached: structured ``actions``/``json`` output
+    modes and session continuity stay in-process to preserve their behaviour.
+    """
+    # Structured output modes have richer in-process event bridging; don't attach.
+    if output_mode in ("actions", "json", "stream", "stream-json"):
+        return False
+
+    try:
+        from ...runtime import get_runtime_descriptor, RuntimeClient, RuntimeUnavailable
+    except ImportError:
+        return False
+
+    # Require a version-compatible runtime: a stale (major-mismatched) server is
+    # not attached to, so the cold in-process path runs instead of silently
+    # talking to an incompatible runtime.
+    descriptor = get_runtime_descriptor(require_compatible=True)
+    if descriptor is None:
+        return False
+
+    output = get_output_controller()
+    try:
+        client = RuntimeClient(descriptor)
+        result = client.run(prompt, model=model, session_id=session_id)
+    except RuntimeUnavailable:
+        # Runtime went away mid-flight; fall back to in-process execution.
+        return False
+
+    output.emit_result(
+        message="Prompt completed",
+        data={"result": str(result) if result else None},
+    )
+    if result and not output.is_json_mode:
+        print(result)
+    return True
 
 
 @app.callback(invoke_without_command=True)
@@ -286,6 +454,11 @@ def run_main(
     # Custom definitions
     agent: Optional[str] = typer.Option(None, "--agent", "-a", help="Use a named custom agent"),
     command: Optional[str] = typer.Option(None, "--command", help="Execute a named custom command"),
+    # Checkpoint / rewind
+    no_checkpoint: bool = typer.Option(False, "--no-checkpoint", help="Disable automatic file checkpoint before the run"),
+    restore: Optional[str] = typer.Option(None, "--restore", help="Restore the workspace to a checkpoint id (or 'last') and exit"),
+    # Warm-runtime live session: tag this run so other terminals can `attach`.
+    attach: Optional[str] = typer.Option(None, "--attach", help="Run on the warm runtime under this session id so other terminals can observe it via `praisonai attach <id>`"),
 ):
     """
     Run agents from a file or prompt.
@@ -300,7 +473,13 @@ def run_main(
     """
     output = get_output_controller()
     _ = get_current_context()  # Initialize context
-    
+
+    # Rewind: restore the workspace to a prior checkpoint and exit. Handled
+    # before any execution so `praisonai run --restore last` is a pure undo.
+    if restore:
+        _restore_checkpoint(restore)
+        return
+
     # Early credential check before any processing
     if target:  # Only check if we actually have something to run
         from ...llm.credentials import is_configured
@@ -366,7 +545,15 @@ def run_main(
     if continue_session and session:
         output.print_error("Cannot use both --continue and --session together")
         raise typer.Exit(1)
-    
+
+    # --attach tags a warm-runtime run so other terminals can observe it, but
+    # only the direct-prompt path forwards to the warm runtime. Reject it up
+    # front on profile/custom-agent/custom-command flows so users never
+    # pass --attach and silently get a session that produces no events.
+    if attach and (agent or command or profile or profile_deep):
+        output.print_error("--attach is only supported for direct prompt runs")
+        raise typer.Exit(1)
+
     # Handle custom agent or command
     if agent:
         from ..features.custom_definitions import load_agent_from_name
@@ -403,15 +590,22 @@ def run_main(
         return
     
     if command:
-        from ..features.custom_definitions import interpolate_command_template
-        prompt = interpolate_command_template(command, target or "")
+        from ..features.custom_definitions import (
+            ShellSubstitutionError,
+            interpolate_command_template,
+        )
+        try:
+            prompt = interpolate_command_template(command, target or "")
+        except ShellSubstitutionError as exc:
+            output.print_error(str(exc))
+            raise typer.Exit(1)
         if not prompt:
             output.print_error(f"Command '{command}' not found")
             raise typer.Exit(1)
         
         # Run the interpolated command as a prompt
         permissions_config = _parse_permissions(allow, deny, permissions, permission_default)
-        mcp_command, mcp_env, permissions_config = _apply_config_defaults(
+        mcp_command, mcp_env, permissions_config, mcp_servers = _apply_config_defaults(
             None, None, permissions_config
         )
         _run_prompt(
@@ -432,6 +626,7 @@ def run_main(
             permissions_config=permissions_config,
             mcp=mcp_command,
             mcp_env=mcp_env,
+            mcp_servers=mcp_servers,
             continue_session=continue_session,
             session=session,
             fork=fork,
@@ -482,6 +677,29 @@ def run_main(
     # Check if target is a file or prompt
     import os
     is_file = os.path.exists(target) and (target.endswith('.yaml') or target.endswith('.yml'))
+
+    # Only the direct-prompt path forwards to the warm runtime, so reject
+    # --attach on file execution rather than letting it run with no observable
+    # session (the attach client would wait forever for events).
+    if attach and is_file:
+        output.print_error("--attach is only supported for direct prompt runs")
+        raise typer.Exit(1)
+
+    # Auto-checkpoint before file-based runs so a bad turn can be rewound with
+    # `praisonai run --restore last`. Scoped to YAML-file runs (which mutate
+    # project files) and snapshotted against the file's own directory so the
+    # checkpoint protects the right workspace. Plain-prompt runs don't touch
+    # project files, so they skip checkpointing (avoiding spurious "no changes"
+    # noise). Best-effort and gated by config (`checkpoints.auto`, default on)
+    # and `--no-checkpoint`.
+    if is_file:
+        from ..state.identifiers import get_current_context as _get_ctx
+        _run_id = getattr(_get_ctx(), "run_id", None)
+        _auto_checkpoint(
+            f"run:{_run_id}" if _run_id else "auto checkpoint before run",
+            no_checkpoint=no_checkpoint,
+            workspace_dir=os.path.dirname(os.path.abspath(target)) or None,
+        )
     
     # Handle profiling
     if profile or profile_deep:
@@ -534,7 +752,7 @@ def run_main(
     else:
         # Run as prompt
         permissions_config = _parse_permissions(allow, deny, permissions, permission_default)
-        mcp_command, mcp_env, permissions_config = _apply_config_defaults(
+        mcp_command, mcp_env, permissions_config, mcp_servers = _apply_config_defaults(
             None, None, permissions_config
         )
         _run_prompt(
@@ -555,10 +773,12 @@ def run_main(
             permissions_config=permissions_config,
             mcp=mcp_command,
             mcp_env=mcp_env,
+            mcp_servers=mcp_servers,
             continue_session=continue_session,
             session=session,
             fork=fork,
             no_save=no_save,
+            attach_session=attach,
         )
 
 
@@ -602,7 +822,7 @@ def _run_from_file(
         auto_save_name = None
         
         if continue_session or session or fork:
-            from ..state.project_sessions import get_project_session_store, find_last_session
+            from ..state.project_sessions import find_last_session, session_exists_anywhere
             
             if continue_session:
                 # Find last session for this project
@@ -614,8 +834,7 @@ def _run_from_file(
                     
             elif session:
                 # Use specific session
-                project_store = get_project_session_store()
-                if project_store.session_exists(session):
+                if session_exists_anywhere(session):
                     session_id = session
                     output.print_info(f"Resuming session: {session_id}")
                 else:
@@ -686,10 +905,12 @@ def _run_prompt(
     permissions_config: Optional[dict] = None,
     mcp: Optional[str] = None,
     mcp_env: Optional[str] = None,
+    mcp_servers: Optional[List[dict]] = None,
     continue_session: bool = False,
     session: Optional[str] = None,
     fork: bool = False,
     no_save: bool = False,
+    attach_session: Optional[str] = None,
 ):
     """Run a direct prompt."""
     output = get_output_controller()
@@ -710,7 +931,7 @@ def _run_prompt(
         auto_save_name = None
         
         if continue_session or session or fork:
-            from ..state.project_sessions import get_project_session_store, find_last_session
+            from ..state.project_sessions import find_last_session, session_exists_anywhere
             
             if continue_session:
                 # Find last session for this project
@@ -722,8 +943,7 @@ def _run_prompt(
                     
             elif session:
                 # Use specific session
-                project_store = get_project_session_store()
-                if project_store.session_exists(session):
+                if session_exists_anywhere(session):
                     session_id = session
                     output.print_info(f"Resuming session: {session_id}")
                 else:
@@ -745,6 +965,31 @@ def _run_prompt(
         if not no_save:
             import uuid
             auto_save_name = session_id or "session-" + str(uuid.uuid4())[:8]
+
+        # Detect-and-attach: if a warm runtime is running, forward the plain
+        # prompt to it (skipping per-invocation cold-start) and fall back to
+        # in-process execution otherwise. Only the simple text path attaches;
+        # per-invocation tool/approval/memory overrides stay in-process so their
+        # behaviour is preserved exactly.
+        # Session continuity/forking is handled in-process; the warm runtime does
+        # not carry session state, so any explicit session flag stays local.
+        # Default auto-save also stays in-process until the warm path can persist
+        # sessions the same way as the normal run path.
+        runtime_eligible = no_save and not any([
+            mcp, mcp_servers, tools, toolset, approval, approve_all_tools,
+            memory, permissions_config, continue_session, session, fork,
+        ])
+        # When --attach <id> is given, tag the warm-runtime run with that id so
+        # other terminals (`praisonai attach <id>`) observe its live events.
+        runtime_session_id = attach_session or session_id
+        if runtime_eligible and _try_attach_runtime(
+            prompt,
+            model=model,
+            output_mode=output_mode,
+            session_id=runtime_session_id,
+        ):
+            return
+
         if output_mode == "actions":
             from praisonaiagents import Agent
             from ..state.project_sessions import build_cli_memory_config, apply_cli_session_continuity
@@ -771,7 +1016,13 @@ def _run_prompt(
             memory_cfg = build_cli_memory_config(session_id=session_id, auto_save=auto_save_name)
             if memory_cfg is not None:
                 agent_config["memory"] = memory_cfg
-            
+
+            # Wire all configured MCP servers (ad-hoc --mcp + config local/remote).
+            if mcp or mcp_servers:
+                mcp_tools = _build_mcp_tools(mcp, mcp_env, mcp_servers, verbose=verbose)
+                if mcp_tools:
+                    agent_config["tools"] = list(agent_config.get("tools", [])) + mcp_tools
+
             agent = Agent(**agent_config)
             if session_id or auto_save_name:
                 apply_cli_session_continuity(agent, session_id or auto_save_name, auto_save=auto_save_name)
@@ -837,6 +1088,7 @@ def _run_prompt(
         args.telemetry = False
         args.mcp = mcp
         args.mcp_env = mcp_env
+        args.mcp_servers = mcp_servers or None
         args.fast_context = None
         args.handoff = None
         args.auto_memory = False
@@ -920,15 +1172,14 @@ def _run_from_file_profiled(
     auto_save_name = None
     
     if continue_session or session or fork:
-        from ..state.project_sessions import get_project_session_store, find_last_session
+        from ..state.project_sessions import find_last_session, session_exists_anywhere
         
         if continue_session:
             session_id = find_last_session()
             if not session_id:
                 typer.echo("Warning: No previous sessions found. Starting new session.", err=True)
         elif session:
-            project_store = get_project_session_store()
-            if project_store.session_exists(session):
+            if session_exists_anywhere(session):
                 session_id = session
                 
                 if fork:
@@ -1047,7 +1298,7 @@ def _run_custom_agent(
         auto_save_name = None
         
         if continue_session or session or fork:
-            from ..state.project_sessions import get_project_session_store, find_last_session
+            from ..state.project_sessions import find_last_session, session_exists_anywhere
             
             if continue_session:
                 session_id = find_last_session()
@@ -1057,8 +1308,7 @@ def _run_custom_agent(
                     output.print_warning("No previous sessions found. Starting new session.")
                     
             elif session:
-                project_store = get_project_session_store()
-                if project_store.session_exists(session):
+                if session_exists_anywhere(session):
                     session_id = session
                     output.print_info(f"Resuming session: {session_id}")
                 else:
@@ -1166,15 +1416,14 @@ def _run_prompt_profiled(
     auto_save_name = None
     
     if continue_session or session or fork:
-        from ..state.project_sessions import get_project_session_store, find_last_session
+        from ..state.project_sessions import find_last_session, session_exists_anywhere
         
         if continue_session:
             session_id = find_last_session()
             if not session_id:
                 typer.echo("Warning: No previous sessions found. Starting new session.", err=True)
         elif session:
-            project_store = get_project_session_store()
-            if project_store.session_exists(session):
+            if session_exists_anywhere(session):
                 session_id = session
                 
                 if fork:

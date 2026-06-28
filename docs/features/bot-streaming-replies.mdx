@@ -15,13 +15,11 @@ graph LR
         C --> D[✅ Final Message]
     end
     
-    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,color:#fff
+    classDef tool fill:#189AB4,color:#fff
     
-    class A input
-    class B,C process
-    class D output
+    class D agent
+    class A,B,C tool
 ```
 
 <Note>
@@ -202,6 +200,68 @@ Live streaming (`draft` mode) works on **Telegram, Slack, and Discord** — each
 | `min_delta` | `int` | `120` | Minimum new characters in the buffer before an edit fires |
 | `placeholder_text` | `str` | `"🤔 Thinking..."` | Initial message text sent before any content arrives |
 | `progress_prefix` | `str` | `"🤔 "` | Prefix used in `progress` mode tool-status updates |
+| `disable_progressive_edits_after` | `int` | `3` | Consecutive recoverable edit failures before progressive editing is turned off for the rest of the stream — the completed answer is then delivered as a single final send |
+| `flood_backoff_factor` | `float` | `2.0` | Multiplier applied to the edit interval on each recoverable (flood / 429 / transient) failure |
+| `max_interval` | `float` | `30.0` | Cap in seconds for the adaptively widened edit interval — backoff stops growing past this |
+| `strip_reasoning_tags` | `bool` | `True` | Strip `<think>…</think>` and `<reasoning>…</reasoning>` spans from streamed and final output. Default ON — set to `false` to opt out |
+
+---
+
+## Flood-control
+
+Your Telegram bot is streaming a long answer during peak hours. Telegram starts returning 429 after the third edit. The streamer doubles its edit interval (1.5s → 3s → 6s → capped at `max_interval`). After `disable_progressive_edits_after` consecutive failures it stops editing entirely and waits — when `finalize()` fires it delivers the completed answer as a fresh message. The user never sees a stuck placeholder, never sees a partial reply, and the rest of your bot's chats are unaffected because the backoff is per-stream.
+
+<Note>
+Backoff is per-stream — `_current_min_interval` is mutated on the stream instance, not the shared `StreamingConfig`. A flood in one chat will never slow streaming in another.
+</Note>
+
+```mermaid
+graph TB
+    Edit[✏️ Try edit] --> OK{🔍 Succeeded?}
+    OK -->|Yes| Reset[✅ Reset fail streak]
+    OK -->|No, recoverable| Back[📈 fail_streak += 1<br/>interval *= backoff_factor<br/>capped at max_interval]
+    Back --> Cap{🔍 fail_streak ≥<br/>disable_progressive_edits_after?}
+    Cap -->|No| Edit
+    Cap -->|Yes| OffPath[🔌 Progressive edits OFF<br/>wait for finalize]
+    OffPath --> Final[📨 finalize: edit-then-send fallback<br/>full answer delivered]
+    Reset --> Edit
+
+    classDef try fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef happy fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Edit try
+    class OK,Cap check
+    class Reset,Final happy
+    class Back,OffPath warn
+```
+
+| Event | What the streamer does |
+|-------|----------------------|
+| Recoverable edit failure (flood / 429 / transient) | `fail_streak += 1`; `current_min_interval *= flood_backoff_factor` (capped at `max_interval`). Per-stream — does not mutate the shared `StreamingConfig` |
+| `fail_streak >= disable_progressive_edits_after` | Progressive editing turns OFF for the rest of this stream. Subsequent token events skip `_perform_update`. The placeholder is left in place until `finalize()` |
+| Non-recoverable edit failure | Logged at WARNING. Fail streak does NOT increment; progressive stays enabled |
+| Successful edit | `fail_streak` resets to 0 (recovery) |
+| `finalize(final_content)` | Strip reasoning tags (if enabled), try edit-in-place, fall back to `send_message` if edit fails |
+
+---
+
+## Reasoning-tag filtering
+
+**Default ON.** `<think>` and `<reasoning>` spans (case-insensitive, multi-line) are stripped from both streamed and final output. A trailing unclosed opening tag is also dropped so internal reasoning never leaks mid-stream while a block is still being produced. Set `strip_reasoning_tags: false` to opt out (for example, on a reasoning-transparency bot).
+
+```python
+from praisonai.bots._streaming import strip_reasoning_tags
+
+strip_reasoning_tags("Hi <think>secret</think> there")        # -> "Hi  there"
+strip_reasoning_tags("a <REASONING>x\ny</REASONING> b")       # -> "a  b"
+strip_reasoning_tags("Answer <think>still going")             # -> "Answer "
+```
+
+<Tip>
+Used to see `<think>` or `<reasoning>` spans land in your Telegram/Slack/Discord chat? Fixed in [PR #2356](https://github.com/MervinPraison/PraisonAI/pull/2356). Reasoning-tag filtering is now on by default. Upgrade `praisonai`.
+</Tip>
 
 ---
 
@@ -221,6 +281,11 @@ channels:
       min_delta: 120
       placeholder_text: "🤔 Thinking..."
       progress_prefix: "🤔 "
+      # New in #2356
+      disable_progressive_edits_after: 3
+      flood_backoff_factor: 2.0
+      max_interval: 30.0
+      strip_reasoning_tags: true
 ```
 
 ### Python API
@@ -257,6 +322,7 @@ streamer = DraftStreamer(
     channel_id="123456",
     config=StreamingConfig(mode=StreamingMode.DRAFT, min_interval=1.5),
     rate_limiter=None,                # optional, defaults from platform
+    platform="telegram",              # enables platform-specific recoverable-error classification
 )
 
 message_id = await streamer.start()                      # sends placeholder
@@ -305,8 +371,40 @@ bot.configure_streaming(StreamingConfig(
 The feature has zero impact on existing bots. Only channels with explicit `streaming:` configuration will use the new behavior. All other channels continue with the original single-message approach.
 </Accordion>
 
-<Accordion title="The final edit always contains the complete text">
-Even if every intermediate edit fails due to network issues or rate limits, the user will always see the full answer at the end when `finalize()` is called. This ensures reliability even in poor network conditions.
+<Accordion title="Final delivery is guaranteed even when edits are flooded">
+When `finalize()` runs, the streamer first tries to edit the placeholder with the full answer. If that edit fails (or progressive editing was already disabled by a flood-control strike), the streamer falls back to a fresh `send_message` so you always receive the completed answer. No stale "🤔 Thinking…" placeholder is left behind.
+
+```mermaid
+sequenceDiagram
+    participant Streamer
+    participant Adapter
+    participant User
+
+    Note over Streamer: finalize(final_content)
+    Streamer->>Streamer: strip_reasoning_tags(final_content)
+    Streamer->>Adapter: edit_message(placeholder_id, final_content)
+    alt edit succeeds
+        Adapter-->>User: ✅ placeholder replaced with full answer
+    else edit fails
+        Adapter-->>Streamer: error
+        Streamer->>Adapter: send_message(final_content)
+        Adapter-->>User: ✅ fresh message with full answer
+    end
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+<Accordion title="Used to see `<think>` or `<reasoning>` spans in your chat?">
+Fixed in [PR #2356](https://github.com/MervinPraison/PraisonAI/pull/2356). Reasoning-tag filtering is now on by default. Upgrade `praisonai` to get the fix automatically.
+</Accordion>
+
+<Accordion title="Bot reply got stuck mid-edit on a busy chat?">
+Fixed in [PR #2356](https://github.com/MervinPraison/PraisonAI/pull/2356). The streamer now backs off on 429/flood, and after 3 consecutive failures falls back to a single final send so you always get the completed answer. Tune `disable_progressive_edits_after` / `flood_backoff_factor` / `max_interval` per channel if your platform's rate limits differ.
 </Accordion>
 </AccordionGroup>
 

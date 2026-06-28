@@ -115,8 +115,24 @@ class BotSessionManager:
         # Agent instance never leaks one user's model to another. Keyed by
         # storage_key (same as _histories).
         self._model_overrides: Dict[str, Any] = {}
+        # Per-route toolset scope staged by a routing handler that cannot thread
+        # ``tool_policy`` through the adapter's own ``chat()`` call (Issue #2298).
+        # The gateway's injected on_message handler runs synchronously right
+        # before the adapter's ``_session.chat()`` in the same dispatch, so it
+        # stages the resolved policy here keyed by agent identity; ``chat()``
+        # consumes-and-clears it when no explicit ``tool_policy`` was passed.
+        # Keyed by ``id(agent)`` so a shared session serving multiple agents
+        # never crosses policies.
+        self._pending_tool_policies: Dict[int, Any] = {}
         # Session reset policy for automatic lifecycle management
         self._reset_policy = reset_policy or SessionResetPolicy(mode="none")
+        # Per-user last agent-emitted presentation. ``chat()`` keeps the return
+        # type ``str`` for backward compatibility; when an agent (or hook)
+        # returns a MessagePresentation/AgentReply, the portable presentation is
+        # captured here so channel adapters can render interactive UI via the
+        # existing per-channel renderers (text fallback otherwise). Keyed by
+        # storage_key and consumed via ``pop_last_presentation``.
+        self._last_presentation: Dict[str, Any] = {}
         # Track storage keys we've already fired SESSION_START for, so the
         # hook fires exactly once per session lifetime (until reset).
         self._seen_sessions: set = set()
@@ -384,6 +400,77 @@ class BotSessionManager:
             except Exception as e:
                 logger.warning("Failed to persist session to store: %s", e)
 
+    def set_pending_tool_policy(
+        self, agent: "Agent", tool_policy: Optional[Any]
+    ) -> None:
+        """Stage a per-route toolset scope for ``agent``'s next ``chat()`` turn.
+
+        Used by routing handlers (e.g. the gateway's injected Discord/Slack
+        ``on_message``) that resolve a :class:`ToolPolicy` but cannot thread it
+        through the adapter's own ``_session.chat()`` call (Issue #2298). The
+        handler runs synchronously right before that ``chat()`` in the same
+        dispatch, so the staged policy is consumed-and-cleared by the very next
+        ``chat()`` for the same agent. ``None`` clears any prior staging so a
+        trusted route never inherits an earlier untrusted route's scope.
+        """
+        if agent is None:
+            return
+        key = id(agent)
+        if tool_policy is None:
+            self._pending_tool_policies.pop(key, None)
+        else:
+            self._pending_tool_policies[key] = tool_policy
+
+    @staticmethod
+    def _apply_tool_policy(
+        agent: "Agent", tool_policy: Optional[Any]
+    ) -> Optional[Any]:
+        """Scope ``agent.tools`` per ``tool_policy`` for one turn (Issue #2298).
+
+        Returns a zero-arg callable that restores the agent's original tools,
+        or ``None`` when no scoping was applied (no policy, no tools, or the
+        policy removed nothing). The apply/restore mirrors the scheduler's
+        proven ``_apply_toolset_scope`` so attended/trusted uses of the same
+        shared agent are never affected.
+        """
+        if tool_policy is None:
+            return None
+        filter_tools = getattr(tool_policy, "filter_tools", None)
+        if not callable(filter_tools):
+            return None
+        original = getattr(agent, "tools", None)
+        if not original:
+            return None
+        try:
+            filtered = filter_tools(list(original))
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Tool policy could not scope agent tools: %s", e)
+            return None
+        if len(filtered) == len(original):
+            return None
+        try:
+            agent.tools = filtered
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("Tool policy could not assign scoped tools: %s", e)
+            return None
+
+        removed = len(original) - len(filtered)
+        logger.info(
+            "Route tool policy scoped agent tools for inbound turn: "
+            "%d -> %d (%d removed)",
+            len(original),
+            len(filtered),
+            removed,
+        )
+
+        def _restore() -> None:
+            try:
+                agent.tools = original
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning("Tool policy could not restore agent tools: %s", e)
+
+        return _restore
+
     async def chat(
         self,
         agent: "Agent",
@@ -395,6 +482,8 @@ class BotSessionManager:
         message_id: str = "",
         account: str = "",
         stream_callback: Optional[Any] = None,
+        tool_policy: Optional[Any] = None,
+        correlation_id: str = "",
     ) -> str:
         """Run ``agent.chat(prompt)`` with *user_id*-scoped history.
 
@@ -407,6 +496,14 @@ class BotSessionManager:
         Args:
             stream_callback: Optional async callback for streaming events.
                             When provided, events are bridged via agent.stream_emitter.
+            tool_policy: Optional per-route toolset scope (Issue #2298). When
+                            supplied, the agent's tools are filtered to the
+                            policy-allowed subset for the duration of this turn
+                            and restored afterwards, so an untrusted inbound
+                            route never advertises dangerous tools to the model
+                            while attended/trusted uses of the same shared agent
+                            stay unaffected. Anything exposing ``filter_tools``
+                            is accepted (e.g. ``ToolPolicy`` / ``RunPolicy``).
 
         N4 — Inbound DLQ: if a ``dlq`` was passed to ``__init__`` and
         ``agent.chat()`` raises, the failing message is persisted to
@@ -419,6 +516,35 @@ class BotSessionManager:
         and ``message_id`` is provided, the message is journaled with deduplication
         and claim/complete semantics for crash-safe, exactly-once processing.
         """
+        # Consume any per-route toolset scope staged by a routing handler that
+        # could not thread it through this call directly (Issue #2298). The
+        # staged policy is always popped (so it applies exactly once and never
+        # leaks into a later turn — including the dedup early-return below); an
+        # explicit ``tool_policy`` argument wins, otherwise the staged one is
+        # used. ``None`` here means "no policy resolved" (full toolset), so an
+        # absent explicit arg safely inherits a fail-closed staged scope.
+        staged_policy = self._pending_tool_policies.pop(id(agent), None)
+        if tool_policy is None:
+            tool_policy = staged_policy
+
+        # Mint/adopt an end-to-end correlation id and bind it for this turn so
+        # ingress, the agent run, and outbound delivery share one stable id in
+        # structured logs. Adopts an explicit correlation_id, else the platform
+        # message_id, else a fresh id. No-op import failure is non-fatal.
+        cid = None
+        cid_token = None
+        try:
+            from ._correlation import correlation_id_from, set_correlation_id
+            cid = correlation_id_from(
+                {"correlation_id": correlation_id, "message_id": message_id}
+            )
+            cid_token = set_correlation_id(cid)
+            logger.debug(
+                "bot turn start", extra={"correlation_id": cid, "platform": self._platform}
+            )
+        except Exception:  # pragma: no cover — defensive
+            cid = correlation_id or message_id or None
+
         # Handle ingress journaling for durable message processing
         journal_key = None
         if self._ingress_journal is not None and message_id:
@@ -428,6 +554,7 @@ class BotSessionManager:
                 "chat_id": chat_id,
                 "thread_id": thread_id,
                 "user_name": user_name,
+                "correlation_id": cid,
             }
             journal_key = self._ingress_journal.receive(
                 platform=self._platform or "unknown",
@@ -437,7 +564,15 @@ class BotSessionManager:
                 payload=payload
             )
             if journal_key is None:
-                # Duplicate message - return empty response
+                # Duplicate message - restore the correlation id before the
+                # early return so the contextvar set for this turn never leaks
+                # into an unrelated subsequent call sharing the same task.
+                if cid_token is not None:
+                    try:
+                        from ._correlation import reset_correlation_id
+                        reset_correlation_id(cid_token)
+                    except Exception as e:  # pragma: no cover — defensive
+                        logger.debug("Failed to reset correlation id: %s", e)
                 return ""
                 
         user_lock = self._get_lock(user_id)
@@ -530,6 +665,14 @@ class BotSessionManager:
                     async with agent_lock:
                         saved_history = agent.chat_history
                         agent.chat_history = user_history
+
+                        # Per-route toolset scope (Issue #2298): swap the
+                        # agent's tools to the policy-allowed subset for this
+                        # turn so untrusted inbound routes never advertise
+                        # dangerous tools to the model. Restored in the finally
+                        # below alongside chat_history/model, so a shared Agent
+                        # instance never leaks a scoped toolset to another turn.
+                        _restore_tools = self._apply_tool_policy(agent, tool_policy)
 
                         # Apply a per-user model override (set via the /model
                         # command) for the duration of this turn only. The swap
@@ -647,6 +790,10 @@ class BotSessionManager:
                             raise
                         finally:
                             agent.chat_history = saved_history
+                            # Restore the agent's original toolset if a
+                            # per-route policy scoped it for this turn.
+                            if _restore_tools is not None:
+                                _restore_tools()
                             # Restore the agent's original model if we applied a
                             # per-user override for this turn.
                             if _model_overridden:
@@ -660,6 +807,28 @@ class BotSessionManager:
                     await loop.run_in_executor(
                         None, self._save_history, user_id, updated_history
                     )
+
+                    # Normalise an agent-emitted presentation (if any) into
+                    # (text, presentation). Agents/hooks may return a plain str
+                    # (unchanged), a MessagePresentation, or an AgentReply. The
+                    # portable presentation is captured per-user so channel
+                    # adapters can render interactive UI; the text is returned as
+                    # before so the str contract and text fallback are preserved.
+                    try:
+                        from praisonaiagents.bots.agent_reply import extract_presentation
+                        storage_key = self._storage_key(user_id)
+                        text, presentation = extract_presentation(response)
+                        # Always normalise to plain text so chat() never leaks a
+                        # non-str (e.g. AgentReply) past its str contract.
+                        response = text
+                        if presentation is not None:
+                            self._last_presentation[storage_key] = presentation
+                        else:
+                            # Clear any stale UI from an earlier turn so a later
+                            # plain-text turn cannot reuse it via run-control.
+                            self._last_presentation.pop(storage_key, None)
+                    except Exception as e:  # pragma: no cover — defensive
+                        logger.debug("presentation extraction skipped: %s", e)
 
                     # Store response to return after cleanup
                     result = response
@@ -687,6 +856,14 @@ class BotSessionManager:
                     _clear_ctx(ctx_token)
                 except Exception as e:
                     logger.debug("Failed to clear task-local session context for ctx_token=%r: %s", ctx_token, e)
+            # Restore the previous correlation id so the contextvar never leaks
+            # the id of this turn into an unrelated subsequent call.
+            if cid_token is not None:
+                try:
+                    from ._correlation import reset_correlation_id
+                    reset_correlation_id(cid_token)
+                except Exception as e:  # pragma: no cover — defensive
+                    logger.debug("Failed to reset correlation id: %s", e)
 
     async def chat_with_run_control(
         self,
@@ -831,6 +1008,12 @@ class BotSessionManager:
         if pending_processed:
             metadata["pending_processed"] = pending_processed
 
+        # Surface any agent-emitted presentation captured during the run(s) so
+        # run-control callers can render interactive UI alongside the text reply.
+        presentation = self.pop_last_presentation(user_id)
+        if presentation is not None:
+            metadata["presentation"] = presentation
+
         return {"response": last_response, "metadata": metadata}
 
     def reap_stale(self, max_age_seconds: int) -> int:
@@ -928,6 +1111,17 @@ class BotSessionManager:
             except Exception as e:
                 logger.warning("Failed to clear session in store: %s", e)
     
+    def pop_last_presentation(self, user_id: str) -> Optional[Any]:
+        """Return and clear the last agent-emitted presentation for *user_id*.
+
+        Channel adapters call this immediately after ``chat()`` to check whether
+        the agent attached interactive UI to its reply. Returns the portable
+        ``MessagePresentation`` (which the adapter renders via the per-channel
+        renderer) or ``None`` when the reply was plain text. Consuming clears it
+        so a later text-only turn never re-renders stale buttons.
+        """
+        return self._last_presentation.pop(self._storage_key(user_id), None)
+
     def reset(self, user_id: str) -> bool:
         """Clear a user's session history.  Returns True if it existed."""
         storage_key = self._storage_key(user_id)

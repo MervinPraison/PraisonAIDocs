@@ -20,10 +20,6 @@ from praisonai._logging import get_logger
 # Type variable for Pydantic models - will be bound at runtime
 T = TypeVar('T')
 
-# Module-level cache for models (for backward compatibility)
-_models_cache: Dict = {}
-_models_lock = threading.Lock()
-
 # =============================================================================
 # THREAD-SAFE LAZY LOADING INFRASTRUCTURE - All heavy imports are deferred
 # =============================================================================
@@ -51,6 +47,42 @@ def _yaml_safe_load(stream):
     return yaml.safe_load(stream)
 
 
+def _atomic_write_text(path, content_writer):
+    """Atomically write text to ``path`` via a sibling temp file + rename.
+
+    ``content_writer(file_obj)`` is called with an open text file in the target
+    directory, so the rename stays on the same filesystem (required for atomicity).
+    This prevents zero-byte / half-written config files if the process crashes,
+    the disk fills, or the user interrupts mid-write.
+    """
+    import tempfile
+
+    target_dir = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".yaml", dir=target_dir)
+    try:
+        # Preserve the existing file's permission bits so a replaced, shared or
+        # deployment-managed config does not silently become unreadable to the
+        # process that later loads it (mkstemp creates 0600 by default).
+        try:
+            existing_mode = os.stat(path).st_mode
+        except OSError:
+            existing_mode = None
+        with os.fdopen(fd, "w") as f:
+            content_writer(f)
+            f.flush()
+            os.fsync(f.fileno())  # durability before rename
+        if existing_mode is not None:
+            try:
+                os.chmod(tmp_path, existing_mode)
+            except OSError:
+                pass  # best-effort; do not block the write on a chmod failure
+        os.replace(tmp_path, path)  # atomic on POSIX + Windows
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # OpenAI client creation removed - create per-call instead of global cache
@@ -63,37 +95,11 @@ from ._framework_availability import is_available
 # Redundant wrapper functions removed - use is_available() directly
 
 
-def _get_crewai():
-    """Lazy load crewai classes (thread-safe)."""
-    return lazy_get("crewai_classes", lambda: (
-        __import__("crewai", fromlist=["Agent", "Task", "Crew"]).Agent,
-        __import__("crewai", fromlist=["Agent", "Task", "Crew"]).Task,
-        __import__("crewai", fromlist=["Agent", "Task", "Crew"]).Crew,
-    ))
-
-
-def _get_autogen():
-    """Lazy load autogen module (thread-safe)."""
-    return lazy_get("autogen_module", lambda: __import__("autogen"))
-
-
-def _get_autogen_v4():
-    """Lazy load autogen v0.4 classes (thread-safe)."""
-    def autogen_v4_loader():
-        from autogen_agentchat.agents import AssistantAgent
-        from autogen_ext.models.openai import OpenAIChatCompletionClient
-        return (AssistantAgent, OpenAIChatCompletionClient)
-    
-    return lazy_get("autogen_v4_classes", autogen_v4_loader)
-
-
-def _get_praisonai():
-    """Lazy load praisonaiagents classes (thread-safe)."""
-    def praisonai_loader():
-        from praisonaiagents import Agent as PraisonAgent, Task as PraisonTask, AgentTeam as Agents
-        return (PraisonAgent, PraisonTask, Agents)
-    
-    return lazy_get("praisonai_classes", praisonai_loader)
+# Framework class loaders removed: framework selection and resolution now go
+# exclusively through the canonical FrameworkAdapter protocol + registry
+# (see framework_adapters/). The previous hand-rolled _get_crewai/_get_autogen/
+# _get_autogen_v4/_get_praisonai loaders were dead code that bypassed the
+# adapter system. Use framework_adapters.registry.get_default_registry().
 
 
 # --- PraisonAI Tools lazy loading ---
@@ -378,59 +384,66 @@ class BaseAutoGenerator:
             config_list: Optional LLM configuration list
         """
         # Resolve LLM endpoint configuration from environment variables
-        from praisonai.llm.env import resolve_llm_endpoint
-        ep = resolve_llm_endpoint()
-        
-        self.config_list = config_list or [
-            {
-                'model': ep.model,
-                'base_url': ep.base_url,
-                'api_key': ep.api_key
-            }
-        ]
+        from praisonai.llm.config import build_config_list
+        self.config_list = config_list or build_config_list(include_api_type=False)
         self._openai_client = None  # lazy, per-instance
         self._async_openai_client = None  # lazy, per-instance async client
         self._client_lock = threading.Lock()
         
     def _get_openai_client(self):
-        """Get or create the OpenAI client for this instance."""
-        if self._openai_client is None:
-            with self._client_lock:
-                if self._openai_client is None:
-                    try:
-                        from openai import OpenAI
-                    except ImportError as e:
-                        raise ImportError("Install with: pip install openai") from e
-                    cfg = self.config_list[0]
-                    self._openai_client = OpenAI(
-                        api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
-                        base_url=cfg.get("base_url"),
-                    )
-        return self._openai_client
+        """Get or create the OpenAI client for this instance.
+
+        Lazy-init AND snapshot the client under the same lock so the returned
+        local reference survives a concurrent close() that nulls the attribute,
+        closing the shutdown-during-request race (mirrors the async path).
+        """
+        with self._client_lock:
+            client = self._openai_client
+            if client is None:
+                try:
+                    from openai import OpenAI
+                except ImportError as e:
+                    raise ImportError("Install with: pip install openai") from e
+                cfg = self.config_list[0]
+                client = self._openai_client = OpenAI(
+                    api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
+                    base_url=cfg.get("base_url"),
+                )
+            return client
 
     def close(self):
         """Close the sync OpenAI client if it exists."""
         if not hasattr(self, '_client_lock'):
             return  # Object was never fully initialized
+        # Snapshot under the lock, close OUTSIDE it, and only null the attribute
+        # after a successful close so a failed close can be retried.
         with self._client_lock:
             client = getattr(self, '_openai_client', None)
-            self._openai_client = None
         if client is not None:
             client.close()
+        with self._client_lock:
+            if getattr(self, '_openai_client', None) is client:
+                self._openai_client = None
     
     async def aclose(self):
         """Close both sync and async OpenAI clients if they exist."""
         if not hasattr(self, '_client_lock'):
             return  # Object was never fully initialized
+        # Snapshot under the lock, close OUTSIDE it, and only null each attribute
+        # after its successful close so a failed close can be retried.
         with self._client_lock:
             sync_client = getattr(self, '_openai_client', None)
-            self._openai_client = None
             async_client = getattr(self, '_async_openai_client', None)
-            self._async_openai_client = None
         if sync_client is not None:
             await asyncio.to_thread(sync_client.close)
+            with self._client_lock:
+                if getattr(self, '_openai_client', None) is sync_client:
+                    self._openai_client = None
         if async_client is not None:
             await async_client.close()
+            with self._client_lock:
+                if getattr(self, '_async_openai_client', None) is async_client:
+                    self._async_openai_client = None
     
     def __enter__(self):
         return self
@@ -470,15 +483,27 @@ class BaseAutoGenerator:
         
         # Try LiteLLM first (preferred - supports 100+ providers)
         if is_available("litellm"):
-            litellm = _get_litellm()
-            response = litellm.completion(
-                model=model_name,
-                messages=messages,
-                response_format=response_model,
-                **kwargs
-            )
-            content = response.choices[0].message.content
-            return response_model.model_validate_json(content)
+            try:
+                litellm = _get_litellm()
+                response = litellm.completion(
+                    model=model_name,
+                    messages=messages,
+                    response_format=response_model,
+                    **kwargs
+                )
+                content = response.choices[0].message.content
+                return response_model.model_validate_json(content)
+            except Exception as e:
+                # Graceful execution-level fallback: if LiteLLM fails at runtime
+                # (auth error, network timeout, unsupported model, or a provider
+                # that ignores response_format and returns no content), fall
+                # through to the OpenAI SDK path below instead of propagating.
+                if not is_available("openai"):
+                    raise
+                logger.warning(
+                    "LiteLLM structured completion failed (%s); "
+                    "falling back to OpenAI SDK.", e
+                )
         
         # Fallback to OpenAI SDK (uses beta.chat.completions.parse)
         if is_available("openai"):
@@ -520,32 +545,44 @@ class BaseAutoGenerator:
         
         # Try LiteLLM async first (preferred - supports 100+ providers)
         if is_available("litellm"):
-            litellm = _get_litellm()
-            response = await litellm.acompletion(
-                model=model_name,
-                messages=messages,
-                response_format=response_model,
-                **kwargs
-            )
-            content = response.choices[0].message.content
-            return response_model.model_validate_json(content)
+            try:
+                litellm = _get_litellm()
+                response = await litellm.acompletion(
+                    model=model_name,
+                    messages=messages,
+                    response_format=response_model,
+                    **kwargs
+                )
+                content = response.choices[0].message.content
+                return response_model.model_validate_json(content)
+            except Exception as e:
+                # Graceful execution-level fallback (see _structured_completion).
+                if not is_available("openai"):
+                    raise
+                logger.warning(
+                    "LiteLLM async structured completion failed (%s); "
+                    "falling back to OpenAI SDK.", e
+                )
         
         # Fallback to OpenAI AsyncSDK (uses beta.chat.completions.parse)
         if is_available("openai"):
-            if self._async_openai_client is None:
-                with self._client_lock:
-                    if self._async_openai_client is None:
-                        try:
-                            from openai import AsyncOpenAI
-                        except ImportError as e:
-                            raise ImportError("Install with: pip install openai") from e
-                        cfg = self.config_list[0]
-                        self._async_openai_client = AsyncOpenAI(
-                            api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
-                            base_url=cfg.get("base_url"),
-                        )
+            # Lazy-init AND snapshot the client under the same lock. The local
+            # reference survives a concurrent aclose() that nulls the attribute,
+            # closing the shutdown-during-request race.
+            with self._client_lock:
+                if self._async_openai_client is None:
+                    try:
+                        from openai import AsyncOpenAI
+                    except ImportError as e:
+                        raise ImportError("Install with: pip install openai") from e
+                    cfg = self.config_list[0]
+                    self._async_openai_client = AsyncOpenAI(
+                        api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
+                        base_url=cfg.get("base_url"),
+                    )
+                client = self._async_openai_client
             
-            response = await self._async_openai_client.beta.chat.completions.parse(
+            response = await client.beta.chat.completions.parse(
                 model=model_name,
                 messages=messages,
                 response_format=response_model,
@@ -648,14 +685,15 @@ class BaseAutoGenerator:
 
 def _get_team_models():
     """Get team structure models, creating them on first use."""
+
     def _create_team_models():
         from pydantic import BaseModel
-        
+
         class TaskDetails(BaseModel):
             """Details for a single task."""
             description: str
             expected_output: str
-        
+
         class RoleDetails(BaseModel):
             """Details for a single role/agent."""
             role: str
@@ -663,11 +701,11 @@ def _get_team_models():
             backstory: str
             tasks: Dict[str, TaskDetails]
             tools: List[str]
-        
+
         class TeamStructure(BaseModel):
             """Structure for multi-agent team."""
             roles: Dict[str, RoleDetails]
-        
+
         class SingleAgentStructure(BaseModel):
             """Structure for single-agent generation (Anthropic's 'start simple' principle)."""
             name: str
@@ -678,29 +716,30 @@ def _get_team_models():
             tools: List[str] = []
             task_description: str
             expected_output: str
-        
+
         class PatternRecommendation(BaseModel):
             """LLM-based pattern recommendation with reasoning."""
             pattern: str  # sequential, parallel, routing, orchestrator-workers, evaluator-optimizer
             reasoning: str  # Why this pattern was chosen
             confidence: float  # 0.0 to 1.0 confidence score
-        
+
         class ValidationGate(BaseModel):
             """Validation gate for prompt chaining workflows."""
             criteria: str  # What to validate
             pass_action: str  # Action if validation passes (e.g., "continue", "next_step")
             fail_action: str  # Action if validation fails (e.g., "retry", "escalate", "abort")
-        
+
         return {
-            'TaskDetails': TaskDetails,
-            'RoleDetails': RoleDetails,
-            'TeamStructure': TeamStructure,
-            'SingleAgentStructure': SingleAgentStructure,
-            'PatternRecommendation': PatternRecommendation,
-            'ValidationGate': ValidationGate
+            "TaskDetails": TaskDetails,
+            "RoleDetails": RoleDetails,
+            "TeamStructure": TeamStructure,
+            "SingleAgentStructure": SingleAgentStructure,
+            "PatternRecommendation": PatternRecommendation,
+            "ValidationGate": ValidationGate,
         }
-    
-    return lazy_get('team_models', _create_team_models)
+
+    return lazy_get("team_models", _create_team_models)
+
 
 class AutoGenerator(BaseAutoGenerator):
     """
@@ -848,9 +887,11 @@ class AutoGenerator(BaseAutoGenerator):
                 for task_id, task_details in role_details['tasks'].items():
                     yaml_data['roles'][role_id]['tasks'][task_id] = self._format_task(task_details)
 
-        # Save to YAML file, maintaining the order
-        with open(self.agent_file, 'w') as f:
-            _yaml_dump(yaml_data, f, allow_unicode=True, sort_keys=False)
+        # Save to YAML file atomically, maintaining the order
+        _atomic_write_text(
+            self.agent_file,
+            lambda f: _yaml_dump(yaml_data, f, allow_unicode=True, sort_keys=False),
+        )
 
     def merge_with_existing_agents(self, new_json_data):
         """
@@ -1063,23 +1104,23 @@ def _get_workflow_models():
             return _models_cache['workflow_models']
         
         from pydantic import BaseModel
-        
+
         class WorkflowStepDetails(BaseModel):
             """Details for a workflow step."""
             agent: str
             action: str
             expected_output: Optional[str] = None
-        
+
         class WorkflowRouteDetails(BaseModel):
             """Details for a route step."""
             name: str
             route: Dict[str, List[str]]
-        
+
         class WorkflowParallelDetails(BaseModel):
             """Details for a parallel step."""
             name: str
             parallel: List[WorkflowStepDetails]
-        
+
         class WorkflowAgentDetails(BaseModel):
             """Details for a workflow agent."""
             name: str
@@ -1087,7 +1128,7 @@ def _get_workflow_models():
             goal: str
             instructions: str
             tools: Optional[List[str]] = None
-        
+
         class WorkflowStructure(BaseModel):
             """Structure for auto-generated workflow."""
             name: str
@@ -1095,7 +1136,7 @@ def _get_workflow_models():
             agents: Dict[str, WorkflowAgentDetails]
             steps: List[Dict]  # Can be agent steps, route, parallel, etc.
             gates: Optional[List[Any]] = None  # Optional validation gates, ValidationGate type resolved at runtime
-        
+
         _models_cache['workflow_models'] = {
             'WorkflowStepDetails': WorkflowStepDetails,
             'WorkflowRouteDetails': WorkflowRouteDetails,
@@ -1104,6 +1145,35 @@ def _get_workflow_models():
             'WorkflowStructure': WorkflowStructure
         }
         return _models_cache['workflow_models']
+
+
+# Names exposed lazily via module __getattr__ (PEP 562) so that
+# `from praisonai.auto import PatternRecommendation` keeps working without
+# importing pydantic at module load time. Each maps to its lazy factory.
+_LAZY_MODEL_EXPORTS = {
+    "PatternRecommendation": ("_get_team_models", "PatternRecommendation"),
+    "SingleAgentStructure": ("_get_team_models", "SingleAgentStructure"),
+    "ValidationGate": ("_get_team_models", "ValidationGate"),
+    "TeamStructure": ("_get_team_models", "TeamStructure"),
+    "WorkflowStructure": ("_get_workflow_models", "WorkflowStructure"),
+    "WorkflowStepDetails": ("_get_workflow_models", "WorkflowStepDetails"),
+    "WorkflowRouteDetails": ("_get_workflow_models", "WorkflowRouteDetails"),
+    "WorkflowParallelDetails": ("_get_workflow_models", "WorkflowParallelDetails"),
+    "WorkflowAgentDetails": ("_get_workflow_models", "WorkflowAgentDetails"),
+}
+
+
+def __getattr__(name: str):
+    """Lazily resolve structured-output Pydantic models (PEP 562).
+
+    Preserves the module's FULL LAZY LOADING contract: pydantic is only
+    imported when one of these models is first accessed.
+    """
+    export = _LAZY_MODEL_EXPORTS.get(name)
+    if export is not None:
+        factory_name, key = export
+        return globals()[factory_name]()[key]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class WorkflowAutoGenerator(BaseAutoGenerator):
@@ -1140,7 +1210,7 @@ class WorkflowAutoGenerator(BaseAutoGenerator):
         self.framework = framework
         self.single_agent = single_agent
     
-    def recommend_pattern_llm(self, topic: str = None) -> PatternRecommendation:
+    def recommend_pattern_llm(self, topic: Optional[str] = None) -> Any:
         """
         Use LLM to recommend the best workflow pattern with reasoning.
         
@@ -1459,10 +1529,12 @@ Example structure:
             if agent_data.get('tools'):
                 workflow_yaml['agents'][agent_id]['tools'] = agent_data['tools']
         
-        # Write to file
+        # Write to file atomically
         full_path = os.path.abspath(self.workflow_file)
-        with open(full_path, 'w') as f:
-            _yaml_dump(workflow_yaml, f, default_flow_style=False, sort_keys=False)
+        _atomic_write_text(
+            full_path,
+            lambda f: _yaml_dump(workflow_yaml, f, default_flow_style=False, sort_keys=False),
+        )
         
         return full_path
 
@@ -1662,9 +1734,11 @@ Generate a workflow for: {self.topic}
             
             workflow_yaml['steps'].append(step_dict)
         
-        # Write to file
+        # Write to file atomically
         full_path = os.path.abspath(self.workflow_file)
-        with open(full_path, 'w') as f:
-            _yaml_dump(workflow_yaml, f, default_flow_style=False, sort_keys=False)
+        _atomic_write_text(
+            full_path,
+            lambda f: _yaml_dump(workflow_yaml, f, default_flow_style=False, sort_keys=False),
+        )
         
         return full_path

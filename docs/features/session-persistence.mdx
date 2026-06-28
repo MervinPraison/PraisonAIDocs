@@ -1,30 +1,78 @@
 ---
 title: "Session Persistence"
+sidebarTitle: "Session Persistence"
 description: "Automatic session persistence with zero configuration"
 icon: "floppy-disk"
 ---
 
-# Session Persistence
+Provide a `session_id` on your agent and conversation history is saved and restored automatically — no database setup required.
 
-PraisonAI Agents provides automatic session persistence with zero configuration. Simply provide a `session_id` to your Agent and conversation history is automatically saved and restored.
+```python
+from praisonaiagents import Agent
 
-<Info>
-**Released in PR #1897** — Earlier versions wrote duplicate messages when `memory="history"` was combined with `auto_save` (one turn produced 4 messages instead of 2), and `Session.save_state()` re-appended full history on every call. Both paths are now exact and idempotent.
-</Info>
+agent = Agent(
+    name="Reviewer",
+    instructions="Review the codebase and answer follow-ups",
+    memory={"session_id": "review-2026-06-25"},
+)
+agent.start("Summarise the auth module")
+```
 
-<Info>
-**Released in PR #1709** — Earlier versions could silently drop the latest messages when `update_session_metadata()` ran concurrently with `add_message()` across processes or store instances. Upgrade to pick up the fix.
-</Info>
+```mermaid
+graph LR
+    subgraph "Session Persistence"
+        A[🤖 Agent] --> S[💾 session_id]
+        S --> D[📁 JSON / DB]
+        D --> R[⏪ Restore on next run]
+    end
 
-<Info>
-**Released in PR #2102** — Earlier versions of the gateway session-resume path used the **first** `session_data` system message it found, which was the empty snapshot written at session create. Reconnecting always restored an empty history. Resume now iterates all system messages and keeps the latest snapshot. Also: `WebSocketGateway.stop()` previously called `session.close()` directly, bypassing persistence; it now goes through `close_session()`, so graceful shutdown (SIGTERM) persists in-flight sessions identically to a WebSocket disconnect.
-</Info>
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
 
-<Info>
-**Released in PR #1972** — Earlier versions of `BotSessionManager` keyed agent locks on `id(agent)`, which CPython is free to reuse once an agent is garbage-collected. In long-running gateways that recreated agents per request, two unrelated users could silently serialize on the same lock — or worse, swap histories. Agent locks now use a `WeakKeyDictionary`, so they auto-clean when the agent is GC'd. Per-user locks are bounded by an LRU+TTL cache. Upgrade to pick up the fix.
-</Info>
+    class A agent
+    class S,D store
+    class R result
+    classDef agent fill:#8B0000,color:#fff
+    classDef tool fill:#189AB4,color:#fff
+```
+
+<Note>
+Upgrade if you rely on multi-process saves, gateway resume, or idempotent `save_state()` — fixes landed in PRs #1709, #1897, #1972, and #2102.
+</Note>
 
 ## Quick Start
+
+<Steps>
+<Step title="Start with a session_id">
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Reviewer",
+    instructions="Review the codebase and answer follow-ups",
+    memory={"session_id": "review-2026-06-25"},
+)
+agent.start("Summarise the auth module")
+```
+
+</Step>
+
+<Step title="Resume from the CLI">
+
+```bash
+praisonai session resume review-2026-06-25 "Now suggest test cases for the same module"
+```
+
+History, model, and agent name are restored — not just the transcript.
+
+</Step>
+</Steps>
+
+---
+
+## Agent Session Persistence
 
 ```python
 from praisonaiagents import Agent
@@ -43,6 +91,26 @@ agent = Agent(
 )
 agent.start("What is my name?")  # Agent remembers: "Alice"
 ```
+
+## Deterministic Resume
+
+As of [PR #2277](https://github.com/MervinPraison/PraisonAI/pull/2277), `praisonai session resume` is a first-class restore — not a transcript display.
+
+What is restored:
+- **Chat history** — full conversation messages
+- **Model** — the LLM used in the session (read from `metadata["model"]`, falls back to `metadata["llm"]`)
+- **Agent name** — the name of the agent that ran the session
+
+New CLI options:
+- `praisonai session resume <id>` — restores state and shows a "Session Resumed" panel
+- `praisonai session resume <id> "<prompt>"` — restores state and continues with a new prompt
+- `praisonai session resume <id> --transcript` — opt-in to the old transcript-only view (panel title: "Session Transcript")
+
+Session lookup checks the project store first, then falls back to the global default store — so sessions created via `praisonai run --continue` or via the gateway/TUI are all reachable.
+
+For the full CLI reference, see [Session Command](/docs/cli/session#resume-a-session).
+
+---
 
 ## How It Works
 
@@ -437,22 +505,25 @@ from praisonaiagents.session import SessionStoreProtocol
 assert isinstance(get_default_session_store(), SessionStoreProtocol)
 ```
 
-<Card icon="plug" href="/docs/features/session-protocol">
-  Learn more about building custom session stores
-</Card>
-
 ## Best Practices
 
-1. **Use meaningful session IDs**: Include user ID or context in the session ID
-   ```python
-   session_id = f"user-{user_id}-{conversation_type}"
-   ```
+<AccordionGroup>
+<Accordion title="Use meaningful session IDs">
+Include user or context in the id: `f"user-{user_id}-{conversation_type}"`.
+</Accordion>
 
-2. **Handle session limits**: Default max messages is 100. Older messages are trimmed.
+<Accordion title="Respect the default message limit">
+Default `max_messages` is 100. Older turns are trimmed unless compaction is enabled on bots.
+</Accordion>
 
-3. **Clean up old sessions**: Use `store.delete_session()` to remove unused sessions, which also purges persisted DB rows.
+<Accordion title="Clean up unused sessions">
+Call `store.delete_session()` to remove stale sessions and purge DB rows when using a DB adapter.
+</Accordion>
 
-4. **Use prompt caching**: Enable `caching=True` for Anthropic models to reduce costs.
+<Accordion title="Enable prompt caching for Anthropic">
+Set `caching=True` on the agent to reduce token cost on repeated conversations.
+</Accordion>
+</AccordionGroup>
 
 ## API Reference
 
@@ -484,6 +555,15 @@ assert isinstance(get_default_session_store(), SessionStoreProtocol)
 | `session_exists(session_id)` | Check if session exists |
 | `invalidate_cache(session_id)` | Drop the in-memory cache entry (no-op for reads; reads always reload) |
 
-<Card icon="compress" href="/docs/features/bot-session-compaction">
-  Summarise older bot session turns instead of dropping them
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Session Protocol" icon="plug" href="/docs/features/session-protocol">
+  Build custom session backends
 </Card>
+<Card title="Bot Session Compaction" icon="compress" href="/docs/features/bot-session-compaction">
+  Summarise older bot turns instead of dropping them
+</Card>
+</CardGroup>

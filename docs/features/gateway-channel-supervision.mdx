@@ -7,6 +7,19 @@ icon: "heart-pulse"
 
 Channel supervision keeps gateway bots alive through network outages with unlimited retries and operator-level pause / resume / reconnect controls.
 
+```yaml
+# gateway.yaml — supervision enabled automatically
+agents:
+  assistant:
+    instructions: "You are a helpful AI assistant."
+    model: gpt-4o-mini
+
+channels:
+  telegram:
+    token: "${TELEGRAM_BOT_TOKEN}"
+    platform: telegram
+```
+
 ```mermaid
 graph LR
     subgraph "Channel Supervision State Machine"
@@ -30,6 +43,9 @@ graph LR
     class FAILED failed
     class PAUSED paused
     class STOPPED stopped
+
+    classDef agent fill:#8B0000,color:#fff
+    classDef tool fill:#189AB4,color:#fff
 ```
 
 ## Quick Start
@@ -169,7 +185,8 @@ gateway:
   health:
     interval: 300            # seconds between sweeps (default 300)
     startup_grace: 60        # grace window after start (default 60)
-    stale_after: 120         # no transport activity → stale-socket (default 120)
+    stale_after: 120         # no inbound activity (idle) → stale-socket (default 120)
+    stuck_after: 900         # busy with no progress (inbound OR in-run) → stuck (default 900)
     max_restarts_per_hour: 10
     enabled: true            # default true
 ```
@@ -190,7 +207,8 @@ supervisor = ChannelSupervisor(health_config=health_config)
 |--------|------|---------|-------------|
 | `interval` | `float` | `300.0` | Seconds between health sweeps |
 | `startup_grace` | `float` | `60.0` | Seconds after start before checks count |
-| `stale_after` | `float` | `120.0` | Seconds without transport activity → `stale-socket` |
+| `stale_after` | `float` | `120.0` | Seconds without **inbound** transport activity (while idle) → `stale-socket` |
+| `stuck_after` | `float` | `900.0` | Seconds a **busy** channel can go without **any progress signal** (inbound transport activity OR in-run progress — tool calls, streamed tokens, emitter events) → `stuck` |
 | `max_restarts_per_hour` | `int` | `10` | Hard cap on restart attempts per channel per hour |
 | `enabled` | `bool` | `True` | Whether monitoring is enabled |
 
@@ -202,9 +220,9 @@ supervisor = ChannelSupervisor(health_config=health_config)
 | `not-running` | No | `health.is_running` is false |
 | `startup-grace` | No | `uptime_seconds < startup_grace` |
 | `disconnected` | Yes | `health.probe` exists and `probe.ok` is false |
-| `stale-socket` | Yes | No transport activity for `stale_after` seconds |
-| `stuck` | Yes | Channel wedged (supervisor-detected) |
-| `busy` | No | Channel busy (non-fatal) |
+| `stale-socket` | Yes | Idle and no **inbound** activity for `stale_after` seconds |
+| `busy` | **No** | `active_runs > 0` with progress within `stuck_after` — protects long runs from mid-run kills |
+| `stuck` | Yes | `active_runs > 0` and no progress (inbound or in-run) for `> stuck_after` — likely wedged |
 | `error` | Yes | `health.error` set or `health.ok` is false |
 
 Decision order in `evaluate_channel_health()`:
@@ -218,7 +236,11 @@ graph TB
     C -->|yes| E[error]
     C -->|no| D[probe fails?]
     D -->|yes| DC[disconnected]
-    D -->|no| F[last_activity stale?]
+    D -->|no| R[active_runs > 0?]
+    R -->|yes| RS[idle > stuck_after?]
+    RS -->|yes| ST[stuck]
+    RS -->|no| BS[busy]
+    R -->|no| F[last_activity stale?]
     F -->|yes| SS[stale-socket]
     F -->|no| G[not health.ok?]
     G -->|yes| E2[error]
@@ -226,9 +248,21 @@ graph TB
 
     classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef result fill:#189AB4,stroke:#7C90A0,color:#fff
-    class A,B,C,D,F,G check
-    class NR,SG,E,DC,SS,E2,H result
+    class A,B,C,D,F,G,R,RS check
+    class NR,SG,E,DC,SS,E2,H,ST,BS result
 ```
+
+### Passive inbound liveness
+
+Channel liveness is driven by whether messages are still flowing IN, not just whether the outbound probe (e.g. Telegram `getMe`) succeeds. Every inbound message refreshes the timestamp via `fire_message_received → _note_inbound()`, so a reachable-but-deaf channel will eventually trip `stale-socket` instead of being reported healthy forever. All adapters get this automatically; WhatsApp and Linear are wired explicitly because they bypass the shared handler.
+
+### Run awareness
+
+The evaluator knows about in-flight agent turns (`HealthResult.active_runs`) **and tracks per-run progress** (`HealthResult.last_run_progress`, refreshed on tool calls, streamed tokens, and agent emitter events). A busy channel is never killed mid-run — `BUSY` is non-recoverable on purpose. Only when a busy channel has made **no progress at all** (neither inbound transport activity nor in-run progress) for `stuck_after` seconds does it escalate to `STUCK` (recoverable). An actively-streaming long agent turn stays `BUSY` indefinitely; a genuinely-hung turn that emits nothing for `stuck_after` is still correctly flagged `STUCK`.
+
+<Note>
+Before praisonaiagents 1.6.82, only inbound transport activity counted toward progress, so a single long agent turn (deep research, big refactor, slow model) was classified `STUCK` once it crossed `stuck_after` — even while actively streaming. The protocol now honours in-run progress (`HealthResult.last_run_progress`), so progressing long runs stay `BUSY` indefinitely. See [PraisonAI #2400](https://github.com/MervinPraison/PraisonAI/pull/2400).
+</Note>
 
 ### Restart guard-rails
 
@@ -374,6 +408,7 @@ The enhanced health endpoint includes supervision status for each channel:
           "platform": "telegram",
           "running": true,
           "last_activity": 1672531500,
+          "active_runs": 2,
           "supervision": {
             "state": "running",
             "last_error": null,
@@ -417,7 +452,8 @@ Key supervision fields:
 - `next_retry_at`: Unix timestamp of next retry attempt (if scheduled)
 - `total_recoveries`: Count of successful recoveries from errors
 - `manual_pause`: Whether channel is manually paused by operator
-- `last_activity`: Unix timestamp of last transport activity (used for `stale-socket` detection)
+- `active_runs`: Number of in-flight agent turns (busy count)
+- `last_activity`: Unix timestamp of last **inbound** transport activity (used for `stale-socket` and `stuck` detection)
 - `health_monitor.enabled`: Whether proactive monitoring is active
 - `health_monitor.restart_count`: Restarts in the current hour
 - `health_monitor.can_restart`: Whether guard-rails allow another restart
@@ -445,6 +481,10 @@ Channels in `FAILED` state require manual intervention. Use `reconnect` (not `re
 
 <Accordion title="Tuning interval and stale_after for chatty vs quiet channels">
 Low-traffic channels need a larger `stale_after` (e.g. 600s) to avoid false `stale-socket` restarts. Chatty channels can use the default 120s.
+</Accordion>
+
+<Accordion title="Tuning stuck_after for long-running agent turns">
+If your agent regularly runs turns longer than 15 minutes (deep research, long tool chains), raise `stuck_after` so genuine progress isn't classified as wedged. The default 900s covers most chat and triage workloads.
 </Accordion>
 
 <Accordion title="When to set max_restarts_per_hour low">

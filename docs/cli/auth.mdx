@@ -1,33 +1,164 @@
 ---
 title: "Auth"
 sidebarTitle: "Auth"
-description: "Store and manage LLM provider API keys securely"
+description: "Store and manage LLM provider credentials securely — API keys or browser-based OAuth"
 icon: "key"
 ---
 
-`praisonai auth` stores provider API keys locally so `praisonai run` works without exporting env vars every session.
+`praisonai auth` stores provider credentials locally so `praisonai run` works without exporting env vars every session. Two methods are supported: a long-lived **API key**, or a short-lived **OAuth token** signed in via your browser.
+
+```mermaid
+graph LR
+    subgraph "praisonai auth login"
+        A[🔑 API Key] --> C[~/.praison/credentials.json]
+        B[🌐 OAuth Token] --> C
+    end
+    C --> D[⚡ praisonai run]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef run fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,B input
+    class C store
+    class D run
+```
 
 ## Quick Start
 
-```bash
-# Interactive — key is hidden at the prompt
-praisonai auth login openai
+<Tabs>
+  <Tab title="API Key">
+    ```bash
+    # Interactive — key is hidden at the prompt
+    praisonai auth login openai
 
-# Then run immediately
-praisonai run "What is 2+2?"
-```
+    # Then run immediately
+    praisonai run "What is 2+2?"
+    ```
+  </Tab>
+  <Tab title="OAuth (Browser)">
+    ```bash
+    # Browser opens; sign in; tokens stored + auto-refreshed
+    praisonai auth login acme --method oauth
+
+    praisonai run "What is 2+2?"
+    ```
+    <Note>OAuth login is available per provider. If a provider isn't OAuth-capable, `auto` falls back to the API-key prompt. Today, OAuth is primarily for self-hosted gateways — `praisonai auth login openai --method oauth` will fail with a clear error until OpenAI is added to the registry.</Note>
+  </Tab>
+  <Tab title="Headless / SSH">
+    ```bash
+    # Prints a URL + code instead of opening a browser
+    praisonai auth login acme --method oauth --no-browser
+    # To sign in, visit https://acme.example/device and enter code: ABCD-EFGH
+
+    praisonai run "What is 2+2?"
+    ```
+  </Tab>
+</Tabs>
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `auth login <provider>` | Store credentials (prompts if `--key` omitted) |
-| `auth list` | List stored providers (keys redacted) |
-| `auth status [provider]` | Check format; add `--validate` for live OpenAI check |
+| `auth login <provider>` | Store credentials. `--method auto` (default) picks OAuth if available, else API key |
+| `auth list` | Show stored providers with method + expiry |
+| `auth status [provider]` | Format check; `--validate` does a live call (uses a freshly-refreshed OAuth token) |
 | `auth logout <provider>` | Remove one provider |
 | `auth logout --all` | Remove all stored credentials |
 
-### Login
+### Login flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--method auto\|apikey\|oauth` | `auto` | Force a flow, or let the CLI pick |
+| `--key sk-…` | (prompt) | API-key only; skip prompt |
+| `--key-stdin` | off | Read API key from stdin |
+| `--no-browser` | off | OAuth only; print URL + code instead of opening a browser |
+| `--base-url URL` | (default) | Custom provider endpoint |
+| `--model NAME` | (none) | Default model recorded with the credential |
+| `--skip-validation` | off | API-key only; skip the live check |
+
+### Which `--method` should I use?
+
+```mermaid
+graph TB
+    Start([Which method?]) --> Q1{Have a long-lived API key?}
+    Q1 -->|Yes| Apikey[--method apikey]
+    Q1 -->|No| Q2{On a headless server / SSH?}
+    Q2 -->|Yes| Headless[--method oauth --no-browser]
+    Q2 -->|No| Desktop[--method oauth]
+
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1,Q2 decision
+    class Apikey,Headless,Desktop result
+```
+
+## OAuth Login (browser-based)
+
+Two flows are negotiated automatically per provider:
+- **Device code** (RFC 8628) — prints a short code + URL, polls until you approve. Default on headless servers.
+- **Authorization code + PKCE** (RFC 7636) — opens your default browser and listens on `127.0.0.1` for the redirect. Default on desktops.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as praisonai
+    participant Browser
+    participant Provider
+
+    User->>CLI: praisonai auth login acme --method oauth
+    CLI->>Browser: Open authorize URL (PKCE) / print device code
+    Browser->>Provider: User signs in & approves
+    Provider-->>CLI: code (via 127.0.0.1 callback) / poll → token
+    CLI->>CLI: Store access_token + refresh_token in ~/.praison/credentials.json
+    CLI-->>User: ✅ Signed in to acme via OAuth
+```
+
+The OAuth callback handler and PKCE helpers are shared with the MCP OAuth integration.
+
+### Token storage & refresh
+
+| Item | Value |
+|---|---|
+| File | `~/.praison/credentials.json` (unchanged from API-key flow) |
+| Permissions | `0o600`, atomic writes |
+| Refresh | Transparent on next use, ~60 s before `expires_at` |
+| Refresh failure | CLI returns no token rather than a stale one — re-run `auth login` |
+
+### Self-hosted / custom OAuth providers
+
+`praisonai auth login` ships an **empty built-in OAuth registry** — production providers are added per release. To enable OAuth for a self-hosted gateway today, register a provider config from Python before invoking the flow:
+
+```python
+from praisonai.cli.configuration.oauth import OAUTH_PROVIDERS, OAuthProviderConfig
+
+OAUTH_PROVIDERS["my-gateway"] = OAuthProviderConfig(
+    flow="device",
+    client_id="my-client-id",
+    token_url="https://gateway.example.com/oauth/token",
+    device_authorization_url="https://gateway.example.com/oauth/device",
+    scope="read write",
+)
+```
+
+Then:
+
+```bash
+praisonai auth login my-gateway --method oauth
+```
+
+### Headless / SSH
+
+```bash
+praisonai auth login acme --method oauth --no-browser
+# To sign in, visit https://acme.example/device and enter code: ABCD-EFGH
+```
+
+## API Key Login
 
 ```bash
 praisonai auth login openai
@@ -54,6 +185,35 @@ praisonai auth logout openai
 praisonai auth logout --all
 ```
 
+## List & Status — new columns
+
+```bash
+praisonai auth list
+# Provider   Method   Secret          Expires   Base URL      Model
+# openai     apikey   sk-1***efgh     (n/a)     (default)     (none)
+# acme       oauth    at-9***xyz1     59m       https://…     acme-large
+```
+
+`Expires` shows `(n/a)` for API keys, `59m`, `1h 23m`, `<1m`, or `expired` for OAuth tokens, and `(no expiry)` when the provider didn't include one.
+
+<Note>The `auth list` and `auth status` table columns changed in this release — two new columns (`Method`, `Expires`) were added. Scripts that parse the table output need to be updated. The `--json` output is additive only (no existing keys removed).</Note>
+
+## Credential Fields (`ProviderCredential`)
+
+Each stored provider credential contains the following fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `api_key` | `str` | Static API key. For OAuth flows, mirrors `access_token` for backward compatibility |
+| `access_token` | `str` | OAuth access token (empty for API-key credentials) |
+| `refresh_token` | `str` | OAuth refresh token used for silent renewal |
+| `expires_at` | `int` | Unix epoch seconds when the access token expires. `0` for API keys (no expiry) |
+| `auth_method` | `str` | `"apikey"` or `"oauth"` — indicates which flow was used to store this credential |
+
+`auth list` and `auth status` show `Method` and `Expires` columns reflecting these fields.
+
+---
+
 ## Storage & Security
 
 | Item | Value |
@@ -61,28 +221,44 @@ praisonai auth logout --all
 | File | `~/.praison/credentials.json` |
 | Permissions | `0o600` (auto-corrected on read if loose) |
 | Writes | Atomic via temp file + `os.replace` |
-| Display | Keys redacted as `sk-1***efgh` everywhere except the file |
+| Display | Keys/tokens redacted as `at-9***xyz1` everywhere except the file |
+| OAuth internals | `refresh_token`, `token_url`, `client_id` are scrubbed before crossing into the LLM resolver — never sent to the provider |
 
 ## Supported Providers
 
-| Provider | Key prefix | Env var injected at run time |
-|---|---|---|
-| `openai` | `sk-` | `OPENAI_API_KEY` (+ `OPENAI_BASE_URL` if set) |
-| `anthropic` | `sk-ant-` | `ANTHROPIC_API_KEY` |
-| `google` / `gemini` | `AI` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
-| `tavily` | `tvly-` | `TAVILY_API_KEY` |
-| `groq` | `gsk_` | `GROQ_API_KEY` |
-| `cohere` | (none) | `COHERE_API_KEY` |
+| Provider | API key prefix | Env var injected at run time | OAuth supported today? |
+|---|---|---|---|
+| `openai` | `sk-` | `OPENAI_API_KEY` (+ `OPENAI_BASE_URL` if set) | Not yet — use API key |
+| `anthropic` | `sk-ant-` | `ANTHROPIC_API_KEY` | Not yet — use API key |
+| `google` / `gemini` | `AI` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Not yet — use API key |
+| `tavily` | `tvly-` | `TAVILY_API_KEY` | Not yet — use API key |
+| `groq` | `gsk_` | `GROQ_API_KEY` | Not yet — use API key |
+| `cohere` | (none) | `COHERE_API_KEY` | Not yet — use API key |
+| Self-hosted / custom | n/a | (your env var) | Yes, via `OAUTH_PROVIDERS` registry override |
 
-Unknown providers accept keys with length ≥ 10.
+Unknown providers accept API keys with length ≥ 10. OAuth is opt-in per provider.
+
+## Optional dependency
+
+The OAuth flow uses the `requests` library. It is lazy-imported, so users on the API-key path never see it. If a user runs `--method oauth` without it installed:
+
+```
+OAuth login requires the optional 'requests' package. Install it with: pip install requests
+```
 
 ## How Run Uses Credentials
 
 `praisonai run` resolves credentials in this order:
 
 1. Environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …)
-2. Stored credentials (injected into `os.environ` before the run)
+2. Stored credentials — **OAuth tokens refreshed transparently** (~60 s before expiry) before injection
 3. LLM endpoint resolution via `resolve_llm_endpoint_with_credentials`
+
+If an expired OAuth token cannot be refreshed (refresh token revoked, network error, etc.), `praisonai run` reports:
+
+```
+Error: No valid token for <provider>. Run: praisonai auth login <provider> --method oauth
+```
 
 If nothing is found, non-interactive mode exits with:
 

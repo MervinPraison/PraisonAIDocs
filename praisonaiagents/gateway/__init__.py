@@ -19,6 +19,7 @@ from .protocols import (
     GatewayMessage,
     EventType,
     OperatorScope,
+    GatewayCloseCode,
     # Push protocols and dataclasses
     PushChannelProtocol,
     PresenceProtocol,
@@ -38,10 +39,19 @@ from .protocols import (
     RouteFacts,
     RouteMatch,
     resolve_route,
+    # Per-route, trust-tiered toolset scoping (Issue #2298)
+    ToolPolicy,
+    UNTRUSTED_DENY_SUBSTRINGS,
+    TRUST_TIERS,
     # Outbound send-policy guard (Issue #2226)
     SendDecision,
     SendPolicyProtocol,
     SendPolicy,
+    # Gateway idle-dormancy / scale-to-zero (Issue #2332)
+    IdleDecision,
+    GatewayIdlePolicyProtocol,
+    GatewayIdlePolicy,  # backward-compat alias
+    ScaleToZeroPolicy,
     # Protocol version negotiation
     PROTOCOL_VERSION,
     MIN_PROTOCOL_VERSION,
@@ -50,6 +60,13 @@ from .protocols import (
     ProtocolHelloOk,
     GapInfo,
     ResumeSnapshot,
+)
+from .hooks import (
+    HookAction,
+    HookConfig,
+    InboundTriggerProtocol,
+    render_template,
+    compute_idempotency_key,
 )
 from .config import (
     GatewayConfig,
@@ -112,6 +129,7 @@ __all__ = [
     "GatewayMessage",
     "EventType",
     "OperatorScope",
+    "GatewayCloseCode",
     # Push protocols (always available)
     "PushChannelProtocol",
     "PresenceProtocol",
@@ -131,10 +149,19 @@ __all__ = [
     "RouteFacts",
     "RouteMatch",
     "resolve_route",
+    # Per-route, trust-tiered toolset scoping (Issue #2298)
+    "ToolPolicy",
+    "UNTRUSTED_DENY_SUBSTRINGS",
+    "TRUST_TIERS",
     # Outbound send-policy guard (Issue #2226)
     "SendDecision",
     "SendPolicyProtocol",
     "SendPolicy",
+    # Gateway idle-dormancy / scale-to-zero (Issue #2332)
+    "IdleDecision",
+    "GatewayIdlePolicyProtocol",
+    "GatewayIdlePolicy",
+    "ScaleToZeroPolicy",
     # Protocol version negotiation
     "PROTOCOL_VERSION",
     "MIN_PROTOCOL_VERSION",
@@ -143,6 +170,12 @@ __all__ = [
     "ProtocolHelloOk",
     "GapInfo",
     "ResumeSnapshot",
+    # Inbound trigger / webhook contract (Issue #2281)
+    "HookAction",
+    "HookConfig",
+    "InboundTriggerProtocol",
+    "render_template",
+    "compute_idempotency_key",
     # Config (always available)
     "GatewayConfig",
     "SessionConfig",
