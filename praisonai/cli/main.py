@@ -167,27 +167,54 @@ def _provider_preflight_message():
 # Use centralized availability detection
 from .._framework_availability import is_available
 
-# Define real module-level constants for internal use (prevents NameError)
-# These are evaluated on-demand for dynamic behavior
-GRADIO_AVAILABLE = is_available("gradio")
-CREWAI_AVAILABLE = is_available("crewai")
-AUTOGEN_AVAILABLE = is_available("autogen")
-PRAISONAI_AVAILABLE = is_available("praisonaiagents")
-TRAIN_AVAILABLE = is_available("unsloth")
+# Optional-dependency availability flags are resolved lazily so that merely
+# importing this module (e.g. for `praisonai --help`) does not walk the
+# meta-path with find_spec() for every optional dependency on every cold start.
+#
+# Maps the public flag name -> the framework key understood by is_available().
+_AVAILABILITY_FLAGS = {
+    "GRADIO_AVAILABLE": "gradio",
+    "CREWAI_AVAILABLE": "crewai",
+    "AUTOGEN_AVAILABLE": "autogen",
+    "PRAISONAI_AVAILABLE": "praisonaiagents",
+    "TRAIN_AVAILABLE": "unsloth",
+}
 
-# Handle CALL_MODULE_AVAILABLE with exception guard
-try:
-    import importlib.util
-    CALL_MODULE_AVAILABLE = importlib.util.find_spec("praisonai.api.call") is not None
-except (ModuleNotFoundError, AttributeError):
-    CALL_MODULE_AVAILABLE = False
 
-# Module-level __getattr__ for backward compatibility with external access
+def _compute_availability_flag(name):
+    """Compute a single availability flag without caching into globals()."""
+    if name in _AVAILABILITY_FLAGS:
+        return is_available(_AVAILABILITY_FLAGS[name])
+    if name == "CALL_MODULE_AVAILABLE":
+        try:
+            import importlib.util
+            return importlib.util.find_spec("praisonai.api.call") is not None
+        except (ModuleNotFoundError, AttributeError):
+            return False
+    raise AttributeError(name)
+
+
+def _ensure_availability_flags():
+    """Populate the module-level availability flags on first use.
+
+    Internal code references these as bare names (e.g. ``if CREWAI_AVAILABLE``)
+    which cannot trigger PEP 562 ``__getattr__``; calling this at the start of
+    command execution binds them into globals() so those references resolve
+    while keeping plain ``import`` cheap.
+    """
+    g = globals()
+    for flag in (*_AVAILABILITY_FLAGS, "CALL_MODULE_AVAILABLE"):
+        if flag not in g:
+            g[flag] = _compute_availability_flag(flag)
+
+
+# Module-level __getattr__ for backward compatibility with external access.
+# This lazily computes the flag on first attribute access and caches it.
 def __getattr__(name):
-    # For external backward compatibility, return the actual module-level values
-    if name in {"GRADIO_AVAILABLE", "CREWAI_AVAILABLE", "AUTOGEN_AVAILABLE",
-                "PRAISONAI_AVAILABLE", "TRAIN_AVAILABLE", "CALL_MODULE_AVAILABLE"}:
-        return globals()[name]
+    if name in _AVAILABILITY_FLAGS or name == "CALL_MODULE_AVAILABLE":
+        value = _compute_availability_flag(name)
+        globals()[name] = value  # cache so subsequent bare-name refs resolve
+        return value
     raise AttributeError(name)
 
 # Lazy import helpers for optional dependencies (defined after availability flags)
@@ -211,7 +238,7 @@ def _get_gradio():
     Raises:
         ImportError: If gradio is not installed
     """
-    if not GRADIO_AVAILABLE:
+    if not _compute_availability_flag("GRADIO_AVAILABLE"):
         raise ImportError(
             "Gradio is not installed. Install with: pip install gradio"
         )
@@ -373,7 +400,12 @@ class PraisonAI:
         """
         # Load environment variables from .env file
         _load_env_once()
-        
+
+        # Bind optional-dependency availability flags into module globals so the
+        # bare-name references used throughout command handling resolve. This is
+        # deferred to command execution to keep plain `import` cheap.
+        _ensure_availability_flags()
+
         # Warning filters now installed via Typer callback for CLI-only usage
         
         # Telemetry defaults now handled in PraisonAI.__init__ with Langfuse awareness
@@ -498,8 +530,14 @@ class PraisonAI:
                     result = self.handle_direct_prompt(combined_prompt)
                     # Result already printed by handle_direct_prompt, don't print again
                     return result
-                else:
+                elif os.path.isfile(args.command) or args.command.lower().endswith((".yaml", ".yml")):
+                    # Treat as an agent file when it is an existing file or a YAML path
                     self.agent_file = args.command
+                else:
+                    # Bare positional that isn't a file/YAML path: run it as a one-shot prompt
+                    result = self.handle_direct_prompt(args.command)
+                    # Result already printed by handle_direct_prompt, don't print again
+                    return result
         elif hasattr(args, 'direct_prompt') and args.direct_prompt:
             # Only handle direct prompt if agent_file wasn't explicitly set in constructor
             if original_agent_file == "agents.yaml":  # Default value, so safe to use direct prompt
@@ -924,6 +962,11 @@ class PraisonAI:
         """
         Parse the command-line arguments for the PraisonAI CLI.
         """
+        # Seed availability flags so bare-name reads resolve even when this
+        # method is reached directly (e.g. tests, library callers) rather than
+        # through main(). Idempotent and cheap after the first call.
+        _ensure_availability_flags()
+
         # Check if we're running in a test environment
         in_test_env = (
             'pytest' in sys.argv[0] or 
@@ -973,7 +1016,7 @@ class PraisonAI:
         parser.add_argument("--ui", choices=["chainlit", "gradio"], help="Specify the UI framework (gradio or chainlit).")
         parser.add_argument("--auto", nargs=argparse.REMAINDER, help="Enable auto mode and pass arguments for it")
         parser.add_argument("--init", nargs=argparse.REMAINDER, help="Initialize agents with optional topic")
-        parser.add_argument("command", nargs="?", help="Command to run or direct prompt")
+        parser.add_argument("command", nargs="?", help="Agent YAML file, subcommand, or a direct natural-language prompt to run as a one-shot task")
         parser.add_argument("--deploy", action="store_true", help="Deploy the application")
         parser.add_argument("--schedule", type=str, help="Schedule deployment (e.g., 'daily', 'hourly', '*/6h', '3600')")
         parser.add_argument("--schedule-config", type=str, help="Path to scheduling configuration file")
@@ -1003,6 +1046,7 @@ class PraisonAI:
         parser.add_argument("--no-tools", action="store_true", help="Disable default built-in tools (for models that don't support tool calling)")
         parser.add_argument("--no-acp", action="store_true", help="Disable ACP tools (agentic file operations with plan/approve/apply)")
         parser.add_argument("--no-lsp", action="store_true", help="Disable LSP tools (code intelligence: symbols, definitions, references)")
+        parser.add_argument("--no-context", action="store_true", help="Disable auto-loading of project context files (AGENTS.md/CLAUDE.md) into the system prompt")
         parser.add_argument("--save", "-s", action="store_true", help="Save research output to file (output/research/)")
         parser.add_argument("-v", "--verbose", action="count", default=0,
                           help="Increase verbosity (-v=verbose, -vv=debug)")
@@ -1975,7 +2019,15 @@ class PraisonAI:
 
         # Handle direct prompt if command is not a special command or file
         # Skip this during testing to avoid pytest arguments interfering
-        if not in_test_env and args.command and not args.command.endswith('.yaml') and args.command not in special_commands:
+        # A bare positional is treated as a one-shot prompt unless it is an
+        # existing file or a YAML agent-file path (case-insensitive .yaml/.yml).
+        if (
+            not in_test_env
+            and args.command
+            and args.command not in special_commands
+            and not os.path.isfile(args.command)
+            and not args.command.lower().endswith((".yaml", ".yml"))
+        ):
             args.direct_prompt = args.command
             args.command = None
 
@@ -4308,6 +4360,10 @@ Do NOT add any explanations or formatting."""
         - @rule:name - Include specific rule
         - @url:https://... - Fetch URL content
         """
+        # Seed availability flags so bare-name reads resolve when invoked
+        # directly (e.g. `praison run` -> handle_direct_prompt) without main().
+        _ensure_availability_flags()
+
         # Check for profiling mode - use unified profiler
         if hasattr(self, 'args') and getattr(self.args, 'profile', False):
             return self._handle_profiled_prompt(prompt)
@@ -4879,6 +4935,14 @@ Do NOT add any explanations or formatting."""
                 flow.display_workflow_start("Direct Prompt", ["DirectAgent"])
             
             agent = PraisonAgent(**agent_config)
+
+            # Reasoning effort (mapped from --thinking on `run`/`code`) → core
+            # extended-thinking budget, applied via the property setter. Default
+            # is unchanged when the flag is omitted.
+            if hasattr(self, 'args'):
+                _thinking_budget = getattr(self.args, 'thinking_budget', None)
+                if _thinking_budget is not None:
+                    agent.thinking_budget = _thinking_budget
 
             if hasattr(self, 'args') and getattr(self.args, 'cli_project_sessions', False):
                 session_id = getattr(self.args, 'resume_session', None) or getattr(self.args, 'auto_save', None)
@@ -5551,6 +5615,9 @@ Now, {final_instruction.lower()}:"""
         """
         Create a Gradio interface for generating agents and performing tasks.
         """
+        # Seed availability flags so bare-name reads resolve when invoked
+        # directly rather than through main().
+        _ensure_availability_flags()
         if GRADIO_AVAILABLE:
             # Lazy import gradio only when needed
             gr = _get_gradio()
@@ -5825,6 +5892,33 @@ Now, {final_instruction.lower()}:"""
             print(f"[red]ERROR: Research failed: {e}[/red]")
             sys.exit(1)
 
+    def _load_cli_project_context(self, budget: int = 8000) -> str:
+        """Auto-discover AGENTS.md/CLAUDE.md project context for the system prompt.
+
+        Walks up from the current working directory to the project root,
+        bounded by ``budget`` characters and cached for the process. Returns
+        an empty string when the optional helper is unavailable or no context
+        files are found.
+        """
+        cached = getattr(self, "_cli_project_context", None)
+        if cached is not None:
+            return cached
+
+        context = ""
+        try:
+            from praisonai.integration.context_files import load_context_files
+            context = load_context_files(walk_up=True) or ""
+        except ImportError:
+            context = ""  # Context files helper is optional
+        except Exception:
+            context = ""
+
+        if budget and len(context) > budget:
+            context = context[:budget] + "\n... [project context truncated]"
+
+        self._cli_project_context = context
+        return context
+
     def _start_interactive_mode(self, args):
         """
         Start interactive TUI mode with streaming responses and tool support.
@@ -5844,6 +5938,13 @@ Now, {final_instruction.lower()}:"""
             import os
             
             console = Console()
+            
+            # Persist the caller's args (e.g. from `praisonai code`) so the
+            # agent-creation path can read the named-agent profile, approval
+            # config, and reasoning effort via self.args. Without this the
+            # --agent/--thinking flags resolved in code.py are silently dropped.
+            if args is not None:
+                self.args = args
             
             # Set interactive mode flag
             self._interactive_mode = True
@@ -6751,6 +6852,12 @@ Provide a concise summary (max 200 words):"""
         from rich.console import Console
         
         console = Console()
+        # Persist the caller's args (e.g. from `praisonai code`) so the
+        # agent-creation path can read the named-agent profile, approval config,
+        # and reasoning effort via self.args. Without this the --agent/--thinking
+        # flags resolved in code.py are silently dropped.
+        if args is not None:
+            self.args = args
         self._interactive_mode = True  # Use interactive mode settings
         
         # Load tools
@@ -6865,6 +6972,13 @@ Provide a concise summary (max 200 words):"""
                             
                             # Build backstory with context
                             backstory = "You are a helpful AI assistant with access to tools for file operations, code intelligence, and shell commands."
+
+                            # Auto-load AGENTS.md/CLAUDE.md project context (unless --no-context)
+                            if not getattr(args, 'no_context', False):
+                                project_context = self._load_cli_project_context()
+                                if project_context:
+                                    backstory += "\n\n# Project Context\n" + project_context
+
                             if conversation_history:
                                 recent = conversation_history[-10:]
                                 context_lines = []
@@ -7006,6 +7120,19 @@ Provide a concise summary (max 200 words):"""
             elif hasattr(self, 'args') and getattr(self.args, 'llm', None):
                 model = self.args.llm
             
+            # Optional named-agent profile (tools + permission scope) and
+            # reasoning effort, surfaced by `praisonai code --agent/--thinking`.
+            agent_kwargs = {}
+            agent_profile = getattr(self.args, 'agent_profile', None) if hasattr(self, 'args') else None
+            if agent_profile and agent_profile.get('tools'):
+                # The profile's tools replace the default tool set so the
+                # least-privilege scope is honoured (e.g. read-only profiles).
+                tools_list = agent_profile['tools']
+            agent_approval = getattr(self.args, 'agent_approval', None) if hasattr(self, 'args') else None
+            if agent_approval is not None:
+                agent_kwargs['approval'] = agent_approval
+            thinking_budget = getattr(self.args, 'thinking_budget', None) if hasattr(self, 'args') else None
+
             # Show thinking indicator and create agent
             timings['agent_create_start'] = time.time()
             with Live(Spinner("dots", text="Thinking...", style="cyan"), console=console, refresh_per_second=10, transient=True):
@@ -7017,8 +7144,13 @@ Provide a concise summary (max 200 words):"""
                     backstory="You are a helpful AI assistant with access to tools for file operations, shell commands, and web search. Use tools when needed to complete tasks.",
                     tools=tools_list if tools_list else None,
                     output="minimal",  # Suppress verbose panels
-                    llm=model
+                    llm=model,
+                    **agent_kwargs,
                 )
+                # Reasoning effort is applied via the property setter (not a
+                # constructor kwarg) to keep defaults byte-for-byte when omitted.
+                if thinking_budget is not None:
+                    agent.thinking_budget = thinking_budget
             timings['agent_create_end'] = time.time()
             
             # Get response

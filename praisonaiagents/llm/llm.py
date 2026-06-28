@@ -923,6 +923,156 @@ Respond with ONLY a valid JSON tool call in this format:
         self._cached_subscription_creds = provider.refresh()
         return self._cached_subscription_creds
 
+    def _should_attempt_auth_refresh(self, e, attempt):
+        """Whether an auth-credential refresh should be attempted this attempt.
+
+        Side-effect-free predicate shared by the sync and async retry loops so
+        the async loop can decide to offload the blocking refresh to a thread.
+
+        Uses the pure ``classify_error_kind`` classifier directly rather than
+        ``resolve_failover_decision``: the latter mutates state (e.g. the idle
+        timeout circuit breaker) and is also called by ``_handle_retry_exception``
+        for the same exception, which would double-count those mutations.
+        """
+        if not (self._auth_provider_id and attempt == 0):
+            return False
+        return self.classify_error_kind(e) == "auth"
+
+    def _try_refresh_subscription_creds(self):
+        """Attempt a credential refresh, keeping failures non-fatal.
+
+        Wraps `_refresh_subscription_creds` so refresh errors never abort the
+        retry/failover flow. Returns the refreshed credentials or ``None``. This
+        is the blocking (network) step; the async loop runs it off the event
+        loop via ``asyncio.to_thread``.
+        """
+        try:
+            logging.info("Authentication error detected - attempting credential refresh")
+            return self._refresh_subscription_creds()
+        except Exception as refresh_error:  # noqa: BLE001 - refresh failures must stay non-fatal so retry/failover can continue
+            logging.warning(
+                "Failed to refresh subscription credentials for auth provider %r (%s). "
+                "Verify the provider login/configuration and retry or re-authenticate.",
+                self._auth_provider_id,
+                type(refresh_error).__name__,
+            )
+            return None
+
+    def _handle_retry_exception(self, e, attempt, kwargs, refreshed_creds=None):
+        """Decide retry vs raise from a failover decision. No sleep/await.
+
+        Shared decision logic used by both the sync (`_call_with_retry`) and
+        async (`_call_with_retry_async`) retry loops. Performs failover
+        bookkeeping (profile rotation, legacy failover kwargs update) but never
+        sleeps or awaits, so it is identical for both paths.
+
+        The blocking credential refresh itself is performed by the caller: the
+        sync loop calls `_try_refresh_subscription_creds()` inline, while the
+        async loop offloads it to a thread via ``asyncio.to_thread`` so it never
+        blocks the event loop. The already-refreshed credentials (if any) are
+        passed in via ``refreshed_creds``.
+
+        Args:
+            e: The exception raised by the wrapped call.
+            attempt: Zero-based attempt index for the current iteration.
+            kwargs: Keyword arguments for the wrapped call (may be updated).
+            refreshed_creds: Credentials already refreshed by the caller (off
+                the event loop for async), or ``None`` if no refresh was done.
+
+        Returns:
+            Tuple of (should_raise, category, retry_delay, error_str, kwargs):
+                should_raise: Whether the caller should re-raise immediately.
+                category: The error category/reason from the decision.
+                retry_delay: Seconds to wait before the next attempt.
+                error_str: String form of the exception.
+                kwargs: The (possibly updated) keyword arguments.
+        """
+        # Use new typed failover decision instead of old classification
+        decision = self.resolve_failover_decision(e, {"attempt": attempt + 1, "max_retries": self._max_retries})
+
+        error_str = str(e)
+
+        # Map decision to old variables for compatibility with existing logic
+        category = decision.reason
+        can_retry = decision.is_retryable
+        retry_delay = decision.backoff_ms / 1000.0  # Convert ms to seconds
+
+        # Apply refreshed subscription credentials (refresh I/O is done by the
+        # caller so the async loop can offload it off the event loop).
+        refreshed_auth = False
+        if category == "auth" and self._auth_provider_id and attempt == 0 and refreshed_creds:
+            # Rebuild parameters (don't clear cache), then re-apply the refreshed
+            # credentials *after* the rebuild. _build_completion_params merges the
+            # incoming kwargs last, so the failed attempt's stale api_key/base_url
+            # would otherwise overwrite the freshly refreshed credentials.
+            kwargs = self._build_completion_params(**kwargs)
+            kwargs["api_key"] = refreshed_creds.api_key
+            if refreshed_creds.base_url:
+                kwargs["base_url"] = refreshed_creds.base_url
+            if refreshed_creds.headers:
+                extra_headers = dict(kwargs.get("extra_headers") or {})
+                extra_headers.update(refreshed_creds.headers)
+                kwargs["extra_headers"] = extra_headers
+            # Retry immediately with refreshed credentials
+            can_retry = True
+            retry_delay = 0.0
+            refreshed_auth = True
+            logging.info("Subscription credentials refreshed, retrying...")
+
+        # A successful credential refresh fully resolves the auth error: retry
+        # immediately with fresh credentials and skip profile rotation so we
+        # neither mark the current profile failed nor overwrite the new creds.
+        if refreshed_auth:
+            return False, category, retry_delay, error_str, kwargs
+
+        # Handle different failover decision actions
+        if decision.action == "rotate_profile" and self._failover_manager:
+            if self._current_profile:
+                is_rate_limit = (category == "rate_limit")
+                self._failover_manager.mark_failure(
+                    self._current_profile, error_str, is_rate_limit=is_rate_limit
+                )
+            next_profile = self._failover_manager.get_next_profile()
+            if next_profile and next_profile != self._current_profile:
+                self._switch_to_profile(next_profile)
+                self._current_profile = next_profile
+                # Update the kwargs with new profile values for the next retry
+                if "api_key" in kwargs:
+                    kwargs["api_key"] = self.api_key
+                if "base_url" in kwargs:
+                    kwargs["base_url"] = self.base_url
+                if "model" in kwargs:
+                    kwargs["model"] = self.model
+                logging.info(f"Failover: switched to profile '{next_profile.name}'")
+            else:
+                # No alternate profile available - retrying would just hit the
+                # same failing profile, so surface the error instead.
+                can_retry = False
+        # Legacy failover for compatibility (when decision is retry but failover is configured)
+        elif self._failover_manager and self._current_profile and decision.action == "retry":
+            is_rate_limit = (category == "rate_limit")
+            self._failover_manager.mark_failure(
+                self._current_profile, error_str, is_rate_limit=is_rate_limit
+            )
+            next_profile = self._failover_manager.get_next_profile()
+            if next_profile and next_profile != self._current_profile:
+                self._switch_to_profile(next_profile)
+                self._current_profile = next_profile
+                # Update the kwargs with new profile values for the next retry
+                if "api_key" in kwargs:
+                    kwargs["api_key"] = self.api_key
+                if "base_url" in kwargs:
+                    kwargs["base_url"] = self.base_url
+                if "model" in kwargs:
+                    kwargs["model"] = self.model
+                # Enable retry for profile switch even if originally non-retryable
+                can_retry = True
+                retry_delay = 0.0
+                logging.info(f"Failover: switched to profile '{next_profile.name}'")
+
+        should_raise = decision.action == "surface_error" or not can_retry
+        return should_raise, category, retry_delay, error_str, kwargs
+
     def _call_with_retry(self, func, *args, **kwargs):
         """Call a function with automatic retry on rate limit errors and failover support.
 
@@ -957,74 +1107,18 @@ Respond with ONLY a valid JSON tool call in this format:
                 return result
 
             except Exception as e:
-                # Use new typed failover decision instead of old classification
-                decision = self.resolve_failover_decision(e, {"attempt": attempt + 1, "max_retries": self._max_retries})
-                
                 last_error = e
-                error_str = str(e)
-                
-                # Map decision to old variables for compatibility with existing logic
-                category = decision.reason
-                can_retry = decision.is_retryable
-                retry_delay = decision.backoff_ms / 1000.0  # Convert ms to seconds
 
-                # Check for auth errors and try refreshing subscription credentials
-                if category == "auth" and self._auth_provider_id and attempt == 0:
-                    try:
-                        logging.info("Authentication error detected - attempting credential refresh")
-                        refreshed_creds = self._refresh_subscription_creds()
-                        if refreshed_creds:
-                            # Update parameters with refreshed credentials (don't clear cache)
-                            kwargs = self._build_completion_params(**kwargs)
-                            # Retry immediately with refreshed credentials
-                            can_retry = True
-                            retry_delay = 0.0
-                            logging.info("Subscription credentials refreshed, retrying...")
-                    except Exception as refresh_error:
-                        logging.warning(f"Failed to refresh subscription credentials: {refresh_error}")
+                # Blocking credential refresh runs inline in the sync path.
+                refreshed_creds = None
+                if self._should_attempt_auth_refresh(e, attempt):
+                    refreshed_creds = self._try_refresh_subscription_creds()
 
-                # Handle different failover decision actions
-                if decision.action == "rotate_profile" and self._failover_manager:
-                    if self._current_profile:
-                        is_rate_limit = (category == "rate_limit")
-                        self._failover_manager.mark_failure(
-                            self._current_profile, error_str, is_rate_limit=is_rate_limit
-                        )
-                    next_profile = self._failover_manager.get_next_profile()
-                    if next_profile and next_profile != self._current_profile:
-                        self._switch_to_profile(next_profile)
-                        self._current_profile = next_profile
-                        # Update the kwargs with new profile values for the next retry
-                        if "api_key" in kwargs:
-                            kwargs["api_key"] = self.api_key
-                        if "base_url" in kwargs:
-                            kwargs["base_url"] = self.base_url
-                        if "model" in kwargs:
-                            kwargs["model"] = self.model
-                        logging.info(f"Failover: switched to profile '{next_profile.name}'")
-                # Legacy failover for compatibility (when decision is retry but failover is configured)
-                elif self._failover_manager and self._current_profile and decision.action == "retry":
-                    is_rate_limit = (category == "rate_limit")
-                    self._failover_manager.mark_failure(
-                        self._current_profile, error_str, is_rate_limit=is_rate_limit
-                    )
-                    next_profile = self._failover_manager.get_next_profile()
-                    if next_profile and next_profile != self._current_profile:
-                        self._switch_to_profile(next_profile)
-                        self._current_profile = next_profile
-                        # Update the kwargs with new profile values for the next retry
-                        if "api_key" in kwargs:
-                            kwargs["api_key"] = self.api_key
-                        if "base_url" in kwargs:
-                            kwargs["base_url"] = self.base_url
-                        if "model" in kwargs:
-                            kwargs["model"] = self.model
-                        # Enable retry for profile switch even if originally non-retryable
-                        can_retry = True
-                        retry_delay = 0.0
-                        logging.info(f"Failover: switched to profile '{next_profile.name}'")
-                
-                if decision.action == "surface_error" or not can_retry:
+                should_raise, category, retry_delay, error_str, kwargs = (
+                    self._handle_retry_exception(e, attempt, kwargs, refreshed_creds=refreshed_creds)
+                )
+
+                if should_raise:
                     raise
 
                 if attempt < self._max_retries:
@@ -1089,74 +1183,21 @@ Respond with ONLY a valid JSON tool call in this format:
                 return result
 
             except Exception as e:
-                # Use new typed failover decision instead of old classification
-                decision = self.resolve_failover_decision(e, {"attempt": attempt + 1, "max_retries": self._max_retries})
-                
                 last_error = e
-                error_str = str(e)
-                
-                # Map decision to old variables for compatibility with existing logic
-                category = decision.reason
-                can_retry = decision.is_retryable
-                retry_delay = decision.backoff_ms / 1000.0  # Convert ms to seconds
 
-                # Check for auth errors and try refreshing subscription credentials
-                if category == "auth" and self._auth_provider_id and attempt == 0:
-                    try:
-                        logging.info("Authentication error detected - attempting credential refresh")
-                        refreshed_creds = self._refresh_subscription_creds()
-                        if refreshed_creds:
-                            # Update parameters with refreshed credentials (don't clear cache)
-                            kwargs = self._build_completion_params(**kwargs)
-                            # Retry immediately with refreshed credentials
-                            can_retry = True
-                            retry_delay = 0.0
-                            logging.info("Subscription credentials refreshed, retrying...")
-                    except Exception as refresh_error:
-                        logging.warning(f"Failed to refresh subscription credentials: {refresh_error}")
-
-                # Handle different failover decision actions
-                if decision.action == "rotate_profile" and self._failover_manager:
-                    if self._current_profile:
-                        is_rate_limit = (category == "rate_limit")
-                        self._failover_manager.mark_failure(
-                            self._current_profile, error_str, is_rate_limit=is_rate_limit
-                        )
-                    next_profile = self._failover_manager.get_next_profile()
-                    if next_profile and next_profile != self._current_profile:
-                        self._switch_to_profile(next_profile)
-                        self._current_profile = next_profile
-                        # Update the kwargs with new profile values for the next retry
-                        if "api_key" in kwargs:
-                            kwargs["api_key"] = self.api_key
-                        if "base_url" in kwargs:
-                            kwargs["base_url"] = self.base_url
-                        if "model" in kwargs:
-                            kwargs["model"] = self.model
-                        logging.info(f"Failover: switched to profile '{next_profile.name}'")
-                # Legacy failover for compatibility (when decision is retry but failover is configured)
-                elif self._failover_manager and self._current_profile and decision.action == "retry":
-                    is_rate_limit = (category == "rate_limit")
-                    self._failover_manager.mark_failure(
-                        self._current_profile, error_str, is_rate_limit=is_rate_limit
+                # Offload the blocking credential refresh to a thread so it
+                # never blocks the event loop in the async path.
+                refreshed_creds = None
+                if self._should_attempt_auth_refresh(e, attempt):
+                    refreshed_creds = await asyncio.to_thread(
+                        self._try_refresh_subscription_creds
                     )
-                    next_profile = self._failover_manager.get_next_profile()
-                    if next_profile and next_profile != self._current_profile:
-                        self._switch_to_profile(next_profile)
-                        self._current_profile = next_profile
-                        # Update the kwargs with new profile values for the next retry
-                        if "api_key" in kwargs:
-                            kwargs["api_key"] = self.api_key
-                        if "base_url" in kwargs:
-                            kwargs["base_url"] = self.base_url
-                        if "model" in kwargs:
-                            kwargs["model"] = self.model
-                        # Enable retry for profile switch even if originally non-retryable
-                        can_retry = True
-                        retry_delay = 0.0
-                        logging.info(f"Failover: switched to profile '{next_profile.name}'")
-                
-                if decision.action == "surface_error" or not can_retry:
+
+                should_raise, category, retry_delay, error_str, kwargs = (
+                    self._handle_retry_exception(e, attempt, kwargs, refreshed_creds=refreshed_creds)
+                )
+
+                if should_raise:
                     raise
 
                 if attempt < self._max_retries:
@@ -1164,6 +1205,21 @@ Respond with ONLY a valid JSON tool call in this format:
                         f"{category} error hit (attempt {attempt + 1}/{self._max_retries + 1}), "
                         f"waiting {retry_delay:.1f}s before retry..."
                     )
+
+                    # P5: Emit retry callback for CLI visibility.
+                    # Use the async dispatcher so a sync callback runs in a
+                    # thread executor (never blocking the event loop) and any
+                    # async-registered 'retry' callback is also awaited.
+                    try:
+                        from ..main import execute_callback
+                        await execute_callback('retry',
+                            attempt=attempt + 1,
+                            max_attempts=self._max_retries + 1,
+                            error=error_str[:200],
+                            retry_in_seconds=retry_delay
+                        )
+                    except ImportError:
+                        pass
 
                     if self._rate_limiter is not None:
                         await self._rate_limiter.wait_for_retry_async(retry_delay)
@@ -1463,6 +1519,42 @@ Result: {tool_result_str}
 
 Now provide your final answer using this result. Summarize the information naturally for the user."""
             }
+
+    def _try_append_multimodal_tool_result(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_result: Any,
+        tool_call_id: str,
+        function_name: Optional[str] = None,
+        deferred_followups: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Append a multimodal tool result if the result carries media.
+
+        The ``tool`` reply is appended in-place so all tool replies for the
+        assistant turn stay consecutive (provider contract). The media-bearing
+        ``user`` follow-up message is collected into ``deferred_followups`` for
+        the caller to flush *after* the whole tool_calls batch is processed; if
+        no collector is supplied it is appended directly (single-call paths).
+
+        Returns True if the result was multimodal (caller should skip its
+        default text-only tool message), False otherwise (no regression).
+        """
+        try:
+            from ..agent.tool_execution import build_tool_result_message_pair
+            pair = build_tool_result_message_pair(
+                tool_result, tool_call_id, function_name=function_name
+            )
+            if pair:
+                tool_message, followup_message = pair
+                messages.append(tool_message)
+                if deferred_followups is not None:
+                    deferred_followups.append(followup_message)
+                else:
+                    messages.append(followup_message)
+                return True
+        except Exception as e:
+            logging.debug(f"Multimodal tool result formatting skipped: {e}")
+        return False
 
     def _get_tool_names_for_prompt(self, formatted_tools: Optional[List]) -> str:
         """Extract tool names from formatted tools for prompts."""
@@ -3000,6 +3092,10 @@ Now provide your final answer using this result. Summarize the information natur
                             tool_calls = tool_calls[:remaining_calls]
                             logging.warning(f"Limiting batch to {remaining_calls} tool calls to stay within limit of {max_tool_calls_per_turn}.")
                         
+                        # Collect media-bearing follow-up messages so they are
+                        # flushed only AFTER every tool reply for this assistant
+                        # turn, keeping all tool replies consecutive (provider contract).
+                        _deferred_media_followups: List[Dict[str, Any]] = []
                         for tool_call in tool_calls:
                             # Handle both object and dict access patterns
                             is_ollama = self._is_ollama_provider()
@@ -3064,6 +3160,13 @@ Now provide your final answer using this result. Summarize the information natur
                             if self._is_ollama_provider():
                                 # For Ollama, use user role and format as natural language
                                 messages.append(self._format_ollama_tool_result_message(function_name, tool_result))
+                            elif self._try_append_multimodal_tool_result(
+                                messages, tool_result, tool_call_id,
+                                function_name=function_name,
+                                deferred_followups=_deferred_media_followups,
+                            ):
+                                # Multimodal result (image/file) emitted as model-visible parts
+                                pass
                             else:
                                 # For other providers, use tool role with tool_call_id
                                 # Format error results more clearly
@@ -3085,7 +3188,12 @@ Now provide your final answer using this result. Summarize the information natur
                             # This mimics the logic from agent.py lines 1004-1007
                             if function_name == "sequentialthinking" and arguments.get("nextThoughtNeeded", False):
                                 should_continue = True
-                        
+
+                        # Flush deferred media follow-ups after all tool replies
+                        # for this turn have been appended (provider contract).
+                        if _deferred_media_followups:
+                            messages.extend(_deferred_media_followups)
+
                         # If we should continue, increment iteration and continue loop
                         if should_continue:
                             iteration_count += 1
@@ -4254,6 +4362,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         logging.warning(f"Limiting batch to {remaining_calls} tool calls to stay within limit of {max_tool_calls_per_turn}.")
                     
                     tool_results = []  # Store current iteration tool results
+                    # Collect media-bearing follow-up messages so they are
+                    # flushed only AFTER every tool reply for this assistant
+                    # turn, keeping all tool replies consecutive (provider contract).
+                    _deferred_media_followups: List[Dict[str, Any]] = []
                     for tool_call in tool_calls:
                         # Handle both object and dict access patterns
                         is_ollama = self._is_ollama_provider()
@@ -4279,6 +4391,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         if self._is_ollama_provider():
                             # For Ollama, use user role and format as natural language
                             messages.append(self._format_ollama_tool_result_message(function_name, tool_result))
+                        elif self._try_append_multimodal_tool_result(
+                            messages, tool_result, tool_call_id,
+                            function_name=function_name,
+                            deferred_followups=_deferred_media_followups,
+                        ):
+                            # Multimodal result (image/file) emitted as model-visible parts
+                            pass
                         else:
                             # For other providers, use tool role with tool_call_id
                             # Format error results more clearly
@@ -4295,6 +4414,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 "tool_call_id": tool_call_id,
                                 "content": content
                             })
+
+                    # Flush deferred media follow-ups after all tool replies
+                    # for this turn have been appended (provider contract).
+                    if _deferred_media_followups:
+                        messages.extend(_deferred_media_followups)
 
                     # For Ollama, add explicit prompt if we need a final answer
                     if self._is_ollama_provider() and iteration_count > 0:

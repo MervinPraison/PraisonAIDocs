@@ -261,13 +261,44 @@ class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin
                     cls._env_output_checked = True
         return cls._env_output_mode
     
+    # Ordered (credential env-var, provider-appropriate default model). The
+    # first provider whose credential is present wins. OpenAI is first so
+    # existing OpenAI users keep their default; any other single configured
+    # provider yields a matching default instead of a failing OpenAI default.
+    _PROVIDER_DEFAULT_MODELS = (
+        ("OPENAI_API_KEY", "gpt-4o-mini"),
+        ("ANTHROPIC_API_KEY", "anthropic/claude-3-5-sonnet-latest"),
+        ("GEMINI_API_KEY", "gemini/gemini-1.5-flash"),
+        ("GOOGLE_API_KEY", "google/gemini-1.5-flash"),
+        ("GROQ_API_KEY", "groq/llama-3.3-70b-versatile"),
+        ("COHERE_API_KEY", "cohere/command-r"),
+        ("OLLAMA_HOST", "ollama/llama3.2"),
+    )
+
+    @classmethod
+    def _resolve_default_model(cls):
+        """Resolve a provider-aware default model from present credentials.
+
+        Precedence: ``OPENAI_MODEL_NAME`` (backward compatible) > first
+        provider whose credential env var is set > hardcoded ``gpt-4o-mini``.
+        Keeps core free of provider-detection policy beyond a simple env scan;
+        the wrapper layer owns recency state and first-run notices.
+        """
+        explicit = os.getenv('OPENAI_MODEL_NAME')
+        if explicit:
+            return explicit
+        for key_var, model in cls._PROVIDER_DEFAULT_MODELS:
+            if os.environ.get(key_var):
+                return model
+        return 'gpt-4o-mini'
+
     @classmethod
     def _get_default_model(cls):
-        """Get cached default model name from OPENAI_MODEL_NAME env var (thread-safe)."""
+        """Get cached provider-aware default model name (thread-safe)."""
         if not cls._default_model_checked:
             with cls._env_cache_lock:
                 if not cls._default_model_checked:
-                    cls._default_model = os.getenv('OPENAI_MODEL_NAME', 'gpt-4o-mini')
+                    cls._default_model = cls._resolve_default_model()
                     cls._default_model_checked = True
         return cls._default_model
     
@@ -1905,7 +1936,8 @@ Your Goal: {self.goal}
             # export PRAISONAI_TOOL_SAFETY=off. This adds zero Agent kwargs.
             _raw_safety_env = os.environ.get("PRAISONAI_TOOL_SAFETY")
             _safety_env = (_raw_safety_env or "").strip().lower()
-            if _safety_env not in ("off", "full", "none", "0", "false"):
+            _bypass_safety = _safety_env in ("off", "full", "none", "0", "false")
+            if not _bypass_safety:
                 from ..approval.registry import PERMISSION_PRESETS
                 _resolved_safety_env = _safety_env or "default"
                 _preset_deny = PERMISSION_PRESETS.get(_resolved_safety_env)
@@ -1920,7 +1952,27 @@ Your Goal: {self.goal}
                     )
                     _resolved_safety_env = "default"
                     _preset_deny = PERMISSION_PRESETS.get(_resolved_safety_env)
-                if _preset_deny is not None:
+
+                # Safe-by-default ask: when no approval kwarg was supplied
+                # (``approval is None``) and we are attached to an interactive
+                # terminal, route dangerous built-in tools (shell exec, file
+                # writes, etc.) through an interactive approval prompt instead
+                # of silently hard-denying them. This makes a fresh, un-flagged
+                # agent safe *and* usable — the user is asked once per dangerous
+                # call and can allow/deny.
+                #
+                # In non-interactive contexts (pipes, CI) — or when the user
+                # explicitly passed ``approval=False`` to opt out of prompting —
+                # we keep the existing deny-by-default preset so dangerous tools
+                # never execute unattended without an explicit policy. The full
+                # bypass remains ``PRAISONAI_TOOL_SAFETY=off`` / ``approval="bypass"``.
+                if approval is None and self._is_interactive_session():
+                    from ..approval.backends import ConsoleBackend
+                    self._approval_backend = ConsoleBackend()
+                    # Leave _perm_deny empty so dangerous tools reach the backend
+                    # (which classifies them via DEFAULT_DANGEROUS_TOOLS) and the
+                    # user is prompted to allow/deny rather than auto-denied.
+                elif _preset_deny is not None:
                     self._perm_deny = _preset_deny
         elif isinstance(approval, ApprovalConfig):
             self._approval_backend = approval.backend
@@ -5051,6 +5103,22 @@ Answer:"""
                 self.knowledge.store(knowledge_item, user_id=self.user_id, agent_id=self.agent_id)
         except Exception as e:
             logging.error(f"Error processing knowledge item: {knowledge_item}, error: {e}")
+
+    @staticmethod
+    def _is_interactive_session() -> bool:
+        """Return True when running attached to an interactive terminal.
+
+        Used to decide whether dangerous built-in tools should be routed
+        through an interactive approval prompt (safe-by-default ``ask``) or
+        hard-denied (non-interactive deny-by-default). A session counts as
+        interactive only when both stdin and stdout are TTYs, so pipes, CI
+        runners and redirected I/O fall back to the deny-by-default policy.
+        """
+        try:
+            import sys
+            return bool(sys.stdin.isatty() and sys.stdout.isatty())
+        except Exception:
+            return False
 
     def _setup_guardrail(self):
         """Setup the guardrail function based on the provided guardrail parameter."""

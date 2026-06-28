@@ -52,6 +52,13 @@ from .protocols import (
     GatewayIdlePolicyProtocol,
     GatewayIdlePolicy,  # backward-compat alias
     ScaleToZeroPolicy,
+    # Gateway graceful-drain on shutdown (Issue #2375)
+    DrainDecision,
+    GatewayDrainPolicyProtocol,
+    DrainTimeoutPolicy,
+    # Port-less, restart-safe external drain trigger (Issue #2390)
+    current_epoch,
+    DrainMarkerPolicy,
     # Protocol version negotiation
     PROTOCOL_VERSION,
     MIN_PROTOCOL_VERSION,
@@ -162,6 +169,12 @@ __all__ = [
     "GatewayIdlePolicyProtocol",
     "GatewayIdlePolicy",
     "ScaleToZeroPolicy",
+    "DrainDecision",
+    "GatewayDrainPolicyProtocol",
+    "DrainTimeoutPolicy",
+    # Port-less, restart-safe external drain trigger (Issue #2390)
+    "current_epoch",
+    "DrainMarkerPolicy",
     # Protocol version negotiation
     "PROTOCOL_VERSION",
     "MIN_PROTOCOL_VERSION",

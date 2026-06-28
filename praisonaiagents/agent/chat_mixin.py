@@ -988,12 +988,13 @@ Your Goal: {self.goal}"""
         formatted_tools = self._format_tools_for_completion(tools)
 
         # Smart fallback for streaming: try streaming first, fall back to non-streaming if unsupported
+        streaming_response = None
         if stream is None:
             # Auto-detect: prefer streaming for better UX, fallback if adapter doesn't support it
             try:
                 # First attempt: try with streaming enabled for better user experience
                 stream_callback = self.stream_emitter.emit if hasattr(self, 'stream_emitter') else None
-                final_response = self._chat_completion_with_retry(
+                streaming_response = self._chat_completion_with_retry(
                     messages=messages,
                     temperature=temperature,
                     tools=formatted_tools,
@@ -1006,7 +1007,6 @@ Your Goal: {self.goal}"""
                     stream_callback=stream_callback,
                     emit_events=True
                 )
-                return final_response
             except ValueError as e:
                 if "Streaming is not supported" in str(e):
                     # Fallback: retry with non-streaming for sync adapters
@@ -1029,19 +1029,22 @@ Your Goal: {self.goal}"""
             # UNIFIED: Single protocol-driven dispatch path (fixes DRY violation)
             # All LLM providers now go through unified dispatcher for consistency and maintainability
             stream_callback = self.stream_emitter.emit if hasattr(self, 'stream_emitter') else None
-            final_response = self._chat_completion_with_retry(
-                messages=messages,
-                temperature=temperature,
-                tools=formatted_tools,
-                stream=stream,
-                reasoning_steps=reasoning_steps,
-                task_name=task_name,
-                task_description=task_description,
-                task_id=task_id,
-                response_format=response_format,
-                stream_callback=stream_callback,
-                emit_events=True,
-            )
+            if streaming_response is not None:
+                final_response = streaming_response
+            else:
+                final_response = self._chat_completion_with_retry(
+                    messages=messages,
+                    temperature=temperature,
+                    tools=formatted_tools,
+                    stream=stream,
+                    reasoning_steps=reasoning_steps,
+                    task_name=task_name,
+                    task_description=task_description,
+                    task_id=task_id,
+                    response_format=response_format,
+                    stream_callback=stream_callback,
+                    emit_events=True,
+                )
 
             # Emit LLM response trace event with token usage
             _duration_ms = (time.time() - start_time) * 1000
@@ -3610,7 +3613,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             ]
                         self._append_to_chat_history(assistant_message)
                         
-                        # Execute tool calls and add results to chat history
+                        # Execute tool calls and add results to chat history.
+                        # Media-bearing follow-up messages are deferred until all
+                        # tool replies for this turn are appended, keeping the
+                        # tool replies consecutive (provider contract).
+                        _deferred_media_followups = []
                         for tool_call in tool_calls_data:
                             if tool_call['id'] and tool_call['function']['name']:
                                 try:
@@ -3626,12 +3633,22 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         parsed_args,
                                         tool_call_id=tool_call.get('id')
                                     )
-                                    # Add tool result to chat history
-                                    self._append_to_chat_history({
-                                        "role": "tool",
-                                        "tool_call_id": tool_call['id'],
-                                        "content": str(tool_result)
-                                    })
+                                    # Add tool result to chat history (multimodal-aware)
+                                    from .tool_execution import build_tool_result_message_pair
+                                    _pair = build_tool_result_message_pair(
+                                        tool_result, tool_call['id'],
+                                        function_name=tool_call['function']['name'],
+                                    )
+                                    if _pair:
+                                        _tool_msg, _followup_msg = _pair
+                                        self._append_to_chat_history(_tool_msg)
+                                        _deferred_media_followups.append(_followup_msg)
+                                    else:
+                                        self._append_to_chat_history({
+                                            "role": "tool",
+                                            "tool_call_id": tool_call['id'],
+                                            "content": str(tool_result)
+                                        })
                                 except Exception as tool_error:
                                     logging.error(f"Tool execution error in streaming: {tool_error}")
                                     # Add error result to chat history
@@ -3640,6 +3657,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         "tool_call_id": tool_call['id'],
                                         "content": f"Error: {str(tool_error)}"
                                     })
+
+                        # Flush deferred media follow-ups after all tool replies.
+                        for _m in _deferred_media_followups:
+                            self._append_to_chat_history(_m)
                     else:
                         # Add complete response to chat history (text-only response)
                         if response_text:

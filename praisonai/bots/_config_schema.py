@@ -120,6 +120,23 @@ class SessionConfigSchema(BaseModel):
     max_history: int = 100
     reset: Optional[SessionResetConfigSchema] = None
     compaction: Optional[SessionCompactionConfigSchema] = None
+    # Group/channel session scope (Issue #2376). ``per_user`` (default) keeps
+    # today's per-sender isolation; ``per_chat`` routes group/channel messages
+    # to a single shared session so the agent follows one multi-party thread.
+    session_scope: str = "per_user"
+    # Sender-attribution template applied to each turn in per_chat scope.
+    # Supports ``{sender}`` and ``{time}`` placeholders.
+    attribution: str = "[{sender}] "
+
+    @field_validator("session_scope")
+    @classmethod
+    def validate_session_scope(cls, v: str) -> str:
+        allowed = {"per_user", "per_chat"}
+        if v not in allowed:
+            raise ValueError(
+                f"Invalid session_scope '{v}'. Must be one of: {', '.join(sorted(allowed))}"
+            )
+        return v
 
 
 class StreamingConfigSchema(BaseModel):
@@ -129,6 +146,11 @@ class StreamingConfigSchema(BaseModel):
     min_delta: int = 120  # Minimum character delta before edit
     placeholder_text: str = "🤔 Thinking..."
     progress_prefix: str = "🤔 "
+    # Flood-control / resilience for progressive edits
+    disable_progressive_edits_after: int = 3  # Consecutive edit failures before giving up
+    flood_backoff_factor: float = 2.0  # Multiply interval on each flood/429
+    max_interval: float = 30.0  # Cap for the adaptively-widened interval
+    strip_reasoning_tags: bool = True  # Strip <think>/<reasoning> from output
     
     @field_validator("mode")
     @classmethod
@@ -180,6 +202,20 @@ class OutboundResilienceSchema(BaseModel):
         return v
 
 
+class DeliveryConfigSchema(BaseModel):
+    """Schema for durable inbound/outbound delivery configuration.
+
+    Durability is **on by default** for long-running gateway/bot runs: a
+    deduplicating inbound journal and an inbound dead-letter queue are wired
+    against a single canonical per-agent SQLite store so a crash mid-turn or a
+    platform webhook redelivery never silently loses or double-processes a
+    message. Advanced operators can override the store location or disable
+    durability entirely.
+    """
+    durable: bool = True  # default on for gateway/bot runs
+    store: Optional[str] = None  # optional canonical SQLite store override
+
+
 class ChannelConfigSchema(BaseModel):
     """Schema for a single channel configuration."""
     platform: Optional[str] = None
@@ -203,8 +239,14 @@ class ChannelConfigSchema(BaseModel):
     home_channel: Optional[str] = None  # Default channel for this platform
     aliases: Dict[str, str] = Field(default_factory=dict)  # Friendly name -> channel_id mapping
     outbound_resilience: Optional[OutboundResilienceSchema] = None
+    delivery: Optional[DeliveryConfigSchema] = None  # Durable inbound/outbound delivery
     session: Optional[SessionConfigSchema] = None
     max_history: Optional[int] = None  # Backward compatibility
+    # Inbound media (Issue #2350): when a user sends a photo/document/video,
+    # adapters download and validate it (SSRF-safe, magic-byte checked) and
+    # forward the cached path to the agent's vision capability. Set to 0 to
+    # disable inbound media handling.
+    max_inbound_media_bytes: int = Field(default=20 * 1024 * 1024, ge=0)
     
     # Platform-specific fields
     phone_number_id: Optional[str] = None  # WhatsApp
