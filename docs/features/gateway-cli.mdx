@@ -91,7 +91,8 @@ curl http://127.0.0.1:8765/health
 | `praisonai gateway start` | Start the gateway server (foreground) | `praisonai gateway start --port 9000` |
 | `praisonai gateway stop` | Stop a running gateway instance | `praisonai gateway stop --force` |
 | `praisonai gateway status` | Check gateway and daemon status | `praisonai gateway status --daemon-only` |
-| `praisonai gateway channels` | List configured channels | `praisonai gateway channels --json` |
+| `praisonai gateway doctor` | Validate channel credentials before start (pre-flight) | `praisonai gateway doctor --config gateway.yaml` |
+| `praisonai gateway channels` | List configured channels (add `--probe` to check creds) | `praisonai gateway channels --probe` |
 
 ### Daemon Service
 
@@ -136,15 +137,19 @@ See [Gateway Inbound Hooks](/docs/features/gateway-inbound-hooks) for full detai
 praisonai gateway start [OPTIONS]
 
 Options:
-  --host TEXT         Host to bind to [default: 127.0.0.1]
-  --port INTEGER      Port to listen on [default: 8765 or $GATEWAY_PORT]
-  --agents TEXT       Path to agent configuration file
-  --config TEXT       Path to gateway.yaml for multi-bot mode
+  --host TEXT                     Host to bind to [default: 127.0.0.1]
+  --port INTEGER                  Port to listen on [default: 8765 or $GATEWAY_PORT]
+  --agents TEXT                   Path to agent configuration file
+  --config TEXT                   Path to gateway.yaml for multi-bot mode
+  --preflight / --no-preflight    Validate channel credentials before
+                                  starting (fail fast on bad tokens)
+                                  [default: --preflight]
 
 Examples:
   praisonai gateway start
   praisonai gateway start --config gateway.yaml
   praisonai gateway start --agents agents.yaml --port 9000
+  praisonai gateway start --config gateway.yaml --no-preflight
   GATEWAY_PORT=9000 praisonai gateway start
 ```
 </Tab>
@@ -185,6 +190,20 @@ Examples:
 ```
 </Tab>
 
+<Tab title="doctor">
+```bash
+praisonai gateway doctor [OPTIONS]
+
+Options:
+  -c, --config TEXT   Path to gateway.yaml [default: gateway.yaml]
+  --json              Output JSON
+
+Examples:
+  praisonai gateway doctor
+  praisonai gateway doctor --config my-gateway.yaml --json
+```
+</Tab>
+
 <Tab title="channels">
 ```bash
 praisonai gateway channels [OPTIONS]
@@ -192,10 +211,12 @@ praisonai gateway channels [OPTIONS]
 Options:
   -c, --config TEXT   Path to gateway.yaml [default: gateway.yaml]
   --json              Output JSON format
+  --probe             Probe each channel's credentials
 
 Examples:
   praisonai gateway channels
   praisonai gateway channels --config my-gateway.yaml --json
+  praisonai gateway channels --probe
 ```
 </Tab>
 
@@ -238,6 +259,138 @@ Examples:
 ```
 </Tab>
 </Tabs>
+
+---
+
+## Pre-flight credential check
+
+`praisonai gateway doctor` validates every channel's token **before** the gateway starts, so a bad or expired credential fails fast with a precise per-channel reason instead of disappearing into the supervisor's silent reconnect loop.
+
+```mermaid
+graph LR
+    subgraph "Pre-flight credential check"
+        Cfg[📄 gateway.yaml] --> Probe[🔍 probe_all]
+        Probe --> Tel[✓ Telegram getMe]
+        Probe --> Sl[✗ Slack auth.test]
+        Probe --> Dis[✓ Discord identify]
+        Tel --> Verdict[📋 Per-channel verdict]
+        Sl --> Verdict
+        Dis --> Verdict
+        Verdict --> Exit{All OK?}
+        Exit -->|Yes| Start[🚀 gateway start]
+        Exit -->|No| Fail[❌ exit 1 — fix tokens]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Cfg input
+    class Probe,Verdict process
+    class Tel,Dis,Start ok
+    class Sl,Fail bad
+```
+
+### Examples
+
+Quick health check:
+
+```bash
+$ praisonai gateway doctor
+telegram     ✓  @my_support_bot
+slack        ✗  invalid_auth (token expired)
+discord      ✓  @MySupport
+```
+
+CI-friendly JSON:
+
+```bash
+$ praisonai gateway doctor --json
+{
+  "telegram": {"ok": true,  "platform": "telegram", "bot_username": "my_support_bot"},
+  "slack":    {"ok": false, "platform": "slack",    "error": "invalid_auth"},
+  "discord":  {"ok": true,  "platform": "discord",  "bot_username": "MySupport"}
+}
+```
+
+Same verdict via the listing command:
+
+```bash
+$ praisonai gateway channels --probe
+```
+
+### Pre-flight gate on start
+
+`praisonai gateway start` runs the same probe automatically before launch when invoked with `--config gateway.yaml`:
+
+```bash
+$ praisonai gateway start --config gateway.yaml
+slack        ✗  invalid_auth (token expired)
+
+Pre-flight check failed — aborting start. Fix the channel credentials
+above or pass --no-preflight to skip.
+```
+
+To bypass during local dev (e.g. flaky probe network):
+
+```bash
+praisonai gateway start --config gateway.yaml --no-preflight
+```
+
+### Token resolution
+
+The probe loads `~/.praisonai/.env` first, so `${VAR}` placeholders set by `praisonai onboard` resolve exactly like they do at runtime — `doctor`, `channels --probe`, and `start --preflight` all share the same token-resolution path.
+
+### Per-channel timeout
+
+Each probe is bounded by a 15-second deadline; a stuck adapter is reported as `"probe timed out after 15s"` and does not hang the aggregate.
+
+### Exit codes
+
+| Outcome | Exit code |
+|---|---|
+| All channels probe OK | `0` |
+| Any channel fails | `1` |
+| `gateway doctor` with no channels configured | `0` |
+
+### When to use which
+
+```mermaid
+graph TB
+    Q[Need to check credentials?] -->|Just-in-time health check| Doctor[praisonai gateway doctor]
+    Q -->|Already using channels list?| WithList[praisonai gateway channels --probe]
+    Q -->|About to start the gateway?| Auto[Default --preflight runs the same check]
+    Q -->|Programmatic healthcheck endpoint| Python[BotOS.probe_all]
+
+    classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef alt fill:#6366F1,stroke:#7C90A0,color:#fff
+    class Doctor pick
+    class WithList,Auto,Python alt
+```
+
+<AccordionGroup>
+  <Accordion title="Programmatic check (Python)">
+
+```python
+import asyncio
+from praisonai.bots import Bot, BotOS
+
+botos = BotOS(
+    bots=[
+        Bot("telegram", token="..."),
+        Bot("slack",    token="..."),
+    ],
+    enable_supervision=False,
+)
+
+results = asyncio.run(botos.probe_all(timeout=15.0))
+for platform, r in results.items():
+    print(platform, "ok" if r.ok else r.error)
+```
+
+  </Accordion>
+</AccordionGroup>
 
 ---
 
