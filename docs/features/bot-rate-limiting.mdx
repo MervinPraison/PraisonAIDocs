@@ -5,26 +5,28 @@ description: "Throttle outbound bot messages to messaging platforms like Telegra
 icon: "gauge"
 ---
 
-Bot Rate Limiting prevents messaging platform 429 errors by throttling outbound messages to channels, respecting platform-specific limits and per-channel delays.
+Bot Rate Limiting prevents messaging platform 429 errors **proactively** (token bucket + per-channel delay) and **reactively** widens a lane when the platform itself sends a `Retry-After` / `retry_after` signal, so subsequent sends do not immediately re-trip the throttle.
 
 ```mermaid
 graph LR
-    subgraph "Bot Rate Limiting Flow"
+    subgraph "Bot Rate Limiting"
         B[🤖 Bot] --> L{⚖️ RateLimiter}
-        L -->|Token Available| Send[📤 Send Message]
-        L -->|Rate Limited| Wait[⏳ Sleep Outside Lock]
+        L -->|Token + lane open| Send[📤 Send]
+        L -->|Lane held| Wait[⏳ Sleep until window clears]
         Wait --> L
-        Send --> P[🔌 Platform API]
-        P --> C1[💬 Channel 1]
-        P --> C2[💬 Channel 2]
-        P --> C3[💬 Channel 3]
+        Send --> P[🔌 Platform]
+        P -->|2xx| Done[✅ Sent]
+        P -->|429 + Retry-After| Pen[🛑 RateLimiter.penalise]
+        Pen --> L
     end
-    
     classDef agent fill:#8B0000,color:#fff
     classDef tool fill:#189AB4,color:#fff
-    
+    classDef warn fill:#F59E0B,color:#fff
+    classDef ok fill:#10B981,color:#fff
     class B agent
-    class L,Send,Wait,P,C1,C2,C3 tool
+    class L,Send,Wait,P tool
+    class Pen warn
+    class Done ok
 ```
 
 ## Quick Start
@@ -130,6 +132,85 @@ The rate limiter uses a two-phase approach:
 
 ---
 
+## Reactive Throttle Handling
+
+When a platform returns a 429 with an explicit wait hint, the limiter widens the affected lane so concurrent sends do not immediately re-trip the throttle.
+
+### `RateLimiter.penalise(channel_id, seconds)`
+
+Called after a 429 with a known server hint. Widens the lane for `seconds`; `channel_id=None` sets a global window that blocks every `acquire()` call.
+
+```python
+from praisonai.bots._rate_limit import RateLimiter
+
+limiter = RateLimiter.for_platform("telegram")
+
+# Widen lane for one channel after receiving a 30s server hint
+await limiter.penalise(channel_id="telegram-chat-12345", seconds=30)
+
+# Widen globally (e.g. platform-wide 429)
+await limiter.penalise(channel_id=None, seconds=60)
+```
+
+`penalise()` is awaitable, never shortens an existing window, and is a no-op when `seconds <= 0`.
+
+### Penalty Windows
+
+| Window | State | Trigger | Effect |
+|---|---|---|---|
+| Per-channel | `_channel_penalty_until[channel_id]` | `penalise(channel_id, n)` | This channel's `acquire()` waits until the window clears |
+| Global | `_global_penalty_until` | `penalise(None, n)` | **Every** `acquire()` waits until the window clears |
+
+Subsequent `acquire()` calls observe both the global and per-channel windows and sleep until the longer of the two clears.
+
+### When does `penalise()` get called?
+
+```mermaid
+graph TB
+    A[Send attempt fails] --> B{server_retry_after err}
+    B -->|seconds found| C[delay = server seconds]
+    B -->|None| D[delay = compute_backoff]
+    C --> E[rate_limiter.penalise channel delay]
+    D --> F[Sleep, retry]
+    E --> F
+
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class B decision
+    class C,D,E,F result
+```
+
+### Penalty API Reference
+
+| API | Signature | Description |
+|---|---|---|
+| `RateLimiter.penalise` | `async penalise(channel_id: Optional[str], seconds: float) -> None` | Widen `channel_id`'s lane for `seconds`. `channel_id=None` ⇒ global. No-op if `seconds <= 0`. Never shortens an existing window. |
+| `RateLimiter.reset` | `reset() -> None` | Clears all state including `_channel_penalty_until` and `_global_penalty_until`. |
+
+---
+
+## Honouring Server Retry-After
+
+The limiter does not parse 429s itself — the retry/send path (`deliver_with_retry`, `ConnectionMonitor`, `OutboundQueue.drain`) extracts the hint via `server_retry_after(err)` and calls `penalise()`. Pass the shared limiter into `deliver_with_retry` so the lane is widened for the whole window:
+
+```python
+from praisonai.bots._rate_limit import RateLimiter
+from praisonai.bots._delivery import deliver_with_retry
+
+limiter = RateLimiter.for_platform("telegram")
+ok, err = await deliver_with_retry(
+    send_fn, channel_id="telegram-chat-12345",
+    rate_limiter=limiter,
+    platform="telegram",
+)
+```
+
+Full details on extraction logic and `server_retry_after()` are in [Durable Delivery](/docs/features/durable-delivery).
+
+---
+
 ## Configuration Options
 
 | Option | Type | Default | Description |
@@ -151,13 +232,18 @@ The rate limiter uses a two-phase approach:
 
 ## Memory Management
 
-Per-channel state is tracked in an LRU cache capped at **4096 channels**. If a bot serves more channels than that, the least-recently-used channels fall out of the cache and their `per_channel_delay` window resets. This bounds memory for long-running bots.
+Per-channel state is tracked in two LRU caches, both capped at **4096 channels**. Oldest entries are evicted on overflow, bounding memory for long-running bots.
+
+| Cache | Tracks |
+|---|---|
+| `_channel_last_send` | Proactive per-channel delay (token bucket) |
+| `_channel_penalty_until` | Reactive penalty windows from server hints |
 
 ```python
 # Memory usage stays bounded even with many channels
 for channel_id in range(10000):  # 10k channels
     await limiter.acquire(f"channel-{channel_id}")
-    # Internal cache automatically evicts old entries at 4096 limit
+    # Both internal caches automatically evict old entries at 4096 limit
 ```
 
 ---
@@ -238,6 +324,22 @@ whatsapp_limiter = RateLimiter(RateLimitConfig(
     burst_size=50,             # Initial burst capacity
     per_channel_delay=0.1      # Quick per-channel recovery
 ))
+```
+</Accordion>
+
+<Accordion title="Always pass a shared limiter to deliver_with_retry">
+Without `rate_limiter=`, a 429 still pauses the failing send (the hint is read from the error), but the limiter has no way to know — concurrent sends on the same channel may immediately re-trip the platform's throttle. Pass the shared limiter so the lane is widened for the whole window.
+
+```python
+from praisonai.bots._rate_limit import RateLimiter
+from praisonai.bots._delivery import deliver_with_retry
+
+limiter = RateLimiter.for_platform("telegram")  # shared across bot instances
+ok, err = await deliver_with_retry(
+    send_fn, channel_id=chat_id,
+    rate_limiter=limiter,
+    platform="telegram",
+)
 ```
 </Accordion>
 </AccordionGroup>

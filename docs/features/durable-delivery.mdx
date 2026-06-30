@@ -114,11 +114,12 @@ sequenceDiagram
         Platform-->>Bot: 200 OK
         Bot->>Queue: mark_sent(key)
     else transient failure
-        Platform-->>Bot: 429 / 503
+        Platform-->>Bot: 429 (retry_after: 30)
         Bot->>Queue: mark_failed(key, permanent=False)
         Note over Queue: status = 'failed'
         Bot->>Queue: drain_pending()
-        Queue->>Platform: retry after backoff
+        Note over Queue: drain gates by max(backoff, server_retry_after)
+        Queue->>Platform: retry after 30s
         Platform-->>Queue: 200 OK
         Queue->>Queue: mark_sent(key)
     else permanent failure
@@ -322,7 +323,7 @@ Call once in your adapter's `__init__` to wire up the outbox.
 
 ### `deliver_with_retry()`
 
-Bounded exponential backoff retry without persistence — returns when the message is sent or max attempts is reached.
+Bounded retry without persistence — on a recoverable failure, the delay is the **server-mandated wait** (`server_retry_after(err)`) when present, otherwise `compute_backoff(policy, attempt)`.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -330,18 +331,49 @@ Bounded exponential backoff retry without persistence — returns when the messa
 | `policy` | `BackoffPolicy` | `BackoffPolicy(max_attempts=3)` | Retry backoff configuration. |
 | `is_recoverable` | `callable \| None` | `None` | Function to classify errors as transient. Defaults to `is_recoverable_error(e, platform)`. |
 | `platform` | `str` | `""` | Platform name for platform-specific error rules. |
+| `rate_limiter` | `Optional[RateLimiter]` | `None` | When supplied, a server-mandated wait (Telegram `retry_after`, HTTP `Retry-After`) triggers `await rate_limiter.penalise(channel_id, delay)` so subsequent sends to the same channel hold off until the platform's window elapses. |
 | `parked_store` | `Any \| None` | `None` | Optional DLQ for failed sends. |
 | `reply_data` | `dict \| None` | `None` | Optional metadata for DLQ storage. |
 
 ```python
-from praisonai.bots._resilience import deliver_with_retry, BackoffPolicy
+from praisonai.bots._delivery import deliver_with_retry
+from praisonai.bots._rate_limit import RateLimiter
+from praisonai.bots._resilience import BackoffPolicy
 
-await deliver_with_retry(
-    send_func=lambda: adapter.send_message(channel_id, text),
+limiter = RateLimiter.for_platform("telegram")
+ok, err = await deliver_with_retry(
+    send_fn, channel_id="telegram-chat-12345",
+    rate_limiter=limiter,
     policy=BackoffPolicy(initial_ms=2000, max_ms=30000, max_attempts=5),
     platform="telegram",
 )
 ```
+
+### `server_retry_after()`
+
+Extracts a server-mandated wait (seconds) from an error or response. Used internally by `deliver_with_retry`, `ConnectionMonitor.record_error`, and `OutboundQueue.drain` to honour explicit throttle signals over the policy backoff.
+
+```python
+from praisonai.bots._resilience import server_retry_after
+
+# Telegram RetryAfter
+wait = server_retry_after(err)          # -> 30.0
+
+# HTTP Retry-After header (seconds or HTTP-date)
+wait = server_retry_after(http_err)     # -> 5.0 or seconds-until-date
+
+# No hint present
+wait = server_retry_after(generic_err)  # -> None
+```
+
+| Source | Where it's read | Notes |
+|---|---|---|
+| Telegram `RetryAfter` | `err.retry_after` attribute | python-telegram-bot exposes this directly. |
+| Telegram raw API 429 | `err.parameters["retry_after"]` | Raw API shape. |
+| HTTP `Retry-After` | `err.headers`, `err.response.headers`, or `err.resp.headers` | Integer seconds **or** HTTP-date (parsed via `email.utils.parsedate_to_datetime`; missing tz treated as UTC; clamped `>= 0`). |
+| Text fallback | regex on `str(err)` | Matches `retry after <n>` / `retry_after: <n>`. |
+
+Returns `None` when no hint is present — callers fall back to the policy backoff.
 
 ### `deliver_chunked()`
 
@@ -409,7 +441,11 @@ succeeded, failed = await delivery.drain_pending()
 succeeded, failed = await adapter.drain_outbox()
 ```
 
-The drain replays oldest messages first, respects backoff delays between attempts, and skips messages that have exceeded `max_attempts`.
+The drain replays oldest messages first and skips messages that have exceeded `max_attempts`. The retry gate is `max(compute_backoff(policy, attempts + 1), server_retry_after(stored_err))` — the platform's mandated wait survives across process restarts.
+
+<Note>
+The hint is recovered from the **stored error string**, not the live exception. Only hints that survive `str(err)` (python-telegram-bot `RetryAfter` repr, HTTP headers folded into the error message, text-form "retry after N") are honoured on drain.
+</Note>
 
 ---
 
