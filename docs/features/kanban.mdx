@@ -214,15 +214,16 @@ Kanban tools are available through the SDK protocols. The wrapper implementation
 
 | Tool | Purpose | Example |
 |------|---------|---------|
-| `kanban_create` | Create new task | `kanban_create("Implement auth", assignee="dev")` |
+| `kanban_create` | Create new task | `kanban_create("Implement auth", assignee="dev", idempotency_key="auth-v1")` |
 | `kanban_list` | Filter tasks | `kanban_list(status="ready", assignee="dev")` |
 | `kanban_show` | Get task details | `kanban_show("task_abc123")` |
+| `kanban_runs` | Read attempt history | `kanban_runs("task_abc123")` |
 
 ### Status Changes
 
 | Tool | Purpose | Example |
 |------|---------|---------|
-| `kanban_complete` | Mark task done | `kanban_complete("task_abc123", "Auth working")` |
+| `kanban_complete` | Mark task done with structured handoff | `kanban_complete("task_abc123", summary="Auth done; 14 tests pass", metadata={"changed_files": ["auth.py"]})` |
 | `kanban_block` | Block with reason | `kanban_block("task_abc123", "Need API keys")` |
 
 ### Coordination
@@ -256,6 +257,193 @@ Kanban tools are available through the SDK protocols. The wrapper implementation
 |----------|--------|---------|
 | `PRAISONAI_KANBAN_BOARD` | Select active board | `export PRAISONAI_KANBAN_BOARD=project-a` |
 | `PRAISONAI_KANBAN_DB` | Override DB path | `export PRAISONAI_KANBAN_DB=/custom/path.db` |
+
+---
+
+## Attempt History & Retry
+
+Each kanban task records every attempt, auto-blocks after repeated failures, and hands off a structured summary on completion.
+
+```mermaid
+graph LR
+    Claim[🎯 Claim] --> Open[▶️ Open run]
+    Open --> Work[🤖 Worker]
+    Work --> Outcome{Outcome?}
+    Outcome -->|completed| Done[✅ done + handoff]
+    Outcome -->|failed/crashed| Fail[⏪ record_failure]
+    Fail --> Limit{≥ max_retries?}
+    Limit -->|no| Ready[🔄 back to ready]
+    Limit -->|yes| Block[🛑 auto-blocked]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef intermediate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef terminal fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Claim,Open,Work,Done agent
+    class Outcome,Limit decision
+    class Fail,Ready intermediate
+    class Block terminal
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Coordinator
+    participant Store as Kanban Store
+    participant Worker
+
+    User->>Coordinator: "Refactor auth module"
+    Coordinator->>Store: kanban_create(title=..., max_retries=3, idempotency_key="auth-refactor")
+    Store-->>Coordinator: task_id (existing if dup key, else new)
+    Coordinator->>Worker: dispatch
+    Worker->>Store: claim → open run
+    alt Success
+        Worker->>Store: kanban_complete(task_id, summary, metadata)
+        Store-->>Worker: task=done, run=completed, counter reset
+    else Failure (below limit)
+        Worker->>Store: record_failure(task_id, error)
+        Store-->>Worker: task back to ready, run=failed/crashed
+        Note over Worker: retry reads kanban_runs(task_id)
+    else Failure (≥ max_retries)
+        Worker->>Store: record_failure(task_id, error)
+        Store-->>Worker: task auto-blocked, run=gave_up
+    end
+```
+
+<Steps>
+<Step title="Idempotent create with retry limit">
+
+```python
+from praisonaiagents import Agent
+from praisonai.tools.kanban_tools import kanban_create
+
+agent = Agent(name="Coordinator", instructions="Break work into tasks")
+
+task = kanban_create(
+    "Replace bcrypt with argon2",
+    body="Migrate auth module to argon2",
+    assignee="coder",
+    max_retries=3,                       # per-task circuit-breaker
+    idempotency_key="auth-refactor-q3",  # safe to repeat
+)
+```
+
+</Step>
+
+<Step title="Structured completion handoff">
+
+```python
+from praisonai.tools.kanban_tools import kanban_complete
+
+kanban_complete(
+    task["id"],
+    summary="argon2 migration; 14 tests pass; CHANGELOG updated",
+    metadata={
+        "changed_files": ["auth.py", "tests/test_auth.py"],
+        "tests_run": 14,
+        "residual_risk": "rotate old hashes on next login",
+    },
+)
+```
+
+</Step>
+
+<Step title="Read attempt history on retry">
+
+```python
+from praisonai.tools.kanban_tools import kanban_runs
+
+history = kanban_runs(task["id"])
+for run in history["runs"]:
+    print(run["outcome"], run["error"] or run["summary"])
+# crashed: ModuleNotFoundError: argon2
+# completed: argon2 migration; 14 tests pass; CHANGELOG updated
+```
+
+</Step>
+</Steps>
+
+### What the dispatcher does automatically
+
+When a worker claims a task, the dispatcher **opens a run** with the claim — anything the worker writes via `kanban_complete` closes it as `completed`, anything that crashes closes it as `crashed`/`failed`. Below the `max_retries` limit, failed attempts release the claim and put the task back on `ready` for re-dispatch. At the limit, the task auto-blocks with `gave_up` so a human can step in. A successful completion **resets the failure counter** — the limit is consecutive, not cumulative.
+
+### New params on `kanban_create`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `max_retries` | `int` | `3` (board default) | Per-task circuit-breaker limit. After this many *consecutive* failed attempts the task auto-blocks. Invalid values (`<1` / non-numeric) fall back to the board default. |
+| `idempotency_key` | `str` | `None` | Per-board, **per-tenant** dedup key. Repeating a create with the same key returns the existing task instead of a duplicate — safe for retrying automation and webhooks. |
+
+### New params on `kanban_complete`
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `summary` | `str` | `""` | Structured summary of what was done. Surfaced to linked children and retrying workers. |
+| `metadata` | `dict` | `{}` | Structured handoff fields. Common keys: `changed_files`, `tests_run`, `residual_risk`, `next_steps`. |
+| `comment` | `str` | `""` | Free-text completion comment (kept for back-compat). |
+
+<Note>
+`kanban_complete` moves the task to `done` **before** recording the run. A `move_task` failure never leaves an orphaned completed run for a task that never reached `done`.
+</Note>
+
+### New tool: `kanban_runs`
+
+| Tool | Purpose | Example |
+|------|---------|---------|
+| `kanban_runs` | Read attempt history (oldest first) | `kanban_runs("task_abc123")` → `{"runs": [{"outcome": "crashed", "error": "...", "started_at": "...", "ended_at": "..."}, ...], "count": 2}` |
+
+Each row matches the `KanbanRunProtocol` shape:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `int` | Auto-incremented run ID |
+| `task_id` | `str` | Parent task ID |
+| `profile` | `str` | Worker/profile identifier |
+| `outcome` | `str \| None` | `completed`, `blocked`, `crashed`, `failed`, or `gave_up`; `None` while the run is open |
+| `summary` | `str` | Structured handoff summary |
+| `metadata` | `dict` | Structured handoff fields |
+| `error` | `str` | Error text for failed/crashed attempts |
+| `started_at` | `str \| None` | ISO-8601 timestamp |
+| `ended_at` | `str \| None` | ISO-8601 timestamp; `None` while the run is open |
+
+### New `Task` fields
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `max_retries` | `int \| None` | Per-task circuit-breaker limit. `None` means use the board default (`3`). |
+| `consecutive_failures` | `int` | Count of consecutive failed attempts since the last `completed` outcome. Reset to `0` by a successful completion. |
+| `current_run_id` | `int \| None` | Active attempt id; `None` when no run is open. |
+
+<Note>
+Existing SQLite databases are **auto-migrated** on first open — no user action required.
+</Note>
+
+### Common Patterns
+
+**Automation-safe creation** — pass `idempotency_key` derived from the trigger (`f"github-issue-{n}"`, `f"webhook-{uuid}"`). Re-firing the webhook is a no-op instead of spawning duplicates. Idempotency is **per-board, per-tenant** — two tenants on the same board never collide on the same key.
+
+**Long-running flaky network tasks** — set `max_retries=5` per task to absorb transient flakes without giving up too early. Watch `consecutive_failures` in `kanban_show` to spot stuck tasks.
+
+**Retrying workers use prior failures** — call `kanban_runs(task_id)` at the start of a retry attempt to read prior outcomes and errors. Use `summary` and `metadata` from the most recent failed run as context: "previous attempt crashed at line X; avoid path Y."
+
+<AccordionGroup>
+<Accordion title="Use idempotency_key for every automated kanban_create">
+Webhooks, schedulers, and GitHub-issue triagers should always pass an `idempotency_key`. The cost is one extra string; the value is zero duplicate tasks under retry.
+</Accordion>
+
+<Accordion title="Tune max_retries per task type">
+Fast deterministic work: `max_retries=1`. Flaky network or integration tests: `max_retries=3–5`. Leave the rest at the board default (`3`).
+</Accordion>
+
+<Accordion title="Send a real summary and metadata">
+Use `summary` and `metadata` in `kanban_complete` instead of free-text comments. Downstream child tasks and retrying workers consume the structured fields; humans still read them fine.
+</Accordion>
+
+<Accordion title="Read kanban_runs before retrying">
+The structured run history is the cheapest "what went wrong last time" context a retrying worker can fetch. Call `kanban_runs(task_id)` at the start of every retry attempt.
+</Accordion>
+</AccordionGroup>
 
 ---
 
@@ -343,6 +531,10 @@ Use separate boards for different projects or contexts. Default board works well
 ## Related
 
 <CardGroup cols={2}>
+<Card title="Kanban CLI" icon="terminal" href="/docs/features/kanban-cli">
+  CLI commands for viewing boards, tasks, and run history
+</Card>
+
 <Card title="Async Jobs" icon="clock" href="/docs/features/async-jobs">
   Asynchronous job processing and queuing
 </Card>
