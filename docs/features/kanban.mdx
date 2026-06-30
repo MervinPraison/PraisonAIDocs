@@ -5,7 +5,7 @@ description: "Persistent task board for multi-agent coordination"
 icon: "kanban"
 ---
 
-Kanban enables agents to coordinate through persistent tasks, creating a shared workspace where work is tracked and distributed across multiple agents.
+Kanban enables agents to coordinate through persistent tasks with per-task retries and structured handoff, creating a shared workspace where work is tracked and distributed across multiple agents.
 
 ```mermaid
 graph LR
@@ -24,10 +24,7 @@ graph LR
     class User user
     class Coordinator,Worker agent
     class Store store
-    class Results result
-
-    classDef agent fill:#8B0000,color:#fff
-    classDef tool fill:#189AB4,color:#fff
+    class Board result
 ```
 
 ## Quick Start
@@ -37,10 +34,8 @@ graph LR
 
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.kanban import KanbanStoreProtocol
 
-# Agent with kanban protocols (implementation needed from wrapper)
-agent = Agent(name="Coordinator", instructions="Break tasks down")
+agent = Agent(name="Coordinator", instructions="Break tasks down and create kanban tasks")
 result = agent.start("Create user auth system")
 ```
 
@@ -50,7 +45,6 @@ result = agent.start("Create user auth system")
 
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.kanban import VALID_KANBAN_STATUSES
 
 worker = Agent(name="Worker", instructions="Claim and complete tasks")
 result = worker.start("Find ready tasks")
@@ -77,7 +71,7 @@ sequenceDiagram
     Store->>Dispatcher: Dispatch ready tasks
     Dispatcher->>Worker: Claim task
     Worker->>Store: Add comments/heartbeat
-    Worker->>Store: Mark completed
+    Worker->>Store: Mark completed (summary + metadata)
     Store->>UI: Update status
     UI->>User: Show progress
 ```
@@ -86,8 +80,8 @@ Task coordination happens through a SQLite-backed persistent store that all agen
 
 | Component | Purpose |
 |-----------|---------|
-| **Kanban Store** | SQLite database storing tasks, comments, links |
-| **Agent Tools** | 8 functions for task CRUD operations |
+| **Kanban Store** | SQLite database storing tasks, comments, links, and run history |
+| **Agent Tools** | 9 functions for task CRUD, completion, and run history |
 | **CLI Commands** | Human interface for task management |
 | **Background Dispatcher** | Auto-claims ready tasks for processing |
 
@@ -116,6 +110,121 @@ graph TB
     class Ready ready
     class Done,Archived done
 ```
+
+---
+
+## Retry & Circuit Breaker
+
+Each task tracks its own consecutive-failure count and auto-blocks after the limit, so a flaky task doesn't loop forever.
+
+```mermaid
+graph TB
+    A[⚡ Attempt task] --> B{Outcome}
+    B -->|completed| C[✅ done<br/>failures reset to 0]
+    B -->|crashed / failed| D{consecutive_failures<br/>≥ max_retries?}
+    D -->|No| E[🟢 released<br/>back to ready]
+    D -->|Yes| F[🚫 auto-blocked<br/>circuit broken]
+    E --> A
+
+    classDef task fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef blocked fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class A task
+    class B,D decision
+    class C,E success
+    class F blocked
+```
+
+| Knob | Where | Default | Effect |
+|------|-------|---------|--------|
+| `max_retries` on `kanban_create` | per-task override | `None` → board default | After N consecutive failed attempts, the task is auto-blocked. |
+| `DEFAULT_MAX_RETRIES` | module-level constant in `praisonai/kanban/sqlite_store.py` | `3` | Fallback when a task has no override (or override is invalid). |
+| Reset behaviour | `record_run(..., 'completed', ...)` | n/a | A completed run resets `consecutive_failures` back to `0`. |
+
+<Note>
+Two edge cases pinned by tests:
+- Non-positive or non-integer `max_retries` on create (e.g. `0`, `-1`, `"oops"`) falls back to `DEFAULT_MAX_RETRIES` instead of auto-blocking on the first failure (`test_invalid_max_retries_falls_back_to_default`).
+- A legacy migrated row with persisted `max_retries = 0` also falls back to the default (`test_legacy_zero_max_retries_does_not_block_on_first_failure`).
+</Note>
+
+---
+
+## Structured Handoff
+
+`kanban_complete` records a structured summary + metadata alongside the status change, so retrying workers and linked children read facts instead of prose.
+
+```python
+from praisonaiagents import Agent
+
+worker = Agent(
+    name="AuthBuilder",
+    instructions=(
+        "Claim a ready task, build the feature, then call kanban_complete "
+        "with a one-line summary and a metadata dict listing changed_files "
+        "and tests_run so the next task can pick up the handoff."
+    ),
+)
+worker.start("Implement the auth task on the board")
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `summary` | `str` | One- or two-sentence statement of what was done. |
+| `metadata` | `dict` | Structured handoff fields, e.g. `{"changed_files": [...], "tests_run": 14, "residual_risk": "..."}`. |
+| `outcome` | `str` | One of `completed` / `blocked` / `crashed` / `failed` / `gave_up`. |
+| `error` | `str` | Error text for non-`completed` outcomes. |
+| `started_at` / `ended_at` | ISO-8601 `str` | Run window; `ended_at` is `None` while the run is open. |
+
+---
+
+## Run History (`kanban_runs`)
+
+Before retrying a task, call `kanban_runs` to read prior attempts' outcomes / summaries / errors so the next attempt avoids the path that already failed.
+
+```python
+from praisonaiagents import Agent
+
+retrier = Agent(
+    name="Retrier",
+    instructions=(
+        "If a task has prior attempts, call kanban_runs(task_id) first. "
+        "Use the prior summary / error to choose a different approach this "
+        "attempt; then complete with kanban_complete(summary=..., metadata=...)."
+    ),
+)
+retrier.start("Pick up task task_abc123 and retry it")
+```
+
+<Note>
+`kanban_runs` returns `{ "task_id": ..., "runs": [...], "count": N }`, oldest first. Each run carries the full `KanbanRunProtocol` shape (fields: `summary`, `metadata`, `outcome`, `error`, `started_at`, `ended_at`).
+</Note>
+
+---
+
+## Idempotent Create
+
+Repeating `kanban_create` with the same `idempotency_key` on the same board (and tenant) returns the existing task instead of creating a duplicate — safe for retrying automation and webhook handlers.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="WebhookHandler",
+    instructions=(
+        "When the webhook fires, call kanban_create(title, "
+        "idempotency_key=<webhook_event_id>). A retry of the same webhook "
+        "must return the existing task, not a duplicate."
+    ),
+)
+```
+
+<Note>
+Idempotency is scoped to `(board, tenant, idempotency_key)`. The same key under a different tenant creates a distinct task — verified by `test_idempotent_create_scoped_by_tenant`.
+</Note>
+
+---
 
 ## Concepts
 
@@ -214,7 +323,7 @@ Kanban tools are available through the SDK protocols. The wrapper implementation
 
 | Tool | Purpose | Example |
 |------|---------|---------|
-| `kanban_create` | Create new task | `kanban_create("Implement auth", assignee="dev")` |
+| `kanban_create` | Create new task (with retry limit + idempotency dedup) | `kanban_create("Audit auth", max_retries=2, idempotency_key="audit-1")` |
 | `kanban_list` | Filter tasks | `kanban_list(status="ready", assignee="dev")` |
 | `kanban_show` | Get task details | `kanban_show("task_abc123")` |
 
@@ -222,8 +331,11 @@ Kanban tools are available through the SDK protocols. The wrapper implementation
 
 | Tool | Purpose | Example |
 |------|---------|---------|
-| `kanban_complete` | Mark task done | `kanban_complete("task_abc123", "Auth working")` |
+| `kanban_complete` | Mark task done with structured handoff | `kanban_complete("task_abc123", summary="JWT + 14 tests", metadata={"changed_files": ["auth.py"]})` |
+| `kanban_runs` | Read attempt history | `kanban_runs("task_abc123")` |
 | `kanban_block` | Block with reason | `kanban_block("task_abc123", "Need API keys")` |
+
+> Back-compat: `kanban_complete("task_abc123", "Auth working")` still works — the second positional becomes `summary`. The old keyword `comment=` is preserved and writes a visible comment if `summary` is empty.
 
 ### Coordination
 
@@ -250,6 +362,10 @@ Kanban tools are available through the SDK protocols. The wrapper implementation
 └── team-x/kanban.db
 ```
 
+<Info>
+Upgrading from a pre-v1.6.84 DB: the store adds a `task_runs` table and four columns on `tasks` (`idempotency_key`, `max_retries`, `consecutive_failures`, `current_run_id`) in place on first open — no migration command needed.
+</Info>
+
 ### Environment Configuration
 
 | Variable | Effect | Example |
@@ -264,16 +380,13 @@ Kanban tools are available through the SDK protocols. The wrapper implementation
 ### Coordinator-Worker Pattern
 
 ```python
-# Coordinator breaks down requests
 from praisonaiagents import Agent
-from praisonaiagents.kanban import VALID_KANBAN_STATUSES
 
 coordinator = Agent(
     name="Coordinator", 
     instructions="Break user requests into kanban tasks"
 )
 
-# Worker with heartbeat reporting
 worker = Agent(
     name="Worker",
     instructions="Claim ready tasks, report progress via heartbeat"
@@ -283,18 +396,7 @@ worker = Agent(
 ### Background Processing
 
 ```python
-# Background processing requires wrapper implementation
-# The praisonaiagents.kanban protocols support:
-# - Task claiming and status updates
-# - Heartbeat reporting for long-running tasks
-# - Multi-board coordination
-```
-
-### Worker with Heartbeat
-
-```python
 from praisonaiagents import Agent
-from praisonaiagents.kanban import VALID_KANBAN_STATUSES
 
 worker = Agent(
     name="Worker",
@@ -302,18 +404,39 @@ worker = Agent(
     Use kanban_heartbeat every 30 seconds during long-running work."""
 )
 
-# Worker claims task and reports progress
 result = worker.start("Find ready tasks, claim one, and report progress")
 ```
 
-### Human-Agent Collaboration
+### Worker with Structured Handoff
 
-```bash
-# Human-agent collaboration pattern
-# Requires wrapper implementation of:
-# - CLI commands for task management
-# - UI board visualization
-# - Agent-to-store protocol bindings
+```python
+from praisonaiagents import Agent
+
+worker = Agent(
+    name="Worker",
+    instructions=(
+        "Claim a ready task, do the work, then call "
+        "kanban_complete with summary and metadata so the next "
+        "agent knows exactly what was done."
+    ),
+)
+worker.start("Find and complete a ready task on the board")
+```
+
+### Retry-Aware Worker
+
+```python
+from praisonaiagents import Agent
+
+worker = Agent(
+    name="RetryWorker",
+    instructions=(
+        "Before starting a task, call kanban_runs to check prior attempts. "
+        "If a prior attempt failed, use that error to choose a different path. "
+        "Always complete with kanban_complete(summary=..., metadata=...)."
+    ),
+)
+worker.start("Retry task task_abc123 with a fresh approach")
 ```
 
 ---
@@ -335,6 +458,14 @@ Use `kanban_heartbeat` during long-running tasks to signal liveness. Add detaile
 
 <Accordion title="Board Organization">
 Use separate boards for different projects or contexts. Default board works well for single-project setups.
+</Accordion>
+
+<Accordion title="Structured Handoff">
+Prefer `kanban_complete(summary="...", metadata={...})` over a free-text `comment`. The summary + metadata are surfaced verbatim to retrying workers (via `kanban_runs`) and to linked children — short structured facts beat parsed prose. Use `comment` only for human-visible notes that don't need to drive automation.
+</Accordion>
+
+<Accordion title="Retry Limits">
+The board default (`DEFAULT_MAX_RETRIES = 3`) is fine for most tasks. Set `kanban_create(..., max_retries=N)` only when you know a task is flaky and want a tighter or looser limit. After `N` consecutive failed attempts the task auto-blocks; a completed attempt resets the counter to `0`.
 </Accordion>
 </AccordionGroup>
 
