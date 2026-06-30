@@ -42,6 +42,12 @@ class KanbanTaskProtocol(TypedDict, total=False):
     board: str
     created_at: float
     updated_at: float
+    # Claim lease / reclamation fields (optional; populated while running).
+    # Timestamps are serialized as ISO 8601 strings by Task.to_dict().
+    claim_lock: str | None
+    claim_expires: str | None
+    worker_pid: int | None
+    last_heartbeat_at: str | None
 
 
 @runtime_checkable
@@ -187,6 +193,57 @@ class KanbanCommentingProtocol(Protocol):
         ...
 
 
+@runtime_checkable
+class KanbanReclaimProtocol(Protocol):
+    """Extension protocol for durable claim leases and stale-claim reclamation.
+
+    Stores implementing this protocol support recovering tasks stranded by
+    crashed, killed, or hung workers. The dispatcher tick calls
+    ``reclaim_stale_claims`` to return such tasks to ``ready`` for re-dispatch.
+
+    This is kept separate from KanbanStoreProtocol so stores can adopt
+    reclamation incrementally without breaking isinstance checks on the core
+    protocol.
+    """
+
+    def claim_task(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        ttl_seconds: int = 900,
+        worker_pid: int | None = None,
+    ) -> bool:
+        """Claim a ready task with a lease (TTL) and optional owner PID.
+
+        Returns:
+            True if the claim succeeded.
+        """
+        ...
+
+    def heartbeat(
+        self,
+        task_id: str,
+        worker_id: str,
+        *,
+        ttl_seconds: int | None = None,
+    ) -> bool:
+        """Record a worker heartbeat, optionally extending the claim lease.
+
+        Returns:
+            True if the heartbeat was recorded (worker owns the claim).
+        """
+        ...
+
+    def reclaim_stale_claims(self, *, stale_timeout_seconds: int = 1800) -> list[str]:
+        """Reclaim running tasks whose lease expired and whose worker is dead/stale.
+
+        Returns:
+            List of task IDs returned to ``ready``.
+        """
+        ...
+
+
 @runtime_checkable 
 class KanbanLinkingProtocol(Protocol):
     """Extension protocol for kanban task linking functionality.
@@ -217,5 +274,28 @@ class KanbanLinkingProtocol(Protocol):
             
         Returns:
             True if unlinked successfully, False otherwise
+        """
+        ...
+
+
+@runtime_checkable
+class KanbanPromotionProtocol(Protocol):
+    """Extension protocol for dependency-driven task promotion.
+
+    Implemented separately from KanbanStoreProtocol so that stores can opt
+    into auto-promotion without breaking isinstance checks on the core
+    protocol. This is the engine that turns a linked parent->child DAG into
+    a self-driving pipeline: the dispatcher calls ``recompute_ready`` each
+    tick before claiming work.
+    """
+
+    def recompute_ready(self) -> list[str]:
+        """Promote dependent tasks to 'ready' when all parents are terminal.
+
+        Scans tasks waiting on dependencies and advances any whose parent
+        tasks are all in a terminal state ('done'/'archived') to 'ready'.
+
+        Returns:
+            List of task IDs promoted to 'ready' in this pass.
         """
         ...

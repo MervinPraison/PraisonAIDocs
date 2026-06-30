@@ -1012,7 +1012,20 @@ class PraisonAI:
         special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag', 'browser', 'replay', 'bot', 'gateway', 'sandbox', 'wizard', 'migrate', 'security', 'persistence', 'paths', 'claw', 'github', 'managed', 'flow', 'dashboard', 'backends', 'audit']
         
         parser = argparse.ArgumentParser(prog="praisonai", description="praisonAI command-line interface")
-        parser.add_argument("--framework", choices=["crewai", "autogen", "praisonai"], help="Specify the framework")
+        try:
+            from ..framework_adapters.registry import list_framework_choices
+            _framework_choices = list_framework_choices(include_unavailable=True) or [
+                "praisonai", "crewai", "autogen",
+            ]
+        except ImportError:
+            # Only fall back to the static trio when the adapter layer itself
+            # cannot be imported; genuine registry discovery errors should surface.
+            _framework_choices = ["praisonai", "crewai", "autogen"]
+        parser.add_argument(
+            "--framework",
+            choices=_framework_choices,
+            help="Specify the agent framework (discovered from installed adapters)",
+        )
         parser.add_argument("--ui", choices=["chainlit", "gradio"], help="Specify the UI framework (gradio or chainlit).")
         parser.add_argument("--auto", nargs=argparse.REMAINDER, help="Enable auto mode and pass arguments for it")
         parser.add_argument("--init", nargs=argparse.REMAINDER, help="Initialize agents with optional topic")
@@ -2009,13 +2022,22 @@ class PraisonAI:
 
         # Only check framework availability for agent-related operations
         if not args.command and (args.init or args.auto or args.framework):
-            if not CREWAI_AVAILABLE and not AUTOGEN_AVAILABLE and not PRAISONAI_AVAILABLE:
-                print("[red]ERROR: No framework is installed. Please install at least one framework:[/red]")
-                print("\npip install \"praisonai\\[crewai]\"  # For CrewAI")
-                print("pip install \"praisonai\\[autogen]\"  # For AutoGen")
-                print("pip install \"praisonai\\[crewai,autogen]\"  # For both frameworks\n")
-                print("pip install praisonaiagents # For Agents\n")  
-                sys.exit(1)
+            try:
+                from ..framework_adapters.registry import list_framework_choices
+                if not list_framework_choices():
+                    print("[red]ERROR: No framework adapter is installed.[/red]")
+                    print("\npip install praisonaiagents  # native PraisonAI")
+                    print("pip install \"praisonai[crewai]\"  # CrewAI")
+                    print("pip install \"praisonai[autogen]\"  # AutoGen\n")
+                    sys.exit(1)
+            except ImportError:
+                if not CREWAI_AVAILABLE and not AUTOGEN_AVAILABLE and not PRAISONAI_AVAILABLE:
+                    print("[red]ERROR: No framework is installed. Please install at least one framework:[/red]")
+                    print("\npip install \"praisonai\\[crewai]\"  # For CrewAI")
+                    print("pip install \"praisonai\\[autogen]\"  # For AutoGen")
+                    print("pip install \"praisonai\\[crewai,autogen]\"  # For both frameworks\n")
+                    print("pip install praisonaiagents # For Agents\n")
+                    sys.exit(1)
 
         # Handle direct prompt if command is not a special command or file
         # Skip this during testing to avoid pytest arguments interfering
@@ -2914,6 +2936,12 @@ class PraisonAI:
             
             # Load and execute the YAML workflow with tool registry
             workflow = manager.load_yaml(yaml_file, tool_registry=tool_registry)
+
+            from ..framework_adapters.workflow_framework import validate_workflow_framework
+            validate_workflow_framework(
+                getattr(workflow, "framework", "praisonai"),
+                source=f"workflow file {yaml_file}",
+            )
             
             # Show workflow info
             table = Table(title=f"Workflow: {workflow.name}")
@@ -3042,6 +3070,12 @@ class PraisonAI:
             
             parser = YAMLWorkflowParser()
             workflow = parser.parse_file(yaml_file)
+
+            from ..framework_adapters.workflow_framework import validate_workflow_framework
+            validate_workflow_framework(
+                getattr(workflow, "framework", "praisonai"),
+                source=f"workflow file {yaml_file}",
+            )
             
             # Show validation results
             table = Table(title="Workflow Validation")
@@ -5635,9 +5669,20 @@ Now, {final_instruction.lower()}:"""
                 result = agents_generator.generate_crew_and_kickoff()
                 return result
 
+            try:
+                from ..framework_adapters.registry import list_framework_choices
+                _gradio_frameworks = list_framework_choices(include_unavailable=True) or [
+                    "crewai", "autogen", "praisonai",
+                ]
+            except ImportError:
+                _gradio_frameworks = ["crewai", "autogen", "praisonai"]
+
             gr.Interface(
                 fn=generate_crew_and_kickoff_interface,
-                inputs=[gr.Textbox(lines=2, label="Auto Args"), gr.Dropdown(choices=["crewai", "autogen"], label="Framework")],
+                inputs=[
+                    gr.Textbox(lines=2, label="Auto Args"),
+                    gr.Dropdown(choices=_gradio_frameworks, label="Framework"),
+                ],
                 outputs="textbox",
                 title="Praison AI Studio",
                 description="Create Agents and perform tasks",
@@ -6046,7 +6091,33 @@ Now, {final_instruction.lower()}:"""
                 'output_reserve': getattr(args, 'context_output_reserve', 8000),
             }
             session_state['context_config'] = context_config
-            
+
+            # Wire turn-aware workspace checkpointing into the session lifecycle.
+            # Reuses the core CheckpointService via CheckpointsHandler; default
+            # safe (disabled unless checkpoints.auto in config or
+            # PRAISONAI_CHECKPOINTS=on), so there is zero overhead when off.
+            try:
+                from praisonai.cli.features.session_checkpoints import (
+                    SessionCheckpointManager,
+                )
+                checkpoint_config = None
+                try:
+                    from praisonai.cli.configuration.resolver import resolve_config
+                    checkpoint_config = resolve_config().extra
+                except Exception:
+                    checkpoint_config = None
+                session_checkpoints = SessionCheckpointManager.from_config(
+                    workspace_dir=os.environ.get("PRAISONAI_WORKSPACE") or os.getcwd(),
+                    config=checkpoint_config,
+                    verbose=verbose_mode,
+                )
+                if session_checkpoints.enabled:
+                    # Baseline checkpoint at session start.
+                    session_checkpoints.checkpoint_turn("session start")
+            except Exception:
+                session_checkpoints = None
+            session_state['session_checkpoints'] = session_checkpoints
+
             # Start the execution worker thread (TRUE ASYNC - runs in background)
             worker_thread = self._start_execution_worker(tools_list, console, session_state)
             
@@ -6059,7 +6130,7 @@ Now, {final_instruction.lower()}:"""
                 from praisonai.cli.features.at_mentions import CombinedCompleter
                 
                 # Create combined completer for / commands and @ mentions
-                commands = ['help', 'exit', 'quit', 'clear', 'tools', 'profile', 'model', 'stats', 'compact', 'undo', 'queue', 'q']
+                commands = ['help', 'exit', 'quit', 'clear', 'tools', 'profile', 'model', 'stats', 'compact', 'undo', 'revert', 'queue', 'q']
                 combined_completer = CombinedCompleter(
                     commands=commands,
                     root_dir=os.getcwd()
@@ -6299,6 +6370,9 @@ Now, {final_instruction.lower()}:"""
                         elif cmd == "undo":
                             self._handle_undo_command(console, session_state)
                             continue
+                        elif cmd == "revert":
+                            self._handle_revert_command(console, cmd_args, session_state)
+                            continue
                         elif cmd == "queue":
                             self._handle_queue_command(console, cmd_args, session_state)
                             continue
@@ -6357,6 +6431,13 @@ Now, {final_instruction.lower()}:"""
                     # Process @file mentions before sending to LLM
                     processed_input = self._process_at_mentions(user_input, console)
                     
+                    # Auto-checkpoint the workspace before a turn that may
+                    # mutate files, so /undo and /revert can roll it back.
+                    # Best-effort: never blocks or breaks the turn.
+                    _ckpt = session_state.get('session_checkpoints')
+                    if _ckpt is not None and getattr(_ckpt, 'enabled', False):
+                        _ckpt.checkpoint_turn(processed_input[:60])
+
                     # Create task with unique ID and full context
                     task_counter['value'] += 1
                     task_id = task_counter['value']
@@ -6505,7 +6586,8 @@ Now, {final_instruction.lower()}:"""
         console.print("  /model [name]  - Show or change current model")
         console.print("  /stats         - Show session statistics (tokens, cost)")
         console.print("  /compact       - Compress conversation history")
-        console.print("  /undo          - Undo last response")
+        console.print("  /undo          - Undo last response (and workspace files if checkpointing on)")
+        console.print("  /revert [n]    - Roll workspace back n turns (needs checkpoints.auto)")
         console.print("  /queue         - Show queued messages")
         console.print("  /queue clear   - Clear message queue")
         console.print("\n[bold]Session Commands:[/bold]")
@@ -6763,6 +6845,35 @@ Provide a concise summary (max 200 words):"""
         except Exception as e:
             console.print(f"[red]Error handling context command: {e}[/red]")
     
+    def _worker_busy(self, session_state):
+        """Return True if the execution worker is processing or has queued work.
+
+        Used to gate workspace-mutating rollbacks (/undo, /revert) so a restore
+        never races a turn that is still writing files.
+        """
+        worker_state = session_state.get('worker_state') or {}
+        queue = session_state.get('execution_queue')
+        lock = session_state.get('processing_lock')
+
+        def _check():
+            if worker_state.get('current_task') is not None:
+                return True
+            try:
+                if queue is not None and queue.qsize() > 0:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        # Read current_task and queue size under the same lock the worker holds
+        # when it dequeues and publishes current_task. This guarantees we never
+        # observe the gap between get() (item leaves the queue) and the
+        # current_task assignment, where a turn is in-flight but invisible.
+        if lock is not None:
+            with lock:
+                return _check()
+        return _check()
+
     def _handle_undo_command(self, console, session_state):
         """
         Handle /undo command - undo the last response.
@@ -6776,6 +6887,23 @@ Provide a concise summary (max 200 words):"""
         if len(history) < 2:
             console.print("[yellow]Nothing to undo[/yellow]")
             return
+
+        # If auto-checkpointing is active, /undo also rolls the workspace files
+        # back to the pre-turn checkpoint. In that case the worker-busy check
+        # MUST run *before* we mutate conversation_history: otherwise a turn that
+        # is still writing files would leave history changed while the workspace
+        # is untouched (and the running turn could then append its own result),
+        # putting history and files permanently out of sync.
+        ckpt = session_state.get('session_checkpoints')
+        rollback_enabled = (
+            ckpt is not None and getattr(ckpt, 'enabled', False) and ckpt.turns
+        )
+        if rollback_enabled and self._worker_busy(session_state):
+            console.print(
+                "[yellow]A turn is still running; nothing undone.[/yellow] "
+                "Wait for it to finish (/status), then retry /undo."
+            )
+            return
         
         # Remove last assistant response and user prompt
         if len(history) >= 2:
@@ -6787,8 +6915,74 @@ Provide a concise summary (max 200 words):"""
             
             console.print("[green]✓ Undone last turn[/green]")
             console.print(f"[dim]Removed: {str(removed_user.get('content', ''))[:50]}...[/dim]")
+
+            # Roll the workspace files back to the pre-turn checkpoint so /undo
+            # is a true safety net, not just a conversation-history edit. The
+            # worker-busy gate was already checked above before mutating history.
+            if rollback_enabled:
+                console.print("[dim]Reverting workspace files to the previous checkpoint...[/dim]")
+                ckpt.preview(1)
+                restored = ckpt.revert(1)
+                if restored:
+                    console.print(f"[green]✓ Workspace restored to {restored.short_id}[/green]")
+                else:
+                    console.print("[yellow]No workspace checkpoint to restore[/yellow]")
         else:
             console.print("[yellow]Not enough history to undo[/yellow]")
+
+    def _handle_revert_command(self, console, args, session_state):
+        """
+        Handle /revert [n] - roll the workspace back n turns (default 1).
+
+        Shows the diff that would be undone, then restores the files via the
+        session checkpoint timeline. Requires auto-checkpointing to be active
+        (checkpoints.auto in config or PRAISONAI_CHECKPOINTS=on).
+        """
+        ckpt = session_state.get('session_checkpoints')
+        if ckpt is None or not getattr(ckpt, 'enabled', False):
+            console.print(
+                "[yellow]Workspace checkpointing is disabled.[/yellow] "
+                "Enable it with [cyan]checkpoints.auto: true[/cyan] in config "
+                "or [cyan]PRAISONAI_CHECKPOINTS=on[/cyan]."
+            )
+            return
+
+        if not ckpt.turns:
+            console.print("[yellow]No checkpoints to revert to[/yellow]")
+            return
+
+        if self._worker_busy(session_state):
+            console.print(
+                "[yellow]A turn is still running.[/yellow] "
+                "Reverting now could race the agent's file writes — wait for it "
+                "to finish (check /status), then retry /revert."
+            )
+            return
+
+        n = 1
+        if args:
+            try:
+                n = int(str(args).strip())
+            except ValueError:
+                console.print("[yellow]Usage: /revert [n][/yellow]")
+                return
+
+        if n < 1 or n > len(ckpt.turns):
+            console.print(
+                f"[yellow]Can only revert 1..{len(ckpt.turns)} turn(s)[/yellow]"
+            )
+            return
+
+        console.print(f"[dim]Changes that will be undone (last {n} turn(s)):[/dim]")
+        ckpt.preview(n)
+        restored = ckpt.revert(n)
+        if restored:
+            console.print(
+                f"[green]✓ Workspace reverted to {restored.short_id}[/green] "
+                f"[dim]({restored.message})[/dim]"
+            )
+        else:
+            console.print("[yellow]Failed to revert workspace[/yellow]")
     
     def _handle_queue_command(self, console, args, session_state):
         """
@@ -6892,6 +7086,9 @@ Provide a concise summary (max 200 words):"""
         approval_request_queue = session_state['approval_request_queue']
         approval_response_queue = session_state['approval_response_queue']
         worker_state = session_state['worker_state']
+        # Shared with _worker_busy() so dequeue+publish of current_task is
+        # atomic w.r.t. the rollback gate (no lock -> fall back to a private one).
+        processing_lock = session_state.get('processing_lock') or threading.Lock()
         
         # Check if trust mode is enabled (via --trust flag or PRAISON_APPROVAL_MODE=auto env var)
         trust_mode = getattr(self.args, 'trust', False) if hasattr(self, 'args') else False
@@ -6903,12 +7100,27 @@ Provide a concise summary (max 200 words):"""
             """Main worker loop - processes execution queue."""
             while worker_state['running']:
                 try:
-                    # Wait for a message with timeout (allows checking running flag)
-                    try:
-                        task = execution_queue.get(timeout=0.5)
-                    except queue_module.Empty:
+                    # Dequeue and publish current_task atomically under the
+                    # shared processing_lock so _worker_busy() can never observe
+                    # the gap between get() (which makes the item invisible to
+                    # qsize()) and the current_task assignment. We use a
+                    # non-blocking get_nowait() inside the lock instead of a
+                    # blocking get(timeout=...) so the lock is held only for the
+                    # microsecond-scale dequeue+publish, never across the poll
+                    # wait (which would stall the rollback gate for up to 0.5s).
+                    task = None
+                    with processing_lock:
+                        try:
+                            task = execution_queue.get_nowait()
+                            worker_state['current_task'] = task
+                        except queue_module.Empty:
+                            task = None
+                    if task is None:
+                        # No work right now; sleep briefly to avoid busy-spin,
+                        # then re-check the running flag and the queue.
+                        time.sleep(0.05)
                         continue
-                    
+
                     # Extract task context
                     prompt = task.get('prompt', '')
                     task_id = task.get('task_id', 0)
@@ -6919,7 +7131,6 @@ Provide a concise summary (max 200 words):"""
                     state_manager.set_state(ProcessingState.PROCESSING)
                     task['status'] = 'running'
                     task['start_time'] = start_time
-                    worker_state['current_task'] = task  # Full task context
                     live_status.clear()
                     live_status.update_status(f"Task #{task_id}: Thinking...")
                     

@@ -15,6 +15,17 @@ from ..configuration.resolver import resolve_config
 app = typer.Typer(help="Run agents")
 
 
+def _framework_help() -> str:
+    try:
+        from ...framework_adapters.registry import framework_option_help
+        return framework_option_help()
+    except ImportError:
+        return "Framework: praisonai, crewai, autogen"
+
+
+_FRAMEWORK_HELP = _framework_help()
+
+
 def _parse_permissions(allow: Optional[List[str]], deny: Optional[List[str]], permissions_file: Optional[str], default: Optional[str]) -> Optional[dict]:
     """Parse permission flags into a config dict.
     
@@ -303,6 +314,23 @@ def _checkpoints_auto_enabled() -> bool:
     return True
 
 
+def _checkpoints_storage_dir() -> Optional[str]:
+    """Return a configured ``checkpoints.storage_dir`` (or ``None``).
+
+    Keeps ``praisonai run`` auto-checkpoints and restores reading from the same
+    store the rest of the CLI (``code --checkpoints``, ``praisonai checkpoint``)
+    uses when ``checkpoints.storage_dir`` is configured.
+    """
+    try:
+        config = resolve_config()
+    except (ValueError, OSError):
+        return None
+    checkpoints = (getattr(config, "extra", None) or {}).get("checkpoints")
+    if isinstance(checkpoints, dict):
+        return checkpoints.get("storage_dir")
+    return None
+
+
 def _auto_checkpoint(label: str, *, no_checkpoint: bool, workspace_dir: Optional[str] = None) -> None:
     """Create an automatic checkpoint of the workspace before a run.
 
@@ -325,7 +353,10 @@ def _auto_checkpoint(label: str, *, no_checkpoint: bool, workspace_dir: Optional
     try:
         from ..features.checkpoints import CheckpointsHandler
 
-        handler = CheckpointsHandler(workspace_dir=workspace_dir or os.getcwd())
+        handler = CheckpointsHandler(
+            workspace_dir=workspace_dir or os.getcwd(),
+            storage_dir=_checkpoints_storage_dir(),
+        )
         asyncio.run(handler.save(label, allow_empty=False, quiet=True))
     except Exception as e:  # pragma: no cover - defensive, never block the run
         if getattr(output, "is_verbose", False):
@@ -339,7 +370,10 @@ def _restore_checkpoint(ref: str, workspace_dir: Optional[str] = None) -> None:
 
     from ..features.checkpoints import CheckpointsHandler
 
-    handler = CheckpointsHandler(workspace_dir=workspace_dir or os.getcwd())
+    handler = CheckpointsHandler(
+        workspace_dir=workspace_dir or os.getcwd(),
+        storage_dir=_checkpoints_storage_dir(),
+    )
 
     async def _run() -> bool:
         service = await handler._get_service()
@@ -425,7 +459,7 @@ def run_main(
     ctx: typer.Context,
     target: Optional[str] = typer.Argument(None, help="Agent file or prompt"),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="LLM model to use"),
-    framework: Optional[str] = typer.Option(None, "--framework", "-f", help="Framework: praisonai, crewai, autogen"),
+    framework: Optional[str] = typer.Option(None, "--framework", "-f", help=_FRAMEWORK_HELP),
     interactive: bool = typer.Option(False, "--interactive", "-i", help="Interactive mode"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     stream: bool = typer.Option(False, "--stream/--no-stream", help="Stream output (default: off for production use)"),
@@ -660,7 +694,7 @@ def run_main(
             "  praisonai run --command summarize \"Long text here\"\n\n"
             "Options:\n"
             "  --model, -m       LLM model to use\n"
-            "  --framework, -f   Framework (praisonai, crewai, autogen)\n"
+            f"  --framework, -f   {_FRAMEWORK_HELP}\n"
             "  --interactive, -i Interactive mode\n"
             "  --verbose, -v     Verbose output\n"
             "  --trace           Enable tracing\n"
@@ -885,6 +919,7 @@ def _run_from_file(
         # Run
         result = praison.run()
         
+        _record_session_usage(session_id or auto_save_name, model, output)
         output.emit_result(
             message="Run completed",
             data={"result": str(result) if result else None}
@@ -1058,6 +1093,7 @@ def _run_prompt(
 
             if bridge is not None:
                 bridge.emit_run_result(result, ok=True)
+            _record_session_usage(session_id or auto_save_name, model, output)
             output.emit_result(
                 message="Prompt completed",
                 data={"result": str(result) if result else None}
@@ -1124,6 +1160,7 @@ def _run_prompt(
         
         result = praison.handle_direct_prompt(prompt)
         
+        _record_session_usage(session_id or auto_save_name, model, output)
         output.emit_result(
             message="Prompt completed",
             data={"result": str(result) if result else None}
@@ -1140,6 +1177,39 @@ def _run_prompt(
         output.emit_error(message=str(e))
         output.print_error(str(e))
         raise typer.Exit(1)
+
+
+def _record_session_usage(session_id, model, output) -> None:
+    """Accumulate this run's token/cost usage into the active session and show
+    a compact running total footer (Issue #2421).
+
+    Best-effort: never let usage accounting break a completed run. Stays quiet
+    in JSON mode so machine-readable output is unaffected.
+    """
+    if not session_id:
+        return
+    try:
+        from ..state.project_sessions import (
+            accumulate_session_usage,
+            format_usage_footer,
+        )
+
+        usage = accumulate_session_usage(session_id, model=model)
+    except Exception:
+        return
+
+    if not usage or not usage.get("total_tokens"):
+        return
+    if output is not None and getattr(output, "is_json_mode", False):
+        return
+    try:
+        footer = format_usage_footer(usage)
+        if output is not None:
+            output.print_info(footer)
+        else:
+            typer.echo(footer)
+    except Exception:
+        pass
 
 
 def _run_from_file_profiled(
@@ -1231,6 +1301,8 @@ def _run_from_file_profiled(
     profiler.mark_exec_start()
     result = praison.run()
     profiler.mark_exec_end()
+    
+    _record_session_usage(session_id or auto_save_name, model, None)
     
     profiler.stop()
     
@@ -1372,6 +1444,7 @@ def _run_custom_agent(
 
         if bridge is not None:
             bridge.emit_run_result(result, ok=True)
+        _record_session_usage(session_id or auto_save_name, model, output)
         output.emit_result(
             message="Agent completed",
             data={"result": str(result) if result else None}
@@ -1480,6 +1553,8 @@ def _run_prompt_profiled(
     profiler.mark_exec_start()
     response = agent.start(prompt)
     profiler.mark_exec_end()
+    
+    _record_session_usage(session_id or auto_save_name, model, None)
     
     profiler.stop()
     
