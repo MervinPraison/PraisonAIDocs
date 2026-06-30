@@ -61,6 +61,44 @@ result = worker.start("Find ready tasks")
 
 ---
 
+## Task dependencies & auto-promotion
+
+Link tasks with parent edges using `kanban_link` — when all parents complete, the child task automatically becomes `ready` on the next dispatcher tick. No flag or manual call needed.
+
+```mermaid
+graph LR
+    Parent1[✅ Parent 1] --> Child[⏳ Child task]
+    Parent2[✅ Parent 2] --> Child
+    Child -.auto-promote.-> Ready[🎯 Ready]
+
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef pending fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ready fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Parent1,Parent2 done
+    class Child pending
+    class Ready ready
+```
+
+```bash
+praisonai kanban create "Design auth flow" --status done   # parent 1
+praisonai kanban create "Set up DB schema" --status done   # parent 2
+praisonai kanban create "Implement auth API" --status todo  # child
+
+praisonai kanban link design_task auth_task
+praisonai kanban link db_task auth_task
+
+# On the next dispatcher tick, auth_task moves to ready automatically.
+```
+
+<Note>
+**Parentless `todo` tasks are intentionally left untouched.** Only tasks with at least one parent link participate in auto-promotion. `todo` remains a valid manual staging column for tasks you want to promote yourself.
+</Note>
+
+Each auto-promoted task fires a `KANBAN_TASK_MOVED` event. See `kanban_link` in the [Agent Tools](#agent-tools) section for how to create parent edges.
+
+---
+
 ## How It Works
 
 ```mermaid
@@ -116,6 +154,44 @@ graph TB
     class Ready ready
     class Done,Archived done
 ```
+
+## Reliability: claim leases & automatic reclamation
+
+If a worker crashes mid-task, PraisonAI automatically retries by detecting the dead worker and putting the task back on the board. No manual intervention required.
+
+```mermaid
+sequenceDiagram
+    participant D as Dispatcher
+    participant W as Worker
+    participant S as Store
+
+    D->>S: claim_task(ttl=900s, pid=W.pid)
+    S-->>D: task claimed (running)
+    D->>W: spawn worker
+    W->>S: heartbeat every ~60s
+    Note over W: Worker crashes
+    D->>S: reclaim_stale_claims() (next tick)
+    Note over S: lease expired + PID dead
+    S-->>D: task → ready
+    D->>W: re-dispatch to new worker
+```
+
+**Env vars for tuning:**
+
+| Variable | Default | What it controls |
+|----------|---------|-----------------|
+| `PRAISONAI_KANBAN_CLAIM_TTL` | `900` (15 min) | Claim lease duration in seconds. After this, the claim is reclaimable if the worker is dead or stale. |
+| `PRAISONAI_KANBAN_STALE_TIMEOUT` | `1800` (30 min) | Heartbeat staleness threshold. A live worker whose heartbeat is older than this is treated as hung. |
+
+For long-running tasks, increase `PRAISONAI_KANBAN_CLAIM_TTL` to match the expected task duration. A live worker can extend its own lease by heartbeating — the reclaim sweep leaves it untouched.
+
+The `KANBAN_TASK_RECLAIMED` event fires when a stranded task returns to `ready`, so monitoring hooks can react. The SQLite store auto-migrates pre-existing databases — no manual action needed on upgrade.
+
+### Advanced: implementing a custom store
+
+Custom store implementations can add lease + heartbeat support by conforming to `KanbanReclaimProtocol` in `praisonaiagents.kanban`. This is an additive extension protocol — existing `KanbanStoreProtocol` implementations are not broken.
+
+---
 
 ## Concepts
 
