@@ -387,15 +387,131 @@ graph LR
     class LA,LB,SL loop
 ```
 
+### Per-Session Isolation with `scoped_bridge()`
+
+A stuck coroutine in one session can park the shared default loop for every other session. `scoped_bridge()` binds a fresh, per-session bridge for the duration of a `with` block so the blast radius is contained.
+
+```python
+from praisonaiagents import Agent
+from praisonai._async_bridge import scoped_bridge, run_sync
+
+async def _fetch_session_data(session_id: str) -> dict:
+    ...
+
+def handle_session(session_id: str, prompt: str) -> str:
+    # Each session gets its own loop+thread; a hung fetch in one
+    # session cannot block any other session's sync→async work.
+    with scoped_bridge() as bridge:
+        data = run_sync(_fetch_session_data(session_id))
+        agent = Agent(name="Assistant", instructions=f"Use: {data}")
+        return agent.start(prompt)
+```
+
+<Tabs>
+<Tab title="Scope-owned bridge (auto shutdown)">
+
+```python
+from praisonai._async_bridge import scoped_bridge, run_sync
+
+with scoped_bridge() as bridge:
+    # A fresh bridge is created for this block.
+    # run_sync() routes through it, not the shared default.
+    result = run_sync(some_coro())
+    bridge.submit(other_coro())  # fire-and-forget
+# bridge is shut down with permanent=True on exit —
+# the scope owns the lifecycle.
+```
+
+</Tab>
+<Tab title="Bring your own bridge">
+
+```python
+from praisonai._async_bridge import AsyncBridge, scoped_bridge, run_sync
+
+my_bridge = AsyncBridge()
+with scoped_bridge(my_bridge):
+    # run_sync() routes through my_bridge inside the block.
+    result = run_sync(some_coro())
+# my_bridge stays alive — you are responsible for my_bridge.shutdown().
+my_bridge.shutdown()
+```
+
+</Tab>
+</Tabs>
+
+`current_bridge()` returns the scoped bridge anywhere inside the `with` block — including in transitive call chains — without any code changes to the callee:
+
+```python
+from praisonai._async_bridge import current_bridge, scoped_bridge
+
+with scoped_bridge() as session_bridge:
+    # Anywhere inside the block, current_bridge() resolves to session_bridge.
+    assert current_bridge() is session_bridge
+```
+
+The override propagates through `contextvars`, so internal callers of `run_sync` inside the block see the scoped bridge automatically.
+
+<Warning>
+Bridges created by `scoped_bridge()` (the no-arg form) are shut down with `permanent=True` on exit. If a context copied inside the block tries to `run_sync` on the bridge afterward, it raises:
+
+```
+RuntimeError: AsyncBridge has been shut down and cannot be reused;
+this usually means a context outlived its scoped_bridge() block
+```
+
+This is intentional — it prevents an orphaned loop+thread from outliving the scope that owned it.
+</Warning>
+
+```mermaid
+graph TB
+    subgraph "Session A"
+        SA[👤 Session A handler] --> WA[with scoped_bridge]
+        WA --> BA[🌉 Bridge A]
+        BA --> LA[🔁 Loop A / Thread A]
+    end
+
+    subgraph "Session B"
+        SB[👤 Session B handler] --> WB[with scoped_bridge]
+        WB --> BB[🌉 Bridge B]
+        BB --> LB[🔁 Loop B / Thread B]
+    end
+
+    subgraph "Shared default"
+        D[📋 Outside any scope] --> DBG[🌉 _BG default]
+        DBG --> DL[🔁 Default Loop]
+    end
+
+    classDef session fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef bridge fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef loop fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class SA,SB,D session
+    class WA,WB,BA,BB,DBG bridge
+    class LA,LB,DL loop
+```
+
+```mermaid
+graph TB
+    Q[How is sync→async work scoped?] -->|Process-wide, one default loop| Mod[Use module-level run_sync]
+    Q -->|Multiple long-lived tenants/services, you own each lifecycle| Own[Construct your own AsyncBridge]
+    Q -->|Per-request/per-session, auto cleanup on exit| Scoped[Use scoped_bridge ✨]
+
+    classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef alt fill:#6366F1,stroke:#7C90A0,color:#fff
+    class Scoped pick
+    class Mod,Own alt
+```
+
 ### When to use a per-instance bridge
 
-| Situation | Module-level `run_sync()` | Your own `AsyncBridge()` |
-|-----------|:-------------------------:|:------------------------:|
-| CLI script / one-shot job | ✅ | — |
-| Single-tenant server | ✅ | — |
-| Multi-tenant gateway (loop scoped to tenant lifecycle) | — | ✅ |
-| Embedding PraisonAI inside another async framework | — | ✅ |
-| Tests needing clean shutdown without affecting others | — | ✅ |
+| Situation | Module-level `run_sync()` | Your own `AsyncBridge()` | `scoped_bridge()` |
+|-----------|:-------------------------:|:------------------------:|:-----------------:|
+| CLI script / one-shot job | ✅ | — | — |
+| Single-tenant server | ✅ | — | — |
+| Multi-tenant gateway (loop scoped to tenant lifecycle) | — | ✅ | — |
+| Embedding PraisonAI inside another async framework | — | ✅ | — |
+| Tests needing clean shutdown without affecting others | — | ✅ | — |
+| Per-request / per-session isolation in a server | — | ✅ (if you also manage the ContextVar yourself) | ✅ preferred — automatic ContextVar + auto-shutdown |
 
 **API Reference:**
 
@@ -403,11 +519,13 @@ graph LR
 |------------------|-----------|-------------|
 | `AsyncBridge` | `class AsyncBridge` | Per-instance async runner; create one per tenant or service. |
 | `AsyncBridge.run_sync` | `(self, coro, *, timeout=300) -> T` | Run a coroutine on this bridge's background loop. |
-| `AsyncBridge.shutdown` | `(self, timeout=5.0) -> None` | Cancel pending tasks and stop this bridge's loop. PR #2122: releases the bridge lock before awaiting cancellation and excludes the current task — safe to call from within an async tool on the bridge's loop. |
+| `AsyncBridge.shutdown` | `(self, timeout: float = 5.0, *, permanent: bool = False) -> None` | Cancel pending tasks and stop this bridge's loop. New `permanent` kwarg: when `True`, the bridge cannot be reused; later `run_sync`/`submit` raises `RuntimeError`. Used by `scoped_bridge()` for scope-owned bridges. Default `False` preserves existing behaviour. PR #2122: releases the bridge lock before awaiting cancellation and excludes the current task — safe to call from within an async tool on the bridge's loop. |
 | `AsyncBridge.submit` | `(self, coro) -> concurrent.futures.Future` | Submit without waiting; returns a `concurrent.futures.Future`. |
 | `AsyncBridge.get` | `(self) -> asyncio.AbstractEventLoop` | Get (lazily spawn) the bridge's event loop. |
 | `run_sync` (module-level) | `(coro, *, timeout=300) -> T` | Routes through the shared default `AsyncBridge`. Behaviour unchanged. |
 | `shutdown` (module-level) | `() -> None` | Shuts down **only** the shared default bridge. User-owned instances are untouched. |
+| `current_bridge` (module-level) | `() -> AsyncBridge` | Returns the bridge bound by an enclosing `scoped_bridge()` block, or the shared process-wide default when no scope is active. Prefer this over importing `_BG`. |
+| `scoped_bridge` (module-level) | `(bridge: Optional[AsyncBridge] = None) -> Iterator[AsyncBridge]` | Context manager. Binds a per-scope bridge via a `ContextVar`. With `None`, creates and owns a fresh bridge (shut down with `permanent=True` on exit). With a caller-provided bridge, the caller retains lifecycle ownership. |
 
 **Environment:** 
 - `PRAISONAI_RUN_SYNC_TIMEOUT`: Default timeout in seconds (300)
@@ -423,6 +541,7 @@ The module-level `shutdown()` only stops the shared default bridge. Per-instance
 - Interactive runtime start/stop operations 
 - Deployment scheduler
 - Gateway operations
+- Per-session loop isolation in servers (`praisonai serve`, gateway, managed agents) — see `scoped_bridge()` above.
 
 See also: [Approval Protocol](/docs/features/approval-protocol) and [Gateway](/docs/features/gateway).
 
