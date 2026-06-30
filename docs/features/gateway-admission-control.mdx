@@ -1,0 +1,251 @@
+---
+title: "Gateway Admission Control"
+sidebarTitle: "Admission Control"
+description: "Bound the number of concurrent inbound agent runs with a fair queue and explicit overflow policy"
+icon: "shield-check"
+---
+
+Admission control caps the number of concurrent inbound agent runs across all users, queues the overflow fairly, and explicitly sheds load when the queue is full.
+
+```mermaid
+graph LR
+    subgraph "Gateway Admission Control"
+        In[📥 Inbound Turn] --> Gate{🚦 Decide}
+        Gate -->|ADMIT| Run[🤖 Run Agent]
+        Gate -->|QUEUE| Q[⏳ Fair Queue]
+        Gate -->|REJECT| Busy[🛑 Busy Ack]
+        Q --> Run
+        Run --> Reply[✅ Reply]
+    end
+
+    classDef inbound fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef queue fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef busy fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class In inbound
+    class Gate decision
+    class Q queue
+    class Busy busy
+    class Run,Reply output
+```
+
+## Quick Start
+
+<Steps>
+
+<Step title="Simple Usage">
+Cap aggregate concurrent runs with a single parameter:
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import BotOS
+
+agent = Agent(name="Support", instructions="Help users")
+
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram"],
+    max_concurrent_runs=32,
+)
+bot.start()
+```
+</Step>
+
+<Step title="With Configuration">
+Add a wait queue and choose what happens when the queue is full:
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import BotOS
+
+agent = Agent(name="Support", instructions="Help users")
+
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram", "discord"],
+    max_concurrent_runs=32,
+    queue_depth=128,
+    overflow_policy="reject",   # reject | queue | shed_oldest
+)
+bot.start()
+```
+</Step>
+
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Gateway
+    participant Admission
+    participant Agent
+    User->>Gateway: Inbound message
+    Gateway->>Admission: decide(in_flight, queued, session_id)
+    alt Capacity available
+        Admission-->>Gateway: ADMIT
+        Gateway->>Agent: Run turn
+        Agent-->>Gateway: Reply
+        Gateway-->>User: Reply
+    else At ceiling, queue has room
+        Admission-->>Gateway: QUEUE
+        Gateway-->>User: (waits fairly)
+        Gateway->>Agent: Run when slot frees
+        Agent-->>User: Reply
+    else Queue full
+        Admission-->>Gateway: REJECT
+        Gateway-->>User: ⏳ Busy right now — please resend in a moment.
+    end
+```
+
+| Decision | When | What the user sees |
+|---|---|---|
+| `ADMIT` | `in_flight < max_concurrent_runs` | Immediate response |
+| `QUEUE` | At ceiling, queue has room | Brief wait, then response |
+| `REJECT` | Queue full and policy is `reject` (or `shed_oldest` can't evict) | Friendly busy acknowledgement |
+
+---
+
+## Configuration Options
+
+The three fields live on `GatewayConfig` (read from `praisonaiagents/gateway/config.py`):
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `max_concurrent_runs` | `int` | `0` | Max concurrent inbound agent runs across all users. `0` disables the gate (legacy behaviour). |
+| `queue_depth` | `int` | `128` | Max number of inbound turns that can wait when at the ceiling. |
+| `overflow_policy` | `str` | `"reject"` | Behaviour when at the ceiling and the queue is full: `reject`, `queue`, or `shed_oldest`. |
+
+**Precedence:** CLI flags → YAML → Python defaults.
+
+### Python
+
+```python
+from praisonai.bots import BotOS
+from praisonaiagents import Agent
+
+agent = Agent(name="Support", instructions="Help users")
+
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram"],
+    max_concurrent_runs=32,
+    queue_depth=128,
+    overflow_policy="reject",
+)
+```
+
+### YAML (`gateway.yaml`)
+
+```yaml
+gateway:
+  host: "127.0.0.1"
+  port: 8765
+  max_concurrent_runs: 32
+  queue_depth: 128
+  overflow_policy: reject   # reject | queue | shed_oldest
+```
+
+### CLI
+
+```bash
+praisonai gateway start \
+  --max-concurrent-runs 32 \
+  --queue-depth 128 \
+  --overflow-policy reject
+```
+
+CLI flags override YAML, which overrides Python defaults.
+
+---
+
+## Common Patterns
+
+**Production multi-tenant bot** — explicit busy ack under load; no OOM risk; no provider 429 storm:
+
+```python
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram", "discord", "slack"],
+    max_concurrent_runs=32,
+    queue_depth=128,
+    overflow_policy="reject",
+)
+```
+
+**Burst-tolerant single-channel** — lower aggregate concurrency, deeper queue, no rejections under modest bursts:
+
+```python
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram"],
+    max_concurrent_runs=8,
+    queue_depth=64,
+    overflow_policy="queue",
+)
+```
+
+**Newest-message-wins** — useful when conversation freshness matters more than fairness. When `shed_oldest` can't evict a live waiter, the newcomer is rejected rather than overfilling the queue:
+
+```python
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram"],
+    max_concurrent_runs=16,
+    queue_depth=32,
+    overflow_policy="shed_oldest",
+)
+```
+
+---
+
+## Observability
+
+`BotOS.admission_stats` exposes live counters without any extra setup:
+
+```python
+print(bot.admission_stats)
+# {"in_flight": 12, "queued": 3, "rejected": 0}
+```
+
+Watch `rejected` alongside your LLM provider's 429 rate. When both rise together, raise `max_concurrent_runs`. When only `rejected` rises, deepen `queue_depth` or switch to `overflow_policy="queue"`.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Start with max_concurrent_runs ≈ 2× expected steady-state">
+    Set `max_concurrent_runs` to roughly twice your expected concurrent-user baseline. Watch `admission_stats.rejected` — if rejections are non-zero under normal load, raise the ceiling.
+  </Accordion>
+
+  <Accordion title="Default to overflow_policy='reject' for multi-user deployments">
+    Silent unbounded queueing under load is harder to debug than an explicit busy ack. `reject` surfaces pressure immediately and lets users retry on their own schedule.
+  </Accordion>
+
+  <Accordion title="Pair with flow control for full gateway protection">
+    Admission control bounds **inbound** concurrent runs; [flow control](/docs/features/gateway-flow-control) bounds **outbound** send throughput and per-session inbox depth. Production gateways usually want both.
+  </Accordion>
+
+  <Accordion title="Leave the gate off only for single-user or local dev">
+    `max_concurrent_runs=0` (the default) disables the gate entirely — every inbound turn runs immediately. Suitable for local development or single-operator deployments where there is no shared provider quota to protect.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Gateway Flow Control" icon="gauge-high" href="/docs/features/gateway-flow-control">
+    Outbound counterpart — bounded inboxes and slow-consumer disconnect
+  </Card>
+  <Card title="Gateway Overview" icon="broadcast-tower" href="/docs/features/gateway-overview">
+    Full gateway architecture and feature index
+  </Card>
+</CardGroup>
