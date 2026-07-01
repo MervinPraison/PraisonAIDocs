@@ -91,11 +91,25 @@ This report compares **Rust SDK feature categories** against **Rust documentatio
 | ❌ Token Management | 2 |
 | ❌ Vector Store | 2 |
 
+> **⚠️ Audit note (2026-06-30):** The following doc pages already exist in `docs/rust/` but the parity generator is not matching them to the SDK categories listed above. This is a false negative in the generator — **do not create duplicate pages**. Re-run the generator or file an upstream bug against `praisonai._dev.parity.docs_generator` in `MervinPraison/PraisonAI` to fix the bucket mapping. See issue [#1242](https://github.com/MervinPraison/PraisonAIDocs/issues/1242) for details.
+>
+> | Category (flagged ❌) | Existing doc file |
+> |-----------------------|-------------------|
+> | Callbacks | `docs/rust/callbacks.mdx` |
+> | Process | `docs/rust/process.mdx` |
+> | Streaming | `docs/rust/streaming.mdx` |
+> | Token Management | `docs/rust/token-management.mdx` |
+> | Vector Store | `docs/rust/vector-store.mdx` |
+>
+> Per AGENTS.md §1.8 these pages are **auto-generated only** — do not hand-author new pages in `docs/rust/`.
+
 ## Documentation Without Features
 
 These docs exist but don't match any implemented feature category:
 
 - ℹ️ CLI (1 docs, 123 lines)
+
+> **ℹ️ Audit note (2026-06-30):** The "CLI" orphan is likely `docs/rust/cli.mdx`. Investigate whether this maps to an upstream Rust SDK category and update the generator's bucket list if so, or accept it as an informational page (CLI usage for the Rust SDK). See issue [#1242](https://github.com/MervinPraison/PraisonAIDocs/issues/1242) for details.
 
 ---
 
