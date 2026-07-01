@@ -130,6 +130,14 @@ class ToolResolver:
         self._local_tools_loaded: bool = False
         self._praisonai_tools_available: Optional[bool] = None
         self._local_tools_lock = threading.Lock()
+        # Cache for the tools/ directory class scan so a long-running multi-agent
+        # process does not re-glob the directory and re-import every module on
+        # every resolve_all_from_yaml() call (mirrors the tools.py cache above).
+        # Keyed by the resolved directory path so a resolver reused across
+        # different projects / after a cwd change resolves against the correct
+        # tools/ tree instead of returning a stale first-scan result.
+        self._local_tools_dir_cache: Dict[str, Dict[str, Any]] = {}
+        self._local_tools_dir_lock = threading.Lock()
         self._registry = registry
         
         # Resolution chain as an ordered list of ToolSource objects. When a
@@ -138,8 +146,10 @@ class ToolResolver:
         # equivalent to the historical hardcoded order.
         if sources is not None:
             self._sources: List[ToolSource] = list(sources)
+            self._uses_default_sources = False
         else:
             self._sources = self.default_sources(registry)
+            self._uses_default_sources = True
 
         # Auto-wire cache invalidation so register_function() on the registry
         # invalidates this resolver's cache without the caller having to
@@ -531,37 +541,113 @@ class ToolResolver:
         Returns:
             Dict mapping tool names to descriptions
         """
-        available: Dict[str, str] = {}
-        
-        # 1. Add local tools
+        return {name: desc for name, (desc, _src) in self._discover_available().items()}
+
+    def list_available_sources(self) -> Dict[str, str]:
+        """List all available tools with their canonical resolution source.
+
+        Unlike :meth:`list_available` (which returns human-readable
+        descriptions that may come from tool docstrings), this returns a
+        stable source identifier per tool — one of ``"local"``, ``"builtin"``,
+        ``"external"`` or ``"registered"``. The source reflects the chain that
+        :meth:`resolve` would actually use, so callers can attribute a tool to
+        its true origin without fragile substring matching on descriptions.
+
+        Returns:
+            Dict mapping tool names to source identifiers
+        """
+        return {name: src for name, (_desc, src) in self._discover_available().items()}
+
+    def _discover_available(self) -> Dict[str, "tuple[str, str]"]:
+        """Discover all available tools as ``{name: (description, source)}``.
+
+        Discovery walks sources in the SAME precedence order as
+        :meth:`resolve` / :meth:`default_sources` so that the reported source
+        matches the callable that would actually be resolved at run time:
+
+        1. local tools.py
+        2. wrapper ToolRegistry (register_function API)
+        3. praisonaiagents.tools (built-in)
+        4. praisonai-tools (external, optional)
+        5. core SDK registry (entry-point plugins / runtime-registered)
+
+        Higher-precedence sources win; a name is never overwritten by a
+        later, lower-precedence source.
+
+        When the resolver is constructed with a custom ``sources=`` chain we do
+        NOT enumerate the default built-in / external / core-registry sources,
+        because :meth:`resolve` only walks ``self._sources`` — advertising tools
+        the resolver cannot resolve would make discovery lie about resolution.
+        The wrapper ``ToolRegistry`` is always enumerated when present, since it
+        is passed independently of the source chain.
+        """
+        available: Dict[str, tuple[str, str]] = {}
+
+        # 1. Local tools (highest precedence)
         local_tools = self._load_local_tools()
         for name, tool in local_tools.items():
             doc = getattr(tool, '__doc__', None) or f"Local tool: {name}"
-            available[name] = doc.split('\n')[0].strip()  # First line only
-        
-        # 2. Add praisonaiagents.tools
+            available[name] = (doc.split('\n')[0].strip(), "local")
+
+        # 2. Wrapper ToolRegistry (register_function API) — must precede the
+        # built-in / external mappings to mirror resolution precedence.
+        if self._registry is not None:
+            try:
+                names = self._registry.list_functions()
+            except Exception:
+                names = []
+            for name in names:
+                if name not in available:
+                    available[name] = ("Registered tool (wrapper registry)", "registered")
+
+        # The remaining sources are only part of the *default* resolution chain.
+        # A resolver built with custom sources= owns its own chain and must not
+        # advertise tools it would not actually resolve.
+        if not self._uses_default_sources:
+            return available
+
+        # 3. praisonaiagents.tools (built-in)
         try:
             from praisonaiagents.tools import TOOL_MAPPINGS
             for name in TOOL_MAPPINGS.keys():
                 if name not in available:
-                    available[name] = "Built-in tool from praisonaiagents"
+                    available[name] = ("Built-in tool from praisonaiagents", "builtin")
         except ImportError:
             pass
-        
-        # 3. Add praisonai-tools (if installed)
+
+        # 4. praisonai-tools (external, optional)
         if self._praisonai_tools_available is None:
             from ._framework_availability import is_available
             self._praisonai_tools_available = is_available("praisonai_tools")
-        
+
         if self._praisonai_tools_available:
             try:
                 from praisonai_tools import __all__ as praisonai_tools_all
                 for name in praisonai_tools_all:
                     if name not in available:
-                        available[name] = "External tool from praisonai-tools"
+                        available[name] = ("External tool from praisonai-tools", "external")
             except (ImportError, AttributeError):
                 pass
-        
+
+        # 5. Core SDK tool registry (entry-point plugins and runtime-registered
+        # tools). These resolve at run time via the resolution chain, so
+        # discovery must surface them too. Mirror the resolution path by
+        # triggering entry-point discovery (idempotent) before listing.
+        try:
+            from praisonaiagents.tools.registry import get_registry
+            reg = get_registry()
+            try:
+                reg.discover_plugins()
+            except Exception:
+                pass
+            for name in reg.list_tools():
+                if name not in available:
+                    available[name] = ("Registered/entry-point tool", "registered")
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Error listing tools from core registry: {e}")
+
         return available
     
     def validate_yaml_tools(self, yaml_config: Dict[str, Any]) -> List[str]:
@@ -621,6 +707,8 @@ class ToolResolver:
         with self._local_tools_lock:
             self._local_tools_cache = MappingProxyType({})
             self._local_tools_loaded = False
+        with self._local_tools_dir_lock:
+            self._local_tools_dir_cache = {}
         with self._resolve_cache_lock:
             self._resolve_cache.clear()
             self._resolve_cache_epoch += 1
@@ -652,16 +740,38 @@ class ToolResolver:
 
     def get_local_tool_classes_from_dir(self, tools_dir: "os.PathLike|str") -> Dict[str, Any]:
         """Load BaseTool/langchain classes from every *.py in a tools/ directory.
-        
+
+        Results are cached per resolver instance so a long-running multi-agent
+        process does not re-glob the directory and re-import every module on
+        every call. Call :meth:`invalidate_local_tools_dir` (or
+        :meth:`clear_cache`) to force a re-scan after the directory changes.
+
         Args:
             tools_dir: Path to the tools directory
-            
+
         Returns:
             Dictionary mapping class names to instantiated tool objects
         """
         from pathlib import Path
+
+        cache_key = str(Path(tools_dir).resolve())
+        cached = self._local_tools_dir_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        with self._local_tools_dir_lock:
+            cached = self._local_tools_dir_cache.get(cache_key)
+            if cached is not None:
+                return cached
+            scanned = self._scan_tools_dir(tools_dir)
+            self._local_tools_dir_cache[cache_key] = scanned
+            return scanned
+
+    def _scan_tools_dir(self, tools_dir: "os.PathLike|str") -> Dict[str, Any]:
+        """Glob a tools/ directory and instantiate its tool classes (uncached)."""
+        from pathlib import Path
         from ._safe_loader import load_user_module
-        
+
         classes: Dict[str, Any] = {}
         for py_file in Path(tools_dir).glob("*.py"):
             if py_file.name.startswith("__"):
@@ -673,6 +783,11 @@ class ToolResolver:
             except Exception as e:
                 logger.warning(f"Error loading tool classes from file {py_file}: {e}")
         return classes
+
+    def invalidate_local_tools_dir(self) -> None:
+        """Re-scan tools/ on next resolution (e.g. from a dev-mode file watcher)."""
+        with self._local_tools_dir_lock:
+            self._local_tools_dir_cache = {}
 
     def _extract_tool_classes(self, module):
         """Extract tool classes from a loaded module that inherit from BaseTool 
@@ -774,16 +889,28 @@ class ToolResolver:
         root_directory = os.getcwd()
         tools_py_path = os.path.join(root_directory, 'tools.py')
         tools_dir = Path(root_directory) / 'tools'
-        
+
+        # Local class-based tools (path B semantics) are layered on top of the
+        # chain result. Surface any name collision so a silent override of a
+        # chain-resolved tool by a same-named local class is debuggable.
+        def _merge_local(local_tools: Dict[str, Any]) -> None:
+            for name in local_tools:
+                if name in tools_dict:
+                    logger.warning(
+                        "Local tool %r overrides a tool already resolved from "
+                        "the resolution chain", name,
+                    )
+            tools_dict.update(local_tools)
+
         # Load from tools.py if it exists
         local_tools = self.get_local_tool_classes()
         if local_tools:
-            tools_dict.update(local_tools)
+            _merge_local(local_tools)
             if os.path.isfile(tools_py_path):
                 logger.debug("tools.py exists in the root directory. Loading tools.py and skipping tools folder.")
         # Otherwise load from tools/ directory if it exists
         elif tools_dir.is_dir():
-            tools_dict.update(self.get_local_tool_classes_from_dir(tools_dir))
+            _merge_local(self.get_local_tool_classes_from_dir(tools_dir))
             logger.debug("tools folder exists in the root directory")
         return tools_dict
 
