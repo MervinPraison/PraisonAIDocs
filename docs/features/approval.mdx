@@ -20,6 +20,10 @@ Approval pauses an agent before it runs a risky tool and asks a human (or anothe
 </Warning>
 
 <Note>
+**Pruned tool surface (since v1.6.91):** Denied tools are removed from the model's view — both the function schema and the system-prompt enumeration. The model never wastes a turn calling a tool it cannot execute. See [How tools are pruned from the LLM](#how-tools-are-pruned-from-the-llm).
+</Note>
+
+<Note>
 **Earlier change (PR #2122):** Approval is enabled by default. YAML configs that omitted the `approval` key previously got `enabled: false`; they now get the prompting policy.
 </Note>
 
@@ -171,6 +175,75 @@ graph TB
 ```
 
 The `default` preset specifically blocks: `execute_command`, `kill_process`, `execute_code`, `acp_execute_command`, `delete_file`, `move_file`, `copy_file`, `acp_delete_file`. Write and create operations (`write_file`, `acp_create_file`, `acp_edit_file`) still run — they are blocked only under the `safe` or `read_only` presets.
+
+---
+
+## How tools are pruned from the LLM
+
+Denied tools are filtered out of both the function schema and the system prompt before the LLM ever sees them.
+
+```mermaid
+graph LR
+    subgraph "Pruned advertised surface"
+        Tools[🧰 Agent tools] --> Filter{🛡️ Permission tier\nallowed?}
+        Filter -->|allowed| Schema[📋 LLM Function Schema]
+        Filter -->|allowed| Prompt[📝 System Prompt:\n'You have access to ...']
+        Filter -->|denied| Drop[🚫 Dropped]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Tools input
+    class Filter gate
+    class Schema,Prompt ok
+    class Drop warn
+```
+
+| Layer | Before v1.6.91 | Since v1.6.91 |
+|-------|----------------|---------------|
+| Function schema sent to LLM | All tools advertised; denial only at execution | Denied tools removed from the schema |
+| `"You have access to the following tools: …"` in system prompt | All tool names listed | Only allowed tool names listed |
+
+```python
+from praisonaiagents import Agent
+
+def execute_command(command: str) -> str:
+    """Run a shell command."""
+    ...
+
+def read_file(path: str) -> str:
+    """Read a file."""
+    ...
+
+agent = Agent(
+    name="Reader",
+    instructions="Help me explore the codebase",
+    tools=[execute_command, read_file],
+    approval="safe",   # blocks execute_command (dangerous)
+)
+
+agent.start("Show me what's in main.py")
+# The model is offered ONLY read_file.
+# execute_command is invisible — no denied-call loops, no wasted turns.
+```
+
+<Note>
+`ask` and `allow` tools stay advertised — approval still runs at execution time as defence in depth. Only tools whose permission tier resolves to a hard `deny` (preset deny set, or explicit `*: deny` rule) disappear from the model's view.
+</Note>
+
+| Preset | Pruned from LLM? | Use when |
+|--------|------------------|----------|
+| `approval="full"` / `"bypass"` | No — everything visible | You fully trust the environment |
+| `approval="default"` (auto-applied in CI / non-TTY) | Yes — shell exec + destructive file ops removed | Default safety, write-friendly |
+| `approval="safe"` / `"read_only"` | Yes — all dangerous tools removed | Read-only / review agents |
+| `approval={"permissions": {"*": "deny", ...}}` | Yes — anything matched as `deny` removed | Custom allow-lists |
+
+<Tip>
+When you set `approval="safe"` on a code-review agent and notice the model never tries to edit or run shell — that's pruning working. No prompts appear because the model isn't asking.
+</Tip>
 
 ---
 
@@ -401,6 +474,7 @@ This is a behavior change from previous versions where approving a tool name onc
 |-------|--------|-----|
 | `PermissionError: Approval request failed for <tool>` | Async agent with console backend | Configure a non-console backend |
 | `RuntimeError: Tool '<tool>' requires approval but cannot use console I/O from async context.` | Same root cause, surfaced earlier | Same fix |
+| Tool I expected to be called was never tried by the model | Tool name is in the active deny set / preset and is pruned from the LLM's view | Either widen permissions (e.g. `approval="full"`) or change your `permissions` rules; check the agent's `_perm_deny` at runtime |
 
 ## Best practices
 
@@ -419,6 +493,9 @@ Without a timeout, the agent blocks indefinitely waiting for a decision.
 </Accordion>
 <Accordion title="Restore old behavior for trusted environments">
 Use `approval="bypass"` or `PRAISONAI_TOOL_SAFETY=off` when you control the environment fully and want the pre-4.6.27 unrestricted behaviour.
+</Accordion>
+<Accordion title="Use approval='safe' for review and plan agents">
+Use `approval="safe"` or `approval="read_only"` for review/plan agents — the model is offered only read tools, so it can't waste turns calling write or shell tools that would just be denied.
 </Accordion>
 </AccordionGroup>
 
