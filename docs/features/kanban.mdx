@@ -187,36 +187,7 @@ graph TB
     class Integration,Testing ready
 ```
 
-### Auto-Promotion
-
-Once all of a child's parents reach `done` or `archived`, the dispatcher auto-promotes the child to `ready` on its next tick — no manual `kanban_move` needed. The DAG becomes self-driving.
-
-```mermaid
-sequenceDiagram
-    participant Worker
-    participant Store
-    participant Dispatcher
-    participant ChildAgent
-
-    Worker->>Store: kanban_complete("design")
-    Dispatcher->>Store: recompute_ready() (next tick)
-    Store-->>Dispatcher: ["backend", "frontend"]
-    Dispatcher->>Store: status = ready (atomic)
-    Dispatcher-->>ChildAgent: KANBAN_TASK_MOVED (to_status="ready")
-    ChildAgent->>Store: claim "backend"
-```
-
-| Behavior | Rule |
-|----------|------|
-| Single parent done | Child promoted on next tick |
-| Multi-parent fan-in | Child waits until **all** parents are terminal |
-| Child linked after parent already done | Still promoted on next tick |
-| Child currently `blocked` | Re-evaluated and promoted when parents complete |
-| Parentless `todo` task | Left untouched — `todo` stays manual (backward compatible) |
-
-<Note>
-Auto-promotion fires `KANBAN_TASK_MOVED` per promoted task with `to_status='ready'`. Subscribe to that hook to react to newly-ready work.
-</Note>
+See [Dependency Auto-Promotion](#dependency-auto-promotion) — the dispatcher promotes children automatically once parents finish.
 
 ### Claim/Release
 
@@ -236,6 +207,105 @@ sequenceDiagram
     Worker1->>Store: Release (complete/block)
     Store-->>Worker1: Task updated
 ```
+
+---
+
+## Dependency Auto-Promotion
+
+When you link a child under one or more parent tasks, the dispatcher promotes the child from `todo`/`blocked` to `ready` as soon as every parent reaches `done` or `archived`.
+
+### Quick Start
+
+```python
+from praisonaiagents import Agent
+
+coordinator = Agent(
+    name="Coordinator",
+    instructions=(
+        "Break the user request into linked kanban tasks. "
+        "Use kanban_link(parent_id, child_id) for each dependency. "
+        "Children stay in 'todo' until the dispatcher promotes them."
+    ),
+)
+coordinator.start("Build a login system: design → backend → frontend → tests")
+```
+
+### How Auto-Promotion Works
+
+```mermaid
+sequenceDiagram
+    participant Agent as 🧠 Agent
+    participant Store as 📋 Store
+    participant Dispatcher as ⚙️ Dispatcher
+    participant Worker as ⚡ Worker
+
+    Agent->>Store: Create child task (status: todo)
+    Agent->>Store: kanban_link(parent_id, child_id)
+    Note over Store: Child waits while parent is running
+    Agent->>Store: Complete parent task (status: done)
+    Dispatcher->>Store: Tick — calls recompute_ready()
+    Store-->>Dispatcher: Child promoted to ready
+    Dispatcher->>Worker: Fire KANBAN_TASK_MOVED event
+    Worker->>Store: Claim child task
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef dispatcher fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef worker fill:#10B981,stroke:#7C90A0,color:#fff
+```
+
+### Behaviour by Scenario
+
+| Scenario | Result |
+|---|---|
+| Child linked, parent still `running` | Child stays in `todo`/`blocked` |
+| Last parent moves to `done` | Child auto-promoted to `ready` on next tick |
+| Child has multiple parents, only some done | Child waits for **all** parents |
+| Child linked *after* parent already `done` | Promoted on the next tick |
+| Parent moves to `archived` | Counts as terminal — promotes child |
+| `todo` task with no parents | **Not** auto-promoted (backward compatible) |
+| `blocked` child whose parents finish | Re-evaluated and promoted to `ready` |
+
+### Does My Task Auto-Promote?
+
+```mermaid
+graph TB
+    Start([Task created]) --> HasParents{Has parent links?}
+    HasParents -- No --> Manual[Stays in todo\nmanual promotion]
+    HasParents -- Yes --> AllDone{All parents done\nor archived?}
+    AllDone -- No --> Wait[Stays in todo/blocked\nwaiting for parents]
+    AllDone -- Yes --> Promote[✅ Auto-promoted to ready\non next dispatcher tick]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef wait fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ready fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef manual fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class HasParents,AllDone decision
+    class Wait wait
+    class Promote ready
+    class Manual manual
+```
+
+### Observability — Subscribe to Promotions
+
+```python
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.KANBAN_TASK_MOVED)
+def on_promotion(event_data):
+    if event_data["to_status"] == "ready":
+        print(f"Task {event_data['task_id']} auto-promoted to ready")
+    return HookResult.allow()
+```
+
+<Note>
+Auto-promotion only runs while the dispatcher is active (`praisonai kanban dispatch` or the gateway dispatcher loop). Without a running dispatcher, children remain waiting until the next tick.
+</Note>
 
 ---
 
