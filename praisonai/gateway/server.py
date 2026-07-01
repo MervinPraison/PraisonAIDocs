@@ -208,6 +208,7 @@ class GatewaySession:
     _was_resumed: bool = False  # Track if session was resumed from persistence
     _sequence: int = 0  # Monotonic sequence number for gap detection
     _protocol_version: int = PROTOCOL_VERSION  # Negotiated protocol version
+    _capabilities: List[str] = field(default_factory=list)  # Client-advertised capability tokens
     
     # Stepper & Concurrency logic
     _inbox: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -236,6 +237,16 @@ class GatewaySession:
     @property
     def last_activity(self) -> float:
         return self._last_activity
+    
+    @property
+    def protocol_version(self) -> int:
+        """The protocol version negotiated during the handshake."""
+        return self._protocol_version
+    
+    @property
+    def capabilities(self) -> List[str]:
+        """Capability tokens advertised by the client during the handshake."""
+        return list(self._capabilities)
     
     def get_state(self) -> Dict[str, Any]:
         return dict(self._state)
@@ -346,6 +357,7 @@ class GatewaySession:
             "event_cursor": self._event_cursor,
             "sequence": self._sequence,
             "protocol_version": self._protocol_version,
+            "capabilities": list(self._capabilities),
             "events": [e.to_dict() for e in self._events[-100:]],  # Keep last 100 events
             "pending_inbox": pending_inbox,
             "is_executing": self._is_executing,
@@ -384,6 +396,8 @@ class GatewaySession:
         session._event_cursor = data.get("event_cursor", 0)
         session._sequence = data.get("sequence", session._event_cursor)
         session._protocol_version = data.get("protocol_version", PROTOCOL_VERSION)
+        restored_caps = data.get("capabilities", [])
+        session._capabilities = list(restored_caps) if isinstance(restored_caps, list) else []
         for event_data in data.get("events", []):
             event = GatewayEvent.from_dict(event_data)
             session._events.append(event)
@@ -535,6 +549,13 @@ class WebSocketGateway:
             ),
             max_queued_frames=int(
                 gateway_config.get("max_queued_frames", 1000)
+            ),
+            max_concurrent_runs=int(
+                gateway_config.get("max_concurrent_runs", 0) or 0
+            ),
+            queue_depth=int(gateway_config.get("queue_depth", 0) or 0),
+            overflow_policy=str(
+                gateway_config.get("overflow_policy", "reject") or "reject"
             ),
             session_config=session_config,
         )
@@ -1699,6 +1720,12 @@ class WebSocketGateway:
             if hasattr(session, '_client_id'):
                 session._client_id = client_id
             
+            # Record the negotiated protocol version and the client's advertised
+            # capabilities on the session so they survive resume/persistence and
+            # can be inspected by the server when tailoring delivery.
+            session._protocol_version = negotiated_version
+            session._capabilities = list(client_caps)
+            
             self._client_sessions[client_id] = session.session_id
             
             # Build features list - only advertise implemented features
@@ -2012,7 +2039,23 @@ class WebSocketGateway:
                 
                 try:
                     loop = asyncio.get_event_loop()
-                    response = await loop.run_in_executor(None, agent.chat, content)
+                    gate = getattr(self, "_admission_gate", None)
+                    if gate is not None and getattr(gate, "enabled", False):
+                        # Gateway-wide inbound admission ceiling (#2454). The
+                        # direct WebSocket path bypasses the bot-session gate,
+                        # so enforce the shared gate here too.
+                        from ..bots._admission import AdmissionRejected
+                        try:
+                            async with gate.admit(session_id=session.session_id):
+                                response = await loop.run_in_executor(
+                                    None, agent.chat, content
+                                )
+                        except AdmissionRejected as rej:
+                            response = rej.message
+                    else:
+                        response = await loop.run_in_executor(
+                            None, agent.chat, content
+                        )
                 except Exception as e:
                     logger.error(f"Agent error in queue processor: {e}")
                     response = f"Error: {str(e)}"
@@ -2513,7 +2556,29 @@ class WebSocketGateway:
 
         try:
             loop = asyncio.get_running_loop()
-            reply = await loop.run_in_executor(None, agent.chat, message)
+            gate = getattr(self, "_admission_gate", None)
+            if gate is not None and getattr(gate, "enabled", False):
+                # Gateway-wide inbound admission ceiling (#2454). Hook-triggered
+                # runs are a distinct inbound surface; route them through the
+                # shared gate so a burst of POST /hooks/<path> requests cannot
+                # exceed max_concurrent_runs and recreate the overload it guards.
+                from ..bots._admission import AdmissionRejected
+                try:
+                    async with gate.admit(session_id=session_key):
+                        reply = await loop.run_in_executor(
+                            None, agent.chat, message
+                        )
+                except AdmissionRejected as rej:
+                    return {
+                        "ok": False,
+                        "error": rej.message,
+                        "action": "agent",
+                        "agent": agent_id,
+                        "session": session_key,
+                        "rejected": True,
+                    }
+            else:
+                reply = await loop.run_in_executor(None, agent.chat, message)
         except Exception as e:  # noqa: BLE001 - report run failure to caller
             logger.error("Hook '%s' agent run failed: %s", hook.path, e)
             return {"ok": False, "error": str(e), "session": session_key}
@@ -3635,6 +3700,10 @@ class WebSocketGateway:
                 bot = self._create_bot(channel_type, token, default_agent, config, ch_cfg)
                 if bot is None:
                     continue
+                # Issue #2454: share the gateway-wide admission gate with this
+                # channel bot so inbound runs are admitted through the global
+                # concurrency ceiling / fair queue. No-op when not configured.
+                self._stamp_admission_gate(bot)
                 self._channel_bots[channel_name] = bot
                 logger.info(f"Channel '{channel_name}' ({channel_type}) initialized")
             except Exception as e:
@@ -3652,6 +3721,27 @@ class WebSocketGateway:
                 task = asyncio.create_task(self._run_bot_safe(name, bot))
                 self._channel_tasks[name] = task
             logger.info(f"Started {len(self._channel_bots)} channel bot(s)")
+
+    def _stamp_admission_gate(self, bot: Any) -> None:
+        """Share the gateway-wide admission gate with a channel bot (Issue #2454).
+
+        The concrete adapters (TelegramBot, DiscordBot, …) expose their session
+        under ``_session`` / ``_session_mgr``. No-op when admission control is
+        not configured, preserving today's immediate-dispatch path. Called from
+        both ``start_channels`` and ``_start_single_channel`` (hot-reload) so a
+        restarted channel can't silently bypass the global concurrency ceiling.
+        """
+        gate = getattr(self, "_admission_gate", None)
+        if gate is None:
+            return
+        sess = (
+            getattr(bot, "_session", None)
+            or getattr(bot, "_session_mgr", None)
+        )
+        if sess is not None and hasattr(sess, "_admission_gate"):
+            sess._admission_gate = gate
+        elif hasattr(bot, "_admission_gate"):
+            bot._admission_gate = gate
 
     def _create_bot(
         self,
@@ -4312,6 +4402,9 @@ class WebSocketGateway:
             bot = self._create_bot(channel_type, token, default_agent, config, ch_cfg)
             if bot is None:
                 return
+            # Issue #2454: stamp the shared admission gate so a channel restarted
+            # during hot-reload still enforces the global concurrency ceiling.
+            self._stamp_admission_gate(bot)
             self._channel_bots[channel_name] = bot
             logger.info(f"Channel '{channel_name}' ({channel_type}) initialized")
         except Exception as e:
@@ -4606,7 +4699,46 @@ class WebSocketGateway:
                     drain_timeout_cfg,
                 )
                 drain_timeout_cfg = None
-        
+
+        # Issue #2454: gateway-wide inbound admission control. Build a single
+        # shared admission gate from the gateway config (CLI overrides win over
+        # YAML) and stamp it onto each channel bot in ``start_channels`` so the
+        # concurrency ceiling / fair queue / overflow policy is enforced on the
+        # inbound run-dispatch path. Disabled (no gate) when no positive
+        # ceiling is configured — preserving today's immediate-dispatch path.
+        def _ovr(attr: str, key: str, default: Any) -> Any:
+            val = getattr(self, attr, None)
+            if val is None:
+                val = gw_cfg.get(key, default)
+            return val
+
+        # Coerce + validate admission config. Invalid config is fail-fast: a
+        # typo in the overload-control knobs must NOT silently start the
+        # gateway with unbounded inbound runs (which would remove the very
+        # protection the operator asked for). ``build_admission_gate`` raises
+        # ``ValueError`` on bad values; we let that propagate to abort startup.
+        try:
+            _max_runs = int(_ovr("_max_concurrent_runs_override", "max_concurrent_runs", 0) or 0)
+            _queue_depth = int(_ovr("_queue_depth_override", "queue_depth", 0) or 0)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Invalid gateway admission config "
+                f"(max_concurrent_runs/queue_depth must be integers): {e}"
+            ) from e
+        _overflow = str(_ovr("_overflow_policy_override", "overflow_policy", "reject") or "reject")
+        from ..bots._admission import build_admission_gate
+        self._admission_gate = build_admission_gate(
+            max_concurrent_runs=_max_runs,
+            queue_depth=_queue_depth,
+            overflow_policy=_overflow,
+        )
+        if self._admission_gate is not None:
+            logger.info(
+                "Gateway admission control enabled "
+                "(max_concurrent_runs=%d queue_depth=%d overflow=%s)",
+                _max_runs, _queue_depth, _overflow,
+            )
+
         # Parse health monitoring configuration
         health_cfg = gw_cfg.get("health")
         if health_cfg and isinstance(health_cfg, dict):
@@ -4648,23 +4780,116 @@ class WebSocketGateway:
             self._start_scheduler_tick()
             await self.start()
 
+        # Issue #2436: crash/shutdown forensics. Capture a fast, non-blocking
+        # snapshot on a termination signal so the next boot (and the operator)
+        # can see *why* the previous instance died (OOM vs supervisor stop vs
+        # parent death). The snapshot/diagnostic never raise and never block
+        # the asyncio teardown. A startup sanity check warns when the
+        # supervisor's stop-timeout has less headroom than ``drain_timeout``.
+        forensics_cfg = gw_cfg.get("forensics")
+        if not isinstance(forensics_cfg, dict):
+            forensics_cfg = {}
+        # Normalise the toggle: env-substituted YAML (e.g. ``enabled:
+        # ${FORENSICS_ENABLED}``) arrives as a string, so a raw truthiness
+        # check would treat "false"/"0" as enabled. Default to enabled.
+        forensics_enabled_raw = forensics_cfg.get("enabled", True)
+        if isinstance(forensics_enabled_raw, str):
+            forensics_enabled = (
+                forensics_enabled_raw.strip().lower()
+                in ("1", "true", "yes", "on")
+            )
+        else:
+            forensics_enabled = bool(forensics_enabled_raw)
+        diagnostic_dir = forensics_cfg.get("diagnostic_dir") or os.path.join(
+            os.path.expanduser("~"), ".praisonai", "gateway", "forensics"
+        )
+        forensics = None
+        if forensics_enabled:
+            try:
+                from .forensics import ShutdownForensics
+
+                forensics = ShutdownForensics(
+                    log_dir=diagnostic_dir, enabled=True
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("Could not initialise shutdown forensics: %s", exc)
+                forensics = None
+
+        # Startup sanity check: warn (don't fail) when the supervisor would
+        # likely kill us mid-drain with no explanation.
+        if forensics is not None and drain_timeout_cfg and drain_timeout_cfg > 0:
+            try:
+                from praisonaiagents.gateway import drain_timeout_has_headroom
+
+                stop_timeout_env = (
+                    forensics_cfg.get("stop_timeout")
+                    or os.environ.get("PRAISONAI_STOP_TIMEOUT")
+                )
+                stop_timeout = (
+                    float(stop_timeout_env) if stop_timeout_env else None
+                )
+                if not drain_timeout_has_headroom(stop_timeout, drain_timeout_cfg):
+                    logger.warning(
+                        "Supervisor stop-timeout (%ss) < drain_timeout (%ss) "
+                        "+ headroom; gateway may be killed mid-drain with no "
+                        "explanation.",
+                        stop_timeout,
+                        drain_timeout_cfg,
+                    )
+            except (TypeError, ValueError, ImportError):
+                pass
+
         # Register signal handlers for graceful shutdown using
         # loop.add_signal_handler (async-safe) with signal.signal fallback.
         import signal
 
-        def _request_shutdown():
-            logger.info("Received shutdown signal, stopping gateway...")
+        def _request_shutdown(
+            signal_name: Optional[str] = None, forensic: bool = True
+        ):
+            # ``forensic`` is False on the raw ``signal.signal`` fallback path:
+            # that callback runs in a C-signal context where re-entering
+            # logging / subprocess could deadlock if a lock was held when the
+            # signal arrived. There we only flip ``should_exit`` and let the
+            # async path (when available) capture forensics. Keep *all* logging
+            # behind this guard so the fallback never touches a logging lock.
+            # Request drain FIRST so uvicorn always begins shutting down even
+            # if the (best-effort) forensic logging / ``subprocess.Popen`` below
+            # momentarily blocks under memory pressure or on a stuck host. This
+            # guarantees we never miss the supervisor's drain window because of
+            # diagnostics work.
             if self._server:
                 self._server.should_exit = True
+            if forensic:
+                logger.info("Received shutdown signal, stopping gateway...")
+            if forensic and forensics is not None:
+                try:
+                    from praisonaiagents.gateway import format_forensics_for_log
+
+                    ctx = forensics.snapshot(signal_name=signal_name)
+                    logger.warning(format_forensics_for_log(ctx))
+                    forensics.spawn_diagnostic(ctx, diagnostic_dir)
+                except Exception:  # pragma: no cover - never block teardown
+                    pass
 
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
+            sig_name = sig.name
             try:
-                loop.add_signal_handler(sig, _request_shutdown)
+                loop.add_signal_handler(
+                    sig, lambda n=sig_name: _request_shutdown(n, forensic=True)
+                )
             except (NotImplementedError, OSError, ValueError):
-                # Fallback for platforms where add_signal_handler is unavailable
+                # Fallback for platforms where add_signal_handler is
+                # unavailable. This runs in a C-signal context, so we must not
+                # re-enter logging/subprocess: skip forensics here and only
+                # request exit (forensic=False).
                 try:
-                    signal.signal(sig, lambda s, f: _request_shutdown())
+                    signal.signal(
+                        sig,
+                        lambda s, f, n=sig_name: _request_shutdown(
+                            n, forensic=False
+                        ),
+                    )
                 except (OSError, ValueError):
                     pass
 
