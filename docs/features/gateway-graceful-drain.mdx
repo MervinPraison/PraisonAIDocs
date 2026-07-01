@@ -1,0 +1,212 @@
+---
+title: "Gateway Graceful Drain"
+sidebarTitle: "Graceful Drain"
+description: "Let in-flight bot turns finish before the gateway process exits — opt-in with a single timeout setting"
+icon: "circle-stop"
+---
+
+When a gateway process receives SIGTERM or SIGINT, it can wait for in-flight bot turns to complete before exiting — instead of cutting them off mid-response. Configure the drain window via the CLI, YAML, or Python.
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots.botos import BotOS
+
+agent = Agent(
+    name="SupportBot",
+    instructions="Help users with support questions.",
+    model="gpt-4o-mini",
+)
+
+bots = BotOS(
+    agent=agent,
+    drain_timeout=30,
+)
+bots.run()
+```
+
+```mermaid
+graph LR
+    subgraph "Graceful Drain on Shutdown"
+        SIG[🛑 SIGTERM / SIGINT] --> STOP["Stop accepting\nnew messages"]
+        STOP --> CHECK{In-flight turns?}
+        CHECK -->|Yes| WAIT["⏳ Wait up to\ndrain_timeout seconds"]
+        CHECK -->|No| EXIT["✅ Clean exit"]
+        WAIT --> DONE{Finished?}
+        DONE -->|Yes| EXIT
+        DONE -->|Timeout reached| FORCE["⚠️ Force exit"]
+        FORCE --> EXIT
+    end
+
+    classDef signal fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class SIG signal
+    class STOP,WAIT process
+    class CHECK,DONE decision
+    class EXIT success
+    class FORCE warn
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Enable via the CLI flag">
+
+```bash
+praisonai gateway start gateway.yaml --drain-timeout 30
+```
+
+The gateway waits up to 30 seconds for in-flight turns to complete before exiting.
+</Step>
+
+<Step title="Enable via YAML config">
+
+```yaml
+# gateway.yaml
+drain_timeout: 30
+
+agent:
+  name: assistant
+  instructions: "Help users"
+  model: gpt-4o-mini
+
+channels:
+  telegram:
+    platform: telegram
+    token: "${TELEGRAM_BOT_TOKEN}"
+```
+
+```bash
+praisonai gateway start gateway.yaml
+```
+</Step>
+
+<Step title="Enable via Python">
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots.botos import BotOS
+
+agent = Agent(
+    name="Bot",
+    instructions="Be helpful.",
+    model="gpt-4o-mini",
+)
+
+bots = BotOS(agent=agent, drain_timeout=30)
+bots.run()
+```
+</Step>
+
+<Step title="Override drain timeout at stop time">
+
+You can also pass a one-off timeout when stopping programmatically:
+
+```python
+import asyncio
+
+async def main():
+    bots = BotOS(agent=agent, drain_timeout=30)
+    asyncio.create_task(bots.run_async())
+
+    await asyncio.sleep(60)
+    await bots.stop(drain_timeout=10)
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant OS as Operating System
+    participant GW as Gateway Process
+    participant IN as Ingress (new messages)
+    participant TURN as In-flight Turn
+    participant USER as User
+
+    OS->>GW: SIGTERM
+    GW->>IN: Stop accepting new messages
+    Note over IN: Rejects any new incoming requests
+    GW->>TURN: Allow to complete (up to drain_timeout)
+    TURN-->>USER: Response delivered
+    TURN-->>GW: Turn complete
+    GW-->>OS: Clean exit (code 0)
+```
+
+The drain phase uses `DrainTimeoutPolicy` from `praisonaiagents.gateway.protocols`. If the timeout elapses before all turns finish, the process exits forcefully but still attempts to flush any queued outbound messages.
+
+---
+
+## Behaviour Table
+
+| Scenario | Within drain window | After drain timeout |
+|----------|--------------------|--------------------|
+| In-flight turn (started before signal) | Runs to completion | Force-killed |
+| New inbound message (after signal) | Rejected / queued for next instance | Rejected |
+| Queued outbound message | Flushed | Best-effort |
+
+---
+
+## Configuration Precedence
+
+When multiple sources specify `drain_timeout`, the most specific wins:
+
+| Source | Precedence |
+|--------|-----------|
+| `bots.stop(drain_timeout=N)` call | Highest |
+| `BotOS(drain_timeout=N)` constructor | High |
+| `gateway.drain_timeout` in YAML | Medium |
+| `--drain-timeout N` CLI flag | Low |
+| Default (no drain) | Lowest — exits immediately on signal |
+
+When `drain_timeout` is `None` or `0`, the gateway exits immediately on SIGTERM without draining.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Set drain_timeout in Kubernetes or container deployments">
+
+Container orchestrators send SIGTERM before force-killing a pod. Set `drain_timeout` to slightly less than the `terminationGracePeriodSeconds` in your pod spec:
+
+```yaml
+# kubernetes deployment
+terminationGracePeriodSeconds: 60
+
+# gateway.yaml
+drain_timeout: 50
+```
+
+This gives the gateway 50 seconds to finish turns and 10 seconds of buffer for the process to exit cleanly.
+</Accordion>
+
+<Accordion title="Keep the timeout proportional to your P99 turn latency">
+
+If your agent typically responds in 5 seconds and your P99 is 20 seconds, set `drain_timeout: 25`. A timeout much larger than your P99 adds unnecessary shutdown delay without benefit.
+</Accordion>
+
+<Accordion title="Cross-link with gateway-scale-to-zero">
+
+Graceful drain is especially important for scale-to-zero deployments. Combine it with the existing scale-to-zero feature to ensure scale-down events don't interrupt active users.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Gateway Scale to Zero" icon="moon" href="/docs/features/gateway-scale-to-zero">
+  Scale the gateway down when idle and back up on demand
+</Card>
+<Card title="Gateway Drain Trigger" icon="power-off" href="/docs/features/gateway-drain-trigger">
+  Port-less external drain signal for hosted deployments
+</Card>
+</CardGroup>
