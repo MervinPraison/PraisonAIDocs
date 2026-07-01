@@ -89,11 +89,15 @@ This report compares **Python SDK feature categories** against **Python document
 |----------|----------|
 | ❌ Vector Store | 1 |
 
+> **⚠️ Audit note (2026-06-30):** `docs/features/vector-store.mdx` (364 lines) already exists and covers `praisonaiagents/knowledge/vector_store.py`. The parity script is mis-categorising this page under **Knowledge** because `vector_store.py` lives inside `praisonaiagents/knowledge/`. This is a false negative in the generator, **not** a missing doc page. Do not create a duplicate page. File an upstream bug against `praisonai._dev.parity.docs_generator` in `MervinPraison/PraisonAI` to fix the bucket mapping. See issue [#1242](https://github.com/MervinPraison/PraisonAIDocs/issues/1242) for details.
+
 ## Documentation Without Features
 
 These docs exist but don't match any implemented feature category:
 
 - ℹ️ Documents (1 docs, 775 lines)
+
+> **ℹ️ Audit note (2026-06-30):** The "Documents" orphan is likely `docs/examples/agent-recipes/documents/` or a recipe-only collection. Investigate which file/folder the parity script counts and either (a) rename it to match an existing SDK category, or (b) accept it as a non-feature recipe (informational only). See issue [#1242](https://github.com/MervinPraison/PraisonAIDocs/issues/1242) for details.
 
 ---
 
