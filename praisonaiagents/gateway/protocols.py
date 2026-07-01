@@ -25,6 +25,7 @@ from typing import (
     Optional,
     Protocol,
     Set,
+    Tuple,
     TypedDict,
     Union,
     runtime_checkable,
@@ -2143,6 +2144,176 @@ class DrainTimeoutPolicy:
 
 
 # ---------------------------------------------------------------------------
+# Gateway inbound admission control (Issue #2454)
+#
+# The gateway protects the *outbound* path (slow-consumer eviction, bounded
+# send queues, send-rate limiting) and serialises runs *per user*, but it has
+# no gateway-wide ceiling on concurrent inbound agent runs. A burst of inbound
+# traffic from many distinct users therefore translates directly into a burst
+# of concurrent provider calls, with no admission gate in front of it.
+#
+# This is the pure, import-free decision contract for an admission gate. The
+# wrapper's run-dispatch path (``BotSessionManager.chat``) supplies live facts
+# (in-flight and queued counts) and the policy returns an ``AdmissionDecision``:
+# admit now, queue (wait for capacity), or reject (busy ack). A config-driven
+# default (:class:`ConcurrencyLimitPolicy`) is provided for the common bounded
+# concurrency + bounded queue case; the wrapper owns the semaphore/queue
+# mechanism (it needs the running event loop), this owns the *decision*.
+# ---------------------------------------------------------------------------
+
+
+class AdmissionDecision(str, Enum):
+    """Outcome of an inbound admission evaluation.
+
+    * ``ADMIT`` — capacity is available; run immediately.
+    * ``QUEUE`` — at the concurrency ceiling but the wait queue has room;
+      block until a slot frees up.
+    * ``REJECT`` — over capacity and the queue is full; shed the run with a
+      busy acknowledgement (a ``503``-style signal to the user).
+    """
+
+    ADMIT = "admit"
+    QUEUE = "queue"
+    REJECT = "reject"
+
+
+@runtime_checkable
+class GatewayConcurrencyPolicyProtocol(Protocol):
+    """Protocol for gateway-wide inbound admission decisions.
+
+    Pure, import-free decision contract consumed by the wrapper's run-dispatch
+    path. The wrapper supplies the live aggregate counts (turns currently
+    in flight and turns currently waiting) and the policy decides whether the
+    next inbound turn may run now, must wait, or should be shed. Concrete
+    enforcement (an ``asyncio.Semaphore`` ceiling plus a bounded
+    ``asyncio.Queue`` with per-session fairness) lives in the wrapper, since it
+    needs the running event loop and live session manager; this contract keeps
+    the *decision* testable in isolation.
+
+    A config-driven default (:class:`ConcurrencyLimitPolicy`) is provided for
+    the common "N concurrent runs, bounded wait queue, declared overflow"
+    case.
+    """
+
+    max_concurrent_runs: int
+    queue_depth: int
+
+    def decide(
+        self,
+        *,
+        in_flight: int,
+        queued: int,
+        session_id: str = "",
+    ) -> AdmissionDecision:
+        """Return an :class:`AdmissionDecision` for the supplied facts."""
+        ...
+
+
+class ConcurrencyLimitPolicy:
+    """Config-driven inbound admission policy for a bounded gateway.
+
+    The default referenced by ``gateway.max_concurrent_runs`` /
+    ``gateway.queue_depth`` / ``gateway.overflow_policy`` in ``gateway.yaml``
+    and the ``BotOS(..., max_concurrent_runs=...)`` Python surface. It is
+    intentionally minimal and dependency-free so the decision lives in core and
+    is provable in isolation; the wrapper owns the side effects (acquire a
+    semaphore slot, enqueue/dequeue, return a busy ack).
+
+    The decision is:
+
+    * ``ADMIT`` while ``in_flight < max_concurrent_runs``.
+    * At the ceiling, ``QUEUE`` while ``queued < queue_depth`` and the
+      ``overflow_policy`` permits waiting.
+    * Otherwise the ``overflow_policy`` decides the shed behaviour:
+        - ``"reject"`` → :attr:`AdmissionDecision.REJECT` (busy ack).
+        - ``"queue"`` → :attr:`AdmissionDecision.QUEUE` (block beyond the
+          declared depth — for callers that prefer unbounded waiting to
+          shedding; the wrapper still bounds the actual queue object).
+        - ``"shed_oldest"`` → :attr:`AdmissionDecision.QUEUE`; the wrapper
+          drops the oldest waiter to make room rather than rejecting the new
+          arrival.
+
+    A ``max_concurrent_runs`` of ``0`` disables admission control entirely
+    (today's behaviour: every inbound turn is admitted immediately).
+
+    Example::
+
+        ConcurrencyLimitPolicy(max_concurrent_runs=32, queue_depth=128,
+                               overflow_policy="reject")
+    """
+
+    _OVERFLOW = ("reject", "queue", "shed_oldest")
+
+    def __init__(
+        self,
+        max_concurrent_runs: int = 0,
+        queue_depth: int = 0,
+        overflow_policy: str = "reject",
+    ):
+        try:
+            ceiling = int(max_concurrent_runs)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"max_concurrent_runs must be an integer, "
+                f"got {max_concurrent_runs!r}"
+            )
+        if ceiling < 0:
+            raise ValueError(
+                f"max_concurrent_runs must be >= 0, got {max_concurrent_runs!r}"
+            )
+        try:
+            depth = int(queue_depth)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"queue_depth must be an integer, got {queue_depth!r}"
+            )
+        if depth < 0:
+            raise ValueError(f"queue_depth must be >= 0, got {queue_depth!r}")
+        overflow = (overflow_policy or "reject").strip().lower()
+        if overflow not in self._OVERFLOW:
+            raise ValueError(
+                f"overflow_policy must be one of {self._OVERFLOW}, "
+                f"got {overflow_policy!r}"
+            )
+        self.max_concurrent_runs = ceiling
+        self.queue_depth = depth
+        self.overflow_policy = overflow
+
+    @property
+    def enabled(self) -> bool:
+        """Whether admission control is active (a positive ceiling is set)."""
+        return self.max_concurrent_runs > 0
+
+    def decide(
+        self,
+        *,
+        in_flight: int,
+        queued: int,
+        session_id: str = "",
+    ) -> AdmissionDecision:
+        # Disabled: preserve legacy always-admit behaviour.
+        if self.max_concurrent_runs <= 0:
+            return AdmissionDecision.ADMIT
+        if in_flight < self.max_concurrent_runs:
+            return AdmissionDecision.ADMIT
+        # At the ceiling: consult the bounded wait queue.
+        if queued < self.queue_depth:
+            return AdmissionDecision.QUEUE
+        # Queue is full: declared overflow behaviour.
+        if self.overflow_policy == "queue":
+            # Caller opted into waiting beyond the declared depth.
+            return AdmissionDecision.QUEUE
+        if self.overflow_policy == "shed_oldest":
+            # Make room by dropping the oldest waiter (wrapper enforces).
+            return AdmissionDecision.QUEUE
+        return AdmissionDecision.REJECT
+
+
+# Backward-compatible alias following the repo's ``*Protocol`` convention.
+GatewayConcurrencyPolicy = GatewayConcurrencyPolicyProtocol
+
+
+# ---------------------------------------------------------------------------
 # Port-less, restart-safe external drain trigger (Issue #2390)
 #
 # Hosted/containerised deployments (Docker, Fly, Kubernetes) need to ask a
@@ -2299,6 +2470,297 @@ class DrainMarkerPolicy:
 
 
 # ---------------------------------------------------------------------------
+# Crash / shutdown forensics (Issue #2436)
+#
+# A 24/7 gateway restarted by a supervisor (systemd/s6/Kubernetes) leaves no
+# evidence of *why* it died when the death was not its own decision — OOM kill,
+# supervisor ``SIGKILL``/``SIGTERM``, or a parent dying. The wrapper installs
+# forensic signal handlers that capture a fast, non-blocking snapshot and spawn
+# a detached diagnostic that survives a ``SIGKILL`` on the process group.
+#
+# The decision/formatting pieces that need no OS I/O live here as pure helpers
+# beside ``ScaleToZeroPolicy``/``DrainTimeoutPolicy``/``DrainMarkerPolicy``; the
+# heavy /proc reads, ``os.getrusage``/``os.getloadavg`` calls, and detached
+# subprocess spawn live in the praisonai wrapper behind the protocol below.
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ShutdownForensicsProtocol(Protocol):
+    """Protocol for capturing forensics when a gateway dies unexpectedly.
+
+    Pure contract consumed by the wrapper's signal handlers. ``snapshot``
+    must be fast (<10ms), never raise, and never block the asyncio teardown;
+    ``spawn_diagnostic`` is fire-and-forget and must run the diagnostic in a
+    *detached* session so a ``SIGKILL`` on the process group does not also kill
+    the diagnostic. Concrete OS I/O (``/proc`` reads, ``os.getrusage``,
+    ``os.getloadavg``, subprocess spawn) lives in the wrapper implementation.
+    """
+
+    def snapshot(self, signal_name: Optional[str] = None) -> Dict[str, Any]:
+        """Return a small, JSON-serialisable forensic context.
+
+        Must never raise; on any internal failure it returns a best-effort
+        (possibly partial) dict so the caller can still log *something*.
+        """
+        ...
+
+    def spawn_diagnostic(self, ctx: Dict[str, Any], log_dir: Optional[str]) -> None:
+        """Fire-and-forget a detached diagnostic into ``log_dir``.
+
+        Must never raise and must not block the caller; the diagnostic runs in
+        a detached session so it survives a ``SIGKILL`` on the process group.
+        """
+        ...
+
+
+def format_forensics_for_log(ctx: Optional[Dict[str, Any]]) -> str:
+    """Render a forensic snapshot dict as a single, stable log line.
+
+    Pure and side-effect free so it is provable in isolation and safe to call
+    from a signal handler. Unknown/missing fields are simply omitted; the
+    output is a compact ``key=value`` sequence prefixed with a stable marker so
+    operators (and log scrapers) can grep ``gateway-forensics`` reliably.
+
+    Args:
+        ctx: The dict returned by :meth:`ShutdownForensicsProtocol.snapshot`,
+            or ``None``.
+
+    Returns:
+        A single-line, human-readable summary. Never raises.
+    """
+    if not isinstance(ctx, dict):
+        return "gateway-forensics: <unavailable>"
+
+    # Ordered so the most operationally useful facts come first.
+    keys = (
+        "signal",
+        "pid",
+        "ppid",
+        "supervised",
+        "loadavg_1m",
+        "traced",
+        "maxrss_kb",
+    )
+    parts: List[str] = []
+    for key in keys:
+        if key not in ctx:
+            continue
+        value = ctx[key]
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            rendered = "yes" if value else "no"
+        elif isinstance(value, float):
+            rendered = f"{value:.2f}"
+        else:
+            rendered = str(value).replace("\n", " ").strip()
+        if rendered == "":
+            continue
+        parts.append(f"{key}={rendered}")
+
+    if not parts:
+        return "gateway-forensics: <empty>"
+    return "gateway-forensics: " + " ".join(parts)
+
+
+def is_supervised(ppid: Optional[int], invocation_id: Optional[str]) -> bool:
+    """Return whether the process appears to run under a service manager.
+
+    Pure predicate. A process is considered supervised when either:
+
+    * its parent is PID 1 (``ppid == 1`` — reparented to init / the container
+      entrypoint), or
+    * the systemd ``INVOCATION_ID`` environment variable is present (the unit
+      was started by systemd).
+
+    Args:
+        ppid: The parent PID, or ``None`` when unavailable.
+        invocation_id: The value of ``$INVOCATION_ID``, or ``None``/empty.
+
+    Returns:
+        ``True`` when either supervision signal is present.
+    """
+    if ppid == 1:
+        return True
+    return bool(invocation_id)
+
+
+def drain_timeout_has_headroom(
+    stop_timeout_s: Optional[float],
+    drain_timeout_s: Optional[float],
+    headroom_s: float = 30.0,
+) -> bool:
+    """Return whether the supervisor stop-timeout leaves room to drain.
+
+    Pure predicate used by a startup sanity check. A supervisor whose
+    stop-timeout is shorter than ``drain_timeout + headroom`` will ``SIGKILL``
+    the gateway mid-drain, leaving no explanation. This returns ``False`` only
+    when we can *prove* the headroom is insufficient; when either value is
+    unknown (``None``) or non-positive it returns ``True`` (fail-open: do not
+    emit a spurious warning when we cannot tell).
+
+    Args:
+        stop_timeout_s: The supervisor's configured stop-timeout in seconds, or
+            ``None`` when it could not be determined.
+        drain_timeout_s: The gateway's configured drain timeout in seconds, or
+            ``None``/0 when draining is disabled.
+        headroom_s: Slack to reserve beyond the drain window for teardown.
+
+    Returns:
+        ``True`` when there is adequate headroom (or it cannot be determined),
+        ``False`` only when the stop-timeout is provably too short.
+    """
+    try:
+        drain = float(drain_timeout_s) if drain_timeout_s is not None else 0.0
+        head = float(headroom_s)
+    except (TypeError, ValueError):
+        return True
+    if drain <= 0:
+        # Draining disabled: nothing to be killed mid-drain.
+        return True
+    if stop_timeout_s is None:
+        # Unknown supervisor timeout: cannot prove a problem.
+        return True
+    try:
+        stop = float(stop_timeout_s)
+    except (TypeError, ValueError):
+        return True
+    if stop <= 0:
+        return True
+    return stop >= drain + head
+
+
+# ---------------------------------------------------------------------------
+# Code-skew guard for hot operations (Issue #2460)
+# ---------------------------------------------------------------------------
+
+
+def detect_code_skew(
+    boot_fp: Optional[str], disk_fp: Optional[str]
+) -> Optional[Tuple[str, str]]:
+    """Return shortened ``(boot, disk)`` fingerprints if the code changed.
+
+    This is the pure, side-effect-free heart of the code-skew guard. It does
+    not read the filesystem or git; callers pass the fingerprint captured at
+    boot and a freshly-read on-disk fingerprint (see
+    :func:`read_code_fingerprint`).
+
+    The check is intentionally fail-open: if either fingerprint is unknown
+    (``None`` / empty) it returns ``None`` so the caller proceeds normally and
+    never blocks an operation just because the revision could not be read.
+
+    Args:
+        boot_fp: Fingerprint captured when the gateway started.
+        disk_fp: Fingerprint of the code currently on disk.
+
+    Returns:
+        ``(boot_short, disk_short)`` when the running code differs from disk,
+        otherwise ``None``. Git SHAs are shortened to 7 characters (including a
+        leading SHA in a combined ``"<sha>+mtime:..."`` fingerprint); other
+        fingerprints are returned unchanged.
+    """
+    if not boot_fp or not disk_fp:
+        return None
+    if boot_fp == disk_fp:
+        return None
+
+    def _is_sha(token: str) -> bool:
+        return len(token) == 40 and all(c in "0123456789abcdef" for c in token.lower())
+
+    def _short(fp: str) -> str:
+        # Shorten bare git SHAs (40 hex chars) to the conventional 7, including
+        # a leading SHA in a combined "<sha>+mtime:<ns>" fingerprint; leave
+        # other fingerprint shapes (e.g. "mtime:...") untouched.
+        if _is_sha(fp):
+            return fp[:7]
+        head, sep, tail = fp.partition("+")
+        if sep and _is_sha(head):
+            return f"{head[:7]}{sep}{tail}"
+        return fp
+
+    return (_short(boot_fp), _short(disk_fp))
+
+
+# ---------------------------------------------------------------------------
+# Restart-intent exit-code protocol (Issue #2437)
+# ---------------------------------------------------------------------------
+#
+# When the gateway/bot process exits, its exit code is the only signal a
+# process supervisor (systemd ``Restart=on-failure``, an s6 finish script,
+# a Kubernetes restart policy) receives about whether coming back is worth
+# it. A generic ``1`` makes a transient blip and a fatal misconfiguration
+# look identical, so a misconfigured gateway crash-loops forever instead of
+# stopping and surfacing the problem.
+#
+# These constants follow the ``sysexits.h`` convention so they compose with
+# existing supervisor tooling without bespoke wrappers:
+#
+#   * ``EX_TEMPFAIL`` (75) — transient/restartable: ask the supervisor to
+#     restart (network blip, upstream 503, intentional drain-then-restart).
+#   * ``EX_CONFIG`` (78) — fatal config error: do NOT restart, fix the
+#     config (duplicate token, no platforms, malformed ``gateway.yaml``,
+#     invalid credentials at startup).
+#
+# The constants and the pure ``classify_exit_reason`` classifier live in
+# core so the wrapper CLI, the runtime entry point, and any future runtime
+# share one source of truth. The wrapper owns the actual ``sys.exit``.
+
+GATEWAY_OK_EXIT_CODE = 0
+"""Clean shutdown / success (EX_OK)."""
+
+GATEWAY_RESTART_EXIT_CODE = 75
+"""Transient/restartable failure — ask the supervisor to restart (EX_TEMPFAIL)."""
+
+GATEWAY_FATAL_CONFIG_EXIT_CODE = 78
+"""Fatal config error — supervisor should stop restarting; fix config (EX_CONFIG)."""
+
+
+class FatalConfigError(Exception):
+    """Raised on an unrecoverable gateway/bot configuration error.
+
+    Signals that restarting the process is pointless until an operator
+    fixes the configuration — e.g. two bots sharing one token, no
+    messaging platform configured, a malformed ``gateway.yaml``, or an
+    invalid credential detected at startup. The wrapper entry point maps
+    this to :data:`GATEWAY_FATAL_CONFIG_EXIT_CODE` (78) so the supervisor
+    halts the crash-loop and the failure is terminal and visible.
+    """
+
+
+def classify_exit_reason(exc: "BaseException | None") -> int:
+    """Map an exit cause to a supervisor-friendly exit code (pure).
+
+    The single source of truth shared by the wrapper CLI and runtime
+    entry point. Side-effect free so it is provable in isolation.
+
+    Args:
+        exc: The exception that terminated the process, or ``None`` for a
+            clean shutdown.
+
+    Returns:
+        * :data:`GATEWAY_OK_EXIT_CODE` (0) when ``exc`` is ``None`` or a
+          ``KeyboardInterrupt``/``SystemExit(0)`` (clean stop).
+        * :data:`GATEWAY_FATAL_CONFIG_EXIT_CODE` (78) for
+          :class:`FatalConfigError` (do not restart — fix config).
+        * :data:`GATEWAY_RESTART_EXIT_CODE` (75) for any other exception
+          (transient — ask supervisor to restart).
+    """
+    if exc is None:
+        return GATEWAY_OK_EXIT_CODE
+    if isinstance(exc, KeyboardInterrupt):
+        return GATEWAY_OK_EXIT_CODE
+    if isinstance(exc, SystemExit):
+        code = exc.code
+        if code is None or code == 0:
+            return GATEWAY_OK_EXIT_CODE
+        return code if isinstance(code, int) else GATEWAY_RESTART_EXIT_CODE
+    if isinstance(exc, FatalConfigError):
+        return GATEWAY_FATAL_CONFIG_EXIT_CODE
+    return GATEWAY_RESTART_EXIT_CODE
+
+
+# ---------------------------------------------------------------------------
 # Protocol Version Negotiation (Issue #2130)
 # ---------------------------------------------------------------------------
 
@@ -2347,3 +2809,129 @@ class ResumeSnapshot(TypedDict, total=False):
     presence: List[Dict[str, Any]]  # Current presence information
     health: Dict[str, Any]  # Gateway health status
     session_state: Dict[str, Any]  # Session-specific state
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Relay transport (Issue #2485)
+#
+# A protocol-first seam so a thin *connector* process can own the platform
+# socket (Telegram/Discord/WhatsApp/...) and relay normalised inbound events
+# to a gateway over an authenticated transport, while accepting outbound
+# sends/interrupts back down. This decouples the *platform connection* from
+# the gateway process, enabling:
+#   * headless / NAT-friendly hosting (gateway needs no public inbound port),
+#   * one gateway fronting many remotely-hosted connectors,
+#   * lossless scale-to-zero (the connector stays connected and buffers while
+#     the gateway is dormant, draining the backlog on wake).
+#
+# These are *protocols only* — no transport (WebSocket/gRPC/message bus) and
+# no platform SDK is imported here. Concrete implementations live in the
+# praisonai wrapper.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class CapabilityDescriptor:
+    """A capability profile a relay connector attests at handshake time.
+
+    Where :class:`~praisonaiagents.bots.presentation.PlatformCapabilities`
+    declares capabilities *statically* in core, this descriptor is negotiated
+    by a remote connector at connect time so the streaming/delivery layer can
+    adapt to the actual platform the connector is fronting.
+
+    Attributes:
+        max_message_length: Maximum outbound message length the platform
+            accepts before the connector must split/truncate.
+        length_unit: How ``max_message_length`` is measured — ``"chars"``
+            (Unicode code points) or ``"utf16"`` (UTF-16 code units, as some
+            platforms count).
+        supports_edit: Whether the platform supports editing a sent message
+            (enables draft-streaming via in-place edits).
+        supports_draft_streaming: Whether the connector can stream partial
+            drafts (incremental updates) for a single turn.
+        markdown_dialect: Markdown flavour the platform renders
+            (e.g. ``"none"``, ``"markdown"``, ``"markdownv2"``, ``"html"``).
+    """
+
+    max_message_length: int
+    length_unit: str = "chars"  # "chars" | "utf16"
+    supports_edit: bool = False
+    supports_draft_streaming: bool = False
+    markdown_dialect: str = "none"
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Convert to a serializable dictionary (for the handshake wire)."""
+        return {
+            "max_message_length": self.max_message_length,
+            "length_unit": self.length_unit,
+            "supports_edit": self.supports_edit,
+            "supports_draft_streaming": self.supports_draft_streaming,
+            "markdown_dialect": self.markdown_dialect,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CapabilityDescriptor":
+        """Reconstruct a descriptor from its serialized form."""
+        return cls(
+            max_message_length=int(data["max_message_length"]),
+            length_unit=str(data.get("length_unit", "chars")),
+            supports_edit=bool(data.get("supports_edit", False)),
+            supports_draft_streaming=bool(
+                data.get("supports_draft_streaming", False)
+            ),
+            markdown_dialect=str(data.get("markdown_dialect", "none")),
+        )
+
+
+@runtime_checkable
+class RelayTransport(Protocol):
+    """Protocol for an out-of-process platform-connector relay.
+
+    A concrete implementation (e.g. a ``WebSocketRelayTransport`` in the
+    praisonai wrapper) lets a connector that holds the platform socket
+    forward normalised inbound :class:`GatewayMessage` events to the gateway
+    and accept outbound sends/interrupts back down. The gateway treats the
+    relay like any other adapter (same inbound routing, admission control,
+    delivery) but the connection lives elsewhere.
+
+    Lifecycle::
+
+        caps = await transport.connect()            # handshake → capabilities
+        transport.set_inbound_handler(on_message)   # wire inbound events in
+        ...                                          # events relayed in/out
+        await transport.go_dormant()                 # pause, keep connection
+        await transport.disconnect()                 # tear down
+    """
+
+    async def connect(self) -> "CapabilityDescriptor":
+        """Establish the relay and complete the handshake.
+
+        Returns the :class:`CapabilityDescriptor` attested by the connector
+        for the platform it is fronting.
+        """
+        ...
+
+    def set_inbound_handler(
+        self, handler: Callable[["GatewayMessage"], Awaitable[None]]
+    ) -> None:
+        """Register the coroutine invoked for each relayed inbound message."""
+        ...
+
+    async def send_outbound(
+        self, target: "TargetInfo", message: "GatewayMessage"
+    ) -> "DeliveryResult":
+        """Relay an outbound message to ``target`` via the connector."""
+        ...
+
+    async def go_dormant(self) -> None:
+        """Pause inbound dispatch without dropping the connection.
+
+        The connector keeps the platform socket open and buffers inbound
+        events while the gateway is dormant (scale-to-zero), so they can be
+        drained losslessly on wake.
+        """
+        ...
+
+    async def disconnect(self) -> None:
+        """Tear down the relay connection."""
+        ...

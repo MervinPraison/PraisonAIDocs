@@ -135,6 +135,11 @@ cd praisonai-package
 python3 src/praisonai/scripts/generate_docs_parity.py --copy-docs
 ```
 
+**Full command for agents (run from repo root):**
+```bash
+python3 praisonai-package/src/praisonai/scripts/generate_docs_parity.py --copy-docs
+```
+
 This command:
 1. Scans SDK features and docs for all three SDKs
 2. Generates `DOCS_PARITY.md` reports
