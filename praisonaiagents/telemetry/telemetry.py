@@ -36,6 +36,12 @@ def _get_posthog():
 # Cached result to avoid repeated environment variable checks
 _TELEMETRY_DISABLED_CACHE = None
 
+# Programmatic override set by enable_telemetry()/disable_telemetry().
+# Takes precedence over the env-based default (but NOT over an explicit
+# env opt-out), and bypasses the cache so downstream instrumentation gates
+# (e.g. instrument_agent/instrument_workflow) see the updated state.
+_MONITORING_OVERRIDE = None
+
 def _is_monitoring_disabled() -> bool:
     """
     Check if monitoring/telemetry is disabled via environment variables.
@@ -46,8 +52,20 @@ def _is_monitoring_disabled() -> bool:
     The legacy disable flags still work for backward compatibility.
     
     This function is cached to avoid repeated environment variable lookups.
+    A programmatic override via enable_telemetry()/disable_telemetry() takes
+    precedence over the default, unless telemetry was explicitly disabled
+    via environment variables.
     """
     global _TELEMETRY_DISABLED_CACHE
+    
+    # Explicit env opt-out always wins, even over a programmatic enable.
+    if _is_telemetry_explicitly_disabled():
+        return True
+    
+    # Programmatic override (set by enable_telemetry/disable_telemetry)
+    # bypasses the cache so instrumentation gates reflect the new state.
+    if _MONITORING_OVERRIDE is not None:
+        return _MONITORING_OVERRIDE
     
     # Return cached result if available
     if _TELEMETRY_DISABLED_CACHE is not None:
@@ -74,6 +92,22 @@ def _is_monitoring_disabled() -> bool:
     # Disabled by default unless explicitly enabled
     _TELEMETRY_DISABLED_CACHE = not explicitly_enabled
     return _TELEMETRY_DISABLED_CACHE
+
+def _is_telemetry_explicitly_disabled() -> bool:
+    """
+    Check if telemetry is explicitly disabled via opt-out environment variables.
+
+    Unlike `_is_monitoring_disabled`, this only returns True when the user has
+    explicitly opted out (e.g. DO_NOT_TRACK). It does NOT treat the
+    "disabled by default" case as disabled, so programmatic `enable_telemetry()`
+    can re-enable telemetry unless the user has explicitly opted out.
+    """
+    return any([
+        os.environ.get('PRAISONAI_PERFORMANCE_DISABLED', '').lower() in ('true', '1', 'yes'),
+        os.environ.get('PRAISONAI_TELEMETRY_DISABLED', '').lower() in ('true', '1', 'yes'),
+        os.environ.get('PRAISONAI_DISABLE_TELEMETRY', '').lower() in ('true', '1', 'yes'),
+        os.environ.get('DO_NOT_TRACK', '').lower() in ('true', '1', 'yes'),
+    ])
 
 class MinimalTelemetry:
     """
@@ -212,7 +246,7 @@ class MinimalTelemetry:
             success: Whether the execution was successful
             async_mode: If True, defer PostHog capture to prevent blocking in streaming scenarios
         """
-        if not self.enabled:
+        if not self.enabled or self._metrics_lock is None:
             return
             
         with self._metrics_lock:
@@ -267,7 +301,7 @@ class MinimalTelemetry:
             task_name: Name of the task (not logged, just for counting)
             success: Whether the task completed successfully
         """
-        if not self.enabled:
+        if not self.enabled or self._metrics_lock is None:
             return
             
         with self._metrics_lock:
@@ -296,7 +330,7 @@ class MinimalTelemetry:
             success: Whether the tool call was successful
             execution_time: Time in seconds the tool took to execute (optional)
         """
-        if not self.enabled:
+        if not self.enabled or self._metrics_lock is None:
             return
             
         with self._metrics_lock:
@@ -350,7 +384,7 @@ class MinimalTelemetry:
         Args:
             error_type: Type of error (not the full message)
         """
-        if not self.enabled:
+        if not self.enabled or self._metrics_lock is None:
             return
             
         with self._metrics_lock:
@@ -403,7 +437,7 @@ class MinimalTelemetry:
         Returns:
             Dictionary of current metrics
         """
-        if not self.enabled:
+        if not self.enabled or self._metrics_lock is None:
             return {"enabled": False}
             
         with self._metrics_lock:
@@ -422,7 +456,7 @@ class MinimalTelemetry:
         
         In a real implementation, this would send data to a backend.
         """
-        if not self.enabled:
+        if not self.enabled or self._metrics_lock is None:
             return
             
         metrics = self.get_metrics()
@@ -470,7 +504,7 @@ class MinimalTelemetry:
         Shutdown telemetry and ensure all events are sent.
         Forces proper cleanup of background threads to prevent hanging.
         """
-        if not self.enabled:
+        if not self.enabled or self._shutdown_lock is None:
             return
         
         # Use lock to prevent concurrent shutdown calls
@@ -657,8 +691,12 @@ def get_telemetry() -> MinimalTelemetry:
 
 def disable_telemetry():
     """Programmatically disable telemetry."""
-    global _telemetry_instance
+    global _telemetry_instance, _MONITORING_OVERRIDE
     with _telemetry_instance_lock:
+        # Flip the monitoring gate so instrumentation paths that check
+        # _is_monitoring_disabled() (e.g. instrument_agent/instrument_workflow)
+        # also stop installing hooks.
+        _MONITORING_OVERRIDE = True
         if _telemetry_instance:
             _telemetry_instance.enabled = False
         else:
@@ -701,13 +739,24 @@ def force_shutdown_telemetry():
 
 def enable_telemetry():
     """Programmatically enable telemetry (if not disabled by environment)."""
-    global _telemetry_instance
+    global _telemetry_instance, _MONITORING_OVERRIDE, _TELEMETRY_DISABLED_CACHE
     with _telemetry_instance_lock:
-        if not _is_telemetry_disabled():
-            if _telemetry_instance:
-                _telemetry_instance.enabled = True
-            else:
-                _telemetry_instance = MinimalTelemetry(enabled=True)
+        if _is_telemetry_explicitly_disabled():
+            return
+        # Flip the monitoring gate so instrumentation paths that check
+        # _is_monitoring_disabled() (e.g. instrument_agent/instrument_workflow)
+        # actually install their hooks even in the default (no env var) case.
+        _MONITORING_OVERRIDE = False
+        _TELEMETRY_DISABLED_CACHE = False
+        needs_init = (
+            _telemetry_instance is None
+            or getattr(_telemetry_instance, "_metrics_lock", None) is None
+        )
+        if needs_init:
+            _telemetry_instance = MinimalTelemetry(enabled=True)
+        else:
+            _telemetry_instance.enabled = True
+            _telemetry_instance._shutdown_complete = False
 
 # For backward compatibility with existing code
 class TelemetryCollector:
