@@ -1,6 +1,6 @@
 # Documentation Parity Tracker (Python)
 
-> **Categories:** 66 | **Documented:** 66 | **Parity:** 100%
+> **Categories:** 66 | **Documented:** 66 | **Parity:** 100.0%
 
 This report compares **Python SDK feature categories** against **Python documentation** (docs/concepts, docs/features, etc.).
 
@@ -11,7 +11,7 @@ This report compares **Python SDK feature categories** against **Python document
 | Feature Categories | 66 |
 | **Documented Categories** | **66** |
 | **Undocumented Categories** | **0** |
-| **Parity** | **100%** |
+| **Parity** | **100.0%** |
 
 ## Documented Categories
 
