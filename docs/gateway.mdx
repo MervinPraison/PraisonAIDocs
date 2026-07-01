@@ -283,6 +283,7 @@ Core SDK exports three pure predicates for gateway lifecycle decisions. Each is 
 | `ScaleToZeroPolicy` | Quiesce when idle; wake on next inbound | [Scale to Zero](/docs/features/gateway-scale-to-zero) |
 | `DrainTimeoutPolicy` | Bounded wait for in-flight turns on shutdown | [Session Continuity](/docs/features/gateway-session-continuity) |
 | `DrainMarkerPolicy` + `current_epoch()` | Port-less, restart-safe external drain signal | [Drain Trigger](/docs/features/gateway-drain-trigger) |
+| `classify_exit_reason` + `FatalConfigError` | Supervisor-friendly sysexits exit codes (0 / 75 / 78) | [Gateway Exit Codes](/docs/features/gateway-exit-codes) |
 
 ```python
 from praisonaiagents.gateway import (
@@ -368,6 +369,143 @@ Reserve port 8765 for unified gateway. Use default ports for service-specific de
 
 ---
 
+## Exit Codes & Supervisor Integration
+
+`praisonai serve gateway` uses sysexits-based exit codes so process supervisors can distinguish a transient failure (restart) from a fatal misconfiguration (stop and fix).
+
+```mermaid
+graph LR
+    subgraph "Exit Code Mapping"
+        Exit{Gateway\nExit}
+        Exit -->|clean stop| Code0["✅ 0 — OK\nrestart not needed"]
+        Exit -->|transient error| Code75["🔄 75 — EX_TEMPFAIL\nrestart"]
+        Exit -->|bad config| Code78["🛑 78 — EX_CONFIG\ndo NOT restart"]
+    end
+
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef restart fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef fatal fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Code0 ok
+    class Code75 restart
+    class Code78 fatal
+```
+
+| Code | Constant | Meaning | Supervisor action |
+|------|----------|---------|-------------------|
+| `0` | `GATEWAY_OK_EXIT_CODE` | Clean shutdown / success | No restart needed |
+| `75` | `GATEWAY_RESTART_EXIT_CODE` (EX_TEMPFAIL) | Transient failure — network blip, recoverable upstream error | Restart |
+| `78` | `GATEWAY_FATAL_CONFIG_EXIT_CODE` (EX_CONFIG) | Fatal misconfiguration — fix before restarting | **Do not restart** |
+
+### What Triggers Fatal (78)
+
+| Cause | Exit code |
+|-------|-----------|
+| Missing or malformed `gateway.yaml` (schema invalid / `ValueError`) | 78 |
+| Missing or malformed `--agents` file | 78 |
+| Missing required dependencies | 78 |
+| Any `FatalConfigError` raised explicitly | 78 |
+| Network blip at startup | 75 |
+| Recoverable platform error | 75 |
+
+### systemd Unit
+
+```ini
+[Unit]
+Description=PraisonAI Gateway
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/praisonai serve gateway
+Restart=on-failure
+RestartSec=5
+
+# Stop the crash-loop on fatal config — fix the config and start manually
+RestartPreventExitStatus=78
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Kubernetes Restart Policy
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: praisonai-gateway
+      image: praisonai:latest
+      command: ["praisonai", "serve", "gateway"]
+  restartPolicy: OnFailure
+```
+
+For Kubernetes, use a wrapper script that maps exit code 78 to success (`exit 0`) to prevent the pod from restarting on fatal config:
+
+```bash
+#!/bin/sh
+praisonai serve gateway "$@"
+code=$?
+if [ $code -eq 78 ]; then
+  echo "Fatal config error — not restarting (code 78)" >&2
+  exit 0
+fi
+exit $code
+```
+
+---
+
+## In-Place Code Updates and `/model`
+
+When a running gateway's code changes on disk (via `git pull`, `pip install -U`, or an auto-update on a durable volume), the first-use lazy import triggered by a `/model` switch can hit a code mismatch and crash with a cryptic `ImportError`. The code-skew guard refuses with a clear message instead.
+
+### How It Works
+
+At startup, the gateway captures a fingerprint of the installed code (git SHA + newest `.py` mtime). Before each `/model` switch it compares this to the current on-disk fingerprint:
+
+```mermaid
+graph LR
+    Boot[🚀 Gateway Boot] --> Capture[📸 Capture boot\nfingerprint]
+    Capture --> Running[🏃 Running]
+    Running -->|/model switch| Compare{Fingerprints\nmatch?}
+    Compare -->|yes| Switch[✅ Switch model]
+    Compare -->|no| Warn[⚠️ Refuse with\nrestart message]
+
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Boot,Running agent
+    class Capture,Compare process
+    class Switch ok
+    class Warn warn
+```
+
+### User-Facing Message
+
+When skew is detected, the user sees:
+
+```
+⚠️ Gateway code changed on disk since it started (<boot-short> → <disk-short>). Restart the gateway to apply updates before switching models.
+```
+
+Where `<boot-short>` and `<disk-short>` are 7-character shortened fingerprints (e.g. git SHAs or `mtime:` suffixes).
+
+### Fail-Open
+
+The guard is **best-effort and fail-open**: if the fingerprint cannot be determined (no git, unreadable directory), the guard returns `None` and the `/model` switch proceeds normally. Normal operation is never blocked by the guard itself.
+
+### Opt-Out
+
+Disable the guard for a session manager:
+
+```python
+session_manager.code_skew_guard = False
+```
+
+---
+
 ## Related
 
 <CardGroup cols={2}>
@@ -376,5 +514,11 @@ Reserve port 8765 for unified gateway. Use default ports for service-specific de
 </Card>
 <Card title="MCP Protocol" icon="plug" href="/docs/concepts/mcp">
   Model Context Protocol integration
+</Card>
+<Card title="Gateway CLI" icon="terminal" href="/docs/features/gateway-cli">
+  CLI commands for managing the gateway
+</Card>
+<Card title="Relay Transport" icon="arrow-left-right" href="/docs/features/relay-transport">
+  Out-of-process platform connector relay
 </Card>
 </CardGroup>

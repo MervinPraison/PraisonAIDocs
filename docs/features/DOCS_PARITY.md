@@ -1,6 +1,6 @@
 # Documentation Parity Tracker (Python)
 
-> **Categories:** 66 | **Documented:** 65 | **Parity:** 98.5%
+> **Categories:** 66 | **Documented:** 66 | **Parity:** 100.0%
 
 This report compares **Python SDK feature categories** against **Python documentation** (docs/concepts, docs/features, etc.).
 
@@ -9,9 +9,9 @@ This report compares **Python SDK feature categories** against **Python document
 | Metric | Count |
 |--------|-------|
 | Feature Categories | 66 |
-| **Documented Categories** | **65** |
-| **Undocumented Categories** | **1** |
-| **Parity** | **98.5%** |
+| **Documented Categories** | **66** |
+| **Undocumented Categories** | **0** |
+| **Parity** | **100.0%** |
 
 ## Documented Categories
 
@@ -78,16 +78,11 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Templates | 1 | 8 | 1655 |
 | ✅ Tools | 12 | 118 | 28063 |
 | ✅ Tracing | 3 | 2 | 139 |
+| ✅ Vector Store | 1 | 1 | 364 |
 | ✅ Video | 2 | 6 | 510 |
 | ✅ Vision | 2 | 1 | 283 |
 | ✅ Web | 3 | 8 | 1849 |
 | ✅ Workflows | 4 | 14 | 6183 |
-
-## Undocumented Categories (Need Documentation)
-
-| Category | Features |
-|----------|----------|
-| ❌ Vector Store | 1 |
 
 ## Documentation Without Features
 
