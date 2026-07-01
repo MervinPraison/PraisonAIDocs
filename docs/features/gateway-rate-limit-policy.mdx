@@ -2,93 +2,98 @@
 title: "Gateway Rate-Limit Policy"
 sidebarTitle: "Rate-Limit Policy"
 description: "Inject a custom rate limiter into the core gateway via RateLimitPolicyProtocol"
-icon: "gauge"
+icon: "gauge-high"
 ---
 
 <Note>
 The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` still works exactly as documented here; for a standalone install see [praisonai-bot Migration](/docs/guides/praisonai-bot-migration).
 </Note>
 
+The `RateLimitPolicyProtocol` lets you plug any rate limiter — per-tenant, Redis-backed, or cost-based — into the gateway's connection handshake with a single `check` method. A built-in sliding window policy covers most use cases out of the box.
 
 ```python
+from praisonaiagents.gateway import SlidingWindowRateLimitPolicy
+from praisonai.gateway import WebSocketGateway
 from praisonaiagents import Agent
 
-agent = Agent(name="assistant", instructions="Answer helpfully within gateway rate limits.")
-# Gateway rate-limit policy applies before agent.start reaches the model
-agent.start("Hello")
+policy = SlidingWindowRateLimitPolicy(max_requests=5, window_seconds=60.0)
+gateway = WebSocketGateway(agent=Agent(name="Bot", instructions="Be helpful"), rate_limit_policy=policy)
 ```
-`RateLimitPolicyProtocol` is the injectable seam that lets you plug any rate-limiting logic — per-tenant, Redis-backed, cost-based — into the core gateway with a single `check` method.
-
-The user sends bursts of messages; rate-limit policy throttles or rejects traffic before agents overload.
 
 ```mermaid
 graph LR
-    Req[📨 Inbound request] --> Check[🔍 RateLimitPolicy.check]
-    Check -->|allowed=True| Handler[✅ Turn handler]
-    Check -->|allowed=False| Reject[❌ RATE_LIMITED\n+ retry_after_seconds]
-
-    classDef req fill:#8B0000,stroke:#7C90A0,color:#fff
+    subgraph "Rate Limit Policy Seam"
+        R[Client Request] --> C{check identity, scope, now}
+        C -->|allowed=True| G[✅ Gateway accepts]
+        C -->|allowed=False| L[🚫 RATE_LIMITED + retry_after_seconds]
+    end
+    classDef req fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef bad fill:#6366F1,stroke:#7C90A0,color:#fff
-
-    class Req req
-    class Check check
-    class Handler ok
-    class Reject bad
+    classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
+    class R req
+    class C check
+    class G ok
+    class L deny
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="Import the built-in sliding-window limiter">
+<Step title="Use the built-in sliding window">
 
 ```python
 from praisonaiagents.gateway import SlidingWindowRateLimitPolicy
 
-limiter = SlidingWindowRateLimitPolicy(max_requests=60, window_seconds=60)
+policy = SlidingWindowRateLimitPolicy(
+    max_requests=5,
+    window_seconds=60.0,
+    lockout_seconds=300.0,   # 5 min cooldown after ceiling breach
+)
 ```
-
 </Step>
 
-<Step title="Inject it into the gateway">
+<Step title="Inject into the gateway">
 
 ```python
 from praisonaiagents import Agent
-from praisonai.bots import BotOS
+from praisonai.gateway import WebSocketGateway
 from praisonaiagents.gateway import SlidingWindowRateLimitPolicy
 
-agent = Agent(name="assistant", instructions="Help the user.")
-limiter = SlidingWindowRateLimitPolicy(max_requests=30, window_seconds=60)
+policy = SlidingWindowRateLimitPolicy(max_requests=30, window_seconds=60.0)
 
-bot = BotOS(
-    agent=agent,
-    platforms=["telegram"],
-    rate_limit_policy=limiter,
+gateway = WebSocketGateway(
+    agent=Agent(name="Bot", instructions="Be helpful"),
+    rate_limit_policy=policy,
 )
-bot.start()
 ```
-
 </Step>
 
-<Step title="Write a custom limiter">
+<Step title="Configure via YAML">
+
+```yaml
+gateway:
+  rate_limit:
+    max_requests: 5
+    window_seconds: 60
+    lockout_seconds: 300
+```
+</Step>
+
+<Step title="Write your own policy">
 
 Any object with a `check(*, identity, scope, now)` method satisfies the protocol — no base class needed:
 
 ```python
-from praisonaiagents.gateway import RateLimitDecision
+from praisonaiagents.gateway import RateLimitDecision, RateLimitPolicyProtocol
 
-class MyTenantLimiter:
+class MyPolicy:
     def check(self, *, identity: str, scope: str, now: float) -> RateLimitDecision:
-        # identity: usually user/chat id
-        # scope: platform or channel name
-        # now: unix timestamp (float) from time.monotonic()
-        allowed = self._check_quota(identity, scope, now)
-        retry_after = 0.0 if allowed else 5.0
-        return RateLimitDecision(allowed=allowed, retry_after_seconds=retry_after)
+        if is_over_quota(identity, scope):
+            return RateLimitDecision(allowed=False, retry_after_seconds=30.0)
+        return RateLimitDecision(allowed=True)
 
-    def _check_quota(self, identity, scope, now):
-        return True   # replace with real logic
+assert isinstance(MyPolicy(), RateLimitPolicyProtocol)  # runtime-checkable
 ```
 
 </Step>
@@ -117,7 +122,7 @@ sequenceDiagram
     end
 ```
 
-`allowed=False` maps to `ConnectErrorCode.RATE_LIMITED` on the wire and sets `HelloError.retry_after_seconds` so clients know when to retry. The shape is symmetric with `SendPolicy`, `ConcurrencyLimitPolicy`, and `DrainPolicy`. Wire details for `rate_limited` and `retry_after_seconds` are in [Gateway Handshake Protocol](/docs/features/gateway-handshake-protocol).
+`allowed=False` maps to `ConnectErrorCode.RATE_LIMITED` on the wire and sets `HelloError.retry_after_seconds` so clients know when to retry. Wire details are in [Gateway Handshake Protocol](/docs/features/gateway-handshake-protocol).
 
 ---
 
@@ -134,16 +139,17 @@ from praisonaiagents.gateway import (
 
 ---
 
+
 ## API Reference
 
 ### `RateLimitDecision`
 
-A **frozen** dataclass returned by every `check` call:
+A frozen dataclass returned by every `check()` call.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `allowed` | `bool` | `True` → request passes; `False` → reject with rate-limit error |
-| `retry_after_seconds` | `float` | Hint to the client for when to retry. `0.0` when allowed. |
+| `allowed` | `bool` | `True` → request passes; `False` → reject with `RATE_LIMITED` error |
+| `retry_after_seconds` | `float` | Hint to the client: how long to wait before retrying. Sent as `HelloError.retry_after_seconds` on the wire. |
 
 ### `RateLimitPolicyProtocol`
 
@@ -154,21 +160,11 @@ class RateLimitPolicyProtocol(Protocol):
     def check(
         self,
         *,
-        identity: str,
-        scope: str,
-        now: float,
+        identity: str,   # Caller identity: auth token, user id, or API key
+        scope: str,      # Endpoint class, channel, or tenant token
+        now: float,      # time.monotonic() float for testability
     ) -> RateLimitDecision: ...
 ```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `identity` | `str` | Per-user or per-chat identifier |
-| `scope` | `str` | Platform or channel name (e.g. `"telegram"`) |
-| `now` | `float` | Current monotonic timestamp (`time.monotonic()`) |
-
-### `RateLimitPolicy`
-
-Backward-compat alias for `RateLimitPolicyProtocol`. New code should import `RateLimitPolicyProtocol`.
 
 ### `SlidingWindowRateLimitPolicy`
 
@@ -176,9 +172,9 @@ Config-driven, dependency-free default. Keyed per `(scope, identity)`.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `max_requests` | `int` | `0` | Max requests per window. `0` disables limiting (always-allow). |
-| `window_seconds` | `float` | `60.0` | Rolling window width in seconds |
-| `lockout_seconds` | `float` | `0.0` | Optional cooldown after a breach before allowing again |
+| `max_requests` | `int` | `0` | Ceiling per `(scope, identity)` in the window. **`0` disables limiting entirely.** |
+| `window_seconds` | `float` | `60.0` | Rolling window width in seconds. Must be `> 0`. |
+| `lockout_seconds` | `float` | `0.0` | Cooldown after ceiling breach. During lockout, every `check()` returns `allowed=False`. |
 
 ```python
 from praisonaiagents.gateway import SlidingWindowRateLimitPolicy
@@ -191,10 +187,18 @@ limiter = SlidingWindowRateLimitPolicy(
 )
 ```
 
-## State ownership
+### `RateLimitPolicy`
 
-The built-in `SlidingWindowRateLimitPolicy` is not internally synchronised and reclaims `(scope, identity)` entries lazily on the next check. Use it for bounded identity spaces (authenticated tenants, endpoint classes). For unbounded or untrusted identity keys (for example raw per-IP strings), implement `RateLimitPolicyProtocol` in the wrapper layer and run periodic reclamation yourself.
+Backward-compat alias for `RateLimitPolicyProtocol`. New code should import `RateLimitPolicyProtocol`.
 
+---
+
+## State Ownership
+
+The built-in `SlidingWindowRateLimitPolicy` is not internally synchronised and reclaims `(scope, identity)` entries lazily on the next check.
+
+- **Suitable for:** bounded, authenticated identity spaces (tenants, endpoint classes, known API keys).
+- **Not suitable for:** unbounded / untrusted identity spaces (raw per-IP keys) — implement `RateLimitPolicyProtocol` in the wrapper layer and run periodic reclamation yourself.
 
 ---
 
@@ -205,10 +209,7 @@ The built-in `SlidingWindowRateLimitPolicy` is not internally synchronised and r
 ```python
 from praisonaiagents.gateway import RateLimitDecision
 
-QUOTAS = {
-    "premium": 120,
-    "free": 10,
-}
+QUOTAS = {"premium": 120, "free": 10}
 
 class TierLimiter:
     def __init__(self):
@@ -220,7 +221,6 @@ class TierLimiter:
     def check(self, *, identity: str, scope: str, now: float) -> RateLimitDecision:
         tier = self._get_tier(identity)
         quota = QUOTAS[tier]
-        # simplified — use a real sliding window in production
         count = self._counts.get(identity, 0)
         if count >= quota:
             return RateLimitDecision(allowed=False, retry_after_seconds=60.0)
@@ -231,8 +231,6 @@ class TierLimiter:
 ### Disable rate limiting (legacy always-allow)
 
 ```python
-from praisonaiagents.gateway import SlidingWindowRateLimitPolicy
-
 limiter = SlidingWindowRateLimitPolicy(max_requests=0)  # 0 = disabled
 ```
 
@@ -244,26 +242,32 @@ limiter = SlidingWindowRateLimitPolicy(max_requests=0)  # 0 = disabled
 
 <Accordion title="Keep check() fast — it runs on every request">
 
-`check` is called synchronously on the hot path. Avoid network calls inside it. Use a local in-process cache (e.g. a dict + sliding window) and sync to Redis or a database asynchronously.
-
+`check` is called synchronously on the hot path. Avoid network calls inside it. Use a local in-process cache (e.g. a dict + sliding window) and sync to Redis asynchronously.
 </Accordion>
 
 <Accordion title="Always return retry_after_seconds when rejecting">
 
 Clients use `retry_after_seconds` to back off correctly. Returning `0.0` on a rejection causes immediate retries and amplifies load. Return a meaningful value (5–60 s).
-
 </Accordion>
 
-<Accordion name="Use SlidingWindowRateLimitPolicy as the baseline">
+<Accordion title="Set max_requests=0 to disable limiting">
 
-The built-in sliding-window limiter covers most production needs with zero dependencies. Build a custom limiter only when you need cross-process state (Redis) or dynamic quotas.
+`max_requests=0` is the default — it passes every request through, identical to having no policy. Use this when you want to add a policy object for future use without enforcing limits yet.
+</Accordion>
 
+<Accordion title="Tune lockout_seconds for abusive callers">
+
+Set `lockout_seconds` to apply a cooldown after a caller hits the ceiling. Without a lockout, callers can burst exactly `max_requests` per window forever by timing their requests carefully.
 </Accordion>
 
 <Accordion title="Scope by both identity and scope for multi-platform bots">
 
 The same user may appear across Telegram and Discord. Scope per `(identity, scope)` to set per-platform limits, or drop `scope` to share a single quota across all platforms.
+</Accordion>
 
+<Accordion title="Use runtime_checkable for duck-typing">
+
+`RateLimitPolicyProtocol` is `@runtime_checkable` — use `isinstance(my_policy, RateLimitPolicyProtocol)` to verify your custom class satisfies the contract before injecting it.
 </Accordion>
 
 </AccordionGroup>
@@ -273,16 +277,16 @@ The same user may appear across Telegram and Discord. Scope per `(identity, scop
 ## Related
 
 <CardGroup cols={2}>
-<Card title="Rate Limiter" icon="gauge-high" href="/docs/features/rate-limiter">
-  LLM API rate limiting (requests per minute, token budget)
+<Card title="Gateway Handshake Protocol" icon="handshake" href="/docs/features/gateway-handshake-protocol">
+  ConnectErrorCode.RATE_LIMITED and HelloError.retry_after_seconds
 </Card>
 <Card title="Bot Rate Limiting" icon="traffic-cone" href="/docs/features/bot-rate-limiting">
   Messaging platform rate limits (Telegram, Discord, Slack)
 </Card>
-<Card title="Gateway Overview" icon="server" href="/docs/features/gateway-overview">
-  Bot gateway architecture and core concepts
+<Card title="Gateway Reliability" icon="shield-check" href="/docs/features/gateway-reliability">
+  One-switch reliability preset for production deployments
 </Card>
-<Card title="Gateway Flow Control" icon="sliders-horizontal" href="/docs/features/gateway-flow-control">
-  Admission control and back-pressure
+<Card title="Rate Limiter" icon="gauge-high" href="/docs/features/rate-limiter">
+  LLM API rate limiting (requests per minute, token budget)</Card>
 </Card>
 </CardGroup>

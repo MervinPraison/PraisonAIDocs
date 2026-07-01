@@ -9,65 +9,79 @@ icon: "arrows-rotate"
 The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` still works exactly as documented here; for a standalone install see [praisonai-bot Migration](/docs/guides/praisonai-bot-migration).
 </Note>
 
-Edit `gateway.yaml` and save — the running gateway diffs it and restarts only what changed, in-flight turns included.
-
-```python
-from praisonaiagents import Agent
-
-agent = Agent(name="ops", instructions="Operate gateway configuration reloads.")
-agent.start("Reload gateway.yaml after I edit agents or channels.")
-```
-
-The user edits `gateway.yaml` or sends SIGHUP; the gateway diffs the file and recreates only agents or channels whose settings changed.
+Edit `gateway.yaml` while the gateway is running and the change applies automatically — no restart, no dropped connections.
 
 ```bash
-# Edit your config, then signal the running gateway to reload
-kill -HUP $(cat ~/.praisonai/gateway.pid)
+pip install "praisonai[gateway]"
+praisonai gateway start --config gateway.yaml
+# Edit gateway.yaml and save — reload applies within seconds
 ```
 
 ```mermaid
-graph LR
-    subgraph "Config Reload Flow"
-        F[📄 File change / SIGHUP] --> D[🔍 Diff configs]
-        D -->|agents changed| A[🤖 Recreate agents]
-        D -->|channel token changed| C[🔄 Drain + restart channel]
-        D -->|host/port changed| R[🔄 Full restart]
-        A --> OK[✅ Ready]
-        C --> OK
-        R --> OK
-    end
-
-    classDef trigger fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
-
-    class F trigger
-    class D,A,C,R process
-    class OK output
+sequenceDiagram
+    participant Op as Operator
+    participant FS as gateway.yaml
+    participant GW as Gateway
+    participant Ch as Channel (bot)
+    Op->>FS: edit gateway.yaml
+    FS-->>GW: watchdog event (or mtime poll)
+    Op->>GW: kill -HUP pid (equivalent)
+    GW->>GW: diff config
+    GW->>Ch: drain(reload_drain_timeout)
+    Ch-->>GW: in-flight turns finished
+    GW->>Ch: restart with new config
+    GW-->>Op: log "reload applied: agents; restart[telegram]"
 ```
 
 ## Quick Start
 
 <Steps>
 
-<Step title="Edit gateway.yaml">
-```yaml
-# Change an agent instruction and save
-agents:
-  support:
-    instructions: "You are a friendly support agent."  # changed
-    model: gpt-4o-mini
+<Step title="Install the gateway extra">
+
+```bash
+pip install "praisonai[gateway]"
 ```
+
+This installs `watchdog>=3.0.0` for event-driven file watching. The gateway falls back to mtime polling when `watchdog` is not installed.
 </Step>
 
-<Step title="Signal the gateway">
-```bash
-kill -HUP $(cat ~/.praisonai/gateway.pid)
-# or via systemd
-systemctl reload praisonai-gateway
+<Step title="Edit gateway.yaml — auto-detected">
+
+```yaml
+# gateway.yaml
+agents:
+  assistant:
+    instructions: "You are a helpful assistant."
+
+gateway:
+  reload_drain_timeout: 10.0   # seconds to drain a channel on reload
 ```
 
-The gateway diffs the config, drains any affected channels, and applies the change — the WebSocket server never drops.
+Save the file. The running gateway detects the change within the watchdog debounce window and reloads automatically.
+</Step>
+
+<Step title="Trigger a reload manually via SIGHUP">
+
+```bash
+systemctl reload praisonai-gateway
+# or
+kill -HUP $(pgrep -f 'praisonai gateway start')
+```
+
+`SIGHUP` runs the same `reload_config` path as a file change — no shutdown. Best-effort on Windows (SIGHUP unavailable, see fallback below).
+</Step>
+
+<Step title="Tune the drain window">
+
+```yaml
+gateway:
+  reload_drain_timeout: 10.0   # seconds to drain a channel on reload
+  # If unset, falls back to gateway.drain_timeout
+  drain_timeout: 5.0
+```
+
+`reload_drain_timeout` controls how long a channel restart waits for in-flight turns to finish. If unset, it falls back to `drain_timeout`.
 </Step>
 
 <Step title="Watch the audit log">
@@ -82,28 +96,25 @@ Each line tells you exactly what changed and which channels were restarted.
 
 ---
 
-## Three Trigger Paths
+## What Triggers a Reload
+
+Two paths trigger the same `reload_config` routine:
+
+| Trigger | Mechanism |
+|---------|-----------|
+| File edit | `watchdog` filesystem event (if installed) or mtime polling every 5 s |
+| Manual | `kill -HUP <pid>` or `systemctl reload praisonai-gateway` |
+
+Both paths debounce rapid consecutive writes before applying — a burst of saves from an editor doesn't cause multiple reloads.
 
 <Tabs>
 
 <Tab title="File-based (event-driven)">
-Install the optional `watchdog` package for instant, debounced change detection:
-
-```bash
-pip install "praisonai[gateway]"
-# installs watchdog>=3.0.0
-```
-
 With `watchdog` installed, filesystem events (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows) trigger a reload within the debounce window (default 1 s) automatically — no signal required.
 </Tab>
 
 <Tab title="File-based (polling fallback)">
 Without `watchdog`, the gateway falls back to mtime polling every 5 s automatically. Zero config change needed to opt in or out — the gateway chooses the best available mechanism at startup.
-
-```bash
-# No extra package needed — polling kicks in automatically
-praisonai gateway start --config gateway.yaml
-```
 </Tab>
 
 <Tab title="Operator-triggered (SIGHUP)">
@@ -115,7 +126,7 @@ kill -HUP <gateway-pid>
 systemctl reload praisonai-gateway
 ```
 
-SIGHUP runs the same diff-driven reload path as the file watcher. Concurrent SIGHUPs (e.g. script fires two in quick succession) are serialized — the second waits for the first to finish.
+Concurrent SIGHUPs are serialized — the second waits for the first to finish.
 
 <Warning>
 SIGHUP does not exist on Windows. The gateway skips the SIGHUP handler silently on Windows and falls back to polling or file-event watching only.
@@ -123,6 +134,19 @@ SIGHUP does not exist on Windows. The gateway skips the SIGHUP handler silently 
 </Tab>
 
 </Tabs>
+
+---
+
+## What Gets Restarted
+
+| Config change | Action |
+|---------------|--------|
+| Agent `instructions` / `model` / `tools` | Recreate affected agents in-place |
+| Channel `token` or platform args | Drain + restart that single channel |
+| Gateway `host` / `port` | Full restart (WebSocket server stays up) |
+| Scheduler / routes / guardrails | Full channel restart |
+
+The WebSocket server itself keeps running throughout — connected clients are not disconnected unless their channel is restarting.
 
 ---
 
@@ -137,57 +161,39 @@ gateway:
   reload_drain_timeout: 10  # reload-specific budget (wins over drain_timeout for reloads)
 ```
 
-<Note>
-When `reload_drain_timeout` is unset, it falls back to `drain_timeout`. Set it shorter for faster ops iteration without loosening your shutdown drain budget.
-</Note>
-
-```mermaid
-sequenceDiagram
-    participant Op as Operator / File Watcher
-    participant GW as Gateway
-    participant CH as Channel (e.g. Telegram)
-    participant Turn as In-flight Turn
-
-    Op->>GW: SIGHUP / file changed
-    GW->>GW: Acquire reload lock
-    GW->>GW: Diff configs
-    GW->>CH: Stop accepting new turns
-    GW->>Turn: Wait (≤ reload_drain_timeout)
-    Turn-->>GW: Done
-    GW->>CH: Restart with new config
-    CH-->>GW: Ready
-    GW->>GW: Release reload lock
-    GW-->>Op: "reload applied: restart[telegram]"
-```
-
 ---
 
-## What Gets Restarted?
+## Windows / No-Watchdog Fallback
 
-| Config change | Action |
-|---------------|--------|
-| Agent `instructions` / `model` / `tools` | Recreate affected agents in-place |
-| Channel `token` or platform args | Drain + restart that single channel |
-| Gateway `host` / `port` | Full restart (WebSocket server stays up) |
-| Scheduler / routes / guardrails | Full channel restart |
-
----
-
-## YAML Reference
-
-```yaml
-gateway:
-  drain_timeout: 30           # shutdown drain window (seconds)
-  reload_drain_timeout: 10    # reload drain window; falls back to drain_timeout if unset
-```
-
----
-
-## Optional Dependency
+| Environment | File watching | SIGHUP |
+|-------------|--------------|--------|
+| Linux / macOS + `watchdog` installed | Event-driven (instant) | Supported |
+| Linux / macOS without `watchdog` | mtime polling (5 s interval) | Supported |
+| Windows + `watchdog` installed | Event-driven (instant) | Not available |
+| Windows without `watchdog` | mtime polling (5 s interval) | Not available |
 
 <Info>
 `pip install "praisonai[gateway]"` adds `watchdog>=3.0.0` for event-driven watching. Without it the gateway uses mtime polling (5 s interval). Both modes apply the same reload logic — the only difference is detection latency.
 </Info>
+
+On Windows, use the file-watch path only. `kill -HUP` is not available; trigger reloads by saving the config file.
+
+---
+
+## Reading the Log Line
+
+A concise summary is logged after each reload:
+
+```
+reload applied: agents; restart[telegram]
+```
+
+| Part | Meaning |
+|------|---------|
+| `agents` | Agent definitions were updated (no channel restart) |
+| `restart[telegram]` | The `telegram` channel was restarted with drain |
+| `restart[telegram,discord]` | Multiple channels were restarted |
+| _(empty)_ | Config was identical; no changes applied |
 
 ---
 
@@ -195,16 +201,31 @@ gateway:
 
 <AccordionGroup>
 
+<Accordion title="Install watchdog for instant detection">
+
+Without `watchdog`, the gateway polls every 5 seconds. With `watchdog` installed (`pip install "praisonai[gateway]"`), changes are detected within milliseconds via filesystem events.
+</Accordion>
+
 <Accordion title="Test reloads on a canary channel first">
 Apply config changes to one channel (e.g. a staging Telegram bot) before rolling to all channels. The per-channel restart scope makes this safe — the reload touches only what changed.
 </Accordion>
 
 <Accordion title="Set reload_drain_timeout shorter than drain_timeout">
-A 10 s reload drain with a 30 s shutdown drain lets you iterate faster during on-call while keeping the shutdown window wide enough for long provider calls.
+A short reload drain (5s–10s) keeps channel restarts fast. A longer shutdown drain (15s–30s) gives in-flight conversations more time to complete. Keep them separate.
+</Accordion>
+
+<Accordion title="Validate before saving">
+
+A bad config (YAML syntax error, missing required field) is rejected at reload time — the gateway keeps the last-known-good config and logs an error. Test with `praisonai gateway validate gateway.yaml` before saving to the watched path.
 </Accordion>
 
 <Accordion title="Grep the audit trail after every reload">
 Log lines like `reload applied: agents; restart[telegram]` are your audit trail. Ship them to your log aggregator and alert on unexpected full restarts.
+</Accordion>
+
+<Accordion title="Use SIGHUP in CI/CD pipelines">
+
+After updating `gateway.yaml` in a deploy pipeline, send `kill -HUP $(cat /var/run/praisonai.pid)` to trigger reload without downtime. No restart, no new process.
 </Accordion>
 
 </AccordionGroup>
@@ -214,16 +235,16 @@ Log lines like `reload applied: agents; restart[telegram]` are your audit trail.
 ## Related
 
 <CardGroup cols={2}>
-  <Card title="Reliability Preset" icon="shield-check" href="/docs/features/gateway-reliability">
-    One-switch production posture that includes drain settings
-  </Card>
-  <Card title="Graceful Drain" icon="circle-stop" href="/docs/features/gateway-graceful-drain">
-    Drain-only knob — full reference and sequence diagram
-  </Card>
-  <Card title="Gateway CLI" icon="terminal" href="/docs/features/gateway-cli">
-    CLI commands for starting, stopping, and managing the gateway
-  </Card>
-  <Card title="Gateway" icon="tower-broadcast" href="/docs/features/gateway">
-    WebSocket control plane overview and full YAML reference
-  </Card>
+<Card title="Gateway" icon="tower-broadcast" href="/docs/features/gateway">
+  WebSocket control plane overview and full YAML reference
+</Card>
+<Card title="Gateway CLI" icon="terminal" href="/docs/features/gateway-cli">
+  CLI commands for starting, stopping, and managing the gateway
+</Card>
+<Card title="Gateway Reliability" icon="shield-check" href="/docs/features/gateway-reliability">
+  Graceful drain and admission control presets
+</Card>
+<Card title="Gateway Graceful Drain" icon="hourglass" href="/docs/features/gateway-graceful-drain">
+  Fine-grained drain timeout configuration
+</Card>
 </CardGroup>

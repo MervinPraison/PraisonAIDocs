@@ -5,18 +5,16 @@ description: "Spawn subagents that run in the background and return a job ID imm
 icon: "rocket"
 ---
 
-A parent agent can fire off one or more subagents and continue working. Each background subagent returns a `job_id` immediately; poll or await results whenever you need them — or let the job push its result back to the originating chat when it finishes.
+A parent agent can fire off one or more subagents and continue working. Each background subagent returns a `job_id` immediately — results can be pulled on demand or delivered automatically back to the originating chat.
 
 ```python
 from praisonaiagents import Agent
 from praisonaiagents.tools.subagent_tool import create_subagent_tools
 
-subagent_tools = create_subagent_tools()
-
 coordinator = Agent(
     name="Coordinator",
     instructions="Spawn background research tasks and collect results when ready.",
-    tools=subagent_tools,
+    tools=create_subagent_tools(),
 )
 
 coordinator.start(
@@ -102,6 +100,28 @@ agent.start("Research the latest Python 3.13 features in the background, "
 ```
 </Step>
 
+<Step title="Deliver result back to chat automatically">
+
+Pass `deliver="origin"` when running behind `BotOS` — the finished result is sent back to the same chat without polling:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.tools.subagent_tool import create_subagent_tools
+
+agent = Agent(
+    name="Researcher",
+    instructions=(
+        "When the user asks for research, spawn a background subagent with "
+        "deliver='origin' so the finished result is delivered back to this chat "
+        "automatically. Tell the user you'll ping them when it's ready."
+    ),
+    tools=create_subagent_tools(),
+)
+```
+
+<Note>`deliver="origin"` only works when the agent is running behind `BotOS` — the wrapper injects `platform`/`chat_id`/`thread_id`/`session_id` automatically. In a bare `Agent`, use `deliver="telegram:12345"` or leave it empty (pull-only).</Note>
+</Step>
+
 <Step title="Fan out and collect all results">
 
 Spawn multiple subagents in parallel and wait for all of them:
@@ -132,6 +152,9 @@ orchestrator.start("Compare the latest language news for Python, Rust, and Go")
 Poll a job without waiting — useful when you want to check periodically:
 
 ```python
+from praisonaiagents import Agent
+from praisonaiagents.tools.subagent_tool import create_subagent_tools
+
 agent = Agent(
     name="Checker",
     instructions=(
@@ -169,31 +192,34 @@ agent.start("Research the latest Python 3.13 features and let me know when done"
 
 ---
 
-## Deliver Back to Chat
+## Chat-Back Delivery Flow
 
-When the agent runs behind `BotOS`, a background subagent can push its finished result to the originating chat — the same delivery tokens as `schedule_add`, with no polling.
+When running inside `BotOS`, a background job can deliver itself back to the originating chat when it finishes — no polling required.
 
-```python
-from praisonaiagents import Agent
-from praisonaiagents.tools.subagent_tool import create_subagent_tools
-
-agent = Agent(
-    name="Researcher",
-    instructions=(
-        "When the user asks for research, spawn a background subagent with "
-        "deliver='origin' so the finished result is delivered back to this chat "
-        "automatically. Tell the user you will ping them when it is ready."
-    ),
-    tools=create_subagent_tools(),
-)
+```mermaid
+sequenceDiagram
+    participant U as User (chat)
+    participant B as BotOS
+    participant A as Agent
+    participant BG as BackgroundJobManager
+    U->>B: "research X in the background"
+    B->>A: turn
+    A->>BG: spawn_subagent(..., background=True, deliver="origin")
+    BG-->>A: job_id
+    A-->>B: "Started; I'll ping you when done"
+    B-->>U: reply (turn ends)
+    Note over BG: job runs...
+    BG->>B: on_background_job_complete(job_info) [JOB_COMPLETED]
+    B-->>U: 📬 Result delivered (no active turn)
 ```
+
+Results are delivered using the same `DeliveryRouter` the scheduler uses for scheduled messages — no extra configuration needed beyond the `deliver` parameter.
 
 <Note>`deliver="origin"` only works when the agent is running behind `BotOS` — the wrapper injects `platform`, `chat_id`, `thread_id`, and `session_id` automatically. In a bare `Agent`, use `deliver="telegram:12345"` or leave it empty (pull-only).</Note>
 
-
 ---
 
-## How It Works
+## How It Works (Pull Mode)
 
 ```mermaid
 sequenceDiagram
@@ -289,12 +315,13 @@ def log_completion(input):
 |-----------|------|---------|-------------|
 | `task` | `str` | required | The task or prompt for the subagent |
 | `agent_name` | `str` | `"subagent"` | Name for the spawned agent |
-| `model` | `str` | `None` | LLM model override |
+| `llm` | `str` | `None` | LLM model override |
+| `permission_mode` | `str` | `None` | Permission mode for the subagent |
 | `tools` | `list` | `[]` | Tools to give the subagent |
 | `background` | `bool` | `False` | When `True`, return immediately with a `job_id` |
-| `deliver` | `str` | `""` | Delivery target: `"origin"` (originating chat), `"all"` (all channels), or `"platform:chat_id"`. Empty = no delivery (pull-only). |
-| `platform` | `str` | `""` | Origin platform (e.g. `"telegram"`, `"slack"`). Usually supplied by the gateway context. Required for `deliver="origin"`. |
-| `chat_id` | `str` | `""` | Origin chat or channel id. Required for `deliver="origin"`. |
+| `deliver` | `str` | `""` | Delivery token: `"origin"`, `"all"`, `"platform:chat_id[:thread_id]"`, or `""` (pull-only) |
+| `platform` | `str` | `""` | Origin platform (e.g. `"telegram"`, `"slack"`). Injected automatically by `BotOS`; required for `deliver="origin"` outside BotOS. |
+| `chat_id` | `str` | `""` | Origin chat/channel id. Required for `deliver="origin"` outside BotOS. |
 | `thread_id` | `str` | `""` | Optional origin thread id. |
 | `session_id` | `str` | `""` | Optional origin session id to preserve context. |
 
@@ -319,6 +346,32 @@ def log_completion(input):
 <Note>
 **Backward compatibility:** With no `deliver` target, behaviour is byte-for-byte as before — pull-only via `subagent_result`. The delivery path is purely additive.
 </Note>
+
+## Delivery Tokens
+
+| Token | Meaning |
+|-------|---------|
+| `""` (empty) | Pull-only via `subagent_result` (unchanged legacy behaviour) |
+| `"origin"` | Deliver back to the platform/chat_id captured at spawn |
+| `"all"` | Broadcast to all registered channels |
+| `"platform:chat_id"` | Deliver to a specific channel (e.g. `"telegram:12345"`) |
+| `"platform:chat_id:thread_id"` | Deliver to a specific thread/reply-context |
+
+---
+
+## Subscribe to Job Completion
+
+Use `JOB_COMPLETED` hook for observability — fires on both success and failure after the completion callback runs:
+
+```python
+from praisonaiagents.hooks import HookEvent, register_hook
+
+@register_hook(HookEvent.JOB_COMPLETED)
+def log_completion(input):
+    print(f"job {input.job_info.job_id} → {input.job_info.status.value}")
+```
+
+See [Hook Events](/docs/features/hook-events) for the full reference.
 
 ---
 
@@ -349,6 +402,11 @@ When you need a result to proceed, always use `subagent_result(job_id, wait=True
 
 In a bot context, `deliver='origin'` is simpler than polling: the parent can close its turn immediately and the result arrives as a new message when ready — no held connections.
 </Accordion>
+
+<Accordion title="Failure delivery behaviour">
+
+On failure, a short notice is delivered to the same target instead of the result. The `JOB_COMPLETED` hook fires for both terminal states (`COMPLETED` and `FAILED`). Any exception raised inside `on_complete` is swallowed and logged at DEBUG level so the worker is never crashed by a handler error.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -356,16 +414,19 @@ In a bot context, `deliver='origin'` is simpler than polling: the parent can clo
 ## Related
 
 <CardGroup cols={2}>
-<Card title="Subagent Tool" icon="robot" href="/docs/features/subagent-tool">
-  Full documentation on the subagent tool, including foreground usage
+<Card title="Hook Events" icon="webhook" href="/docs/features/hook-events">
+  Subscribe to JOB_COMPLETED and other lifecycle events
 </Card>
 <Card title="Background Tasks" icon="clock" href="/docs/features/background-tasks">
   Other background task patterns for long-running work
 </Card>
-<Card title="Hook Events" icon="webhook" href="/docs/features/hook-events">
-  JOB_COMPLETED and other observable hook events
-</Card>
 <Card title="Proactive Delivery" icon="bell" href="/docs/features/proactive-delivery">
   Push messages to users outside of a turn
+</Card>
+<Card title="Channels Gateway" icon="tower-broadcast" href="/docs/features/channels-gateway">
+  Configure BotOS for multi-platform bot deployments
+</Card>
+<Card title="Gateway Reliability" icon="shield-check" href="/docs/features/gateway-reliability">
+  Production reliability presets for the gateway
 </Card>
 </CardGroup>
