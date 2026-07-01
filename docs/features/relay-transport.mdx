@@ -1,44 +1,64 @@
 ---
-title: "Relay Transport"
+title: "Out-of-Process Relay Transport"
 sidebarTitle: "Relay Transport"
-description: "Let a thin connector own the Telegram/Discord socket while a headless gateway runs the agent — no public port, NAT-friendly, scale-to-zero ready"
-icon: "network-wired"
+description: "Run a thin connector that owns the platform socket and relay events to a headless gateway over an authenticated transport"
+icon: "arrow-left-right"
 ---
 
-`RelayTransport` separates the **connector** (owns the platform socket) from the **gateway** (runs the agent). The connector lives where the platform can reach it; the gateway runs anywhere — behind NAT, in a serverless function, or scaled to zero.
+A relay transport lets a lightweight **connector** process own the Telegram/Discord/WhatsApp socket while a separate **headless gateway** handles all agent logic — enabling NAT-friendly hosting, one gateway fronting many connectors, and lossless scale-to-zero.
 
 ```mermaid
 graph LR
-    subgraph "Connector Process"
-        TG[📱 Telegram\nSocket] --> RT[🔌 RelayTransport]
-        DC[💬 Discord\nSocket] --> RT
-        WA[📲 WhatsApp\nSocket] --> RT
+    subgraph "Connector (public)"
+        T[📱 Telegram\nSocket]
+        W[💬 WhatsApp\nSocket]
     end
 
-    RT <-->|Relay Protocol| GW
-
-    subgraph "Headless Gateway"
-        GW[🛰️ Gateway\nno public port] --> RA[RelayAdapter]
-        RA --> A[🧠 Agent]
-        A --> RA
-        RA --> GW
+    subgraph "Relay Transport"
+        RT[🔌 Authenticated\nChannel]
     end
 
-    classDef platform fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef relay fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef gateway fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    subgraph "Gateway (private / serverless)"
+        GW[🧠 Agent\nGateway]
+        A1[🤖 Agent A]
+        A2[🤖 Agent B]
+    end
 
-    class TG,DC,WA platform
-    class RT relay
-    class GW,RA gateway
-    class A agent
+    T --> RT
+    W --> RT
+    RT <-->|inbound events\noutbound sends| GW
+    GW --> A1
+    GW --> A2
+
+    classDef connector fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef transport fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef gateway fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef agent fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class T,W connector
+    class RT transport
+    class GW gateway
+    class A1,A2 agent
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="Run a headless gateway with relay transport">
+<Step title="In-Process (Default — No Change Needed)">
+Without a relay transport, the bot adapter runs in the same process as the gateway. This is the default and requires no extra config:
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import TelegramBot
+
+agent = Agent(name="Chat Agent", instructions="Help users.")
+bot = TelegramBot(token="YOUR_TOKEN", agent=agent)
+await bot.start()
+```
+</Step>
+
+<Step title="Out-of-Process via Relay Transport">
+Pass a `transport=` to the `Bot` constructor to use a remote connector. The `transport=` parameter is **optional** and backward-compatible:
 
 ```python
 from praisonaiagents import Agent
@@ -100,6 +120,28 @@ await bot.go_dormant()
 bot.run()
 ```
 
+
+from praisonai.bots import WebSocketRelayTransport
+
+agent = Agent(name="Headless Agent", instructions="Help users.")
+
+transport = WebSocketRelayTransport(
+    url="wss://gw.internal/relay",
+    token="YOUR_RELAY_SECRET",
+)
+
+bot = Bot("telegram", agent=agent, transport=transport)
+await bot.start()
+```
+</Step>
+
+<Step title="CLI Gateway with Relay">
+```bash
+praisonai gateway relay \
+  --platform telegram \
+  --to wss://gw.internal/relay \
+  --token YOUR_RELAY_SECRET
+```
 </Step>
 </Steps>
 
@@ -109,102 +151,113 @@ bot.run()
 
 ```mermaid
 sequenceDiagram
-    participant C as Connector
-    participant T as RelayTransport
-    participant G as Gateway
-    participant A as Agent
+    participant Platform as 📱 Platform (Telegram)
+    participant Connector as 🔌 Connector
+    participant Transport as 🔄 RelayTransport
+    participant Gateway as 🧠 Gateway
 
-    C->>T: connect()
-    T-->>C: CapabilityDescriptor\n(max_length, markdown_dialect…)
+    Connector->>Transport: connect()
+    Transport->>Gateway: handshake
+    Gateway-->>Transport: CapabilityDescriptor
+    Transport-->>Connector: capabilities
 
-    Note over C,G: Inbound event
-    C->>T: inbound GatewayMessage
-    T->>G: set_inbound_handler callback
-    G->>A: session.chat(message)
-    A-->>G: reply
-    G->>T: send_outbound(reply)
-    T-->>C: relay reply to user
-
-    Note over C,G: Scale-to-zero
-    G->>T: go_dormant()
-    T-->>C: dormant signal
-    Note over C: Buffers messages; gateway shuts down
-    Note over C,G: Gateway wakes up
-    C->>T: replays buffered messages
+    Platform->>Connector: inbound message
+    Connector->>Transport: relay inbound event
+    Transport->>Gateway: set_inbound_handler() callback
+    Gateway->>Gateway: run agent
+    Gateway->>Transport: send_outbound(message)
+    Transport->>Connector: relay outbound
+    Connector->>Platform: deliver reply
 ```
 
-### RelayTransport Protocol
-
-`RelayTransport` is a `@runtime_checkable` Protocol — any object that implements these five methods works:
-
-| Method | Description |
-|--------|-------------|
-| `connect()` | Establish the relay connection; returns `CapabilityDescriptor` |
-| `set_inbound_handler(handler)` | Register the callback for inbound messages from the connector |
-| `send_outbound(message)` | Send a reply back through the relay to the platform |
-| `go_dormant()` | Signal the connector to buffer; gateway can scale to zero |
-| `disconnect()` | Clean shutdown |
-
-### CapabilityDescriptor
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `max_message_length` | `int` | Maximum characters (or UTF-16 code units) per message |
-| `length_unit` | `"chars"` \| `"utf16"` | How `max_message_length` is measured |
-| `supports_edit` | `bool` | Whether the connector can edit previous messages (streaming) |
-| `supports_draft_streaming` | `bool` | Whether the connector supports incremental draft updates |
-| `markdown_dialect` | `str` | Markdown flavour (`"telegram"`, `"slack"`, `"discord"`, `"none"`) |
+At handshake time the connector attests a `CapabilityDescriptor` — the gateway uses this to adapt streaming, markdown, and message-length behaviour to the actual platform being fronted, even though it never touches the platform socket directly.
 
 ---
 
-## Common Patterns
+## `CapabilityDescriptor` Fields
 
-### One gateway, many connectors
+The connector attests these capabilities at handshake time:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_message_length` | `int` | required | Maximum outbound message length the platform accepts |
+| `length_unit` | `str` | `"chars"` | How length is measured: `"chars"` (Unicode code points) or `"utf16"` (UTF-16 code units) |
+| `supports_edit` | `bool` | `False` | Platform supports editing a sent message (enables draft-streaming) |
+| `supports_draft_streaming` | `bool` | `False` | Connector can stream partial drafts incrementally |
+| `markdown_dialect` | `str` | `"none"` | Markdown flavour: `"none"`, `"markdown"`, `"markdownv2"`, `"html"` |
+
+---
+
+## `RelayTransport` Protocol
+
+Implement these methods to create a custom transport:
+
+| Method | Description |
+|--------|-------------|
+| `connect() -> CapabilityDescriptor` | Establish relay and complete handshake; returns connector capabilities |
+| `set_inbound_handler(handler)` | Register coroutine called for each inbound event |
+| `send_outbound(target, message) -> DeliveryResult` | Relay an outbound message to a target via the connector |
+| `go_dormant()` | Pause inbound dispatch without dropping the connection (scale-to-zero) |
+| `disconnect()` | Tear down the relay connection |
+
+---
+
+## When to Use a Relay
+
+```mermaid
+graph TB
+    Q1{Is the gateway\nin a private network\nor serverless?}
+    Q1 -->|Yes| Q2{Do you need\none gateway to front\nmultiple platforms?}
+    Q1 -->|No| INPROC[✅ In-process adapter\n(default)]
+    Q2 -->|Yes| RELAY[✅ Relay transport]
+    Q2 -->|No| Q3{Will the gateway\nscale to zero?}
+    Q3 -->|Yes| RELAY
+    Q3 -->|No| INPROC
+
+    classDef decision fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef inproc fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef relay fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Q1,Q2,Q3 decision
+    class INPROC inproc
+    class RELAY relay
+```
+
+---
+
+## Scale-to-Zero with `go_dormant()`
+
+When the gateway scales to zero, call `go_dormant()` to pause inbound dispatch:
 
 ```python
-# Gateway process (no public port, no platform SDK)
-from praisonai.bots import Bot
-from praisonaiagents import Agent
+transport = WebSocketRelayTransport(url="wss://gw.internal/relay")
+caps = await transport.connect()
 
-agent = Agent(name="assistant", instructions="Help users")
-
-# Each connector connects via relay — one agent, multiple channels
-telegram_bot = Bot("telegram", agent=agent, transport=WebSocketRelayTransport(url="wss://relay/telegram"))
-discord_bot  = Bot("discord",  agent=agent, transport=WebSocketRelayTransport(url="wss://relay/discord"))
+await transport.go_dormant()
 ```
 
-### NAT-friendly deployment
-
-The connector lives in a public DMZ and holds the platform WebSocket. The gateway runs in a private subnet or serverless environment — it only makes outbound calls to the relay endpoint.
-
-```
-Public DMZ:          Private subnet / serverless:
-  Connector ──────────── Gateway (agent runs here)
-  (owns socket)          (no inbound port needed)
-```
+The connector **keeps the platform socket open** and buffers inbound events while the gateway is dormant. When the gateway wakes, it drains the backlog losslessly — no messages are dropped during the idle period.
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
-
-<Accordion title="Return accurate CapabilityDescriptor at handshake">
-The gateway uses the descriptor to split long messages and choose the correct markdown dialect. Returning wrong values causes formatting issues or truncated replies.
+<Accordion title="Secure the relay with a shared secret">
+The relay transport authenticates with a `token` passed at `connect()` time. Use a long, random secret and rotate it with your other infrastructure credentials.
 </Accordion>
 
-<Accordion title="Implement go_dormant for scale-to-zero">
-A gateway that doesn't implement `go_dormant` will drop messages when it shuts down. The connector should buffer inbound messages until the gateway resumes.
+<Accordion title="Use go_dormant() during scale-to-zero, not disconnect()">
+`disconnect()` tears down the connection and the connector stops buffering. `go_dormant()` keeps the connector alive and buffering, so events that arrive while the gateway is sleeping are drained on wake.
 </Accordion>
 
-<Accordion title="Use runtime_checkable duck-typing">
-`RelayTransport` is a `Protocol` — your transport doesn't need to inherit from any base class. Any class that implements the five methods passes the `isinstance` check.
+<Accordion title="Capability negotiation at handshake">
+Always use the `CapabilityDescriptor` returned by `connect()` to configure your delivery layer. Never hard-code platform limits — the connector is the authority on what the actual platform supports.
 </Accordion>
 
-<Accordion title="Reconnect logic belongs in the connector">
-The gateway treats the relay as a reliable stream. Reconnection, back-pressure, and buffering are responsibilities of the connector / relay middleware.
+<Accordion title="The transport= parameter is optional">
+Omit `transport=` entirely to keep the existing in-process behaviour. No existing code needs to change; just add the parameter when you need an out-of-process connector.
 </Accordion>
-
 </AccordionGroup>
 
 ---
@@ -212,16 +265,16 @@ The gateway treats the relay as a reliable stream. Reconnection, back-pressure, 
 ## Related
 
 <CardGroup cols={2}>
-<Card title="Gateway Overview" icon="server" href="/docs/features/gateway-overview">
-  Architecture of the PraisonAI gateway
+<Card title="Gateway Overview" icon="gateway" href="/docs/features/gateway-overview">
+  How the gateway connects agents to channels
 </Card>
-<Card title="Gateway Scale-to-Zero" icon="moon" href="/docs/features/gateway-scale-to-zero">
-  Drain and resume gateway instances
+<Card title="Gateway Scale-to-Zero" icon="power" href="/docs/features/gateway-scale-to-zero">
+  Idle dormancy and wake-up behaviour
 </Card>
-<Card title="Bot Gateway" icon="network-wired" href="/docs/features/bot-gateway">
-  Connect bots to the gateway layer
+<Card title="Durable Outbound Delivery" icon="shield-check" href="/docs/features/durable-outbound-delivery">
+  Retry and DLQ for all channels
 </Card>
-<Card title="Gateway Handshake Protocol" icon="handshake" href="/docs/features/gateway-handshake-protocol">
-  Capability negotiation at connection time
+<Card title="Multi-Channel Bots" icon="layers" href="/docs/features/multi-channel-bots">
+  One gateway, many platforms
 </Card>
 </CardGroup>

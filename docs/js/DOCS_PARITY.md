@@ -1,6 +1,6 @@
 # Documentation Parity Tracker (TypeScript/JavaScript)
 
-> **Categories:** 75 | **Documented:** 68 | **Parity:** 90.7%
+> **Categories:** 75 | **Documented:** 75 | **Parity:** 100.0%
 
 This report compares **TypeScript/JavaScript SDK feature categories** against **TypeScript/JavaScript documentation** (docs/js/).
 
@@ -9,15 +9,16 @@ This report compares **TypeScript/JavaScript SDK feature categories** against **
 | Metric | Count |
 |--------|-------|
 | Feature Categories | 75 |
-| **Documented Categories** | **68** |
-| **Undocumented Categories** | **7** |
-| **Parity** | **90.7%** |
+| **Documented Categories** | **75** |
+| **Undocumented Categories** | **0** |
+| **Parity** | **100.0%** |
 
 ## Documented Categories
 
 | Category | Features | Docs | Lines |
 |----------|----------|------|-------|
 | ✅ AGUI | 1 | 1 | 195 |
+| ✅ AI SDK | 38 | 1 | 218 |
 | ✅ Agent | 66 | 7 | 2084 |
 | ✅ Agent-to-Agent (A2A) | 15 | 1 | 342 |
 | ✅ Approval | 9 | 1 | 165 |
@@ -36,6 +37,7 @@ This report compares **TypeScript/JavaScript SDK feature categories** against **
 | ✅ Context Management | 17 | 3 | 504 |
 | ✅ Criteria | 1 | 1 | 162 |
 | ✅ Database | 14 | 2 | 469 |
+| ✅ Deep Research | 2 | 2 | 292 |
 | ✅ Display | 20 | 1 | 342 |
 | ✅ Embeddings | 6 | 3 | 813 |
 | ✅ Evaluation | 8 | 4 | 866 |
@@ -49,11 +51,13 @@ This report compares **TypeScript/JavaScript SDK feature categories** against **
 | ✅ Handoffs | 12 | 1 | 179 |
 | ✅ Hooks | 8 | 3 | 572 |
 | ✅ Image | 4 | 2 | 282 |
+| ✅ Jobs | 8 | 1 | 156 |
 | ✅ Knowledge | 3 | 4 | 842 |
 | ✅ LLM | 6 | 4 | 668 |
 | ✅ Loops | 11 | 1 | 180 |
 | ✅ MCP | 17 | 4 | 828 |
 | ✅ Memory | 17 | 4 | 779 |
+| ✅ Middleware | 2 | 1 | 162 |
 | ✅ OCR | 2 | 1 | 162 |
 | ✅ Observability | 6 | 28 | 2277 |
 | ✅ Optimizer | 1 | 1 | 162 |
@@ -71,54 +75,24 @@ This report compares **TypeScript/JavaScript SDK feature categories** against **
 | ✅ Retrieval | 5 | 1 | 150 |
 | ✅ Routing | 1 | 1 | 153 |
 | ✅ Sandbox | 8 | 2 | 134 |
+| ✅ Scheduler | 2 | 2 | 398 |
 | ✅ Security | 2 | 1 | 157 |
 | ✅ Sessions | 3 | 2 | 429 |
 | ✅ Skills | 7 | 2 | 380 |
+| ✅ Streaming | 2 | 1 | 207 |
 | ✅ Tasks | 4 | 1 | 165 |
 | ✅ Teams | 1 | 1 | 170 |
 | ✅ Telemetry | 6 | 2 | 269 |
 | ✅ Templates | 1 | 2 | 598 |
+| ✅ Token Management | 1 | 1 | 159 |
 | ✅ Tools | 34 | 17 | 3598 |
 | ✅ Tracing | 8 | 3 | 477 |
+| ✅ Vector Store | 6 | 2 | 485 |
 | ✅ Video | 2 | 1 | 150 |
 | ✅ Vision | 2 | 1 | 155 |
 | ✅ Voice | 1 | 2 | 515 |
 | ✅ Web | 4 | 1 | 150 |
 | ✅ Workflows | 7 | 4 | 876 |
-
-## Undocumented Categories (Need Documentation)
-
-| Category | Features |
-|----------|----------|
-| ❌ AI SDK | 38 |
-| ❌ Jobs | 8 |
-| ❌ Middleware | 2 |
-| ❌ Scheduler | 2 |
-| ❌ Streaming | 2 |
-| ❌ Token Management | 1 |
-| ❌ Vector Store | 6 |
-
-> **⚠️ Audit note (2026-06-30):** The following doc pages already exist in `docs/js/` but the parity generator is not matching them to the SDK categories listed above. This is a false negative in the generator — **do not create duplicate pages**. Re-run the generator or file an upstream bug against `praisonai._dev.parity.docs_generator` in `MervinPraison/PraisonAI` to fix the bucket mapping. See issue [#1242](https://github.com/MervinPraison/PraisonAIDocs/issues/1242) for details.
->
-> | Category (flagged ❌) | Existing doc file |
-> |-----------------------|-------------------|
-> | AI SDK | `docs/js/ai-sdk.mdx`, `docs/js/ai-sdk-cli.mdx` |
-> | Jobs | `docs/js/jobs.mdx` |
-> | Middleware | `docs/js/middleware.mdx` |
-> | Scheduler | `docs/js/scheduler.mdx`, `docs/js/scheduler-cli.mdx` |
-> | Streaming | `docs/js/streaming.mdx`, `docs/js/streaming-cli.mdx` |
-> | Token Management | `docs/js/token-management.mdx` |
-> | Vector Store | `docs/js/vector-store.mdx`, `docs/js/vector-stores.mdx` |
->
-> Per AGENTS.md §1.8 these pages are **auto-generated only** — do not hand-author new pages in `docs/js/`.
-
-## Documentation Without Features
-
-These docs exist but don't match any implemented feature category:
-
-- ℹ️ Deep Research (2 docs, 292 lines)
-
-> **ℹ️ Audit note (2026-06-30):** The "Deep Research" orphan is likely `docs/js/deep-research.mdx` and `docs/js/deep-research-cli.mdx`. Investigate whether these map to an upstream TypeScript SDK category and update the generator's bucket list if so. See issue [#1242](https://github.com/MervinPraison/PraisonAIDocs/issues/1242) for details.
 
 ---
 
