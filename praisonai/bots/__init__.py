@@ -20,17 +20,20 @@ if TYPE_CHECKING:
     from ._session import BotSessionManager
     from ._identity import StoreBackedIdentityResolver
     from ._dlq import InboundDLQ, DLQEntry
+    from ._dead_targets import DeadTargetRegistry, DeadTarget
     from ._ingress import InboundJournal, JournalEntry
     from ._slack_approval import SlackApproval
     from ._telegram_approval import TelegramApproval
     from ._discord_approval import DiscordApproval
     from ._webhook_approval import WebhookApproval
     from ._http_approval import HTTPApproval
+    from ._presentation_approval_backend import PresentationApprovalBackend
     from ._streaming import StreamingConfig, StreamingMode, DraftStreamer
     from ._outbox import OutboundQueue, OutboundEntry
     from ._approval_store import ApprovalStore
     from ._delivery import DurableDelivery, deliver_with_retry
     from ._durable_adapter import DurableAdapterMixin
+    from ._outbound_resilience import OutboundResilienceMixin
     from ._outbound_messenger import BotOutboundMessenger
     from ._correlation import (
         correlation_id_from,
@@ -84,6 +87,9 @@ def __getattr__(name: str):
     if name == "HTTPApproval":
         from ._http_approval import HTTPApproval
         return HTTPApproval
+    if name == "PresentationApprovalBackend":
+        from ._presentation_approval_backend import PresentationApprovalBackend
+        return PresentationApprovalBackend
     # W1 — cross-platform mirror + identity
     if name == "mirror_to_session":
         from ._mirror import mirror_to_session
@@ -101,6 +107,13 @@ def __getattr__(name: str):
     if name == "DLQEntry":
         from ._dlq import DLQEntry
         return DLQEntry
+    # Self-healing dead-target registry (issue #2486)
+    if name == "DeadTargetRegistry":
+        from ._dead_targets import DeadTargetRegistry
+        return DeadTargetRegistry
+    if name == "DeadTarget":
+        from ._dead_targets import DeadTarget
+        return DeadTarget
     # Inbound message journal for durable processing
     if name == "InboundJournal":
         from ._ingress import InboundJournal
@@ -140,6 +153,9 @@ def __getattr__(name: str):
     if name == "DurableAdapterMixin":
         from ._durable_adapter import DurableAdapterMixin
         return DurableAdapterMixin
+    if name == "OutboundResilienceMixin":
+        from ._outbound_resilience import OutboundResilienceMixin
+        return OutboundResilienceMixin
     if name == "BotOutboundMessenger":
         from ._outbound_messenger import BotOutboundMessenger
         return BotOutboundMessenger
@@ -168,17 +184,20 @@ __all__ = [
     "BotSessionManager",
     "StoreBackedIdentityResolver",
     "InboundDLQ", "DLQEntry",
+    "DeadTargetRegistry", "DeadTarget",
     "InboundJournal", "JournalEntry",
     "OutboundQueue", "OutboundEntry",
     "ApprovalStore",
     "DurableDelivery", "deliver_with_retry", "deliver_chunked",
     "DurableAdapterMixin",
+    "OutboundResilienceMixin",
     "BotOutboundMessenger",
     # Correlation + metrics (gateway message-flow observability)
     "correlation_id_from", "current_correlation_id", "new_correlation_id",
     "use_correlation_id", "GatewayMetrics",
     "SlackApproval", "TelegramApproval", "DiscordApproval",
     "WebhookApproval", "HTTPApproval",
+    "PresentationApprovalBackend",
     # Streaming
     "StreamingConfig", "StreamingMode", "DraftStreamer",
     # W1
