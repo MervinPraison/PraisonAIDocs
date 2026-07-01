@@ -192,6 +192,10 @@ Your Goal: {self.goal}"""
                     logging.warning(f"Could not extract tool name from {tool}: {e}")
                     continue
             
+            # Prune permission-denied tool names so the advertised surface in the
+            # system prompt matches the function schema (and execution-time rules).
+            tool_names = [n for n in tool_names if self._tool_name_allowed(n)]
+
             if tool_names:
                 system_prompt += f"\n\nYou have access to the following tools: {', '.join(tool_names)}. Use these tools when appropriate to help complete your tasks. Always use tools when they can help provide accurate information or perform actions."
                 system_prompt += "\n\nExplain Before Acting: Before calling a tool, provide a brief one-sentence explanation of what you are about to do and why. Skip explanations only for repetitive low-level operations where narration would be noisy. When performing a batch of similar operations (e.g. searching for multiple items), explain the group once rather than narrating each call individually."
@@ -520,6 +524,12 @@ Your Goal: {self.goal}"""
         
         cleaned_tools = sort_formatted_tools(cleaned_tools)
         
+        # Prune permission-denied tools from the advertised set so the model is
+        # only ever offered tools it can actually call. Mirrors the execution-time
+        # enforcement in tool_execution.py (_perm_deny / _perm_allow). No-op when
+        # no deny set and no allow set are configured (backward compatible).
+        cleaned_tools = self._prune_denied_tools(cleaned_tools)
+        
         # Cache the formatted tools with LRU eviction, including tool search metadata
         self._cache_put(
             self._formatted_tools_cache,
@@ -527,6 +537,126 @@ Your Goal: {self.goal}"""
             (cleaned_tools, getattr(self, "_tool_search_metadata", None)),
         )
         return cleaned_tools
+
+    def _build_before_tool_definitions_input(self, formatted_tools):
+        """Build the BEFORE_TOOL_DEFINITIONS hook input.
+
+        A deep copy of ``formatted_tools`` is used so that in-place hook
+        mutations never leak back into ``_format_tools_for_completion``'s cache
+        and corrupt subsequent requests.
+        """
+        import copy
+        from ..hooks import HookEvent, BeforeToolDefinitionsInput
+        return BeforeToolDefinitionsInput(
+            session_id=getattr(self, '_session_id', 'default'),
+            cwd=os.getcwd(),
+            event_name=HookEvent.BEFORE_TOOL_DEFINITIONS,
+            timestamp=str(time.time()),
+            agent_name=self.name,
+            model=self.llm if isinstance(self.llm, str) else str(self.llm),
+            tool_definitions=copy.deepcopy(formatted_tools),
+        )
+
+    def _apply_before_tool_definitions_hook(self, formatted_tools):
+        """Fire the BEFORE_TOOL_DEFINITIONS hook so hooks/plugins can inspect or
+        rewrite the advertised tool definitions before they reach the LLM.
+
+        Mirrors how BEFORE_LLM lets a hook mutate its payload in place. No-op
+        (returns the input unchanged) when no hook runner or no tools exist.
+        Returns the possibly-mutated list of tool definitions. Synchronous
+        path; use ``_aapply_before_tool_definitions_hook`` in async contexts.
+        """
+        if not formatted_tools or not getattr(self, '_hook_runner', None):
+            return formatted_tools
+        try:
+            from ..hooks import HookEvent
+            _inp = self._build_before_tool_definitions_input(formatted_tools)
+            self._hook_runner.execute_sync(HookEvent.BEFORE_TOOL_DEFINITIONS, _inp)
+            # Adopt mutations, mirroring how BEFORE_LLM adopts its payload.
+            return _inp.tool_definitions
+        except Exception as _e:
+            logging.debug(f"[before-tool-definitions] hook skipped: {_e}")
+            return formatted_tools
+
+    async def _aapply_before_tool_definitions_hook(self, formatted_tools):
+        """Async variant of ``_apply_before_tool_definitions_hook``.
+
+        ``execute_sync`` raises inside a running event loop, so the async chat
+        path must await the hook runner directly to actually run the hook.
+        """
+        if not formatted_tools or not getattr(self, '_hook_runner', None):
+            return formatted_tools
+        try:
+            from ..hooks import HookEvent
+            _inp = self._build_before_tool_definitions_input(formatted_tools)
+            await self._hook_runner.execute(HookEvent.BEFORE_TOOL_DEFINITIONS, _inp)
+            return _inp.tool_definitions
+        except Exception as _e:
+            logging.debug(f"[before-tool-definitions] async hook skipped: {_e}")
+            return formatted_tools
+
+    def _prune_denied_tools(self, formatted_tools):
+        """Remove tools whose permission resolves to ``deny`` from the payload.
+
+        The advertised tool surface is shaped by the agent's effective
+        permission tier (resolved at ``__init__`` into ``_perm_deny`` /
+        ``_perm_allow``) so the model is never offered a tool it cannot call.
+        ``ask``/``allow`` tools stay advertised — approval still happens at
+        execution time (defence in depth). This is a no-op when no ``deny`` set
+        and no ``allow`` set are configured, preserving backward compatibility.
+
+        Args:
+            formatted_tools: List of OpenAI-schema tool definitions.
+
+        Returns:
+            The filtered list (a new list only when something is pruned).
+        """
+        if not formatted_tools:
+            return formatted_tools
+
+        perm_deny = getattr(self, "_perm_deny", None)
+        perm_allow = getattr(self, "_perm_allow", None)
+
+        # Fast path: no permission shaping configured -> advertise everything.
+        if not perm_deny and perm_allow is None:
+            return formatted_tools
+
+        def _tool_id(tool):
+            if isinstance(tool, dict) and tool.get("type") == "function":
+                return str(tool.get("function", {}).get("name") or "")
+            return ""
+
+        pruned = []
+        for tool in formatted_tools:
+            name = _tool_id(tool)
+            if not name:
+                # Keep unrecognized schemas as-is; cannot evaluate permission.
+                pruned.append(tool)
+                continue
+            if not self._tool_name_allowed(name):
+                logging.debug("Pruning permission-denied tool from payload: %s", name)
+                continue
+            pruned.append(tool)
+        return pruned
+
+    def _tool_name_allowed(self, name):
+        """Return ``True`` if ``name`` is callable under the agent's permissions.
+
+        Mirrors the execution-time enforcement in ``tool_execution.py``
+        (``_perm_deny`` / ``_perm_allow``): a tool is denied if it is in the
+        deny set or, when an allow set is configured, absent from it.
+        ``ask``/``allow`` tools remain callable (approval happens at execution
+        time). No-op (always allowed) when no permission shaping is configured.
+        """
+        if not name:
+            return True
+        perm_deny = getattr(self, "_perm_deny", None)
+        perm_allow = getattr(self, "_perm_allow", None)
+        if perm_deny and name in perm_deny:
+            return False
+        if perm_allow is not None and name not in perm_allow:
+            return False
+        return True
 
     def _build_multimodal_prompt(
         self, 
@@ -986,6 +1116,8 @@ Your Goal: {self.goal}"""
 
         # Use the new _format_tools_for_completion helper method
         formatted_tools = self._format_tools_for_completion(tools)
+        # Let hooks/plugins inspect or rewrite advertised tool definitions
+        formatted_tools = self._apply_before_tool_definitions_hook(formatted_tools)
 
         # Smart fallback for streaming: try streaming first, fall back to non-streaming if unsupported
         streaming_response = None
@@ -1601,6 +1733,26 @@ Your Goal: {self.goal}"""
             
             # Cache the dispatcher
             self._unified_dispatcher = dispatcher
+
+        # Pre-call budget guard (parity with sync _chat_completion). Bots and
+        # other async callers route through here, not _chat_completion.
+        if self._max_budget and self._on_budget_exceeded == "stop":
+            _est_min_cost = self._estimate_min_call_cost(
+                messages, getattr(self, 'max_tokens', None)
+            )
+            with self._cost_lock:
+                _projected_cost = self._total_cost + _est_min_cost
+                _current_cost = self._total_cost
+            if _projected_cost >= self._max_budget:
+                raise BudgetExceededError(
+                    f"Agent '{self.name}' would exceed budget before call: "
+                    f"${_current_cost:.4f} + est ${_est_min_cost:.4f} >= "
+                    f"${self._max_budget:.4f}",
+                    budget_type="cost",
+                    limit=self._max_budget,
+                    used=_current_cost,
+                    agent_id=self.name
+                )
         
         # Execute unified async dispatch with all necessary parameters
         # Includes all parameters from both legacy paths to ensure full compatibility
@@ -1642,8 +1794,47 @@ Your Goal: {self.goal}"""
                     or None
                 ),
             )
+
+            # Post-call budget accounting (parity with sync _chat_completion).
+            _prompt_tokens = 0
+            _completion_tokens = 0
+            _cost_usd = 0.0
+            if final_response:
+                _usage = getattr(final_response, 'usage', None)
+                if _usage:
+                    _prompt_tokens = getattr(_usage, 'prompt_tokens', 0) or 0
+                    _completion_tokens = getattr(_usage, 'completion_tokens', 0) or 0
+                    _cost_usd = self._calculate_llm_cost(
+                        _prompt_tokens, _completion_tokens, response=final_response
+                    )
+            with self._cost_lock:
+                self._total_cost += _cost_usd
+                self._total_tokens_in += _prompt_tokens
+                self._total_tokens_out += _completion_tokens
+                self._llm_call_count += 1
+                budget_exceeded = self._max_budget and self._total_cost >= self._max_budget
+                current_cost = self._total_cost
+            if budget_exceeded:
+                if self._on_budget_exceeded == "stop":
+                    raise BudgetExceededError(
+                        f"Agent '{self.name}' exceeded budget: ${current_cost:.4f} >= ${self._max_budget:.4f}",
+                        budget_type="cost",
+                        limit=self._max_budget,
+                        used=current_cost,
+                        agent_id=self.name
+                    )
+                elif self._on_budget_exceeded == "warn":
+                    logging.warning(
+                        f"[budget] {self.name}: ${current_cost:.4f} exceeded "
+                        f"${self._max_budget:.4f} budget"
+                    )
+                elif callable(self._on_budget_exceeded):
+                    self._on_budget_exceeded(current_cost, self._max_budget)
+
             return final_response
-            
+
+        except BudgetExceededError:
+            raise
         except Exception as e:
             from ..errors import LLMError
             # Apply the same structured error classification for async path
@@ -2808,6 +2999,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
                     # Use the new _format_tools_for_completion helper method
                     formatted_tools = self._format_tools_for_completion(tools)
+                    # Let hooks/plugins inspect or rewrite advertised tool definitions
+                    formatted_tools = await self._aapply_before_tool_definitions_hook(formatted_tools)
                     
                     # NEW: Unified protocol dispatch path (Issue #1304) - Async version
                     # Enable unified dispatch by default for DRY and feature parity (sync/async consistent)
