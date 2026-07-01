@@ -17,11 +17,11 @@ Before creating any documentation page:
 3. **Find the dataclass/config class** - Look in `praisonaiagents/config/feature_configs.py`
 4. **Check for related existing docs** - Avoid duplication, ensure consistency
 5. **Verify imports** - Confirm exact import paths from the SDK
-6. The files you create are not SDK Focused. Its user focused. We have a dedicated auto Generated SDK Document section, so dont need to worry about detailed SDK Focused document. Need it to be user friendly , non developers and beginners should understand
-7. Progressive discloure of Features
-8. People who go through the documentation should make them feel like only few lines of code and it can do the task
-9. Documentation need to be agent centric. Top of the document should always start with Agent Centric code example. Features are there, but how to implement from Agent perspective, that need to be addressed.
-10. Include user interaction flow - show how users will interact with the feature in real scenarios 
+6. The files you create are **not SDK-focused**; they are **user-focused**. The auto-generated SDK reference covers detailed API surface — these pages must be friendly to non-developers and beginners.
+7. **Progressive disclosure** of features.
+8. After reading the code, the user should feel *"is it this easy to use?"* — minimal lines, maximum payoff.
+9. **Agent-centric**: the top of every document must start with an Agent-centric code example. Features exist, but the angle must always be "how do I do this from the Agent's perspective?".
+10. **Include a user-interaction flow** — show how users will actually interact with the feature in a real scenario.
 
 ### 1.2 SDK-First Documentation Cycle
 
@@ -389,6 +389,10 @@ from praisonaiagents import Agent, Task, PraisonAIAgents
 # MCP
 from praisonaiagents import Agent
 from praisonaiagents.mcp import MCP
+
+# Workflow primitives — use the friendly top-level import
+from praisonaiagents import when, parallel, loop
+# NOT: from praisonaiagents.workflows import when, parallel, loop
 ```
 
 ### 5.3 Example Structure
@@ -442,13 +446,14 @@ Always document ALL options from the SDK:
 | **Active voice** | "Enable planning with `planning=True`" | "Planning can be enabled by setting the planning parameter to True" |
 | **Direct** | "Use `gpt-4o` for planning" | "It is recommended that you consider using gpt-4o for planning" |
 | **Specific** | "Set `timeout=60` for slow servers" | "Increase the timeout if needed" |
-All documents should focus on non-developers
-Less descriptive,
-After reading the code they should feel "is it this easy to use?"
-If there are different concepts in one page, then explain each concept using mermaid diagram. 
-Also include the flow diagram if that could be useful for the user.
-If multiple options in one page, people might be confused on what to choose, so create the mermaid diagram to choose what option at what instance. 
-Our aim to use friendly import easy for users and non-programmers, so don't use complex imports like from praisonaiagents.workflows import when, parallel, loop, instead use the simple import from praisonaiagents import when, parallel, loop.
+Additional style rules:
+- All documents should focus on **non-developers**.
+- Less descriptive.
+- After reading the code, the reader should feel *"is it this easy to use?"*.
+- If there are different concepts in one page, explain **each** concept with its own Mermaid diagram.
+- Include a flow diagram when it helps the user.
+- If a page has multiple options, add a Mermaid **decision diagram** showing which option fits which scenario.
+- Use friendly, top-level imports — e.g. `from praisonaiagents import when, parallel, loop`, **not** `from praisonaiagents.workflows import when, parallel, loop`.
 
 ### 6.2 Section Introductions
 
