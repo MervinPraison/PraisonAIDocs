@@ -67,13 +67,13 @@ async def handler():
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `agent_file` | `str` | required | Path to your `agents.yaml`. |
-| `framework` | `str \| None` | `None` (auto-detect) | One of `"crewai"`, `"praisonai"`, `"autogen"`, `"ag2"`. |
+| `framework` | `str \| None` | `None` (auto-detect) | One of `"crewai"`, `"praisonai"`, `"autogen"`, `"ag2"`, `"langgraph"`. LangGraph must be selected explicitly — it is not in the auto-detect chain. |
 | `tools` | `list \| None` | `None` | Optional list of tool callables passed through to `AgentsGenerator`. |
 | `agent_yaml` | `str \| None` | `None` | Inline YAML string; takes precedence over `agent_file` when both are given. |
 | `cli_config` | `dict \| None` | `None` | Advanced: override the resolved CLI config (rarely needed). |
 
 <Note>
-If no framework is installed, `run()` raises `RuntimeError("No supported framework installed. Install one of: crewai, praisonaiagents, autogen, ag2.")`. Install one with `pip install praisonaiagents` (recommended for new projects).
+If no framework is installed, `run()` raises `RuntimeError("No supported framework installed. Install one of: crewai, praisonaiagents, autogen, ag2.")`. Install one with `pip install praisonaiagents` (recommended for new projects). LangGraph is not in the auto-detect chain; pass `framework="langgraph"` explicitly.
 </Note>
 
 ### When to use `PraisonAI(...)` instead
@@ -173,6 +173,92 @@ if __name__ == "__main__":
     advanced()
     auto()
 ```
+
+## Lifecycle / cleanup
+
+Each `AgentsGenerator` lazily creates a bounded thread-pool to run synchronous tools under per-call timeouts. The pool is **owned by the instance**, not the process — concurrent sessions in a multi-tenant runtime never share workers.
+
+When you're done with a generator, release the pool with `.close()` or use it as a context manager:
+
+```python
+from praisonai.agents_generator import AgentsGenerator
+
+# Pattern A: context manager (recommended)
+with AgentsGenerator(agent_file="agents.yaml", framework="crewai", config_list=[...]) as gen:
+    gen.generate_crew_and_kickoff()
+# pool is shut down on exit, even if generate_crew_and_kickoff raises
+
+# Pattern B: explicit close()
+gen = AgentsGenerator(agent_file="agents.yaml", framework="crewai", config_list=[...])
+try:
+    gen.generate_crew_and_kickoff()
+finally:
+    gen.close()
+```
+
+`close()` is idempotent — calling it twice is safe.
+
+### Injecting a shared executor (multi-tenant)
+
+If you already manage a thread-pool (e.g. one per tenant), inject it via `tool_timeout_executor=`. The generator will use the pool but **never shut it down** — ownership stays with you.
+
+```python
+import concurrent.futures
+from praisonai.agents_generator import AgentsGenerator
+
+tenant_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=8,
+    thread_name_prefix=f"tenant-{tenant_id}",
+)
+
+with AgentsGenerator(
+    agent_file="agents.yaml",
+    framework="crewai",
+    config_list=[...],
+    tool_timeout_executor=tenant_pool,   # borrowed; close() will NOT shut it down
+) as gen:
+    gen.generate_crew_and_kickoff()
+
+# you remain responsible for tenant_pool.shutdown()
+```
+
+Each owned pool is named `praisonai-tool-timeout-<hexid>` for easy enumeration in `top` / `py-spy` / thread dumps.
+
+### `tool_timeout_executor` parameter
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `tool_timeout_executor` | `concurrent.futures.Executor \| None` | `None` (lazy, instance-owned) | Optional executor for per-call tool timeouts. When `None`, the generator lazily creates and owns a bounded `ThreadPoolExecutor` (default 32 workers, override with `PRAISONAI_TOOL_TIMEOUT_WORKERS`). When supplied, it is **borrowed** — the generator never shuts it down. |
+
+<AccordionGroup>
+
+<Accordion title="Always close or use `with`">
+
+Leaked tool-timeout pools accumulate threads named `praisonai-tool-timeout-<hexid>` across instances. Use `with AgentsGenerator(...) as gen:` or call `gen.close()` to release them. Check `top` / `py-spy` if you suspect thread accumulation.
+
+</Accordion>
+
+<Accordion title="Borrowed pools stay yours">
+
+Passing `tool_timeout_executor=` means `close()` won't shut it down. You manage the lifecycle — call `your_pool.shutdown()` when you're done with it.
+
+</Accordion>
+
+<Accordion title="One generator per session in multi-tenant">
+
+Don't share `AgentsGenerator` instances across tenants. Share the executor instead — inject the same pool via `tool_timeout_executor=` into each per-tenant generator.
+
+</Accordion>
+
+<Accordion title="Unique task names per workflow">
+
+With the CrewAI framework, `context=[...]` lookup keys on the task name. Two roles defining the same task name now raise `ValueError` — pick names like `<role>_<verb>` for clarity.
+
+</Accordion>
+
+</AccordionGroup>
+
+---
 
 ## Logging in scripts
 
