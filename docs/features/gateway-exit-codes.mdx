@@ -35,41 +35,50 @@ graph LR
 ## Quick Start
 
 <Steps>
-<Step title="Run the gateway with a process supervisor">
-
-The gateway already emits the correct exit code — no configuration needed in your code:
-
+<Step title="Start the gateway normally">
 ```bash
-praisonai serve gateway --config gateway.yaml
+praisonai gateway start --agents my_agents.yaml
 ```
 
+The process exits with code `0` on clean shutdown, `75` on transient failure (supervisor should restart), and `78` on fatal config error (supervisor should alert, not restart).
 </Step>
 
-<Step title="Configure systemd to restart on transient failures">
-
+<Step title="Systemd service with correct restart policy">
 ```ini
-# /etc/systemd/system/praisonai-gateway.service
+[Unit]
+Description=PraisonAI Gateway
+After=network.target
+
 [Service]
-ExecStart=/usr/local/bin/praisonai serve gateway --config /etc/praisonai/gateway.yaml
+ExecStart=/usr/local/bin/praisonai gateway start --agents /etc/praisonai/agents.yaml
 Restart=on-failure
-RestartPreventExitStatus=78
 RestartSec=5
+# Restart on transient failure (75), but not on fatal config error (78)
+RestartForceExitStatus=75
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target
 ```
-
-With this config, systemd restarts on exit 75 (transient) but **stops** on exit 78 (fatal config) so you know to fix the config before re-enabling.
-
 </Step>
 
-<Step title="Configure Kubernetes restart policy">
-
+<Step title="Kubernetes restart policy">
 ```yaml
-# In your Pod spec
+apiVersion: v1
+kind: Pod
 spec:
-  restartPolicy: OnFailure  # restart on non-zero exit
+  restartPolicy: OnFailure
+  containers:
+    - name: praisonai-gateway
+      image: praisonai/gateway:latest
+      command: ["praisonai", "gateway", "start", "--agents", "/etc/praisonai/agents.yaml"]
+      lifecycle:
+        postStart:
+          exec:
+            command: ["/bin/sh", "-c", "echo Gateway started"]
 ```
 
-For more granular control, use an init container or liveness probe to detect the 78 exit code and send an alert.
-
+For exit code 78, set an alert in your monitoring system and do not auto-restart.
 </Step>
 </Steps>
 
@@ -455,6 +464,56 @@ services:
     restart: on-failure
     volumes:
       - ./gateway.yaml:/config/gateway.yaml
+
+[Service]
+ExecStart=praisonai gateway start --agents /etc/praisonai/agents.yaml
+Restart=on-failure
+RestartSec=5
+RestartForceExitStatus=75
+SuccessExitStatus=0 75
+```
+
+`RestartForceExitStatus=75` tells systemd to restart even when `Restart=on-failure` would not normally trigger (e.g. the process exits quickly). Exit code 78 is NOT in `RestartForceExitStatus`, so systemd will not restart on fatal config errors.
+
+### Kubernetes
+
+```yaml
+spec:
+  restartPolicy: OnFailure
+  containers:
+    - name: gateway
+      image: praisonai/gateway:latest
+      command: ["praisonai", "gateway", "start"]
+      env:
+        - name: PRAISONAI_AGENTS_FILE
+          value: /config/agents.yaml
+```
+
+Add a liveness probe alert on exit code 78:
+
+```yaml
+livenessProbe:
+  exec:
+    command: ["test", "-f", "/tmp/gateway.ready"]
+  initialDelaySeconds: 10
+  periodSeconds: 30
+```
+
+### s6 / runit
+
+```bash
+#!/bin/sh
+# /etc/services.d/praisonai-gateway/run
+exec praisonai gateway start --agents /etc/praisonai/agents.yaml
+
+# /etc/services.d/praisonai-gateway/finish
+#!/bin/sh
+# $1 = exit code
+if [ "$1" -eq 78 ]; then
+  echo "Fatal config error — alerting operator"
+  touch /tmp/praisonai-config-error
+  exit 125  # s6: do not restart
+fi
 ```
 
 ---
@@ -524,6 +583,28 @@ A `78` exit in production means a deployment broke the config. Wire it to your o
 The gateway exits 0 when it receives a shutdown signal (SIGTERM, `/drain` endpoint). Supervisors that restart on any non-zero exit will leave the gateway alone after a graceful stop.
 </Accordion>
 
+
+<Accordion title="Never treat exit code 78 as a transient failure">
+Code 78 means the configuration is broken. Auto-restarting on 78 creates a restart loop that burns CPU without making progress. Always alert an operator first.
+</Accordion>
+
+<Accordion title="Add RestartSec to avoid restart storms">
+When restarting on exit code 75, add at least 5 seconds between restarts to avoid hammering a degraded upstream.
+
+```ini
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+```
+</Accordion>
+
+<Accordion title="Use FatalConfigError for missing secrets">
+At startup, validate that all required API keys and config values are present. Raise `FatalConfigError` immediately rather than letting the process crash mid-run.
+</Accordion>
+
+<Accordion title="Log the exit code in your monitoring system">
+Route stdout/stderr to your log aggregator and alert on `exit_code=78` to catch config regressions in CI/CD pipelines.
+</Accordion>
 </AccordionGroup>
 
 ---
