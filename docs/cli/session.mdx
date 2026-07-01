@@ -64,12 +64,12 @@ Project: MyApp (ID: a1b2c3d4)
 
 📋 Available Sessions:
 
-┌────┬─────────────────┬─────────────────────┬──────────┬──────────┐
-│ #  │ Session ID      │ Last Active         │ Messages │ Status   │
-├────┼─────────────────┼─────────────────────┼──────────┼──────────┤
-│ 1  │ session-abc123  │ 2024-12-16 15:45    │ 12       │ active   │
-│ 2  │ session-def456  │ 2024-12-16 14:20    │ 8        │ paused   │
-└────┴─────────────────┴─────────────────────┴──────────┴──────────┘
+┌────┬─────────────────┬─────────────────────┬──────────┬──────────┬───────────┬──────────┬──────────┐
+│ #  │ Session ID      │ Last Active         │ Messages │ Status   │ Tokens    │ Cost     │ Updated  │
+├────┼─────────────────┼─────────────────────┼──────────┼──────────┼───────────┼──────────┼──────────┤
+│ 1  │ session-abc123  │ 2024-12-16 15:45    │ 12       │ active   │ 12,440    │ $0.0710  │ 15:45    │
+│ 2  │ session-def456  │ 2024-12-16 14:20    │ 8        │ paused   │ 340       │ $0.0008  │ 14:20    │
+└────┴─────────────────┴─────────────────────┴──────────┴──────────┴───────────┴──────────┴──────────┘
 
 Total: 2 sessions (current project only)
 ```
@@ -172,6 +172,185 @@ sequenceDiagram
 <Note>
 When you pass a continuation prompt, the resume panel is suppressed — the run pipeline emits the only top-level output. To inspect a session without continuing, use `--transcript` or omit the prompt.
 </Note>
+
+---
+
+## Cost & Token Tracking
+
+PraisonAI accumulates input/output/cached tokens and dollar cost on every session run, so you can see exactly what a conversation has spent.
+
+```mermaid
+graph LR
+    subgraph "Per-Session Usage Accounting"
+        Run[💬 praisonai run] --> LLM[🤖 LLM Call]
+        LLM --> Collector[📊 Token Collector]
+        Collector --> Accum[➕ accumulate_session_usage]
+        Accum --> Store[💾 Session Store]
+        Store --> Footer[🧾 1,240 in / 3,980 out · $0.0140]
+        Store --> List[📋 session list: Tokens / Cost]
+        Store --> Resume[↩️ resume rehydrates totals]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef storage fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Run input
+    class LLM,Collector,Accum process
+    class Store storage
+    class Footer,List,Resume output
+```
+
+### Quick Start
+
+<Steps>
+<Step title="Run with a session">
+
+```bash
+praisonai run "Summarise the Q3 report" --session q3-review
+```
+
+After the answer, the CLI prints a one-line footer:
+
+```
+1,240 in / 3,980 out · $0.0140
+```
+
+</Step>
+
+<Step title="Check cumulative usage">
+
+```bash
+praisonai session list
+```
+
+```
+ID          Name        Status   Events   Tokens    Cost      Updated
+q3-review   q3-review   active   1        12,440    $0.0710   10:14
+```
+
+</Step>
+
+<Step title="Continue — totals keep accumulating">
+
+```bash
+praisonai run "Drill into the revenue line" --session q3-review
+```
+
+Totals continue from where you left off — they do not reset.
+
+</Step>
+</Steps>
+
+### What gets persisted
+
+Each session stores a `usage` object in its metadata:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `input_tokens` | `int` | `0` | Cumulative prompt tokens across the session. |
+| `output_tokens` | `int` | `0` | Cumulative completion tokens across the session. |
+| `cached_tokens` | `int` | `0` | Cumulative cached tokens (provider-reported). |
+| `total_tokens` | `int` | `0` | `input + output` total. |
+| `cost` | `float` | `0.0` | Cumulative dollar cost rounded to 6 decimal places. |
+| `requests` | `int` | `0` | Cumulative number of LLM interactions. |
+
+```json
+{
+  "session_id": "q3-review",
+  "metadata": {
+    "usage": {
+      "input_tokens": 1240,
+      "output_tokens": 3980,
+      "cached_tokens": 0,
+      "total_tokens": 5220,
+      "cost": 0.014,
+      "requests": 1
+    },
+    "total_tokens": 5220,
+    "cost": 0.014
+  }
+}
+```
+
+### Footer format
+
+After each prompt run with an active session, the CLI prints:
+
+```
+1,240 in / 3,980 out · $0.0140
+```
+
+Format: `"{input:,} in / {output:,} out · ${cost:.4f}"` — locale-formatted integers, 4-decimal cost. The footer is suppressed in `--json` mode but usage is still persisted.
+
+### Resume behaviour
+
+Totals are rehydrated on `--continue` / `--session <id>` and keep accumulating — they do not reset. The resume panel shows a usage summary line:
+
+```
+╭─ Session Resumed: q3-review ──────────────────────────╮
+│ Session: q3-review                                    │
+│ Model:  gpt-4o-mini                                   │
+│ Messages restored: 3                                  │
+│ Usage:  12,440 tokens · $0.0710 (3 requests)          │
+╰───────────────────────────────────────────────────────╯
+```
+
+### How it works
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Run as praisonai run
+    participant Collector as token_collector
+    participant Pricing as cost_tracker.get_pricing
+    participant Store as project session store
+
+    User->>Run: "Summarise the Q3 report" --session q3-review
+    Run->>Collector: per-call usage (input/output/cached)
+    Run->>Pricing: price by model
+    Pricing-->>Run: delta cost
+    Run->>Store: merge deltas into metadata.usage
+    Store-->>Run: updated cumulative totals
+    Run->>Collector: reset() (avoid double-counting)
+    Run-->>User: answer + footer "1,240 in / 3,980 out · $0.0140"
+```
+
+### Reading usage programmatically
+
+```python
+from praisonai.cli.state.project_sessions import (
+    read_session_usage,
+    format_usage_footer,
+)
+
+usage = read_session_usage("q3-review")
+print(format_usage_footer(usage))
+# 1,240 in / 3,980 out · $0.0140
+
+print(f"Cumulative requests: {usage['requests']}")
+print(f"Cached tokens: {usage['cached_tokens']:,}")
+```
+
+### Notes
+
+<AccordionGroup>
+<Accordion title="Best-effort — never breaks a run">
+Any failure (pricing lookup, persistence error, missing collector) leaves the session untouched. Usage accounting never breaks a run.
+</Accordion>
+<Accordion title="Multi-model aware">
+When a run uses more than one model, each model's tokens are priced individually with `get_pricing(model_name)`.
+</Accordion>
+<Accordion title="Cached tokens tracked separately">
+Provider-reported cached reads are accumulated in `cached_tokens` but excluded from cost — the provider already discounts them.
+</Accordion>
+<Accordion title="Footer only appears with an active session">
+One-shot `praisonai run "..."` without `--session` runs without footer output.
+</Accordion>
+</AccordionGroup>
+
+---
 
 ### Show Session Details
 

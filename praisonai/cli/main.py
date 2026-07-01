@@ -263,7 +263,7 @@ def _get_autogen():
     # execution protocol. This still honours any user-registered "autogen"
     # adapter discovered via the praisonai.framework_adapters entry points.
     adapter = get_default_registry().resolve("autogen")()
-    hint = getattr(adapter, "install_hint", 'pip install "praisonai[autogen]"')
+    hint = getattr(adapter, "install_hint", 'pip install "praisonai-frameworks[autogen]"')
     if not adapter.is_available():
         raise ImportError(f"AutoGen is not installed. {hint}")
     # The family adapter's is_available() is True if *any* variant (v0.2/v0.4/AG2)
@@ -350,6 +350,19 @@ class PraisonAI:
         Run the PraisonAI application.
         """
         return self.main()
+
+    @staticmethod
+    def _require_agents():
+        """Exit with an install hint if praisonaiagents is unavailable.
+
+        Single source of truth for the "needs praisonaiagents" guard so the same
+        check is not duplicated across every command branch.
+        """
+        _ensure_availability_flags()
+        if not globals().get("PRAISONAI_AVAILABLE", False):
+            print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
+            print("\npip install praisonaiagents\n")
+            sys.exit(1)
 
     def read_stdin_if_available(self):
         """
@@ -1015,12 +1028,12 @@ class PraisonAI:
         try:
             from ..framework_adapters.registry import list_framework_choices
             _framework_choices = list_framework_choices(include_unavailable=True) or [
-                "praisonai", "crewai", "autogen",
+                "ag2", "autogen", "crewai", "praisonai",
             ]
         except ImportError:
-            # Only fall back to the static trio when the adapter layer itself
+            # Only fall back to the static list when the adapter layer itself
             # cannot be imported; genuine registry discovery errors should surface.
-            _framework_choices = ["praisonai", "crewai", "autogen"]
+            _framework_choices = ["ag2", "autogen", "crewai", "praisonai"]
         parser.add_argument(
             "--framework",
             choices=_framework_choices,
@@ -1431,10 +1444,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'context':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 if not args.url:
                     print("[red]ERROR: --url is required for context command[/red]")
@@ -1450,10 +1460,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'research':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get the research query from remaining args
                 research_query = ' '.join(unknown_args) if unknown_args else None
@@ -1473,10 +1480,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'memory':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'help'
@@ -1486,10 +1490,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'rules':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
@@ -1498,10 +1499,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'workflow':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
@@ -1516,10 +1514,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'hooks':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
@@ -1527,10 +1522,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'knowledge':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'help'
@@ -1539,10 +1531,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'session':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
@@ -1551,10 +1540,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'tools':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
@@ -1563,10 +1549,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'todo':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
@@ -1575,10 +1558,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'docs':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
@@ -1587,10 +1567,7 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'mcp':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 # Get action and arguments from remaining args
                 action = unknown_args[0] if unknown_args else 'list'
@@ -1599,19 +1576,13 @@ class PraisonAI:
                 sys.exit(0)
 
             elif args.command == 'commit':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 self.handle_commit_command(unknown_args)
                 sys.exit(0)
 
             elif args.command == 'skills':
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 from .features.skills import handle_skills_command, add_skills_parser
                 
@@ -1704,10 +1675,7 @@ class PraisonAI:
             
             elif args.command == 'agents':
                 # Agents command - run multiple agents with custom definitions
-                if not PRAISONAI_AVAILABLE:
-                    print("[red]ERROR: PraisonAI Agents is not installed. Install with:[/red]")
-                    print("\npip install praisonaiagents\n")
-                    sys.exit(1)
+                self._require_agents()
                 
                 from .features.agents import handle_agents_command, add_agents_parser
                 
@@ -2027,15 +1995,21 @@ class PraisonAI:
                 if not list_framework_choices():
                     print("[red]ERROR: No framework adapter is installed.[/red]")
                     print("\npip install praisonaiagents  # native PraisonAI")
-                    print("pip install \"praisonai[crewai]\"  # CrewAI")
-                    print("pip install \"praisonai[autogen]\"  # AutoGen\n")
+                    print("pip install \"praisonai-frameworks[crewai]\"  # CrewAI")
+                    print("pip install \"praisonai-frameworks[autogen]\"  # AutoGen")
+                    print("pip install \"praisonai-frameworks[openai-agents]\"  # OpenAI Agents SDK")
+                    print("pip install \"praisonai-frameworks[agno]\"  # Agno")
+                    print("pip install \"praisonai-frameworks[google-adk]\"  # Google ADK\n")
                     sys.exit(1)
             except ImportError:
                 if not CREWAI_AVAILABLE and not AUTOGEN_AVAILABLE and not PRAISONAI_AVAILABLE:
                     print("[red]ERROR: No framework is installed. Please install at least one framework:[/red]")
-                    print("\npip install \"praisonai\\[crewai]\"  # For CrewAI")
-                    print("pip install \"praisonai\\[autogen]\"  # For AutoGen")
-                    print("pip install \"praisonai\\[crewai,autogen]\"  # For both frameworks\n")
+                    print("\npip install \"praisonai-frameworks\\[crewai]\"  # For CrewAI")
+                    print("pip install \"praisonai-frameworks\\[autogen]\"  # For AutoGen")
+                    print("pip install \"praisonai-frameworks\\[openai-agents]\"  # OpenAI Agents SDK")
+                    print("pip install \"praisonai-frameworks\\[agno]\"  # Agno")
+                    print("pip install \"praisonai-frameworks\\[google-adk]\"  # Google ADK")
+                    print("pip install \"praisonai-frameworks\\[crewai,autogen]\"  # Multiple frameworks\n")
                     print("pip install praisonaiagents # For Agents\n")
                     sys.exit(1)
 
@@ -2095,17 +2069,14 @@ class PraisonAI:
                 else:
                     # Treat as comma-separated tool names
                     try:
-                        from praisonaiagents.tools import TOOL_MAPPINGS
-                        import praisonaiagents.tools as tools_module
-                        
-                        tool_names = [t.strip() for t in rewrite_tools.split(',')]
+                        import inspect
+                        from praisonai.tool_resolver import resolve_tool
+
+                        tool_names = [t.strip() for t in rewrite_tools.split(',') if t.strip()]
                         for tool_name in tool_names:
-                            if tool_name in TOOL_MAPPINGS:
-                                try:
-                                    tool = getattr(tools_module, tool_name)
-                                    rewrite_tools_list.append(tool)
-                                except Exception as e:
-                                    print(f"[yellow]Warning: Failed to load rewrite tool '{tool_name}': {e}[/yellow]")
+                            tool = resolve_tool(tool_name)
+                            if tool is not None:
+                                rewrite_tools_list.append(tool() if inspect.isclass(tool) else tool)
                             else:
                                 print(f"[yellow]Warning: Unknown rewrite tool '{tool_name}'[/yellow]")
                         if rewrite_tools_list:
@@ -2187,17 +2158,14 @@ class PraisonAI:
                 else:
                     # Treat as comma-separated tool names
                     try:
-                        from praisonaiagents.tools import TOOL_MAPPINGS
-                        import praisonaiagents.tools as tools_module
-                        
-                        tool_names = [t.strip() for t in expand_tools.split(',')]
+                        import inspect
+                        from praisonai.tool_resolver import resolve_tool
+
+                        tool_names = [t.strip() for t in expand_tools.split(',') if t.strip()]
                         for tool_name in tool_names:
-                            if tool_name in TOOL_MAPPINGS:
-                                try:
-                                    tool = getattr(tools_module, tool_name)
-                                    expand_tools_list.append(tool)
-                                except Exception as e:
-                                    print(f"[yellow]Warning: Failed to load expand tool '{tool_name}': {e}[/yellow]")
+                            tool = resolve_tool(tool_name)
+                            if tool is not None:
+                                expand_tools_list.append(tool() if inspect.isclass(tool) else tool)
                             else:
                                 print(f"[yellow]Warning: Unknown expand tool '{tool_name}'[/yellow]")
                         if expand_tools_list:
@@ -4615,26 +4583,35 @@ Do NOT add any explanations or formatting."""
                     
                     agent_config["planning"] = PlanningConfig(**planning_kwargs) if planning_kwargs else True
                 
-                # P8/G11: Tool timeout - prevent slow tools from blocking
+                # P8/G11: Tool timeout and retry policy via ToolConfig
+                # Agent expects tool execution settings through tool_config=ToolConfig(...),
+                # not the deprecated top-level tool_timeout / tool_retry_policy kwargs.
+                tool_config_kwargs = {}
+
+                # Tool timeout - prevent slow tools from blocking
                 tool_timeout = getattr(self.args, 'tool_timeout', 60)
                 if tool_timeout and tool_timeout > 0:
-                    agent_config["tool_timeout"] = tool_timeout
-                
+                    tool_config_kwargs["timeout"] = int(tool_timeout)
+
                 # Tool retry policy - handle transient failures with exponential backoff
                 retry_attempts = getattr(self.args, 'tool_retry_attempts', 3)
                 retry_delay = getattr(self.args, 'tool_retry_delay', 1000)
                 retry_backoff = getattr(self.args, 'tool_retry_backoff', 2.0)
                 retry_on_str = getattr(self.args, 'tool_retry_on', "timeout,rate_limit,connection_error")
                 retry_on = set(error_type.strip() for error_type in retry_on_str.split(',') if error_type.strip())
-                
+
                 if retry_attempts > 1:  # Only create retry policy if retries are enabled
                     from praisonaiagents.tools.retry import RetryPolicy
-                    agent_config["tool_retry_policy"] = RetryPolicy(
+                    tool_config_kwargs["retry_policy"] = RetryPolicy(
                         max_attempts=retry_attempts,
                         initial_delay_ms=retry_delay,
                         backoff_factor=retry_backoff,
                         retry_on=retry_on
                     )
+
+                if tool_config_kwargs:
+                    from praisonaiagents.config.feature_configs import ToolConfig
+                    agent_config["tool_config"] = ToolConfig(**tool_config_kwargs)
                 
                 # Memory
                 if getattr(self.args, 'memory', False):
@@ -5334,9 +5311,9 @@ Now, {final_instruction.lower()}:"""
             return "Task completed"
         else:
             print("[red]ERROR: No framework is installed. Please install at least one framework:[/red]")
-            print("\npip install \"praisonai\\[crewai]\"  # For CrewAI")
-            print("pip install \"praisonai\\[autogen]\"  # For AutoGen")
-            print("pip install \"praisonai\\[crewai,autogen]\"  # For both frameworks\n")
+            print("\npip install \"praisonai-frameworks\\[crewai]\"  # For CrewAI")
+            print("pip install \"praisonai-frameworks\\[autogen]\"  # For AutoGen")
+            print("pip install \"praisonai-frameworks\\[crewai,autogen]\"  # Multiple frameworks\n")
             print("pip install praisonaiagents # For Agents\n")  
             sys.exit(1)
 
@@ -5819,17 +5796,14 @@ Now, {final_instruction.lower()}:"""
                 else:
                     # Treat as comma-separated tool names (e.g., "internet_search,wiki_search")
                     try:
-                        from praisonaiagents.tools import TOOL_MAPPINGS
-                        import praisonaiagents.tools as tools_module
-                        
-                        tool_names = [t.strip() for t in tools_path.split(',')]
+                        import inspect
+                        from praisonai.tool_resolver import resolve_tool
+
+                        tool_names = [t.strip() for t in tools_path.split(',') if t.strip()]
                         for tool_name in tool_names:
-                            if tool_name in TOOL_MAPPINGS:
-                                try:
-                                    tool = getattr(tools_module, tool_name)
-                                    tools_list.append(tool)
-                                except Exception as e:
-                                    print(f"[yellow]Warning: Failed to load tool '{tool_name}': {e}[/yellow]")
+                            tool = resolve_tool(tool_name)
+                            if tool is not None:
+                                tools_list.append(tool() if inspect.isclass(tool) else tool)
                             else:
                                 print(f"[yellow]Warning: Unknown tool '{tool_name}'[/yellow]")
                         if tools_list:
