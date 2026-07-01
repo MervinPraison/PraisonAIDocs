@@ -5,6 +5,14 @@ description: "Versioned WebSocket handshake with capability negotiation and stru
 icon: "handshake"
 ---
 
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="handshake-agent", instructions="Perform gateway connection handshake.")
+agent.start("Establish a secure handshake with the remote gateway.")
+```
+
+
 The gateway handshake lets clients and servers agree on a protocol version, discover supported features, and recover from disconnects — all in one round trip.
 
 ```python
@@ -239,6 +247,29 @@ Events are advertised only if the client requested the matching capability.
 
 ---
 
+## Server-side state after handshake
+
+After `hello_ok` is sent, the gateway records the negotiated protocol version and the client's advertised capabilities on the session itself. Both are read-only and survive resume.
+
+```python
+session = gateway.get_session(session_id)
+session.protocol_version    # → 1   (negotiated min(client_max, GATEWAY_PROTOCOL_VERSION))
+session.capabilities        # → ["streaming", "presence", "ack"]   (defensive copy)
+```
+
+| Property | Type | Notes |
+|----------|------|-------|
+| `session.protocol_version` | `int` | Read-only. Set by the `hello` handler from the negotiated value. |
+| `session.capabilities` | `List[str]` | Read-only. Returns a copy — mutating the returned list does not change session state. Empty list when the client advertised no capabilities. |
+
+Both properties are populated on the `hello` path **and** the legacy `join` path, so server code can branch on `session.capabilities` without checking which handshake the client used.
+
+<Tip>
+Use this to tailor delivery — e.g. only enqueue `token_stream` events when `"streaming" in session.capabilities` — without re-parsing the original `hello` frame.
+</Tip>
+
+---
+
 ## Policy Limits
 
 | Key | Default | Description |
@@ -249,6 +280,53 @@ Events are advertised only if the client requested the matching capability.
 | `heartbeat_ms` | `30000` | Heartbeat interval (`heartbeat_interval * 1000`, default 30 s) |
 
 Clients should self-configure from the `policy` object in `hello_ok`. See [Gateway Flow Control](/docs/features/gateway-flow-control) for tuning `max_buffered_bytes` and `max_queued_frames`.
+
+---
+
+## Persisted Session State
+
+After `hello_ok`, the gateway records both the negotiated protocol version and the client-advertised capabilities on the `GatewaySession`. These values survive disconnect and resume.
+
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="assistant",
+        capabilities=["streaming", "ack"],
+    )
+    await client.connect()
+    # After hello_ok, the server-side session exposes:
+    # session.protocol_version  → "1"  (negotiated version string)
+    # session.capabilities      → ["streaming", "ack"]  (client-advertised)
+
+asyncio.run(main())
+```
+
+| Property | Type | Description |
+|---|---|---|
+| `session.protocol_version` | `str` | The negotiated protocol version agreed during `hello`. |
+| `session.capabilities` | `list[str]` | The capabilities the client advertised in the `hello` message. |
+
+Both properties are written into `session.to_dict()` and restored by `from_dict()`, so they survive server restarts and session persistence backends.
+
+**Server-side hooks** and **custom routing code** can read these off any live session:
+
+```python
+def on_message(session, payload):
+    if "streaming" in session.capabilities:
+        # send token_stream events
+        ...
+    else:
+        # send complete message at once
+        ...
+```
+
+<Note>
+If `to_dict()` / `from_dict()` encounters a non-list value for capabilities (e.g. from an older snapshot), it is safely restored as `[]` to avoid errors.
+</Note>
 
 ---
 
