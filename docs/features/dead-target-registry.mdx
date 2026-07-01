@@ -97,55 +97,215 @@ print(f"Registry size: {registry.size()}")
 
 ---
 
-## How Self-Healing Works
+## How It Works
 
 ```mermaid
-graph TB
-    subgraph "Self-Heal Timeline"
-        A[Bot Kicked\n403 Forbidden] -->|mark_dead| B[⏸ Suppressed\nno sends]
-        B -->|reprobe_seconds elapsed\n~1 hour| C[🔍 One probe\nallowed through]
-        C -->|send succeeds| D[✅ Clear — active again]
-        C -->|send fails| E[🔴 Reset timer\nstill dead]
-        E -->|next reprobe_seconds| C
+sequenceDiagram
+    participant Router as DeliveryRouter
+    participant Reg as DeadTargetRegistry
+    participant Plat as Platform
+
+    Router->>Reg: is_dead(platform, channel_id)?
+    alt suppressed and not yet re-probeable
+        Reg-->>Router: True
+        Router-->>Router: short-circuit (target_unreachable_suppressed)
+    else not suppressed (or re-probe due)
+        Reg-->>Router: False (or reprobe=True)
+        Router->>Plat: send_message
+        alt success
+            Plat-->>Router: ok
+            Router->>Reg: clear(platform, channel_id) — self-heal
+        else permanent failure (403 / 404 / 410 / text pattern)
+            Plat-->>Router: error
+            Router->>Reg: mark_dead(platform, channel_id, reason)
+        else transient (5xx / 429 / timeout) or message-scoped 404
+            Plat-->>Router: error
+            Note over Router: no mark — stays on retry path
+        end
     end
-
-    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef suppress fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef probe fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef fail fill:#6366F1,stroke:#7C90A0,color:#fff
-
-    class A start
-    class B suppress
-    class C probe
-    class D success
-    class E fail
 ```
 
-A suppressed target is re-probed once per `reprobe_seconds` (default: 1 hour). On the first successful send `clear()` is called and the target re-enters normal circulation. On failure the clock resets for another `reprobe_seconds`.
+**Self-heal timeline:**
 
----
+```mermaid
+graph LR
+    A[T=0: mark_dead] --> B[T < 1h: all sends suppressed]
+    B --> C[T ≈ 1h: one reprobe send allowed]
+    C -->|success| D[cleared — fully back in service]
+    C -->|still permanent| E[re-marked dead — clock resets]
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef quiet fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef probe fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+    class A start
+    class B quiet
+    class C probe
+    class D good
+    class E bad
+```
 
-## Permanent vs Transient Failures
-
-| HTTP Status | Permanent? | Notes |
-|-------------|-----------|-------|
-| 403 Forbidden | ✅ | Bot kicked or blocked by user |
-| 404 Not Found | ✅ | Chat deleted or never existed |
-| 410 Gone | ✅ | Permanently removed |
-| 401 Unauthorized | ❌ | Token/account issue — still retried |
-| 5xx Server Error | ❌ | Transient — retry with backoff |
-| 429 Too Many Requests | ❌ | Transient — honour Retry-After |
-
-<Warning>
-**401 is NOT a permanent failure.** It reflects an account- or token-level auth issue, not a per-channel dead target. The registry will not mark 401 responses as dead.
-</Warning>
-
-Platform-specific text patterns are also classified — e.g. "chat not found", "bot was kicked" in Telegram error messages trigger `mark_dead`.
+| Phase | Behaviour |
+|-------|-----------|
+| **mark_dead** | Target recorded with timestamp. Persisted atomically to JSON. |
+| **suppressed** | Every `deliver()` call returns `False` immediately — no API hit. |
+| **reprobe** | After `reprobe_seconds`, one send is allowed through to test recovery. |
+| **self-heal** | Success clears the registry entry. Next send goes through normally. |
+| **re-marked** | Permanent failure on reprobe resets the clock for another cycle. |
 
 ---
 
 ## Configuration Options
+
+### `DeadTargetRegistry` constructor
+
+```python
+from praisonai.bots import DeadTargetRegistry
+
+registry = DeadTargetRegistry(
+    persist_path="~/.praisonai/state/dead_targets.json",
+    max_size=10_000,
+    ttl_seconds=2_592_000,
+    reprobe_seconds=3600,
+)
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `persist_path` | `Path \| None` | `~/.praisonai/state/dead_targets.json` | JSON file for durability. Parent directories are created automatically. Pass a tmp path for ephemeral / test instances. |
+| `max_size` | `int` | `10_000` | Maximum dead entries kept. Oldest (by `ts`) are evicted when exceeded. `<= 0` disables the bound. |
+| `ttl_seconds` | `int` | `2_592_000` (30 days) | Entries older than this are dropped lazily on the next access, so a long-dead target is eventually re-probed even if no send ever cleared it. `<= 0` disables TTL. |
+| `reprobe_seconds` | `int` | `3600` (1 hour) | Once this elapses since `mark_dead`, **one** send is allowed through to test recovery. Success self-heals; repeated permanent failure resets the clock. `<= 0` disables re-probing. |
+
+### Public methods
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `is_dead(platform, channel_id)` | `bool` | `True` if currently suppressed. Expired entries are removed lazily and `False` is returned. |
+| `should_reprobe(platform, channel_id)` | `bool` | `True` if a dead target is due for a single self-healing re-probe (`reprobe_seconds` elapsed since last `mark_dead`). |
+| `mark_dead(platform, channel_id, reason)` | `None` | Record a confirmed-permanent failure. Idempotent — re-marking refreshes the timestamp and resets the re-probe clock. Persisted atomically. |
+| `clear(platform, channel_id)` | `None` | Un-suppress a target. Called automatically on every successful send. No-op if the target is not in the registry. Persisted atomically. |
+| `list_dead()` | `list[DeadTarget]` | Snapshot of currently-suppressed targets (TTL-expired ones pruned first), sorted oldest-first by `ts`. |
+| `size()` | `int` | Number of currently-suppressed targets (TTL-expired ones pruned first). |
+
+`DeadTarget` is a frozen dataclass: `platform: str`, `channel_id: str`, `reason: str`, `ts: float` (Unix epoch).
+
+---
+
+## What Counts as Permanent
+
+`is_permanent_target_failure(err, platform)` classifies an exception before `DeliveryRouter` calls `mark_dead`.
+
+### Permanent — target marked dead
+
+| Signal | Details |
+|--------|---------|
+| HTTP `403` Forbidden | Via `err.status`, `err.status_code`, or `err.error_code` |
+| HTTP `404` Not Found | Same attribute probe — **only** if not a message-scoped 404 (see exclusions below) |
+| HTTP `410` Gone | Same attribute probe |
+| `forbidden` | Text pattern (case-insensitive) on the exception message |
+| `bot was kicked` | |
+| `bot was blocked` | |
+| `user is deactivated` | |
+| `chat not found` | |
+| `channel not found` | |
+| `group chat was deleted` | |
+| `the group chat was deleted` | |
+| `bot is not a member` | |
+| `not enough rights` | |
+| `have no rights to send` | |
+| `need administrator rights` | |
+| `peer_id_invalid` | |
+| `account_not_found` | |
+| `channel_archived` | |
+| `is_archived` | |
+| `blocked by the user` | |
+
+### Not permanent — stays on the retry path
+
+| Signal | Why excluded |
+|--------|-------------|
+| Any transient / recoverable error | 5xx, 429, timeouts, connection resets — checked **first**, transient wins |
+| `message to edit not found` | Message-scoped 404 — does NOT condemn the whole channel |
+| `message not found` | Same |
+| `message to delete not found` | Same |
+| `message_id_invalid` | Same |
+| `thread not found` | Same |
+| `unknown message` | Same |
+| `reply not found` | Same |
+| `message can't be edited` | Same |
+| **HTTP `401` Unauthorized** | **Deliberately excluded.** 401 signals an account-/token-level auth problem (revoked or wrong credentials), not the death of one specific channel. Marking channels dead on a 401 would suppress every target the moment a token expires, and the 30-day TTL would keep them suppressed long after the token is fixed. Auth failures stay off the dead-target path. |
+
+<Note>
+**Platform names are stored lower-cased.** `mark_dead("Telegram", ...)` and `is_dead("TELEGRAM", ...)` refer to the same entry. Users coming from YAML keys like `Telegram:` don't need to worry about casing.
+</Note>
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `path` | `str` | required | Path to the persistent JSON file (supports `~` expansion) |
+| `max_size` | `int` | unlimited | Maximum number of dead entries to keep (oldest evicted first) |
+| `ttl_seconds` | `int` | `None` | Auto-evict entries older than this many seconds |
+| `reprobe_seconds` | `int` | `3600` | How often to let a single delivery attempt through to probe recovery |
+
+### Registry API
+
+| Method | Description |
+|--------|-------------|
+| `is_dead(target_id)` | Returns `True` if the channel is currently suppressed |
+| `mark_dead(target_id)` | Suppress the channel and reset its re-probe clock |
+| `clear(target_id)` | Remove a channel from the dead list (self-heal) |
+| `list_dead()` | Return all currently suppressed channel IDs |
+| `size()` | Number of entries in the registry |
+| `should_reprobe(target_id)` | Returns `True` when re-probe window has elapsed |
+
+---
+
+## Common Patterns
+
+### Long-running broadcast gateway
+
+A gateway pushing periodic updates to many channels suppresses dead ones so they don't burn rate-limit budget on every cycle.
+
+```python
+import asyncio
+from praisonai.bots import BotOS, DeliveryRouter, DeadTargetRegistry
+
+registry = DeadTargetRegistry()
+botos    = BotOS(...)
+router   = DeliveryRouter(botos, dead_targets=registry)
+
+async def broadcast(channels, message):
+    for platform, channel_id in channels:
+        await router.deliver(f"{platform}:{channel_id}", message)
+```
+
+Dead channels are skipped silently; recovered channels re-enter service within one reprobe cycle (~1 h by default).
+
+### Operator dashboard via `list_dead()`
+
+Expose suppressed channels in a health or admin endpoint so operators can see what has been suppressed and why.
+
+```python
+from praisonai.bots import DeadTargetRegistry
+
+registry = DeadTargetRegistry()
+
+@app.get("/admin/dead-targets")
+async def dead_targets():
+    return [
+        {"platform": t.platform, "channel_id": t.channel_id,
+         "reason": t.reason, "since": t.ts}
+        for t in registry.list_dead()
+    ]
+```
+
+### Custom suppression for one chat
+
+Un-suppress a channel manually after confirming the bot has been re-added.
+
+```python
+registry.clear("telegram", "-1001234567890")
+```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -172,6 +332,75 @@ Platform-specific text patterns are also classified — e.g. "chat not found", "
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Default-OFF on purpose">
+Attach a registry only on long-running gateways with periodic, broadcast, or scheduled sends. Single-request CLIs and request-response bots don't need it — adding suppression to short-lived processes just adds complexity with no benefit.
+</Accordion>
+
+<Accordion title="401 is intentionally NOT permanent">
+Never treat HTTP 401 Unauthorized as a dead-target signal. Token expiry would suppress every channel simultaneously, and the 30-day TTL would hide the fix for a month. Auth failures stay on the normal error path so the operator sees and fixes them quickly.
+</Accordion>
+
+<Accordion title="Keep persist_path on a real filesystem">
+Store the registry on a persistent local path — not `/tmp` and not a container tmpfs. The default `~/.praisonai/state/dead_targets.json` is the right location; use it as a template.
+
+```python
+registry = DeadTargetRegistry(
+    persist_path="/data/praisonai/state/dead_targets.json"
+)
+```
+</Accordion>
+
+<Accordion title="Tune reprobe_seconds to your fan-out cadence">
+The default 1-hour reprobe window suits most periodic-update gateways. Raise it if kicked-bot scenarios are rare and you'd rather not probe recovered channels frequently. Lower it if recovery latency matters (e.g. high-priority alert channels).
+
+```python
+registry = DeadTargetRegistry(reprobe_seconds=300)
+```
+</Accordion>
+
+<Accordion title="list_dead() is your operator dashboard">
+Expose `list_dead()` in your gateway's admin or health endpoint so operators can see suppressed channels at a glance. Pair it with `registry.size()` for a quick health metric.
+
+```python
+print(f"Suppressed channels: {registry.size()}")
+for t in registry.list_dead():
+    print(f"  {t.platform}:{t.channel_id} — {t.reason}")
+```
+</Accordion>
+
+
+<Accordion title="Use for broadcast / proactive delivery bots">
+The registry is most valuable when you push messages to many stored targets (newsletters, alerts). For one-on-one chat bots, the existing retry path is sufficient.
+</Accordion>
+
+<Accordion title="Store on a durable volume">
+The JSON file survives restarts and preserves which channels are suppressed between runs. Store it on the same persistent volume as your SQLite approval store.
+</Accordion>
+
+<Accordion title="Self-healing is automatic">
+When a successful send reaches a channel that was in the dead list — even a regular delivery, not only a scheduled re-probe — the channel is cleared automatically. No manual intervention needed.
+</Accordion>
+
+<Accordion title="401 errors are not permanent">
+A 401 Unauthorized response is account-level, not per-channel. The registry never marks a channel dead for a 401 — use it only for 403/404/410 failures with the appropriate error text.
+</Accordion>
+
+
+<Accordion title="Keep TTL short for fast-recovering platforms">
+A 24-hour default works for most bots. On platforms where users frequently delete and recreate accounts, use a shorter TTL (e.g. 1–4 hours) to allow re-delivery sooner.
+</Accordion>
+
+<Accordion title="Size the registry to your user base">
+Each entry uses ~100 bytes. `max_size=10_000` uses ~1 MB. For bots with millions of users, increase `max_size` proportionally or use a persistent backend.
+</Accordion>
+
+<Accordion title="Always clear on manual recovery">
+If an operator manually restores a blocked channel, call `registry.clear(target)` so the next send goes through. Without clearing, the entry persists until TTL expiry.
+</Accordion>
+
+<Accordion title="Pair with durable delivery">
+The registry prevents re-sending to dead targets, but in-flight messages that fail permanently should also go to the outbound DLQ. See [Durable Delivery](/docs/features/durable-delivery) and [Delivery Config](/docs/features/delivery-config).
+
 <Accordion title="Enable registry for broadcast / proactive bots">
 Subscription bots that push to many channels benefit most from the registry — fan-out cycles skip dead targets instantly instead of waiting for a timeout per doomed call.
 </Accordion>
@@ -194,16 +423,16 @@ The registry writes atomically to a JSON file. On failure the write is logged as
 ## Related
 
 <CardGroup cols={2}>
-<Card title="Durable Outbound Delivery" icon="shield-check" href="/docs/features/durable-outbound-delivery">
-  Retry and DLQ for all channels
+<Card title="Durable Delivery" icon="shield-check" href="/docs/features/durable-delivery">
+  Persistent outbox + retry for transient failures — composes with the dead-target registry
+</Card>
+<Card title="Channel Supervision" icon="heart-pulse" href="/docs/features/gateway-channel-supervision">
+  Self-healing gateway channels with operator pause/resume/reconnect controls
+</Card>
+<Card title="Proactive Delivery" icon="send" href="/docs/features/proactive-delivery">
+  Scheduled and broadcast outbound message delivery
 </Card>
 <Card title="Delivery Config" icon="settings" href="/docs/features/delivery-config">
-  Full delivery configuration reference
-</Card>
-<Card title="Proactive Delivery" icon="bell" href="/docs/features/proactive-delivery">
-  Scheduled and broadcast message delivery
-</Card>
-<Card title="Bot Routing" icon="git-branch" href="/docs/features/bot-routing">
-  Route messages across multiple channels
+  Delivery surface configuration reference
 </Card>
 </CardGroup>
