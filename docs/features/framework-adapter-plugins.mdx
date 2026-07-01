@@ -5,6 +5,14 @@ description: "Extend PraisonAI with custom framework adapters via Python entry p
 icon: "puzzle-piece"
 ---
 
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="adapter-agent", instructions="Use framework adapter plugins.")
+agent.start("Enable the LangChain adapter plugin for this workflow.")
+```
+
+
 Framework adapter plugins enable third-party developers to add new execution frameworks to PraisonAI without modifying core code.
 
 ```mermaid
@@ -29,6 +37,10 @@ graph LR
     classDef tool fill:#189AB4,color:#fff
 ```
 
+<Warning>
+**Deprecated:** Direct imports of concrete built-in adapter classes from `praisonai.framework_adapters` (`CrewAIAdapter`, `AutoGenAdapter`, `AutoGenV4Adapter`, `AG2Adapter`) now emit `DeprecationWarning`. Use the registry (`get_default_registry().create("crewai")`) or register via the entry-point group instead.
+</Warning>
+
 ## Quick Start
 
 <Steps>
@@ -38,10 +50,10 @@ Register a framework adapter directly in your code:
 
 ```python
 from typing import Any, Callable, Dict, List, Optional
+from praisonaiagents import BaseFrameworkAdapter
 from praisonai.framework_adapters.registry import get_default_registry
-from praisonai.framework_adapters.base import FrameworkAdapter
 
-class MyFrameworkAdapter:
+class MyFrameworkAdapter(BaseFrameworkAdapter):
     name = "myframework"
 
     def is_available(self) -> bool:
@@ -62,11 +74,7 @@ class MyFrameworkAdapter:
         task_callback: Optional[Callable] = None,
         cli_config: Optional[Dict[str, Any]] = None,
     ) -> str:
-        # Framework execution logic
         return "Framework execution result"
-
-    def cleanup(self) -> None:
-        pass
 
 # Register the adapter (preferred for app code)
 registry = get_default_registry()
@@ -75,28 +83,84 @@ registry.register("myframework", MyFrameworkAdapter)
 
 </Step>
 
-<Step title="Entry Point Plugin">
+<Step title="Entry-Point Plugin (installable)">
 
-Create a pip-installable plugin using `pyproject.toml`:
+Create a pip-installable plugin — no manual `registry.register()` call needed:
+
+```python
+# my_framework_adapter.py
+from praisonaiagents import BaseFrameworkAdapter
+
+class MyFrameworkAdapter(BaseFrameworkAdapter):
+    name = "my_framework"
+    install_hint = "pip install my-framework-bridge"
+    requires_tools_extra = False
+
+    def is_available(self) -> bool:
+        return True
+
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ) -> str:
+        return f"my_framework ran: {topic}"
+```
 
 ```toml
 # pyproject.toml
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "myframework-praisonai"
-version = "1.0.0"
+name = "my-framework-bridge"
+version = "0.0.1"
+dependencies = ["praisonaiagents"]
+
+[tool.setuptools]
+py-modules = ["my_framework_adapter"]
 
 [project.entry-points."praisonai.framework_adapters"]
-myframework = "myframework_praisonai.adapter:MyFrameworkAdapter"
+my_framework = "my_framework_adapter:MyFrameworkAdapter"
 ```
 
 ```bash
-# Use the framework after installation
-pip install myframework-praisonai
-praisonai --framework myframework agents.yaml
+pip install -e ./examples/python/frameworks/custom_adapter
+praisonai --framework my_framework agents.yaml
 ```
+
+After `pip install`, the adapter appears in `praisonai --framework` choices and `praisonai doctor` automatically — no manual `registry.register()` call needed.
 
 </Step>
 </Steps>
+
+---
+
+## What the Registry Controls
+
+Registering through the `praisonai.framework_adapters` entry-point group gives your adapter automatic visibility across three surfaces — no extra wiring required:
+
+| Surface | Effect |
+|---------|--------|
+| `praisonai --framework <name>` | Your adapter name appears in the argparse `choices=` list |
+| `praisonai doctor config` | `agents.yaml framework: <name>` passes validation |
+| Install-hint messages | Your adapter's `install_hint` attribute is shown when the framework module is missing |
+
+```bash
+# Example: after pip install praisonai-langgraph
+$ praisonai --framework langgraph agents.yaml   # accepted
+$ praisonai doctor
+✓ agents.yaml framework='langgraph' is a registered adapter
+```
+
+See [Framework Availability — Dynamic Discovery](/docs/features/framework-availability#dynamic-framework-discovery) for more details on how the registry feeds these surfaces.
 
 ---
 
@@ -129,6 +193,60 @@ The framework adapter registry provides a central point for managing framework i
 | Registration | Adapters registered by name | Plugin installation |
 | Creation | Adapter instances created on demand | CLI framework selection |
 | Availability | Framework dependencies checked | Before execution |
+
+---
+
+## Auto-Discovery in the CLI
+
+Once your adapter is registered (in-process via `register()` or via the `praisonai.framework_adapters` entry-point group), it appears automatically wherever framework names are listed or validated — no further wiring needed:
+
+| Surface | What it shows / validates against |
+|---------|-----------------------------------|
+| `praisonai --framework <name>` argparse `choices` | `list_framework_choices(include_unavailable=True)` |
+| `praisonai doctor` `agents.yaml` `framework:` field check | `list_framework_choices(include_unavailable=True)` |
+| Missing-framework error → install hint | adapter's own `install_hint` (falls back to `pip install 'praisonai[<name>]'`) |
+
+The single source of truth is `praisonai.framework_adapters.list_framework_choices()`. When `include_unavailable=False` (the default) only adapters whose `is_available()` returns `True` are returned; the CLI uses `include_unavailable=True` so users see every registered framework and get a friendly error if its dependencies are missing.
+
+### Declaring an install hint
+
+Surface a tailored install command for your adapter so users don't see the generic fallback:
+
+```python
+class MyFrameworkAdapter:
+    name = "myframework"
+    install_hint = 'pip install "myframework-praisonai[gpu]"'
+
+    def is_available(self) -> bool: ...
+    def run(self, config, llm_config, topic, *, tools_dict=None,
+            agent_callback=None, task_callback=None, cli_config=None): ...
+    def cleanup(self) -> None: ...
+```
+
+When `myframework` is selected but not installed, the CLI now raises:
+
+```
+ImportError: 'myframework' was requested but is not installed.
+Install with: pip install "myframework-praisonai[gpu]"
+```
+
+If you omit `install_hint`, the wrapper falls back to `pip install 'praisonai[myframework]'`.
+
+### Missing optional dependencies no longer leak
+
+`FrameworkAdapterRegistry.is_available()` now catches `ImportError` raised when an adapter's constructor touches a missing optional dependency, alongside the existing `ValueError`/`TypeError`. A plugin with unmet deps reports as unavailable rather than crashing the CLI list, the doctor check, or `pick_default()`.
+
+---
+
+## Helpers exposed at the package root
+
+```python
+from praisonai.framework_adapters import (
+    list_framework_choices,   # canonical name list (sorted, optionally filtered to available)
+    get_install_hint,         # adapter-declared hint, or fallback
+    get_default_registry,
+)
+```
 
 ---
 
@@ -196,7 +314,7 @@ A family adapter routes to a concrete sibling adapter based on environment or co
 import os
 import logging
 from typing import Dict, Any, Optional
-from praisonai.framework_adapters.base import BaseFrameworkAdapter
+from praisonaiagents import BaseFrameworkAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +406,8 @@ def resolve(self, *, config: Optional[Dict[str, Any]] = None) -> "FrameworkAdapt
 **Worked example — `AutoGenAdapter.resolve`:** the orchestrator passes YAML config; the adapter instantiates siblings directly:
 
 ```python
+from praisonaiagents import BaseFrameworkAdapter
+
 def resolve(self, *, config: Optional[Dict[str, Any]] = None) -> "BaseFrameworkAdapter":
     version = "auto"
     if config and config.get("autogen_version"):
@@ -351,10 +471,10 @@ sequenceDiagram
 
 ```python
 from typing import Any, Callable, Dict, List, Optional
+from praisonaiagents import BaseFrameworkAdapter
 from praisonai.framework_adapters.registry import get_default_registry
-from praisonai.framework_adapters.base import FrameworkAdapter
 
-class CustomCrewAIAdapter:
+class CustomCrewAIAdapter(BaseFrameworkAdapter):
     name = "crewai"
 
     def is_available(self) -> bool:
@@ -391,7 +511,7 @@ registry.register("crewai", CustomCrewAIAdapter)
 ```python
 import subprocess
 from typing import Any, Callable, Dict, List, Optional
-from praisonai.framework_adapters.base import BaseFrameworkAdapter
+from praisonaiagents import BaseFrameworkAdapter
 
 class NonPythonAdapter(BaseFrameworkAdapter):
     name = "external_framework"
@@ -426,7 +546,7 @@ class NonPythonAdapter(BaseFrameworkAdapter):
 ```python
 import logging
 from typing import Any, Callable, Dict, List, Optional
-from praisonai.framework_adapters.base import BaseFrameworkAdapter
+from praisonaiagents import BaseFrameworkAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -525,7 +645,7 @@ Log framework events for debugging:
 
 ```python
 import logging
-from praisonai.framework_adapters.base import BaseFrameworkAdapter
+from praisonaiagents import BaseFrameworkAdapter
 
 class LoggingAdapter(BaseFrameworkAdapter):
     def __init__(self):
@@ -599,11 +719,42 @@ def is_available(self) -> bool:
     return check_availability("myframework")  # cached, uses importlib.util.find_spec
 ```
 
-The `is_available()` method is called on every CLI startup and framework probe. Full imports here cause multi-second delays. The centralized availability check uses cached `importlib.util.find_spec` for fast, repeated checks.
-
 </Accordion>
 
 </AccordionGroup>
+
+---
+
+## Registry Helpers
+
+Registry-level helpers for building CLIs and plugins:
+
+```python
+from praisonai.framework_adapters.registry import (
+    list_framework_choices,
+    list_available_frameworks,
+    get_install_hint,
+)
+```
+
+| Helper | Returns | Use case |
+|---|---|---|
+| `list_framework_choices(*, include_unavailable=False)` | `list[str]` | Build the CLI `--framework` choice list (registered adapters; pass `include_unavailable=True` for the full list) |
+| `list_available_frameworks()` | `list[str]` | Filter to just those whose `is_available()` returns `True` |
+| `get_install_hint(name)` | `str` | Adapter-aware install hint string (e.g. `pip install 'praisonai[autogen]'`) |
+| `framework_option_help()` | `str` | Auto-generated `--help` text for the `--framework` flag |
+
+```python
+from praisonai.framework_adapters.registry import list_framework_choices, get_install_hint
+
+# See which frameworks appear in --framework choices
+choices = list_framework_choices()
+print(choices)  # ['crewai', 'praisonai', 'autogen', 'my_framework']
+
+# Get install instructions for a missing framework
+hint = get_install_hint("crewai")
+print(hint)  # pip install 'praisonai[crewai]'
+```
 
 ---
 
@@ -661,6 +812,8 @@ default = registry.pick_default()  # returns your plugin adapter name
 
 <Note>
 The `praisonaiagents → praisonai` rename is reflected in `DEFAULT_PRIORITY` — the tuple uses `"praisonai"`, not `"praisonaiagents"`. Any YAML or code that relied on the old probe tuple `("crewai", "praisonaiagents", "autogen", "ag2")` now uses `pick_default()` instead.
+
+The static fallback list used by the CLI only when the adapter layer itself cannot be imported is `["ag2", "autogen", "crewai", "praisonai"]` (alphabetical) — `ag2` is a first-class member of this canonical list.
 </Note>
 
 ---
@@ -737,7 +890,7 @@ Your code can still ignore the values — the signature just needs to accept the
 
 <Accordion title="My adapter disappeared from the available frameworks list">
 
-If `praisonai --list-frameworks` (or `registry.list_names()`) no longer shows your adapter, run `registry.is_available("<your-adapter-name>")`. Since PR #2083, `is_available()` catches `TypeError` from the new protocol validator and returns `False` rather than raising — so a malformed plugin is silently filtered out of the available list. Check the application logs for the `TypeError` message above and fix the `run()` signature.
+If `praisonai --list-frameworks` (or `registry.list_names()`) no longer shows your adapter, run `registry.is_available("<your-adapter-name>")`. Since PR #2083, `is_available()` catches `TypeError` from the new protocol validator and returns `False` rather than raising — so a malformed plugin is silently filtered out of the available list. Since PR #2415, `is_available()` also catches `ImportError` raised during adapter construction (e.g., when the adapter's `__init__` touches an optional dependency). Check the application logs for the error message above and fix the `run()` signature or ensure your dependencies are properly guarded.
 
 </Accordion>
 </AccordionGroup>
@@ -752,5 +905,8 @@ If `praisonai --list-frameworks` (or `registry.list_names()`) no longer shows yo
 </Card>
 <Card title="CrewAI Integration" icon="users" href="/docs/framework/crewai">
   See how built-in framework adapters are implemented
+</Card>
+<Card title="Workflow YAML Framework Field" icon="diagram-project" href="/docs/features/workflow-yaml-framework-field">
+  How framework: works in workflow YAML vs agents.yaml
 </Card>
 </CardGroup>

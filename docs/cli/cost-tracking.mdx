@@ -16,6 +16,25 @@ The cost tracking system monitors:
 - **Session statistics** - Aggregated stats across requests
 - **Model breakdown** - Usage per model
 
+## Per-session totals
+
+After every `praisonai run` with an active session, a compact footer prints to stdout:
+
+```bash
+praisonai run "Refactor auth.py" --session refactor
+# → 1,240 in / 3,980 out · $0.0140
+
+praisonai session list
+# → Tokens/Cost columns now populated
+
+praisonai run "and add tests" --continue --session refactor
+# → totals accumulate, not reset
+```
+
+Totals persist in session metadata and survive resume. Multi-model runs are priced per-model — each call is priced against its own model via `get_pricing(model)`, then summed. The footer is silenced under `--output json`.
+
+---
+
 ## Quick Start
 
 ```bash
@@ -246,6 +265,65 @@ DEFAULT_PRICING["my-custom-model"] = ModelPricing(
 tracker.track_request("my-custom-model", 1000, 500)
 ```
 
+## Per-session persistence
+
+Usage is now accumulated into the session metadata at `~/.praisonai/sessions/<id>.json` under a `usage` blob, so costs persist across terminal sessions and are visible in `praisonai session list`.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as praisonai CLI
+    participant Agent
+    participant Store as Session store
+
+    User->>CLI: praisonai run "task" (session active)
+    CLI->>Agent: agent.start(...)
+    Agent-->>CLI: response + per-call usage
+    CLI->>Store: accumulate_session_usage(session_id, model)
+    Store-->>CLI: merged cumulative usage
+    CLI-->>User: response + "1,240 in / 3,980 out · $0.0140"
+    Note over User: later...
+    User->>CLI: praisonai run --continue
+    CLI->>Store: read_session_usage(session_id)
+    Store-->>CLI: cumulative totals
+    CLI-->>User: resume panel with "Usage:" line
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef cli fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef agent fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+```
+
+**How it works:**
+
+- After each run, `accumulate_session_usage` merges the new per-call usage from `praisonaiagents.telemetry.token_collector` into the session file.
+- The `token_collector` is then **reset** to avoid double-counting on the next run.
+- Pricing comes from `cli/features/cost_tracker.get_pricing(model)` — the same model price table used by `/cost`.
+- Resuming with `praisonai run --continue` or `praisonai run --session <id>` rehydrates `RehydratedSession.usage` so the cumulative totals continue accumulating.
+
+**Sessions stored in the global store** (created via the gateway or TUI) are handled transparently — `_resolve_usage_store` prefers whichever record already carries `usage`, so resuming a globally-stored session keeps accumulating into the original record.
+
+**Persisted `usage` blob keys:**
+
+| Key | Type | Notes |
+|---|---|---|
+| `input_tokens` | `int` | Cumulative prompt tokens |
+| `output_tokens` | `int` | Cumulative completion tokens |
+| `cached_tokens` | `int` | Cumulative cached / prefix-hit tokens (when the provider reports them) |
+| `total_tokens` | `int` | `input + output` (cached not double-counted); mirrored to flat `total_tokens` on session metadata |
+| `cost` | `float` | USD; mirrored to flat `cost` on session metadata |
+| `requests` | `int` | Count of `agent.start()` runs that produced usage |
+
+```bash
+# View current session costs
+praisonai session list
+
+ID         Name            Status   Events  Tokens   Cost     Updated
+abc12345   research-bot    active   12      12,345   $0.0140  2026-06-29 23:48 UTC
+```
+
+Cross-link: see [Session](/docs/cli/session) for the full `session list` column reference and [Run](/docs/cli/run) for the per-run usage footer.
+
 ## Scheduler Integration
 
 `AgentScheduler` and `AsyncAgentScheduler` price every run through `ModelPricing` (since [PR #2171](https://github.com/MervinPraison/PraisonAI/pull/2171)). Any model you register here becomes spendable from the scheduler's `max_cost` brake:
@@ -360,3 +438,5 @@ export PRAISONAI_PRICING_FILE=/path/to/pricing.json
 - [Slash Commands](/docs/cli/slash-commands) - Use `/cost` command
 - [Metrics](/docs/cli/metrics) - Detailed performance metrics
 - [Telemetry](/docs/cli/telemetry) - Usage analytics
+- [Session](/docs/cli/session) - Per-session token and cost columns in `session list`
+- [Run](/docs/cli/run) - Per-run usage footer after each prompt
