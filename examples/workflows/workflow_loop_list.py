@@ -4,8 +4,7 @@ Workflow Loop with List Example
 Demonstrates iterating over a list of items, processing each one.
 """
 
-from praisonaiagents import AgentFlow, WorkflowContext, StepResult
-from praisonaiagents.workflows import loop
+from praisonaiagents import AgentFlow, WorkflowContext, StepResult, loop
 
 # Sample data
 fruits = ["apple", "banana", "cherry", "date", "elderberry"]

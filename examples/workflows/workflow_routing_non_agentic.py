@@ -5,8 +5,7 @@ Demonstrates decision-based routing where the workflow
 takes different paths based on the output of a decision step.
 """
 
-from praisonaiagents import AgentFlow, WorkflowContext, StepResult
-from praisonaiagents.workflows import route
+from praisonaiagents import AgentFlow, WorkflowContext, StepResult, route
 
 # Decision maker - determines which route to take
 def classify_request(ctx: WorkflowContext) -> StepResult:
