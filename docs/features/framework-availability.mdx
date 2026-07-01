@@ -5,6 +5,14 @@ description: "Thread-safe, cached framework availability checking for PraisonAI 
 icon: "check-circle"
 ---
 
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="framework-agent", instructions="Check available framework integrations.")
+agent.start("Which frameworks are available in this PraisonAI installation?")
+```
+
+
 Check whether optional frameworks and dependencies are installed before you run agents or YAML workflows.
 
 ```python
@@ -14,6 +22,52 @@ from praisonai import PraisonAI
 praison = PraisonAI(agent_file="agents.yaml")
 praison.run()
 ```
+
+## Dynamic Framework Discovery
+
+`praisonai --framework` choices and `praisonai doctor` framework validation are both driven by the adapter registry — not a hardcoded list. Any pip-installed third-party adapter registered under the `praisonai.framework_adapters` entry-point group appears automatically in `--help` and passes the doctor check.
+
+```bash
+# After pip install praisonai-langgraph, langgraph appears automatically:
+$ praisonai --framework langgraph agents.yaml
+
+# praisonai doctor also accepts it:
+$ praisonai doctor
+✓ agents.yaml framework='langgraph' is a registered adapter
+```
+
+Two registration paths feed the registry:
+
+1. **Built-ins** — `praisonai`, `crewai`, `autogen`, `ag2` are registered at import time.
+2. **Third-party entry points** — packages that declare `praisonai.framework_adapters` entries are discovered automatically. See [Framework Adapter Plugins](/docs/features/framework-adapter-plugins) for how to author and register a plugin.
+
+```mermaid
+graph LR
+    subgraph "Adapter discovery"
+        Reg[Adapter Registry]
+        EP[Entry-point group<br/>praisonai.framework_adapters]
+        Built[Built-ins<br/>praisonai / crewai / autogen]
+        CLI[praisonai --framework choices]
+        Doc[praisonai doctor validation]
+        Hint[Install-hint messages]
+    end
+
+    Built --> Reg
+    EP --> Reg
+    Reg --> CLI
+    Reg --> Doc
+    Reg --> Hint
+
+    classDef reg fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef src fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef out fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Reg reg
+    class Built,EP src
+    class CLI,Doc,Hint out
+```
+
+Install-hint messages for missing frameworks also come from each adapter's own `install_hint` attribute via `get_install_hint()`, so third-party adapters can ship accurate instructions (e.g. `pip install praisonai-langgraph`).
 
 ```mermaid
 graph LR
@@ -59,7 +113,7 @@ from praisonai._framework_availability import is_available
 if is_available("crewai"):
     print("CrewAI is installed")
 
-frameworks = ["autogen", "autogen_v4", "crewai", "ag2", "agno"]
+frameworks = ["autogen", "autogen_v4", "crewai", "ag2", "langgraph"]
 available = [fw for fw in frameworks if is_available(fw)]
 print(f"Available: {available}")
 ```
@@ -88,12 +142,12 @@ The following framework names are supported:
 | `autogen` | `importlib.util.find_spec("autogen")` | AutoGen v0.2 package |
 | `autogen_v4` | `find_spec("autogen_agentchat")` + `find_spec("autogen_ext")` | AutoGen v0.4 packages |
 | `ag2` | Distribution + namespace check | See AG2 Detection below |
-| `agno` | Three-step probe: `dist("agno")` → `find_spec("agno")` → `from agno.agent import Agent` | Install: `pip install "praisonai-frameworks[agno]>=0.1.6"` |
 | `praisonaiagents` | `import praisonaiagents` | PraisonAI agents framework |
 | `praisonai_tools` | `import praisonai_tools` | PraisonAI tools package |
 | `agentops` | `import agentops` | AgentOps observability |
 | `litellm` | `import litellm` | LiteLLM package |
 | `openai` | `import openai` | OpenAI Python client |
+| `langgraph` | `importlib.util.find_spec("langgraph.prebuilt")` | Guarded against import-time errors; wrapper adapter ships separately in `praisonai-frameworks[langgraph]` |
 | `chromadb` | `importlib.util.find_spec("chromadb")` | Vector store backend; used by `ChromaVectorStore` |
 | `pinecone` | `importlib.util.find_spec("pinecone")` | Vector store backend; used by `PineconeVectorStore` |
 | `qdrant_client` | `importlib.util.find_spec("qdrant_client")` | Vector store backend |
@@ -103,6 +157,10 @@ Vector store backends use the same centralized probe registry — `praisonai.ada
 
 <Note>
 `autogen_v2` is an **adapter name** registered in `FrameworkAdapterRegistry`, not a probe name in `_framework_availability`. The probe name remains `autogen` (it imports the `autogen` v0.2 package). Use the adapter's `.is_available()` method to test whether a specific adapter will dispatch successfully — it folds in the `implemented` marker.
+</Note>
+
+<Note>
+`autogen_v4` and `ag2` are **not in the built-in adapter registry** by default. `praisonai doctor` and `praisonai --framework` only list them when registered via an entry-point plugin. Raw package installation alone (e.g. `pip install autogen-agentchat`) does not cause them to appear.
 </Note>
 
 ---
@@ -115,11 +173,17 @@ Two distinct concepts affect whether an AutoGen-family adapter will actually wor
 |---|---|
 | "Is the underlying package importable?" | `is_available("autogen")` from `_framework_availability` |
 | "Will calling `adapter.run(...)` actually work?" | `AutoGenV4Adapter().is_available()` (folds `implemented` flag) |
+| "Is the adapter registered AND available?" | `registry.is_available("autogen_v4")` |
 
 For AutoGen v0.4 and AG2 today: the package may import successfully, but the adapter still reports `False` because `implemented = False`. This is the safety-by-default behaviour added in PR #2086.
 
+`praisonai doctor` and `--framework` choices now use `registry.is_available(name)` — not raw package probes — for `autogen_v4` and `ag2`. This means installing `autogen-agentchat` alone will **not** flip them to available unless the adapter is also registered. Since `autogen_v4` and `ag2` adapters are unregistered stubs by default (excluded from `_BUILTIN_ADAPTERS`), they only appear in `doctor` and `--framework` when registered via an entry-point plugin.
+
 ```python
 from praisonai._framework_availability import is_available
+from praisonai.framework_adapters.registry import get_default_registry
+
+registry = get_default_registry()
 
 # Package-level check: is the v0.4 package installed?
 pkg_available = is_available("autogen_v4")  # True if autogen-agentchat is installed
@@ -128,8 +192,11 @@ pkg_available = is_available("autogen_v4")  # True if autogen-agentchat is insta
 from praisonai.framework_adapters.autogen_adapter import AutoGenV4Adapter
 adapter_available = AutoGenV4Adapter().is_available()  # False — implemented = False
 
-# pkg_available may be True while adapter_available is False
-# Always use adapter.is_available() to test dispatch-readiness
+# Registry-level check: what doctor and --framework choices use
+registry_available = registry.is_available("autogen_v4")  # False — not in builtin registry
+
+# pkg_available may be True while adapter_available and registry_available are False
+# Always use registry.is_available() to test whether --framework will list an adapter
 ```
 
 ---
@@ -290,5 +357,8 @@ For default framework selection, call `FrameworkAdapterRegistry.pick_default()` 
   </Card>
   <Card title="AutoGen Framework" icon="robot" href="/docs/framework/autogen">
     AutoGen framework integration
+  </Card>
+  <Card title="LangGraph Framework" icon="diagram-project" href="/docs/framework/langgraph">
+    LangGraph framework integration
   </Card>
 </CardGroup>

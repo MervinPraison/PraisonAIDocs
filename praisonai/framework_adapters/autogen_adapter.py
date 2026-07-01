@@ -16,7 +16,7 @@ class AutoGenAdapter(BaseFrameworkAdapter):
     """Adapter for AutoGen v0.2 framework with version resolution."""
     
     name = "autogen_v2"  # Changed from "autogen" to "autogen_v2" per PR fix
-    install_hint = 'pip install "praisonai[autogen]"'  # v0.2 only
+    install_hint = 'pip install "praisonai-frameworks[autogen]"'  # v0.2 only
     requires_tools_extra = True
     
     def is_available(self) -> bool:
@@ -62,7 +62,7 @@ class AutoGenAdapter(BaseFrameworkAdapter):
         # If we get here, neither version is available
         raise ImportError(
             f"AutoGen is not available. Version requested: {version}. "
-            f"Install with 'pip install praisonai[autogen]' for v0.2 or 'pip install praisonai[autogen-v4]' for v0.4"
+            f"Install with 'pip install praisonai-frameworks[autogen]' for v0.2 or 'pip install praisonai-frameworks[autogen-v4]' for v0.4"
         )
     
     def run(
@@ -111,37 +111,34 @@ class AutoGenAdapter(BaseFrameworkAdapter):
             }
         )
         
+        from ._config_builder import build_agent_specs
+
         agents = {}
         tasks = []
-        
-        # Create agents from config
-        for role, details in config.get('roles', {}).items():
-            agent_name = self._format_template(details['role'], topic=topic)
-            agent_goal = self._format_template(details['goal'], topic=topic)
-            
+
+        # Single canonical YAML -> spec conversion (shared across adapters)
+        specs = build_agent_specs(config, topic, tools_dict, self._format_template)
+
+        # Create agents from the normalized specs
+        for spec in specs:
             # Create AutoGen assistant agent
-            agents[role] = autogen.AssistantAgent(
-                name=agent_name,
+            agents[spec.key] = autogen.AssistantAgent(
+                name=spec.role,
                 llm_config=llm_config_dict,
-                system_message=self._format_template(details['backstory'], topic=topic) + 
+                system_message=spec.backstory +
                              ". Must Reply \"TERMINATE\" in the end when everything is done.",
             )
             
-            # Register tools if specified
-            if tools_dict and 'tools' in details:
-                for tool_name in details['tools']:
-                    if tool_name in tools_dict:
-                        # Register tool with the agent
-                        # This is a simplified approach - actual implementation may vary
-                        pass
+            # NOTE: AutoGen v0.2 tool/function registration (register_for_llm /
+            # register_for_execution) is intentionally not wired here yet — the
+            # resolved callables live on ``spec.tools``. Tracked separately so we
+            # don't ship a half-registration that silently no-ops.
             
             # Prepare tasks
-            for task_name, task_details in details.get('tasks', {}).items():
-                description_filled = self._format_template(task_details['description'], topic=topic)
-                
+            for task_spec in spec.tasks:
                 chat_task = {
-                    "recipient": agents[role],
-                    "message": description_filled,
+                    "recipient": agents[spec.key],
+                    "message": task_spec.description,
                     "summary_method": "last_msg",
                 }
                 tasks.append(chat_task)
@@ -152,21 +149,13 @@ class AutoGenAdapter(BaseFrameworkAdapter):
         
         logger.info("AutoGen v0.2 execution completed")
         return result
-    
-    def _format_template(self, template: str, **kwargs) -> str:
-        """Safely format template string with given kwargs."""
-        try:
-            return template.format(**kwargs)
-        except KeyError as e:
-            logger.warning(f"Missing placeholder {e} in template: {template}")
-            return template  # Return template as-is if formatting fails
 
 
 class AutoGenV4Adapter(BaseFrameworkAdapter):
     """Adapter for AutoGen v0.4 framework."""
     
     name = "autogen_v4"
-    install_hint = 'pip install "praisonai[autogen-v4]"'
+    install_hint = 'pip install "praisonai-frameworks[autogen-v4]"'
     requires_tools_extra = True
     implemented: bool = False  # explicit marker
     
@@ -213,7 +202,7 @@ class AG2Adapter(BaseFrameworkAdapter):
     """Adapter for AG2 framework."""
     
     name = "ag2"
-    install_hint = 'pip install "praisonai[ag2]"'
+    install_hint = 'pip install "praisonai-frameworks[ag2]"'
     requires_tools_extra = False
     implemented: bool = False  # explicit marker
     
@@ -263,7 +252,7 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
     """
 
     name = "autogen"
-    install_hint = 'pip install "praisonai[autogen]"'
+    install_hint = 'pip install "praisonai-frameworks[autogen]"'
     is_router = True
     
     def is_available(self) -> bool:
@@ -333,7 +322,7 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
                 return "autogen_v2"
             raise ImportError(
                 "AUTOGEN_VERSION=v0.2 was requested, but the AutoGen v0.2 adapter "
-                "is not available. Install with: pip install 'praisonai[autogen]'."
+                "is not available. Install with: pip install 'praisonai-frameworks[autogen]'."
             )
         elif requested == "v0.4":
             if v4_available:
@@ -341,7 +330,7 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
             raise ImportError(
                 "AUTOGEN_VERSION=v0.4 was requested, but the v0.4 adapter is not "
                 "registered or available. Install/register an autogen_v4 adapter "
-                "(pip install 'praisonai[autogen-v4]'), or unset AUTOGEN_VERSION "
+                "(pip install 'praisonai-frameworks[autogen-v4]'), or unset AUTOGEN_VERSION "
                 "to use auto-selection."
             )
         elif requested == "ag2":
@@ -350,7 +339,7 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
             raise ImportError(
                 "AUTOGEN_VERSION=ag2 was requested, but the AG2 adapter is not "
                 "registered or available. Install/register an AG2 adapter "
-                "(pip install 'praisonai[ag2]'), or unset AUTOGEN_VERSION to use "
+                "(pip install 'praisonai-frameworks[ag2]'), or unset AUTOGEN_VERSION to use "
                 "auto-selection."
             )
 
@@ -365,9 +354,9 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
         # Nothing selectable.
         raise ImportError(
             "No runnable AutoGen variant is available. Install with:\n"
-            "  pip install 'praisonai[autogen]' for v0.2\n"
-            "  pip install 'praisonai[autogen-v4]' for v0.4\n"
-            "  pip install 'praisonai[ag2]' for AG2"
+            "  pip install 'praisonai-frameworks[autogen]' for v0.2\n"
+            "  pip install 'praisonai-frameworks[autogen-v4]' for v0.4\n"
+            "  pip install 'praisonai-frameworks[ag2]' for AG2"
         )
     
     def resolve(self, *, config: Optional[Dict[str, Any]] = None) -> "BaseFrameworkAdapter":
