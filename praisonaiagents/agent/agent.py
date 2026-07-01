@@ -306,6 +306,22 @@ class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin
         """Lazy-create LLM instance from deferred init params (avoids import at Agent())."""
         if self._llm_instance is not None:
             return self._llm_instance
+        if self._panel_descriptor is not None:
+            try:
+                from ..llm.panel import create_panel_llm
+                # Forward the same Agent-level connection/execution settings a
+                # normal model selection preserves (base_url, api_key, auth,
+                # metrics, max_iter, web_search, web_fetch, prompt_caching,
+                # claude_memory) so the panel aggregator behaves identically.
+                self._llm_instance = create_panel_llm(
+                    self._panel_descriptor, **self._panel_llm_kwargs
+                )
+            except ImportError as e:
+                raise ImportError(
+                    "LLM features requested but dependencies not installed. "
+                    "Please install with: pip install \"praisonaiagents[llm]\""
+                ) from e
+            return self._llm_instance
         if self._llm_init_params:
             try:
                 from ..llm.llm import LLM
@@ -1578,6 +1594,8 @@ class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin
         self._using_custom_llm = False
         self._llm_instance = None
         self._llm_init_params = None
+        self._panel_descriptor = None
+        self._panel_llm_kwargs = {}
         # Flag to track if final result has been displayed to prevent duplicates
         self._final_display_shown = False
         
@@ -1645,8 +1663,38 @@ class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin
         self.base_url = base_url
         self.api_key = api_key
 
+        # Panel (multi-model) descriptor: "panel:<name>" or {"provider": "panel"}.
+        # Resolved lazily into a PanelLLM; composes with the normal tool loop.
+        # Detected inline (no heavy import) to keep Agent() construction lazy.
+        _is_panel = (
+            (isinstance(llm, str) and llm.startswith("panel:"))
+            or (isinstance(llm, dict) and llm.get("provider") == "panel")
+        )
+        if _is_panel:
+            self._panel_descriptor = llm
+            self._using_custom_llm = True
+            self.llm = llm if isinstance(llm, str) else "panel"
+            # Capture the same connection/execution options the normal LLM paths
+            # forward, so the panel aggregator (and references) behave identically
+            # to a regular model selection. Stored now because some (e.g. auth)
+            # are not retained as Agent attributes.
+            self._panel_llm_kwargs = {
+                k: v
+                for k, v in (
+                    ("base_url", base_url),
+                    ("api_key", api_key),
+                    ("auth", auth),
+                    ("metrics", metrics),
+                    ("max_iter", max_iter),
+                    ("web_search", web_search),
+                    ("web_fetch", web_fetch),
+                    ("prompt_caching", prompt_caching),
+                    ("claude_memory", claude_memory),
+                )
+                if v is not None
+            }
         # If base_url is provided, defer custom LLM instance creation
-        if base_url:
+        elif base_url:
             if isinstance(llm, dict):
                 llm_config = llm.copy()
                 llm_config['base_url'] = base_url
@@ -2669,10 +2717,40 @@ Summary:"""
             from ..skills import SkillManager
             self._skill_manager = SkillManager()
 
-            # Add explicit skill paths
+            # Discover bundles so '@bundle' selectors in self._skills can be
+            # expanded into their member skill names before injection. Honour
+            # the configured discovery scope: only fall back to default skill
+            # dirs when auto_discover is enabled or no explicit dirs are set.
+            try:
+                self._skill_manager.discover_bundles(
+                    self._skills_dirs,
+                    include_defaults=auto_discover or not self._skills_dirs,
+                )
+            except Exception as e:  # noqa: BLE001 - bundles are optional
+                logging.debug("Bundle discovery skipped: %s", e)
+
+            # Add explicit skill selectors. '@bundle' entries expand to their
+            # member skill names (resolved by name against discovered skills);
+            # plain paths pass through unchanged and load directly. Member
+            # discovery honours the configured scope (only fall back to default
+            # skill dirs when auto_discover is on), and a missing member is
+            # logged so a typo'd bundle entry is not silently dropped.
             if self._skills:
-                for skill_path in self._skills:
-                    self._skill_manager.add_skill(skill_path)
+                from ..skills.bundles import is_bundle_selector
+                for selector in self._skills:
+                    if is_bundle_selector(selector):
+                        for member in self._skill_manager.resolve([selector]):
+                            loaded = self._skill_manager.add_skill_by_name(
+                                member, self._skills_dirs,
+                                include_defaults=auto_discover,
+                            )
+                            if loaded is None:
+                                logging.warning(
+                                    "Skill bundle member '%s' (from '%s') not "
+                                    "found; skipping.", member, selector,
+                                )
+                    else:
+                        self._skill_manager.add_skill(selector)
 
             # Discover skills from directories; honour SkillsConfig.auto_discover
             # by falling back to default locations when requested.
@@ -4118,77 +4196,6 @@ Summary:"""
     # -------------------------------------------------------------------------
     #                     Runtime Capability Management
     # -------------------------------------------------------------------------
-    
-    def _resolve_runtime_config(self, runtime):
-        """Resolve runtime configuration parameter.
-        
-        Args:
-            runtime: Runtime parameter (bool, str, dict, or RuntimeConfig)
-            
-        Returns:
-            RuntimeConfig instance or None
-        """
-        try:
-            from ..config import resolve_runtime
-            return resolve_runtime(runtime)
-        except ImportError:
-            raise ImportError(
-                "Runtime capability features requested but configuration not available. "
-                "This should not happen in a properly installed praisonaiagents package."
-            )
-    
-    def _validate_runtime_capabilities(self):
-        """Validate that current runtime supports required capabilities.
-        
-        Performs fail-fast validation of runtime capabilities against
-        agent requirements at config/creation time.
-        
-        Raises:
-            CapabilityValidationError: If validation fails
-        """
-        if not self._runtime_config or not self._runtime_config.required_capabilities:
-            return  # No requirements to validate
-        
-        try:
-            from ..runtime import RuntimeCapability, validate_capabilities, get_native_runtime_capabilities
-            
-            # Convert string capability names to enum values
-            required_set = set()
-            for cap in self._runtime_config.required_capabilities:
-                if isinstance(cap, str):
-                    # Convert string to enum value
-                    cap_upper = cap.upper()
-                    if hasattr(RuntimeCapability, cap_upper):
-                        required_set.add(getattr(RuntimeCapability, cap_upper))
-                    else:
-                        raise ValueError(f"Unknown capability: {cap}")
-                else:
-                    # Assume it's already a RuntimeCapability enum
-                    required_set.add(cap)
-            
-            # Get the actual runtime capabilities based on the selected runtime
-            runtime_name = self._runtime_config.preferred_runtime or "native"
-            
-            # Determine which capability matrix to use based on runtime type
-            if runtime_name in ["native", "praisonai"]:
-                runtime_matrix = get_native_runtime_capabilities()
-            elif runtime_name in ["plugin", "harness", "reduced", "plugin-harness", "claude-code"]:
-                # Use reduced capabilities for plugin/harness runtimes
-                from praisonaiagents.runtime.capabilities import get_reduced_harness_capabilities
-                runtime_matrix = get_reduced_harness_capabilities()
-            else:
-                # For unknown runtimes, use reduced capabilities as safe default
-                from praisonaiagents.runtime.capabilities import get_reduced_harness_capabilities
-                runtime_matrix = get_reduced_harness_capabilities()
-            
-            # Perform validation
-            validate_capabilities(runtime_matrix, required_set, runtime_name)
-            
-        except ImportError:
-            raise ImportError(
-                "Runtime capability validation requested but runtime module not available. "
-                "This should not happen in a properly installed praisonaiagents package."
-            )
     
     def _run_verification_hooks(self) -> List[Dict[str, Any]]:
         """Run all registered verification hooks.
