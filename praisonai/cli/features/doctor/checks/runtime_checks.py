@@ -59,6 +59,27 @@ class RuntimeCompatibilityChecker:
             from praisonai._framework_availability import is_available
         except ImportError:
             is_available = lambda x: False
+
+        # Adapter-aware availability: a runtime is only "usable" if its adapter
+        # is both installed AND implemented/registered. This keeps `doctor` in
+        # sync with the registry-backed `--framework` choices so it never
+        # reports a runtime as available when the matching framework cannot run
+        # (e.g. unimplemented AutoGen v0.4 / AG2 entry-point placeholders).
+        def _runtime_usable(framework_name: str, package_name: str) -> bool:
+            try:
+                from praisonai.framework_adapters.registry import get_default_registry
+            except ImportError:
+                # Fallback to raw package probe only when the registry module
+                # itself cannot be imported (e.g. partial install).
+                return is_available(package_name)
+
+            registry = get_default_registry()
+            # When the registry is the source of truth, an unregistered
+            # framework is not runnable even if its packages are installed,
+            # so doctor stays consistent with the `--framework` choices.
+            if framework_name not in registry.list_names():
+                return False
+            return registry.is_available(framework_name)
         
         # PraisonAI Agents runtime
         runtimes['praisonai'] = RuntimeInfo(
@@ -105,11 +126,11 @@ class RuntimeCompatibilityChecker:
             supports_tool_loop=True
         )
         
-        # AutoGen v0.4 runtime
+        # AutoGen v0.4 runtime (optional entry-point adapter)
         runtimes['autogen_v4'] = RuntimeInfo(
             id='autogen_v4',
             name='AutoGen v0.4',
-            available=is_available('autogen') and self._check_autogen_v4(),
+            available=_runtime_usable('autogen_v4', 'autogen_v4'),
             capabilities=[
                 RuntimeCapability('agent_creation', 'Create and manage agents'),
                 RuntimeCapability('tool_execution', 'Execute tools and functions'),
@@ -119,14 +140,66 @@ class RuntimeCompatibilityChecker:
             supports_tool_loop=True
         )
         
-        # AG2 runtime
+        # AG2 runtime (optional entry-point adapter)
         runtimes['ag2'] = RuntimeInfo(
             id='ag2',
             name='AG2 (AutoGen Next)',
-            available=is_available('ag2'),
+            available=_runtime_usable('ag2', 'ag2'),
             capabilities=[
                 RuntimeCapability('agent_creation', 'Create and manage agents'),
                 RuntimeCapability('tool_execution', 'Execute tools and functions'),
+            ],
+            supports_handoff=False,
+            supports_tool_loop=True
+        )
+
+        runtimes['langgraph'] = RuntimeInfo(
+            id='langgraph',
+            name='LangGraph',
+            available=_runtime_usable('langgraph', 'langgraph'),
+            capabilities=[
+                RuntimeCapability('agent_creation', 'Create and manage agents'),
+                RuntimeCapability('tool_execution', 'Execute tools and functions'),
+                RuntimeCapability('sequential_execution', 'Sequential task execution'),
+            ],
+            supports_handoff=False,
+            supports_tool_loop=True
+        )
+
+        runtimes['openai_agents'] = RuntimeInfo(
+            id='openai_agents',
+            name='OpenAI Agents SDK',
+            available=_runtime_usable('openai_agents', 'openai_agents'),
+            capabilities=[
+                RuntimeCapability('agent_creation', 'Create and manage agents'),
+                RuntimeCapability('tool_execution', 'Execute tools and functions'),
+                RuntimeCapability('handoff_support', 'Agent-to-agent handoffs', required=False),
+            ],
+            supports_handoff=True,
+            supports_tool_loop=True
+        )
+
+        runtimes['agno'] = RuntimeInfo(
+            id='agno',
+            name='Agno',
+            available=_runtime_usable('agno', 'agno'),
+            capabilities=[
+                RuntimeCapability('agent_creation', 'Create and manage agents'),
+                RuntimeCapability('tool_execution', 'Execute tools and functions'),
+                RuntimeCapability('sequential_execution', 'Sequential task execution'),
+            ],
+            supports_handoff=False,
+            supports_tool_loop=True
+        )
+
+        runtimes['google_adk'] = RuntimeInfo(
+            id='google_adk',
+            name='Google ADK',
+            available=_runtime_usable('google_adk', 'google_adk'),
+            capabilities=[
+                RuntimeCapability('agent_creation', 'Create and manage agents'),
+                RuntimeCapability('tool_execution', 'Execute tools and functions'),
+                RuntimeCapability('sequential_execution', 'Sequential task execution'),
             ],
             supports_handoff=False,
             supports_tool_loop=True
@@ -135,11 +208,10 @@ class RuntimeCompatibilityChecker:
         return runtimes
     
     def _check_autogen_v4(self) -> bool:
-        """Check if AutoGen v0.4+ is available."""
+        """Check if AutoGen v0.4+ packages are installed."""
         try:
-            import autogen
-            version = getattr(autogen, '__version__', '0.0.0')
-            return version.startswith(('0.4', '0.5'))
+            from praisonai._framework_availability import is_available as fw_available
+            return fw_available('autogen_v4')
         except ImportError:
             return False
     
@@ -357,7 +429,7 @@ class RuntimeCompatibilityChecker:
                     status=CheckStatus.FAIL,
                     message=f"Agent '{agent.role_name}' configured for handoffs but runtime '{runtime_info.name if runtime_info else agent.resolved_runtime}' doesn't support handoffs",
                     details=f"Handoff targets: {', '.join(agent.handoff_targets)}",
-                    remediation="Use praisonai or autogen_v4 framework for handoff support",
+                    remediation="Use praisonai, autogen_v4, or openai_agents framework for handoff support",
                     severity=CheckSeverity.HIGH
                 )
                 continue
@@ -410,7 +482,7 @@ class RuntimeCompatibilityChecker:
         handoff_agents = [a for a in agents if a.handoff_targets]
         if handoff_agents:
             handoff_runtimes = {a.resolved_runtime for a in handoff_agents}
-            incompatible_handoff_runtimes = handoff_runtimes - {'praisonai', 'autogen_v4'}
+            incompatible_handoff_runtimes = handoff_runtimes - {'praisonai', 'autogen_v4', 'openai_agents'}
             
             if incompatible_handoff_runtimes:
                 yield CheckResult(
@@ -419,8 +491,8 @@ class RuntimeCompatibilityChecker:
                     category=CheckCategory.CONFIG,
                     status=CheckStatus.FAIL,
                     message=f"Handoffs configured with incompatible runtimes: {', '.join(incompatible_handoff_runtimes)}",
-                    details="Only praisonai and autogen_v4 runtimes support handoffs",
-                    remediation="Use praisonai or autogen_v4 for agents that need handoff capabilities",
+                    details="Only praisonai, autogen_v4, and openai_agents runtimes support handoffs",
+                    remediation="Use praisonai, autogen_v4, or openai_agents for agents that need handoff capabilities",
                     severity=CheckSeverity.HIGH
                 )
 

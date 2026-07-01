@@ -56,9 +56,27 @@ from .protocols import (
     DrainDecision,
     GatewayDrainPolicyProtocol,
     DrainTimeoutPolicy,
+    # Gateway inbound admission control (Issue #2454)
+    AdmissionDecision,
+    GatewayConcurrencyPolicyProtocol,
+    GatewayConcurrencyPolicy,  # backward-compat alias
+    ConcurrencyLimitPolicy,
     # Port-less, restart-safe external drain trigger (Issue #2390)
     current_epoch,
     DrainMarkerPolicy,
+    # Crash / shutdown forensics (Issue #2436)
+    ShutdownForensicsProtocol,
+    format_forensics_for_log,
+    is_supervised,
+    drain_timeout_has_headroom,
+    # Code-skew guard for hot operations (Issue #2460)
+    detect_code_skew,
+    # Restart-intent exit-code protocol (Issue #2437)
+    GATEWAY_OK_EXIT_CODE,
+    GATEWAY_RESTART_EXIT_CODE,
+    GATEWAY_FATAL_CONFIG_EXIT_CODE,
+    FatalConfigError,
+    classify_exit_reason,
     # Protocol version negotiation
     PROTOCOL_VERSION,
     MIN_PROTOCOL_VERSION,
@@ -67,6 +85,9 @@ from .protocols import (
     ProtocolHelloOk,
     GapInfo,
     ResumeSnapshot,
+    # Out-of-process platform-connector relay (Issue #2485)
+    CapabilityDescriptor,
+    RelayTransport,
 )
 from .hooks import (
     HookAction,
@@ -172,9 +193,27 @@ __all__ = [
     "DrainDecision",
     "GatewayDrainPolicyProtocol",
     "DrainTimeoutPolicy",
+    # Gateway inbound admission control (Issue #2454)
+    "AdmissionDecision",
+    "GatewayConcurrencyPolicyProtocol",
+    "GatewayConcurrencyPolicy",
+    "ConcurrencyLimitPolicy",
     # Port-less, restart-safe external drain trigger (Issue #2390)
     "current_epoch",
     "DrainMarkerPolicy",
+    # Crash / shutdown forensics (Issue #2436)
+    "ShutdownForensicsProtocol",
+    "format_forensics_for_log",
+    "is_supervised",
+    "drain_timeout_has_headroom",
+    # Code-skew guard for hot operations (Issue #2460)
+    "detect_code_skew",
+    # Restart-intent exit-code protocol (Issue #2437)
+    "GATEWAY_OK_EXIT_CODE",
+    "GATEWAY_RESTART_EXIT_CODE",
+    "GATEWAY_FATAL_CONFIG_EXIT_CODE",
+    "FatalConfigError",
+    "classify_exit_reason",
     # Protocol version negotiation
     "PROTOCOL_VERSION",
     "MIN_PROTOCOL_VERSION",
@@ -183,6 +222,9 @@ __all__ = [
     "ProtocolHelloOk",
     "GapInfo",
     "ResumeSnapshot",
+    # Out-of-process platform-connector relay (Issue #2485)
+    "CapabilityDescriptor",
+    "RelayTransport",
     # Inbound trigger / webhook contract (Issue #2281)
     "HookAction",
     "HookConfig",

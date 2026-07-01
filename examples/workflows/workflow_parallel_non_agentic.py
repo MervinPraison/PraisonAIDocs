@@ -5,8 +5,7 @@ Demonstrates running multiple steps concurrently and
 combining their results.
 """
 
-from praisonaiagents import AgentFlow, WorkflowContext, StepResult
-from praisonaiagents.workflows import parallel
+from praisonaiagents import AgentFlow, WorkflowContext, StepResult, parallel
 import time
 
 # Parallel workers - each does independent work
