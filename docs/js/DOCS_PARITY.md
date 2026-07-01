@@ -98,11 +98,27 @@ This report compares **TypeScript/JavaScript SDK feature categories** against **
 | ❌ Token Management | 1 |
 | ❌ Vector Store | 6 |
 
+> **⚠️ Audit note (2026-06-30):** The following doc pages already exist in `docs/js/` but the parity generator is not matching them to the SDK categories listed above. This is a false negative in the generator — **do not create duplicate pages**. Re-run the generator or file an upstream bug against `praisonai._dev.parity.docs_generator` in `MervinPraison/PraisonAI` to fix the bucket mapping. See issue [#1242](https://github.com/MervinPraison/PraisonAIDocs/issues/1242) for details.
+>
+> | Category (flagged ❌) | Existing doc file |
+> |-----------------------|-------------------|
+> | AI SDK | `docs/js/ai-sdk.mdx`, `docs/js/ai-sdk-cli.mdx` |
+> | Jobs | `docs/js/jobs.mdx` |
+> | Middleware | `docs/js/middleware.mdx` |
+> | Scheduler | `docs/js/scheduler.mdx`, `docs/js/scheduler-cli.mdx` |
+> | Streaming | `docs/js/streaming.mdx`, `docs/js/streaming-cli.mdx` |
+> | Token Management | `docs/js/token-management.mdx` |
+> | Vector Store | `docs/js/vector-store.mdx`, `docs/js/vector-stores.mdx` |
+>
+> Per AGENTS.md §1.8 these pages are **auto-generated only** — do not hand-author new pages in `docs/js/`.
+
 ## Documentation Without Features
 
 These docs exist but don't match any implemented feature category:
 
 - ℹ️ Deep Research (2 docs, 292 lines)
+
+> **ℹ️ Audit note (2026-06-30):** The "Deep Research" orphan is likely `docs/js/deep-research.mdx` and `docs/js/deep-research-cli.mdx`. Investigate whether these map to an upstream TypeScript SDK category and update the generator's bucket list if so. See issue [#1242](https://github.com/MervinPraison/PraisonAIDocs/issues/1242) for details.
 
 ---
 
