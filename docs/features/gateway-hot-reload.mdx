@@ -29,19 +29,23 @@ praisonai gateway run gateway.yaml
 
 ```mermaid
 graph LR
-    Edit[✏️ Edit gateway.yaml] --> Diff[🔍 Diff paths]
+    Edit[✏️ Edit gateway.yaml] --> Watcher[👁️ File watcher]
+    Watcher -->|watchdog available| Event[⚡ Event-driven]
+    Watcher -->|fallback| Poll[🔄 mtime polling]
+    Event --> Debounce[⏱️ Debounce 1s]
+    Poll --> Debounce
+    Debounce --> Diff[🔍 Diff paths]
     Diff -->|agents.*| Agents[🔄 Recreate agents]
     Diff -->|channels.name.*| Channel[🔄 Restart one channel]
     Diff -->|routes/scheduler| Full[🔄 Full channel restart]
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
 
     class Edit agent
-    class Diff,Agents,Channel,Full tool
-
-    classDef agent fill:#8B0000,color:#fff
-    classDef tool fill:#189AB4,color:#fff
+    class Watcher,Debounce,Diff tool
+    class Event,Poll,Agents,Channel,Full warn
 ```
 
 ## Quick Start
@@ -60,7 +64,84 @@ praisonai gateway run gateway.yaml
 Change agent instructions or a single channel token in `gateway.yaml` and save. The watcher applies a selective reload within ~5 seconds (1s debounce).
 
 </Step>
+
+<Step title="Trigger reload manually with SIGHUP">
+
+Send `SIGHUP` to reload without editing a file — useful for orchestration scripts and systemd:
+
+```bash
+# Find the gateway pid, then:
+kill -HUP $(pgrep -f "praisonai gateway")
+
+# Or under systemd:
+systemctl reload praisonai-gateway
+```
+
+</Step>
 </Steps>
+
+---
+
+## Event-driven vs Polling
+
+The watcher **prefers** event-driven file notifications via the optional `watchdog` package and **falls back gracefully** to mtime polling when `watchdog` is unavailable or an observer cannot start.
+
+| Mode | How it works | When used |
+|---|---|---|
+| Event-driven | OS file-system events via `watchdog` | `watchdog>=3.0.0` installed |
+| mtime polling | Periodic stat check every 5s | `watchdog` not installed or observer fails |
+
+Both modes apply the same 1s debounce to coalesce rapid saves.
+
+**Install `watchdog` for faster reload detection:**
+
+```bash
+pip install "praisonai[gateway]"
+# or
+pip install "praisonai[all]"
+```
+
+<Note>
+`watchdog` is **optional** — without it, polling continues exactly as before. Install it only when faster reaction times matter.
+</Note>
+
+---
+
+## Operator-triggered Reload via SIGHUP
+
+`start_with_config` installs a `SIGHUP` handler that runs the same `reload_config` path as a file-change reload — no shutdown, no dropped connections.
+
+```mermaid
+graph LR
+    Sig[📡 SIGHUP] --> Handler[🔧 SIGHUP handler]
+    Handler --> Reload[reload_config]
+    Reload --> Diff[🔍 Diff + apply]
+    Diff --> Drain[⏳ Drain in-flight turns]
+    Drain --> Restart[🔄 Restart affected channels]
+
+    classDef signal fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Sig signal
+    class Handler,Reload,Diff,Drain process
+    class Restart result
+```
+
+Reload via `SIGHUP` is **best-effort** — it is silently skipped on platforms without `SIGHUP` support (e.g. Windows).
+
+---
+
+## Drain-coordinated Channel Restart
+
+When a reload triggers a channel restart, the gateway drains in-flight turns before bouncing the channel — no mid-conversation cuts.
+
+The drain window for reload-triggered restarts is controlled by a new YAML key:
+
+```yaml
+gateway:
+  reload_drain_timeout: 10   # seconds; falls back to drain_timeout if unset
+```
 
 ---
 
@@ -79,12 +160,31 @@ Full restart stops and starts all channels but **does not** restart the WebSocke
 
 ---
 
+## Observability
+
+Reloads log a concise summary line on completion:
+
+```
+reload applied: agents; restart[telegram]
+```
+
+The format is `reload applied: <changed-sections>; restart[<channels>]`. Grep for `reload applied` to trace all reloads in your log stream.
+
+---
+
 ## Tuning
 
 | Setting | Default | Description |
 |---|---|---|
-| Poll interval | `5.0`s | How often the watcher checks the file |
+| Poll interval | `5.0`s | How often the mtime watcher checks the file |
 | Debounce | `1.0`s | Wait after last write before applying |
+| `gateway.reload_drain_timeout` | falls back to `gateway.drain_timeout` | Bounded drain window before a reload-triggered channel restart |
+
+---
+
+<Note>
+**Backward compatibility:** Leaving `reload_drain_timeout` unset preserves the prior immediate-restart behaviour. Not installing `watchdog` keeps polling as before. This is a fully additive change.
+</Note>
 
 ---
 
@@ -102,6 +202,10 @@ Edit one channel block to restart only that platform.
 <Accordion title="Validate YAML before saving">
 Invalid saves are ignored — the previous config keeps running.
 </Accordion>
+
+<Accordion title="Use SIGHUP in systemd for zero-downtime config pushes">
+Add `ExecReload=kill -HUP $MAINPID` to your systemd unit so `systemctl reload` triggers a drain-coordinated reload without stopping the process.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -117,5 +221,8 @@ Invalid saves are ignored — the previous config keeps running.
 </Card>
 <Card title="Code-Skew Guard" icon="shield-halved" href="/docs/features/gateway-code-skew-guard">
   Detect in-place code updates and refuse hot operations until the process restarts.
+</Card>
+<Card title="Gateway Reliability Preset" icon="shield-check" href="/docs/features/gateway-reliability-preset">
+  One switch to compose drain + admission control
 </Card>
 </CardGroup>
