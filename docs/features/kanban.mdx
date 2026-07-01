@@ -89,7 +89,7 @@ Task coordination happens through a SQLite-backed persistent store that all agen
 | **Kanban Store** | SQLite database storing tasks, comments, links |
 | **Agent Tools** | 8 functions for task CRUD operations |
 | **CLI Commands** | Human interface for task management |
-| **Background Dispatcher** | Auto-claims ready tasks for processing |
+| **Background Dispatcher** | Auto-claims `ready` tasks **and auto-promotes dependent tasks whose parents are all complete** |
 
 ---
 
@@ -99,11 +99,12 @@ Task coordination happens through a SQLite-backed persistent store that all agen
 graph TB
     subgraph "Task Lifecycle"
         Triage[🔍 triage] --> Todo[📝 todo]
-        Todo --> Ready[🟢 ready]
+        Todo -->|"parents done<br/>(auto)"| Ready[🟢 ready]
+        Todo -->|manual| Ready
         Ready --> Running[⚡ running]
         Running --> Review[👁️ review]
         Running --> Blocked[🚫 blocked]
-        Blocked --> Ready
+        Blocked -->|"parents done<br/>(auto)"| Ready
         Review --> Done[✅ done]
         Done --> Archived[📦 archived]
     end
@@ -127,11 +128,12 @@ Tasks flow through 8 defined states from creation to completion:
 graph TB
     subgraph "Status Flow"
         Triage[🔍 triage] --> Todo[📝 todo]
-        Todo --> Ready[🟢 ready]
+        Todo -->|"parents done<br/>(auto)"| Ready[🟢 ready]
+        Todo -->|manual| Ready
         Ready --> Running[⚡ running]
         Running --> Review[👁️ review]
         Running --> Blocked[🚫 blocked]
-        Blocked --> Ready
+        Blocked -->|"parents done<br/>(auto)"| Ready
         Review --> Done[✅ done]
         Done --> Archived[📦 archived]
     end
@@ -185,6 +187,8 @@ graph TB
     class Integration,Testing ready
 ```
 
+See [Dependency Auto-Promotion](#dependency-auto-promotion) — the dispatcher promotes children automatically once parents finish.
+
 ### Claim/Release
 
 Workers coordinate through atomic claim and release operations:
@@ -203,6 +207,105 @@ sequenceDiagram
     Worker1->>Store: Release (complete/block)
     Store-->>Worker1: Task updated
 ```
+
+---
+
+## Dependency Auto-Promotion
+
+When you link a child under one or more parent tasks, the dispatcher promotes the child from `todo`/`blocked` to `ready` as soon as every parent reaches `done` or `archived`.
+
+### Quick Start
+
+```python
+from praisonaiagents import Agent
+
+coordinator = Agent(
+    name="Coordinator",
+    instructions=(
+        "Break the user request into linked kanban tasks. "
+        "Use kanban_link(parent_id, child_id) for each dependency. "
+        "Children stay in 'todo' until the dispatcher promotes them."
+    ),
+)
+coordinator.start("Build a login system: design → backend → frontend → tests")
+```
+
+### How Auto-Promotion Works
+
+```mermaid
+sequenceDiagram
+    participant Agent as 🧠 Agent
+    participant Store as 📋 Store
+    participant Dispatcher as ⚙️ Dispatcher
+    participant Worker as ⚡ Worker
+
+    Agent->>Store: Create child task (status: todo)
+    Agent->>Store: kanban_link(parent_id, child_id)
+    Note over Store: Child waits while parent is running
+    Agent->>Store: Complete parent task (status: done)
+    Dispatcher->>Store: Tick — calls recompute_ready()
+    Store-->>Dispatcher: Child promoted to ready
+    Dispatcher->>Worker: Fire KANBAN_TASK_MOVED event
+    Worker->>Store: Claim child task
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef dispatcher fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef worker fill:#10B981,stroke:#7C90A0,color:#fff
+```
+
+### Behaviour by Scenario
+
+| Scenario | Result |
+|---|---|
+| Child linked, parent still `running` | Child stays in `todo`/`blocked` |
+| Last parent moves to `done` | Child auto-promoted to `ready` on next tick |
+| Child has multiple parents, only some done | Child waits for **all** parents |
+| Child linked *after* parent already `done` | Promoted on the next tick |
+| Parent moves to `archived` | Counts as terminal — promotes child |
+| `todo` task with no parents | **Not** auto-promoted (backward compatible) |
+| `blocked` child whose parents finish | Re-evaluated and promoted to `ready` |
+
+### Does My Task Auto-Promote?
+
+```mermaid
+graph TB
+    Start([Task created]) --> HasParents{Has parent links?}
+    HasParents -- No --> Manual[Stays in todo\nmanual promotion]
+    HasParents -- Yes --> AllDone{All parents done\nor archived?}
+    AllDone -- No --> Wait[Stays in todo/blocked\nwaiting for parents]
+    AllDone -- Yes --> Promote[✅ Auto-promoted to ready\non next dispatcher tick]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef wait fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ready fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef manual fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class HasParents,AllDone decision
+    class Wait wait
+    class Promote ready
+    class Manual manual
+```
+
+### Observability — Subscribe to Promotions
+
+```python
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.KANBAN_TASK_MOVED)
+def on_promotion(event_data):
+    if event_data["to_status"] == "ready":
+        print(f"Task {event_data['task_id']} auto-promoted to ready")
+    return HookResult.allow()
+```
+
+<Note>
+Auto-promotion only runs while the dispatcher is active (`praisonai kanban dispatch` or the gateway dispatcher loop). Without a running dispatcher, children remain waiting until the next tick.
+</Note>
 
 ---
 
@@ -232,6 +335,8 @@ Kanban tools are available through the SDK protocols. The wrapper implementation
 | `kanban_comment` | Add progress note | `kanban_comment("task_abc123", "50% complete")` |
 | `kanban_link` | Create dependency | `kanban_link("design_task", "implement_task")` |
 | `kanban_heartbeat` | Signal liveness | `kanban_heartbeat("task_abc123", "testing")` |
+
+Once all parents of a linked child are `done` or `archived`, the child auto-promotes to `ready` on the next dispatcher tick — see [Auto-Promotion](#auto-promotion).
 
 ---
 
@@ -278,6 +383,26 @@ worker = Agent(
     name="Worker",
     instructions="Claim ready tasks, report progress via heartbeat"
 )
+```
+
+### Self-Driving Pipeline
+
+Link tasks once and let the dispatcher handle promotion automatically:
+
+```python
+from praisonaiagents import Agent
+
+coordinator = Agent(
+    name="Coordinator",
+    instructions="""
+    Break the user request into linked tasks:
+      1. kanban_create(...) for each step
+      2. kanban_link(parent_id, child_id) to wire dependencies
+    Then exit. The dispatcher will auto-promote children as parents finish.
+    """,
+)
+
+coordinator.start("Ship a login feature: design → backend → frontend → test")
 ```
 
 ### Background Processing
