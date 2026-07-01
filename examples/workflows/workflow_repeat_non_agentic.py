@@ -5,8 +5,7 @@ Demonstrates repeating a step until a condition is met.
 This is useful for iterative improvement patterns.
 """
 
-from praisonaiagents import AgentFlow, WorkflowContext, StepResult
-from praisonaiagents.workflows import repeat
+from praisonaiagents import AgentFlow, WorkflowContext, StepResult, repeat
 
 # Simulated content generator that improves each iteration
 class ContentGenerator:
