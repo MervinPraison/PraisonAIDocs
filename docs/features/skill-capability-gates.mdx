@@ -1,7 +1,7 @@
 ---
 title: "Skill Capability Gates"
 sidebarTitle: "Capability Gates"
-description: "Declare and enforce tool, server, and env requirements for Agent Skills"
+description: "Declare what skills require — or graceful fallback for — and enforce it at runtime"
 icon: "shield-check"
 ---
 
@@ -118,8 +118,104 @@ All frontmatter keys are **optional** and **backward-compatible**. Existing skil
 | `requires_env` | `requires-env` | `list[str]` or string | `SkillRequirements.env_vars` |
 | `allowed-tools` | — | `list[str]` or string | **Also** appended to `tools` (backward compat) |
 | `openclaw` | — | `dict` | `SkillRequirements.openclaw_hints` (passthrough) |
+| `fallback_for_tools` | `fallback-for-tools` | `list[str]` or string | `SkillRequirements.fallback_for_tools` |
+| `fallback_for_servers` | `fallback-for-servers` | `list[str]` or string | `SkillRequirements.fallback_for_servers` |
 
-**String forms are normalized** — both `requires_tools: "pdf_read, ocr_extract"` and `requires_tools: "pdf_read ocr_extract"` work.
+**String forms are normalized** — both `requires_tools: "pdf_read, ocr_extract"` and `requires_tools: "pdf_read ocr_extract"` work. The same normalization applies to `fallback_for_tools` and `fallback_for_servers`.
+
+---
+
+## Graceful Fallback Skills
+
+`fallback_for_tools` / `fallback_for_servers` let a skill stay hidden until the agent is missing the capability it covers.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Researcher",
+    instructions="Answer questions, citing sources",
+    skills=["./skills/web-via-terminal"],  # auto-hidden if web_search tool is present
+)
+
+agent.start("Find today's BTC closing price")
+```
+
+The matching `SKILL.md` frontmatter:
+
+```yaml
+---
+name: web-via-terminal
+description: Fetch the web via terminal when no web tool is available.
+requires_tools: [terminal]       # this fallback still needs a shell to run
+fallback_for_tools: [web_search] # only offered when web_search is absent
+---
+
+# Web via terminal
+When asked to fetch a URL, use curl/wget through the terminal tool.
+```
+
+### Behaviour
+
+| `web_search` present | `terminal` present | `web-via-terminal` offered? |
+|:--:|:--:|:--:|
+| ✅ | ✅ | ❌ (hidden — capable agent doesn't need fallback) |
+| ❌ | ✅ | ✅ (fallback fires) |
+| ❌ | ❌ | ❌ (own `requires_tools: [terminal]` unmet) |
+| ✅ | ❌ | ❌ (capability already present) |
+
+<Note>
+A fallback skill's own `requires_*` gates are always enforced, regardless of the enforcement level. An unusable fallback is never injected into the agent's context.
+</Note>
+
+### When to Use fallback vs. requires
+
+```mermaid
+graph TB
+    Q{Should the skill always be available?} -->|Yes| R[Use requires_tools / requires_servers]
+    Q -->|"No — only when something is missing"| F[Use fallback_for_tools / fallback_for_servers]
+    F --> N{Does the fallback itself need a tool?}
+    N -->|Yes| C[Add requires_tools alongside fallback_for_tools]
+    N -->|No| D[Just declare fallback_for_*]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef both fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q,N question
+    class R,D result
+    class C,F both
+```
+
+### Skill Discovery Sequence
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant SkillManager
+    participant CapabilityValidator
+    participant ToolRegistry
+
+    Note over Agent,ToolRegistry: Capability PRESENT — fallback hidden
+    Agent->>SkillManager: discover skills
+    SkillManager->>CapabilityValidator: evaluate web-via-terminal
+    CapabilityValidator->>ToolRegistry: is web_search available?
+    ToolRegistry-->>CapabilityValidator: YES
+    CapabilityValidator-->>SkillManager: HIDDEN (fallback not needed)
+    SkillManager-->>Agent: skill excluded from index
+
+    Note over Agent,ToolRegistry: Capability ABSENT — fallback offered
+    Agent->>SkillManager: discover skills
+    SkillManager->>CapabilityValidator: evaluate web-via-terminal
+    CapabilityValidator->>ToolRegistry: is web_search available?
+    ToolRegistry-->>CapabilityValidator: NO
+    CapabilityValidator->>ToolRegistry: is terminal available? (requires_tools)
+    ToolRegistry-->>CapabilityValidator: YES
+    CapabilityValidator-->>SkillManager: ACTIVE (fallback fires)
+    SkillManager-->>Agent: skill included in index
+```
+
+The validator evaluates both `available_tools` / `available_servers` for the keep-or-hide decision and the fallback skill's own `requires_*` gates before injecting it.
 
 ---
 
@@ -292,6 +388,34 @@ praisonai doctor skills --requirements   # Show detailed per-skill diagnostics
 
 ## Common Patterns
 
+### Terminal-based Web Fallback
+
+```yaml
+---
+name: web-via-terminal
+description: Fetch the web via terminal when no web tool is available.
+requires_tools: [terminal]
+fallback_for_tools: [web_search]
+---
+
+# Web via terminal
+When asked to fetch a URL, use curl/wget through the terminal tool.
+```
+
+### Local-file Fallback for Absent MCP Server
+
+```yaml
+---
+name: local-notes
+description: Search ~/notes when the Notion MCP server is unavailable.
+requires_tools: [filesystem_read]
+fallback_for_servers: [mcp:notion]
+---
+
+# Local notes search
+Search ~/notes/ for relevant files when Notion is unavailable.
+```
+
 ### Soft-warn in Dev, Strict in Prod
 
 ```python
@@ -371,6 +495,10 @@ SKILL_CAPABILITY_ENFORCEMENT=warn
 # Production
 SKILL_CAPABILITY_ENFORCEMENT=strict
 ```
+</Accordion>
+
+<Accordion title="Use fallback_for_* for graceful degradation, not as a feature switch">
+Fallback skills disappear automatically when the real capability is present; they are not a runtime toggle. If you need a user-controlled switch, gate the skill with `requires_env` on a feature-flag env var instead.
 </Accordion>
 
 <Accordion title="Cache validation results (validator already caches; document clear_cache())">
