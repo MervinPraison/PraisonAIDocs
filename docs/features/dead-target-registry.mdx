@@ -1,94 +1,97 @@
 ---
 title: "Dead-Target Registry"
 sidebarTitle: "Dead-Target Registry"
-description: "Stop hammering permanently failed channels (bot kicked, chat deleted) and automatically self-heal the moment a send succeeds again"
-icon: "shield-exclamation"
+description: "Self-healing registry that short-circuits permanently-unreachable channels and re-probes them automatically"
+icon: "skull"
 ---
 
-When broadcasting to many channels, some will permanently fail — the bot was kicked, the chat was deleted. The `DeadTargetRegistry` suppresses those channels so your agent stops retrying them, then automatically un-suppresses them the moment any send succeeds again.
+The dead-target registry stops your gateway from wasting requests on channels where the bot was kicked, the group was deleted, or a 403/404 is permanent — and automatically self-heals when a target recovers.
 
 ```mermaid
 graph LR
-    subgraph "Delivery Flow"
-        A[🤖 Agent] --> DR[DeliveryRouter]
-        DR --> R{Registry\nchecks}
-        R -->|Suppressed| SC[⏭️ Skip]
-        R -->|OK| S[📤 Send]
-        S -->|Permanent fail\n403/404/410| M[🔴 Mark dead]
-        S -->|Success| H[💚 Self-heal\nclear from registry]
-        M --> RP[⏰ Re-probe\nafter ~1 hour]
-        RP -->|Success| H
-        RP -->|Fail again| M
+    subgraph "Dead-Target Registry Flow"
+        Send[🤖 Outbound Send] --> Check{📋 Registry\nCheck}
+        Check -->|not dead| Channel[📡 Send to Channel]
+        Check -->|dead + reprobe due| Probe[🔍 Re-probe\nonce]
+        Check -->|dead, not due| Skip[⏭️ Skip]
+        Channel -->|success| Clear[✅ Clear dead flag]
+        Channel -->|403/404/410| Mark[🔴 Mark dead]
+        Probe -->|success| Clear
+        Probe -->|failure| Mark
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef router fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef dead fill:#EF4444,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warning fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
 
-    class A agent
-    class DR router
-    class R,RP check
-    class H,SC ok
-    class M dead
-    class S ok
+    class Send agent
+    class Check,Probe process
+    class Channel,Clear success
+    class Skip,Mark warning
 ```
+
+<Note>
+The registry is **default OFF**. The `DeliveryRouter` works exactly as before until you construct and attach a `DeadTargetRegistry` instance.
+</Note>
 
 ## Quick Start
 
 <Steps>
-<Step title="Add a registry to your bot">
+<Step title="Enable the Registry">
+Attach a registry to suppress known-dead targets:
 
 ```python
 from praisonaiagents import Agent
-from praisonai.bots import Bot
-from praisonai.bots._dead_targets import DeadTargetRegistry
+from praisonai.bots import TelegramBot
+from praisonai.bots import DeadTargetRegistry, DeliveryRouter
 
-agent = Agent(name="broadcaster", instructions="Send daily updates")
-bot = Bot(
-    "telegram",
-    agent=agent,
-    dead_targets=DeadTargetRegistry(path="~/.praisonai/state/dead.json"),
+agent = Agent(
+    name="Broadcast Agent",
+    instructions="Deliver scheduled updates to subscribers.",
 )
-bot.run()
-```
 
+registry = DeadTargetRegistry()
+
+bot = TelegramBot(
+    token="YOUR_TOKEN",
+    agent=agent,
+    dead_target_registry=registry,
+)
+await bot.start()
+```
 </Step>
 
-<Step title="Configure eviction and re-probe intervals">
+<Step title="Persist to a Custom Path">
+By default the registry persists to `~/.praisonai/state/dead_targets.json`. Override it:
 
 ```python
-from praisonai.bots._dead_targets import DeadTargetRegistry
+from pathlib import Path
+from praisonai.bots import DeadTargetRegistry
 
 registry = DeadTargetRegistry(
-    path="~/.praisonai/state/dead.json",
-    max_size=10_000,           # cap the registry size
-    ttl_seconds=7 * 86400,    # auto-evict entries after 7 days
-    reprobe_seconds=3600,      # re-probe dead channels every hour
+    persist_path=Path("/var/lib/praisonai/dead_targets.json"),
+    ttl_seconds=7 * 86400,      # forget after 7 days
+    max_size=5000,               # cap at 5 000 dead entries
+    reprobe_seconds=1800,        # re-probe every 30 minutes
 )
 ```
-
 </Step>
 
-<Step title="Inspect or manage dead targets">
-
+<Step title="Inspect and Clear Manually">
 ```python
-from praisonai.bots._dead_targets import DeadTargetRegistry
+from praisonai.bots import DeadTargetRegistry
 
-registry = DeadTargetRegistry(path="~/.praisonai/state/dead.json")
+registry = DeadTargetRegistry()
 
-# List channels currently suppressed
 dead = registry.list_dead()
-print(f"{len(dead)} channels suppressed")
+for target in dead:
+    print(f"{target.platform}:{target.channel_id} — {target.reason}")
 
-# Manually clear a channel (e.g. after re-inviting the bot)
-registry.clear("telegram:channel:-1001234567")
-
-# Check size
-print(registry.size())
+registry.clear("telegram", "-1001234567890")
+print(f"Registry size: {registry.size()}")
 ```
-
 </Step>
 </Steps>
 
@@ -304,6 +307,26 @@ Un-suppress a channel manually after confirming the bot has been re-added.
 registry.clear("telegram", "-1001234567890")
 ```
 
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `persist_path` | `Path \| str` | `~/.praisonai/state/dead_targets.json` | JSON file for durability |
+| `max_size` | `int` | `10000` | Maximum dead entries; oldest evicted when exceeded |
+| `ttl_seconds` | `int` | `2592000` (30 days) | Entries older than this are forgotten |
+| `reprobe_seconds` | `int` | `3600` (1 hour) | How often to let one send through for self-heal |
+
+---
+
+## Public API
+
+| Method | Description |
+|--------|-------------|
+| `is_dead(platform, channel_id)` | Returns `True` if target is suppressed |
+| `should_reprobe(platform, channel_id)` | Returns `True` if a reprobe is due |
+| `mark_dead(platform, channel_id, reason)` | Suppresses the target |
+| `clear(platform, channel_id)` | Removes suppression (called on success) |
+| `list_dead()` | Returns all currently-dead targets |
+| `size()` | Count of suppressed targets |
+
 ---
 
 ## Best Practices
@@ -377,6 +400,21 @@ If an operator manually restores a blocked channel, call `registry.clear(target)
 
 <Accordion title="Pair with durable delivery">
 The registry prevents re-sending to dead targets, but in-flight messages that fail permanently should also go to the outbound DLQ. See [Durable Delivery](/docs/features/durable-delivery) and [Delivery Config](/docs/features/delivery-config).
+
+<Accordion title="Enable registry for broadcast / proactive bots">
+Subscription bots that push to many channels benefit most from the registry — fan-out cycles skip dead targets instantly instead of waiting for a timeout per doomed call.
+</Accordion>
+
+<Accordion title="Set TTL to match your re-subscription window">
+If users typically re-add your bot within 7 days, set `ttl_seconds=604800`. The registry will forget the entry and perform a clean probe attempt rather than waiting the full 30-day default.
+</Accordion>
+
+<Accordion title="Monitor the registry size">
+A rapidly-growing registry is a signal that your bot is being kicked at scale. Investigate the root cause before the registry fills to `max_size` and starts evicting entries.
+</Accordion>
+
+<Accordion title="Persistence is best-effort">
+The registry writes atomically to a JSON file. On failure the write is logged as a warning but never raised — the in-memory state is still correct and the file will be updated on the next successful write.
 </Accordion>
 </AccordionGroup>
 
