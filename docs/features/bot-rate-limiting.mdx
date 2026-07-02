@@ -62,17 +62,15 @@ Use platform presets for optimal compliance with API limits.
 ```python
 from praisonai.bots._rate_limit import RateLimiter
 
-# Telegram: 25 msg/sec, 30 burst, 0.05s per-channel
+# Single-process: fast in-memory bucket (unchanged behaviour)
 telegram_limiter = RateLimiter.for_platform("telegram")
 
-# Discord: 1 msg/sec, 5 burst, 1s per-channel  
-discord_limiter = RateLimiter.for_platform("discord")
-
-# Slack: 1 msg/sec, 1 burst, 1s per-channel
-slack_limiter = RateLimiter.for_platform("slack")
-
-# WhatsApp: 50 msg/sec, 80 burst, 0.1s per-channel
-whatsapp_limiter = RateLimiter.for_platform("whatsapp")
+# Multi-worker: share ONE bucket across every gateway worker on this bot token
+from praisonai.bots import DeliveryControlStore
+shared = DeliveryControlStore("~/.praisonai/state/delivery_control.sqlite")
+telegram_limiter = RateLimiter.for_platform("telegram", store=shared)
+# scope defaults to the platform name — all "telegram" limiters on this store
+# share one ceiling. Pass scope="telegram:bot-<hash>" for multi-tenant isolation.
 ```
 </Step>
 
@@ -150,6 +148,13 @@ The rate limiter uses a two-phase approach:
 | `burst_size` | `int` | `5` | Max tokens that can accumulate (burst capacity). |
 | `per_channel_delay` | `float` | `1.0` | Minimum seconds between two sends to the same channel. |
 
+### `RateLimiter` constructor kwargs (multi-worker)
+
+| Kwarg | Type | Default | Description |
+|---|---|---|---|
+| `store` | `DeliveryControlStore` \| None | `None` | When set, `acquire`/`penalise`/`reset` route through a shared SQLite bucket. When `None` (default), the fast per-process in-memory bucket is used — correct for single-process gateways. |
+| `scope` | `str` | `"default"` | Identity of the shared bucket in the store — typically the platform name (`RateLimiter.for_platform` sets this for you) or a hash of the bot token. All limiters sharing a token **must** use the same `scope` so they share the ceiling. |
+
 ### Platform Presets
 
 | Platform | messages_per_second | burst_size | per_channel_delay | Notes |
@@ -174,9 +179,74 @@ for channel_id in range(10000):  # 10k channels
 
 ---
 
+## Multi-worker (horizontally-scaled gateway)
+
+A single-process gateway is served by the fast in-memory token bucket — `RateLimiter()` with no `store=` — and that's the right default. But once you run **N workers**, each with its own `RateLimiter`, each worker keeps its own bucket and the platform sees `N × messages_per_second`. That's the exact scenario a token-bucket limiter exists to prevent, and it produces 429s and temporary bans.
+
+Pass a shared [`DeliveryControlStore`](#deliverycontrolstore) so every worker draws from **one** SQLite-backed bucket:
+
+```python
+from praisonai.bots import DeliveryControlStore
+from praisonai.bots._rate_limit import RateLimiter
+
+# One file, shared by every worker on the box (or on the shared volume)
+store = DeliveryControlStore("~/.praisonai/state/delivery_control.sqlite")
+
+limiter = RateLimiter.for_platform("telegram", store=store)
+# scope defaults to "telegram" — matches every other worker calling for_platform("telegram", store=store)
+```
+
+The token reservation now happens inside a `BEGIN IMMEDIATE` transaction, so `N` workers racing on `acquire()` get **atomic** wait times summing to the configured ceiling. The sleep still happens outside the transaction — workers block only for their share of the wait, not for the transaction round-trip.
+
+### `scope` — sharing identity
+
+`scope` is the shared-bucket identity. All limiters that must share one ceiling **must use the same scope string**. Two common patterns:
+
+- **Per platform** (default): every worker running `for_platform("telegram", store=store)` uses `scope="telegram"` — one ceiling per platform per host.
+- **Per bot token** (multi-tenant): hash the token so tenant A's Telegram bot doesn't share a bucket with tenant B's Telegram bot: `RateLimiter.for_platform("telegram", store=store, scope=f"telegram:{token_hash}")`.
+
+### Restart survival
+
+The bucket state (`tokens`, `last_refill`, `global_penalty_until`, per-channel `last_send`, `penalty_until`) is persisted on every reservation. A worker restart resumes from the last recorded reservation anchor instead of refilling to `burst_size`, so a rolling restart doesn't briefly triple the send rate.
+
+### `penalise()` and `reset()` are also shared
+
+When any worker records a 429/Retry-After hint via `penalise()`, every other worker on the same `scope` immediately respects the same hold-off window. `reset()` clears the shared row.
+
+<Note>
+The shared store uses `time.time()` (wall clock) instead of `time.monotonic()` because monotonic clocks are per-process and cannot be shared. Keep the workers' clocks in sync (NTP or the same host) — a clock skew of `X` seconds between two workers effectively widens the bucket by `X × messages_per_second` tokens during that skew.
+</Note>
+
+### DeliveryControlStore
+
+The store is stdlib `sqlite3`-only (no extra dependency), uses WAL journaling, and can back both the rate limiter and the dead-target registry from one file.
+
+```python
+from praisonai.bots import DeliveryControlStore
+
+store = DeliveryControlStore("~/.praisonai/state/delivery_control.sqlite")
+# Parent directory is created if missing.
+```
+
+| Kwarg | Type | Default | Description |
+|---|---|---|---|
+| `path` | `str` \| `Path` | required | SQLite file path. Can share the same file as your outbox / DLQ. |
+
+Table shape (informational — you never write SQL yourself):
+
+- `rate_limit_state(scope, tokens, last_refill, global_penalty_until)` — one row per scope.
+- `rate_limit_channel(scope, channel_id, last_send, penalty_until)` — per-channel rows, capped at 4096 per scope with LRU eviction.
+- `dead_targets(platform, channel_id, reason, ts)` — see [Dead-Target Registry](/docs/features/dead-target-registry#multi-worker-horizontally-scaled-gateway).
+
+---
+
 ## Concurrency Design
 
 The global lock is held only long enough to reserve a token and update bookkeeping — the actual sleep happens outside the lock. Multiple channels can be rate-limited concurrently without serialising on one mutex.
+
+<Note>
+When a `store=` is set, "Phase 1: Reserve" runs inside a SQLite `BEGIN IMMEDIATE` transaction so N workers on N hosts race atomically on one bucket. The sleep in "Phase 2" still happens outside the transaction, so a slow worker never blocks another worker's reservation. See [Multi-worker (horizontally-scaled gateway)](#multi-worker-horizontally-scaled-gateway).
+</Note>
 
 **Before PR #1870** (serialized):
 ```python
@@ -258,6 +328,7 @@ limiter = RateLimiter.for_platform("telegram")
 | Widens per-channel wait window by `seconds` | That channel's sends space out |
 | Adds a global bucket penalty | Other channels slow slightly too |
 | Resets automatically after the penalty duration | Normal rate resumes without intervention |
+| Persists across workers via `DeliveryControlStore` | Every worker on the same `scope` immediately respects the penalty; no cross-worker `penalise()` call needed |
 
 ---
 
@@ -277,19 +348,19 @@ limiter = RateLimiter(RateLimitConfig(messages_per_second=10.0))
 </Accordion>
 
 <Accordion title="Share Limiters Across Bot Instances">
-Create one rate limiter per platform and share it across all bot instances to respect global rate limits.
+Within one process, share one `RateLimiter` object across every bot instance. Across **multiple processes** (a horizontally-scaled gateway), instead pass a shared `DeliveryControlStore`:
 
 ```python
-# Good: shared limiter
-telegram_limiter = RateLimiter.for_platform("telegram")
+from praisonai.bots import DeliveryControlStore
+from praisonai.bots._rate_limit import RateLimiter
 
-bot1 = TelegramBot(rate_limiter=telegram_limiter)
-bot2 = TelegramBot(rate_limiter=telegram_limiter)
-
-# Bad: separate limiters bypass global limits
-bot1 = TelegramBot(rate_limiter=RateLimiter.for_platform("telegram"))
-bot2 = TelegramBot(rate_limiter=RateLimiter.for_platform("telegram"))
+# Multi-worker gateway — every worker constructs its own limiter, but they share
+# one bucket via the store on the shared volume.
+store = DeliveryControlStore("~/.praisonai/state/delivery_control.sqlite")
+telegram_limiter = RateLimiter.for_platform("telegram", store=store)
 ```
+
+See [Multi-worker (horizontally-scaled gateway)](#multi-worker-horizontally-scaled-gateway).
 </Accordion>
 
 <Accordion title="Monitor Rate Limit Logs">
