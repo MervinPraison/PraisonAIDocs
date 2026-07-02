@@ -5,7 +5,7 @@ Demonstrates the evaluator-optimizer pattern where an agent
 generates content and another evaluates it, repeating until approved.
 """
 
-from praisonaiagents import Agent, Workflow, repeat
+from praisonaiagents import Agent, AgentFlow, repeat
 
 # Create generator agent
 generator = Agent(
