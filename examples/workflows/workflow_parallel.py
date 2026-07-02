@@ -5,7 +5,8 @@ Demonstrates running multiple agents concurrently and
 combining their results with an aggregator agent.
 """
 
-from praisonaiagents import Agent, AgentFlow, parallel
+from praisonaiagents import Agent, AgentFlow
+from praisonaiagents.workflows import parallel
 
 # Create parallel research agents
 market_researcher = Agent(

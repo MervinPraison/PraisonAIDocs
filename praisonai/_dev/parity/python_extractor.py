@@ -71,7 +71,7 @@ class PythonFeatureExtractor:
         'tools': ['tools.tools', 'tools.base', 'tools.decorator', 'tools.registry'],
         'llm': ['llm.llm', 'llm.failover'],
         'memory': ['memory.memory'],
-        'knowledge': ['knowledge.knowledge', 'knowledge.chunking'],
+        'knowledge': ['knowledge.knowledge', 'knowledge.chunking', 'knowledge.vector_store'],
         'db': ['db'],
         'obs': ['obs'],
         'mcp': ['mcp.mcp'],
