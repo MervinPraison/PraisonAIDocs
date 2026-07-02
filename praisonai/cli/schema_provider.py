@@ -1,23 +1,11 @@
-"""
-Schema provider selection for PraisonAI unified configuration.
+"""Backward-compatibility shim for :mod:`praisonai.cli.schema_provider`."""
 
-Selects the appropriate schema provider based on available dependencies.
-"""
+import sys as _sys
 
-try:
-    from pydantic import BaseModel
-    PYDANTIC_AVAILABLE = True
-except ImportError:
-    PYDANTIC_AVAILABLE = False
+import praisonai_code.cli.schema_provider as _impl
 
-if PYDANTIC_AVAILABLE:
-    # Use full Pydantic implementation
-    from .unified_schema import RAGSchemaProvider
-    rag_schema_provider = RAGSchemaProvider()
-else:
-    # Use basic fallback implementation  
-    from .fallback_schema import basic_rag_schema_provider
-    rag_schema_provider = basic_rag_schema_provider
+_sys.modules[__name__] = _impl
 
-# Export the selected provider
-__all__ = ['rag_schema_provider']
+_parent_name, _, _child_name = __name__.rpartition(".")
+if _parent_name and _parent_name in _sys.modules:
+    setattr(_sys.modules[_parent_name], _child_name, _impl)

@@ -1,5 +1,9 @@
 import threading
 
+from ._bootstrap import ensure_praisonai_code
+
+ensure_praisonai_code()
+
 # Version is lightweight, import directly
 from .version import __version__
 
@@ -149,8 +153,8 @@ def __getattr__(name):
     elif name == 'run_integrated_gateway':
         from .integration.gateway_host import run_integrated_gateway
         return run_integrated_gateway
-    elif name == 'AgentApp':
-        # Silent alias for AgentOS (backward compatibility)
+    elif name in ('AgentOS', 'AgentApp'):
+        # AgentApp is a silent alias for AgentOS (backward compatibility)
         from .app import AgentOS
         return AgentOS
     elif name in ('ManagedAgent', 'ManagedAgentIntegration'):
