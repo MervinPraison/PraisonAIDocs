@@ -12,7 +12,8 @@ The if: pattern enables dynamic workflow paths based on
 runtime conditions and variable values.
 """
 
-from praisonaiagents import AgentFlow, WorkflowContext, StepResult, if_, loop
+from praisonaiagents import AgentFlow, WorkflowContext, StepResult
+from praisonaiagents.workflows import if_, loop
 
 
 # =============================================================================
