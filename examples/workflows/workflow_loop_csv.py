@@ -4,7 +4,8 @@ Agentic Loop with CSV Workflow Example
 Demonstrates iterating over a CSV file with an agent processing each row.
 """
 
-from praisonaiagents import Agent, Workflow, loop
+from praisonaiagents import Agent, Workflow
+from praisonaiagents.workflows import loop
 import tempfile
 import os
 

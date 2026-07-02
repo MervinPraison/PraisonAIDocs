@@ -5,7 +5,8 @@ Demonstrates decision-based routing where an agent classifier
 routes to specialized handler agents based on the request type.
 """
 
-from praisonaiagents import Agent, AgentFlow, route
+from praisonaiagents import Agent, AgentFlow
+from praisonaiagents.workflows import route
 
 # Create classifier agent
 classifier = Agent(
