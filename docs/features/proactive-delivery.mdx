@@ -141,6 +141,59 @@ Call `botos.delivery_router.refresh_directory()` periodically so adapters enumer
 
 ---
 
+## Rate Limiting & Idempotency
+
+Scheduled and background sends now share the reply-path rate limiter and dedup guard automatically — no config change required.
+
+```mermaid
+graph LR
+    Agent[🤖 Agent] --> Msg[BotOutboundMessenger]
+    Msg --> Dup{🔍 is_duplicate_key?}
+    Dup -->|Hit| Skip[⏭ Skip envelope]
+    Dup -->|Miss| Rate{⚖️ Rate Limiter}
+    Rate --> Send[📤 Send text]
+    Send --> Media[📎 Send media]
+    Media --> Remember[💾 remember_key]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef config fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Agent agent
+    class Msg,Rate,Send,Media process
+    class Dup,Skip config
+    class Remember result
+```
+
+| You call | What happens |
+|----------|--------------|
+| `botos.deliver("ops-alerts", "...")` with no `idempotency_key` | Rate-limited per platform. No dedup. |
+| `botos.deliver(..., idempotency_key="job-42")` | Rate-limited **and** dedup'd within this process (bounded LRU, 4096 keys). A retry with the same key returns success without re-sending. |
+| `botos.deliver(..., idempotency_key="job-42")` with attachments | Whole text + media envelope is deduped. Key is recorded only after both text and media succeed — a failed media upload leaves the key retryable. |
+| Adapter's `send_message()` returns `False` | Treated as a transient failure. Key not stored. Dead-target flag not tripped. Safe to retry. |
+
+```python
+# Scheduled daily digest — safe to retry from cron on transient failure
+await botos.deliver(
+    "ops-alerts",
+    "Nightly digest ready",
+    idempotency_key=f"digest-{today.isoformat()}",
+)
+```
+
+```python
+# Notification with attachment — media won't double-upload on retry
+await botos.deliver(
+    "ops-alerts",
+    "Build finished",
+    attachments=[BuildLog("/var/log/build.log")],
+    idempotency_key=f"build-{build_id}",
+)
+```
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
@@ -155,6 +208,21 @@ Bare-platform targets fail without a configured home channel.
 </Accordion>
 <Accordion title="Handle the bool return">
 `deliver()` returns `False` on resolution or send failure — log and retry as needed.
+</Accordion>
+<Accordion title="Pick a stable idempotency_key for scheduled sends">
+Derive the key from the trigger — job ID, cron-timestamp, or inbound message ID. Never use `uuid.uuid4()` inside the retry loop; a new UUID on every call defeats deduplication.
+
+```python
+# ✅ Good: derived from a stable trigger
+idempotency_key=f"digest-{today.isoformat()}"
+
+# ❌ Bad: new UUID on every call — no dedup across retries
+import uuid
+idempotency_key=str(uuid.uuid4())
+```
+</Accordion>
+<Accordion title="In-process dedup is best-effort">
+The LRU dedup guard holds at most 4096 keys per process. If your cron re-fires the same job on a different worker, the in-memory LRU won't catch it. For cross-worker dedup, use the reply-path `delivery.send(...)` outbox (see [Durable Delivery](/docs/features/durable-delivery)) or an external idempotency store keyed off the same `idempotency_key`.
 </Accordion>
 </AccordionGroup>
 
