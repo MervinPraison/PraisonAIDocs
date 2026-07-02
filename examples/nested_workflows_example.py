@@ -11,7 +11,8 @@ These patterns enable complex data processing pipelines
 while maintaining clean, readable workflow definitions.
 """
 
-from praisonaiagents import AgentFlow, WorkflowContext, StepResult, loop, parallel, route
+from praisonaiagents import AgentFlow, WorkflowContext, StepResult
+from praisonaiagents.workflows import loop, parallel, route
 
 
 # =============================================================================
