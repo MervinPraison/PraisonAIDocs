@@ -1,20 +1,19 @@
 ---
 title: "Gateway Approval Durability"
 sidebarTitle: "Approval Durability"
-description: "Survive gateway restarts with persisted pending approvals and allow-always grants"
+description: "Survive gateway restarts with persisted pending approvals using the secure approval backend"
 icon: "database"
 ---
 
-Turn on `PRAISONAI_GATEWAY_DURABLE_APPROVALS=1` so pending approvals and "allow-always" grants survive a gateway restart.
+Use `--approval secure` so pending approvals survive a gateway restart — the SQLite-backed `PresentationApprovalBackend` persists every decision and rehydrates outstanding requests on startup.
 
 ```mermaid
 graph LR
     subgraph "Gateway Approval Durability"
-        Agent[🤖 Agent] --> Gateway[🔀 Gateway]
-        Gateway --> Mgr[⚙️ ExecApproval\nManager]
-        Mgr --> Store[(💾 SQLite\nStore)]
+        Agent[🤖 Agent] --> Backend[🔒 PresentationApproval\nBackend]
+        Backend --> Store[(💾 SQLite\nStore)]
         Store --> Restart[🔄 Restart]
-        Restart --> Rehydrate[📥 Rehydrate]
+        Restart --> Rehydrate[📥 rehydrate()]
         Rehydrate --> Resolve[✅ Same request\nresolvable]
     end
 
@@ -24,7 +23,7 @@ graph LR
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Agent agent
-    class Gateway,Mgr,Rehydrate process
+    class Backend,Rehydrate process
     class Store storage
     class Restart,Resolve result
 ```
@@ -32,15 +31,13 @@ graph LR
 ## Quick Start
 
 <Steps>
-<Step title="Turn it on">
-One env var enables durability — no code changes needed:
-
+<Step title="Set required env vars">
 ```bash
-export PRAISONAI_GATEWAY_DURABLE_APPROVALS=1
-praisonai gateway start
+export PRAISONAI_APPROVAL_ACTORS="your-user-id"
+export PRAISONAI_HOME=/var/lib/praisonai   # optional, overrides ~/.praisonai
 ```
 
-Accepted truthy values: `1`, `true`, `yes`, `on` (case-insensitive). Anything else keeps the default in-memory behaviour.
+`PRAISONAI_APPROVAL_ACTORS` is required — the secure backend refuses to start without at least one authorised actor.
 </Step>
 
 <Step title="Agent-centric example">
@@ -50,12 +47,19 @@ from praisonaiagents import Agent
 agent = Agent(
     name="Ops",
     instructions="You are a careful ops assistant. Ask before destructive commands.",
+    approval="secure",
     tools=["shell_exec"],
 )
 
 agent.start("Clean up /tmp/cache")
-# The gateway asks the human once, they choose "Allow always for this agent".
-# Restart the gateway — the grant is still there. The agent runs without a re-prompt.
+# The gateway asks the human once. Restart the gateway — the pending request
+# is rehydrated from SQLite and the human can still Allow or Deny.
+```
+</Step>
+
+<Step title="CLI usage">
+```bash
+praisonai run --approval secure agent.py
 ```
 </Step>
 </Steps>
@@ -67,27 +71,27 @@ agent.start("Clean up /tmp/cache")
 ```mermaid
 sequenceDiagram
     participant Agent
-    participant Manager as ExecApprovalManager
-    participant Store as SQLite Store
+    participant Backend as PresentationApprovalBackend
+    participant Store as SQLite Store (ApprovalStore)
     participant Human
 
-    Agent->>Manager: register approval request
-    Manager->>Store: persist(approval_id, request, expires_at)
-    Manager->>Human: prompt for decision
-    Note over Manager,Store: gateway restarts
-    Manager->>Store: rehydrate() on startup
-    Store-->>Manager: outstanding pending approvals
-    Human->>Manager: Allow / Deny
-    Manager->>Store: resolve + audit trail write
-    Manager-->>Agent: decision delivered
+    Agent->>Backend: request_approval(request)
+    Backend->>Store: persist(approval_id, request, expires_at)
+    Backend->>Human: prompt for decision
+    Note over Backend,Store: gateway restarts
+    Backend->>Store: rehydrate() on startup
+    Store-->>Backend: outstanding pending approvals
+    Human->>Backend: Allow / Deny
+    Backend->>Store: resolve + audit trail write
+    Backend-->>Agent: ApprovalDecision
 ```
 
 | Step | What happens |
 |------|-------------|
-| `register` | Request is persisted to SQLite before the human is prompted |
+| `persist` | Request is written to SQLite before the human is prompted |
 | `rehydrate()` | On startup, outstanding requests are restored with their **original expiry** |
 | `resolve` | Every decision (approved / denied / expired) is written to the audit trail |
-| `allow_always` | Scoped grants persist in a separate allowlist store, scoped per agent |
+| actor check | Only actors listed in `PRAISONAI_APPROVAL_ACTORS` may approve |
 
 ---
 
@@ -95,7 +99,7 @@ sequenceDiagram
 
 | Setting | Value | Notes |
 |---------|-------|-------|
-| `PRAISONAI_GATEWAY_DURABLE_APPROVALS` | `1` / `true` / `yes` / `on` | Enables durable mode. Default: off (in-memory) |
+| `PRAISONAI_APPROVAL_ACTORS` | Comma-separated actor IDs | **Required** for `--approval secure`. Approvers not on this list are rejected. |
 | `PRAISONAI_HOME` | Any path | Overrides the state root. Default: `~/.praisonai` |
 
 ### Default persistence paths
@@ -103,13 +107,12 @@ sequenceDiagram
 | File | Contents |
 |------|----------|
 | `~/.praisonai/state/approvals.sqlite` | Pending approvals + audit trail (approved / denied / expired) |
-| `~/.praisonai/state/gateway/approvals.sqlite` | Scoped `allow_always` grants `(agent_id, tool_name, arg_signature)` |
 
 Override the root with `PRAISONAI_HOME`:
 
 ```bash
 export PRAISONAI_HOME=/var/lib/praisonai
-# Stores will be created under /var/lib/praisonai/state/
+# Store will be created under /var/lib/praisonai/state/approvals.sqlite
 ```
 
 ---
@@ -117,23 +120,34 @@ export PRAISONAI_HOME=/var/lib/praisonai
 ## Programmatic Override
 
 ```python
-from praisonai.gateway import create_exec_approval_manager
-from praisonai.bots import ApprovalStore
+from pathlib import Path
+from praisonai.bots import ApprovalStore, PresentationApprovalBackend
+from praisonaiagents import Agent
+from praisonaiagents.approval import ApprovalConfig
 
-manager = create_exec_approval_manager(
-    ttl=600,
-    store=ApprovalStore(path="/var/lib/praisonai/approvals.sqlite"),
-    allowlist_path="/var/lib/praisonai/allow.json",
+store = ApprovalStore(path="/var/lib/praisonai/state/approvals.sqlite")
+backend = PresentationApprovalBackend(
+    store=store,
+    allowed_actors={"user-123", "ops-team"},
+    timeout=600,
+)
+
+agent = Agent(
+    name="Ops",
+    instructions="Ask before destructive commands.",
+    approval=ApprovalConfig(backend=backend, all_tools=True),
 )
 ```
 
-`ExecApprovalManager` constructor knobs:
+`PresentationApprovalBackend` constructor parameters:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ttl` | `float` | `300.0` | Seconds before a pending approval expires |
-| `store` | `ApprovalStoreProtocol` | `None` | Durable queue store; `None` means in-memory |
-| `allowlist_path` | `str \| Path` | `None` | Path to the JSON allow-list file |
+| `store` | `ApprovalStore \| None` | `None` | Durable SQLite store; `None` means in-memory only |
+| `allowed_actors` | `Iterable[str] \| None` | `None` | Actor IDs that may approve; `None` allows any actor (legacy) |
+| `channel_send_func` | `callable \| None` | `None` | Async function to send approval prompt to a channel |
+| `target` | `str \| None` | `None` | Default channel/chat ID |
+| `timeout` | `float` | `300.0` | Seconds to wait for a decision before failing closed |
 
 ---
 
@@ -143,38 +157,9 @@ manager = create_exec_approval_manager(
 Rehydrated pending requests keep their **original expiry** — a restart does not reset the TTL clock. A request that had 30 seconds left still has 30 seconds after rehydration.
 </Note>
 
-- **No live awaiter**: the awaiting agent call was lost with the previous process. Rehydrated requests stay visible via `list_pending()` and are resolvable via the gateway UI or API. The audit trail records the terminal state.
-- **Expiry is preserved**: `rehydrate()` derives `created_at` from the stored `expires_at` minus `ttl`, so a nearly-expired approval is not inadvertently extended.
+- **No live awaiter**: the awaiting agent call was lost with the previous process. Rehydrated requests stay resolvable via the gateway UI or API. The audit trail records the terminal state.
+- **Expiry is preserved**: `rehydrate()` filters by stored `expires_at`, so a nearly-expired approval is not inadvertently extended.
 - **Fail-open startup**: a corrupted store logs the error and returns 0 — it never blocks gateway startup.
-- **`allow_always` grants persist**: grants are written to the scoped allowlist store immediately and survive restarts without rehydration.
-
----
-
-## Scoping of `allow_always` Grants
-
-Grants default to being scoped to the requesting agent — granting `shell_exec` to `ops-agent` does not authorise `chat-agent`.
-
-```mermaid
-graph TB
-    Grant[allow_always grant] --> Scope{Scope}
-    Scope -->|default| Agent["Scoped to\n(agent_id, tool_name)"]
-    Scope -->|scope_to_args=True| Args["Scoped to\n(agent_id, tool_name, arg_signature)"]
-    Scope -->|scope_to_agent=False| Global["Global grant\n(legacy, all agents)"]
-
-    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef warning fill:#F59E0B,stroke:#7C90A0,color:#fff
-
-    class Grant config
-    class Agent,Args result
-    class Global warning
-```
-
-| Scope mode | Behaviour |
-|-----------|-----------|
-| Default (agent-scoped) | Grant applies only to the specific agent that requested it |
-| `scope_to_args=True` | Narrows further to the exact argument signature |
-| `scope_to_agent=False` | Legacy global grant — applies to all agents (not recommended) |
 
 ---
 
@@ -182,19 +167,19 @@ graph TB
 
 <AccordionGroup>
 <Accordion title="Enable in every production deployment">
-Set `PRAISONAI_GATEWAY_DURABLE_APPROVALS=1` in your deployment environment. Without it, a gateway restart drops all pending approvals — agents waiting for a human decision receive `timeout`/`deny`.
+Pass `approval="secure"` (or `--approval secure` on the CLI) in your deployment environment. Without a durable store, a gateway restart drops all pending approvals — agents waiting for a human decision receive a `timeout`/`deny`.
 </Accordion>
 
-<Accordion title="Prefer scoped grants over global">
-Default agent-scoped grants are safer: granting `shell_exec` to `ops-agent` does not silently authorise `chat-agent`. Reserve global grants only for tools that are truly safe for every agent.
+<Accordion title="Always set PRAISONAI_APPROVAL_ACTORS">
+The secure backend requires at least one authorised actor. Omitting `PRAISONAI_APPROVAL_ACTORS` causes a startup error by design — it prevents a misconfigured deployment from silently accepting approvals from any actor.
 </Accordion>
 
 <Accordion title="Rotate SQLite files with host rotation">
-Grants are stored per-host. When rotating to a new host, copy `~/.praisonai/state/*.sqlite` or regenerate grants — do not leave agents in a state where they re-prompt unnecessarily in production.
+Grants are stored per-host. When rotating to a new host, copy `~/.praisonai/state/*.sqlite` to preserve in-flight approvals — do not leave agents in a state where they re-prompt unnecessarily in production.
 </Accordion>
 
 <Accordion title="Combine with actor allow-lists for defence-in-depth">
-Pair `PRAISONAI_GATEWAY_DURABLE_APPROVALS=1` with `PRAISONAI_APPROVAL_ACTORS` from the [Secure Approval Backend](/docs/features/approval-secure-backend) so that only authorised actors can approve persisted requests.
+`PRAISONAI_APPROVAL_ACTORS` scopes who can approve. Pair this with network-level access controls on the gateway callback endpoint for defence-in-depth.
 </Accordion>
 </AccordionGroup>
 
@@ -204,7 +189,7 @@ Pair `PRAISONAI_GATEWAY_DURABLE_APPROVALS=1` with `PRAISONAI_APPROVAL_ACTORS` fr
 
 <CardGroup cols={2}>
 <Card title="Secure Approval Backend" icon="shield-check" href="/docs/features/approval-secure-backend">
-  Actor-authorised approval backend with actor allow-lists
+  Full reference for the actor-authorised, durable approval backend
 </Card>
 <Card title="Gateway" icon="network" href="/docs/features/gateway">
   Gateway deployment and configuration
