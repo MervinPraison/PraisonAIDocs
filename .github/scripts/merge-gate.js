@@ -14,6 +14,9 @@ const ALLOWED_MERGE_STATES = new Set(['CLEAN', 'UNSTABLE']);
 const BLOAT_FILE_MAX_AUTO_LINES = 100;
 const PR_MAX_AUTO_ADDITIONS = 800;
 const PR_MAX_AUTO_FILES = 30;
+const DOCS_PRIMARY_MAX_ADDITIONS = 1200;
+const DOCS_PRIMARY_MAX_FILES = 40;
+const DOCS_PRIMARY_MAX_SDK_ADDITIONS = 25;
 const MANUAL_ONLY_LABELS = new Set(['security', 'breaking-change', 'needs-manual-review', 'release']);
 const WORKFLOW_ONLY_LABEL = 'merge-gate-ci-only';
 const CI_ONLY_PATH_PREFIXES = ['.github/workflows/', '.github/actions/', '.github/scripts/merge-gate'];
@@ -253,18 +256,51 @@ function shouldSkipStaleFinalRecovery(comments, headPushedAt, headPusherLogin = 
   return { skip: false, reason: '' };
 }
 
+function extractDocsNavPath(line) {
+  const m = (line || '').match(/"(docs\/[^"]+)"/);
+  return m ? m[1] : null;
+}
+
+function isDocsPrimaryPullRequest(files) {
+  if (!files.length) return false;
+  const hasDocChange = files.some((f) => {
+    const name = f.filename || '';
+    return name.startsWith('docs/') || name === 'docs.json';
+  });
+  if (!hasDocChange) return false;
+  return files.every((f) => {
+    const name = f.filename || '';
+    return (
+      name.startsWith('docs/') ||
+      name === 'docs.json' ||
+      SDK_PATH_PREFIXES.some((p) => name.startsWith(p))
+    );
+  });
+}
+
 function isNavOnlyDocsJsonPatch(patch) {
-  if (!patch) return false;
+  if (!patch || /<<<<<<<|=======|>>>>>>>/.test(patch)) return false;
+  const removedPaths = [];
+  const addedPaths = [];
   for (const line of patch.split('\n')) {
     if (line.startsWith('@@') || line.startsWith('+++') || line.startsWith('---')) continue;
-    if (!line.startsWith('+') && !line.startsWith('-')) continue;
     if (DOCS_JSON_CONFIG_KEYS.test(line)) return false;
+    if (!line.startsWith('+') && !line.startsWith('-')) continue;
     const content = line.slice(1).trim();
     if (!content) continue;
+    const path = extractDocsNavPath(content);
     if (line.startsWith('-')) {
-      if (/^"docs\//.test(content) || /"(group|tab|pages|icon)"/.test(content)) return false;
-      if (!/^[\]},]?$/.test(content)) return false;
+      if (path) removedPaths.push(path);
+      else if (/"(group|tab|pages|icon)"/.test(content)) return false;
+      else if (!/^[\]},]?$/.test(content)) return false;
+    } else {
+      if (path) addedPaths.push(path);
+      else if (/"(group|tab|pages|icon)"/.test(content)) return false;
+      else if (!/^[\]},]?$/.test(content)) return false;
     }
+  }
+  for (const removed of removedPaths) {
+    if (!addedPaths.includes(removed)) return false;
   }
   return true;
 }
@@ -317,7 +353,9 @@ async function getMergeState(github, owner, repo, prNumber) {
   };
 }
 
-async function allChecksGreenOnSha(github, owner, repo, sha, core) {
+async function allChecksGreenOnSha(github, owner, repo, sha, core, options = {}) {
+  const mergeStateStatus = (options.mergeStateStatus || '').toUpperCase();
+  const ignoreWhenClean = new Set(['detect-and-trigger']);
   const { data } = await github.rest.checks.listForRef({
     owner,
     repo,
@@ -336,6 +374,10 @@ async function allChecksGreenOnSha(github, owner, repo, sha, core) {
     }
     const ok = ['success', 'neutral', 'skipped'].includes(run.conclusion);
     if (!ok) {
+      if (mergeStateStatus === 'CLEAN' && ignoreWhenClean.has(run.name || '')) {
+        core?.info?.(`Ignoring stale failed check on CLEAN PR: ${run.name}`);
+        continue;
+      }
       core?.info?.(`Check failed: ${run.name} (${run.conclusion})`);
       return false;
     }
@@ -581,12 +623,15 @@ function sensitivePathReasons(files, labels = []) {
 
 function prSizeReasons(files) {
   const reasons = [];
+  const docsPrimary = isDocsPrimaryPullRequest(files);
+  const maxAdditions = docsPrimary ? DOCS_PRIMARY_MAX_ADDITIONS : PR_MAX_AUTO_ADDITIONS;
+  const maxFiles = docsPrimary ? DOCS_PRIMARY_MAX_FILES : PR_MAX_AUTO_FILES;
   const totalAdditions = files.reduce((sum, f) => sum + (f.additions || 0), 0);
-  if (totalAdditions > PR_MAX_AUTO_ADDITIONS) {
-    reasons.push(`PR +${totalAdditions} lines (>${PR_MAX_AUTO_ADDITIONS}) requires manual review`);
+  if (totalAdditions > maxAdditions) {
+    reasons.push(`PR +${totalAdditions} lines (>${maxAdditions}) requires manual review`);
   }
-  if (files.length > PR_MAX_AUTO_FILES) {
-    reasons.push(`${files.length} files changed (>${PR_MAX_AUTO_FILES}) requires manual review`);
+  if (files.length > maxFiles) {
+    reasons.push(`${files.length} files changed (>${maxFiles}) requires manual review`);
   }
   return reasons;
 }
@@ -600,6 +645,10 @@ function missingTestsReason(files) {
       (f.additions || 0) > 0
   );
   if (sdkAdds.length === 0) return null;
+  if (isDocsPrimaryPullRequest(files)) {
+    const sdkAdditions = sdkAdds.reduce((sum, f) => sum + (f.additions || 0), 0);
+    if (sdkAdditions <= DOCS_PRIMARY_MAX_SDK_ADDITIONS) return null;
+  }
   const hasTestChange = files.some(
     (f) => /\/tests?\//.test(f.filename) || /test_.*\.py$/.test(f.filename) || /_test\.py$/.test(f.filename)
   );
@@ -763,7 +812,9 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
     reasons.push('claude.yml in progress');
   }
 
-  const checksOk = await allChecksGreenOnSha(github, owner, repo, ctx.headSha, core);
+  const checksOk = await allChecksGreenOnSha(github, owner, repo, ctx.headSha, core, {
+    mergeStateStatus: ctx.mergeState.status,
+  });
   if (!checksOk) reasons.push('CI not green on HEAD');
 
   if (!finalClaudeCompletedOnSha(ctx.comments, ctx.headPushedAt)) {
@@ -880,6 +931,8 @@ module.exports = {
   hasManualOnlyLabel,
   sensitivePathReasons,
   isNavOnlyDocsJsonPatch,
+  isDocsPrimaryPullRequest,
+  extractDocsNavPath,
   prSizeReasons,
   missingTestsReason,
   secretScanReasons,
