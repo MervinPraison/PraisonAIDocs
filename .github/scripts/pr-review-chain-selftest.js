@@ -59,6 +59,13 @@ assert(
   'skipCopilot proceeds after prior reviewers',
   chain.claudeFinalReady([coderabbit, greptile], [], { skipCopilot: true }).ready
 );
+const docsFinal = {
+  user: { login: 'github-actions[bot]' },
+  body: '@claude You are the FINAL documentation reviewer.',
+  created_at: '2026-07-03T07:16:00Z',
+};
+assert('docs FINAL trigger recognized', chain.isFinalClaudeTriggerComment(docsFinal));
+assert('docs FINAL counts as already triggered', chain.claudeFinalAlreadyTriggered([docsFinal]));
 const prev = process.env.REVIEW_CHAIN_SKIP_COPILOT;
 process.env.REVIEW_CHAIN_SKIP_COPILOT = '1';
 assert(
