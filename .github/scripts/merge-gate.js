@@ -32,9 +32,11 @@ const SECRET_PATTERNS = [
   /Bearer eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/,
   /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/,
 ];
+const MERGE_GATE_ACTIVE_LABEL = 'claude-merge-gate-active';
+const MERGE_GATE_ACTIVE_STALE_MS = 45 * 60 * 1000;
 const BLOCK_LABELS = new Set([
   'claude-conflict-pending',
-  'claude-merge-gate-active',
+  MERGE_GATE_ACTIVE_LABEL,
   'no-auto-merge',
   'auto-merged-by-gate',
 ]);
@@ -280,6 +282,97 @@ function claudeRunBlocksPr(run, headRef) {
 
 function hasBlockingClaudeRunForPr(runs, headRef) {
   return (runs || []).some((r) => claudeRunBlocksPr(r, headRef));
+}
+
+function mergeGateJobTargetsPr(jobName, prNumber) {
+  const name = jobName || '';
+  return name.includes(`(${prNumber},`) || name.includes(`(${prNumber})`);
+}
+
+async function listMergeGateRuns(github, owner, repo, status = null) {
+  const params = {
+    owner,
+    repo,
+    workflow_id: 'claude-merge-gate.yml',
+    per_page: 30,
+  };
+  if (status) params.status = status;
+  const { data } = await github.rest.actions.listWorkflowRuns(params);
+  return data.workflow_runs || [];
+}
+
+async function hasInProgressMergeGateForPr(github, owner, repo, prNumber) {
+  try {
+    const runs = await listMergeGateRuns(github, owner, repo, 'in_progress');
+    for (const run of runs) {
+      const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({
+        owner,
+        repo,
+        run_id: run.id,
+      });
+      for (const job of jobsData.jobs || []) {
+        if (!mergeGateJobTargetsPr(job.name, prNumber)) continue;
+        if (job.status === 'in_progress' || job.status === 'queued') return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function getLastMergeGateActivityMs(github, owner, repo, prNumber) {
+  try {
+    const runs = await listMergeGateRuns(github, owner, repo);
+    let latest = 0;
+    for (const run of runs) {
+      const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({
+        owner,
+        repo,
+        run_id: run.id,
+      });
+      const hit = (jobsData.jobs || []).some((j) => mergeGateJobTargetsPr(j.name, prNumber));
+      if (hit) {
+        const t = new Date(run.created_at).getTime();
+        if (t > latest) latest = t;
+      }
+    }
+    return latest || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Drop stuck claude-merge-gate-active when no assess/merge job is running (45 min grace). */
+async function reconcileMergeGateActiveLabel(github, owner, repo, prNumber, labels, core) {
+  if (!labels.includes(MERGE_GATE_ACTIVE_LABEL)) return { block: false, stale: false };
+  if (await hasInProgressMergeGateForPr(github, owner, repo, prNumber)) {
+    return { block: true, stale: false };
+  }
+  const lastActivity = await getLastMergeGateActivityMs(github, owner, repo, prNumber);
+  if (lastActivity && Date.now() - lastActivity < MERGE_GATE_ACTIVE_STALE_MS) {
+    return { block: true, stale: false };
+  }
+  try {
+    await github.rest.issues.removeLabel({
+      owner,
+      repo,
+      issue_number: prNumber,
+      name: MERGE_GATE_ACTIVE_LABEL,
+    });
+    core?.info?.(`Removed stale ${MERGE_GATE_ACTIVE_LABEL} from PR #${prNumber}`);
+  } catch (err) {
+    if (err.status !== 404) core?.warning?.(`Could not remove stale merge-gate label: ${err.message}`);
+  }
+  return { block: false, stale: true };
+}
+
+function shouldBlockOnMergeGateActiveLabel({ assessInProgress, lastActivityMs, nowMs = Date.now() }) {
+  if (assessInProgress) return { block: true, stale: false };
+  if (lastActivityMs && nowMs - lastActivityMs < MERGE_GATE_ACTIVE_STALE_MS) {
+    return { block: true, stale: false };
+  }
+  return { block: false, stale: true };
 }
 
 async function hasInProgressClaudeAssistant(github, owner, repo, prNumber = null) {
@@ -573,8 +666,11 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
   if (ctx.labels.includes('auto-merged-by-gate')) reasons.push('already merged by gate');
   if (ctx.labels.includes('no-auto-merge')) reasons.push('no-auto-merge label');
   if (ctx.labels.includes('claude-conflict-pending')) reasons.push('claude-conflict-pending');
-  if (!forMergeStep && ctx.labels.includes('claude-merge-gate-active')) {
-    reasons.push('claude-merge-gate-active');
+  if (!forMergeStep && ctx.labels.includes(MERGE_GATE_ACTIVE_LABEL)) {
+    const gate = await reconcileMergeGateActiveLabel(
+      github, owner, repo, prNumber, ctx.labels, core
+    );
+    if (gate.block) reasons.push('claude-merge-gate-active');
   }
 
   const { status, headRepo, maintainerCanModify } = ctx.mergeState;
@@ -726,4 +822,10 @@ module.exports = {
   evaluatePipelineQuiescent,
   selectMergeGateCandidates,
   findMergeGateVerdict,
+  MERGE_GATE_ACTIVE_LABEL,
+  MERGE_GATE_ACTIVE_STALE_MS,
+  mergeGateJobTargetsPr,
+  shouldBlockOnMergeGateActiveLabel,
+  hasInProgressMergeGateForPr,
+  reconcileMergeGateActiveLabel,
 };
