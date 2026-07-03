@@ -124,12 +124,13 @@ async function ensurePipelineLabels(github, owner, repo, core) {
 }
 
 async function syncPipelineLabels(github, owner, repo, prNumber, core) {
-  const ctx = await mergeGate.loadPrContext(github, owner, repo, prNumber);
-  if (ctx.pr.state !== 'open') return { synced: false, reason: 'not_open' };
-
   const evalResult = await mergeGate.evaluatePipelineQuiescent(
     github, owner, repo, prNumber, core
   );
+
+  if (evalResult.reasons.includes('not open')) return { synced: false, reason: 'not_open' };
+
+  const ctx = evalResult._ctx || await mergeGate.loadPrContext(github, owner, repo, prNumber);
   const { stage, blockers, all } = computePipelineLabels(ctx.comments, evalResult);
 
   const current = ctx.labels.filter((l) => l.startsWith(PIPELINE_PREFIX));

@@ -640,6 +640,7 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
     reasons,
     headSha: ctx.headSha,
     prNumber,
+    _ctx: ctx,
   };
 }
 
