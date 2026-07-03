@@ -121,11 +121,93 @@ jobs:
       issues: write
       actions: read
     steps:
+      - name: Check PR context (fork / merge state)
+        id: check_fork
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const isPR = context.eventName === 'pull_request'
+              || context.eventName === 'pull_request_review'
+              || context.eventName === 'pull_request_review_comment'
+              || (context.payload.issue && context.payload.issue.pull_request);
+
+            if (!isPR) {
+              core.setOutput('is_pr', 'false');
+              core.setOutput('is_fork', 'false');
+              core.setOutput('can_push_fork', 'false');
+              return;
+            }
+
+            const prNumber = context.payload.pull_request
+              ? context.payload.pull_request.number
+              : context.payload.issue.number;
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            let mergeState = '';
+            try {
+              const gql = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) { mergeStateStatus }
+                  }
+                }`,
+                { owner: context.repo.owner, repo: context.repo.repo, number: prNumber }
+              );
+              mergeState = (gql.repository.pullRequest.mergeStateStatus || '').toUpperCase();
+            } catch (e) {
+              core.warning(`GraphQL mergeStateStatus failed: ${e.message}`);
+            }
+            if (!mergeState) {
+              mergeState = (pr.data.mergeable_state || pr.data.merge_state_status || '').toUpperCase();
+            }
+
+            core.setOutput('is_pr', 'true');
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('pr_branch', pr.data.head.ref);
+            core.setOutput('head_repo', pr.data.head.repo.full_name);
+            core.setOutput('merge_state', mergeState);
+
+            const baseRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const maintainerCanModify = pr.data.maintainer_can_modify === true;
+            if (pr.data.head.repo && pr.data.head.repo.full_name !== baseRepo) {
+              core.setOutput('is_fork', 'true');
+              core.setOutput('can_push_fork', String(maintainerCanModify));
+              core.setOutput('fork_repo', pr.data.head.repo.full_name);
+              return;
+            }
+            core.setOutput('is_fork', 'false');
+            core.setOutput('can_push_fork', 'false');
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
           token: ${{ secrets.GH_TOKEN }}
+
+      - name: Fetch PR branch and setup remote
+        if: steps.check_fork.outputs.is_pr == 'true'
+        env:
+          PR_BRANCH: ${{ steps.check_fork.outputs.pr_branch }}
+          PR_NUMBER: ${{ steps.check_fork.outputs.pr_number }}
+          IS_FORK: ${{ steps.check_fork.outputs.is_fork }}
+          CAN_PUSH_FORK: ${{ steps.check_fork.outputs.can_push_fork }}
+          FORK_REPO: ${{ steps.check_fork.outputs.fork_repo }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          git fetch origin "pull/${PR_NUMBER}/head:${PR_BRANCH}"
+          git checkout "${PR_BRANCH}"
+          git fetch origin main
+          if [ "${IS_FORK}" = "true" ] && [ "${CAN_PUSH_FORK}" = "true" ]; then
+            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${FORK_REPO}.git"
+          elif [ "${IS_FORK}" = "true" ]; then
+            git remote set-url origin "file://$(pwd)"
+          fi
 
       - uses: anthropics/claude-code-action@beta
         env:
@@ -143,6 +225,9 @@ jobs:
             Follow AGENTS.md strictly — it contains the exact page structure, Mintlify components,
             Mermaid diagram standards, and code example rules you MUST follow.
 
+            ${{ steps.check_fork.outputs.is_fork == 'true' && steps.check_fork.outputs.can_push_fork != 'true' && 'CRITICAL: THIS IS A PULL REQUEST FROM A FORK WITHOUT MAINTAINER EDITS. YOU DO NOT HAVE PUSH PERMISSIONS. ONLY READ FILES, VALIDATE DOCS, AND PROVIDE COMMENTS ON THIS PR. DO NOT ATTEMPT TO PUSH OR CREATE PULL REQUESTS.\n\n' || (steps.check_fork.outputs.can_push_fork == 'true' && format('NOTE: Fork PR with maintainer edits allowed. Push directly to fork {0} branch {1}.\n\n', steps.check_fork.outputs.fork_repo, steps.check_fork.outputs.pr_branch) || (steps.check_fork.outputs.is_pr == 'true' && steps.check_fork.outputs.is_fork != 'true' && 'NOTE: The branch is under MervinPraison/PraisonAIDocs (not a fork). You are able to make modifications and push directly to this branch.\n\n' || '')) }}
+            ${{ steps.check_fork.outputs.is_pr == 'true' && format('CONTEXT: PR #{0} on branch {1}. head.repo={2}, is_fork={3}, can_push_fork={4}, merge_state={5}.\n\n', steps.check_fork.outputs.pr_number, steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.head_repo, steps.check_fork.outputs.is_fork, steps.check_fork.outputs.can_push_fork, steps.check_fork.outputs.merge_state) || '' }}
+
             STEP 0 — SETUP GIT IDENTITY & AUTH:
             git config --global user.name "MervinPraison"
             git config --global user.email "454862+MervinPraison@users.noreply.github.com"
@@ -158,7 +243,16 @@ jobs:
             - Quality checklist (Section 9)
             Every documentation page you create MUST pass the quality checklist.
 
-            STEP 2 — UNDERSTAND THE ISSUE:
+            FOLDER RULES (CRITICAL — NEVER VIOLATE):
+            - NEVER create or modify pages in docs/concepts/ — that folder is HUMAN-APPROVED ONLY
+            - Always place new documentation pages in docs/features/ instead
+            - If the issue mentions "concepts", still place the file in docs/features/
+            - Update docs.json to add new pages under the "Features" group, NOT "Concepts"
+            - Existing docs/concepts/ pages must NOT be touched without explicit human approval
+
+            ${{ steps.check_fork.outputs.is_pr == 'true' && (steps.check_fork.outputs.is_fork != 'true' || steps.check_fork.outputs.can_push_fork == 'true') && steps.check_fork.outputs.merge_state == 'DIRTY' && format('STEP 2 — RESOLVE MERGE CONFLICTS ON PR (branch: {0}, PR #{1}{2}):\n- DO NOT create a new branch or PR\n- git fetch origin main && git rebase origin/main\n- Resolve conflicts: keep this PR\'s doc intent, merge in newer main logic\n- For docs.json: combine nav entries from both sides; never leave conflict markers\n- git add -A && git rebase --continue (repeat until done)\n- git push --force-with-lease origin {0}\n- Verify docs.json is valid JSON and Mintlify paths exist\n- Comment which files you resolved\n', steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.pr_number, steps.check_fork.outputs.can_push_fork == 'true' && format(', fork: {0}', steps.check_fork.outputs.fork_repo) || '') || '' }}
+            ${{ steps.check_fork.outputs.is_pr == 'true' && (steps.check_fork.outputs.is_fork != 'true' || steps.check_fork.outputs.can_push_fork == 'true') && steps.check_fork.outputs.merge_state != 'DIRTY' && format('STEP 2 — IMPLEMENT ON EXISTING PR (branch: {0}, PR #{1}{2}):\n- DO NOT create a new branch or PR\n- git checkout {0}\n- SCOPE: docs/, docs.json, mint.json only — documentation changes\n- Read ./praisonaiagents/ and ./praisonai/ synced source before editing\n- Apply reviewer feedback or fix valid doc issues from comments above\n- git add -A && git commit -m "docs: <description>"\n- git push origin {0}\n- Comment a summary of exact files modified and what you skipped\n', steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.pr_number, steps.check_fork.outputs.can_push_fork == 'true' && format(', fork: {0}', steps.check_fork.outputs.fork_repo) || '') || '' }}
+            ${{ steps.check_fork.outputs.is_pr != 'true' && 'STEP 2 — UNDERSTAND THE ISSUE:
             Read the issue title, body, and all comments carefully.
             Determine what documentation needs to be created or updated.
 
@@ -166,13 +260,6 @@ jobs:
             Read `./praisonaiagents/` and `./praisonai/` first (AGENTS.md §1.4). Extract signatures,
             defaults, feature_configs.py, imports. If missing, clone: gh repo clone MervinPraison/PraisonAI /tmp/PraisonAI --depth=1
             NEVER guess — read the code.
-
-            FOLDER RULES (CRITICAL — NEVER VIOLATE):
-            - NEVER create or modify pages in docs/concepts/ — that folder is HUMAN-APPROVED ONLY
-            - Always place new documentation pages in docs/features/ instead
-            - If the issue mentions "concepts", still place the file in docs/features/
-            - Update docs.json to add new pages under the "Features" group, NOT "Concepts"
-            - Existing docs/concepts/ pages must NOT be touched without explicit human approval
 
             STEP 4 — BRANCH, IMPLEMENT, COMMIT, PUSH, OPEN PR (mandatory — do not defer):
             - Set BRANCH once: BRANCH="claude/issue-${{ env.ISSUE_NUMBER_RESOLVED }}-$(date +%Y%m%d-%H%M)" then git checkout -b "$BRANCH"
@@ -196,6 +283,7 @@ jobs:
             - git checkout "$BRANCH"
             - Apply fixes, commit, push to the same branch
             - Do NOT run gh pr create again if a PR already exists for $BRANCH
+            ' || '' }}
           allowed_tools: |
             Bash(git:*)
             Bash(python:*)

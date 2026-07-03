@@ -141,7 +141,11 @@ function isFinalClaudeTriggerComment(c) {
   if (!CLAUDE_TRIGGER_LOGINS.has(c.user?.login)) return false;
   if (!body.includes('@claude')) return false;
   if (body.includes('merge conflict')) return false;
-  return body.includes('final architecture reviewer') || body.includes('lead engineer');
+  return (
+    body.includes('final architecture reviewer') ||
+    body.includes('final documentation reviewer') ||
+    body.includes('lead engineer')
+  );
 }
 
 function claudeFinalAlreadyTriggered(comments) {
