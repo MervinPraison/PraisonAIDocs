@@ -204,7 +204,7 @@ Once your adapter is registered (in-process via `register()` or via the `praison
 |---------|-----------------------------------|
 | `praisonai --framework <name>` argparse `choices` | `list_framework_choices(include_unavailable=True)` |
 | `praisonai doctor` `agents.yaml` `framework:` field check | `list_framework_choices(include_unavailable=True)` |
-| Missing-framework error → install hint | adapter's own `install_hint` (falls back to `pip install 'praisonai[<name>]'`) |
+| Missing-framework error → install hint | adapter's own `install_hint` (falls back to `pip install 'praisonai-frameworks[<name>]'`) |
 
 The single source of truth is `praisonai.framework_adapters.list_framework_choices()`. When `include_unavailable=False` (the default) only adapters whose `is_available()` returns `True` are returned; the CLI uses `include_unavailable=True` so users see every registered framework and get a friendly error if its dependencies are missing.
 
@@ -230,7 +230,7 @@ ImportError: 'myframework' was requested but is not installed.
 Install with: pip install "myframework-praisonai[gpu]"
 ```
 
-If you omit `install_hint`, the wrapper falls back to `pip install 'praisonai[myframework]'`.
+If you omit `install_hint`, the wrapper falls back to `pip install 'praisonai-frameworks[myframework]'`.
 
 ### Missing optional dependencies no longer leak
 
@@ -273,15 +273,19 @@ from praisonai.framework_adapters import (
 
 Framework adapters must implement the `FrameworkAdapter` protocol:
 
-| Method | Required | Description |
+| Method / Attribute | Required | Description |
 |--------|----------|-------------|
 | `name` | ✅ | Unique framework identifier |
+| `install_hint` | ❌ | String shown when the framework is missing (falls back to `pip install 'praisonai-frameworks[<name>]'`) |
+| `requires_tools_extra` | ❌ | `bool`, default `False`. Set `True` if the adapter needs the tools extra. |
+| `is_router` | ❌ | `bool`, default `False`. Set `True` for router adapters that delegate to concrete siblings — skips `run()` protocol validation at registration time. |
 | `is_available()` | ✅ | Check framework dependencies |
 | `resolve(*, config=None)` | ❌ | Pick the concrete adapter variant from YAML config (keyword-only `config`; default returns `self`) |
 | `resolve_alias()` | ❌ | Return the concrete adapter name to dispatch to (string). Default returns `self.name`. Override when your adapter is a router that picks a sibling adapter at runtime by name. |
 | `setup(*, framework_tag)` | ❌ | Framework-specific pre-run hooks (default no-op) |
 | `run(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ✅ | Execute framework logic (all four trailing kwargs are validated at registration time — see Troubleshooting) |
-| `cleanup()` | ✅ | Clean up resources |
+| `arun(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ❌ | Async execution path. Default offloads `run()` to a thread via `asyncio.to_thread`. Override with a native `async def` for a fully async path. |
+| `cleanup()` | ❌ | Release resources after execution (default no-op) |
 
 ### Protocol Validation (PR #2083)
 
@@ -304,7 +308,99 @@ Adapters that fail validation also report `registry.is_available("<name>") == Fa
 As of [PR #2257](https://github.com/MervinPraison/PraisonAI/pull/2257) the no-op `resolve_variant` default has been removed from both the `FrameworkAdapter` Protocol and `BaseFrameworkAdapter`. Old adapters that still define `resolve_variant` will have it **silently ignored** — only `resolve(*, config=...)` and `resolve_alias()` are invoked.
 </Warning>
 
-**Single authoritative `arun()` default:** The Protocol declares `arun()` once; `BaseFrameworkAdapter` provides a single default that runs `run()` in a worker thread via `asyncio.to_thread`. Any adapter without native async support inherits this and does nothing extra. Adapters with native async should **override `arun()`** so they don't pay the thread-offload cost. Earlier revisions declared `arun()` twice on both the Protocol and the base class; those duplicate declarations have been removed and there is now exactly one default to override.
+**Default `arun()` offloads `run()` via `asyncio.to_thread`**, allowing sync adapters to be called from async contexts without blocking the event loop.
+
+Override `arun()` with a native `async def` to skip the thread offload entirely and use the framework's own async API.
+
+---
+
+## Adding an Async Path
+
+<Steps>
+
+<Step title="Sync-only adapter (default)">
+
+Leave `arun()` unoverridden. The base class offloads `run()` via `asyncio.to_thread` automatically:
+
+```python
+from praisonaiagents import BaseFrameworkAdapter
+
+class MySyncAdapter(BaseFrameworkAdapter):
+    name = "my_sync_framework"
+
+    def is_available(self) -> bool:
+        try:
+            import my_sync_framework
+            return True
+        except ImportError:
+            return False
+
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ) -> str:
+        import my_sync_framework
+        return my_sync_framework.execute(config, topic)
+```
+
+</Step>
+
+<Step title="Native async adapter">
+
+Override `arun()` with a real `async def` to use the framework's native async API:
+
+```python
+from praisonaiagents import BaseFrameworkAdapter
+
+class MyAsyncAdapter(BaseFrameworkAdapter):
+    name = "my_async_framework"
+
+    def is_available(self) -> bool:
+        try:
+            import my_async_framework
+            return True
+        except ImportError:
+            return False
+
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ) -> str:
+        import asyncio
+        return asyncio.run(self.arun(config, llm_config, topic))
+
+    async def arun(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ) -> str:
+        import my_async_framework
+        return await my_async_framework.aexecute(config, topic)
+```
+
+</Step>
+
+</Steps>
 
 ### Family Router Pattern — `AutoGenFamilyAdapter` as Canonical Example
 
@@ -322,6 +418,7 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
     """Router adapter for AutoGen family (v0.2, v0.4, AG2)."""
 
     name = "autogen"
+    is_router = True
 
     def is_available(self) -> bool:
         v2 = AutoGenAdapter()
@@ -329,48 +426,73 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
         ag2 = AG2Adapter()
         return v2.is_available() or v4.is_available() or ag2.is_available()
 
-    def resolve_alias(self) -> str:
-        """Pick adapter name from AUTOGEN_VERSION env var."""
-        requested = os.getenv("AUTOGEN_VERSION", "auto").lower()
+    def resolve_alias(self, config: Optional[Dict[str, Any]] = None) -> str:
+        """Pick adapter name from config or AUTOGEN_VERSION env var."""
+        requested = str(
+            (config or {}).get("autogen_version")
+            or os.getenv("AUTOGEN_VERSION", "auto")
+        ).strip().lower()
         v2_available = AutoGenAdapter().is_available()
         v4_available = AutoGenV4Adapter().is_available()
         ag2_available = AG2Adapter().is_available()
 
         if requested == "v0.2":
-            if not v2_available:
-                logger.warning("AUTOGEN_VERSION=v0.2 requested but autogen (v0.2) is not installed")
-            return "autogen_v2"
+            if v2_available:
+                return "autogen_v2"
+            raise ImportError(
+                "AUTOGEN_VERSION=v0.2 was requested, but the AutoGen v0.2 adapter "
+                "is not available. Install with: pip install 'praisonai-frameworks[autogen]'."
+            )
         if requested == "v0.4":
-            if not v4_available:
-                logger.warning("AUTOGEN_VERSION=v0.4 requested but autogen_agentchat (v0.4) is not installed")
-            return "autogen_v4"
+            if v4_available:
+                return "autogen_v4"
+            raise ImportError(
+                "AUTOGEN_VERSION=v0.4 was requested, but the v0.4 adapter is not "
+                "registered or available. Install/register an autogen_v4 adapter "
+                "(pip install 'praisonai-frameworks[autogen-v4]'), or unset AUTOGEN_VERSION "
+                "to use auto-selection."
+            )
         if requested == "ag2":
-            if not ag2_available:
-                logger.warning("AUTOGEN_VERSION=ag2 requested but AG2 is not installed")
-            return "ag2"
+            if ag2_available:
+                return "ag2"
+            raise ImportError(
+                "AUTOGEN_VERSION=ag2 was requested, but the AG2 adapter is not "
+                "registered or available. Install/register an AG2 adapter "
+                "(pip install 'praisonai-frameworks[ag2]'), or unset AUTOGEN_VERSION to use "
+                "auto-selection."
+            )
 
-        # auto: prefer v0.2 (v0.4 and ag2 are stubs)
+        # auto: prefer v0.2 (v0.4 and ag2 are currently unimplemented)
         if v2_available:
             return "autogen_v2"
-        elif v4_available:
-            logger.warning("AutoGen v0.4 is installed but not yet implemented, falling back.")
+        if v4_available:
             return "autogen_v4"
-        elif ag2_available:
+        if ag2_available:
             return "ag2"
 
         raise ImportError(
-            "No AutoGen variant is available. Install with:\n"
+            "No runnable AutoGen variant is available. Install with:\n"
             "  pip install 'praisonai-frameworks[autogen]' for v0.2\n"
             "  pip install 'praisonai-frameworks[autogen-v4]' for v0.4\n"
             "  pip install 'praisonai-frameworks[ag2]' for AG2"
         )
 
     def resolve(self, *, config: Optional[Dict[str, Any]] = None) -> "BaseFrameworkAdapter":
-        adapter_name = self.resolve_alias()
+        adapter_name = self.resolve_alias(config)
         from praisonai.framework_adapters.registry import get_default_registry
         return get_default_registry().create(adapter_name)
 
-    def run(self, config, llm_config, topic) -> str:
+    def run(
+        self,
+        config,
+        llm_config,
+        topic,
+        *,
+        tools_dict=None,
+        agent_callback=None,
+        task_callback=None,
+        cli_config=None,
+    ) -> str:
         raise RuntimeError(
             "AutoGenFamilyAdapter.run() should not be called directly. "
             "The resolve() method should have been called first to get the concrete adapter."
@@ -378,9 +500,9 @@ class AutoGenFamilyAdapter(BaseFrameworkAdapter):
 ```
 
 Key points:
-- `resolve_alias()` returns a **string name** (env-var based routing)
-- `resolve()` uses that name to fetch the concrete adapter from the registry
-- `run()` raises `RuntimeError` — the orchestrator calls `resolve()` first, then calls `run()` on the returned concrete adapter
+- `resolve_alias(config)` accepts optional `config` dict — config `autogen_version` key wins over `AUTOGEN_VERSION` env var
+- `resolve()` passes `config` to `resolve_alias()`, then fetches the concrete adapter from the registry
+- `run()` has the full four keyword-only kwargs and raises `RuntimeError` — the orchestrator calls `resolve()` first, then calls `run()` on the returned concrete adapter
 
 ---
 
@@ -499,7 +621,7 @@ class CustomCrewAIAdapter(BaseFrameworkAdapter):
         return "Custom CrewAI result"
 
     def cleanup(self) -> None:
-        pass
+        super().cleanup()
 
 # Override built-in CrewAI adapter
 registry = get_default_registry()
@@ -676,26 +798,23 @@ class ResourceAwareAdapter(BaseFrameworkAdapter):
         self._connections = []
         self._temp_files = []
     
-    def run(self, config, llm_config, topic):
-        # Create resources during execution
+    def run(self, config, llm_config, topic, *, tools_dict=None,
+            agent_callback=None, task_callback=None, cli_config=None):
         conn = self._create_connection()
         self._connections.append(conn)
         
         temp_file = self._create_temp_file()
         self._temp_files.append(temp_file)
         
-        # Use resources...
         return result
     
     def cleanup(self) -> None:
-        # Close connections
         for conn in self._connections:
             try:
                 conn.close()
             except Exception:
                 pass
         
-        # Clean up temp files
         for temp_file in self._temp_files:
             try:
                 temp_file.unlink()
@@ -704,6 +823,7 @@ class ResourceAwareAdapter(BaseFrameworkAdapter):
         
         self._connections.clear()
         self._temp_files.clear()
+        super().cleanup()
 ```
 
 </Accordion>
@@ -713,10 +833,36 @@ class ResourceAwareAdapter(BaseFrameworkAdapter):
 Use cached availability checks to avoid multi-second imports on every probe:
 
 ```python
-from praisonai._framework_availability import is_available as check_availability
+import importlib.util
 
 def is_available(self) -> bool:
-    return check_availability("myframework")  # cached, uses importlib.util.find_spec
+    return importlib.util.find_spec("myframework") is not None
+```
+
+</Accordion>
+
+<Accordion title="Prefer native async for high-concurrency workloads">
+
+The default `arun()` offloads `run()` via `asyncio.to_thread`, which relies on Python's shared thread pool. For high-concurrency workloads, override `arun()` with a native `async def` to avoid thread pool contention:
+
+```python
+from praisonaiagents import BaseFrameworkAdapter
+
+class ScalableAsyncAdapter(BaseFrameworkAdapter):
+    name = "scalable_framework"
+
+    def is_available(self) -> bool:
+        return True
+
+    def run(self, config, llm_config, topic, *, tools_dict=None,
+            agent_callback=None, task_callback=None, cli_config=None) -> str:
+        import asyncio
+        return asyncio.run(self.arun(config, llm_config, topic))
+
+    async def arun(self, config, llm_config, topic, *, tools_dict=None,
+                   agent_callback=None, task_callback=None, cli_config=None) -> str:
+        import scalable_framework
+        return await scalable_framework.arun(config, topic)
 ```
 
 </Accordion>
@@ -741,7 +887,7 @@ from praisonai.framework_adapters.registry import (
 |---|---|---|
 | `list_framework_choices(*, include_unavailable=False)` | `list[str]` | Build the CLI `--framework` choice list (registered adapters; pass `include_unavailable=True` for the full list) |
 | `list_available_frameworks()` | `list[str]` | Filter to just those whose `is_available()` returns `True` |
-| `get_install_hint(name)` | `str` | Adapter-aware install hint string (e.g. `pip install 'praisonai[autogen]'`) |
+| `get_install_hint(name)` | `str` | Adapter-aware install hint string (e.g. `pip install 'praisonai-frameworks[autogen]'`) |
 | `framework_option_help()` | `str` | Auto-generated `--help` text for the `--framework` flag |
 
 ```python
@@ -753,7 +899,7 @@ print(choices)  # ['crewai', 'praisonai', 'autogen', 'my_framework']
 
 # Get install instructions for a missing framework
 hint = get_install_hint("crewai")
-print(hint)  # pip install 'praisonai[crewai]'
+print(hint)  # pip install 'praisonai-frameworks[crewai]'
 ```
 
 ---
@@ -891,6 +1037,19 @@ Your code can still ignore the values — the signature just needs to accept the
 <Accordion title="My adapter disappeared from the available frameworks list">
 
 If `praisonai --list-frameworks` (or `registry.list_names()`) no longer shows your adapter, run `registry.is_available("<your-adapter-name>")`. Since PR #2083, `is_available()` catches `TypeError` from the new protocol validator and returns `False` rather than raising — so a malformed plugin is silently filtered out of the available list. Since PR #2415, `is_available()` also catches `ImportError` raised during adapter construction (e.g., when the adapter's `__init__` touches an optional dependency). Check the application logs for the error message above and fix the `run()` signature or ensure your dependencies are properly guarded.
+
+</Accordion>
+
+<Accordion title="Sync adapter called from async context">
+
+The default `arun()` uses `asyncio.to_thread` to offload sync `run()` calls. This is safe for most workloads. If you need a fully async path, override `arun()` with a native `async def`:
+
+```python
+class MyAdapter(BaseFrameworkAdapter):
+    async def arun(self, config, llm_config, topic, *, tools_dict=None,
+                   agent_callback=None, task_callback=None, cli_config=None) -> str:
+        return await my_native_async_call(config, topic)
+```
 
 </Accordion>
 </AccordionGroup>
