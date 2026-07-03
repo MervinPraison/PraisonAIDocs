@@ -150,4 +150,33 @@ assert('fork sync PR link rejected', !mg.isInternalPullRequestLink(
   'PraisonAIDocs'
 ));
 
+// Merge-gate active label stale after 45 min with no in-progress assess
+const now = Date.parse('2026-07-03T12:00:00Z');
+assert(
+  'blocks when assess in progress',
+  mg.shouldBlockOnMergeGateActiveLabel({ assessInProgress: true, lastActivityMs: null, nowMs: now }).block
+);
+assert(
+  'blocks within 45m grace after last activity',
+  mg.shouldBlockOnMergeGateActiveLabel({
+    assessInProgress: false,
+    lastActivityMs: now - 30 * 60 * 1000,
+    nowMs: now,
+  }).block
+);
+assert(
+  'stale after 45m with no assess running',
+  mg.shouldBlockOnMergeGateActiveLabel({
+    assessInProgress: false,
+    lastActivityMs: now - 46 * 60 * 1000,
+    nowMs: now,
+  }).stale
+);
+assert(
+  'stale when label stuck with no activity record',
+  mg.shouldBlockOnMergeGateActiveLabel({ assessInProgress: false, lastActivityMs: null, nowMs: now }).stale
+);
+assert('merge gate job name matches PR', mg.mergeGateJobTargetsPr('claude-assess (1460, abc123)', 1460));
+assert('merge gate job name rejects other PR', !mg.mergeGateJobTargetsPr('claude-assess (1461, abc123)', 1460));
+
 process.exit(failed ? 1 : 0);
