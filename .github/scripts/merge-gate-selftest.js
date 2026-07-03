@@ -101,6 +101,40 @@ assert('nav-only docs.json not sensitive', mg.sensitivePathReasons([{ filename: 
 const themePatch = navOnlyPatch.replace('+      "docs/features/new-page",', '+  "theme": "dark",');
 assert('docs.json theme change still sensitive', mg.sensitivePathReasons([{ filename: 'docs.json', patch: themePatch }]).length === 1);
 
+const commaFixPatch = [
+  '--- a/docs.json',
+  '+++ b/docs.json',
+  '@@ -1123,7 +1123,8 @@',
+  '-              "docs/features/mongodb-memory"',
+  '+              "docs/features/mongodb-memory",',
+  '+              "docs/features/dakera-memory"',
+].join('\n');
+assert('comma-fix nav docs.json not sensitive', mg.sensitivePathReasons([{ filename: 'docs.json', patch: commaFixPatch }]).length === 0);
+
+const navRemovalPatch = [
+  '--- a/docs.json',
+  '+++ b/docs.json',
+  '@@ -10,6 +10,5 @@',
+  '     "pages": [',
+  '-      "docs/cli/doctor",',
+  '     ]',
+].join('\n');
+assert('nav path removal still sensitive', mg.sensitivePathReasons([{ filename: 'docs.json', patch: navRemovalPatch }]).length === 1);
+
+const conflictMarkerPatch = navOnlyPatch.replace('+      "docs/features/new-page",', '+<<<<<<< HEAD');
+assert('conflict markers in docs.json blocked', !mg.isNavOnlyDocsJsonPatch(conflictMarkerPatch));
+
+const docsPrimaryFiles = [
+  { filename: 'docs/features/foo.mdx', additions: 840 },
+];
+assert('docs-primary allows larger audit file', mg.prSizeReasons(docsPrimaryFiles).length === 0);
+
+const sdkMirrorFiles = [
+  { filename: 'docs/features/toolsets.mdx', additions: 34 },
+  { filename: 'praisonaiagents/toolsets.py', additions: 8 },
+];
+assert('small SDK mirror sync ok without tests', mg.missingTestsReason(sdkMirrorFiles) === null);
+
 // Stale-FINAL recovery guards (PraisonAI #2334 parity)
 const finalAt = '2026-07-03T10:00:00Z';
 const pushSoonAfter = '2026-07-03T10:05:00Z';
