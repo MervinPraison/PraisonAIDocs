@@ -33,15 +33,15 @@ Each page is checked against these criteria (Y = pass, N = fail, N/A = not appli
 
 | Page | Hero Mermaid | Std Colors | Agent-Centric | Seq Diagram | `<Steps>` | `<Accordion>` | `<CardGroup>` | Frontmatter | Imports | No Forbidden | No Placeholders | Forbidden Phrases | Score |
 |------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|---|:---:|
-| `features/browser-troubleshooting.mdx` | N | N | N | N | N | N | N | N | N/A | Y | N |  | 10% |
-| `features/replay.mdx` | N | N | N | N | N | N | N | N | N | Y | Y |  | 18% |
-| `features/browser-architecture.mdx` | N | N | N | Y | N | N | N | N | N/A | Y | N |  | 20% |
-| `features/routellm.mdx` | N | N | Y | N | N | N | N | N | Y | Y | N |  | 27% |
-| `features/browser/extension-architecture.mdx` | N | N | Y | N | N | N | N | N | N/A | Y | Y |  | 30% |
-| `features/chat.mdx` | N | N | N | N | N | N | Y | N | Y | Y | Y |  | 36% |
-| `features/llm-judge.mdx` | N | N | N | N | Y | N | Y | N | N | Y | Y |  | 36% |
-| `features/mcp/index.mdx` | N | N | Y | N | N | N | N | N | Y | Y | Y |  | 36% |
-| `features/recipe-workflow.mdx` | N | N | N | N | Y | N | Y | N | N/A | Y | Y |  | 40% |
+| `docs/features/browser-troubleshooting.mdx` | N | N | N | N | N | N | N | N | N/A | Y | N |  | 10% |
+| `docs/features/replay.mdx` | N | N | N | N | N | N | N | N | N | Y | Y |  | 18% |
+| `docs/features/browser-architecture.mdx` | N | N | N | Y | N | N | N | N | N/A | Y | N |  | 20% |
+| `docs/features/routellm.mdx` | N | N | Y | N | N | N | N | N | Y | Y | N |  | 27% |
+| `docs/features/browser/extension-architecture.mdx` | N | N | Y | N | N | N | N | N | N/A | Y | Y |  | 30% |
+| `docs/features/chat.mdx` | N | N | N | N | N | N | Y | N | Y | Y | Y |  | 36% |
+| `docs/features/llm-judge.mdx` | N | N | N | N | Y | N | Y | N | N | Y | Y |  | 36% |
+| `docs/features/mcp/index.mdx` | N | N | Y | N | N | N | N | N | Y | Y | Y |  | 36% |
+| `docs/features/recipe-workflow.mdx` | N | N | N | N | Y | N | Y | N | N/A | Y | Y |  | 40% |
 | `docs/tools/external/agentql-toolkit.mdx` | N | N | Y | N | Y | N | Y | N | Y | Y | N |  | 45% |
 | `docs/tools/external/bearly-code-interpreter.mdx` | N | N | Y | N | Y | N | Y | N | Y | Y | N |  | 45% |
 | `docs/tools/external/brave-search.mdx` | N | N | Y | N | Y | N | Y | N | Y | Y | N |  | 45% |
@@ -748,15 +748,15 @@ Each page is checked against these criteria (Y = pass, N = fail, N/A = not appli
 
 These pages scored ≤ 50% and should be fixed first:
 
-- **`features/browser-troubleshooting.mdx`** (10%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter, placeholder values
-- **`features/replay.mdx`** (18%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter, friendly imports
-- **`features/browser-architecture.mdx`** (20%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter, placeholder values
-- **`features/routellm.mdx`** (27%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter, placeholder values
-- **`features/browser/extension-architecture.mdx`** (30%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter
-- **`features/chat.mdx`** (36%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<Steps>`, `<AccordionGroup>`, complete frontmatter
-- **`features/llm-judge.mdx`** (36%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<AccordionGroup>`, complete frontmatter, friendly imports
-- **`features/mcp/index.mdx`** (36%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter
-- **`features/recipe-workflow.mdx`** (40%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<AccordionGroup>`, complete frontmatter
+- **`docs/features/browser-troubleshooting.mdx`** (10%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter, placeholder values
+- **`docs/features/replay.mdx`** (18%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter, friendly imports
+- **`docs/features/browser-architecture.mdx`** (20%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter, placeholder values
+- **`docs/features/routellm.mdx`** (27%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter, placeholder values
+- **`docs/features/browser/extension-architecture.mdx`** (30%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter
+- **`docs/features/chat.mdx`** (36%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<Steps>`, `<AccordionGroup>`, complete frontmatter
+- **`docs/features/llm-judge.mdx`** (36%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<AccordionGroup>`, complete frontmatter, friendly imports
+- **`docs/features/mcp/index.mdx`** (36%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<Steps>`, `<AccordionGroup>`, `<CardGroup>`, complete frontmatter
+- **`docs/features/recipe-workflow.mdx`** (40%) — missing: hero Mermaid diagram, standard color scheme, agent-centric intro, sequence diagram, `<AccordionGroup>`, complete frontmatter
 - **`docs/tools/external/agentql-toolkit.mdx`** (45%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<AccordionGroup>`, complete frontmatter, placeholder values
 - **`docs/tools/external/bearly-code-interpreter.mdx`** (45%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<AccordionGroup>`, complete frontmatter, placeholder values
 - **`docs/tools/external/brave-search.mdx`** (45%) — missing: hero Mermaid diagram, standard color scheme, sequence diagram, `<AccordionGroup>`, complete frontmatter, placeholder values
@@ -791,17 +791,17 @@ These pages scored ≤ 50% and should be fixed first:
 Based on lowest compliance scores, fix in this order:
 
 ### Batch 1
-- `features/browser-troubleshooting.mdx` (10%)
-- `features/replay.mdx` (18%)
-- `features/browser-architecture.mdx` (20%)
-- `features/routellm.mdx` (27%)
-- `features/browser/extension-architecture.mdx` (30%)
+- `docs/features/browser-troubleshooting.mdx` (10%)
+- `docs/features/replay.mdx` (18%)
+- `docs/features/browser-architecture.mdx` (20%)
+- `docs/features/routellm.mdx` (27%)
+- `docs/features/browser/extension-architecture.mdx` (30%)
 
 ### Batch 2
-- `features/chat.mdx` (36%)
-- `features/llm-judge.mdx` (36%)
-- `features/mcp/index.mdx` (36%)
-- `features/recipe-workflow.mdx` (40%)
+- `docs/features/chat.mdx` (36%)
+- `docs/features/llm-judge.mdx` (36%)
+- `docs/features/mcp/index.mdx` (36%)
+- `docs/features/recipe-workflow.mdx` (40%)
 - `docs/tools/external/agentql-toolkit.mdx` (45%)
 
 ### Batch 3
