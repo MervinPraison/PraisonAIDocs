@@ -15,7 +15,15 @@ on:
   pull_request_review:
     types: [submitted]
   pull_request:
-    types: [opened]
+    types: [opened, synchronize]
+  schedule:
+    - cron: '30 3,9,15,21 * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Optional PR number to re-trigger FINAL @claude'
+        required: false
+        type: string
 
 env:
   MAX_POLL_ATTEMPTS: 20
@@ -443,3 +451,80 @@ jobs:
             // It will be triggered by copilot-after-coderabbit or copilot-after-qodo
             // once those bots finish, ensuring Copilot always reviews LAST.
             console.log('Copilot will be triggered after CodeRabbit/Qodo complete.');
+
+  # ================================================================
+  # Merge gate: stale FINAL recovery + pipeline labels
+  # ================================================================
+  claude-final-on-sync:
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Re-post stale FINAL @claude after push
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const path = require('path');
+            const review = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review.js'));
+            const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request.number;
+            const result = await review.postFinalClaudeReviewIfNeeded(
+              github, owner, repo, prNumber, core, { resyncOnly: true }
+            );
+            if (result.posted) core.info(`Posted stale FINAL @claude on PR #${prNumber}`);
+            await ps.ensurePipelineLabels(github, owner, repo, core);
+            await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+
+  stale-final-recovery:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Re-post stale or missing FINAL @claude
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const path = require('path');
+            const review = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review.js'));
+            const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const manual = (process.env.PR_NUMBER_INPUT || '').trim();
+
+            if (manual) {
+              const prNumber = parseInt(manual, 10);
+              if (Number.isNaN(prNumber)) throw new Error(`Invalid pr_number: ${manual}`);
+              await review.postFinalClaudeReviewIfNeeded(github, owner, repo, prNumber, core, { force: true });
+              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+              return;
+            }
+
+            const { data: prs } = await github.rest.pulls.list({ owner, repo, state: 'open', per_page: 100 });
+            let posted = 0;
+            for (const pr of prs) {
+              if (pr.draft) continue;
+              const result = await review.postFinalClaudeReviewIfNeeded(
+                github, owner, repo, pr.number, core, { resyncOnly: true }
+              );
+              if (result.posted) posted += 1;
+              await ps.syncPipelineLabels(github, owner, repo, pr.number, core);
+            }
+            core.info(`Scheduled FINAL recovery complete (${posted} posted)`);
