@@ -135,9 +135,37 @@ jobs:
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
             const comments = await mergeGate.listAllComments(github, owner, repo, prNumber);
             const headPushedAt = (await mergeGate.getHeadCommitDate(github, owner, repo, prNumber)) || pr.updated_at;
+            const headPusher = context.payload.sender?.login || null;
             const hasFinal = mergeGate.hasFinalClaudeReviewTrigger(comments);
             const isStale = mergeGate.isStaleFinalAfterPush(comments, headPushedAt);
-            if (!hasFinal || isStale) {
+
+            if (mergeGate.shouldSkipFinalRecovery(comments, headPushedAt)) {
+              core.info('Recent @claude within 35min and FINAL not stale — skip recovery');
+              await ps.ensurePipelineLabels(github, owner, repo, core);
+              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+              return;
+            }
+            if (await mergeGate.hasInProgressClaudeAssistant(github, owner, repo, prNumber)) {
+              core.info('Claude workflow in progress — skip recovery');
+              await ps.ensurePipelineLabels(github, owner, repo, core);
+              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+              return;
+            }
+
+            if (hasFinal && isStale) {
+              const gate = mergeGate.shouldSkipStaleFinalRecovery(comments, headPushedAt, headPusher);
+              if (gate.skip) {
+                core.info(`Skip stale-FINAL recovery: ${gate.reason}`);
+                await ps.ensurePipelineLabels(github, owner, repo, core);
+                await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+                return;
+              }
+              await chain.maybeTriggerClaudeFinal(
+                github, owner, repo, prNumber,
+                mergeGate.FINAL_CLAUDE_REVIEW_BODY, core,
+                { skipCopilot: true, optionalWaitMs: 0, prCreatedAt: pr.created_at }
+              );
+            } else if (!hasFinal) {
               await chain.maybeTriggerClaudeFinal(
                 github, owner, repo, prNumber,
                 mergeGate.FINAL_CLAUDE_REVIEW_BODY, core,
@@ -193,6 +221,13 @@ jobs:
               if (hasFinal && !isStale) continue;
               if (mergeGate.hasRecentClaudeTrigger(comments, 10)) continue;
               if (await mergeGate.hasInProgressClaudeAssistant(github, owner, repo, pr.number)) continue;
+              if (hasFinal && isStale) {
+                const gate = mergeGate.shouldSkipStaleFinalRecovery(comments, headPushedAt);
+                if (gate.skip) {
+                  core.info(`PR #${pr.number}: skip stale — ${gate.reason}`);
+                  continue;
+                }
+              }
               const result = await chain.maybeTriggerClaudeFinal(
                 github, owner, repo, pr.number,
                 mergeGate.FINAL_CLAUDE_REVIEW_BODY, core,
