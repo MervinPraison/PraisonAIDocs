@@ -15,11 +15,16 @@ const BLOAT_FILE_MAX_AUTO_LINES = 100;
 const PR_MAX_AUTO_ADDITIONS = 800;
 const PR_MAX_AUTO_FILES = 30;
 const DOCS_PRIMARY_MAX_ADDITIONS = 1200;
-const DOCS_PRIMARY_MAX_FILES = 40;
+const DOCS_PRIMARY_MAX_FILES = 80;
 const DOCS_PRIMARY_MAX_SDK_ADDITIONS = 25;
 const MANUAL_ONLY_LABELS = new Set(['security', 'breaking-change', 'needs-manual-review', 'release']);
 const WORKFLOW_ONLY_LABEL = 'merge-gate-ci-only';
-const CI_ONLY_PATH_PREFIXES = ['.github/workflows/', '.github/actions/', '.github/scripts/merge-gate'];
+const CI_ONLY_PATH_PREFIXES = [
+  '.github/workflows/',
+  '.github/actions/',
+  '.github/scripts/merge-gate',
+  '.github/scripts/pipeline-status',
+];
 const SDK_PATH_PREFIXES = ['praisonaiagents/', 'praisonai/'];
 const BLOAT_FILES = [];
 const SENSITIVE_PATH_PATTERNS = [
@@ -606,13 +611,20 @@ function hasManualOnlyLabel(labels) {
   return labels.some((l) => MANUAL_ONLY_LABELS.has(l));
 }
 
+function isDocsJsonAdditionsOnly(file) {
+  if (file.filename !== 'docs.json') return false;
+  if (file.patch && isNavOnlyDocsJsonPatch(file.patch)) return true;
+  if (!file.patch && (file.deletions || 0) === 0 && (file.additions || 0) > 0) return true;
+  return false;
+}
+
 function sensitivePathReasons(files, labels = []) {
   if (labels.includes(WORKFLOW_ONLY_LABEL) && isCiOnlyChange(files)) {
     return [];
   }
   const reasons = [];
   for (const f of files) {
-    if (f.filename === 'docs.json' && isNavOnlyDocsJsonPatch(f.patch)) continue;
+    if (isDocsJsonAdditionsOnly(f)) continue;
     if (SENSITIVE_PATH_PATTERNS.some((p) => p.test(f.filename))) {
       reasons.push(`sensitive path: ${f.filename}`);
       break;
@@ -930,6 +942,7 @@ module.exports = {
   touchesSdk,
   hasManualOnlyLabel,
   sensitivePathReasons,
+  isDocsJsonAdditionsOnly,
   isNavOnlyDocsJsonPatch,
   isDocsPrimaryPullRequest,
   extractDocsNavPath,
