@@ -88,6 +88,43 @@ assert('ci-only label not exempt mixed changes', mg.sensitivePathReasons(
 ).length === 1);
 assert('secret in patch', mg.secretScanReasons([{ filename: 'x.py', patch: '+key = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"' }]).length === 1);
 
+// Nav-only docs.json exempt from manual-review sensitive path
+const navOnlyPatch = [
+  '--- a/docs.json',
+  '+++ b/docs.json',
+  '@@ -10,6 +10,7 @@',
+  '     "pages": [',
+  '+      "docs/features/new-page",',
+  '     ]',
+].join('\n');
+assert('nav-only docs.json not sensitive', mg.sensitivePathReasons([{ filename: 'docs.json', patch: navOnlyPatch }]).length === 0);
+const themePatch = navOnlyPatch.replace('+      "docs/features/new-page",', '+  "theme": "dark",');
+assert('docs.json theme change still sensitive', mg.sensitivePathReasons([{ filename: 'docs.json', patch: themePatch }]).length === 1);
+
+// Stale-FINAL recovery guards (PraisonAI #2334 parity)
+const finalAt = '2026-07-03T10:00:00Z';
+const pushSoonAfter = '2026-07-03T10:05:00Z';
+const staleComments = [
+  { user: { login: 'MervinPraison' }, body: '@claude FINAL architecture reviewer', created_at: finalAt },
+  { user: { login: 'praisonai-triage-agent[bot]' }, body: 'Claude finished', created_at: '2026-07-03T10:04:00Z' },
+];
+assert(
+  'skip stale recovery when push soon after FINAL',
+  mg.shouldSkipStaleFinalRecovery(staleComments, pushSoonAfter, 'praisonai-triage-agent[bot]').skip
+);
+assert(
+  'automation pusher skips stale recovery',
+  mg.shouldSkipStaleFinalRecovery(staleComments, pushSoonAfter, 'praisonai-triage-agent[bot]').skip
+);
+assert('isClaudeAutomationLogin triage bot', mg.isClaudeAutomationLogin('praisonai-triage-agent[bot]'));
+
+// Cooldown: FINAL current on HEAD should not block merge gate
+const finalCompleteComments = [
+  { user: { login: 'MervinPraison' }, body: '@claude FINAL architecture reviewer', created_at: '2026-07-03T10:00:00Z' },
+];
+assert('final complete on head when not stale', mg.finalClaudeCompletedOnSha(finalCompleteComments, '2026-07-03T10:00:30Z'));
+assert('final not complete when head after final without re-trigger', !mg.finalClaudeCompletedOnSha(finalCompleteComments, '2026-07-03T10:07:00Z'));
+
 // Claude run scoping — other PR branches must not block
 assert('other branch claude does not block', !mg.hasBlockingClaudeRunForPr(
   [{ event: 'issue_comment', head_branch: 'other-branch' }],
