@@ -121,11 +121,93 @@ jobs:
       issues: write
       actions: read
     steps:
+      - name: Check PR context (fork / merge state)
+        id: check_fork
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const isPR = context.eventName === 'pull_request'
+              || context.eventName === 'pull_request_review'
+              || context.eventName === 'pull_request_review_comment'
+              || (context.payload.issue && context.payload.issue.pull_request);
+
+            if (!isPR) {
+              core.setOutput('is_pr', 'false');
+              core.setOutput('is_fork', 'false');
+              core.setOutput('can_push_fork', 'false');
+              return;
+            }
+
+            const prNumber = context.payload.pull_request
+              ? context.payload.pull_request.number
+              : context.payload.issue.number;
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            let mergeState = '';
+            try {
+              const gql = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) { mergeStateStatus }
+                  }
+                }`,
+                { owner: context.repo.owner, repo: context.repo.repo, number: prNumber }
+              );
+              mergeState = (gql.repository.pullRequest.mergeStateStatus || '').toUpperCase();
+            } catch (e) {
+              core.warning(`GraphQL mergeStateStatus failed: ${e.message}`);
+            }
+            if (!mergeState) {
+              mergeState = (pr.data.mergeable_state || pr.data.merge_state_status || '').toUpperCase();
+            }
+
+            core.setOutput('is_pr', 'true');
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('pr_branch', pr.data.head.ref);
+            core.setOutput('head_repo', pr.data.head.repo.full_name);
+            core.setOutput('merge_state', mergeState);
+
+            const baseRepo = `${context.repo.owner}/${context.repo.repo}`;
+            const maintainerCanModify = pr.data.maintainer_can_modify === true;
+            if (pr.data.head.repo && pr.data.head.repo.full_name !== baseRepo) {
+              core.setOutput('is_fork', 'true');
+              core.setOutput('can_push_fork', String(maintainerCanModify));
+              core.setOutput('fork_repo', pr.data.head.repo.full_name);
+              return;
+            }
+            core.setOutput('is_fork', 'false');
+            core.setOutput('can_push_fork', 'false');
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
           token: ${{ secrets.GH_TOKEN }}
+
+      - name: Fetch PR branch and setup remote
+        if: steps.check_fork.outputs.is_pr == 'true'
+        env:
+          PR_BRANCH: ${{ steps.check_fork.outputs.pr_branch }}
+          PR_NUMBER: ${{ steps.check_fork.outputs.pr_number }}
+          IS_FORK: ${{ steps.check_fork.outputs.is_fork }}
+          CAN_PUSH_FORK: ${{ steps.check_fork.outputs.can_push_fork }}
+          FORK_REPO: ${{ steps.check_fork.outputs.fork_repo }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          git fetch origin "pull/${PR_NUMBER}/head:${PR_BRANCH}"
+          git checkout "${PR_BRANCH}"
+          git fetch origin main
+          if [ "${IS_FORK}" = "true" ] && [ "${CAN_PUSH_FORK}" = "true" ]; then
+            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${FORK_REPO}.git"
+          elif [ "${IS_FORK}" = "true" ]; then
+            git remote set-url origin "file://$(pwd)"
+          fi
 
       - uses: anthropics/claude-code-action@beta
         env:
@@ -134,7 +216,7 @@ jobs:
           allowed_bots: 'praisonai-triage-agent[bot]'
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GH_TOKEN }}
-          anthropic_model: claude-sonnet-4-6
+          model: claude-sonnet-4-6
           trigger_phrase: "@claude"
           label_trigger: "claude"
 
@@ -142,6 +224,9 @@ jobs:
             You are a documentation engineer for PraisonAI. This is a DOCUMENTATION repository.
             Follow AGENTS.md strictly — it contains the exact page structure, Mintlify components,
             Mermaid diagram standards, and code example rules you MUST follow.
+
+            ${{ steps.check_fork.outputs.is_fork == 'true' && steps.check_fork.outputs.can_push_fork != 'true' && 'CRITICAL: THIS IS A PULL REQUEST FROM A FORK WITHOUT MAINTAINER EDITS. YOU DO NOT HAVE PUSH PERMISSIONS. ONLY READ FILES, VALIDATE DOCS, AND PROVIDE COMMENTS ON THIS PR. DO NOT ATTEMPT TO PUSH OR CREATE PULL REQUESTS.\n\n' || (steps.check_fork.outputs.can_push_fork == 'true' && format('NOTE: Fork PR with maintainer edits allowed. Push directly to fork {0} branch {1}.\n\n', steps.check_fork.outputs.fork_repo, steps.check_fork.outputs.pr_branch) || (steps.check_fork.outputs.is_pr == 'true' && steps.check_fork.outputs.is_fork != 'true' && 'NOTE: The branch is under MervinPraison/PraisonAIDocs (not a fork). You are able to make modifications and push directly to this branch.\n\n' || '')) }}
+            ${{ steps.check_fork.outputs.is_pr == 'true' && format('CONTEXT: PR #{0} on branch {1}. head.repo={2}, is_fork={3}, can_push_fork={4}, merge_state={5}.\n\n', steps.check_fork.outputs.pr_number, steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.head_repo, steps.check_fork.outputs.is_fork, steps.check_fork.outputs.can_push_fork, steps.check_fork.outputs.merge_state) || '' }}
 
             STEP 0 — SETUP GIT IDENTITY & AUTH:
             git config --global user.name "MervinPraison"
@@ -158,7 +243,16 @@ jobs:
             - Quality checklist (Section 9)
             Every documentation page you create MUST pass the quality checklist.
 
-            STEP 2 — UNDERSTAND THE ISSUE:
+            FOLDER RULES (CRITICAL — NEVER VIOLATE):
+            - NEVER create or modify pages in docs/concepts/ — that folder is HUMAN-APPROVED ONLY
+            - Always place new documentation pages in docs/features/ instead
+            - If the issue mentions "concepts", still place the file in docs/features/
+            - Update docs.json to add new pages under the "Features" group, NOT "Concepts"
+            - Existing docs/concepts/ pages must NOT be touched without explicit human approval
+
+            ${{ steps.check_fork.outputs.is_pr == 'true' && (steps.check_fork.outputs.is_fork != 'true' || steps.check_fork.outputs.can_push_fork == 'true') && steps.check_fork.outputs.merge_state == 'DIRTY' && format('STEP 2 — RESOLVE MERGE CONFLICTS ON PR (branch: {0}, PR #{1}{2}):\n- DO NOT create a new branch or PR\n- git fetch origin main && git rebase origin/main\n- Resolve conflicts: keep this PR\'s doc intent, merge in newer main logic\n- For docs.json: combine nav entries from both sides; never leave conflict markers\n- git add -A && git rebase --continue (repeat until done)\n- git push --force-with-lease origin {0}\n- Verify docs.json is valid JSON and Mintlify paths exist\n- Comment which files you resolved\n', steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.pr_number, steps.check_fork.outputs.can_push_fork == 'true' && format(', fork: {0}', steps.check_fork.outputs.fork_repo) || '') || '' }}
+            ${{ steps.check_fork.outputs.is_pr == 'true' && (steps.check_fork.outputs.is_fork != 'true' || steps.check_fork.outputs.can_push_fork == 'true') && steps.check_fork.outputs.merge_state != 'DIRTY' && format('STEP 2 — IMPLEMENT ON EXISTING PR (branch: {0}, PR #{1}{2}):\n- DO NOT create a new branch or PR\n- git checkout {0}\n- SCOPE: docs/, docs.json, mint.json only — documentation changes\n- Read ./praisonaiagents/ and ./praisonai/ synced source before editing\n- Apply reviewer feedback or fix valid doc issues from comments above\n- git add -A && git commit -m "docs: <description>"\n- git push origin {0}\n- Comment a summary of exact files modified and what you skipped\n', steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.pr_number, steps.check_fork.outputs.can_push_fork == 'true' && format(', fork: {0}', steps.check_fork.outputs.fork_repo) || '') || '' }}
+            ${{ steps.check_fork.outputs.is_pr != 'true' && 'STEP 2 — UNDERSTAND THE ISSUE:
             Read the issue title, body, and all comments carefully.
             Determine what documentation needs to be created or updated.
 
@@ -167,39 +261,29 @@ jobs:
             defaults, feature_configs.py, imports. If missing, clone: gh repo clone MervinPraison/PraisonAI /tmp/PraisonAI --depth=1
             NEVER guess — read the code.
 
-            FOLDER RULES (CRITICAL — NEVER VIOLATE):
-            - NEVER create or modify pages in docs/concepts/ — that folder is HUMAN-APPROVED ONLY
-            - Always place new documentation pages in docs/features/ instead
-            - If the issue mentions "concepts", still place the file in docs/features/
-            - Update docs.json to add new pages under the "Features" group, NOT "Concepts"
-            - Existing docs/concepts/ pages must NOT be touched without explicit human approval
-
-            STEP 4 — CREATE DOCUMENTATION:
-            - Create one feature branch and reuse its name in STEP 7, e.g. BRANCH="claude/issue-${{ env.ISSUE_NUMBER_RESOLVED }}-$(date +%Y%m%d)" then git checkout -b "$BRANCH"
+            STEP 4 — BRANCH, IMPLEMENT, COMMIT, PUSH, OPEN PR (mandatory — do not defer):
+            - Set BRANCH once: BRANCH="claude/issue-${{ env.ISSUE_NUMBER_RESOLVED }}-$(date +%Y%m%d-%H%M)" then git checkout -b "$BRANCH"
             - Place ALL new .mdx files in docs/features/ (NEVER docs/concepts/)
             - Follow the page structure template in AGENTS.md Section 2
             - Start every page with an agent-centric Quick Start example
             - Use Mintlify components (Steps, AccordionGroup, CardGroup, Tabs)
             - Include Mermaid diagrams with the standard color scheme
             - All code examples must be copy-paste runnable with correct imports
-            - User-friendly: non-developers and beginners should understand
-            - Progressive disclosure: simple first, advanced later
-
-            STEP 5 — UPDATE NAVIGATION:
-            If creating new pages, add them to docs.json in the correct section.
-            Check existing structure in docs.json to find the right group.
-
-            STEP 6 — VERIFY:
-            - Confirm all .mdx files exist and are valid
-            - Verify docs.json is valid JSON
-            - Check all code examples have correct imports
-            - Ensure Mermaid diagrams use the standard color scheme
-
-            STEP 7 — COMMIT, PUSH, OPEN PR (mandatory end state):
+            - If creating new pages, add them to docs.json in the correct section
+            - Verify docs.json is valid JSON and all .mdx files exist
             - git add -A && git commit -m "docs: <description> (fixes #${{ env.ISSUE_NUMBER_RESOLVED }})"
-            - git push -u origin "$BRANCH"   # same $BRANCH as STEP 4; never use a second $(date ...) for the branch name
-            - gh pr create --base main --head "$BRANCH" --title "docs: <title>" --body "Fixes #${{ env.ISSUE_NUMBER_RESOLVED }}"
-            Opening the PR is required for every run that produced commits. Do not finish after push only, do not ask a human to open a PR, and do not stop for a "summary" until `gh pr create` returns a PR URL. If `gh pr create` fails, read the error, fix (e.g. auth, duplicate PR, wrong head), and retry until it succeeds.
+            - git push -u origin "$BRANCH"
+            CRITICAL: Immediately after push, run exactly:
+            gh pr create --base main --head "$BRANCH" --title "docs: <title>" --body "Fixes #${{ env.ISSUE_NUMBER_RESOLVED }}"
+            Do NOT stop after push. Do NOT ask a human to open a PR. Do NOT finish until `gh pr create` returns a PR URL.
+            If `gh pr create` fails, read the error, fix (auth, duplicate PR, wrong head), and retry until it succeeds.
+            Reuse the same $BRANCH for any follow-up commits — never create a second branch with a new date.
+
+            STEP 5 — FOLLOW-UP (only if reviewers request changes on the open PR):
+            - git checkout "$BRANCH"
+            - Apply fixes, commit, push to the same branch
+            - Do NOT run gh pr create again if a PR already exists for $BRANCH
+            ' || '' }}
           allowed_tools: |
             Bash(git:*)
             Bash(python:*)
@@ -220,3 +304,84 @@ jobs:
             mcp__github__get_issue_comments
             mcp__github__update_issue
           timeout_minutes: 30
+
+      - name: Ensure open PR for issue branch
+        if: |
+          (github.event_name == 'issues' && github.event.action == 'labeled') ||
+          (github.event_name == 'issue_comment' && !github.event.issue.pull_request)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const path = require('path');
+            const orphan = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/orphan-pr.js'));
+            const issueNumber = context.payload.issue.number;
+            await orphan.ensureOpenPrForIssue(
+              github, context.repo.owner, context.repo.repo, issueNumber, core
+            );
+
+      - name: Kick review chain for new PR
+        if: |
+          (github.event_name == 'issues' && github.event.action == 'labeled') ||
+          (github.event_name == 'issue_comment' && !github.event.issue.pull_request)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const path = require('path');
+            const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/bot-pr-review-chain.js'));
+            const issueNumber = context.payload.issue.number;
+            await chain.kickReviewChainForIssue(
+              github, context.repo.owner, context.repo.repo, issueNumber, core
+            );
+
+      - name: Sync pipeline status labels
+        if: |
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+          github.event_name == 'pull_request_review' ||
+          github.event_name == 'pull_request_review_comment'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const path = require('path');
+            const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request?.number || context.payload.issue?.number;
+            if (!prNumber) return;
+            await ps.ensurePipelineLabels(github, owner, repo, core);
+            await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+
+      - name: Dispatch merge gate when PR pipeline ready
+        if: |
+          (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+          github.event_name == 'pull_request_review' ||
+          github.event_name == 'pull_request_review_comment'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const path = require('path');
+            const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request?.number || context.payload.issue?.number;
+            if (!prNumber) return;
+            const check = await mergeGate.evaluatePipelineQuiescent(
+              github, owner, repo, prNumber, core, {
+                skipGlobalClaudeRunCheck: true,
+                skipRecentClaudeCooldown: true,
+              }
+            );
+            if (!check.ready) {
+              core.info(`PR #${prNumber} not ready for merge gate: ${check.reasons.join(', ')}`);
+              return;
+            }
+            await github.rest.repos.createDispatchEvent({
+              owner,
+              repo,
+              event_type: 'claude-merge-gate',
+              client_payload: { pr_number: prNumber },
+            });
+            core.info(`Dispatched merge gate for PR #${prNumber}`);

@@ -1,6 +1,6 @@
 ---
 title: "PraisonAI Package Integration"
-description: "Guide for integrating the PraisonAI package into your Python projects, including YAML configuration and different execution modes"
+description: "Guide for integrating the PraisonAI package into your Python projects, including YAML configuration, execution modes, and the C8 wrapper–code boundary architecture"
 icon: "box"
 ---
 
@@ -273,4 +273,133 @@ PraisonAI(agent_file="agents.yaml").run()
 ```
 
 If you want PraisonAI to leave your application's logging untouched, just don't call `configure_cli_logging` — only namespaced `praisonai.*` loggers will be used.
+
+---
+
+## C8 Architecture: Wrapper–Code Boundary (Developer Reference)
+
+<Note>
+This section covers the internal three-tier package architecture. It is relevant to contributors and maintainers, not end-users.
+</Note>
+
+### Three-Tier Model
+
+PraisonAI uses a strict three-tier package model with a one-way dependency rule:
+
+```mermaid
+graph TB
+    subgraph tier1 ["Tier 1 — praisonaiagents (Core SDK)"]
+        PROTO[Protocols / Hooks / Base Classes]
+        CLI_PROTO[cli/protocols.py]
+    end
+
+    subgraph tier2 ["Tier 2 — praisonai-code (Terminal CLI)"]
+        RUN[run / chat / code / serve]
+        BRIDGE[_wrapper_bridge.py]
+    end
+
+    subgraph tier3 ["Tier 3 — praisonai (Wrapper)"]
+        CMDS[Repatriated Commands]
+        FEATS[Repatriated Features]
+        ADAPT[adapters/]
+    end
+
+    PROTO --> RUN
+    CLI_PROTO --> ADAPT
+    RUN -.->|"lazy bridge only — no PyPI dep"| CMDS
+    BRIDGE -.-> CMDS
+    BRIDGE -.-> FEATS
+
+    classDef core fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef code fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef wrapper fill:#4a5568,stroke:#7C90A0,color:#fff
+
+    class PROTO,CLI_PROTO core
+    class RUN,BRIDGE code
+    class CMDS,FEATS,ADAPT wrapper
+```
+
+**Invariant:** `praisonai-code/pyproject.toml` declares **no** PyPI dependency on `praisonai`. All `praisonai-code` → `praisonai` wrapper access goes through `praisonai_code._wrapper_bridge` only.
+
+### C8 Metrics (post-C8, merged 2026-07-02)
+
+| Metric | Pre-C8 | Post-C8 |
+|--------|--------|---------|
+| Wrapper import lines in `praisonai-code` | 225 | **0** |
+| Regression baseline in `check_c7_imports.sh` | 225 | **50** |
+| Allowlisted files | 47 | **0** |
+
+### `_wrapper_bridge` — The Only Cross-Tier Path
+
+`praisonai_code._wrapper_bridge` is the **sole** permitted mechanism for `praisonai-code` to call into `praisonai`. It lazy-loads the wrapper at runtime and never causes an import-time error when the wrapper is absent.
+
+```python
+from praisonai_code._wrapper_bridge import get_wrapper_module
+
+mod = get_wrapper_module("praisonai.cli.commands.train")
+if mod:
+    mod.train_command()
+```
+
+Direct `import praisonai` or `from praisonai import …` inside `praisonai-code` is forbidden and enforced by `scripts/check_c7_imports.sh`.
+
+### `_WRAPPER_RESIDENT_COMMANDS`
+
+Commands that live in the `praisonai` wrapper but are registered in the `praisonai-code` CLI router. The variable was renamed from `_WRAPPER_COMMANDS` in C8.1 (backward-compat alias retained).
+
+`get_command()` lazy-loads these via the absolute `praisonai.cli.commands.*` path through the bridge.
+
+**C8.2 Repatriated Commands** (moved from `praisonai-code` back to `praisonai`):
+
+| Batch | Commands |
+|-------|---------|
+| A | `langfuse`, `langextract`, `flow`, `n8n`, `replay`, `langfuse_client` |
+| B | `train`, `managed`, `examples`, `standardise` |
+| C | `docs`, `schedule`, `batch` |
+| D | `rag`, `knowledge`, `realtime`, `profile`, `audit`, `app` |
+| E | `serve` wrapper paths (SDK subcommands remain in `praisonai-code`) |
+
+### C8.3 Repatriated Features
+
+The following `cli/features/*` modules moved from `praisonai-code` to `praisonai/cli/features/`:
+
+`recipe`, `templates`, `deploy`, `recipe_optimizer`, `persistence`, `eval`, `agent_scheduler`, `acp`, `registry`, `sandbox_cli`, `ollama`, `workflow`, `tui/app`, `interactive/async_tui`, `interactive/core`
+
+Also repatriated: `commands/recipe`, `context`, `mcp`, `validate`.
+
+### Protocols & Adapters (C8.5)
+
+C8.5 introduces typed protocol contracts to enforce the tier boundary. The `SessionStoreProtocol` (session persistence) already ships in `praisonaiagents`:
+
+```python
+from praisonaiagents.session.protocols import SessionStoreProtocol
+```
+
+`TemplateStoreProtocol` and `ServeHandlerProtocol` are defined in the C8.5 design but their physical extraction is **deferred** (same milestone as the `PraisonAI` class split).
+
+| Protocol | Location | Purpose |
+|----------|----------|---------|
+| `SessionStoreProtocol` | `praisonaiagents.session.protocols` | Session persistence backend contract (`add_message`, `get_chat_history`, …) |
+| `TemplateStoreProtocol` | _deferred_ | Template persistence for repatriated CLI features |
+| `ServeHandlerProtocol` | _deferred_ | Dispatch serve subcommands without direct wrapper imports |
+
+The `praisonai.adapters` module lazily re-exports existing adapter classes (`AutoReader`, `ChromaVectorStore`, `BasicRetriever`, `FusionRetriever`, `LLMReranker`, and registration helpers) to preserve backward compatibility.
+
+### C8.4 Legacy Structure
+
+- `praisonai/cli/legacy/inbuilt_tools.py`, `framework_run.py` — extraction targets for lazy loaders.
+- `praisonai-code/cli/legacy/prompt_dispatch.py` — standalone-safe helpers.
+- `main.py` still contains the `PraisonAI` class body; wrapper access is normalised via the bridge. The physical 7k-line split is **deferred** (out of scope of C8).
+
+### Developer Tooling
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/check_c7_imports.sh` | Counts wrapper import lines in `praisonai-code`; enforces baseline ≤ 50 |
+| `scripts/c8_bridge_convert.py` | Converts direct `from praisonai …` imports to `_wrapper_bridge` calls |
+| `scripts/c8_repatriate.py` | Moves a command/feature implementation from `praisonai-code` → `praisonai` |
+
+### Deferred Work
+
+The physical extraction of the `PraisonAI` class (~7k lines in `main.py`) to `praisonai/cli/legacy/praison_class.py` was explicitly deferred from C8. The `docs/concepts/architecture.mdx` page (HUMAN-ONLY) also needs a maintainer update to reflect the C8 metrics.
 

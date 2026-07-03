@@ -362,6 +362,15 @@ class GatewayConfigSchema(BaseModel):
     # Routing and daemon config
     routing: Optional[RoutingConfigSchema] = None
     daemon: Optional[DaemonConfigSchema] = None
+
+    # Gateway server settings (host/port, drain_timeout, admission control,
+    # etc.) and inbound trigger hooks. These are read by
+    # ``gateway/server.py::load_gateway_config`` / ``_apply_hooks_from_config``
+    # rather than modelled field-by-field here; kept permissive so a real
+    # ``gateway.yaml`` with a top-level ``gateway:``/``hooks:`` block validates
+    # through this single schema instead of being rejected. See issue #2585.
+    gateway: Optional[Dict[str, Any]] = None
+    hooks: Optional[List[Dict[str, Any]]] = None
     
     @model_validator(mode="after")
     def normalize_and_validate(self):
@@ -390,8 +399,29 @@ class GatewayConfigSchema(BaseModel):
                 "(telegram, discord, slack, whatsapp) to your config"
             )
             
-        # Validate platform names
-        valid_platforms = {"telegram", "discord", "slack", "whatsapp", "email", "agentmail", "linear"}
+        # Validate platform names against the platform registry (single source
+        # of truth). This includes built-in platforms, entry-point discovered
+        # channels (``praisonai.channels`` / ``praisonai.bots``), and any
+        # channel registered at runtime via ``register_platform()``.
+        try:
+            from ._registry import list_platforms
+            valid_platforms = set(list_platforms())
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "Platform registry unavailable; falling back to built-in "
+                "platform list.", exc_info=True
+            )
+            # Fall back to the built-in set (single source of truth) if the
+            # registry is unavailable.
+            try:
+                from ._registry import _BUILTIN_PLATFORMS
+                valid_platforms = set(_BUILTIN_PLATFORMS)
+            except Exception:
+                valid_platforms = {
+                    "telegram", "discord", "slack", "whatsapp",
+                    "email", "agentmail", "linear",
+                }
         for name, channel in self.channels.items():
             platform = (channel.platform or name).lower()
             if platform not in valid_platforms:

@@ -11,6 +11,21 @@ Hook events are triggered at specific points in the agent lifecycle, allowing yo
 This page covers **in-process lifecycle hooks** (SETUP, SESSION_START, BEFORE_AGENT, etc.) that fire inside a running agent. For **HTTP inbound triggers** that start agent runs from external services via `POST /hooks/<path>`, see [Gateway Inbound Hooks](/docs/features/gateway-inbound-hooks).
 </Note>
 
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import add_hook
+
+@add_hook("before_tool")
+def log_tool(event_data):
+    print(f"Tool: {event_data.tool_name}")
+
+agent = Agent(name="MyAgent", instructions="Be helpful.")
+agent.start("Run a tool and show lifecycle hooks")
+```
+
+The user sends a prompt; hooks fire at each lifecycle event as the agent runs.
+
 ```mermaid
 graph TB
     subgraph "Agent Lifecycle Events"
@@ -407,18 +422,83 @@ def after_compaction(event_data):
 
 ### Message Events
 
-| Event | Trigger | Use Case |
-|-------|---------|----------|
-| `MESSAGE_RECEIVED` | Message received | Preprocessing |
-| `MESSAGE_SENDING` | Before message sent | Modification |
-| `MESSAGE_SENT` | After message sent | Confirmation |
+| Event | Trigger | Input Type | Use Case |
+|-------|---------|------------|----------|
+| `MESSAGE_RECEIVED` | Inbound message from a bot channel, before agent dispatch | `MessageReceivedInput` | **Inbound gate** — drop (deny), redact/rewrite content, authorise sender, rate-limit |
+| `MESSAGE_SENDING` | Before message sent | `MessageSendingInput` | Outbound gate — cancel or rewrite outbound text |
+| `MESSAGE_SENT` | After message sent | `MessageSentInput` | Confirmation |
+
+`MESSAGE_RECEIVED` is a **first-class control point**: hooks can drop an inbound message so the agent never runs, or rewrite the message content before the agent (or memory) sees it. This is symmetric with `MESSAGE_SENDING` on the outbound side.
+
+<Note>
+`MESSAGE_RECEIVED` and `MESSAGE_SENDING` are the two message-lifecycle events that **do gate** — `deny` drops the message entirely, `modified_input["content"]` rewrites it. The gate is safe from both sync and async adapters (Telegram, Slack, Discord, WhatsApp, Email, AgentMail) — no `async def` required in your hook. See [PraisonAI #2589](https://github.com/MervinPraison/PraisonAI/pull/2589).
+</Note>
+
+#### Drop / block an inbound message
 
 ```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
 @registry.on(HookEvent.MESSAGE_RECEIVED)
-def on_message_received(event_data):
-    print(f"Received: {event_data.message}")
+def block_bots(event_data):
+    if event_data.sender_id.endswith("bot"):
+        return HookResult.deny("no bots")
     return HookResult.allow()
 
+agent = Agent(name="Concierge", instructions="Be helpful.", hooks=registry)
+```
+
+#### Redact PII before the agent sees it
+
+```python
+import re
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.MESSAGE_RECEIVED)
+def redact_pii(event_data):
+    cleaned = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[SSN]", event_data.content)
+    return HookResult(decision="allow", modified_input={"content": cleaned})
+
+agent = Agent(name="SafeAgent", instructions="Be helpful.", hooks=registry)
+```
+
+#### Authorise sender against an allowlist
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+ALLOWED = {"U123", "U456"}
+
+@registry.on(HookEvent.MESSAGE_RECEIVED)
+def only_allowed_users(event_data):
+    if event_data.sender_id not in ALLOWED:
+        return HookResult.deny("unauthorised")
+    return HookResult.allow()
+
+agent = Agent(name="PrivateAgent", instructions="Be helpful.", hooks=registry)
+```
+
+#### How the gate applies decisions
+
+| Decision | Effect |
+|----------|--------|
+| `HookResult.deny("reason")` | Message is dropped; the agent is never invoked; the adapter returns immediately |
+| `HookResult(decision="allow", modified_input={"content": "..."})` | Content is rewritten in place; agent, memory, and command parser all see the new text |
+| `HookResult.allow()` | Message passes through unchanged |
+
+<Note>
+When multiple `MESSAGE_RECEIVED` hooks run, the **last matching modification** wins. Hook errors are non-fatal — the message passes through unchanged.
+</Note>
+
+```python
 @registry.on(HookEvent.MESSAGE_SENDING)
 def on_message_sending(event_data):
     print(f"Sending: {event_data.message}")
@@ -562,8 +642,8 @@ def on_auto_promotion(event_data):
 | `SETUP` | System | Initialization |
 | `BEFORE_COMPACTION` | Context | Before compaction |
 | `AFTER_COMPACTION` | Context | After compaction |
-| `MESSAGE_RECEIVED` | Message | Message received |
-| `MESSAGE_SENDING` | Message | Before message sent |
+| `MESSAGE_RECEIVED` | Message | Inbound gate — drop (deny) or redact/rewrite before agent dispatch |
+| `MESSAGE_SENDING` | Message | Outbound gate — cancel or rewrite before sending |
 | `MESSAGE_SENT` | Message | After message sent |
 | `GATEWAY_START` | Gateway | Gateway starts |
 | `GATEWAY_STOP` | Gateway | Gateway stops |
@@ -588,6 +668,10 @@ Gateway and session hooks are emitted by `BotOS` and `BotSessionManager` — no 
 - All emission is **best-effort** and a **no-op when no hooks are registered** (zero overhead)
 - `BEFORE_AGENT` / `AFTER_AGENT` are fired by `agent.chat()` itself — they are **not** re-fired at the gateway boundary to avoid double-dispatch
 - In async contexts (e.g. inside `BotSessionManager.chat`), emission is fire-and-forget; in sync contexts it is blocking
+
+<Note>
+**`MESSAGE_RECEIVED` and `MESSAGE_SENDING` are policy gates, not passive observers.** `deny` drops the message; `modified_input["content"]` rewrites it. Gateway/session lifecycle events (`GATEWAY_START`, `GATEWAY_STOP`, `SESSION_START`, `SESSION_END`) remain best-effort observability points and do not gate startup or shutdown.
+</Note>
 
 ---
 

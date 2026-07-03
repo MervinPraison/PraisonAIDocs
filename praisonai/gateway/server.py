@@ -117,8 +117,16 @@ class _ClientConn:
 
     def start(self) -> None:
         """Start the background drain task for this connection."""
-        if self._task is None:
-            self._task = asyncio.ensure_future(self._drain())
+        if self._task is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Sync client registration (e.g. unit tests) — no running loop yet.
+            # The drain task is started lazily on the first ``offer`` once the
+            # gateway event loop is running, so no frames are lost.
+            return
+        self._task = loop.create_task(self._drain())
 
     def offer(self, data: Any) -> bool:
         """Try to enqueue a frame within the configured bounds.
@@ -128,6 +136,14 @@ class _ClientConn:
         """
         if self._closed:
             return False
+        # Lazily start the drain task. When a client is registered from a
+        # synchronous context (e.g. ``add_client`` before the event loop is
+        # running) ``start()`` cannot schedule the drain and leaves ``_task``
+        # as ``None``. ``offer`` always runs on the event loop in production,
+        # so starting here guarantees queued frames are drained rather than
+        # accumulating silently until the client is spuriously evicted.
+        if self._task is None:
+            self.start()
         size = self._frame_size(data)
         if self.max_queued_frames > 0 and self._queue.qsize() >= self.max_queued_frames:
             return False
