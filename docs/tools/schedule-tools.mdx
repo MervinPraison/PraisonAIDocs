@@ -24,8 +24,8 @@ graph LR
     A --> T[Tool]
     T --> O[Output]
 
-    classDef agent fill:#8B0000,color:#fff
-    classDef tool fill:#189AB4,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
 
     class A agent
     class U,O tool
@@ -37,7 +37,7 @@ graph LR
   **Built-in** — no extra dependencies required. Schedule tools are included in the core `praisonaiagents` package.
 </Note>
 
-Schedule tools let your agents self-schedule reminders, recurring tasks, and one-shot jobs — all via simple tool calls. No changes to the `Agent` class are needed.
+Schedule tools let your agents self-schedule reminders, recurring tasks, and one-shot jobs — all via simple tool calls. Optionally gate each tick with a cheap shell check via `pre_run` so expensive model turns only happen when there's real work to do. No changes to the `Agent` class are needed.
 
 ## Quick Start
 
@@ -65,7 +65,7 @@ print(schedule_list())
 </Step>
 </Steps>
 
-The agent willThe agent will call `schedule_add` with the appropriate schedule expression, and the job will be persisted to disk.
+The agent will call `schedule_add` with the appropriate schedule expression, and the job will be persisted to disk.
 
 ## Available Tools
 
@@ -243,7 +243,7 @@ for run in history:
 |-------|------|-------------|
 | `job_id` | `str` | Job that was executed |
 | `job_name` | `str` | Human-readable job name |
-| `status` | `str` | `"succeeded"` or `"failed"` |
+| `status` | `str` | `"succeeded"`, `"failed"`, or `"skipped"` (when a `pre_run` gate returned `run=False`) |
 | `result` | `str` | Agent output (truncated) |
 | `error` | `str` | Error message if failed |
 | `duration` | `float` | Execution time in seconds |
@@ -267,6 +267,94 @@ loop.start()
 <Info>
 See [Background Tasks — ScheduleLoop](/docs/features/background-tasks#scheduleloop) for the full API and combined examples with `BackgroundRunner`.
 </Info>
+
+## Pre-Run Condition Gate
+
+Gate a scheduled tick on a cheap shell check so no model tokens are spent when there's nothing to do.
+
+```mermaid
+graph TB
+    Q{Does the tick always have work?}
+    Q -->|Yes — always run| Plain[No pre_run<br/>Runs unconditionally]
+    Q -->|No — depends on external state| Gate[Use pre_run shell command]
+    Gate --> Ex1[Exit 0, empty stdout →<br/>runs, no extra context]
+    Gate --> Ex2[Exit 0, non-empty stdout →<br/>runs, stdout appended as context]
+    Gate --> Ex3[Non-zero exit →<br/>skipped, 0 tokens spent]
+    Gate --> Ex4[Timeout > 30s →<br/>skipped, process group killed]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q q
+    class Plain,Gate opt
+    class Ex1,Ex2,Ex3,Ex4 result
+```
+
+<Steps>
+<Step title="Add pre_run to a schedule in bot.yaml">
+```yaml
+# bot.yaml
+schedules:
+  - name: new-issue-triage
+    schedule: "*/5m"
+    message: "Triage any new issues from the queue."
+    pre_run: "gh issue list --state open --json number,title --search 'created:>1h ago'"
+```
+</Step>
+<Step title="Every tick, PraisonAI evaluates pre_run before spending tokens">
+| Exit code | stdout | Outcome |
+|-----------|--------|---------|
+| `0` | empty | Job runs with original message; no context added |
+| `0` | non-empty | Job runs; stdout appended as context (capped at 8 000 chars) |
+| non-zero | — | Job **skipped**; truncated stderr in `reason` (max 500 chars) |
+| timed out (>30 s) | — | Job skipped; process group killed; reason: `pre-run gate timed out` |
+</Step>
+</Steps>
+
+<Note>
+`pre_run` is a **cost gate** (decides *whether* to run). It is not a **safety gate** (`RunPolicy`, which decides *what* a run may do). Use both when you need both.
+</Note>
+
+### Real-World Examples
+
+**Only triage when new issues exist:**
+```yaml
+pre_run: "gh issue list --state open --search 'created:>10m ago' --json title"
+```
+
+**Only summarise inbox when there's unread mail:**
+```yaml
+pre_run: "test -s $HOME/.mail/inbox/unread"
+```
+
+**Guard against off-hours runs (Monday–Friday, 09:00–18:00):**
+```yaml
+pre_run: "test $(date +%u) -lt 6 && test $(date +%H) -ge 9 && test $(date +%H) -lt 18"
+```
+
+### Custom Condition Gate
+
+Any object implementing `JobConditionProtocol` can replace the default shell gate — a Python callable, an MCP probe, a database check.
+
+```python
+from praisonaiagents.scheduler.protocols import GateResult, JobConditionProtocol
+from praisonai.scheduler.executor import ScheduledAgentExecutor
+
+class DatabaseGate:
+    def should_run(self, job) -> GateResult:
+        rows = pending_rows()
+        if rows == 0:
+            return GateResult(run=False, reason="no pending rows")
+        return GateResult(run=True, context=f"{rows} rows waiting")
+
+executor = ScheduledAgentExecutor(
+    runner=runner,
+    agent_resolver=lambda agent_id: gateway.get_agent(agent_id),
+    condition_resolver=lambda job: DatabaseGate(),
+)
+```
+
+Pass `condition_resolver=False` to disable gating entirely. The default resolver automatically activates `ShellConditionGate` for any job that has a `pre_run` value.
 
 ## BotOS Integration
 
@@ -332,6 +420,9 @@ Schedule tools follow PraisonAI's core principles:
   </Accordion>
   <Accordion title="Handle job failures gracefully">
     Scheduled jobs should catch exceptions and report errors rather than silently failing.
+  </Accordion>
+  <Accordion title="Use pre_run to avoid paying for empty ticks">
+    If a schedule only has work when some external state changes (new emails, new PRs, a queue with pending rows), put the cheap check in `pre_run`. Model tokens are spent only for ticks that actually have work to do.
   </Accordion>
 </AccordionGroup>
 
