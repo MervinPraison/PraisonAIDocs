@@ -124,6 +124,15 @@ assert('nav path removal still sensitive', mg.sensitivePathReasons([{ filename: 
 const conflictMarkerPatch = navOnlyPatch.replace('+      "docs/features/new-page",', '+<<<<<<< HEAD');
 assert('conflict markers in docs.json blocked', !mg.isNavOnlyDocsJsonPatch(conflictMarkerPatch));
 
+assert(
+  'docs.json additions-only without patch not sensitive',
+  mg.sensitivePathReasons([{ filename: 'docs.json', additions: 3, deletions: 0 }]).length === 0
+);
+assert(
+  'docs.json deletions without patch still sensitive',
+  mg.sensitivePathReasons([{ filename: 'docs.json', additions: 1, deletions: 2 }]).length === 1
+);
+
 const docsPrimaryFiles = [
   { filename: 'docs/features/foo.mdx', additions: 840 },
 ];
