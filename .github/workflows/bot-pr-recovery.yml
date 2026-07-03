@@ -1,6 +1,6 @@
 name: PR Review Recovery
 
-# Belt-and-braces: post missing FINAL @claude when pull_request:opened did not fire.
+# Belt-and-braces: open missing PRs from orphan claude/issue-* branches and post FINAL @claude.
 
 on:
   schedule:
@@ -24,7 +24,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Post missing FINAL @claude on open PRs
+      - name: Recover orphan branches and missing FINAL reviews
         uses: actions/github-script@v7
         env:
           PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
@@ -33,19 +33,33 @@ jobs:
           script: |
             const path = require('path');
             const review = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review.js'));
+            const orphan = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/orphan-pr.js'));
             const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const manual = (process.env.PR_NUMBER_INPUT || '').trim();
 
             if (manual) {
-              const prNumber = parseInt(manual, 10);
-              if (Number.isNaN(prNumber)) throw new Error(`Invalid pr_number: ${manual}`);
-              await review.postFinalClaudeReviewIfNeeded(github, owner, repo, prNumber, core);
-              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+              const n = parseInt(manual, 10);
+              if (Number.isNaN(n)) throw new Error(`Invalid pr_number: ${manual}`);
+              try {
+                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: n });
+                await review.postFinalClaudeReviewIfNeeded(github, owner, repo, pr.number, core);
+                await ps.syncPipelineLabels(github, owner, repo, pr.number, core);
+                return;
+              } catch (err) {
+                if (err?.status !== 404) throw err;
+              }
+              await orphan.ensureOpenPrForIssue(github, owner, repo, n, core);
+              const pr = await orphan.findOpenPrForIssue(github, owner, repo, n);
+              if (pr) {
+                await review.postFinalClaudeReviewIfNeeded(github, owner, repo, pr.number, core);
+                await ps.syncPipelineLabels(github, owner, repo, pr.number, core);
+              }
               return;
             }
 
+            const orphans = await orphan.recoverOrphanBranches(github, owner, repo, { maxRecover: 5 }, core);
             const { data: prs } = await github.rest.pulls.list({ owner, repo, state: 'open', per_page: 100 });
             let posted = 0;
             for (const pr of prs) {
@@ -57,4 +71,4 @@ jobs:
               if (result.posted) posted += 1;
               await ps.syncPipelineLabels(github, owner, repo, pr.number, core);
             }
-            core.info(`Recovery complete (${posted} FINAL posted)`);
+            core.info(`Recovery complete (${orphans} orphan PR(s), ${posted} FINAL posted)`);
