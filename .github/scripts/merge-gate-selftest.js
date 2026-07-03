@@ -151,15 +151,34 @@ const staleComments = [
   { user: { login: 'MervinPraison' }, body: '@claude FINAL architecture reviewer', created_at: finalAt },
   { user: { login: 'praisonai-triage-agent[bot]' }, body: 'Claude finished', created_at: '2026-07-03T10:04:00Z' },
 ];
+const soonAfterNow = new Date('2026-07-03T10:10:00Z').getTime();
 assert(
-  'skip stale recovery when push soon after FINAL',
-  mg.shouldSkipStaleFinalRecovery(staleComments, pushSoonAfter, 'praisonai-triage-agent[bot]').skip
+  'skip stale recovery when push soon after FINAL (within debounce window)',
+  mg.shouldSkipStaleFinalRecovery(staleComments, pushSoonAfter, 'praisonai-triage-agent[bot]', soonAfterNow).skip
+);
+assert(
+  'debounce expires after head push ages out',
+  !mg.isPushSoonAfterLatestFinal(staleComments, pushSoonAfter, new Date('2026-07-03T10:25:00Z').getTime())
+);
+assert(
+  'stale recovery allowed after debounce window',
+  !mg.shouldSkipStaleFinalRecovery(staleComments, pushSoonAfter, null, new Date('2026-07-03T11:00:00Z').getTime()).skip
 );
 assert(
   'automation pusher skips stale recovery',
-  mg.shouldSkipStaleFinalRecovery(staleComments, pushSoonAfter, 'praisonai-triage-agent[bot]').skip
+  mg.shouldSkipStaleFinalRecovery(staleComments, pushSoonAfter, 'praisonai-triage-agent[bot]', soonAfterNow).skip
 );
 assert('isClaudeAutomationLogin triage bot', mg.isClaudeAutomationLogin('praisonai-triage-agent[bot]'));
+
+const cleanMergeConflict = {
+  user: { login: 'MervinPraison' },
+  body: '@claude this PR has merge conflicts with main',
+  created_at: '2026-07-03T10:00:00Z',
+};
+assert(
+  'conflict comment ignored when merge state is CLEAN',
+  !mg.hasRecentConflictComment([cleanMergeConflict], '2026-07-03T09:00:00Z', 'CLEAN')
+);
 
 // Cooldown: FINAL current on HEAD should not block merge gate
 const finalCompleteComments = [

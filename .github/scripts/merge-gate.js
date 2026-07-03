@@ -46,8 +46,10 @@ const SECRET_PATTERNS = [
 ];
 const MERGE_GATE_ACTIVE_LABEL = 'claude-merge-gate-active';
 const MERGE_GATE_ACTIVE_STALE_MS = 45 * 60 * 1000;
+const CONFLICT_PENDING_LABEL = 'claude-conflict-pending';
+const CONFLICT_PENDING_STALE_MS = 45 * 60 * 1000;
 const BLOCK_LABELS = new Set([
-  'claude-conflict-pending',
+  CONFLICT_PENDING_LABEL,
   MERGE_GATE_ACTIVE_LABEL,
   'no-auto-merge',
   'auto-merged-by-gate',
@@ -127,7 +129,10 @@ function conflictRebaseQuiescent(comments, headPushedAt) {
   return finalClaudeCompletedOnSha(comments, headPushedAt);
 }
 
-function hasRecentConflictComment(comments, headPushedAt = null) {
+function hasRecentConflictComment(comments, headPushedAt = null, mergeStateStatus = null) {
+  const status = (mergeStateStatus || '').toUpperCase();
+  if (status && ALLOWED_MERGE_STATES.has(status)) return false;
+
   const cutoff = Date.now() - CONFLICT_COOLDOWN_MS;
   const hasRecentTrigger = comments.some((c) => {
     if (!isConflictRebaseTriggerComment(c)) return false;
@@ -223,7 +228,7 @@ function isClaudeAutomationLogin(login) {
   return lower.includes('praisonai-triage') || lower === 'github-actions[bot]';
 }
 
-function isPushSoonAfterLatestFinal(comments, headPushedAt) {
+function isPushSoonAfterLatestFinal(comments, headPushedAt, nowMs = Date.now()) {
   if (!headPushedAt) return false;
   const finals = comments.filter(isFinalClaudeTriggerComment);
   if (finals.length === 0) return false;
@@ -233,18 +238,19 @@ function isPushSoonAfterLatestFinal(comments, headPushedAt) {
   const finalTime = new Date(latestFinal.created_at).getTime();
   const headTime = new Date(headPushedAt).getTime();
   if (headTime <= finalTime) return false;
-  return headTime - finalTime < PUSH_AFTER_FINAL_DEBOUNCE_MS;
+  if (headTime - finalTime >= PUSH_AFTER_FINAL_DEBOUNCE_MS) return false;
+  return nowMs - headTime < PUSH_AFTER_FINAL_DEBOUNCE_MS;
 }
 
 /** Returns { skip: true, reason } when stale-FINAL recovery should not post. */
-function shouldSkipStaleFinalRecovery(comments, headPushedAt, headPusherLogin = null) {
+function shouldSkipStaleFinalRecovery(comments, headPushedAt, headPusherLogin = null, nowMs = Date.now()) {
   if (!isStaleFinalAfterPush(comments, headPushedAt)) {
     return { skip: true, reason: 'not stale' };
   }
   if (headPusherLogin && isClaudeAutomationLogin(headPusherLogin)) {
     return { skip: true, reason: 'head pushed by Claude automation' };
   }
-  if (isPushSoonAfterLatestFinal(comments, headPushedAt)) {
+  if (isPushSoonAfterLatestFinal(comments, headPushedAt, nowMs)) {
     return {
       skip: true,
       reason: 'head pushed soon after FINAL (wait for CI / batched fixes)',
@@ -481,6 +487,41 @@ async function reconcileMergeGateActiveLabel(github, owner, repo, prNumber, labe
     if (err.status !== 404) core?.warning?.(`Could not remove stale merge-gate label: ${err.message}`);
   }
   return { block: false, stale: true };
+}
+
+/** Drop stuck claude-conflict-pending when rebase trigger is older than grace (45 min). */
+async function reconcileConflictPendingLabel(
+  github, owner, repo, prNumber, labels, comments, mergeStateStatus, core
+) {
+  if (!labels.includes(CONFLICT_PENDING_LABEL)) return { pending: false, stale: false };
+  if ((mergeStateStatus || '').toUpperCase() !== 'DIRTY') {
+    return { pending: false, stale: false };
+  }
+  const triggers = comments.filter(isConflictRebaseTriggerComment);
+  const latest = triggers.reduce(
+    (a, b) => (new Date(a.created_at) > new Date(b.created_at) ? a : b),
+    null
+  );
+  const triggerAge = latest
+    ? Date.now() - new Date(latest.created_at).getTime()
+    : CONFLICT_PENDING_STALE_MS + 1;
+  if (triggerAge < CONFLICT_PENDING_STALE_MS) {
+    return { pending: true, stale: false };
+  }
+  try {
+    await github.rest.issues.removeLabel({
+      owner,
+      repo,
+      issue_number: prNumber,
+      name: CONFLICT_PENDING_LABEL,
+    });
+    core?.info?.(`Removed stale ${CONFLICT_PENDING_LABEL} from PR #${prNumber}`);
+  } catch (err) {
+    if (err.status !== 404) {
+      core?.warning?.(`Could not remove stale conflict-pending label: ${err.message}`);
+    }
+  }
+  return { pending: false, stale: true };
 }
 
 function shouldBlockOnMergeGateActiveLabel({ assessInProgress, lastActivityMs, nowMs = Date.now() }) {
@@ -811,7 +852,7 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
     reasons.push('fork PR');
   }
 
-  if (hasRecentConflictComment(ctx.comments, ctx.headPushedAt)) {
+  if (hasRecentConflictComment(ctx.comments, ctx.headPushedAt, ctx.mergeState.status)) {
     reasons.push('recent merge-conflict @claude');
   }
   if (!skipRecentClaudeCooldown && hasRecentClaudeTrigger(ctx.comments, 35)) {
@@ -969,4 +1010,7 @@ module.exports = {
   shouldBlockOnMergeGateActiveLabel,
   hasInProgressMergeGateForPr,
   reconcileMergeGateActiveLabel,
+  reconcileConflictPendingLabel,
+  CONFLICT_PENDING_LABEL,
+  CONFLICT_PENDING_STALE_MS,
 };

@@ -9,7 +9,7 @@ on:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '45 * * * *'
 
 concurrency:
   group: merge-conflict-scan-${{ github.repository }}
@@ -44,9 +44,9 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const baseRepo = `${owner}/${repo}`;
-            const COOLDOWN_MS = 12 * 60 * 60 * 1000;
+            const RETRY_COOLDOWN_MS = mergeGate.CONFLICT_PENDING_STALE_MS;
             const AUTO_ACTORS = ['github-actions[bot]', 'MervinPraison'];
-            const LABEL = 'claude-conflict-pending';
+            const LABEL = mergeGate.CONFLICT_PENDING_LABEL;
             const COMMENT_BODY = [
               '@claude this PR has merge conflicts with `main`.',
               'Please rebase onto latest `main`, resolve conflicts (keep this PR\'s intent, merge in newer main logic),',
@@ -98,7 +98,7 @@ jobs:
             }
 
             function hasRecentAutoComment(comments) {
-              const cutoff = Date.now() - COOLDOWN_MS;
+              const cutoff = Date.now() - RETRY_COOLDOWN_MS;
               return comments.some((c) => {
                 if (!AUTO_ACTORS.includes(c.user.login)) return false;
                 const body = (c.body || '').toLowerCase();
@@ -116,7 +116,7 @@ jobs:
                 repo,
                 issue_number: prNumber,
               });
-              const labels = issue.labels.map((l) => l.name);
+              let labels = issue.labels.map((l) => l.name);
 
               if (status !== 'DIRTY' && labels.includes(LABEL)) {
                 await github.rest.issues.removeLabel({
@@ -126,6 +126,7 @@ jobs:
                   name: LABEL,
                 });
                 core.info(`Removed ${LABEL} from PR #${prNumber}`);
+                labels = labels.filter((l) => l !== LABEL);
               }
 
               if (status !== 'DIRTY') return { skipped: true, reason: 'not dirty' };
@@ -133,16 +134,18 @@ jobs:
               if (headRepo && headRepo !== baseRepo && !maintainerCanModify) {
                 return { skipped: true, reason: 'fork without maintainer edits' };
               }
-              if (labels.includes(LABEL)) {
+
+              const comments = await mergeGate.listAllComments(github, owner, repo, prNumber);
+              const conflictState = await mergeGate.reconcileConflictPendingLabel(
+                github, owner, repo, prNumber, labels, comments, status, core
+              );
+              if (conflictState.pending) {
                 return { skipped: true, reason: 'conflict resolution pending' };
               }
+              if (conflictState.stale) {
+                labels = labels.filter((l) => l !== LABEL);
+              }
 
-              const { data: comments } = await github.rest.issues.listComments({
-                owner,
-                repo,
-                issue_number: prNumber,
-                per_page: 100,
-              });
               if (hasRecentAutoComment(comments)) {
                 return { skipped: true, reason: 'recent auto comment' };
               }
