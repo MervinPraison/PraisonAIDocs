@@ -1,13 +1,17 @@
-"""
-Unified Interactive Core for PraisonAI CLI.
+"""Hybrid CLI interactive package: wrapper core/TUI + code runtime modules.
 
-This module provides a single core runtime that powers all interactive modes:
-- `praisonai run --interactive`
-- `praisonai chat`
-- `praisonai tui launch`
-
-All UIs consume the same event model; only rendering differs.
+After C8 repatriation, ``core`` and ``async_tui`` live under this package.
+Config, events, REPL, and frontends remain in ``praisonai_code.cli.interactive``.
 """
+
+try:  # pragma: no cover - defensive
+    import praisonai_code.cli.interactive as _code_interactive
+
+    for _code_dir in getattr(_code_interactive, "__path__", []):
+        if _code_dir not in __path__:
+            __path__.append(_code_dir)
+except ImportError:  # pragma: no cover - code package optional at import time
+    _code_interactive = None
 
 __all__ = [
     "InteractiveCore",
@@ -19,30 +23,22 @@ __all__ = [
     "ApprovalDecision",
 ]
 
-# Lazy imports to avoid loading heavy dependencies on import
-_lazy_cache = {}
-
 
 def __getattr__(name: str):
-    """Lazy load interactive components."""
-    if name in _lazy_cache:
-        return _lazy_cache[name]
-    
     if name == "InteractiveCore":
         from .core import InteractiveCore
-        _lazy_cache[name] = InteractiveCore
+
         return InteractiveCore
-    
-    if name == "InteractiveConfig":
-        from .config import InteractiveConfig
-        _lazy_cache[name] = InteractiveConfig
-        return InteractiveConfig
-    
-    if name in ("InteractiveEvent", "InteractiveEventType", "ApprovalRequest", 
-                "ApprovalResponse", "ApprovalDecision"):
-        from . import events
-        obj = getattr(events, name)
-        _lazy_cache[name] = obj
-        return obj
-    
+    if _code_interactive is not None:
+        try:
+            return getattr(_code_interactive, name)
+        except AttributeError:
+            pass
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    base = set(globals().keys()) | set(__all__)
+    if _code_interactive is not None:
+        base |= set(dir(_code_interactive))
+    return sorted(base)

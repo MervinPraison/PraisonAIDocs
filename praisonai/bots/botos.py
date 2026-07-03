@@ -86,6 +86,18 @@ class BotOS:
         platforms: List of platform names; creates a Bot per platform
             using the shared *agent*.
         config: Optional BotOSConfig.
+        reliability: Named reliability posture (Issue #2531) composing the
+            existing lifecycle knobs in one switch:
+
+            * ``"production"`` — graceful drain (15s) + inbound admission with a
+              CPU-scaled ceiling and a bounded fair wait queue.
+            * ``"default"`` / ``None`` — a sane small drain window (5s) so a
+              restart doesn't cut in-flight turns; no admission ceiling.
+            * ``"off"`` — today's immediate-teardown, no-backpressure behaviour.
+
+            Explicit ``drain_timeout`` / ``max_concurrent_runs`` /
+            ``admission_policy`` always override the preset. Durable inbound
+            journaling stays on by default at the session level regardless.
     """
 
     def __init__(
@@ -103,13 +115,39 @@ class BotOS:
         queue_depth: int = 0,
         overflow_policy: str = "reject",
         admission_policy: Optional[Any] = None,
+        reliability: Optional[str] = None,
     ):
         self._bots: Dict[str, Bot] = {}
         self._is_running = False
         self._config = config
-        # Issue #2375: opt-in graceful drain on shutdown. Default off —
-        # when None/0 the gateway behaves exactly as before (in-flight
-        # agent turns are cancelled immediately on stop()).
+
+        # Issue #2531: a single, discoverable reliability posture that composes
+        # the already-existing lifecycle knobs (graceful drain + inbound
+        # admission) so the happy path is production-grade in one switch. The
+        # preset only fills in fields the caller left unset — explicit
+        # ``drain_timeout=`` / ``max_concurrent_runs=`` / ``admission_policy=``
+        # always win. ``reliability="off"`` preserves today's immediate-
+        # teardown, no-backpressure behaviour.
+        from ._reliability import resolve_reliability
+
+        self._reliability = reliability
+        _resolved = resolve_reliability(
+            reliability,
+            drain_timeout=drain_timeout,
+            max_concurrent_runs=max_concurrent_runs,
+            queue_depth=queue_depth,
+            overflow_policy=overflow_policy,
+            admission_policy=admission_policy,
+        )
+        drain_timeout = _resolved.drain_timeout
+        max_concurrent_runs = _resolved.max_concurrent_runs
+        queue_depth = _resolved.queue_depth
+        overflow_policy = _resolved.overflow_policy
+
+        # Issue #2375: graceful drain on shutdown. A sane default window is now
+        # applied via the reliability preset (Issue #2531) so a restart does not
+        # cut in-flight turns; ``reliability="off"`` restores the immediate-
+        # cancel behaviour.
         self._drain_timeout: Optional[float] = _coerce_drain_timeout(drain_timeout)
         # Whether ingress should keep dispatching new turns. Flipped to
         # False at the start of a drain so current turns finish but no
@@ -658,7 +696,176 @@ class BotOS:
 
         logger.info(f"BotOS: executed schedule job '{job.name}'")
         return (result_str, delivered)
-    
+
+    @staticmethod
+    def _summarize_job_result(result: Any) -> Optional[str]:
+        """Extract a human-readable summary from a background job's result.
+
+        Background subagents return a dict shaped like
+        ``{"success": bool, "output": ..., "error": ...}`` (see
+        ``subagent_tool._run_subagent``). Prefer ``output`` on success and
+        ``error`` on failure; fall back to ``str(result)`` for anything else.
+        Returns ``None`` when there is nothing meaningful to deliver.
+        """
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            if result.get("success") and result.get("output") is not None:
+                text = result["output"]
+            elif result.get("error"):
+                text = f"Task failed: {result['error']}"
+            else:
+                text = result.get("output") or result.get("error")
+            return str(text) if text is not None else None
+        text = str(result)
+        return text or None
+
+    def on_background_job_complete(self, job_info: Any) -> bool:
+        """Route a completed background job's result back to its origin chat.
+
+        Registered as the ``on_complete`` callback on ``spawn_subagent(
+        ..., background=True, deliver=...)`` so a finished background job
+        delivers itself into the originating conversation with no active
+        turn — the defining capability of a persistent gateway. Reuses the
+        SAME ``DeliveryRouter`` the scheduler uses. Fires the ``JOB_COMPLETED``
+        hook for observability. Best-effort: any failure is logged, never
+        raised (it runs on the background worker thread).
+
+        Args:
+            job_info: The terminal ``JobInfo`` carrying ``origin`` context
+                captured at spawn time (``deliver``/``platform``/``chat_id``/
+                ``thread_id``/``session_id``).
+
+        Returns:
+            True if the result was delivered, False otherwise.
+        """
+        try:
+            origin = dict(getattr(job_info, "origin", {}) or {})
+            job_id = str(getattr(job_info, "job_id", "") or "")
+            status = getattr(getattr(job_info, "status", ""), "value", None) or str(
+                getattr(job_info, "status", "")
+            )
+            error = getattr(job_info, "error", None)
+            result = getattr(job_info, "result", None)
+            deliver = origin.get("deliver", "")
+
+            # Fire the observability hook regardless of whether we can deliver.
+            try:
+                from ._protocol_mixin import fire_job_completed
+                fire_job_completed(
+                    self._get_hook_runner(),
+                    job_id=job_id,
+                    status=status,
+                    result=result,
+                    error=error,
+                    deliver=deliver,
+                    platform=origin.get("platform", ""),
+                    chat_id=origin.get("chat_id", ""),
+                    thread_id=origin.get("thread_id", ""),
+                    session_id=origin.get("session_id", ""),
+                )
+            except Exception as e:  # pragma: no cover — defensive
+                logger.debug(f"JOB_COMPLETED emit error (non-fatal): {e}")
+
+            if not deliver:
+                return False
+
+            # Build the delivery text: success summary or failure notice.
+            if error:
+                text = f"Background task failed: {error}"
+            else:
+                text = self._summarize_job_result(result)
+            if not text:
+                logger.debug(
+                    "Background job %s completed with no deliverable text", job_id
+                )
+                return False
+
+            origin_source = None
+            platform = origin.get("platform", "")
+            chat_id = origin.get("chat_id", "")
+            if platform and chat_id:
+                origin_source = SessionSource(
+                    platform=platform,
+                    channel_id=chat_id,
+                    thread_id=origin.get("thread_id") or None,
+                )
+
+            delivered = self._run_coroutine_sync(
+                self._deliver_job_text(deliver, text, origin_source)
+            )
+            if delivered:
+                logger.info(
+                    "Delivered background job %s result to %s", job_id, deliver
+                )
+            else:
+                logger.warning(
+                    "Background job %s ran but delivery to %s failed",
+                    job_id, deliver,
+                )
+            return bool(delivered)
+        except Exception as e:  # pragma: no cover — must never crash worker
+            logger.warning(f"on_background_job_complete error (non-fatal): {e}")
+            return False
+
+    async def _deliver_job_text(
+        self, target: str, text: str, origin: Optional[Any]
+    ) -> bool:
+        """Deliver ``text`` to ``target``, resolving the ``"all"`` broadcast token.
+
+        ``DeliveryRouter`` resolves ``"origin"``, ``"platform"``, aliases and
+        ``"platform:channel"`` but not the documented ``"all"`` fan-out token.
+        Mirror the gateway's ``all`` semantics here by fanning out to every
+        reachable home channel; anything else routes straight through the
+        shared router (the scheduler's path). A send is considered delivered
+        if it reaches at least one target.
+        """
+        if target == "all":
+            directory = getattr(self._delivery_router, "directory", None)
+            targets = directory.describe_targets() if directory is not None else []
+            homes = [t for t in targets if t.get("kind") == "home"]
+            if not homes:
+                logger.warning("Background job deliver='all' has no home channels")
+                return False
+            delivered_any = False
+            for t in homes:
+                try:
+                    ok = await self._delivery_router.deliver(
+                        target=f"{t['platform']}:{t['channel_id']}",
+                        text=text,
+                        origin=origin,
+                    )
+                    delivered_any = delivered_any or bool(ok)
+                except Exception as e:  # pragma: no cover — best-effort fan-out
+                    logger.warning(
+                        "Background job deliver='all' to %s:%s failed: %s",
+                        t.get("platform"), t.get("channel_id"), e,
+                    )
+            return delivered_any
+        return await self._delivery_router.deliver(
+            target=target, text=text, origin=origin
+        )
+
+    @staticmethod
+    def _run_coroutine_sync(coro: Any) -> Any:
+        """Run an awaitable to completion from a (possibly sync) context.
+
+        The background job runner invokes ``on_complete`` on a plain worker
+        thread with no running event loop, while ``DeliveryRouter.deliver`` is
+        a coroutine. If a loop is already running on this thread we schedule
+        the coroutine thread-safely onto it; otherwise we run it directly.
+        """
+        if not asyncio.iscoroutine(coro):
+            return coro
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            return future.result()
+        return asyncio.run(coro)
+
     @staticmethod
     def _find_session_manager(bot: Bot) -> Optional[Any]:
         """Locate a bot's ``BotSessionManager`` across the adapter variants.
@@ -1068,24 +1275,66 @@ class BotOS:
                 if key in agent_cfg:
                     agent_kwargs[key] = agent_cfg[key]
 
-            # Resolve tool names to real functions
+            # Resolve tool names to real functions. Delegate string names to the
+            # shared ToolResolver so BotOS honours the same resolution chain as
+            # the rest of the framework (local tools.py -> wrapper registry ->
+            # praisonaiagents -> praisonai-tools -> plugins) instead of only
+            # seeing built-in praisonaiagents.tools. See issue #2585.
             tool_names = agent_cfg.get("tools")
             if tool_names and isinstance(tool_names, list):
-                resolved_tools = []
-                for tname in tool_names:
-                    if isinstance(tname, str):
+                # Resolve string names to callables via the shared ToolResolver,
+                # falling back to the built-in praisonaiagents.tools lookup if the
+                # resolver is unavailable. Callables pass through unchanged and the
+                # original list order is preserved (order can influence tool
+                # priority/selection).
+                resolver = None
+                fallback_mod = None
+                if any(isinstance(t, str) for t in tool_names):
+                    try:
+                        # Go through the praisonai.tool_resolver shim so the
+                        # praisonai_code bootstrap runs in lean installs.
+                        from praisonai.tool_resolver import ToolResolver
+
+                        # Point the resolver at the config directory's tools.py so
+                        # config-local tools are found regardless of process cwd
+                        # (matches the recipe loader's config-relative lookup).
+                        from pathlib import Path
+
+                        tools_py_path = str(Path(path).resolve().parent / "tools.py")
+                        resolver = ToolResolver(tools_py_path=tools_py_path)
+                    except ImportError:
+                        import importlib
                         try:
-                            import importlib
-                            mod = importlib.import_module("praisonaiagents.tools")
-                            fn = getattr(mod, tname, None)
-                            if fn:
-                                resolved_tools.append(fn)
-                            else:
-                                logger.warning(f"BotOS: tool '{tname}' not found in praisonaiagents.tools")
+                            fallback_mod = importlib.import_module("praisonaiagents.tools")
                         except ImportError:
-                            logger.warning(f"BotOS: could not import tools module for '{tname}'")
+                            fallback_mod = None
+
+                resolved_tools = []
+                for tool in tool_names:
+                    if not isinstance(tool, str):
+                        # Already-callable tools pass through unchanged.
+                        resolved_tools.append(tool)
+                        continue
+                    if resolver is not None:
+                        fn = resolver.resolve(tool)
+                        if fn is not None:
+                            resolved_tools.append(fn)
+                        else:
+                            logger.warning(
+                                f"BotOS: tool '{tool}' could not be resolved "
+                                "via ToolResolver (local/praisonaiagents/"
+                                "praisonai-tools/plugins)"
+                            )
                     else:
-                        resolved_tools.append(tname)  # Already a callable
+                        fn = getattr(fallback_mod, tool, None) if fallback_mod else None
+                        if fn:
+                            resolved_tools.append(fn)
+                        else:
+                            logger.warning(
+                                f"BotOS: tool '{tool}' not found in "
+                                "praisonaiagents.tools"
+                            )
+
                 if resolved_tools:
                     agent_kwargs["tools"] = resolved_tools
 
@@ -1142,6 +1391,11 @@ class BotOS:
             or "reject"
         )
 
+        # Issue #2531: single reliability posture. Accept a top-level
+        # ``reliability`` or ``gateway.reliability``; the preset composes drain
+        # + admission while any explicit field above still overrides it.
+        reliability = raw.get("reliability", gateway_cfg.get("reliability"))
+
         return cls(
             bots=bots,
             health_monitor=health_monitor,
@@ -1150,6 +1404,7 @@ class BotOS:
             max_concurrent_runs=max_concurrent_runs,
             queue_depth=queue_depth,
             overflow_policy=overflow_policy,
+            reliability=reliability,
         )
 
     async def probe_all(self, timeout: float = 15.0) -> Dict[str, Any]:

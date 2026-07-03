@@ -58,7 +58,7 @@ if os.environ.get("PRAISON_DEBUG", "").lower() in ("1", "true", "yes"):
 # Branding - Import from unified source
 # ============================================================================
 
-from praisonai.cli.branding import get_logo, get_version
+from praisonai_code.cli.branding import get_logo, get_version
 
 
 # ============================================================================
@@ -79,6 +79,84 @@ class AsyncTUIConfig:
     autonomy_mode: bool = True  # Enable autonomous task delegation (aligned with InteractiveConfig)
     debug: bool = False  # Enable debug logging to file (~/.praisonai/async_tui_debug.log)
     no_rules: bool = False  # Disable auto-injection of project instruction files
+
+
+# ============================================================================
+# Auth / execution failure detection (issue #2562)
+# ============================================================================
+
+# Signatures that indicate an authentication / authorization failure. Kept in
+# sync with praisonaiagents.llm.error_classifier ErrorCategory.AUTH patterns so
+# both raised exceptions and logged-then-swallowed errors are detected.
+_AUTH_ERROR_SIGNATURES = (
+    "authentication failed",
+    "invalid api key",
+    "invalid_api_key",
+    "incorrect api key",
+    "authenticationerror",
+    "http 401",
+    "error code: 401",
+    "error code: 403",
+)
+
+
+def _detect_auth_error(text: Optional[str]) -> Optional[str]:
+    """Return a concise auth-error message if *text* looks like an auth failure."""
+    if not text:
+        return None
+    lowered = text.lower()
+    for sig in _AUTH_ERROR_SIGNATURES:
+        if sig in lowered:
+            return "Authentication failed: check your API key/credentials."
+    return None
+
+
+def _extract_response_output(response) -> Optional[str]:
+    """Extract user-visible text from an agent response.
+
+    Handles plain strings as well as wrapper objects such as
+    ``AutonomyResult`` returned by ``agent.astart()`` which expose the
+    generated text via an ``output`` attribute.
+    """
+    if response is None:
+        return None
+    output = getattr(response, "output", None)
+    if output is not None:
+        text = str(output).strip()
+        return text or None
+    text = str(response).strip()
+    return text or None
+
+
+def _is_empty_agent_response(response) -> bool:
+    """True when the agent produced no user-visible output.
+
+    ``agent.astart()`` may return a truthy wrapper object (e.g.
+    ``AutonomyResult(success=True, output='')``) even on auth failure, so a
+    plain ``not response`` check is insufficient (issue #2568).
+    """
+    return _extract_response_output(response) is None
+
+
+class _LogCapture(logging.Handler):
+    """Lightweight logging handler that records messages for failure detection."""
+
+    def __init__(self, level: int = logging.WARNING):
+        super().__init__(level=level)
+        self.records: List[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.records.append(record.getMessage())
+        except Exception:
+            pass
+
+    def find_auth_error(self) -> Optional[str]:
+        for message in self.records:
+            found = _detect_auth_error(message)
+            if found:
+                return found
+        return None
 
 
 # ============================================================================
@@ -120,6 +198,7 @@ class AsyncTUI:
         self._agent = None
         self._processing = False
         self._status_text = ""
+        self._last_error: Optional[Exception] = None
         self._app = None
         self._output_buffer = None
         self._prompt_queue: List[str] = []  # Queue for pending prompts
@@ -260,7 +339,7 @@ class AsyncTUI:
         
         logger.debug("Starting runtime...")
         try:
-            from praisonai.cli.features.interactive_runtime import create_runtime
+            from praisonai_code.cli.features.interactive_runtime import create_runtime
             
             self._runtime = create_runtime(
                 workspace=self.config.workspace or ".",
@@ -301,7 +380,7 @@ class AsyncTUI:
         
         # Try to load all interactive tools (basic + ACP + LSP)
         try:
-            from praisonai.cli.features.interactive_tools import get_interactive_tools
+            from praisonai_code.cli.features.interactive_tools import get_interactive_tools
             tools = get_interactive_tools(
                 groups=["basic", "acp", "lsp"],  # All tool groups
                 workspace=self.config.workspace,
@@ -739,6 +818,7 @@ Example: /handoff code "refactor the auth module" """
         
         logger.debug(f"Executing prompt: {prompt[:100]}...")
         
+        self._last_error = None
         try:
             agent = self._get_agent()
             logger.debug(f"Agent loaded: {agent.name if hasattr(agent, 'name') else 'unnamed'}")
@@ -751,6 +831,19 @@ Example: /handoff code "refactor the auth module" """
             captured_stderr = io.StringIO()
             sys.stdout = captured_stdout
             sys.stderr = captured_stderr
+
+            # Capture WARNING/ERROR log records (e.g. "Authentication failed")
+            # emitted by the agent so we can detect silent failures where
+            # agent.start() logs an auth error but returns None.
+            #
+            # NOTE: praisonaiagents emits these via the *root* logger
+            # (``logging.warning(...)`` in llm.py), so the handler must be on
+            # the root logger to catch them. False positives are avoided by (a)
+            # only matching precise auth signatures (no broad "permission
+            # denied"/"access denied") and (b) gating on an empty response.
+            log_capture = _LogCapture(level=logging.WARNING)
+            root_logger = logging.getLogger()
+            root_logger.addHandler(log_capture)
             
             try:
                 # Try async execution first for better non-blocking behavior
@@ -771,6 +864,7 @@ Example: /handoff code "refactor the auth module" """
             finally:
                 sys.stdout = old_stdout
                 sys.stderr = old_stderr
+                root_logger.removeHandler(log_capture)
                 
                 # Log captured output
                 stdout_content = captured_stdout.getvalue()
@@ -781,9 +875,38 @@ Example: /handoff code "refactor the auth module" """
                     logger.debug(f"Agent stderr: {stderr_content[:500]}")
             
             logger.debug(f"Response received: {str(response)[:200] if response else 'None'}")
-            return str(response) if response else None
+
+            # Detect silent failures: some providers log an auth/permission
+            # error and return None instead of raising. Surface these so the
+            # CLI can exit with a non-zero status (issue #2562).
+            #
+            # NOTE: agent.astart() may return a truthy wrapper object such as
+            # AutonomyResult(success=True, output='') even on auth failure, so
+            # we must inspect the actual output rather than the object's
+            # truthiness (issue #2568).
+            output_text = _extract_response_output(response)
+            auth_error = log_capture.find_auth_error()
+            if auth_error and output_text is None:
+                self._last_error = RuntimeError(auth_error)
+                return f"Error: {auth_error}"
+
+            # Surface explicit failures reported by wrapper objects even when
+            # no auth signature matched (e.g. AutonomyResult.success is False).
+            result_error = getattr(response, "error", None)
+            if result_error:
+                self._last_error = RuntimeError(str(result_error))
+                return f"Error: {result_error}"
+            if getattr(response, "success", None) is False:
+                self._last_error = RuntimeError("Agent execution failed")
+                # Preserve any partial/diagnostic output for the user instead
+                # of hiding it behind a generic message (still exits non-zero
+                # via ``execution_failed``).
+                return output_text if output_text is not None else "Error: Agent execution failed"
+
+            return output_text
         except Exception as e:
             logger.error(f"Error executing prompt: {e}", exc_info=True)
+            self._last_error = e
             return f"Error: {e}"
     
     def _execute_in_background(self, prompt: str):
@@ -1201,6 +1324,14 @@ Example: /handoff code "refactor the auth module" """
     def run_single(self, prompt: str) -> Optional[str]:
         """Run a single prompt (non-interactive)."""
         return self._execute_prompt(prompt)
+
+    @property
+    def execution_failed(self) -> bool:
+        """True if the last prompt execution failed (e.g. auth error).
+
+        Lets the CLI propagate a non-zero exit code on failure (issue #2562).
+        """
+        return self._last_error is not None
 
 
 def start_async_tui(

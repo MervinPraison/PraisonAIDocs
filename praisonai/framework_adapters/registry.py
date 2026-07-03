@@ -68,11 +68,12 @@ class FrameworkAdapterRegistry(PluginRegistry[FrameworkAdapter]):
     # unavailable.
     DEFAULT_PRIORITY: tuple[str, ...] = ("crewai", "praisonai", "autogen", "ag2")
 
-    def __init__(self) -> None:
+    def __init__(self, *, discover_entry_points: bool = True) -> None:
         """Initialize the registry with built-in adapters."""
         super().__init__(
             entry_point_group="praisonai.framework_adapters",
-            builtins=_BUILTIN_ADAPTERS
+            builtins=_BUILTIN_ADAPTERS,
+            discover_entry_points=discover_entry_points,
         )
 
     def pick_default(self) -> str:
@@ -230,6 +231,7 @@ def get_install_hint(name: str) -> str:
         "autogen_v4": "autogen-v4",
         "openai_agents": "openai-agents",
         "google_adk": "google-adk",
+        "pydantic_ai": "pydantic-ai",
     }.get(name, name)
     return f"pip install 'praisonai-frameworks[{extra_name}]'"
 

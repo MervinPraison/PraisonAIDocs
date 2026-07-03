@@ -692,7 +692,7 @@ def langfuse_traces(
     
     # Import the client
     try:
-        from ..langfuse_client import LangfuseClient, LangfuseAPIError
+        from praisonai.cli.langfuse_client import LangfuseClient, LangfuseAPIError
     except ImportError:
         console.print("[red]❌ Langfuse client not available[/red]")
         raise typer.Abort()
@@ -785,7 +785,7 @@ def langfuse_sessions(
     
     # Import the client
     try:
-        from ..langfuse_client import LangfuseClient, LangfuseAPIError
+        from praisonai.cli.langfuse_client import LangfuseClient, LangfuseAPIError
     except ImportError:
         console.print("[red]❌ Langfuse client not available[/red]")
         raise typer.Abort()
@@ -870,7 +870,7 @@ def langfuse_show(
     
     # Import the client
     try:
-        from ..langfuse_client import LangfuseClient, LangfuseAPIError
+        from praisonai.cli.langfuse_client import LangfuseClient, LangfuseAPIError
     except ImportError:
         console.print("[red]❌ Langfuse client not available[/red]")
         raise typer.Abort()

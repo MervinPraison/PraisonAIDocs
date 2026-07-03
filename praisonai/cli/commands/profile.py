@@ -41,7 +41,7 @@ def profile_query(
     """
     # Use unified profiler for consistent results
     try:
-        from ..execution import ExecutionRequest, Profiler, ProfilerConfig as UnifiedProfilerConfig
+        from praisonai.cli.execution import ExecutionRequest, Profiler, ProfilerConfig as UnifiedProfilerConfig
     except ImportError as e:
         typer.echo(f"Error: Unified profiler not available: {e}", err=True)
         raise typer.Exit(1)
@@ -232,7 +232,7 @@ def profile_suite(
         praisonai profile suite --quick
     """
     try:
-        from ..features.profiler import run_profile_suite, ScenarioConfig
+        from praisonai_code.cli.features.profiler import run_profile_suite, ScenarioConfig
     except ImportError as e:
         typer.echo(f"Error: Profiler module not available: {e}", err=True)
         raise typer.Exit(1)
@@ -304,7 +304,7 @@ def profile_snapshot(
         praisonai profile snapshot v2.0 --format json
     """
     try:
-        from ..features.profiler import (
+        from praisonai_code.cli.features.profiler import (
             run_profile_suite,
             ScenarioConfig,
             PerfSnapshotManager,
@@ -397,7 +397,7 @@ def profile_optimize(
         praisonai profile optimize --lite
     """
     try:
-        from ..features.profiler import (
+        from praisonai_code.cli.features.profiler import (
             PrewarmManager,
             get_lite_mode_config,
             get_provider_cache,

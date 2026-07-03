@@ -16,7 +16,7 @@ app = typer.Typer(help="Scheduler management")
 def _run_schedule(args: list) -> int:
     """Run schedule command with args."""
     try:
-        from ..features.agent_scheduler import AgentSchedulerHandler
+        from praisonai.cli.features.agent_scheduler import AgentSchedulerHandler
         
         # Parse subcommand
         if args and args[0] in ['start', 'list', 'stop', 'logs', 'restart', 'delete', 'describe', 'save', 'stop-all', 'stats']:

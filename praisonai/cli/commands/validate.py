@@ -56,7 +56,7 @@ def validate(
         praisonai validate agents.yaml --strict
         praisonai validate my-config.yaml --json
     """
-    from ...config.validator import ConfigValidator
+    from praisonai.config.validator import ConfigValidator
     import json as json_module
     
     file_path = Path(file)
@@ -155,7 +155,7 @@ def check(
         praisonai validate check ./configs --pattern "*.yml"
         praisonai validate check . --strict --stop-on-error
     """
-    from ...config.validator import ConfigValidator
+    from praisonai.config.validator import ConfigValidator
     import glob
     
     # Find all matching files
@@ -237,7 +237,7 @@ def schema():
     - Workflow configuration
     - Global settings
     """
-    from ...config.schema import YAMLConfig, AgentConfig, TaskConfig
+    from praisonai.config.schema import YAMLConfig, AgentConfig, TaskConfig
     import json
     
     console.print("[bold cyan]PraisonAI YAML Configuration Schema[/bold cyan]\n")

@@ -5,7 +5,16 @@ description: "Self-healing registry that short-circuits permanently-unreachable 
 icon: "skull"
 ---
 
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="gateway-agent", instructions="Route outbound bot messages safely.")
+agent.start("Send the daily digest to the Telegram group.")
+```
 The dead-target registry stops your gateway from wasting requests on channels where the bot was kicked, the group was deleted, or a 403/404 is permanent — and automatically self-heals when a target recovers.
+
+The user triggers an outbound send; the registry skips dead targets and re-probes them when recovery is due.
+
 
 ```mermaid
 graph LR
@@ -77,6 +86,28 @@ registry = DeadTargetRegistry(
     reprobe_seconds=1800,        # re-probe every 30 minutes
 )
 ```
+</Step>
+
+<Step title="Share Across Multiple Workers">
+For a horizontally-scaled gateway, pass a shared [`DeliveryControlStore`](/docs/features/bot-rate-limiting#deliverycontrolstore) so every worker sees the same dead-target set. Marking a channel dead in worker A immediately suppresses sends from worker B; a successful send from any worker self-heals across all of them.
+
+```python
+from pathlib import Path
+from praisonai.bots import DeadTargetRegistry, DeliveryControlStore
+
+store = DeliveryControlStore(Path("~/.praisonai/state/delivery_control.sqlite"))
+
+registry = DeadTargetRegistry(
+    store=store,
+    ttl_seconds=7 * 86400,
+    max_size=5000,
+    reprobe_seconds=1800,
+)
+```
+
+<Warning>
+Every registry sharing a store **must** use identical `ttl_seconds` and `max_size`. The dead-target sweep is table-wide (no per-registry column), so divergent bounds would silently prune the other registry's suppressions. `DeliveryControlStore.register_dead_config()` enforces this at construction: a second registry attaching to the same store with different bounds raises `ValueError` with a clear message. Use separate store files for registries with different settings.
+</Warning>
 </Step>
 
 <Step title="Inspect and Clear Manually">
@@ -172,7 +203,8 @@ registry = DeadTargetRegistry(
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `persist_path` | `Path \| None` | `~/.praisonai/state/dead_targets.json` | JSON file for durability. Parent directories are created automatically. Pass a tmp path for ephemeral / test instances. |
+| `store` | `DeliveryControlStore` \| `None` | `None` | Shared SQLite store for cross-worker sharing. When set, `persist_path` is ignored — dead-target state lives entirely in the store (row-based atomic upsert, no whole-file JSON rewrite). Every registry sharing one store must use identical `ttl_seconds` / `max_size` (enforced by `register_dead_config`, raises `ValueError` on mismatch). See [Multi-worker (horizontally-scaled gateway)](/docs/features/bot-rate-limiting#multi-worker-horizontally-scaled-gateway). |
+| `persist_path` | `Path \| None` | `~/.praisonai/state/dead_targets.json` | JSON file for durability. Parent directories are created automatically. Pass a tmp path for ephemeral / test instances. Ignored when `store=` is set. |
 | `max_size` | `int` | `10_000` | Maximum dead entries kept. Oldest (by `ts`) are evicted when exceeded. `<= 0` disables the bound. |
 | `ttl_seconds` | `int` | `2_592_000` (30 days) | Entries older than this are dropped lazily on the next access, so a long-dead target is eventually re-probed even if no send ever cleared it. `<= 0` disables TTL. |
 | `reprobe_seconds` | `int` | `3600` (1 hour) | Once this elapses since `mark_dead`, **one** send is allowed through to test recovery. Success self-heals; repeated permanent failure resets the clock. `<= 0` disables re-probing. |
@@ -240,24 +272,6 @@ registry = DeadTargetRegistry(
 **Platform names are stored lower-cased.** `mark_dead("Telegram", ...)` and `is_dead("TELEGRAM", ...)` refer to the same entry. Users coming from YAML keys like `Telegram:` don't need to worry about casing.
 </Note>
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `path` | `str` | required | Path to the persistent JSON file (supports `~` expansion) |
-| `max_size` | `int` | unlimited | Maximum number of dead entries to keep (oldest evicted first) |
-| `ttl_seconds` | `int` | `None` | Auto-evict entries older than this many seconds |
-| `reprobe_seconds` | `int` | `3600` | How often to let a single delivery attempt through to probe recovery |
-
-### Registry API
-
-| Method | Description |
-|--------|-------------|
-| `is_dead(target_id)` | Returns `True` if the channel is currently suppressed |
-| `mark_dead(target_id)` | Suppress the channel and reset its re-probe clock |
-| `clear(target_id)` | Remove a channel from the dead list (self-heal) |
-| `list_dead()` | Return all currently suppressed channel IDs |
-| `size()` | Number of entries in the registry |
-| `should_reprobe(target_id)` | Returns `True` when re-probe window has elapsed |
-
 ---
 
 ## Common Patterns
@@ -280,6 +294,10 @@ async def broadcast(channels, message):
 ```
 
 Dead channels are skipped silently; recovered channels re-enter service within one reprobe cycle (~1 h by default).
+
+<Note>
+On a multi-worker gateway, pass the same `DeliveryControlStore` to every worker's registry and rate limiter. That way, a channel marked dead by worker A immediately stops burning fan-out cycles on workers B/C/D. See [Multi-worker (horizontally-scaled gateway)](/docs/features/bot-rate-limiting#multi-worker-horizontally-scaled-gateway).
+</Note>
 
 ### Operator dashboard via `list_dead()`
 
@@ -307,26 +325,6 @@ Un-suppress a channel manually after confirming the bot has been re-added.
 registry.clear("telegram", "-1001234567890")
 ```
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `persist_path` | `Path \| str` | `~/.praisonai/state/dead_targets.json` | JSON file for durability |
-| `max_size` | `int` | `10000` | Maximum dead entries; oldest evicted when exceeded |
-| `ttl_seconds` | `int` | `2592000` (30 days) | Entries older than this are forgotten |
-| `reprobe_seconds` | `int` | `3600` (1 hour) | How often to let one send through for self-heal |
-
----
-
-## Public API
-
-| Method | Description |
-|--------|-------------|
-| `is_dead(platform, channel_id)` | Returns `True` if target is suppressed |
-| `should_reprobe(platform, channel_id)` | Returns `True` if a reprobe is due |
-| `mark_dead(platform, channel_id, reason)` | Suppresses the target |
-| `clear(platform, channel_id)` | Removes suppression (called on success) |
-| `list_dead()` | Returns all currently-dead targets |
-| `size()` | Count of suppressed targets |
-
 ---
 
 ## Best Practices
@@ -334,6 +332,10 @@ registry.clear("telegram", "-1001234567890")
 <AccordionGroup>
 <Accordion title="Default-OFF on purpose">
 Attach a registry only on long-running gateways with periodic, broadcast, or scheduled sends. Single-request CLIs and request-response bots don't need it — adding suppression to short-lived processes just adds complexity with no benefit.
+</Accordion>
+
+<Accordion title="Keep bounds consistent across workers">
+When several workers share one `DeliveryControlStore`, they must agree on `ttl_seconds` and `max_size`. `DeliveryControlStore.register_dead_config()` enforces this at attach time — the second worker with divergent bounds raises `ValueError` instead of silently pruning the first worker's suppressions. Roll config changes through the whole fleet together; if you genuinely need two different retention windows, use two separate store files.
 </Accordion>
 
 <Accordion title="401 is intentionally NOT permanent">
@@ -381,13 +383,8 @@ The JSON file survives restarts and preserves which channels are suppressed betw
 When a successful send reaches a channel that was in the dead list — even a regular delivery, not only a scheduled re-probe — the channel is cleared automatically. No manual intervention needed.
 </Accordion>
 
-<Accordion title="401 errors are not permanent">
-A 401 Unauthorized response is account-level, not per-channel. The registry never marks a channel dead for a 401 — use it only for 403/404/410 failures with the appropriate error text.
-</Accordion>
-
-
 <Accordion title="Keep TTL short for fast-recovering platforms">
-A 24-hour default works for most bots. On platforms where users frequently delete and recreate accounts, use a shorter TTL (e.g. 1–4 hours) to allow re-delivery sooner.
+The 30-day default suits most bots. On platforms where users frequently delete and recreate accounts, use a shorter TTL (e.g. 1–7 days) to allow re-delivery sooner.
 </Accordion>
 
 <Accordion title="Size the registry to your user base">
@@ -395,14 +392,11 @@ Each entry uses ~100 bytes. `max_size=10_000` uses ~1 MB. For bots with millions
 </Accordion>
 
 <Accordion title="Always clear on manual recovery">
-If an operator manually restores a blocked channel, call `registry.clear(target)` so the next send goes through. Without clearing, the entry persists until TTL expiry.
+If an operator manually restores a blocked channel, call `registry.clear(platform, channel_id)` so the next send goes through. Without clearing, the entry persists until TTL expiry.
 </Accordion>
 
 <Accordion title="Pair with durable delivery">
 The registry prevents re-sending to dead targets, but in-flight messages that fail permanently should also go to the outbound DLQ. See [Durable Delivery](/docs/features/durable-delivery) and [Delivery Config](/docs/features/delivery-config).
-
-<Accordion title="Enable registry for broadcast / proactive bots">
-Subscription bots that push to many channels benefit most from the registry — fan-out cycles skip dead targets instantly instead of waiting for a timeout per doomed call.
 </Accordion>
 
 <Accordion title="Set TTL to match your re-subscription window">

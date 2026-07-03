@@ -1,6 +1,6 @@
 # Documentation Parity Tracker (Python)
 
-> **Categories:** 66 | **Documented:** 65 | **Parity:** 98.5%
+> **Categories:** 66 | **Documented:** 66 | **Parity:** 100.0%
 
 This report compares **Python SDK feature categories** against **Python documentation** (docs/concepts, docs/features, etc.).
 
@@ -9,91 +9,86 @@ This report compares **Python SDK feature categories** against **Python document
 | Metric | Count |
 |--------|-------|
 | Feature Categories | 66 |
-| **Documented Categories** | **65** |
-| **Undocumented Categories** | **1** |
-| **Parity** | **98.5%** |
+| **Documented Categories** | **66** |
+| **Undocumented Categories** | **0** |
+| **Parity** | **100.0%** |
 
 ## Documented Categories
 
 | Category | Features | Docs | Lines |
 |----------|----------|------|-------|
 | ✅ AGUI | 1 | 2 | 420 |
-| ✅ Agent | 21 | 43 | 11901 |
-| ✅ Agent-to-Agent (A2A) | 1 | 7 | 2927 |
-| ✅ Agent-to-User (A2U) | 1 | 3 | 573 |
-| ✅ Approval | 1 | 4 | 1856 |
-| ✅ Audio | 2 | 10 | 645 |
-| ✅ Auto Generation | 5 | 7 | 2032 |
-| ✅ Autonomy | 3 | 6 | 2148 |
-| ✅ Bots | 7 | 24 | 8439 |
+| ✅ Agent | 21 | 43 | 12047 |
+| ✅ Agent-to-Agent (A2A) | 1 | 7 | 2951 |
+| ✅ Agent-to-User (A2U) | 1 | 3 | 585 |
+| ✅ Approval | 1 | 5 | 2140 |
+| ✅ Audio | 2 | 10 | 658 |
+| ✅ Auto Generation | 5 | 7 | 2046 |
+| ✅ Autonomy | 3 | 6 | 2163 |
+| ✅ Bots | 7 | 24 | 8676 |
 | ✅ Budget | 1 | 1 | 287 |
-| ✅ CLI | 5 | 111 | 28211 |
-| ✅ Chunking | 2 | 2 | 339 |
+| ✅ CLI | 5 | 111 | 28430 |
+| ✅ Chunking | 2 | 2 | 372 |
 | ✅ Citations | 2 | 1 | 202 |
-| ✅ Code Execution | 2 | 13 | 3739 |
-| ✅ Conditions | 1 | 3 | 1108 |
-| ✅ Configuration | 3 | 7 | 2281 |
-| ✅ Context Management | 16 | 33 | 11293 |
-| ✅ Database | 1 | 40 | 5669 |
+| ✅ Code Execution | 2 | 13 | 3752 |
+| ✅ Conditions | 1 | 3 | 1124 |
+| ✅ Configuration | 3 | 7 | 2299 |
+| ✅ Context Management | 16 | 33 | 11478 |
+| ✅ Database | 1 | 40 | 5748 |
 | ✅ Deep Research | 8 | 2 | 497 |
-| ✅ Display | 6 | 3 | 610 |
-| ✅ Embeddings | 6 | 23 | 1968 |
-| ✅ Evaluation | 1 | 6 | 2509 |
-| ✅ Events | 1 | 2 | 711 |
-| ✅ Execution | 3 | 4 | 1455 |
-| ✅ Failover | 2 | 1 | 398 |
-| ✅ Files | 2 | 6 | 1770 |
+| ✅ Display | 6 | 3 | 648 |
+| ✅ Embeddings | 6 | 23 | 1990 |
+| ✅ Evaluation | 1 | 6 | 2511 |
+| ✅ Events | 1 | 2 | 735 |
+| ✅ Execution | 3 | 4 | 1471 |
+| ✅ Failover | 2 | 1 | 400 |
+| ✅ Files | 2 | 6 | 1845 |
 | ✅ Flow | 1 | 3 | 777 |
-| ✅ Gateway | 7 | 30 | 11244 |
-| ✅ Guardrails | 4 | 4 | 1637 |
-| ✅ Handoffs | 11 | 6 | 2596 |
-| ✅ Hooks | 2 | 9 | 3482 |
-| ✅ Image | 1 | 11 | 1105 |
-| ✅ Knowledge | 4 | 24 | 4739 |
-| ✅ LLM | 3 | 11 | 4033 |
-| ✅ Loops | 4 | 3 | 778 |
-| ✅ MCP | 1 | 52 | 11147 |
-| ✅ Memory | 6 | 17 | 6103 |
-| ✅ OCR | 2 | 1 | 228 |
+| ✅ Gateway | 7 | 38 | 13639 |
+| ✅ Guardrails | 4 | 4 | 1642 |
+| ✅ Handoffs | 11 | 6 | 2654 |
+| ✅ Hooks | 2 | 9 | 3660 |
+| ✅ Image | 1 | 11 | 1113 |
+| ✅ Knowledge | 4 | 12 | 3687 |
+| ✅ LLM | 3 | 12 | 4292 |
+| ✅ Loops | 4 | 3 | 797 |
+| ✅ MCP | 1 | 52 | 11155 |
+| ✅ Memory | 6 | 17 | 6211 |
+| ✅ OCR | 2 | 1 | 237 |
 | ✅ Observability | 2 | 23 | 2768 |
 | ✅ Optimizer | 1 | 2 | 750 |
-| ✅ Output | 3 | 5 | 1099 |
-| ✅ Parallel Execution | 3 | 2 | 364 |
-| ✅ Planning | 6 | 6 | 1423 |
-| ✅ Plugins | 8 | 3 | 971 |
-| ✅ Prompts | 2 | 7 | 1197 |
-| ✅ Providers | 1 | 54 | 6787 |
+| ✅ Output | 3 | 5 | 1102 |
+| ✅ Parallel Execution | 3 | 2 | 419 |
+| ✅ Planning | 6 | 6 | 1418 |
+| ✅ Plugins | 8 | 3 | 994 |
+| ✅ Prompts | 2 | 7 | 1201 |
+| ✅ Providers | 1 | 54 | 7047 |
 | ✅ Query | 1 | 2 | 623 |
-| ✅ RAG | 5 | 15 | 2889 |
+| ✅ RAG | 5 | 15 | 2908 |
 | ✅ Realtime | 2 | 5 | 584 |
-| ✅ Reflection | 3 | 3 | 662 |
-| ✅ Retrieval | 2 | 5 | 903 |
-| ✅ Routing | 1 | 2 | 365 |
-| ✅ Sandbox | 5 | 6 | 2458 |
-| ✅ Security | 1 | 3 | 2772 |
-| ✅ Sessions | 4 | 12 | 4264 |
-| ✅ Skills | 6 | 13 | 4831 |
-| ✅ Tasks | 2 | 6 | 2709 |
-| ✅ Telemetry | 1 | 2 | 574 |
-| ✅ Templates | 1 | 8 | 1655 |
-| ✅ Tools | 12 | 122 | 30097 |
+| ✅ Reflection | 3 | 3 | 665 |
+| ✅ Retrieval | 2 | 5 | 915 |
+| ✅ Routing | 1 | 2 | 413 |
+| ✅ Sandbox | 5 | 6 | 2464 |
+| ✅ Security | 1 | 3 | 2787 |
+| ✅ Sessions | 4 | 12 | 4292 |
+| ✅ Skills | 6 | 13 | 4856 |
+| ✅ Tasks | 2 | 6 | 2715 |
+| ✅ Telemetry | 1 | 2 | 576 |
+| ✅ Templates | 1 | 8 | 1657 |
+| ✅ Tools | 12 | 125 | 31449 |
 | ✅ Tracing | 3 | 2 | 139 |
+| ✅ Vector Store | 1 | 12 | 1139 |
 | ✅ Video | 2 | 6 | 510 |
 | ✅ Vision | 2 | 1 | 283 |
-| ✅ Web | 3 | 8 | 1901 |
-| ✅ Workflows | 5 | 15 | 6439 |
-
-## Undocumented Categories (Need Documentation)
-
-| Category | Features |
-|----------|----------|
-| ❌ Vector Store | 1 |
+| ✅ Web | 3 | 8 | 1910 |
+| ✅ Workflows | 5 | 16 | 6915 |
 
 ## Documentation Without Features
 
 These docs exist but don't match any implemented feature category:
 
-- ℹ️ Documents (1 docs, 775 lines)
+- ℹ️ Documents (1 docs, 787 lines)
 
 ---
 

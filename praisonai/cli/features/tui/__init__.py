@@ -1,83 +1,19 @@
-"""
-TUI (Terminal User Interface) for PraisonAI.
+"""Hybrid TUI package: wrapper app + code widgets/screens."""
 
-Provides an app-like interactive experience with:
-- Event-loop driven async UI
-- Multi-pane layout (chat, tools, queue, status)
-- Streaming output
-- Queue management
-- Session persistence
-- Headless simulation mode for CI/testing
+try:  # pragma: no cover - defensive
+    import praisonai_code.cli.features.tui as _code_tui
 
-Requires the [tui] extra: pip install praisonai[tui]
-"""
+    for _code_dir in getattr(_code_tui, "__path__", []):
+        if _code_dir not in __path__:
+            __path__.append(_code_dir)
+except ImportError:  # pragma: no cover - code package optional at import time
+    _code_tui = None
 
-from typing import TYPE_CHECKING
+if _code_tui is not None:
+    __all__ = list(getattr(_code_tui, "__all__", []))
 
-if TYPE_CHECKING:
-    from .app import TUIApp
-    from .events import TUIEvent, TUIEventType
-    from .orchestrator import TuiOrchestrator, UIStateModel, SimulationRunner
-    from .mock_provider import MockProvider, MockProviderConfig
+    def __getattr__(name: str):
+        return getattr(_code_tui, name)
 
-_lazy_cache = {}
-
-
-def __getattr__(name: str):
-    """Lazy load TUI components."""
-    global _lazy_cache
-    
-    if name in _lazy_cache:
-        return _lazy_cache[name]
-    
-    if name == "TUIApp":
-        from .app import TUIApp
-        _lazy_cache[name] = TUIApp
-        return TUIApp
-    elif name == "TUIEvent":
-        from .events import TUIEvent
-        _lazy_cache[name] = TUIEvent
-        return TUIEvent
-    elif name == "TUIEventType":
-        from .events import TUIEventType
-        _lazy_cache[name] = TUIEventType
-        return TUIEventType
-    elif name == "run_tui":
-        from .app import run_tui
-        _lazy_cache[name] = run_tui
-        return run_tui
-    elif name == "TuiOrchestrator":
-        from .orchestrator import TuiOrchestrator
-        _lazy_cache[name] = TuiOrchestrator
-        return TuiOrchestrator
-    elif name == "UIStateModel":
-        from .orchestrator import UIStateModel
-        _lazy_cache[name] = UIStateModel
-        return UIStateModel
-    elif name == "SimulationRunner":
-        from .orchestrator import SimulationRunner
-        _lazy_cache[name] = SimulationRunner
-        return SimulationRunner
-    elif name == "MockProvider":
-        from .mock_provider import MockProvider
-        _lazy_cache[name] = MockProvider
-        return MockProvider
-    elif name == "MockProviderConfig":
-        from .mock_provider import MockProviderConfig
-        _lazy_cache[name] = MockProviderConfig
-        return MockProviderConfig
-    
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-__all__ = [
-    "TUIApp",
-    "TUIEvent",
-    "TUIEventType",
-    "run_tui",
-    "TuiOrchestrator",
-    "UIStateModel",
-    "SimulationRunner",
-    "MockProvider",
-    "MockProviderConfig",
-]
+    def __dir__():
+        return sorted(set(globals().keys()) | set(dir(_code_tui)))
