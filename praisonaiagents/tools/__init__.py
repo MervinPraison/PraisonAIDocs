@@ -201,6 +201,26 @@ TOOL_MAPPINGS = {
     'is_ast_grep_available': ('.ast_grep_tool', None),
     'get_ast_grep_tools': ('.ast_grep_tool', None),
     'ast_grep_tools': ('.ast_grep_tool', None),
+
+    # Edit Tools (diff-based file editing with fuzzy matching + LSP diagnostics)
+    'edit_file': ('.edit_tools', None),
+    'apply_patch': ('.edit_tools', None),
+    'create_edit_tools': ('.edit_tools', None),
+    'edit_tools': ('.edit_tools', None),
+
+    # Todo Tools (agent-facing task tracking)
+    'todo_add': ('.todo_tools', None),
+    'todo_list': ('.todo_tools', None),
+    'todo_update': ('.todo_tools', None),
+    'create_todo_tools': ('.todo_tools', None),
+    'todo_tools': ('.todo_tools', None),
+
+    # LSP Navigation Tools (language-server-accurate code navigation)
+    'lsp_definition': ('.lsp_tools', None),
+    'lsp_references': ('.lsp_tools', None),
+    'lsp_hover': ('.lsp_tools', None),
+    'lsp_document_symbols': ('.lsp_tools', None),
+    'lsp_workspace_symbols': ('.lsp_tools', None),
     
     # Memory Tools (active memory store/search for agents)
     'store_memory': ('.memory', None),
@@ -374,6 +394,9 @@ def __getattr__(name: str) -> Any:
             'send_message',
             'grep', 'glob',
             'ast_grep_search', 'ast_grep_rewrite', 'ast_grep_scan', 'is_ast_grep_available', 'get_ast_grep_tools',
+            'edit_file', 'apply_patch', 'create_edit_tools',
+            'todo_add', 'todo_list', 'todo_update', 'create_todo_tools',
+            'lsp_definition', 'lsp_references', 'lsp_hover', 'lsp_document_symbols', 'lsp_workspace_symbols',
             'store_memory', 'search_memory',
             'store_learning', 'search_learning',
             'session_search', 'create_session_tools',
@@ -383,7 +406,7 @@ def __getattr__(name: str) -> Any:
             'clarify'
         ]:
             return getattr(module, name)
-        if name in ['file_tools', 'spider_tools', 'python_tools', 'shell_tools', 'cot_tools', 'tavily_tools', 'youdotcom_tools', 'exa_tools', 'crawl4ai_tools', 'skill_tools', 'github_tools', 'jira_tools', 'schedule_tools', 'messaging_tools', 'search_tools', 'ast_grep_tools', 'email_tools']:
+        if name in ['file_tools', 'spider_tools', 'python_tools', 'shell_tools', 'cot_tools', 'tavily_tools', 'youdotcom_tools', 'exa_tools', 'crawl4ai_tools', 'skill_tools', 'github_tools', 'jira_tools', 'schedule_tools', 'messaging_tools', 'search_tools', 'ast_grep_tools', 'edit_tools', 'todo_tools', 'email_tools']:
             return module  # Returns the callable module
         return getattr(module, name)
     else:
