@@ -190,8 +190,24 @@ async function dispatchMergeGateForOldestReady(github, owner, repo, readyCandida
   return 0;
 }
 
+async function dispatchMergeConflictScan(github, owner, repo, core) {
+  try {
+    await github.rest.actions.createWorkflowDispatch({
+      owner,
+      repo,
+      workflow_id: 'merge-conflict-claude.yml',
+      ref: 'main',
+    });
+    core?.info?.('Dispatched merge-conflict-claude workflow');
+    return true;
+  } catch (err) {
+    core?.warning?.(`Could not dispatch merge-conflict scan: ${err.message}`);
+    return false;
+  }
+}
+
 async function syncOpenPullRequests(github, owner, repo, options, core) {
-  const { maxPrs = 20, dispatchMergeGate = true } = options || {};
+  const { maxPrs = 20, dispatchMergeGate = true, dispatchConflictScan = true } = options || {};
   await ensurePipelineLabels(github, owner, repo, core);
   let prs;
   if (maxPrs <= 100) {
@@ -211,11 +227,15 @@ async function syncOpenPullRequests(github, owner, repo, options, core) {
   }
   let synced = 0;
   const readyCandidates = [];
+  let dirtyConflict = false;
   for (const pr of prs) {
     if (synced >= maxPrs) break;
     if (pr.draft) continue;
     if (pr.head?.repo?.full_name && pr.head.repo.full_name !== `${owner}/${repo}`) continue;
     const result = await syncPipelineLabels(github, owner, repo, pr.number, core);
+    if ((result.reasons || []).some((r) => r === 'mergeState=DIRTY' || r.includes('claude-conflict-pending'))) {
+      dirtyConflict = true;
+    }
     if (result.ready) {
       readyCandidates.push({
         prNumber: pr.number,
@@ -230,6 +250,9 @@ async function syncOpenPullRequests(github, owner, repo, options, core) {
     dispatched = await dispatchMergeGateForOldestReady(
       github, owner, repo, readyCandidates, core
     );
+  }
+  if (dispatchConflictScan && dirtyConflict) {
+    await dispatchMergeConflictScan(github, owner, repo, core);
   }
   core?.info?.(`Pipeline label sync complete (${synced} PR(s), dispatched=${dispatched || 'none'})`);
   return synced;
@@ -246,4 +269,5 @@ module.exports = {
   syncPipelineLabels,
   syncOpenPullRequests,
   dispatchMergeGateForOldestReady,
+  dispatchMergeConflictScan,
 };

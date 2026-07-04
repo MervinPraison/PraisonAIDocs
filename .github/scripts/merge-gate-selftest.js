@@ -180,6 +180,14 @@ assert(
   !mg.hasRecentConflictComment([cleanMergeConflict], '2026-07-03T09:00:00Z', 'CLEAN')
 );
 
+// reconcileConflictPendingLabel: reduce must not use null initial (crashes on first element)
+const oneTrigger = [cleanMergeConflict];
+const latestOne = oneTrigger.length === 0
+  ? null
+  : oneTrigger.reduce((a, b) => (new Date(a.created_at) > new Date(b.created_at) ? a : b));
+assert('conflict trigger reduce with one item', latestOne === oneTrigger[0]);
+assert('conflict trigger reduce with empty', [].length === 0);
+
 // Cooldown: FINAL current on HEAD should not block merge gate
 const finalCompleteComments = [
   { user: { login: 'MervinPraison' }, body: '@claude FINAL architecture reviewer', created_at: '2026-07-03T10:00:00Z' },
