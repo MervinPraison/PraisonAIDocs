@@ -498,10 +498,11 @@ async function reconcileConflictPendingLabel(
     return { pending: false, stale: false };
   }
   const triggers = comments.filter(isConflictRebaseTriggerComment);
-  const latest = triggers.reduce(
-    (a, b) => (new Date(a.created_at) > new Date(b.created_at) ? a : b),
-    null
-  );
+  const latest = triggers.length === 0
+    ? null
+    : triggers.reduce((a, b) =>
+        new Date(a.created_at) > new Date(b.created_at) ? a : b
+      );
   const triggerAge = latest
     ? Date.now() - new Date(latest.created_at).getTime()
     : CONFLICT_PENDING_STALE_MS + 1;
@@ -837,7 +838,16 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
   if (ctx.pr.state !== 'open') reasons.push('not open');
   if (ctx.labels.includes('auto-merged-by-gate')) reasons.push('already merged by gate');
   if (ctx.labels.includes('no-auto-merge')) reasons.push('no-auto-merge label');
-  if (ctx.labels.includes('claude-conflict-pending')) reasons.push('claude-conflict-pending');
+  if (ctx.labels.includes(CONFLICT_PENDING_LABEL)) {
+    const conflict = await reconcileConflictPendingLabel(
+      github, owner, repo, prNumber, ctx.labels, ctx.comments, ctx.mergeState.status, core
+    );
+    if (conflict.pending) {
+      reasons.push('claude-conflict-pending');
+    } else {
+      ctx.labels = ctx.labels.filter((l) => l !== CONFLICT_PENDING_LABEL);
+    }
+  }
   if (!forMergeStep && ctx.labels.includes(MERGE_GATE_ACTIVE_LABEL)) {
     const gate = await reconcileMergeGateActiveLabel(
       github, owner, repo, prNumber, ctx.labels, core
