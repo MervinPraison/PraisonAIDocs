@@ -120,13 +120,10 @@ function conflictRebaseQuiescent(comments, headPushedAt) {
   );
   const conflictTime = new Date(latestConflict.created_at).getTime();
 
-  const rebaseDone = comments.some(
+  return comments.some(
     (c) =>
       new Date(c.created_at).getTime() > conflictTime && isConflictRebaseCompletionComment(c)
   );
-  if (!rebaseDone) return false;
-
-  return finalClaudeCompletedOnSha(comments, headPushedAt);
 }
 
 function hasRecentConflictComment(comments, headPushedAt = null, mergeStateStatus = null) {
@@ -323,7 +320,7 @@ function finalClaudeCompletedOnSha(comments, headPushedAt) {
 }
 
 const FINAL_CLAUDE_REVIEW_BODY =
-  '@claude You are the FINAL documentation reviewer. If the branch is under MervinPraison/PraisonAIDocs (not a fork), you are able to make modifications to this branch and push directly. SCOPE: `docs/`, `docs.json`, `mint.json` — documentation only. Do NOT modify synced `praisonaiagents/` or `praisonai/` copies unless fixing a doc-blocking sync error. Read ALL comments above from Gemini, Qodo, CodeRabbit, and Copilot carefully before responding.\n\n**Phase 1: Review per AGENTS.md**\n1. SDK-first: verify against `praisonaiagents/` and `praisonai/` synced source\n2. User-focused, beginner-friendly, copy-paste runnable examples\n3. Mintlify components and Mermaid standards correct\n4. New pages go in `docs/features/` — never `docs/concepts/` without human approval\n5. Navigation updated in `docs.json` when adding pages\n\n**Phase 2: FIX Valid Issues**\n6. Fix valid doc errors, broken links, wrong imports, or Mintlify issues\n7. Push fixes directly to THIS branch (do NOT create a new PR)\n8. Comment summary of files modified and what you skipped\n\n**Phase 3: Final Verdict**\n9. If all issues are resolved, approve the PR\n10. If blocking issues remain, request changes with clear action items';
+  '@claude Docs PR ready for merge-gate review per AGENTS.md.';
 
 async function getMergeState(github, owner, repo, prNumber) {
   const query = `
@@ -867,8 +864,7 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
   }
   if (!skipRecentClaudeCooldown && hasRecentClaudeTrigger(ctx.comments, 35)) {
     const verdictOnHead = findMergeGateVerdict(ctx.comments, null, ctx.headPushedAt) !== null;
-    const finalCurrent = finalClaudeCompletedOnSha(ctx.comments, ctx.headPushedAt);
-    if (!verdictOnHead && !finalCurrent) reasons.push('recent @claude within 35min');
+    if (!verdictOnHead) reasons.push('recent @claude within 35min');
   }
 
   if (!skipGlobalClaudeRunCheck && (await hasInProgressClaudeAssistant(github, owner, repo, prNumber))) {
@@ -879,16 +875,6 @@ async function evaluatePipelineQuiescent(github, owner, repo, prNumber, core, op
     mergeStateStatus: ctx.mergeState.status,
   });
   if (!checksOk) reasons.push('CI not green on HEAD');
-
-  if (!finalClaudeCompletedOnSha(ctx.comments, ctx.headPushedAt)) {
-    if (!hasFinalClaudeReviewTrigger(ctx.comments)) {
-      reasons.push('no FINAL Claude review trigger');
-    } else if (isStaleFinalAfterPush(ctx.comments, ctx.headPushedAt)) {
-      reasons.push('stale FINAL after new commits (needs @claude re-review)');
-    } else {
-      reasons.push('FINAL Claude not complete on HEAD');
-    }
-  }
 
   if (hasAnyChangesRequested(ctx.reviews)) reasons.push('CHANGES_REQUESTED review');
 

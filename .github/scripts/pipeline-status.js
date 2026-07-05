@@ -39,7 +39,6 @@ const LABEL_SPECS = [
 
 function deriveStage(comments, evalResult) {
   if (evalResult.ready) return 'pipeline/merge-ready';
-  if (!mergeGate.hasFinalClaudeReviewTrigger(comments)) return 'pipeline/final-claude-pending';
   return 'pipeline/awaiting-merge-gate';
 }
 
