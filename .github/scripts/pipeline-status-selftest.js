@@ -27,17 +27,17 @@ const finalComment = {
 };
 
 assert(
-  'final pending without FINAL trigger',
-  ps.deriveStage([], { ready: false, reasons: ['no FINAL Claude review trigger'] })
-    === 'pipeline/final-claude-pending'
+  'not ready maps to awaiting merge gate',
+  ps.deriveStage([], { ready: false, reasons: ['CI not green on HEAD'] })
+    === 'pipeline/awaiting-merge-gate'
 );
 assert(
-  'final pending after review kick comments',
+  'not ready after review kicks still awaiting merge gate',
   ps.deriveStage(kickComments, { ready: false, reasons: ['no FINAL Claude review trigger'] })
-    === 'pipeline/final-claude-pending'
+    === 'pipeline/awaiting-merge-gate'
 );
 assert(
-  'awaiting merge gate after final',
+  'awaiting merge gate when in cooldown',
   ps.deriveStage(
     [...kickComments, finalComment],
     { ready: false, reasons: ['recent @claude within 35min'] }

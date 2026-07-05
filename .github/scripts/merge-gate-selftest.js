@@ -209,7 +209,7 @@ assert('issues event never blocks', !mg.hasBlockingClaudeRunForPr(
   'my-branch'
 ));
 
-// Conflict rebase clears after bot completion + FINAL on HEAD (within 12h cooldown)
+// Conflict rebase clears after bot completion comment (no FINAL @claude required)
 const conflictNowMs = Date.now();
 const conflictIso = (offsetMs) => new Date(conflictNowMs + offsetMs).toISOString();
 const conflictTrigger = {
@@ -222,19 +222,11 @@ const rebaseDone = {
   body: 'Rebase complete — PR #2308 onto latest main',
   created_at: conflictIso(-29 * 60 * 1000),
 };
-const finalAfterRebase = {
-  user: { login: 'MervinPraison' },
-  body: '@claude You are the FINAL architecture reviewer.',
-  created_at: conflictIso(-20 * 60 * 1000),
-};
 const headAfterRebase = conflictIso(-21 * 60 * 1000);
-const rebaseComments = [conflictTrigger, rebaseDone, finalAfterRebase];
+const rebaseComments = [conflictTrigger, rebaseDone];
 assert('conflict blocks before rebase done', mg.hasRecentConflictComment([conflictTrigger], headAfterRebase));
-assert('conflict clears after rebase + FINAL on HEAD', !mg.hasRecentConflictComment(rebaseComments, headAfterRebase));
-assert('conflict still blocks without FINAL on HEAD', mg.hasRecentConflictComment(
-  [conflictTrigger, rebaseDone],
-  headAfterRebase
-));
+assert('conflict clears after rebase completion', !mg.hasRecentConflictComment(rebaseComments, headAfterRebase));
+assert('conflictRebaseQuiescent after completion', mg.conflictRebaseQuiescent(rebaseComments, headAfterRebase));
 
 // Tests heuristic (synced SDK copies in docs repo)
 assert('sdk without tests', mg.missingTestsReason([{ filename: 'praisonaiagents/a/b.py', additions: 3 }]) !== null);

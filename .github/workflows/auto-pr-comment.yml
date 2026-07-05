@@ -1,10 +1,7 @@
 name: Auto PR Comment
 
-# Review chain: CodeRabbit (+ optional Greptile/Qodo/Gemini) → Claude (FINAL)
-# Copilot disabled (REVIEW_CHAIN_SKIP_COPILOT=1) — re-enable legacy copilot-* jobs to restore.
-#
-# Claude trigger runs IN-BAND (same workflow) to avoid GitHub Actions
-# blocking bot-triggered workflows with action_required approval gates.
+# Review chain: CodeRabbit (+ optional Greptile/Qodo/Gemini) → merge gate (no FINAL @claude PR comments).
+
 on:
   issue_comment:
     types: [created]
@@ -12,71 +9,18 @@ on:
     types: [submitted]
   pull_request:
     types: [opened, synchronize]
-  schedule:
-    - cron: '15 * * * *'
   workflow_dispatch:
     inputs:
       pr_number:
-        description: 'Optional PR number to re-trigger FINAL @claude'
+        description: 'Optional PR number to sync pipeline labels'
         required: false
         type: string
 
 env:
   REVIEW_CHAIN_SKIP_COPILOT: '1'
-  CLAUDE_TRIGGER_LOGINS: '["MervinPraison","github-actions[bot]"]'
+  GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
 
 jobs:
-  # ================================================================
-  # Claude FINAL after CodeRabbit / Greptile / optional Qodo / Gemini
-  # ================================================================
-  claude-after-prior-reviewers:
-    if: |
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       (
-         github.event.comment.user.login == 'coderabbitai[bot]' ||
-         github.event.comment.user.login == 'greptile-apps[bot]' ||
-         contains(github.event.comment.user.login, 'gemini-code-assist') ||
-         contains(github.event.comment.user.login, 'qodo-code-review')
-       )) ||
-      (github.event_name == 'pull_request_review' &&
-       contains(github.event.review.user.login, 'qodo-code-review'))
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Post Claude FINAL after prior reviewers
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GH_TOKEN }}
-          script: |
-            const path = require('path');
-            const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review-chain.js'));
-            const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
-            const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
-            const prNumber = context.payload.issue?.number || context.payload.pull_request?.number;
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const { data: pr } = await github.rest.pulls.get({
-              owner, repo, pull_number: prNumber,
-            });
-            const result = await chain.maybeTriggerClaudeFinal(
-              github, owner, repo, prNumber,
-              mergeGate.FINAL_CLAUDE_REVIEW_BODY, core,
-              { skipCopilot: true, optionalWaitMs: 0, prCreatedAt: pr.created_at }
-            );
-            if (result.posted) core.info(`Posted Claude FINAL on PR #${prNumber}`);
-            await ps.ensurePipelineLabels(github, owner, repo, core);
-            await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
-
-  # ================================================================
-  # BOT PRs: kick CodeRabbit + Qodo + Gemini
-  # ================================================================
   bot-pr-trigger-reviews:
     if: |
       github.event_name == 'pull_request' &&
@@ -93,7 +37,7 @@ jobs:
       - name: Trigger CodeRabbit, Qodo, and Gemini reviews
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ env.GH_TOKEN }}
           script: |
             const path = require('path');
             const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/bot-pr-review-chain.js'));
@@ -106,140 +50,66 @@ jobs:
               body: '@gemini review this PR',
             });
 
-  # ================================================================
-  # Stale/missing FINAL recovery + pipeline labels
-  # ================================================================
-  claude-final-on-sync:
-    if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+  pipeline-sync:
+    if: |
+      github.event_name == 'pull_request' ||
+      github.event_name == 'issue_comment' ||
+      github.event_name == 'pull_request_review' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       issues: write
       pull-requests: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Re-post stale FINAL @claude after push
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GH_TOKEN }}
-          script: |
-            const path = require('path');
-            const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review-chain.js'));
-            const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
-            const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const prNumber = context.payload.pull_request.number;
-            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-            const comments = await mergeGate.listAllComments(github, owner, repo, prNumber);
-            const headPushedAt = (await mergeGate.getHeadCommitDate(github, owner, repo, prNumber)) || pr.updated_at;
-            const headPusher = context.payload.sender?.login || null;
-            const hasFinal = mergeGate.hasFinalClaudeReviewTrigger(comments);
-            const isStale = mergeGate.isStaleFinalAfterPush(comments, headPushedAt);
-
-            if (mergeGate.shouldSkipFinalRecovery(comments, headPushedAt)) {
-              core.info('Recent @claude within 35min and FINAL not stale — skip recovery');
-              await ps.ensurePipelineLabels(github, owner, repo, core);
-              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
-              return;
-            }
-            if (await mergeGate.hasInProgressClaudeAssistant(github, owner, repo, prNumber)) {
-              core.info('Claude workflow in progress — skip recovery');
-              await ps.ensurePipelineLabels(github, owner, repo, core);
-              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
-              return;
-            }
-
-            if (hasFinal && isStale) {
-              const gate = mergeGate.shouldSkipStaleFinalRecovery(comments, headPushedAt, headPusher);
-              if (gate.skip) {
-                core.info(`Skip stale-FINAL recovery: ${gate.reason}`);
-                await ps.ensurePipelineLabels(github, owner, repo, core);
-                await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
-                return;
-              }
-              await chain.maybeTriggerClaudeFinal(
-                github, owner, repo, prNumber,
-                mergeGate.FINAL_CLAUDE_REVIEW_BODY, core,
-                { skipCopilot: true, optionalWaitMs: 0, prCreatedAt: pr.created_at }
-              );
-            } else if (!hasFinal) {
-              await chain.maybeTriggerClaudeFinal(
-                github, owner, repo, prNumber,
-                mergeGate.FINAL_CLAUDE_REVIEW_BODY, core,
-                { skipCopilot: true, optionalWaitMs: 0, prCreatedAt: pr.created_at }
-              );
-            }
-            await ps.ensurePipelineLabels(github, owner, repo, core);
-            await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
-
-  stale-final-recovery:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Re-post stale or missing FINAL @claude
+      - name: Sync pipeline labels and dispatch merge gate when ready
         uses: actions/github-script@v7
         env:
           PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ env.GH_TOKEN }}
           script: |
             const path = require('path');
-            const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review-chain.js'));
-            const review = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review.js'));
             const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
             const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const manual = (process.env.PR_NUMBER_INPUT || '').trim();
 
+            async function maybeDispatch(prNumber) {
+              const check = await mergeGate.evaluatePipelineQuiescent(
+                github, owner, repo, prNumber, core
+              );
+              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+              if (!check.ready) {
+                core.info(`PR #${prNumber} not merge-ready: ${check.reasons.join(', ')}`);
+                return;
+              }
+              await github.rest.repos.createDispatchEvent({
+                owner,
+                repo,
+                event_type: 'claude-merge-gate',
+                client_payload: { pr_number: prNumber },
+              });
+              core.info(`Dispatched merge gate for PR #${prNumber}`);
+            }
+
             if (manual) {
               const prNumber = parseInt(manual, 10);
               if (Number.isNaN(prNumber)) throw new Error(`Invalid pr_number: ${manual}`);
-              await review.postFinalClaudeReviewIfNeeded(github, owner, repo, prNumber, core, { force: true });
-              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
+              await ps.ensurePipelineLabels(github, owner, repo, core);
+              await maybeDispatch(prNumber);
               return;
             }
 
-            const { data: prs } = await github.rest.pulls.list({ owner, repo, state: 'open', per_page: 100 });
-            let posted = 0;
-            for (const pr of prs) {
-              if (pr.draft) continue;
-              const comments = await mergeGate.listAllComments(github, owner, repo, pr.number);
-              const headPushedAt = (await mergeGate.getHeadCommitDate(github, owner, repo, pr.number)) || pr.updated_at;
-              const hasFinal = mergeGate.hasFinalClaudeReviewTrigger(comments);
-              const isStale = mergeGate.isStaleFinalAfterPush(comments, headPushedAt);
-              if (hasFinal && !isStale) continue;
-              if (mergeGate.hasRecentClaudeTrigger(comments, 10)) continue;
-              if (await mergeGate.hasInProgressClaudeAssistant(github, owner, repo, pr.number)) continue;
-              if (hasFinal && isStale) {
-                const gate = mergeGate.shouldSkipStaleFinalRecovery(comments, headPushedAt);
-                if (gate.skip) {
-                  core.info(`PR #${pr.number}: skip stale — ${gate.reason}`);
-                  continue;
-                }
-                const result = await review.postFinalClaudeReviewIfNeeded(
-                  github, owner, repo, pr.number, core, { resyncOnly: true }
-                );
-                if (result.posted) posted += 1;
-                await ps.syncPipelineLabels(github, owner, repo, pr.number, core);
-                continue;
-              }
-              const result = await chain.maybeTriggerClaudeFinal(
-                github, owner, repo, pr.number,
-                mergeGate.FINAL_CLAUDE_REVIEW_BODY, core,
-                { skipCopilot: true, optionalWaitMs: 0, prCreatedAt: pr.created_at }
-              );
-              if (result.posted) posted += 1;
-              await ps.syncPipelineLabels(github, owner, repo, pr.number, core);
-            }
-            core.info(`Scheduled FINAL recovery complete (${posted} posted)`);
+            const prNumber =
+              context.payload.pull_request?.number ||
+              context.payload.issue?.number;
+            if (!prNumber) return;
+
+            await ps.ensurePipelineLabels(github, owner, repo, core);
+            await maybeDispatch(prNumber);
