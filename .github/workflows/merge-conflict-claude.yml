@@ -1,6 +1,6 @@
 name: Auto Merge Conflict → Claude
 
-# Detects internal PRs with mergeStateStatus=DIRTY and posts @claude to trigger claude.yml.
+# Detects DIRTY internal PRs and runs Claude in-band (no issue_comment → claude.yml chain).
 
 on:
   push:
@@ -8,30 +8,45 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Optional PR number (scan all open PRs if empty)'
+        required: false
+        type: string
   schedule:
     - cron: '45 * * * *'
 
-concurrency:
-  group: merge-conflict-scan-${{ github.repository }}
-  cancel-in-progress: true
-
 env:
-  # PAT posts as MervinPraison so issue_comment triggers claude.yml (GITHUB_TOKEN cannot chain workflows)
   GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+  MAX_CONFLICT_CANDIDATES: 2
+  DISPATCH_PR_NUMBER: ${{ github.event.inputs.pr_number || '' }}
 
 permissions:
-  pull-requests: write
-  issues: write
+  contents: read
+  pull-requests: read
+  issues: read
+  actions: read
 
 jobs:
-  detect-and-trigger:
+  scan-conflicts:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+      issues: write
+      actions: read
+    concurrency:
+      group: merge-conflict-scan-${{ github.repository }}
+      cancel-in-progress: true
+    outputs:
+      matrix: ${{ steps.scan.outputs.matrix }}
+      has_candidates: ${{ steps.scan.outputs.has_candidates }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Detect conflicting PRs and trigger Claude
+      - name: Scan DIRTY PRs for in-band Claude rebase
+        id: scan
         uses: actions/github-script@v7
         with:
           github-token: ${{ env.GH_TOKEN }}
@@ -44,16 +59,11 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const baseRepo = `${owner}/${repo}`;
-            const RETRY_COOLDOWN_MS = mergeGate.CONFLICT_PENDING_STALE_MS;
-            const AUTO_ACTORS = ['github-actions[bot]', 'MervinPraison'];
+            const maxCandidates = parseInt(process.env.MAX_CONFLICT_CANDIDATES || '2', 10);
+            const inputPr = String(process.env.DISPATCH_PR_NUMBER || '').trim();
             const LABEL = mergeGate.CONFLICT_PENDING_LABEL;
-            const COMMENT_BODY = [
-              '@claude this PR has merge conflicts with `main`.',
-              'Please rebase onto latest `main`, resolve conflicts (keep this PR\'s intent, merge in newer main logic),',
-              'run targeted tests, and force-push with `--force-with-lease`.',
-              'Comment which files you resolved.',
-              'Follow AGENTS.md: keep new pages in docs/features/, update docs.json, verify against synced SDK source.',
-            ].join(' ');
+            const RETRY_COOLDOWN_MS = mergeGate.CONFLICT_PENDING_STALE_MS;
+            const AUTO_ACTORS = mergeGate.AUTO_ACTORS;
 
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -65,7 +75,7 @@ jobs:
                       mergeStateStatus
                       maintainerCanModify
                       isDraft
-                      headRef { repository { nameWithOwner } }
+                      headRef { repository { nameWithOwner } name oid }
                     }
                   }
                 }
@@ -79,6 +89,8 @@ jobs:
                     status,
                     isDraft: prGql.isDraft,
                     headRepo: prGql.headRef?.repository?.nameWithOwner,
+                    headRef: prGql.headRef?.name,
+                    headSha: prGql.headRef?.oid,
                     maintainerCanModify: prGql.maintainerCanModify === true,
                   };
                 }
@@ -89,12 +101,10 @@ jobs:
                 status: (pr.data.mergeable_state || '').toUpperCase(),
                 isDraft: pr.data.draft,
                 headRepo: pr.data.head.repo?.full_name,
+                headRef: pr.data.head.ref,
+                headSha: pr.data.head.sha,
                 maintainerCanModify: pr.data.maintainer_can_modify === true,
               };
-            }
-
-            function hasFinalClaudeReviewTrigger(comments) {
-              return mergeGate.hasFinalClaudeReviewTrigger(comments);
             }
 
             function hasRecentAutoComment(comments) {
@@ -102,30 +112,27 @@ jobs:
               return comments.some((c) => {
                 if (!AUTO_ACTORS.includes(c.user.login)) return false;
                 const body = (c.body || '').toLowerCase();
-                if (!body.includes('@claude') || !body.includes('merge conflict')) return false;
+                if (!body.includes('merge conflict') && !body.includes('conflict rebase')) return false;
                 return new Date(c.created_at).getTime() > cutoff;
               });
             }
 
-            async function processPR(prNumber) {
-              const { status, isDraft, headRepo, maintainerCanModify } = await getMergeState(prNumber);
-              core.info(`PR #${prNumber}: mergeState=${status}, head=${headRepo}, draft=${isDraft}, maintainerCanModify=${maintainerCanModify}`);
+            async function evaluatePR(prNumber) {
+              const { status, isDraft, headRepo, headRef, headSha, maintainerCanModify } =
+                await getMergeState(prNumber);
+              core.info(
+                `PR #${prNumber}: mergeState=${status}, head=${headRepo}/${headRef}, draft=${isDraft}`
+              );
 
               const { data: issue } = await github.rest.issues.get({
-                owner,
-                repo,
-                issue_number: prNumber,
+                owner, repo, issue_number: prNumber,
               });
               let labels = issue.labels.map((l) => l.name);
 
               if (status !== 'DIRTY' && labels.includes(LABEL)) {
                 await github.rest.issues.removeLabel({
-                  owner,
-                  repo,
-                  issue_number: prNumber,
-                  name: LABEL,
+                  owner, repo, issue_number: prNumber, name: LABEL,
                 });
-                core.info(`Removed ${LABEL} from PR #${prNumber}`);
                 labels = labels.filter((l) => l !== LABEL);
               }
 
@@ -147,49 +154,192 @@ jobs:
               }
 
               if (hasRecentAutoComment(comments)) {
-                return { skipped: true, reason: 'recent auto comment' };
+                return { skipped: true, reason: 'recent auto rebase attempt' };
               }
-
-              if (!hasFinalClaudeReviewTrigger(comments)) {
+              if (!mergeGate.hasFinalClaudeReviewTrigger(comments)) {
                 return { skipped: true, reason: 'awaiting final claude review trigger' };
               }
+              if (await mergeGate.hasInProgressClaudeAssistant(github, owner, repo, prNumber)) {
+                return { skipped: true, reason: 'claude.yml in progress' };
+              }
 
-              await github.rest.issues.addLabels({
-                owner,
-                repo,
-                issue_number: prNumber,
-                labels: [LABEL],
-              });
+              if (!labels.includes(LABEL)) {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: prNumber, labels: [LABEL],
+                });
+              }
               await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: prNumber,
-                body: COMMENT_BODY,
+                owner, repo, issue_number: prNumber,
+                body: [
+                  'Automated merge-conflict rebase started (in-band Claude).',
+                  'Rebasing onto latest `main`, resolving conflicts, force-pushing with `--force-with-lease`.',
+                ].join(' '),
               });
-              return { triggered: true };
+
+              return {
+                resolve: true,
+                pr_number: prNumber,
+                head_sha: headSha,
+                head_ref: headRef,
+              };
             }
 
             let prNumbers = [];
-            if (context.eventName === 'pull_request') {
+            if (inputPr) {
+              const n = parseInt(inputPr, 10);
+              if (Number.isNaN(n)) throw new Error(`Invalid pr_number: ${inputPr}`);
+              prNumbers = [n];
+            } else if (context.eventName === 'pull_request') {
               prNumbers = [context.payload.pull_request.number];
             } else {
               const prs = await github.paginate(github.rest.pulls.list, {
-                owner,
-                repo,
-                state: 'open',
-                per_page: 100,
+                owner, repo, state: 'open', per_page: 100, sort: 'created', direction: 'asc',
               });
               prNumbers = prs.map((p) => p.number);
             }
 
+            const candidates = [];
             const results = [];
             for (const num of prNumbers) {
               try {
-                results.push({ pr: num, ...(await processPR(num)) });
+                const outcome = await evaluatePR(num);
+                results.push({ pr: num, ...outcome });
+                if (outcome.resolve) {
+                  candidates.push({
+                    pr_number: outcome.pr_number,
+                    head_sha: outcome.head_sha,
+                    head_ref: outcome.head_ref,
+                  });
+                }
+                if (candidates.length >= maxCandidates) break;
               } catch (err) {
                 core.error(`PR #${num}: ${err.message}`);
                 results.push({ pr: num, error: err.message });
               }
             }
-            core.summary.addRaw('```json\n' + JSON.stringify(results, null, 2) + '\n```');
+
+            core.setOutput('matrix', JSON.stringify({ include: candidates }));
+            core.setOutput('has_candidates', candidates.length > 0 ? 'true' : 'false');
+            core.summary.addRaw('```json\n' + JSON.stringify({ candidates, results }, null, 2) + '\n```');
             await core.summary.write();
+
+  claude-rebase:
+    needs: scan-conflicts
+    if: needs.scan-conflicts.outputs.has_candidates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    concurrency:
+      group: merge-conflict-rebase-${{ github.repository }}-${{ matrix.pr_number }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.scan-conflicts.outputs.matrix) }}
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Fetch PR branch
+        env:
+          PR_NUMBER: ${{ matrix.pr_number }}
+          HEAD_REF: ${{ matrix.head_ref }}
+        run: |
+          git fetch origin "pull/${PR_NUMBER}/head:${HEAD_REF}"
+          git checkout "${HEAD_REF}"
+          git fetch origin main
+
+      - name: Resolve merge conflicts (in-band Claude)
+        id: rebase
+        continue-on-error: true
+        uses: ./.github/actions/claude-code-action
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+          CLAUDE_CODE_SUBAGENT_MODEL: inherit
+          ANTHROPIC_DEFAULT_SONNET_MODEL: claude-sonnet-4-6
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ env.GH_TOKEN }}
+          model: claude-sonnet-4-6
+          trigger_phrase: '@claude-conflict-rebase-internal'
+          direct_prompt: |
+            You are a documentation engineer for PraisonAIDocs PR #${{ matrix.pr_number }}.
+            Follow AGENTS.md strictly.
+
+            CONTEXT: branch ${{ matrix.head_ref }}, merge_state=DIRTY (conflicts with main).
+
+            STEP 0 — SETUP:
+            git config --global user.name "MervinPraison"
+            git config --global user.email "454862+MervinPraison@users.noreply.github.com"
+            gh auth setup-git
+
+            STEP 1 — RESOLVE MERGE CONFLICTS (mandatory):
+            - DO NOT create a new branch or PR
+            - git fetch origin main && git rebase origin/main
+            - Resolve conflicts: keep this PR's doc intent, merge in newer main logic
+            - For docs.json: combine nav entries from both sides; never leave conflict markers
+            - git add -A && git rebase --continue (repeat until done)
+            - git push --force-with-lease origin ${{ matrix.head_ref }}
+            - Verify docs.json is valid JSON and Mintlify paths exist
+            - Post a PR comment listing files resolved and noting "rebase complete"
+
+            FOLDER RULES:
+            - NEVER modify docs/concepts/ without explicit approval
+            - New pages belong in docs/features/
+          allowed_tools: |
+            Bash(git:*)
+            Bash(gh:*)
+            Bash(python:*)
+            View
+            GlobTool
+            GrepTool
+            Edit
+            Replace
+            mcp__github__get_issue
+            mcp__github__get_issue_comments
+            mcp__github__update_issue
+          timeout_minutes: 30
+
+      - name: Post-rebase pipeline sync and stale FINAL
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ env.GH_TOKEN }}
+          script: |
+            const path = require('path');
+            const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
+            const review = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pr-review.js'));
+            const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = ${{ matrix.pr_number }};
+            const rebaseOk = '${{ steps.rebase.outcome }}' === 'success';
+
+            const ctx = await mergeGate.loadPrContext(github, owner, repo, prNumber);
+            const status = (ctx.mergeState.status || '').toUpperCase();
+
+            if (status !== 'DIRTY' && ctx.labels.includes(mergeGate.CONFLICT_PENDING_LABEL)) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner, repo, issue_number: prNumber,
+                  name: mergeGate.CONFLICT_PENDING_LABEL,
+                });
+              } catch (err) {
+                if (err.status !== 404) core.warning(err.message);
+              }
+            }
+
+            if (rebaseOk && status !== 'DIRTY') {
+              await review.postFinalClaudeReviewIfNeeded(
+                github, owner, repo, prNumber, core, { resyncOnly: true }
+              );
+            } else if (!rebaseOk) {
+              core.warning(`PR #${prNumber}: in-band rebase step did not succeed`);
+            }
+
+            await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
