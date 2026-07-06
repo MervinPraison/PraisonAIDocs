@@ -9,12 +9,17 @@ Before you run your first `Agent(...)`, run `praisonai doctor --live` to make su
 ## Quick Start
 
 ```bash
-# Full setup report (multi-category — first-run / troubleshooting)
+# Run the full setup report (multi-category — first-run / troubleshooting)
 praisonai doctor
 
 # Fast env-only checks (CI-friendly)
-praisonai doctor --quick        # alias for `praisonai doctor env`
 praisonai doctor env
+# or the equivalent alias
+praisonai doctor --quick
+
+# Run checks for a specific category
+praisonai doctor config
+praisonai doctor tools
 
 # Output in JSON format
 praisonai doctor --json
@@ -74,6 +79,7 @@ All existing subcommands (`env`, `mcp`, `runtime`, etc.) are unchanged, and the 
 | `llm-providers` | Check LLM providers configuration |
 | `memory-store` | Check memory store backends |
 | `metadata-store` | Check metadata store configuration |
+| `fix` | Safe auto-remediation for common setup issues (dry-run by default). Phase-1 scope: migrate deprecated `cli_backend` YAML. |
 | `runtime` | Runtime preflight for team YAML (`--team`) and migrate legacy `cli_backend` settings (`--fix`) |
 | `fix` | Safe auto-remediation for common setup issues (dry-run by default). Currently migrates deprecated `cli_backend` YAML. |
 
@@ -81,6 +87,8 @@ All existing subcommands (`env`, `mcp`, `runtime`, etc.) are unchanged, and the 
 
 | Flag | Description |
 |------|-------------|
+| `--quick` | Fast env-only checks (alias for `doctor env`). |
+| `--live` | Include live provider pings (validates keys, not just presence). |
 | `--json` | Output in JSON format |
 | `--format text\|json` | Output format (default: text) |
 | `--output PATH` | Write report to file |
@@ -110,6 +118,95 @@ All existing subcommands (`env`, `mcp`, `runtime`, etc.) are unchanged, and the 
 | 1 | One or more checks failed |
 | 2 | Timeout |
 | 3 | Internal error |
+
+## Full Setup Report
+
+Running `praisonai doctor` without a subcommand runs a comprehensive report combining environment, config, tools, and provider checks for first-run and operator troubleshooting.
+
+```bash
+# Full setup report
+praisonai doctor
+
+# Include live provider pings
+praisonai doctor --live
+
+# Machine-readable output
+praisonai doctor --json
+
+# Treat warnings as failures (useful for strict operator checks)
+praisonai doctor --strict
+```
+
+When warnings or failures are found, a "Next steps:" footer lists numbered remediations:
+
+```
+─────────────────────────────
+Next steps:
+  1. ⚠ Optional Dependencies: Reinstall the broken optional package(s): chromadb (Knowledge/RAG features)
+  2. ✗ OpenAI API key: Set OPENAI_API_KEY in your environment or ~/.praisonai/.env
+```
+
+<Note>
+The "Next steps:" footer is only shown when there are warnings or failures, and is suppressed by `--quiet`.
+</Note>
+
+```mermaid
+graph TB
+    Start([praisonai doctor ...]) --> Q{Which situation?}
+    Q -->|First run / troubleshoot| Full["praisonai doctor<br/>(bare)"]
+    Q -->|CI / fast check| Fast["praisonai doctor env<br/>or --quick"]
+    Q -->|Auto-remediate issues| Fix["praisonai doctor fix"]
+    Q -->|Migrate team YAML| Runtime["praisonai doctor runtime"]
+
+    Full --> Report["Full setup report + Next steps footer"]
+    Fast --> EnvOnly["Env checks only — no side-effects"]
+    Fix --> Remediate["Dry-run proposed fixes — add --execute to apply"]
+    Runtime --> Migrate["Runtime YAML validation / cli_backend migration"]
+
+    classDef cmd fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef result fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decide fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef entry fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Start entry
+    class Q decide
+    class Full,Fast,Fix,Runtime cmd
+    class Report,EnvOnly,Remediate,Migrate result
+```
+
+## `doctor fix` Auto-Remediation
+
+`praisonai doctor fix` runs safe auto-remediation for common setup issues.
+
+```bash
+# Dry-run: list proposed changes without modifying anything (default)
+praisonai doctor fix
+
+# Apply safe fixes (creates .bak backup alongside the original file)
+praisonai doctor fix --execute
+
+# Apply without creating a backup
+praisonai doctor fix --execute --no-backup
+
+# Target a specific YAML file
+praisonai doctor fix --file agents.yaml
+
+# Minimal output
+praisonai doctor fix --quiet
+```
+
+<Warning>
+`--execute` modifies files on disk. A `.bak` backup is created alongside the original unless `--no-backup` is passed. Always review the dry-run output first.
+</Warning>
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dry-run / --execute` | `--dry-run` | Preview proposed changes vs. apply them |
+| `--no-backup` | `False` | Skip `.bak` backup when `--execute` is set |
+| `--file, -f TEXT` | auto-detect | Config file to target |
+| `--quiet, -q` | `False` | Minimal output |
+
+Phase-1 scope: migrate deprecated `cli_backend` YAML configuration to the new `models.default.runtime` format.
 
 ## Examples
 
@@ -444,6 +541,36 @@ graph LR
   "exit_code": 1
 }
 ```
+
+## Optional Dependencies
+
+`praisonai doctor` probes optional packages in parallel on daemon threads, one per package, with a per-package timeout.
+
+Packages probed:
+- `chromadb` — Knowledge/RAG features
+- `crawl4ai` — Web crawling
+- `duckduckgo_search` — Web search
+- `praisonaiagents` — Core agents
+- `litellm` — LLM providers
+- `openai` — OpenAI provider
+- `anthropic` — Anthropic provider
+- `mem0` — Memory features
+
+Each package falls into one of four outcome buckets:
+
+| Bucket | Status | Meaning |
+|--------|--------|--------|
+| `available` | PASS | Import succeeded |
+| `missing` | informational | `ImportError` raised — not installed |
+| `broken` | **WARN** | Other exception during import (e.g. broken C extension) — remediation: reinstall |
+| `slow` | informational | Thread still alive past deadline — daemon thread abandoned, never blocks CLI exit |
+
+When any package is `broken`, the check reports **WARN** with the remediation message:
+> *Reinstall the broken optional package(s): `{names}`*
+
+<Note>
+Daemon threads (rather than a ThreadPoolExecutor) are used deliberately: a pool's worker threads are joined by its internal atexit handler at interpreter shutdown even after `shutdown(wait=False)`, so a truly hanging import would still stall CLI exit. Daemon threads are abandoned on exit, so a hanging import can never block the process from terminating.
+</Note>
 
 ## Check Categories
 
