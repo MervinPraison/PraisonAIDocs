@@ -278,4 +278,9 @@ assert(
 assert('merge gate job name matches PR', mg.mergeGateJobTargetsPr('claude-assess (1460, abc123)', 1460));
 assert('merge gate job name rejects other PR', !mg.mergeGateJobTargetsPr('claude-assess (1461, abc123)', 1460));
 
+assert('ignores removed claude-final-on-sync failure', mg.isIgnorableStaleCheckRun('claude-final-on-sync', 'failure'));
+assert('ignores removed detect-and-trigger cancelled', mg.isIgnorableStaleCheckRun('detect-and-trigger', 'cancelled'));
+assert('does not ignore mintlify failure', !mg.isIgnorableStaleCheckRun('Mintlify Deployment', 'failure'));
+assert('does not ignore removed job success', !mg.isIgnorableStaleCheckRun('claude-final-on-sync', 'success'));
+
 process.exit(failed ? 1 : 0);

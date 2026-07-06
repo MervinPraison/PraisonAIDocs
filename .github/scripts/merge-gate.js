@@ -361,6 +361,23 @@ async function getMergeState(github, owner, repo, prNumber) {
   };
 }
 
+const REMOVED_AUTO_PR_COMMENT_CHECKS = new Set([
+  'detect-and-trigger',
+  'claude-final-on-sync',
+  'claude-after-prior-reviewers',
+  'stale-final-recovery',
+  'claude-after-gemini',
+  'claude-after-copilot',
+  'claude-after-copilot-qodo',
+  'copilot-after-coderabbit',
+  'copilot-after-qodo',
+]);
+
+function isIgnorableStaleCheckRun(name, conclusion) {
+  if (!REMOVED_AUTO_PR_COMMENT_CHECKS.has(name || '')) return false;
+  return ['failure', 'cancelled', 'timed_out', 'action_required'].includes(conclusion || '');
+}
+
 async function allChecksGreenOnSha(github, owner, repo, sha, core, options = {}) {
   const mergeStateStatus = (options.mergeStateStatus || '').toUpperCase();
   const ignoreWhenClean = new Set(['detect-and-trigger']);
@@ -382,6 +399,10 @@ async function allChecksGreenOnSha(github, owner, repo, sha, core, options = {})
     }
     const ok = ['success', 'neutral', 'skipped'].includes(run.conclusion);
     if (!ok) {
+      if (isIgnorableStaleCheckRun(run.name, run.conclusion)) {
+        core?.info?.(`Ignoring removed workflow check: ${run.name} (${run.conclusion})`);
+        continue;
+      }
       if (mergeStateStatus === 'CLEAN' && ignoreWhenClean.has(run.name || '')) {
         core?.info?.(`Ignoring stale failed check on CLEAN PR: ${run.name}`);
         continue;
@@ -963,6 +984,8 @@ module.exports = {
   finalClaudeCompletedOnSha,
   getMergeState,
   allChecksGreenOnSha,
+  isIgnorableStaleCheckRun,
+  REMOVED_AUTO_PR_COMMENT_CHECKS,
   hasInProgressClaudeAssistant,
   claudeRunBlocksPr,
   hasBlockingClaudeRunForPr,
