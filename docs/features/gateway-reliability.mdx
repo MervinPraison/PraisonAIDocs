@@ -9,57 +9,63 @@ icon: "shield-check"
 The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` still works exactly as documented here; for a standalone install see [praisonai-bot Migration](/docs/guides/praisonai-bot-migration).
 </Note>
 
+<Note>This page covers the **gateway reliability preset** (drain + admission). For task/workflow retry (retry jitter, `workflow_timeout`, `fail_on_callback_error`), see [Reliability](/docs/features/reliability).</Note>
 
-One line makes your gateway production-grade — `reliability="production"` composes graceful drain and admission control automatically.
+One parameter composing graceful drain and inbound admission control into a production-ready configuration — without touching individual knobs.
 
 ```python
 from praisonaiagents import Agent
 from praisonai.bots import BotOS
 
-agent = Agent(name="SupportBot", instructions="Help users with support questions.")
-bots = BotOS(agent=agent, platforms=["telegram", "discord"], reliability="production")
-bots.run()
+BotOS(
+    agent=Agent(name="SupportBot", instructions="Help users with support questions."),
+    platforms=["telegram", "discord"],
+    reliability="production",
+)
 ```
-
-The user sends messages during partial failures; reliability settings retry delivery and keep sessions consistent.
 
 ```mermaid
 graph LR
-    subgraph "Reliability Preset Composer"
-        P[🛡️ reliability=production] --> D[⏱️ drain_timeout: 15s]
-        P --> M[🔢 max_concurrent_runs: CPU × 4]
-        P --> Q[📋 queue_depth: 32]
-        P --> O[🔄 overflow_policy: queue]
+    subgraph "Reliability Preset"
+        P[production] --> D1[15s drain]
+        P --> A1[CPU-scaled admission]
+        P --> Q1[bounded queue 32]
+        D[default] --> D2[5s drain]
+        O[off] --> D3[0s drain]
     end
-
-    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
-
-    class P config
-    class D,M,Q,O output
+    classDef prod fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef def fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef off_ fill:#8B0000,stroke:#7C90A0,color:#fff
+    class P,D1,A1,Q1 prod
+    class D,D2 def
+    class O,D3 off_
 ```
 
 ## Quick Start
 
 <Steps>
 
-<Step title="Enable production preset">
+<Step title="Python (BotOS)">
+
 ```python
 from praisonaiagents import Agent
 from praisonai.bots import BotOS
 
-agent = Agent(name="SupportBot", instructions="Help users.")
-bots = BotOS(agent=agent, platforms=["telegram"], reliability="production")
-bots.run()
+BotOS(
+    agent=Agent(name="SupportBot", instructions="Help users."),
+    platforms=["telegram", "discord"],
+    reliability="production",
+).run()
 ```
 </Step>
 
 <Step title="Override specific knobs">
+
 Explicit args always beat the preset — useful for canary deployments:
 
 ```python
-bots = BotOS(
-    agent=agent,
+BotOS(
+    agent=Agent(name="SupportBot", instructions="Help users."),
     platforms=["telegram"],
     reliability="production",
     drain_timeout=30,          # override: 30s instead of preset 15s
@@ -67,19 +73,21 @@ bots = BotOS(
 ```
 </Step>
 
-<Step title="Configure via YAML">
+<Step title="YAML (gateway.yaml)">
+
 ```yaml
-# gateway.yaml
 reliability: production
+# or nested under gateway:
+gateway:
+  reliability: production
+  max_concurrent_runs: 8   # explicit override still respected
+```
+</Step>
 
-agents:
-  support:
-    instructions: "Help users."
-    model: gpt-4o-mini
+<Step title="CLI">
 
-channels:
-  telegram:
-    token: "${TELEGRAM_BOT_TOKEN}"
+```bash
+praisonai gateway start --config gateway.yaml --reliability production
 ```
 </Step>
 
@@ -87,117 +95,74 @@ channels:
 
 ---
 
-## Profile Comparison
+## Profiles
 
 | Profile | `drain_timeout` | `max_concurrent_runs` | `overflow_policy` | When to use |
 |---------|----------------|-----------------------|-------------------|-------------|
-| `production` | 15 s | CPU × 4 (min 4, max 32) | `queue` (depth 32) | Production / staging |
-| `default` / `None` | 5 s | unset | `reject` | Local dev with graceful restart |
-| `off` | 0 s | unset | `reject` | Legacy immediate-teardown behaviour |
+| `"production"` | 15 s | CPU-scaled: `max(4, min(32, cpus × 4))` | `queue` (depth 32) | Production / staging / rolling deploys |
+| `"default"` / `None` | 5 s | unset (unbounded) | `reject` | Local dev with graceful restart |
+| `"off"` | 0 s | unset | `reject` | Legacy immediate-teardown / unit tests |
 
 <Note>
-`max_concurrent_runs` is calculated as `os.cpu_count() * 4`, clamped to the range [4, 32]. On a 4-core machine that's 16 concurrent turns; on an 8-core machine, 32.
+`max_concurrent_runs` is calculated as `os.cpu_count() * 4`, clamped to the range [4, 32]. On a 4-core machine that's 16 concurrent turns; on an 8-core machine, 32. Unknown profile names fail fast with `ValueError`.
 </Note>
 
 ---
 
-## Three Configuration Surfaces
+## What Each Knob Does
 
-<Tabs>
-<Tab title="Python">
+```mermaid
+sequenceDiagram
+    participant C as Inbound Turn
+    participant G as Admission Gate
+    participant A as Agent Runner
+    participant S as Shutdown
+
+    C->>G: arrives
+    G->>G: check concurrent ceiling (production: CPU-scaled)
+    alt under ceiling
+        G->>A: dispatch immediately
+    else at ceiling, queue_depth > 0
+        G->>G: wait in bounded queue (max 32)
+        G->>A: dispatch when slot opens
+    else queue full
+        G-->>C: reject (503-equivalent)
+    end
+    S->>A: drain(15s) — wait for in-flight turns
+    A-->>S: turns finish
+```
+
+**Graceful drain** — on `BotOS.stop()`, the gateway quiesces ingress and waits for in-flight agent turns to finish before cancelling tasks. The drain window is the maximum time to wait.
+
+**Inbound admission control** — caps the number of concurrent agent runs across all channels. Excess turns either queue (bounded fair wait) or are rejected immediately, depending on the `overflow_policy`.
+
+---
+
+## Precedence Ladder
+
+Explicit constructor fields always win over the preset. Only fields left unset are filled by the preset.
+
+```
+CLI flag
+  > constructor arg (drain_timeout=, max_concurrent_runs=, admission_policy=)
+  > gateway.reliability YAML key
+  > top-level reliability: YAML key
+  > preset default
+```
+
+Example — preset sets drain to 15s, but explicit override wins:
+
+
 ```python
 from praisonaiagents import Agent
 from praisonai.bots import BotOS
 
-agent = Agent(name="SupportBot", instructions="Help users.")
-
-bots = BotOS(
-    agent=agent,
-    platforms=["telegram", "discord"],
-    reliability="production",
-)
-bots.run()
-```
-</Tab>
-
-<Tab title="YAML">
-Top-level `reliability:` field:
-
-```yaml
-# gateway.yaml
-reliability: production
-
-agents:
-  support:
-    instructions: "You are a support agent."
-    model: gpt-4o-mini
-
-channels:
-  telegram:
-    token: "${TELEGRAM_BOT_TOKEN}"
-  discord:
-    token: "${DISCORD_BOT_TOKEN}"
-```
-
-Alternatively, nest under `gateway:`:
-
-```yaml
-gateway:
-  reliability: production
-  drain_timeout: 30   # explicit override — beats the preset
-```
-</Tab>
-
-<Tab title="CLI">
-```bash
-praisonai gateway start --config gateway.yaml --reliability production
-```
-
-The `--reliability` flag overrides `reliability:` from YAML but is itself overridden by explicit `--drain-timeout` / `--max-concurrent-runs`.
-</Tab>
-</Tabs>
-
----
-
-## Precedence Rules
-
-Explicit constructor / CLI args always win over the preset. The preset only fills in fields left unset.
-
-```python
-bots = BotOS(
-    agent=agent,
+BotOS(
+    agent=Agent(name="SupportBot", instructions="Help users."),
     platforms=["telegram"],
-    reliability="production",   # preset: 15s drain, CPU-scaled ceiling, queue
-    drain_timeout=30,           # explicit → 30s wins; other preset values stay
+    reliability="production",
+    drain_timeout=30.0,  # 30s wins over preset's 15s
 )
-```
-
-Order (highest wins):
-
-1. Explicit Python arg / CLI flag (`drain_timeout=`, `--drain-timeout`)
-2. `reliability=` preset
-3. Framework defaults (immediate cancel, unbounded dispatch)
-
----
-
-## User Interaction Flow
-
-When `reliability="production"` is set, the gateway stops admitting new turns on SIGTERM, then waits up to 15 s for in-flight turns to finish. Inbound bursts during the window are queued (up to 32 deep) rather than rejected.
-
-```mermaid
-sequenceDiagram
-    participant Op as Operator
-    participant GW as Gateway
-    participant User as Inbound User
-    participant Turn as In-flight Turn
-
-    Op->>GW: SIGTERM
-    GW->>GW: Stop admitting new turns
-    User->>GW: New message
-    GW->>GW: Enqueue (up to depth 32)
-    GW->>Turn: Wait for completion (≤ 15 s)
-    Turn-->>GW: Done
-    GW-->>Op: Clean exit
 ```
 
 ---
@@ -223,6 +188,15 @@ graph TB
 
 ---
 
+## What It Does NOT Change
+
+These are already default-on regardless of the reliability preset:
+
+- Durable inbound journal (session level)
+- Durable outbound outbox
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
@@ -231,12 +205,23 @@ graph TB
 The preset values (15 s drain, CPU × 4 ceiling, 32-deep queue) are conservative defaults tuned for latency-bound LLM workloads. Only override a value after measuring that the default doesn't fit — e.g. a 99th-percentile turn time of 25 s warrants `drain_timeout=30`.
 </Accordion>
 
-<Accordion title="Explicit args always win — use them for canaries">
-A canary deployment can keep `reliability="production"` for sensible defaults while pinning `drain_timeout=5` to detect stragglers early. The explicit arg wins without needing a separate profile.
+<Accordion title="Use production for rolling deploys">
+
+`reliability="production"` ensures in-flight conversations finish before a new version takes over. Pair with a process manager that sends `SIGTERM` on deploy.
+</Accordion>
+
+<Accordion title="Keep default for development">
+
+`reliability="default"` (or `None`) gives you a 5-second drain so you don't cut conversations mid-turn during `Ctrl+C`, without the admission overhead of production mode.
 </Accordion>
 
 <Accordion title="Keep off for backward-compat regression testing only">
-`reliability="off"` restores the pre-reliability behaviour (immediate cancel on SIGTERM, unbounded concurrency). Use it only when you need to verify that old behaviour still works — never deploy `off` to production.
+`reliability="off"` restores the pre-reliability behaviour (immediate cancel on SIGTERM, unbounded concurrency). Use it only in tests — never deploy `off` to production.
+</Accordion>
+
+<Accordion title="Override individual knobs when needed">
+
+If the preset drain window or admission ceiling doesn't fit your load, pass `drain_timeout=` or `max_concurrent_runs=` directly — they always take precedence over the preset. See the [Graceful Drain](/docs/features/gateway-graceful-drain) and [Admission Control](/docs/features/gateway-admission-control) pages for the full knob reference.
 </Accordion>
 
 </AccordionGroup>
@@ -246,16 +231,16 @@ A canary deployment can keep `reliability="production"` for sensible defaults wh
 ## Related
 
 <CardGroup cols={2}>
-  <Card title="Graceful Drain" icon="circle-stop" href="/docs/features/gateway-graceful-drain">
-    Drain-only knob — when you want fine-grained drain control without the full preset
-  </Card>
-  <Card title="Admission Control" icon="shield-check" href="/docs/features/gateway-admission-control">
-    Concurrency ceiling and fair queue — the other half of the production preset
-  </Card>
-  <Card title="Config Reload" icon="arrows-rotate" href="/docs/features/gateway-config-reload">
-    Hot-reload gateway.yaml without dropping in-flight turns
-  </Card>
-  <Card title="Gateway" icon="tower-broadcast" href="/docs/features/gateway">
-    WebSocket control plane overview and full YAML reference
-  </Card>
+<Card title="Gateway Graceful Drain" icon="hourglass" href="/docs/features/gateway-graceful-drain">
+  Drain-only knob — fine-grained drain control without the full preset
+</Card>
+<Card title="Gateway Admission Control" icon="traffic-cone" href="/docs/features/gateway-admission-control">
+  Concurrency ceiling and fair queue — the other half of the production preset
+</Card>
+<Card title="Config Reload" icon="arrows-rotate" href="/docs/features/gateway-config-reload">
+  Hot-reload gateway.yaml without dropping in-flight turns
+</Card>
+<Card title="Reliability" icon="rotate-ccw" href="/docs/features/reliability">
+  Task/workflow retry jitter and failure policies
+</Card>
 </CardGroup>
