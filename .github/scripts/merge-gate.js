@@ -102,7 +102,12 @@ function isConflictRebaseTriggerComment(c) {
 
 function isConflictRebaseCompletionComment(c) {
   const login = (c.user?.login || '').toLowerCase();
-  if (!login.includes('praisonai-triage') && !login.includes('github-actions')) return false;
+  const fromAutomation =
+    login.includes('praisonai-triage') ||
+    login.includes('github-actions') ||
+    login === 'mervinpraison' ||
+    AUTO_ACTORS.includes(c.user?.login);
+  if (!fromAutomation) return false;
   const body = (c.body || '').toLowerCase();
   return (
     body.includes('rebase complete') ||
@@ -373,9 +378,20 @@ const REMOVED_AUTO_PR_COMMENT_CHECKS = new Set([
   'copilot-after-qodo',
 ]);
 
+/** Pipeline meta-jobs — cancelled/failed runs must not block doc merges. */
+const PIPELINE_INFRA_CHECKS = new Set([
+  'scan-conflicts',
+  'pipeline-sync',
+  'claude-rebase',
+  'bot-pr-trigger-reviews',
+]);
+
 function isIgnorableStaleCheckRun(name, conclusion) {
-  if (!REMOVED_AUTO_PR_COMMENT_CHECKS.has(name || '')) return false;
-  return ['failure', 'cancelled', 'timed_out', 'action_required'].includes(conclusion || '');
+  const bad = ['failure', 'cancelled', 'timed_out', 'action_required'].includes(conclusion || '');
+  if (!bad) return false;
+  if (REMOVED_AUTO_PR_COMMENT_CHECKS.has(name || '')) return true;
+  if (PIPELINE_INFRA_CHECKS.has(name || '')) return true;
+  return false;
 }
 
 async function allChecksGreenOnSha(github, owner, repo, sha, core, options = {}) {
@@ -986,6 +1002,7 @@ module.exports = {
   allChecksGreenOnSha,
   isIgnorableStaleCheckRun,
   REMOVED_AUTO_PR_COMMENT_CHECKS,
+  PIPELINE_INFRA_CHECKS,
   hasInProgressClaudeAssistant,
   claudeRunBlocksPr,
   hasBlockingClaudeRunForPr,
