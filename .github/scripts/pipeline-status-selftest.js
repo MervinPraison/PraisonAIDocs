@@ -73,4 +73,27 @@ assert(
   )
 );
 
+const now = Date.parse('2026-07-06T18:00:00Z');
+assert(
+  'skip conflict dispatch when scan in progress',
+  ps.shouldSkipConflictScanDispatch(
+    { id: 1, status: 'in_progress', created_at: '2026-07-06T17:45:00Z' },
+    now
+  )
+);
+assert(
+  'skip conflict dispatch when scan finished recently',
+  ps.shouldSkipConflictScanDispatch(
+    { id: 2, status: 'completed', created_at: '2026-07-06T17:50:00Z' },
+    now
+  )
+);
+assert(
+  'allow conflict dispatch when last run is stale',
+  !ps.shouldSkipConflictScanDispatch(
+    { id: 3, status: 'completed', created_at: '2026-07-06T17:00:00Z' },
+    now
+  )
+);
+
 process.exit(failed ? 1 : 0);
