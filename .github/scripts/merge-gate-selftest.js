@@ -228,6 +228,16 @@ assert('conflict blocks before rebase done', mg.hasRecentConflictComment([confli
 assert('conflict clears after rebase completion', !mg.hasRecentConflictComment(rebaseComments, headAfterRebase));
 assert('conflictRebaseQuiescent after completion', mg.conflictRebaseQuiescent(rebaseComments, headAfterRebase));
 
+const inBandRebaseDone = {
+  user: { login: 'MervinPraison' },
+  body: '## Rebase complete\n\nRebased onto origin/main',
+  created_at: conflictIso(-28 * 60 * 1000),
+};
+assert(
+  'in-band rebase complete from MervinPraison clears conflict',
+  !mg.hasRecentConflictComment([conflictTrigger, inBandRebaseDone], headAfterRebase)
+);
+
 // Tests heuristic (synced SDK copies in docs repo)
 assert('sdk without tests', mg.missingTestsReason([{ filename: 'praisonaiagents/a/b.py', additions: 3 }]) !== null);
 assert('sdk with tests ok', mg.missingTestsReason([
@@ -280,7 +290,9 @@ assert('merge gate job name rejects other PR', !mg.mergeGateJobTargetsPr('claude
 
 assert('ignores removed claude-final-on-sync failure', mg.isIgnorableStaleCheckRun('claude-final-on-sync', 'failure'));
 assert('ignores removed detect-and-trigger cancelled', mg.isIgnorableStaleCheckRun('detect-and-trigger', 'cancelled'));
-assert('does not ignore mintlify failure', !mg.isIgnorableStaleCheckRun('Mintlify Deployment', 'failure'));
 assert('does not ignore removed job success', !mg.isIgnorableStaleCheckRun('claude-final-on-sync', 'success'));
+assert('ignores cancelled scan-conflicts', mg.isIgnorableStaleCheckRun('scan-conflicts', 'cancelled'));
+assert('ignores failed pipeline-sync infra', mg.isIgnorableStaleCheckRun('pipeline-sync', 'failure'));
+assert('does not ignore mintlify failure', !mg.isIgnorableStaleCheckRun('Mintlify Deployment', 'failure'));
 
 process.exit(failed ? 1 : 0);
