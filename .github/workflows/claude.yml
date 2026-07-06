@@ -25,10 +25,18 @@ jobs:
       issues: write
       contents: read
     steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Triage and acknowledge issue
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const issue = context.payload.issue;
             const title = (issue.title || '').toLowerCase();
@@ -87,12 +95,27 @@ jobs:
                   '- Make sure you\'ve included steps to reproduce (for bugs)',
                   `- Check [existing issues](https://github.com/${context.repo.owner}/${context.repo.repo}/issues) for duplicates`,
                   '- Review the [documentation](https://praison.ai/docs) for related guides',
+                  '',
+                  '_A maintainer can trigger deeper analysis by commenting `@claude` on this issue._'
                 ].join('\n')
               });
             }
 
-            // Claude label: added by .github/workflows/auto-issue-comment.yml on issues:opened
-            // (do not add 'claude' here — avoids duplicate labeled events and double Claude runs)
+            // Owner/collaborator: add claude label via App token so issues:labeled triggers claude-response
+            if (isOwner) {
+              await github.rest.issues.addLabels({
+                issue_number: issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                labels: ['claude']
+              });
+              await github.rest.issues.createComment({
+                issue_number: issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: '🤖 Auto-triaging with Claude. Analysing issue and implementing a fix...\n\nClaude will:\n1. Read AGENTS.md and the SDK source\n2. Create or update documentation on a `claude/issue-*` branch\n3. Push and open a PR automatically (`Fixes #<issue>`)\n\nIf the PR is missing after Claude finishes, CI will open it within ~30 minutes.'
+              });
+            }
 
   # ================================================================
   # Job 2: Full Claude docs-fix
@@ -106,6 +129,8 @@ jobs:
       github.event.action != 'opened' &&
       (github.event_name != 'issues' || (github.event.action == 'labeled' && github.event.label.name == 'claude')) &&
       (github.event_name != 'issue_comment' || contains(github.event.comment.body, '@claude')) &&
+      (github.event_name != 'pull_request_review' || contains(github.event.review.body, '@claude')) &&
+      (github.event_name != 'pull_request_review_comment' || contains(github.event.comment.body, '@claude')) &&
       (
         !contains(github.actor, '[bot]') ||
         github.actor == 'github-actions[bot]' ||
@@ -114,18 +139,30 @@ jobs:
       github.actor != 'dependabot[bot]' &&
       github.actor != 'cursor[bot]' &&
       github.actor != 'renovate[bot]'
+    concurrency:
+      group: claude-response-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
       issues: write
       actions: read
+      id-token: write
     steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Check PR context (fork / merge state)
         id: check_fork
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const isPR = context.eventName === 'pull_request'
               || context.eventName === 'pull_request_review'
@@ -188,7 +225,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          token: ${{ secrets.GH_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Fetch PR branch and setup remote
         if: steps.check_fork.outputs.is_pr == 'true'
@@ -211,12 +248,12 @@ jobs:
 
       - uses: anthropics/claude-code-action@beta
         env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_TOKEN: ${{ steps.check_fork.outputs.can_push_fork == 'true' && secrets.GH_TOKEN || steps.app-token.outputs.token }}
         with:
           allowed_bots: 'praisonai-triage-agent[bot]'
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.GH_TOKEN }}
-          model: claude-sonnet-4-6
+          github_token: ${{ steps.app-token.outputs.token }}
+          model: claude-opus-4-8
           trigger_phrase: "@claude"
           label_trigger: "claude"
 
@@ -225,7 +262,7 @@ jobs:
             Follow AGENTS.md strictly — it contains the exact page structure, Mintlify components,
             Mermaid diagram standards, and code example rules you MUST follow.
 
-            ${{ steps.check_fork.outputs.is_fork == 'true' && steps.check_fork.outputs.can_push_fork != 'true' && 'CRITICAL: THIS IS A PULL REQUEST FROM A FORK WITHOUT MAINTAINER EDITS. YOU DO NOT HAVE PUSH PERMISSIONS. ONLY READ FILES, VALIDATE DOCS, AND PROVIDE COMMENTS ON THIS PR. DO NOT ATTEMPT TO PUSH OR CREATE PULL REQUESTS.\n\n' || (steps.check_fork.outputs.can_push_fork == 'true' && format('NOTE: Fork PR with maintainer edits allowed. Push directly to fork {0} branch {1}.\n\n', steps.check_fork.outputs.fork_repo, steps.check_fork.outputs.pr_branch) || (steps.check_fork.outputs.is_pr == 'true' && steps.check_fork.outputs.is_fork != 'true' && 'NOTE: The branch is under MervinPraison/PraisonAIDocs (not a fork). You are able to make modifications and push directly to this branch.\n\n' || '')) }}
+            ${{ steps.check_fork.outputs.is_fork == 'true' && steps.check_fork.outputs.can_push_fork != 'true' && 'CRITICAL: THIS IS A PULL REQUEST FROM A FORK WITHOUT MAINTAINER EDITS. YOU DO NOT HAVE PUSH PERMISSIONS. ONLY READ FILES, VALIDATE DOCS, AND PROVIDE COMMENTS ON THIS PR. DO NOT ATTEMPT TO PUSH OR CREATE PULL REQUESTS.\n\n' || (steps.check_fork.outputs.can_push_fork == 'true' && format('NOTE: Fork PR with maintainer edits allowed. Push directly to fork {0} branch {1}.\n\n', steps.check_fork.outputs.fork_repo, steps.check_fork.outputs.pr_branch) || (steps.check_fork.outputs.is_pr == 'true' && steps.check_fork.outputs.is_fork != 'true' && 'NOTE: The branch is under MervinPraison/PraisonAIDocs (not a fork). You are able to make modifications and push directly to this branch.\n\n' || (steps.check_fork.outputs.is_pr != 'true' && 'NOTE: This is an issue (not a PR). Create a new fix branch per STEP 4 below.\n\n' || ''))) }}
             ${{ steps.check_fork.outputs.is_pr == 'true' && format('CONTEXT: PR #{0} on branch {1}. head.repo={2}, is_fork={3}, can_push_fork={4}, merge_state={5}.\n\n', steps.check_fork.outputs.pr_number, steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.head_repo, steps.check_fork.outputs.is_fork, steps.check_fork.outputs.can_push_fork, steps.check_fork.outputs.merge_state) || '' }}
 
             STEP 0 — SETUP GIT IDENTITY & AUTH:
@@ -250,33 +287,33 @@ jobs:
             - Update docs.json to add new pages under the "Features" group, NOT "Concepts"
             - Existing docs/concepts/ pages must NOT be touched without explicit human approval
 
-            ${{ steps.check_fork.outputs.is_pr == 'true' && (steps.check_fork.outputs.is_fork != 'true' || steps.check_fork.outputs.can_push_fork == 'true') && steps.check_fork.outputs.merge_state == 'DIRTY' && format('STEP 2 — RESOLVE MERGE CONFLICTS ON PR (branch: {0}, PR #{1}{2}):\n- DO NOT create a new branch or PR\n- git fetch origin main && git rebase origin/main\n- Resolve conflicts: keep this PR\'s doc intent, merge in newer main logic\n- For docs.json: combine nav entries from both sides; never leave conflict markers\n- git add -A && git rebase --continue (repeat until done)\n- git push --force-with-lease origin {0}\n- Verify docs.json is valid JSON and Mintlify paths exist\n- Comment which files you resolved\n', steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.pr_number, steps.check_fork.outputs.can_push_fork == 'true' && format(', fork: {0}', steps.check_fork.outputs.fork_repo) || '') || '' }}
+            ${{ steps.check_fork.outputs.is_pr == 'true' && (steps.check_fork.outputs.is_fork != 'true' || steps.check_fork.outputs.can_push_fork == 'true') && steps.check_fork.outputs.merge_state == 'DIRTY' && format('STEP 2 — RESOLVE MERGE CONFLICTS ON PR (branch: {0}, PR #{1}{2}):\n- DO NOT create a new branch or PR\n- git fetch origin main && git rebase origin/main\n- Resolve conflicts: keep this PR doc intent, merge in newer main logic\n- For docs.json: combine nav entries from both sides; never leave conflict markers\n- git add -A && git rebase --continue (repeat until done)\n- git push --force-with-lease origin {0}\n- Verify docs.json is valid JSON and Mintlify paths exist\n- Comment which files you resolved\n', steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.pr_number, steps.check_fork.outputs.can_push_fork == 'true' && format(', fork: {0}', steps.check_fork.outputs.fork_repo) || '') || '' }}
             ${{ steps.check_fork.outputs.is_pr == 'true' && (steps.check_fork.outputs.is_fork != 'true' || steps.check_fork.outputs.can_push_fork == 'true') && steps.check_fork.outputs.merge_state != 'DIRTY' && format('STEP 2 — IMPLEMENT ON EXISTING PR (branch: {0}, PR #{1}{2}):\n- DO NOT create a new branch or PR\n- git checkout {0}\n- SCOPE: docs/, docs.json, mint.json only — documentation changes\n- Read ./praisonaiagents/ and ./praisonai/ synced source before editing\n- Apply reviewer feedback or fix valid doc issues from comments above\n- git add -A && git commit -m "docs: <description>"\n- git push origin {0}\n- Comment a summary of exact files modified and what you skipped\n', steps.check_fork.outputs.pr_branch, steps.check_fork.outputs.pr_number, steps.check_fork.outputs.can_push_fork == 'true' && format(', fork: {0}', steps.check_fork.outputs.fork_repo) || '') || '' }}
             ${{ steps.check_fork.outputs.is_pr != 'true' && 'STEP 2 — UNDERSTAND THE ISSUE:
             Read the issue title, body, and all comments carefully.
             Determine what documentation needs to be created or updated.
 
             STEP 3 — READ SDK SOURCE:
-            Read `./praisonaiagents/` and `./praisonai/` first (AGENTS.md §1.4). Extract signatures,
+            Read ./praisonaiagents/ and ./praisonai/ first (AGENTS.md section 1.4). Extract signatures,
             defaults, feature_configs.py, imports. If missing, clone: gh repo clone MervinPraison/PraisonAI /tmp/PraisonAI --depth=1
             NEVER guess — read the code.
 
             STEP 4 — BRANCH, IMPLEMENT, COMMIT, PUSH, OPEN PR (mandatory — do not defer):
-            - Set BRANCH once: BRANCH="claude/issue-${{ env.ISSUE_NUMBER_RESOLVED }}-$(date +%Y%m%d-%H%M)" then git checkout -b "$BRANCH"
+            - Set BRANCH once: BRANCH="claude/issue-$ISSUE_NUMBER-$(date +%Y%m%d-%H%M)" then git checkout -b "$BRANCH"
             - Place ALL new .mdx files in docs/features/ (NEVER docs/concepts/)
             - Follow the page structure template in AGENTS.md Section 2
             - Start every page with an agent-centric Quick Start example
             - Use Mintlify components (Steps, AccordionGroup, CardGroup, Tabs)
-            - Include Mermaid diagrams with the standard color scheme
+            - Include Mermaid diagrams with the standard colour scheme
             - All code examples must be copy-paste runnable with correct imports
             - If creating new pages, add them to docs.json in the correct section
             - Verify docs.json is valid JSON and all .mdx files exist
-            - git add -A && git commit -m "docs: <description> (fixes #${{ env.ISSUE_NUMBER_RESOLVED }})"
+            - git add -A && git commit -m "docs: <description> (fixes #$ISSUE_NUMBER)"
             - git push -u origin "$BRANCH"
             CRITICAL: Immediately after push, run exactly:
-            gh pr create --base main --head "$BRANCH" --title "docs: <title>" --body "Fixes #${{ env.ISSUE_NUMBER_RESOLVED }}"
-            Do NOT stop after push. Do NOT ask a human to open a PR. Do NOT finish until `gh pr create` returns a PR URL.
-            If `gh pr create` fails, read the error, fix (auth, duplicate PR, wrong head), and retry until it succeeds.
+            gh pr create --base main --head "$BRANCH" --title "docs: <title>" --body "Fixes #$ISSUE_NUMBER"
+            Do NOT stop after push. Do NOT ask a human to open a PR. Do NOT finish until gh pr create returns a PR URL.
+            If gh pr create fails, read the error, fix (auth, duplicate PR, wrong head), and retry until it succeeds.
             Reuse the same $BRANCH for any follow-up commits — never create a second branch with a new date.
 
             STEP 5 — FOLLOW-UP (only if reviewers request changes on the open PR):
