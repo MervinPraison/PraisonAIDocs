@@ -1,93 +1,78 @@
 ---
 title: "Workspace Boundary"
 sidebarTitle: "Workspace Boundary"
-description: "Gate shell/file access outside your workspace with the external_dir:* approval"
+description: "Gate shell and file access outside your project root with a distinct external_dir approval"
 icon: "shield-halved"
 ---
 
-Set a `workspace_root` and any tool call that reads, writes, or executes outside it needs approval — via a distinct `external_dir:*` target.
+Set a workspace root and any tool call touching a path outside it asks for extra approval — a single broad allow no longer lets the agent reach your whole machine.
 
 <Note>
 This feature is introduced in [PraisonAI PR #2575](https://github.com/MervinPraison/PraisonAI/pull/2575). The `workspace_root` parameter is set on `PermissionManager` directly. When `workspace_root=None` (the default), no boundary check runs and existing behaviour is unchanged.
 </Note>
 
-```python
-from praisonaiagents.permissions import PermissionManager
-
-manager = PermissionManager(workspace_root="./my-project")
-
-# Tool operating inside workspace — uses normal rules
-result = manager.check("write:./my-project/app.py")
-
-# Tool operating outside workspace — requires approval via external_dir:*
-result = manager.check("write:/etc/hosts")
-print(result.needs_approval)  # True — reason: "Out-of-workspace path requires approval"
-```
-
 ```mermaid
 graph LR
-    subgraph "Workspace Boundary Gate"
-        A[🤖 Agent] --> T[🛠️ Tool call]
-        T --> R{📁 Inside workspace_root?}
-        R -->|Yes| OK[✅ Normal rules apply]
-        R -->|No| EXT[🛡️ external_dir:*]
-        EXT -->|allow rule| OK
-        EXT -->|deny rule| NO[🚫 Blocked]
-        EXT -->|default| ASK[❓ Ask user]
+    subgraph "Workspace Boundary"
+        A[🤖 Agent] --> B[🔧 Tool Call]
+        B --> C{Path Check}
+        C -->|Inside workspace| D[✅ Allow]
+        C -->|Outside workspace| E[❓ external_dir: ask]
+        E -->|Rule: allow| F[✅ Pre-authorised]
+        E -->|Rule: deny| G[🚫 Blocked]
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef deny fill:#EF4444,stroke:#7C90A0,color:#fff
-    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef allow fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef block fill:#EF4444,stroke:#7C90A0,color:#fff
 
     class A agent
-    class T tool
-    class R,EXT gate
-    class OK ok
-    class NO deny
-    class ASK config
+    class B tool
+    class C check
+    class D,F allow
+    class E check
+    class G block
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="Enable the boundary gate">
+<Step title="Enable workspace boundary">
 
-Pass `workspace_root` to `PermissionManager` to activate the gate:
+Create a `PermissionManager` with `workspace_root` and the boundary gate activates automatically:
 
 ```python
 from praisonaiagents.permissions import PermissionManager
 
-manager = PermissionManager(workspace_root="./my-project")
+manager = PermissionManager(workspace_root="/path/to/project")
 
-# Paths inside ./my-project → normal rule flow
-# Paths outside → triggers external_dir:* gate (asks by default)
-result = manager.check("write:/tmp/debug.log")
-print(result.needs_approval)  # True
+result = manager.check("bash:cat /etc/passwd")
+print(result.needs_approval)  # True — /etc/passwd is outside workspace
+print(result.target)          # bash:cat /etc/passwd
 ```
+
+When the manager checks `cat /etc/passwd`, it returns `needs_approval=True` — even if a broad `bash:cat *` → allow rule is set.
 
 </Step>
 
-<Step title="Combine with explicit rules">
+<Step title="Pre-authorise an external directory">
 
-Pre-authorise a known external dir and lock everything else out:
+Add a rule to allow a specific external directory without prompting:
 
 ```python
-from praisonaiagents.permissions import PermissionManager
+from praisonaiagents.permissions import PermissionManager, PermissionRule, PermissionAction
 
-manager = PermissionManager(workspace_root="./my-project")
-manager.load_rules_from_config({
-    "external_dir:/tmp/agent-scratch/*": "allow",   # pre-authorise scratch space
-    "external_dir:*": "deny",                        # block all other external access
-    "bash:git *": "allow",                           # allow git inside workspace
-})
+manager = PermissionManager(workspace_root="/proj")
+manager.add_rule(PermissionRule(
+    pattern="external_dir:/data/*",
+    action=PermissionAction.ALLOW,
+    description="Allow shared data volume",
+))
 
-# /tmp/agent-scratch/output.txt → allowed (explicit allow rule)
-# /etc/hosts → denied (matches external_dir:* deny)
-# ./my-project/app.py → uses bash:git * rule (inside workspace)
+result = manager.check("bash:cat /data/input.csv")
+print(result.action)  # allow — pre-authorised
 ```
 
 </Step>
@@ -97,155 +82,165 @@ manager.load_rules_from_config({
 
 ## How It Works
 
-Each shell or file tool call passes through two checks when `workspace_root` is set:
-
 ```mermaid
 sequenceDiagram
+    participant User
     participant Agent
+    participant Tool
     participant PermissionManager
-    participant PathCheck as Path Boundary Check
-    participant RuleEngine as Rule Engine
+    participant CommandParser
+    participant path_safety
 
-    Agent->>PermissionManager: check("write:/etc/hosts")
-    PermissionManager->>PathCheck: is /etc/hosts inside workspace_root?
-    PathCheck-->>PermissionManager: No — outside workspace
-    PermissionManager->>RuleEngine: check flat rule for "write:/etc/hosts"
-    RuleEngine-->>PermissionManager: deny? → deny wins
-    alt Flat rule is deny
-        PermissionManager-->>Agent: DENY
-    else No deny rule
-        PermissionManager->>RuleEngine: check "external_dir:/etc/*"
-        RuleEngine-->>PermissionManager: allow / deny / no match
-        alt external_dir rule is allow
-            PermissionManager-->>Agent: honour flat rule decision
-        else external_dir rule is deny
-            PermissionManager-->>Agent: DENY
-        else no matching external_dir rule
-            PermissionManager-->>Agent: ASK ("Out-of-workspace path requires approval")
-        end
-    end
+    User->>Agent: Run task
+    Agent->>Tool: bash:cat /etc/passwd
+    Tool->>PermissionManager: check("bash:cat /etc/passwd")
+    PermissionManager->>CommandParser: parse_command("cat /etc/passwd")
+    CommandParser-->>PermissionManager: [ShellOp(cat, /etc/passwd)]
+    PermissionManager->>path_safety: is_within_root("/etc/passwd", "/proj")
+    path_safety-->>PermissionManager: False (outside workspace)
+    PermissionManager-->>Tool: ask (external_dir:/etc/*)
+    Tool-->>Agent: Approval required
+    Agent-->>User: Prompt for external_dir:/etc/*
 ```
 
-### Decision table
-
-| Situation | Result |
-|-----------|--------|
-| Path inside `workspace_root` | Normal rule flow (unchanged) |
-| `external_dir:` matches a **deny** rule | **Deny** |
-| Flat file-target matches a **deny** rule | **Deny** (deny still wins) |
-| `external_dir:` matches an **allow** rule | Honour the flat file-target's decision |
-| No `external_dir:` rule matches | **Ask** — reason: *"Out-of-workspace path requires approval"* |
-
-### What triggers the gate
-
-The boundary check fires for these tool targets when the resolved path escapes `workspace_root`:
-
-**File tools** — any target with these prefixes:
-
-```
-write:    write_file:    edit:    edit_file:    apply_patch:
-append:   append_file:   delete:  delete_file:
-```
-
-**Shell commands** — path-like arguments extracted from the command:
-
-- Absolute paths: `/etc/x`, `/tmp/out`
-- Home-relative: `~/config`
-- Relative with explicit prefix: `./sub/`, `../sibling/`
-- Env-prefixed: `$HOME/data`, `$TMPDIR/work`
-- Write redirects: `> /tmp/log`, `>> /var/log/app.log`, `&> /dev/null`
-- Joined-flag paths: `--config=/etc/app.conf`, `-o/tmp/out`
-
-Bare command names (e.g. `ls`, `rm`) are **not** boundary-checked — only path-like arguments are.
+| Step | Action |
+|---|---|
+| 1 | Tool call arrives as `bash:<cmd>` or file tool target |
+| 2 | `CommandParser` extracts path-like arguments from the command |
+| 3 | Each path is checked with `path_safety.is_within_root(path, workspace_root)` |
+| 4 | Out-of-workspace paths emit an `external_dir:<parent>/*` sub-target |
+| 5 | Sub-target evaluated — defaults to **ask** unless a rule pre-authorises or denies it |
 
 ---
 
-## Configuration Options
+## What Triggers the Gate
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `workspace_root` | `Optional[str]` | `None` | Root directory for the boundary gate. `None` disables boundary checking entirely. Paths are resolved to real, absolute, symlink-collapsed paths before comparison. |
+Any path that resolves outside `workspace_root` triggers an `external_dir:` approval request.
+
+| Path form | Example | Outcome |
+|---|---|---|
+| Absolute path | `/etc/hosts` | `external_dir:/etc/*` → ask |
+| Home-relative | `~/.bashrc` | `external_dir:<home>/*` → ask |
+| Explicit relative | `../../etc/passwd` | `external_dir:/etc/*` → ask |
+| Env-prefixed | `$HOME/.config/x` | `external_dir:<home>/*` → ask |
+| Bare traversal | `sub/../../etc/passwd` | `external_dir:/etc/*` → ask |
+| Joined flag value | `--config=/etc/x` | `external_dir:/etc/*` → ask |
+| Short-getopt attached | `curl -o/tmp/file` | `external_dir:/tmp/*` → ask |
+| Redirect write-target | `echo x > ~/.bashrc` | `external_dir:<home>/*` → ask |
+| External executable | `/tmp/tool.sh` | `external_dir:/tmp/*` → ask |
 
 <Note>
-When `workspace_root=None` (the default), the boundary gate is **off**. All existing rules behave exactly as before — no behaviour change for code that does not set `workspace_root`.
+Bare PATH-resolved command names like `ls`, `rm`, `cat` are **not** boundary-checked — only tokens that reference the filesystem by path. An executable named `/tmp/tool.sh` is checked; a bare `ls` is not.
 </Note>
-
-<Card title="PermissionManager API Reference" icon="code" href="/docs/features/permissions">
-  Full `PermissionManager` parameter reference
-</Card>
 
 ---
 
-## Common Patterns
+## Aggregation with Existing Rules
 
-### Pre-authorise a data directory
+The workspace boundary fits into the same deny→ask→allow aggregation as all other permission checks.
 
-Allow the agent to write to a known external scratch directory without prompting:
+| Rule state | Command touches external path | Outcome |
+|---|---|---|
+| `bash:cat *` → allow | `cat /etc/passwd` | **ask** (boundary gate fires) |
+| `external_dir:/data/*` → allow | `cat /data/x.csv` | allow (pre-authorised) |
+| `external_dir:*` → deny | `cat /etc/passwd` | deny (hard block) |
+| `bash:rm *` → deny | `rm -rf /etc/other` | deny (explicit deny wins first) |
 
-```python
-from praisonaiagents.permissions import PermissionManager
+**Deny always wins** — an explicit deny on `bash:rm *` or `external_dir:*` beats the boundary ask, and an explicit deny cannot be overridden by a boundary allow.
 
-manager = PermissionManager(workspace_root="./project")
-manager.load_rules_from_config({
-    "external_dir:/data/*": "allow",
-    "external_dir:/tmp/agent/*": "allow",
-})
+---
 
-# /data/output.csv → allowed
-# /tmp/agent/cache.json → allowed
-# /etc/hosts → asks user (no matching rule)
-```
+## Backward Compatibility
 
-### Lock down everything outside the workspace
-
-Deny all out-of-workspace access — no prompts, no exceptions:
+When `workspace_root` is `None` (the default), no boundary check runs and behaviour is 100% unchanged. Only opting in to `workspace_root` activates the gate — no existing code breaks.
 
 ```python
 from praisonaiagents.permissions import PermissionManager
 
-manager = PermissionManager(workspace_root="./project")
-manager.load_rules_from_config({
-    "external_dir:*": "deny",
-})
+# No workspace_root → old behaviour, no boundary check
+manager = PermissionManager()
 
-# Any path outside ./project → denied immediately
+# With workspace_root → boundary gate active
+manager_bounded = PermissionManager(workspace_root="/proj")
 ```
 
-### Deny wins over the boundary ask
+---
 
-A targeted `deny` rule blocks even when `external_dir:*` might otherwise ask:
+## Fail-Closed Behaviour
+
+<Warning>
+If `path_safety` cannot be imported, or if a path cannot be resolved (e.g. broken symlink, permission error), the boundary check **fails closed** — it emits an `external_dir:` → ask rather than silently allowing the operation. This is intentional and tested behaviour. Do not report it as a bug. If you see unexpected ask prompts in edge-case environments, check whether path resolution is failing.
+</Warning>
+
+---
+
+## Pre-Authorising External Directories
+
+<Tabs>
+<Tab title="CLI">
+
+```bash
+praisonai permissions allow "external_dir:/data/*" --description "Shared data volume"
+praisonai permissions deny "external_dir:*" --description "Block all external paths"
+```
+
+</Tab>
+<Tab title="YAML">
+
+```yaml
+# agents.yaml
+permissions:
+  "external_dir:/data/*": allow
+  "external_dir:*": deny
+  "read:*": allow
+  "bash:rm *": deny
+```
+
+</Tab>
+<Tab title="Python">
 
 ```python
-from praisonaiagents.permissions import PermissionManager
+from praisonaiagents.permissions import PermissionManager, PermissionRule, PermissionAction
 
-manager = PermissionManager(workspace_root="./project")
-manager.load_rules_from_config({
-    "bash:rm *": "deny",   # always deny rm, regardless of path
-})
-
-# bash:rm -rf /tmp/other → denied (flat deny rule wins over ask gate)
-# bash:rm ./project/tmp → denied (flat deny rule)
+manager = PermissionManager(workspace_root="/proj")
+manager.add_rule(PermissionRule(
+    pattern="external_dir:/data/*",
+    action=PermissionAction.ALLOW,
+    description="Allow shared data volume",
+))
+manager.add_rule(PermissionRule(
+    pattern="external_dir:*",
+    action=PermissionAction.DENY,
+    description="Block all other external paths",
+))
+manager.add_rule(PermissionRule(
+    pattern="read:*",
+    action=PermissionAction.ALLOW,
+))
 ```
+
+</Tab>
+</Tabs>
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Set workspace_root in production">
-Always set `workspace_root` when agents run with file or shell tools in production. Pair it with `external_dir:* -> deny` for defence-in-depth — this blocks unexpected external access rather than asking.
+<Accordion title="Set workspace_root to your project root in CI runners">
+Point `workspace_root` at your checked-out repository path. The agent can freely read and write within the project; anything outside requires explicit pre-authorisation.
 </Accordion>
 
-<Accordion title="Pre-authorise well-known directories">
-Instead of blocking everything, pre-authorise directories the agent legitimately needs: `~/.cache`, `/tmp/agent-scratch`, `/var/data/input`. Use specific `external_dir:/path/*` allow rules to grant access only where needed.
+<Accordion title="Pre-authorise shared data directories">
+If your workflow legitimately reads from `/data/` or `/shared/`, add `external_dir:/data/*` → allow. This is safer than using `--approve-all-tools` which bypasses the gate entirely.
 </Accordion>
 
-<Accordion title="Deny still wins">
-A targeted `deny` rule (e.g. `bash:rm *`) cannot be overridden by an `external_dir:*` allow rule. Deny always takes priority in the aggregation chain.
+<Accordion title="Combine with external_dir:* → deny for maximum safety">
+Set `external_dir:*` → deny to hard-block all out-of-workspace access. No ask prompt appears — the operation is immediately rejected. Use this in high-security CI pipelines.
 </Accordion>
 
-<Accordion title="Fail-closed on resolution errors">
-If path resolution raises an error (permission issue, broken symlink), the boundary check treats the path as external and emits the `external_dir:` gate (asks, or denies if a deny rule exists) rather than silently allowing. Watch the `praisonaiagents.permissions.manager` logger for `warning` and `error` messages.
+<Accordion title="Deny still wins over the boundary gate">
+A `bash:rm *` → deny rule fires before the boundary check. You can still hard-block destructive commands regardless of whether the path is inside or outside the workspace.
 </Accordion>
 </AccordionGroup>
 
@@ -254,16 +249,16 @@ If path resolution raises an error (permission issue, broken symlink), the bound
 ## Related
 
 <CardGroup cols={2}>
-<Card title="Permissions" icon="shield-halved" href="/docs/features/permissions">
-  Pattern-based permission rules and PermissionManager API
+<Card title="Permissions Module" icon="shield" href="/docs/features/permissions">
+  Programmatic PermissionManager API and configuration options
 </Card>
-<Card title="Command-Aware Permissions" icon="shield" href="/docs/features/command-aware-permissions">
-  How compound shell commands are decomposed for rule matching
+<Card title="Command-Aware Permissions" icon="shield-halved" href="/docs/features/command-aware-permissions">
+  How compound shell commands are decomposed and checked
 </Card>
-<Card title="Approval" icon="check" href="/docs/features/approval">
-  Interactive approval backends (Slack, console, webhook)
+<Card title="Declarative Permissions" icon="file-code" href="/docs/features/declarative-permissions">
+  YAML, CLI, and Python permission policies
 </Card>
-<Card title="Workspace" icon="folder-lock" href="/docs/features/workspace">
-  Agent-level file sandbox (workspace= on Agent)
+<Card title="Interactive Approval" icon="check" href="/docs/features/interactive-approval">
+  User-facing approval prompts and backends
 </Card>
 </CardGroup>
