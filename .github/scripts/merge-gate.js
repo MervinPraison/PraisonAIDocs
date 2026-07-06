@@ -805,32 +805,6 @@ async function listAllComments(github, owner, repo, issueNumber) {
   return data;
 }
 
-async function getHeadCommitDate(github, owner, repo, prNumber) {
-  try {
-    let commits;
-    if (typeof github.paginate === 'function') {
-      commits = await github.paginate(github.rest.pulls.listCommits, {
-        owner,
-        repo,
-        pull_number: prNumber,
-        per_page: 100,
-      });
-    } else {
-      const { data } = await github.rest.pulls.listCommits({
-        owner,
-        repo,
-        pull_number: prNumber,
-        per_page: 100,
-      });
-      commits = data;
-    }
-    const last = commits[commits.length - 1];
-    return last?.commit?.committer?.date || last?.commit?.author?.date || null;
-  } catch {
-    return null;
-  }
-}
-
 async function loadPrContext(github, owner, repo, prNumber) {
   const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
   const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: prNumber });
@@ -843,8 +817,6 @@ async function loadPrContext(github, owner, repo, prNumber) {
   });
   const mergeState = await getMergeState(github, owner, repo, prNumber);
   const headSha = mergeState.headSha || pr.head.sha;
-  const headCommitDate = await getHeadCommitDate(github, owner, repo, prNumber);
-  const headPushedAt = headCommitDate || pr.updated_at;
 
   return {
     pr,
@@ -853,7 +825,7 @@ async function loadPrContext(github, owner, repo, prNumber) {
     reviews,
     mergeState,
     headSha,
-    headPushedAt,
+    headPushedAt: pr.updated_at,
     labels: issue.labels.map((l) => l.name),
     baseRepo: `${owner}/${repo}`,
   };
@@ -954,6 +926,7 @@ async function selectMergeGateCandidates(github, owner, repo, prNumbers, maxCand
     const result = await evaluatePipelineQuiescent(github, owner, repo, num, core);
     if (result.ready) {
       readyList.push({ pr_number: num, head_sha: result.headSha });
+      if (readyList.length >= maxCandidates) break;
     } else {
       skipped.push({ pr: num, reasons: result.reasons });
     }
@@ -1028,7 +1001,6 @@ module.exports = {
   secretScanReasons,
   sdkTestChecksReason,
   listAllComments,
-  getHeadCommitDate,
   isStaleFinalAfterPush,
   needsStaleFinalRecovery,
   shouldSkipFinalRecovery,

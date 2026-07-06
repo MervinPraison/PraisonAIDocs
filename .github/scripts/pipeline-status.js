@@ -189,8 +189,33 @@ async function dispatchMergeGateForOldestReady(github, owner, repo, readyCandida
   return 0;
 }
 
+const CONFLICT_SCAN_DEBOUNCE_MS = 30 * 60 * 1000;
+const CONFLICT_SCAN_RECENT_DONE_MS = 15 * 60 * 1000;
+
+function shouldSkipConflictScanDispatch(latestRun, nowMs = Date.now()) {
+  if (!latestRun) return false;
+  const age = nowMs - new Date(latestRun.created_at).getTime();
+  if (age >= CONFLICT_SCAN_DEBOUNCE_MS) return false;
+  const active = ['in_progress', 'queued', 'waiting', 'pending'].includes(latestRun.status);
+  if (active) return true;
+  return latestRun.status === 'completed' && age < CONFLICT_SCAN_RECENT_DONE_MS;
+}
+
 async function dispatchMergeConflictScan(github, owner, repo, core) {
   try {
+    const { data } = await github.rest.actions.listWorkflowRuns({
+      owner,
+      repo,
+      workflow_id: 'merge-conflict-claude.yml',
+      per_page: 1,
+    });
+    const latest = data.workflow_runs?.[0];
+    if (shouldSkipConflictScanDispatch(latest)) {
+      core?.info?.(
+        `Skip conflict scan dispatch — recent run #${latest.id} (${latest.status})`
+      );
+      return false;
+    }
     await github.rest.actions.createWorkflowDispatch({
       owner,
       repo,
@@ -269,4 +294,6 @@ module.exports = {
   syncOpenPullRequests,
   dispatchMergeGateForOldestReady,
   dispatchMergeConflictScan,
+  shouldSkipConflictScanDispatch,
+  CONFLICT_SCAN_DEBOUNCE_MS,
 };
