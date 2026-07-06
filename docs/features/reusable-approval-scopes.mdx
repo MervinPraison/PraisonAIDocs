@@ -48,25 +48,49 @@ graph LR
 
 <Steps>
 
-<Step title="Programmatic approval with reusable scope">
+<Step title="Enable reusable scopes on your Agent">
+
+Add one line to opt in — approval fatigue drops immediately:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Shell Assistant",
+    instructions="Run git commands the user asks for",
+    tools=["shell"],
+    approval={"reusable_scope": True},
+)
+
+agent.start("Show me the status and then the last five commits")
+```
+
+The first time the agent runs `git status -s`, the user sees the prompt once. Every subsequent `git status <flags>` variant is auto-approved for the session.
+
+</Step>
+
+<Step title="Preview and store scopes programmatically">
+
+For advanced workflows — CLIs, approval UIs, or testing — call the `PermissionManager` API directly:
 
 ```python
 from praisonaiagents.permissions import PermissionManager
 
-manager = PermissionManager()
+mgr = PermissionManager()
 
-approval = manager.approve(
+suggested = mgr.suggest_scope_pattern("bash:git status -s")
+print(suggested)
+# => "bash:git status *"
+
+mgr.approve(
     target="bash:git status -s",
     approved=True,
     scope="always",
     reusable_scope=True,
 )
-
-print(approval.pattern)   # 'bash:git status *'
-print(approval.derived)   # True
 ```
 
-Future calls to `bash:git status`, `bash:git status --short`, or any `bash:git status …` variant are auto-approved without prompting.
+`suggest_scope_pattern()` lets you surface the derived pattern in your UI before committing it, so users can review what `always` will cover.
 
 </Step>
 
@@ -167,29 +191,46 @@ The stored `PersistentApproval` has `derived=True`, which enables a bare-prefix 
 |----------|----------|-------|---------|
 | Version control | `git`, `gh`, `hg`, `svn` | 2 | `git status -s` → `bash:git status *` |
 | Package managers | `npm`, `yarn`, `pnpm`, `pip`, `cargo`, `go`, `poetry`, `uv`, `make` | 2 | `npm run build` → `bash:npm run *` |
-| Containers | `docker`, `docker compose`, `kubectl`, `helm` | 2 | `docker compose up -d` → `bash:docker compose *` |
-| Python tooling | `python`, `python3`, `ruff` | 2 | `ruff check .` → `bash:ruff check *` |
+| Containers | `docker` | 2 | `docker pull ubuntu` → `bash:docker pull *` |
+| Containers | `docker compose` | 2 | `docker compose up -d` → `bash:docker compose *` |
+| Containers | `kubectl`, `helm` | 2 | `kubectl get pods` → `bash:kubectl get *` |
+| Python tooling | `python`, `python3` | 2 | `python -m pytest` → `bash:python -m *` |
+| Python tooling | `ruff` | 2 | `ruff check .` → `bash:ruff check *` |
 | Python tooling | `pytest` | 1 | `pytest tests/` → `bash:pytest *` |
 | System | `apt`, `apt-get`, `brew`, `systemctl` | 2 | `apt install pkg` → `bash:apt install *` |
 | Unknown / other | — | 1 (conservative) | `foo bar baz` → `bash:foo *` (only if there are trailing args) |
 
-Multi-word keys win over their base command: `docker compose` (arity 2) keeps `docker compose`, not just `docker`.
+<Note>
+Multi-word keys win over single-word keys. `docker compose` (a 2-word key, arity 2) takes precedence over `docker` (arity 2), so `docker compose up -d` derives `bash:docker compose *`. Commands not in the table default to arity 1 — only the first token is kept.
+</Note>
 
 ### Behaviour table
 
-| Input `target` | Output | Reason |
-|----------------|--------|--------|
-| `bash:git status` | `bash:git status *` | git arity 2, appends ` *` |
-| `bash:git status -s` | `bash:git status *` | same — trailing args replaced |
-| `bash:npm run build` | `bash:npm run *` | npm arity 2 |
-| `bash:docker compose up -d` | `bash:docker compose *` | multi-word key wins |
-| `bash:git` | `bash:git` | bare single-token → literal |
-| `bash:cd /tmp && rm -rf x` | `bash:cd /tmp && rm -rf x` | `&&` → literal |
-| `bash:echo $(rm x)` | `bash:echo $(rm x)` | command substitution → literal |
-| `bash:ls \| grep x` | `bash:ls \| grep x` | pipe → literal |
-| `bash:git status *` | `bash:git status *` | already contains glob → unchanged |
-| `read:/etc/hosts` | `read:/etc/hosts` | non-shell prefix → literal |
-| `shell:ls -la` | `shell:ls *` | `shell:` prefix also generalised |
+**Escape hatches — these always stay literal:**
+
+| Condition | Example target | Stored as |
+|-----------|---------------|-----------|
+| Non-shell target | `read:/etc/hosts` | `read:/etc/hosts` |
+| Already globbed | `bash:git status *` | `bash:git status *` |
+| Contains `&&`, `\|\|`, `\|`, `;`, `&` | `bash:cd /tmp && rm -rf x` | exact string |
+| Contains `$(`, backtick, `>`, `<`, newline | `bash:echo $(whoami)` | exact string |
+| Bare single token equals the full command | `bash:git` | `bash:git` |
+
+The bare-single-token rule is the most important: approving `bash:git` stays literal — it never automatically covers `bash:git push --force`.
+
+### Extend the arity table for your own tools
+
+Pass a custom `arity_map` to `derive_pattern()` to add commands not in the built-in table:
+
+```python
+from praisonaiagents.permissions import derive_pattern
+
+my_tools = {"mytool": 2, "mytool sub": 3}
+
+pattern = derive_pattern("bash:mytool sub action --flag", arity_map=my_tools)
+print(pattern)
+# => "bash:mytool sub action *"
+```
 
 ---
 
@@ -242,6 +283,53 @@ approval = manager.check("bash:cd /tmp && rm x")
 print(approval.pattern)  # 'bash:cd /tmp && rm x'  — literal, not generalised
 ```
 
+### Session vs Always scope
+
+```python
+from praisonaiagents.permissions import PermissionManager
+
+mgr = PermissionManager()
+
+mgr.approve(
+    target="bash:npm run build",
+    approved=True,
+    scope="session",
+    reusable_scope=True,
+)
+
+mgr.approve(
+    target="bash:git status -s",
+    approved=True,
+    scope="always",
+    reusable_scope=True,
+)
+```
+
+Use `session` for exploratory work and `always` only for commands you trust unconditionally across all future sessions.
+
+### Preview before storing
+
+```python
+from praisonaiagents.permissions import PermissionManager
+
+mgr = PermissionManager()
+
+targets = [
+    "bash:git log --oneline",
+    "bash:npm run test",
+    "bash:docker ps",
+]
+
+for t in targets:
+    print(f"{t!r}  →  {mgr.suggest_scope_pattern(t)!r}")
+```
+
+```
+'bash:git log --oneline'  →  'bash:git log *'
+'bash:npm run test'       →  'bash:npm run *'
+'bash:docker ps'          →  'bash:docker *'
+```
+
 **Preview and override before saving**
 
 ```python
@@ -273,6 +361,7 @@ pattern = derive_pattern("bash:mycli deploy prod", arity_map=custom_map)
 print(pattern)  # "bash:mycli deploy *"
 ```
 
+
 ---
 
 ## Best Practices
@@ -283,6 +372,30 @@ print(pattern)  # "bash:mycli deploy *"
 Routine VCS and build commands (`git status`, `npm run`, `pytest`) are the best candidates. They have stable subcommand prefixes and many trailing-arg variants.
 </Accordion>
 
+<Accordion title="Preview the scope before storing">
+
+Call `suggest_scope_pattern()` in your CLI or approval UI so users can see exactly what `always` will cover before confirming. A pattern like `bash:rm *` deserves a careful second look:
+
+```python
+from praisonaiagents.permissions import PermissionManager
+
+mgr = PermissionManager()
+pattern = mgr.suggest_scope_pattern("bash:rm -rf /tmp/build")
+print(f"This will auto-approve: {pattern}")
+```
+
+</Accordion>
+
+<Accordion title="Prefer session over always for reusable scopes">
+
+A bad derived pattern that uses `always` persists across all future sessions. Use `session` by default for reusable scopes — if the pattern turns out to be safe, upgrade it to `always` deliberately:
+
+```python
+mgr.approve(target="bash:git status -s", approved=True, scope="session", reusable_scope=True)
+```
+
+</Accordion>
+
 <Accordion title="Pass an explicit pattern= to override the suggestion">
 If `suggest_scope_pattern` returns a pattern that is broader or narrower than you want, override it with `pattern=`. The stored approval will have `derived=False`, keeping exact `fnmatch` semantics.
 </Accordion>
@@ -291,8 +404,28 @@ If `suggest_scope_pattern` returns a pattern that is broader or narrower than yo
 A `cd /tmp && rm x` approval covers only that exact string. If you want to reuse two operations independently, create two separate approvals — one for `cd` variants and one for `rm` variants.
 </Accordion>
 
-<Accordion title="Non-shell targets stay literal">
-`read:`, `write:`, and `write_file:` patterns are never derived. Use explicit globs for those, e.g. `pattern="read:/tmp/*"`.
+<Accordion title="Non-shell targets stay literal — that is intentional">
+
+Path approvals such as `read:/etc/hosts` or `write:/tmp/report.txt` must remain exact. File paths that look like prefixes (`read:/etc/`) would grant access to all files under `/etc/`, which is a security anti-pattern. The literal-only behaviour for non-shell targets is by design.
+
+</Accordion>
+
+<Accordion title="Extend ARITY for your own CLI tools">
+
+If your agent uses an internal tool (`mytool`) or a domain-specific CLI (`kubectl`), pass a custom `arity_map` to `derive_pattern()` so the prefix is derived correctly:
+
+```python
+from praisonaiagents.permissions import derive_pattern
+
+corp_tools = {
+    "deploy": 2,
+    "deploy rollback": 2,
+}
+
+pattern = derive_pattern("bash:deploy rollback service-a --dry-run", arity_map=corp_tools)
+# => "bash:deploy rollback *"
+```
+
 </Accordion>
 
 <Accordion title="Not a replacement for deny rules">
