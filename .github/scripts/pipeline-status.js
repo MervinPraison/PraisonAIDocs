@@ -301,6 +301,20 @@ async function syncOpenPullRequests(github, owner, repo, options, core) {
   const readyCandidates = [];
   let dirtyConflict = false;
   for (const pr of prs) {
+    if (pr.draft && (pr.head?.ref || '').startsWith('claude/') &&
+        pr.head?.repo?.full_name === `${owner}/${repo}`) {
+      try {
+        await github.rest.pulls.update({
+          owner, repo, pull_number: pr.number, draft: false,
+        });
+        pr.draft = false;
+        core?.info?.(`Promoted draft claude PR #${pr.number} to ready for review`);
+      } catch (err) {
+        core?.warning?.(`Could not promote draft PR #${pr.number}: ${err.message}`);
+      }
+    }
+  }
+  for (const pr of prs) {
     if (synced >= maxPrs) break;
     if (pr.draft) continue;
     if (pr.head?.repo?.full_name && pr.head.repo.full_name !== `${owner}/${repo}`) continue;
