@@ -1,0 +1,186 @@
+---
+title: "OpenAI Client Retries"
+sidebarTitle: "OpenAI Client Retries"
+description: "Turn on the OpenAI SDK's built-in Retry-After + backoff for the native client path"
+icon: "rotate"
+---
+
+OpenAI client retries turn on the OpenAI SDK's built-in retry engine so transient 429s and network blips on the native client path are retried automatically.
+
+```mermaid
+graph LR
+    subgraph "OpenAI Client Retries"
+        A[🤖 Agent] --> C[🧰 OpenAIClient]
+        C --> S{🌐 OpenAI API}
+        S -->|429 / 5xx / blip| R[⏳ Retry-After + backoff]
+        R --> S
+        S -->|200| OK[✅ Response]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class C,S proc
+    class R warn
+    class OK ok
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Turn it on with one env var (zero code change)">
+```python
+# export OPENAI_MAX_RETRIES=5
+
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Assistant",
+    instructions="You are a helpful assistant.",
+)
+agent.start("Summarise today's news.")
+# Transient 429s and network blips are now retried automatically.
+```
+
+The user runs an agent; transient rate limits and network blips retry automatically on the native OpenAI client path.
+</Step>
+
+<Step title="Pass max_retries through the client factory">
+```python
+from praisonaiagents.llm import get_openai_client
+
+client = get_openai_client(max_retries=5)
+```
+</Step>
+
+<Step title="Construct the client directly">
+```python
+from praisonaiagents.llm import OpenAIClient
+
+client = OpenAIClient(max_retries=5)
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+The value is forwarded into the underlying `openai` SDK, which honours `Retry-After` on 429s and applies exponential backoff for transient errors.
+
+```mermaid
+sequenceDiagram
+    participant App as Your code
+    participant Client as OpenAIClient
+    participant SDK as openai SDK
+    participant API as OpenAI API
+
+    App->>Client: get_openai_client(max_retries=5)
+    Client->>SDK: OpenAI(..., max_retries=5)
+    App->>SDK: chat.completions.create(...)
+    SDK->>API: POST /v1/chat/completions
+    API-->>SDK: 429 Too Many Requests (Retry-After: 2)
+    SDK->>SDK: sleep(2s) + exponential backoff
+    SDK->>API: retry
+    API-->>SDK: 200 OK
+    SDK-->>App: response
+```
+
+| Behaviour | Detail |
+|-----------|--------|
+| Applies to | The native `OpenAIClient` / `get_openai_client` path (used internally by `AutoAgents`) and any direct callers. |
+| Not affected | The LiteLLM-backed `LLM` class and agent-loop resilience engine (see [Agent Retry](/docs/features/agent-retry)). |
+| When unset | Behaviour is byte-identical to before — `max_retries` is only forwarded when it is not `None`. |
+| Cache | `get_openai_client()` caches on `max_retries`, so changing it mid-process rebuilds the SDK client. |
+
+---
+
+## Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `max_retries` (arg on `OpenAIClient` / `get_openai_client`) | `Optional[int]` | `None` | Number of automatic retries for transient errors on the native OpenAI client path. |
+| `OPENAI_MAX_RETRIES` (env var) | `int` (string) | unset | Fallback used when `max_retries` is not passed. Non-integer values silently fall back to the SDK default. |
+
+Precedence: `explicit arg  >  OPENAI_MAX_RETRIES env var  >  SDK default`.
+
+<Note>
+Non-integer `OPENAI_MAX_RETRIES` (e.g. `"abc"`) is silently ignored and the SDK default takes over — no crash.
+</Note>
+
+---
+
+## Common Patterns
+
+**Turn it on globally with one env var** — for production deployments where every call should retry the same way.
+
+```python
+# export OPENAI_MAX_RETRIES=5
+from praisonaiagents import Agent
+
+agent = Agent(name="Assistant", instructions="You are a helpful assistant.")
+agent.start("Draft a weekly status report.")
+```
+
+**Scope it to one call site** — pass `max_retries` explicitly when you build the client for a hot path.
+
+```python
+from praisonaiagents.llm import get_openai_client
+
+# Only this client retries; the rest of the process is unaffected.
+client = get_openai_client(max_retries=5)
+```
+
+<Note>
+`AutoAgents` also accepts a `max_retries` argument, but that controls its own config-generation retries — it is separate from the SDK-level `max_retries` documented here. Use `OPENAI_MAX_RETRIES` for a process-wide native-client policy.
+</Note>
+
+**Local server (LM Studio / vLLM) — leave it off** — local endpoints rarely emit `Retry-After`, so retries are wasted latency.
+
+```python
+from praisonaiagents.llm import get_openai_client
+
+# No max_retries: keep local calls fast and fail fast.
+client = get_openai_client(base_url="http://localhost:1234/v1")
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Prefer the env var for cluster-wide policy">
+One place, no code change, easy to bump per environment. Set `OPENAI_MAX_RETRIES` once and every native call inherits it.
+</Accordion>
+
+<Accordion title="Start with 3–5">
+This matches the SDK's typical rate-limit budget without inflating tail latency.
+</Accordion>
+
+<Accordion title="Don't stack with agent-level retry unless you mean to">
+Combining `OPENAI_MAX_RETRIES=5` with `Agent(retry=True, max_retries=3)` multiplies attempts (5 × 3 = 15). Pick one layer for the primary retry policy and use the other only as a safety net.
+</Accordion>
+
+<Accordion title="Not a substitute for failover">
+Retries help transient blips; for provider outages use `LLMConfig(fallbacks=[...])` — see [Model Fallback](/docs/features/model-fallback).
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Agent Retry" icon="clock-rotate-left" href="/docs/features/agent-retry">
+Retry the LiteLLM-backed agent loop with jittered exponential backoff.
+</Card>
+<Card title="Model Fallback" icon="shuffle" href="/docs/features/model-fallback">
+Fail over to alternate models during provider outages.
+</Card>
+<Card title="LLM Error Classification" icon="triangle-exclamation" href="/docs/features/llm-error-classification">
+Understand which errors are retryable versus fatal.
+</Card>
+</CardGroup>
