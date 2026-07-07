@@ -333,8 +333,10 @@ from praisonaiagents.session import DefaultSessionStore
 
 store = DefaultSessionStore(
     session_dir="/custom/path/sessions",
-    max_messages=200,  # Default: 100
-    lock_timeout=10.0,  # Default: 5.0 seconds
+    max_messages=200,        # Default: 100
+    lock_timeout=10.0,       # Default: 5.0 seconds
+    retention="compact",     # "compact" (default) | "truncate" | "keep_all"
+    active_window=200,       # Recent turns kept live; defaults to max_messages
 )
 ```
 
@@ -508,6 +510,196 @@ from praisonaiagents.session import SessionStoreProtocol
 assert isinstance(get_default_session_store(), SessionStoreProtocol)
 ```
 
+## Retention Policies
+
+Long conversations stay safe — older turns are summarised and archived, not silently dropped.
+
+```python
+from praisonaiagents import Agent
+
+# Long conversations are now safe — older turns are summarised and archived,
+# not silently dropped. This is the default behaviour.
+agent = Agent(
+    name="assistant",
+    instructions="Answer helpfully, remembering everything the user has told you.",
+    memory={"session_id": "my-long-chat"},
+)
+
+# 100+ turns later, the earliest questions the user asked are still
+# accessible — as a summary in the active window, and raw in the archive.
+agent.start("What was the first thing I asked you?")
+```
+
+Before this change, the 101st turn silently deleted the 1st on every write. Retention policies (Issue #2709) fix that: overflow beyond the active window is rolled up into one summary message and preserved raw in a durable `archived_messages` field.
+
+### The Three Policies
+
+| Policy | Behaviour |
+|---|---|
+| `"compact"` (default) | Summarise the oldest overflow turns into **one** synthetic summary message and archive the raw turns in `archived_messages` — nothing is silently dropped. |
+| `"truncate"` | Legacy behaviour — hard-slice to the tail; older turns are permanently dropped. |
+| `"keep_all"` | Never trim the active window (unbounded history). |
+
+Built-in defaults from `store.py`: `DEFAULT_RETENTION = "compact"` and `DEFAULT_MAX_MESSAGES = 100`.
+
+### What Non-Destructive Means
+
+Overflow becomes one summary message plus a raw archive — the active window stays small while the full record survives.
+
+```mermaid
+graph LR
+    subgraph "Compact Retention"
+        A[📚 New turn] --> B{🔍 Over active window?}
+        B -->|No| C[✅ Append]
+        B -->|Yes| D[📝 Summarise oldest]
+        D --> E[💾 Archive raw]
+        E --> C
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A input
+    class B,D,E process
+    class C output
+```
+
+### Choosing a Policy
+
+Pick the policy that matches what you care about most.
+
+```mermaid
+graph TB
+    Q{What matters most?} --> A[Keep every turn — never lose context]
+    Q --> B[Bounded disk usage — hard cap]
+    Q --> C[Unlimited growth — I compact externally]
+
+    A --> A1["retention='compact' (default)"]
+    B --> B1["retention='truncate'"]
+    C --> C1["retention='keep_all'"]
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef choice fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q question
+    class A,B,C choice
+    class A1,B1,C1 answer
+```
+
+### Configuration
+
+Configure retention three ways — from zero-code env vars up to the constructor.
+
+**Level 1 — env vars (zero code):**
+
+```bash
+export PRAISONAI_SESSION_RETENTION=compact       # default
+export PRAISONAI_SESSION_ACTIVE_WINDOW=200       # keep 200 recent turns live
+```
+
+**Level 2 — constructor:**
+
+```python
+from praisonaiagents.session import DefaultSessionStore
+
+store = DefaultSessionStore(
+    retention="compact",     # or "truncate", or "keep_all"
+    active_window=200,       # optional; defaults to max_messages
+)
+```
+
+**Level 3 — legacy behaviour (backward-compat trap):**
+
+```python
+# Passing max_messages != 100 with NO explicit retention keeps the
+# LEGACY truncate behaviour. This is intentional backward compatibility.
+# Set retention="compact" explicitly to opt into non-destructive rollup.
+store = DefaultSessionStore(max_messages=50)  # -> truncate
+store = DefaultSessionStore(max_messages=50, retention="compact")  # -> compact
+```
+
+<Warning>
+Passing `max_messages=N` with `N != 100` and **no** explicit `retention` keeps the legacy `truncate` behaviour — older turns are permanently dropped. To opt into non-destructive rollup, pass `retention="compact"` explicitly.
+</Warning>
+
+### Environment Variables
+
+Both env vars are read only when the global default store is **first** constructed (lazy singleton). Setting them mid-process has no effect.
+
+| Env var | Type | Values | Effect |
+|---|---|---|---|
+| `PRAISONAI_SESSION_RETENTION` | `string` | `compact` \| `truncate` \| `keep_all` | Overrides the global default store's retention policy. Invalid values are logged and the default (`compact`) is used. |
+| `PRAISONAI_SESSION_ACTIVE_WINDOW` | `int` | any positive int | Overrides the number of recent turns kept live in `messages`. Non-int values are logged and ignored. |
+
+### Constructor Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `retention` | `str` | `None` → `compact` (or `truncate` when a non-default `max_messages` is passed) | Overflow policy: `compact`, `truncate`, or `keep_all`. Invalid values raise `ValueError`. |
+| `active_window` | `int` | `None` → `max_messages` | Number of recent turns kept live in `messages`. Tune separately from `max_messages`. |
+
+### The `archived_messages` Field
+
+Raw archived turns are preserved on disk in `SessionData.archived_messages` and loaded back into `SessionData` / `ExtendedSessionData` on subsequent reads — old session JSON without the field loads cleanly as an empty list. Once the archive crosses `ARCHIVE_WARN_THRESHOLD` (`10_000` entries) the store logs a one-off warning (`archived_messages has grown to N entries`) so operators can spot runaway sessions.
+
+### Reads Return Full History
+
+`get_chat_history()` no longer silently re-caps reads at the legacy 100-message tail — full stored history returns unless you pass `max_messages` explicitly.
+
+### Retention in Practice
+
+A compact session summarises overflow on write and hands back summary + recent turns on resume.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Store as DefaultSessionStore
+
+    Note over Store: retention="compact", active_window=100
+    User->>Agent: Turn 100
+    Agent->>Store: save(session)
+    Store->>Store: _enforce_window → within window, append
+    User->>Agent: Turn 101
+    Agent->>Store: save(session)
+    Store->>Store: _enforce_window → summarise oldest, archive raw
+    Note right of Store: log: "compacted 1 early turns into a summary"
+    User->>Agent: (later) resume session
+    Agent->>Store: get_chat_history()
+    Store-->>Agent: summary + recent turns
+    Agent-->>User: continues with context preserved
+```
+
+<Warning>
+Upgrading is safe. Old session JSON files load cleanly — a missing `archived_messages` defaults to `[]`. Callers that pass `max_messages=N` keep the legacy `truncate` behaviour by default. To opt into non-destructive rollup, either omit `max_messages` (the store uses `DEFAULT_MAX_MESSAGES=100` + `retention="compact"`) or pass `retention="compact"` explicitly.
+</Warning>
+
+### Retention Best Practices
+
+<AccordionGroup>
+<Accordion title="Keep the default (compact) unless you have a specific reason to drop history">
+Non-destructive rollup is the right default for `--continue`, `resume`, and `Agent(session_id=...)` flows — the earliest turns survive as a summary plus a raw archive.
+</Accordion>
+
+<Accordion title="Use truncate for strict FIFO caps on shared/CI machines">
+When you want a hard cap on disk usage and don't care about old turns, `retention="truncate"` hard-slices to the tail.
+</Accordion>
+
+<Accordion title="Use keep_all only for short-lived sessions or when you compact externally">
+`keep_all` never trims — `archived_messages` and the active window grow unbounded otherwise.
+</Accordion>
+
+<Accordion title="Tune active_window separately from max_messages">
+A larger `active_window` keeps more live context per turn but raises token cost. It defaults to `max_messages` when unset.
+</Accordion>
+
+<Accordion title="Watch for the archived_messages warning in logs">
+The store logs once when the archive crosses `ARCHIVE_WARN_THRESHOLD` (`10_000`) so operators can spot runaway sessions.
+</Accordion>
+</AccordionGroup>
+
 ## Best Practices
 
 <AccordionGroup>
@@ -516,7 +708,7 @@ Include user or context in the id: `f"user-{user_id}-{conversation_type}"`.
 </Accordion>
 
 <Accordion title="Respect the default message limit">
-Default `max_messages` is 100. Older turns are trimmed unless compaction is enabled on bots.
+Default `max_messages` is 100. Overflow is summarised and archived by default (`retention="compact"`) — see [Retention Policies](#retention-policies).
 </Accordion>
 
 <Accordion title="Clean up unused sessions">
