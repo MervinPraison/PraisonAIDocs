@@ -63,25 +63,30 @@ agent.start("Refactor utils.py")
 <Step title="With Configuration">
 
 ```bash
-praisonai --approval console run "Refactor utils.py"
+praisonai --approval console run "Show me git status"
 ```
 
 A prompt appears:
 
 ```
 ⚠ Tool Approval Required
-Tool: edit(path='utils.py', ...)
+Tool: bash(command='git status -s')
 Risk: medium
 Agent: Coder
 
 Options:
   [a] Allow once
-  [A] Always allow (persist rule)
+  [A] Always allow this command (bash:git status *)
+  [T] Always allow ALL uses of bash (bash:*)
   [d] Deny
   [D] Always deny (persist rule)
 
 Your choice:
 ```
+
+<Note>
+`[A]` persists the **narrowest reasonable** pattern (command-prefix for shell tools, first-arg literal for others). Only the explicit `[T]` choice grants blanket `bash:*`.
+</Note>
 
 </Step>
 
@@ -109,14 +114,87 @@ sequenceDiagram
     alt Existing rule
         PM-->>B: allow / deny
     else Prompt
-        B->>U: [a]/[A]/[d]/[D]
+        B->>U: [a] / [A] / [T] / [d] / [D]
         U-->>B: decision
-        opt Persist
-            B->>PM: save rule
+        opt Persist [A] or [T]
+            B->>PM: save narrow or blanket rule
+        end
+        opt Denial reason
+            U-->>B: optional feedback
         end
     end
-    B-->>A: ApprovalDecision
-    A->>T: execute or skip
+    B-->>A: ApprovalDecision (+ metadata.feedback on deny)
+    A->>T: execute · skip · re-plan
+```
+
+## Change Preview
+
+Before you press `[A]` on a file-mutating tool, PraisonAI prints a preview so you approve the actual change — not just the tool name.
+
+For `edit` / `apply_patch` (unified diff supplied by the caller):
+
+```
+Preview (diff):
+--- a/utils.py
++++ b/utils.py
+@@ -1,3 +1,3 @@
+-def add(a, b): return a+b
++def add(a: int, b: int) -> int: return a + b
+```
+
+For `write` (up to 2000 chars, truncated after):
+
+```
+Preview (content to utils.py):
+def add(a: int, b: int) -> int:
+    return a + b
+```
+
+No preview is shown for read-only or non-file tools.
+
+```mermaid
+graph LR
+    A[Tool call] --> B{Needs preview?}
+    B -->|edit / apply_patch| C[Diff]
+    B -->|write| D[Content]
+    B -->|read-only| E[No preview]
+    C --> F[Your choice]
+    D --> F
+    E --> F
+
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef prev fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A tool
+    class B check
+    class C,D,E prev
+    class F ok
+```
+
+## Denial Steering
+
+Pressing `[d]` or `[D]` opens a follow-up prompt for an optional reason, which is passed back to the agent as feedback so it can correct course instead of aborting.
+
+```
+Your choice: d
+Reason for denial (optional, steers the agent): use `git diff --stat` instead — this diff is too noisy
+```
+
+Empty input skips feedback. Non-interactive shells (CI, `PRAISONAI_NON_INTERACTIVE=1`) skip the prompt entirely — the run stays fail-closed and denials carry no feedback.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant B as ApprovalBackend
+    participant A as Agent
+
+    U->>B: [d]
+    B->>U: Reason for denial?
+    U->>B: use git diff --stat instead
+    B->>A: metadata.feedback = reason
+    A->>A: re-plan with correction
 ```
 
 ## Approval modes
@@ -151,11 +229,20 @@ The CLI uses `--approval bypass` but the enum value is `bypass_permissions`.
 
 ## Persistence
 
-Press `[A]` or `[D]` to write a `PermissionRule` to `.praisonai/permissions/rules.json` (priority `100`, scoped to the project directory). Manage rules with:
+Press `[A]`, `[T]`, or `[D]` to write a `PermissionRule` to `.praisonai/permissions/rules.json` (priority `100`, scoped to the project directory). The two allow choices persist different scopes:
 
-<Note>
-**Coming soon:** `PermissionManager.approve()` will support `reusable_scope=True` to store a command-prefix glob (e.g. `bash:git status *`) that auto-approves every trailing-arg variant without prompting again. This requires [PraisonAI PR #2576](https://github.com/MervinPraison/PraisonAI/pull/2576). Until then, pass the glob pattern directly: `manager.approve("bash:git status *", True, scope="always")`. See [Reusable Approval Scopes](/docs/features/reusable-approval-scopes).
-</Note>
+| Choice | Scope | Persisted pattern example |
+|--------|-------|---------------------------|
+| `[A] Always allow this command` | Narrow command-prefix | `bash:git status *`, `edit:utils.py`, `write:.env` |
+| `[T] Always allow ALL uses of <tool>` | Blanket | `bash:*`, `edit:*`, `write:*` |
+
+`[A]` uses the shared `derive_pattern` helper so the CLI, YAML `--allow`/`--deny`, and Python `PermissionManager` all scope identically. Compound commands (`&&`, `|`, `;`, `$(...)`) fall back to a **literal single-use** pattern so a persisted rule can only match the exact invocation you approved.
+
+<Tip>
+Tune the derived pattern with [Reusable Approval Scopes](/docs/features/reusable-approval-scopes) — call `PermissionManager.suggest_scope_pattern(target)` for a custom UI, or hand-author `bash:git *` via `praisonai permissions allow`.
+</Tip>
+
+Manage rules with:
 
 ```bash
 praisonai permissions list
@@ -200,6 +287,18 @@ Tools marked `external` always prompt — verify third-party integrations before
 Team-wide allow/deny patterns belong in version control.
 </Accordion>
 
+<Accordion title="[A] is safe by default — only [T] grants blanket access">
+`[A]` scopes to the specific command-prefix (shell tools) or first-arg literal (other tools), while `[T]` is the only path to `<tool>:*` — use `[A]` for daily work and reserve `[T]` for tools you already trust project-wide.
+</Accordion>
+
+<Accordion title="Skim the change preview before pressing [A]">
+The preview is your last chance to catch an unintended edit. It renders for `edit`, `write`, and `apply_patch` so you approve the actual change, not just the tool name.
+</Accordion>
+
+<Accordion title="Give a denial reason instead of pressing Ctrl-C">
+A reason turns a rejection into a correction — the agent can re-plan rather than abort the whole run.
+</Accordion>
+
 </AccordionGroup>
 
 ## Bot/chat-channel approvals
@@ -208,6 +307,10 @@ This page covers the CLI/terminal approval flow. When running PraisonAI on Teleg
 
 <Card title="Interactive Callback Authorization" icon="user-shield" href="/docs/features/interactive-callback-authorization">
   Lock approval buttons to specific users in shared chats — covers Telegram, Slack, and Discord bots.
+</Card>
+
+<Card icon="function" href="/docs/sdk/reference/praisonaiagents/modules/permissions">
+  `derive_pattern` — shared narrow-pattern derivation used by CLI, YAML, and Python rules
 </Card>
 
 ## Related
