@@ -164,10 +164,13 @@ async function syncPipelineLabels(github, owner, repo, prNumber, core) {
   };
 }
 
-async function dispatchMergeGateForOldestReady(github, owner, repo, readyCandidates, core) {
+async function dispatchMergeGateForOldestReady(github, owner, repo, readyCandidates, core, options = {}) {
+  const maxDispatches = Math.max(1, options.maxDispatches ?? 3);
   if (!readyCandidates.length) return 0;
   readyCandidates.sort((a, b) => a.createdAt - b.createdAt);
+  let dispatched = 0;
   for (const cand of readyCandidates) {
+    if (dispatched >= maxDispatches) break;
     if ((cand.labels || []).includes('claude-merge-gate-active')) {
       const gate = await mergeGate.reconcileMergeGateActiveLabel(
         github, owner, repo, cand.prNumber, cand.labels || [], core
@@ -184,9 +187,9 @@ async function dispatchMergeGateForOldestReady(github, owner, repo, readyCandida
       client_payload: { pr_number: cand.prNumber },
     });
     core?.info?.(`Dispatched merge gate for ready PR #${cand.prNumber}`);
-    return cand.prNumber;
+    dispatched += 1;
   }
-  return 0;
+  return dispatched;
 }
 
 const CONFLICT_SCAN_DEBOUNCE_MS = 30 * 60 * 1000;
@@ -230,8 +233,53 @@ async function dispatchMergeConflictScan(github, owner, repo, core) {
   }
 }
 
+async function shouldRunScheduledMergeGateScan(github, owner, repo, core) {
+  try {
+    const { data } = await github.rest.actions.listWorkflowRuns({
+      owner,
+      repo,
+      workflow_id: 'claude-merge-gate.yml',
+      event: 'schedule',
+      per_page: 1,
+    });
+    const latest = data.workflow_runs?.[0];
+    if (!latest) return true;
+    const ageMs = Date.now() - new Date(latest.created_at).getTime();
+    if (ageMs > 20 * 60 * 1000) {
+      core?.info?.(`Merge gate schedule stale (${Math.round(ageMs / 60000)}m) — triggering scan`);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    core?.warning?.(`Could not check merge gate schedule: ${err.message}`);
+    return false;
+  }
+}
+
+async function triggerMergeGateScan(github, owner, repo, core) {
+  try {
+    await github.rest.actions.createWorkflowDispatch({
+      owner,
+      repo,
+      workflow_id: 'claude-merge-gate.yml',
+      ref: 'main',
+    });
+    core?.info?.('Dispatched claude-merge-gate workflow_dispatch scan');
+    return true;
+  } catch (err) {
+    core?.warning?.(`Could not dispatch merge gate scan: ${err.message}`);
+    return false;
+  }
+}
+
 async function syncOpenPullRequests(github, owner, repo, options, core) {
-  const { maxPrs = 20, dispatchMergeGate = true, dispatchConflictScan = true } = options || {};
+  const {
+    maxPrs = 20,
+    dispatchMergeGate = true,
+    dispatchConflictScan = true,
+    maxGateDispatches = 3,
+    fallbackMergeGateScan = true,
+  } = options || {};
   await ensurePipelineLabels(github, owner, repo, core);
   let prs;
   if (maxPrs <= 100) {
@@ -272,8 +320,12 @@ async function syncOpenPullRequests(github, owner, repo, options, core) {
   let dispatched = 0;
   if (dispatchMergeGate && readyCandidates.length) {
     dispatched = await dispatchMergeGateForOldestReady(
-      github, owner, repo, readyCandidates, core
+      github, owner, repo, readyCandidates, core, { maxDispatches: maxGateDispatches }
     );
+  }
+  if (fallbackMergeGateScan && readyCandidates.length > dispatched) {
+    const stale = await shouldRunScheduledMergeGateScan(github, owner, repo, core);
+    if (stale) await triggerMergeGateScan(github, owner, repo, core);
   }
   if (dispatchConflictScan && dirtyConflict) {
     await dispatchMergeConflictScan(github, owner, repo, core);
@@ -293,6 +345,8 @@ module.exports = {
   syncPipelineLabels,
   syncOpenPullRequests,
   dispatchMergeGateForOldestReady,
+  shouldRunScheduledMergeGateScan,
+  triggerMergeGateScan,
   dispatchMergeConflictScan,
   shouldSkipConflictScanDispatch,
   CONFLICT_SCAN_DEBOUNCE_MS,
