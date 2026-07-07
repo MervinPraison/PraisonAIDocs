@@ -284,8 +284,10 @@ Framework adapters must implement the `FrameworkAdapter` protocol:
 | `resolve_alias()` | ❌ | Return the concrete adapter name to dispatch to (string). Default returns `self.name`. Override when your adapter is a router that picks a sibling adapter at runtime by name. |
 | `setup(*, framework_tag)` | ❌ | Framework-specific pre-run hooks (default no-op) |
 | `run(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ✅ | Execute framework logic (all four trailing kwargs are validated at registration time — see Troubleshooting) |
-| `arun(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ❌ | Async execution path. Default offloads `run()` to a thread via `asyncio.to_thread`. Override with a native `async def` for a fully async path. |
-| `cleanup()` | ❌ | Release resources after execution (default no-op) |
+| `arun(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ❌ | Async execution path. When `SUPPORTS_ASYNC` is `False` (default), it offloads `run()` to this adapter's bounded thread pool and logs a one-line warning. Override with a native `async def` for a fully async path. |
+| `cleanup()` | ❌ | Release resources after execution (default no-op; also shuts down the offload pool) |
+| `SUPPORTS_ASYNC` | ❌ | `bool`, default `False`. Set `True` when you override `arun()` with a native `async def`. When `False`, `arun()` offloads `run()` to the adapter's bounded thread pool and logs a one-line warning. |
+| `_THREAD_OFFLOAD_MAX_WORKERS` | ❌ | `int`, default `4`. Size of this adapter's private `ThreadPoolExecutor` used by `arun()`'s sync-offload path. Override on the class or instance for high-concurrency workloads. |
 
 ### Protocol Validation (PR #2083)
 
@@ -308,9 +310,60 @@ Adapters that fail validation also report `registry.is_available("<name>") == Fa
 As of [PR #2257](https://github.com/MervinPraison/PraisonAI/pull/2257) the no-op `resolve_variant` default has been removed from both the `FrameworkAdapter` Protocol and `BaseFrameworkAdapter`. Old adapters that still define `resolve_variant` will have it **silently ignored** — only `resolve(*, config=...)` and `resolve_alias()` are invoked.
 </Warning>
 
-**Default `arun()` offloads `run()` via `asyncio.to_thread`**, allowing sync adapters to be called from async contexts without blocking the event loop.
+**Default `arun()` offloads `run()` to a bounded per-adapter thread pool**, allowing sync adapters to be called from async contexts without blocking the event loop. Unlike `asyncio.to_thread` (which shares the process-wide executor), each adapter gets its own `ThreadPoolExecutor` sized by `_THREAD_OFFLOAD_MAX_WORKERS` (default `4`), so one slow framework run cannot starve every other async caller.
 
-Override `arun()` with a native `async def` to skip the thread offload entirely and use the framework's own async API.
+Override `arun()` with a native `async def` and set `SUPPORTS_ASYNC = True` to skip the thread offload entirely and use the framework's own async API.
+
+### Async capability flags
+
+Set `SUPPORTS_ASYNC = True` when you provide a native `async def arun()`; leave it `False` to inherit the bounded thread-pool offload.
+
+```python
+from praisonaiagents import BaseFrameworkAdapter
+
+class MyFrameworkAdapter(BaseFrameworkAdapter):
+    name = "myframework"
+    SUPPORTS_ASYNC = True             # native async arun() below
+    _THREAD_OFFLOAD_MAX_WORKERS = 8   # only used when SUPPORTS_ASYNC is False
+
+    def is_available(self) -> bool: ...
+
+    def run(self, config, llm_config, topic, *, tools_dict=None,
+            agent_callback=None, task_callback=None, cli_config=None): ...
+
+    async def arun(self, config, llm_config, topic, *, tools_dict=None,
+                   agent_callback=None, task_callback=None, cli_config=None): ...
+```
+
+| Flag | Default | Consulted by | Effect when `False` / unchanged |
+|---|---|---|---|
+| `SUPPORTS_ASYNC` | `False` | `BaseFrameworkAdapter.arun()` | Sync `run()` is offloaded to the adapter's bounded thread pool and a one-line warning is logged |
+| `_THREAD_OFFLOAD_MAX_WORKERS` | `4` | `_get_thread_pool()` (offload path) | Caps concurrent offloaded `run()` calls; increase for high-concurrency sync adapters |
+
+```mermaid
+graph LR
+    ARun[⚡ arun called] --> Flag{SUPPORTS_ASYNC?}
+    Flag -->|True| Native[🚀 native async run]
+    Flag -->|False| Warn[⚠️ log one-line warning]
+    Warn --> Pool[🧵 bounded ThreadPoolExecutor<br/>max_workers = _THREAD_OFFLOAD_MAX_WORKERS]
+    Pool --> Sync[🔁 offload sync run]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef native fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef pool fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class ARun start
+    class Flag decision
+    class Native native
+    class Warn warn
+    class Pool,Sync pool
+```
+
+<Note>
+Only `PraisonAIAdapter` sets `SUPPORTS_ASYNC = True` today — its `arun()` awaits the native async run path directly. The built-in `CrewAIAdapter` and `AutoGenAdapter` keep `SUPPORTS_ASYNC = False` and use the bounded thread-pool offload.
+</Note>
 
 ---
 
@@ -320,7 +373,7 @@ Override `arun()` with a native `async def` to skip the thread offload entirely 
 
 <Step title="Sync-only adapter (default)">
 
-Leave `arun()` unoverridden. The base class offloads `run()` via `asyncio.to_thread` automatically:
+Leave `arun()` unoverridden and `SUPPORTS_ASYNC` at its `False` default. The base class offloads `run()` to the adapter's bounded thread pool automatically:
 
 ```python
 from praisonaiagents import BaseFrameworkAdapter
@@ -354,13 +407,14 @@ class MySyncAdapter(BaseFrameworkAdapter):
 
 <Step title="Native async adapter">
 
-Override `arun()` with a real `async def` to use the framework's native async API:
+Override `arun()` with a real `async def` and set `SUPPORTS_ASYNC = True` to use the framework's native async API:
 
 ```python
 from praisonaiagents import BaseFrameworkAdapter
 
 class MyAsyncAdapter(BaseFrameworkAdapter):
     name = "my_async_framework"
+    SUPPORTS_ASYNC = True
 
     def is_available(self) -> bool:
         try:
@@ -847,13 +901,14 @@ def is_available(self) -> bool:
 
 <Accordion title="Prefer native async for high-concurrency workloads">
 
-The default `arun()` offloads `run()` via `asyncio.to_thread`, which relies on Python's shared thread pool. For high-concurrency workloads, override `arun()` with a native `async def` to avoid thread pool contention:
+The default `arun()` offloads `run()` to the adapter's bounded thread pool (`_THREAD_OFFLOAD_MAX_WORKERS`, default `4`). For high-concurrency workloads, either raise the pool size or override `arun()` with a native `async def` (and set `SUPPORTS_ASYNC = True`) to avoid offload contention:
 
 ```python
 from praisonaiagents import BaseFrameworkAdapter
 
 class ScalableAsyncAdapter(BaseFrameworkAdapter):
     name = "scalable_framework"
+    SUPPORTS_ASYNC = True
 
     def is_available(self) -> bool:
         return True
@@ -1049,10 +1104,12 @@ If `praisonai --list-frameworks` (or `registry.list_names()`) no longer shows yo
 
 <Accordion title="Sync adapter called from async context">
 
-The default `arun()` uses `asyncio.to_thread` to offload sync `run()` calls. This is safe for most workloads. If you need a fully async path, override `arun()` with a native `async def`:
+The default `arun()` offloads sync `run()` calls to the adapter's bounded thread pool and logs a one-line warning. This is safe for most workloads. If you need a fully async path, set `SUPPORTS_ASYNC = True` and override `arun()` with a native `async def`:
 
 ```python
 class MyAdapter(BaseFrameworkAdapter):
+    SUPPORTS_ASYNC = True
+
     async def arun(self, config, llm_config, topic, *, tools_dict=None,
                    agent_callback=None, task_callback=None, cli_config=None) -> str:
         return await my_native_async_call(config, topic)
