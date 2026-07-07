@@ -164,28 +164,38 @@ When you set `tool_timeout` in YAML (`framework: praisonai`) **or** pass `--tool
 This means the `tool_timeout` knob is enforced even if the downstream SDK ignores it, even if the tool is a blocking C extension, and even if the tool is a subprocess that does not honour `CancelledError`.
 
 The wrapper handles **sync and async tools** differently:
-- **Sync tools** run in a daemon thread (`threading.Thread(daemon=True)`); on timeout the wrapper returns a JSON error dict and abandons the thread (daemon threads do not block process exit).
-- **Async tools** are wrapped with `asyncio.wait_for(...)`; on timeout the wrapper returns the same JSON error dict.
+- **Sync tools** run in an instance-owned `ThreadPoolExecutor` (see `_get_tool_timeout_executor` in `agents_generator.py`); on timeout the future is best-effort cancelled. A call that already started cannot be interrupted, so the worker may keep running.
+- **Async tools** are wrapped with `asyncio.wait_for(...)`, which cancels the underlying task cleanly.
 
-The returned shape on wrapper-level timeout is a **JSON string** (because the wrapper boundary serialises) containing:
-```json
-{
-  "error": "tool_timeout",
-  "tool": "<function name>",
-  "timeout_seconds": 30
-}
+**Exception raised on wrapper-level timeout:** on timeout the wrapper **raises `ToolTimeoutError`** (a `TimeoutError` subclass), not a JSON dict. This preserves each tool's declared return-type contract — a typed return value is never silently downgraded to a string. Framework adapters catch it and translate it per framework.
+
+```python
+from praisonaiagents import Agent
+from praisonai.agents_generator import ToolTimeoutError
+
+def slow_lookup(query: str) -> str:
+    ...  # a tool that may hang
+
+agent = Agent(
+    name="Researcher",
+    instructions="Look things up.",
+    tools=[slow_lookup],
+    tool_config={"timeout": 5},  # ToolConfig(timeout=5) also works
+)
+
+try:
+    agent.start("Look up X")
+except ToolTimeoutError as e:
+    print(e.tool_name, e.timeout_seconds, e.background_work_may_continue)
 ```
 
-For **sync tools** that have already started executing, the payload may also include `"background_work_may_continue": true`. This means the timeout fired but the worker thread may still be running — do not assume a timed-out tool stopped doing work.
+`ToolTimeoutError` carries three attributes:
 
-If the worker thread exits without publishing a result (defensive fallback), the wrapper returns:
-```json
-{
-  "error": "tool_execution_error",
-  "tool": "<function name>",
-  "detail": "worker_exited_without_result"
-}
-```
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `tool_name` | `str` | Name of the tool that timed out |
+| `timeout_seconds` | `float` | The per-call limit that was exceeded |
+| `background_work_may_continue` | `bool` | `True` only when a started sync worker could not be cancelled; async tools cancel cleanly (`False`) |
 
 Crucially, the wrapper **also keeps passing** `tool_timeout` to the SDK Agent, so both layers are active — hence "defense in depth". The SDK's executor catches the common case; the wrapper catches the pathological one.
 
@@ -208,10 +218,10 @@ roles:
     tasks:
       fetch:
         description: Fetch {topic}
-        expected_output: Summarised payload, or a structured timeout dict if the upstream is slow.
+        expected_output: Summarised payload, or a translated timeout message if the upstream is slow.
 ```
 
-When `fetch_url` blocks for more than 15 s, the agent receives the structured JSON dict above instead of an indefinite hang, so the crew keeps moving.
+When `fetch_url` blocks for more than 15 s, the wrapper raises `ToolTimeoutError` instead of hanging indefinitely; the framework adapter catches it and translates it into a value its framework understands, so the crew keeps moving.
 
 **Precedence note:** When both wrapper-level and SDK-level timeouts apply, the **shorter** of the two wins in practice (whichever fires first). Both currently read from the same `tool_timeout` value, so they fire at the same time; if a user later configures different values at different layers, the first-to-fire semantics still hold.
 
@@ -228,7 +238,7 @@ The wrapper resolves a single effective timeout per invocation:
 Boolean YAML values (`tool_timeout: yes`, `tool_timeout: true`) are **explicitly ignored** — they used to be silently coerced to a 1-second cap because `bool` subclasses `int`. Use integers or floats (e.g. `tool_timeout: 30`).
 
 <Note>
-`PRAISONAI_TOOL_TIMEOUT_WORKERS` caps the named thread pool that runs sync tools under timeout (default `32`). Invalid or non-positive values fall back to `32` with a warning log line.
+`PRAISONAI_TOOL_TIMEOUT_WORKERS` caps the named thread pool that runs sync tools under timeout (default `32`). Invalid or non-positive values fall back to `32` with a warning log line. Once half the pool's workers are permanently leaked to stuck sync tools, the pool is automatically recycled: leaked threads continue until their syscall returns, but new tool calls get a fresh pool instead of queueing behind them.
 </Note>
 
 ### Advanced Timeout Configuration

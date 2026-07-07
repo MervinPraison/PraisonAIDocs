@@ -188,9 +188,11 @@ await agent.achat("Use slow tool")  # Will timeout after 5 seconds
 
 When running through YAML or the CLI, the wrapper wraps every tool with a timeout-enforcing shim **before** handing the agent to the SDK. This provides defense-in-depth timeout enforcement even for pathological tools.
 
+On timeout the wrapper **raises `ToolTimeoutError`** (a `TimeoutError` subclass) instead of returning a JSON dict. This preserves each tool's declared return-type contract — a typed return value is never silently downgraded to a string. Framework adapters catch it and translate it per framework.
+
 The wrapper handles **sync and async tools** differently:
-- **Sync tools** run in a daemon thread (`threading.Thread(daemon=True)`); on timeout the wrapper returns a JSON error dict and abandons the thread (daemon threads do not block process exit).
-- **Async tools** are wrapped with `asyncio.wait_for(...)`; on timeout the wrapper returns the same JSON error dict.
+- **Sync tools** run in an instance-owned `ThreadPoolExecutor` (see `_get_tool_timeout_executor` in `agents_generator.py`); on timeout the future is best-effort cancelled. A call that already started cannot be interrupted, so `background_work_may_continue` is `True`.
+- **Async tools** are wrapped with `asyncio.wait_for(...)`, which cancels the underlying task cleanly, so `background_work_may_continue` is `False`.
 
 ```mermaid
 graph LR
@@ -199,7 +201,7 @@ graph LR
         WrapShim --> SDK[🧠 SDK Agent Executor<br/>tool_timeout enforced]
         SDK --> Tool[🔧 Tool]
         Tool --> Result[✅ Result]
-        WrapShim -.->|timeout| Dict1[📦 JSON: tool_timeout]
+        WrapShim -.->|timeout| Raise1[🚨 raise ToolTimeoutError]
         SDK -.->|timeout| Dict2[📦 dict: Tool timed out after Ns]
     end
 
@@ -213,22 +215,44 @@ graph LR
     class WrapShim,SDK safety
     class Tool execution
     class Result output
-    class Dict1,Dict2 error
+    class Raise1,Dict2 error
 ```
 
 *In Python, configure with `tool_config=ToolConfig(timeout=…)`.*
 
-**JSON return shape on wrapper-level timeout:**
-```json
-{
-  "error": "tool_timeout",
-  "tool": "<function name>",
-  "timeout_seconds": 30,
-  "background_work_may_continue": true
-}
+**Exception raised on wrapper-level timeout:**
+
+```python
+from praisonaiagents import Agent
+from praisonai.agents_generator import ToolTimeoutError
+
+def slow_lookup(query: str) -> str:
+    ...  # a tool that may hang
+
+agent = Agent(
+    name="Researcher",
+    instructions="Look things up.",
+    tools=[slow_lookup],
+    tool_config={"timeout": 5},  # ToolConfig(timeout=5) also works
+)
+
+try:
+    agent.start("Look up X")
+except ToolTimeoutError as e:
+    print(e.tool_name, e.timeout_seconds, e.background_work_may_continue)
 ```
 
-The `background_work_may_continue` field appears on sync tool timeouts when the worker thread could not be cancelled — the call timed out but side effects may still occur.
+`ToolTimeoutError` carries three attributes:
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `tool_name` | `str` | Name of the tool that timed out |
+| `timeout_seconds` | `float` | The per-call limit that was exceeded |
+| `background_work_may_continue` | `bool` | `True` only when a started sync worker could not be cancelled; async tools cancel cleanly (`False`) |
+
+<Note>
+Once half the pool's workers are permanently leaked to stuck sync tools, the pool is automatically recycled: leaked threads continue until their syscall returns, but new tool calls get a fresh pool instead of queueing behind them.
+</Note>
 
 See [Tool Configuration](/configuration/tool-config#wrapper-level-tool-timeout) for full details and [Concurrency](/features/concurrency#timeout-return-shape) for shape comparison.
 
