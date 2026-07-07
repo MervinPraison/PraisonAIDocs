@@ -95,24 +95,34 @@ agent.start("Hello!")
 Place plugins in `~/.praisonai/plugins/` (user-wide) or `./.praisonai/plugins/` (project-specific).
 </Note>
 
+<Warning>
+`plugins.enable()` auto-discovers filesystem and entry-point plugins only when `PRAISONAI_ALLOW_PLUGIN_DISCOVERY=true` (or `1`/`yes`). Without this env var, `plugins.enable()` still bridges plugins you register manually via `PluginManager.register(...)`, but no directory or entry-point scan runs.
+</Warning>
+
 ---
 
 ## How It Works
 
+`plugins.enable()` auto-calls `wire_into_hook_registry()`, which registers each enabled plugin's lifecycle methods on the default hook registry the agent consults at runtime.
+
 ```mermaid
 sequenceDiagram
     participant User
+    participant Enable as plugins.enable()
+    participant Bridge as wire_into_hook_registry
+    participant Registry as Default HookRegistry
     participant Agent
-    participant Plugins
-    participant Tool
+    participant Plugin
 
-    User->>Agent: Ask a question
-    Agent->>Plugins: Run before_agent + before_tool hooks
-    Plugins-->>Agent: Adjusted tools / context
-    Agent->>Tool: Call a plugin tool
-    Tool-->>Agent: Result
-    Agent->>Plugins: Run after_agent guardrails
-    Agent-->>User: Final response
+    User->>Enable: plugins.enable()
+    Enable->>Bridge: auto-called
+    Bridge->>Registry: register before_agent, before_llm, ...
+    User->>Agent: agent.start("...")
+    Agent->>Registry: fire BEFORE_AGENT
+    Registry->>Plugin: run before_agent(prompt, ctx)
+    Plugin-->>Registry: modified prompt (in-place)
+    Registry-->>Agent: HookResult.allow()
+    Agent-->>User: response
 ```
 
 The hooks fire in this order around each agent run:
@@ -228,6 +238,83 @@ agent.start("Search for Python tutorials")
 
 ---
 
+## Lifecycle-Method Plugins
+
+Subclass `Plugin` and override a lifecycle method to transform prompts, messages, or responses. Call `plugins.enable()` to wire the method into the runtime.
+
+Create `~/.praisonai/plugins/pii_redactor.py`:
+
+```python
+"""
+Plugin Name: PII Redactor
+Description: Scrubs SSNs from LLM responses
+Version: 1.0.0
+"""
+import re
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class PIIRedactor(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="pii_redactor",
+            version="1.0.0",
+            description="Scrubs SSNs from LLM responses",
+            hooks=[PluginHook.AFTER_LLM],
+        )
+
+    def after_llm(self, response: str, usage: dict) -> str:
+        return re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[SSN]", response)
+
+def create_plugin():
+    return PIIRedactor()
+```
+
+Load and enable:
+
+```python
+from praisonaiagents import Agent, plugins
+
+plugins.enable()   # bridges lifecycle methods into the runtime hook registry
+
+agent = Agent(name="Assistant", instructions="Help users.")
+agent.start("My SSN is 123-45-6789")   # response is redacted before the user sees it
+```
+
+---
+
+## How the Bridge Works
+
+`plugins.enable()` auto-calls `wire_into_hook_registry()` — no manual step. Only lifecycle methods a plugin actually overrides (or declares in `PluginInfo.hooks`) are bridged, so a plugin with one guardrail never fires on every event. Return a new value and the bridge writes it back onto the payload in place. Errors in a lifecycle method are non-fatal, and `plugins.disable([...])` calls `unwire_from_hook_registry(name)` so the plugin truly stops firing.
+
+| Plugin method | Hook event | In-place mutation |
+|---------------|-----------|-------------------|
+| `before_agent(prompt, ctx)` | `BEFORE_AGENT` | Return a `str` → rewrites `data.prompt` |
+| `after_agent(response, ctx)` | `AFTER_AGENT` | Return a `str` → rewrites `data.response` |
+| `before_llm(messages, params)` | `BEFORE_LLM` | Return `(new_messages, ...)` → replaces `data.messages` |
+| `after_llm(response, usage)` | `AFTER_LLM` | Return a `str` → rewrites `data.response` |
+| `before_tool(name, args)` | `BEFORE_TOOL` | Return a `dict` → replaces `data.tool_input` |
+| `after_tool(name, result)` | `AFTER_TOOL` | Observational (no mutation) |
+| `before_tool_definitions(defs)` | `BEFORE_TOOL_DEFINITIONS` | Return a `list` → replaces `data.tool_definitions` |
+| `before_message(msg)` | `MESSAGE_RECEIVED` | Return `{"content": "..."}` → rewrites `data.content` |
+| `after_message(msg)` | `MESSAGE_SENDING` | Return `{"content": "..."}` → rewrites `data.content` |
+| `on_permission_ask(target, reason)` | `ON_PERMISSION_ASK` | `True`/`False`/`None` → allow/deny/allow |
+
+---
+
+## Ship a Plugin as a pip Package
+
+Register your plugin class in the `praisonai.plugins` entry-point group in `pyproject.toml`:
+
+```toml
+[project.entry-points."praisonai.plugins"]
+my_plugin = "my_package.plugins:MyPlugin"
+```
+
+`plugins.enable()` auto-discovers and bridges it — no user code changes needed.
+
+---
+
 ## CLI Commands
 
 ```bash
@@ -263,6 +350,9 @@ Pass `tools=["get_weather"]` — the string must match the `@tool` function name
 </Accordion>
 <Accordion title="Use plugins.enable for built-ins">
 Enable `logging` and `metrics` without writing plugin files.
+</Accordion>
+<Accordion title="Call plugins.enable() to activate lifecycle methods">
+Tools and guardrails work without `plugins.enable()`. But lifecycle-method plugins (subclasses of `Plugin` that override `before_llm`, `after_llm`, and so on) only fire after you call `plugins.enable()` — that wires them into the runtime hook registry.
 </Accordion>
 </AccordionGroup>
 
