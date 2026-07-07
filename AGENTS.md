@@ -67,14 +67,16 @@ Documentation MUST reflect SDK ground truth.
 | Skills | `praisonaiagents/skills/` | `docs/features/` (new pages) or `docs/concepts/skills.mdx` (existing, human-only) |
 | Memory | `praisonaiagents/memory/` | `docs/features/` (new pages) or `docs/concepts/memory.mdx` (existing, human-only) |
 | Knowledge | `praisonaiagents/knowledge/` | `docs/features/` (new pages) or `docs/concepts/knowledge.mdx` (existing, human-only) |
+| Terminal CLI | `praisonai_code/cli/`, `praisonai_code/runtime/` | `docs/cli/`, `docs/features/` |
+| Bots / gateway | `praisonai_bot/bots/`, `praisonai_bot/gateway/` | `docs/features/`, `docs/gateway.mdx` |
 
 > [!CAUTION]
 > **AI agents: always write new pages to `docs/features/`** — the `docs/concepts/*.mdx` paths listed above are existing human-approved pages (read-only for AI). See §1.9 (Folder Placement Rules) for the full rules.
 
 
-In **PraisonAIDocs**, "SDK Location" paths are under **repo root** `praisonaiagents/` (not `src/`).
+In **PraisonAIDocs**, synced Python source is at **repo root** (not `src/`): `praisonaiagents/`, `praisonai/`, `praisonai_code/`, `praisonai_bot/`, and `examples/`.
 
-**Reference folders (check these for any doc proposal, edit, or new page):** repo-root `praisonaiagents/` and `praisonai/`. Synced daily via `update_repos.sh` / `.github/workflows/update-repos.yml`. Reject or correct proposals that conflict with code there; do not document behaviour absent from those trees (use TS/Rust paths below when documenting those SDKs).
+**Reference folders (check these for any doc proposal, edit, or new page):** the four packages above. Synced daily via `update_repos.sh` / `.github/workflows/update-repos.yml`. Reject or correct proposals that conflict with code there. For bot, gateway, or terminal CLI behaviour, read `praisonai_bot/` and `praisonai_code/` first — `praisonai.bots` / `praisonai.gateway` may be shims. TypeScript and Rust paths below are submodule-only.
 
 > [!IMPORTANT]
 > **§1.4 vs §1.9 Precedence:** The "Docs Location" column above describes the **current canonical location** of existing pages — it is not a directive to create new pages in `docs/concepts/`. For **new** feature pages, always default to `docs/features/` (per §1.9). For **edits to existing** `docs/concepts/` pages, explicit per-file human approval is required before any AI agent may make changes (per §1.9). AI agents following the SDK-First Documentation Cycle (§1.2) that encounter a `docs/concepts/` mapping in this table should document the feature in `docs/features/` instead, unless a human has explicitly approved edits to the specific concept page.
@@ -83,11 +85,12 @@ In **PraisonAIDocs**, "SDK Location" paths are under **repo root** `praisonaiage
 
 PraisonAI has three SDK implementations. Use these paths as source of truth:
 
-> **Path note:** Only the Python SDK is synced into this repo at `praisonaiagents/` (source of truth for Python docs). The TypeScript and Rust upstream paths below are in the separate `praisonai-package` submodule and are **not** present in this repo root — they are used only by the auto-generation scripts.
+> **Path note:** Python tiers synced at repo root: `praisonaiagents/` (core SDK), `praisonai/` (wrapper), `praisonai_code/` (terminal CLI), `praisonai_bot/` (bots/gateway). TypeScript and Rust upstream paths below live in the `praisonai-package` submodule and are **not** copied by the daily sync — auto-generation scripts only.
 
 | SDK | Source Code Path | Documentation Path | Parity Tracker |
 |-----|------------------|-------------------|----------------|
-| **Python** | Repo root `praisonaiagents/` (synced copy; upstream: `praisonai-package/src/praisonai-agents/`) | `docs/features/`, `docs/concepts/` (human-only) | `docs/features/DOCS_PARITY.md` |
+| **Python (core)** | `praisonaiagents/` | `docs/features/`, `docs/concepts/` (human-only) | `docs/features/DOCS_PARITY.md` |
+| **Python (CLI / bot)** | `praisonai_code/`, `praisonai_bot/`, `praisonai/` | `docs/cli/`, `docs/features/`, `docs/gateway.mdx` | `docs/features/DOCS_PARITY.md` |
 | **TypeScript/JS** | `praisonai-package/src/praisonai-ts/src/` (submodule only) | `docs/js/` | `docs/js/DOCS_PARITY.md` |
 | **Rust** | `praisonai-package/src/praisonai-rust/src/` (submodule only) | `docs/rust/` | `docs/rust/DOCS_PARITY.md` |
 
@@ -393,6 +396,10 @@ from praisonaiagents.mcp import MCP
 # Workflow primitives — use the friendly top-level import
 from praisonaiagents import when, parallel, loop
 # NOT: from praisonaiagents.workflows import when, parallel, loop
+
+# Terminal CLI / bot (when documenting those tiers — verify path in synced source)
+from praisonai_bot.bots import Bot
+from praisonai_code.cli.main import main  # example; confirm in praisonai_code/
 ```
 
 ### 5.3 Example Structure
