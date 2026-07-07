@@ -1,0 +1,405 @@
+"""
+Output formatters for the Doctor CLI module.
+
+Provides text and JSON formatting with secret redaction.
+"""
+
+import json
+import re
+import sys
+from typing import Any, Dict, List, Optional, TextIO
+from .models import CheckResult, CheckStatus, DoctorReport, ReportSummary
+
+
+# Patterns for detecting secrets
+SECRET_PATTERNS = [
+    re.compile(r'(sk-[a-zA-Z0-9]{20,})', re.IGNORECASE),  # OpenAI
+    re.compile(r'(sk-ant-[a-zA-Z0-9-]{20,})', re.IGNORECASE),  # Anthropic
+    re.compile(r'(AIza[a-zA-Z0-9_-]{35})', re.IGNORECASE),  # Google
+    re.compile(r'(tvly-[a-zA-Z0-9]{20,})', re.IGNORECASE),  # Tavily
+    re.compile(r'(xai-[a-zA-Z0-9]{20,})', re.IGNORECASE),  # xAI
+    re.compile(r'([a-zA-Z0-9_-]*api[_-]?key[a-zA-Z0-9_-]*=\s*["\']?[a-zA-Z0-9_-]{16,})', re.IGNORECASE),
+    re.compile(r'([a-zA-Z0-9_-]*token[a-zA-Z0-9_-]*=\s*["\']?[a-zA-Z0-9_-]{16,})', re.IGNORECASE),
+    re.compile(r'([a-zA-Z0-9_-]*secret[a-zA-Z0-9_-]*=\s*["\']?[a-zA-Z0-9_-]{16,})', re.IGNORECASE),
+    re.compile(r'(password\s*=\s*["\']?[^\s"\']{8,})', re.IGNORECASE),
+]
+
+# Known API key environment variable names
+API_KEY_ENV_VARS = [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "TAVILY_API_KEY",
+    "EXA_API_KEY",
+    "COHERE_API_KEY",
+    "HUGGINGFACE_API_KEY",
+    "HF_TOKEN",
+    "LANGFUSE_PUBLIC_KEY",
+    "LANGFUSE_SECRET_KEY",
+    "LANGSMITH_API_KEY",
+    "AGENTOPS_API_KEY",
+    "WANDB_API_KEY",
+    "DATADOG_API_KEY",
+    "BRAINTRUST_API_KEY",
+    "YDC_API_KEY",
+]
+
+
+def redact_secrets(text: str, show_prefix_suffix: bool = False) -> str:
+    """
+    Redact secrets from text.
+    
+    Args:
+        text: Text to redact
+        show_prefix_suffix: If True, show first 4 and last 4 chars
+        
+    Returns:
+        Text with secrets redacted
+    """
+    if not text:
+        return text
+    
+    result = text
+    
+    for pattern in SECRET_PATTERNS:
+        def replace_match(match):
+            secret = match.group(1)
+            if show_prefix_suffix and len(secret) > 12:
+                return f"{secret[:4]}...{secret[-4:]}"
+            return "***REDACTED***"
+        result = pattern.sub(replace_match, result)
+    
+    return result
+
+
+def redact_dict(data: Dict[str, Any], show_prefix_suffix: bool = False) -> Dict[str, Any]:
+    """
+    Recursively redact secrets from a dictionary.
+    
+    Args:
+        data: Dictionary to redact
+        show_prefix_suffix: If True, show first 4 and last 4 chars
+        
+    Returns:
+        Dictionary with secrets redacted
+    """
+    result = {}
+    for key, value in data.items():
+        if isinstance(value, str):
+            # Check if key suggests it's a secret
+            key_lower = key.lower()
+            if any(s in key_lower for s in ["key", "token", "secret", "password", "credential"]):
+                if show_prefix_suffix and len(value) > 12:
+                    result[key] = f"{value[:4]}...{value[-4:]}"
+                else:
+                    result[key] = "***REDACTED***"
+            else:
+                result[key] = redact_secrets(value, show_prefix_suffix)
+        elif isinstance(value, dict):
+            result[key] = redact_dict(value, show_prefix_suffix)
+        elif isinstance(value, list):
+            result[key] = [
+                redact_dict(v, show_prefix_suffix) if isinstance(v, dict)
+                else redact_secrets(v, show_prefix_suffix) if isinstance(v, str)
+                else v
+                for v in value
+            ]
+        else:
+            result[key] = value
+    return result
+
+
+class BaseFormatter:
+    """Base class for output formatters."""
+    
+    def __init__(
+        self,
+        no_color: bool = False,
+        quiet: bool = False,
+        redact: bool = True,
+        show_prefix_suffix: bool = False,
+    ):
+        self.no_color = no_color or not sys.stdout.isatty()
+        self.quiet = quiet
+        self.redact = redact
+        self.show_prefix_suffix = show_prefix_suffix
+    
+    def format_report(self, report: DoctorReport) -> str:
+        """Format a complete report."""
+        raise NotImplementedError
+    
+    def format_result(self, result: CheckResult) -> str:
+        """Format a single check result."""
+        raise NotImplementedError
+    
+    def _safe_write(self, output: TextIO, text: str) -> None:
+        """Write text, falling back to ASCII on legacy-console encoding errors.
+
+        On Windows consoles using a legacy code page (e.g. cp1252), writing
+        Unicode characters raises UnicodeEncodeError. When that happens we
+        retry with an ASCII-safe representation so the command never crashes.
+        """
+        try:
+            output.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(output, "encoding", None) or "ascii"
+            safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            output.write(safe_text)
+
+    def write(self, report: DoctorReport, output: Optional[TextIO] = None) -> None:
+        """Write formatted report to output."""
+        output = output or sys.stdout
+        rendered = self.format_report(report)
+        if not rendered.endswith("\n"):
+            rendered += "\n"
+        self._safe_write(output, rendered)
+
+
+class TextFormatter(BaseFormatter):
+    """Text formatter with optional color support."""
+    
+    def __init__(
+        self,
+        no_color: bool = False,
+        quiet: bool = False,
+        redact: bool = True,
+        show_prefix_suffix: bool = False,
+    ):
+        super().__init__(no_color, quiet, redact, show_prefix_suffix)
+        # Cache encoding detection result at initialization
+        self._unicode_supported = self._can_encode_unicode()
+    
+    # ANSI color codes
+    COLORS = {
+        "reset": "\033[0m",
+        "bold": "\033[1m",
+        "dim": "\033[2m",
+        "red": "\033[31m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "cyan": "\033[36m",
+        "white": "\033[37m",
+    }
+    
+    STATUS_COLORS = {
+        CheckStatus.PASS: "green",
+        CheckStatus.WARN: "yellow",
+        CheckStatus.FAIL: "red",
+        CheckStatus.SKIP: "dim",
+        CheckStatus.ERROR: "red",
+    }
+    
+    STATUS_SYMBOLS = {
+        CheckStatus.PASS: "✓",
+        CheckStatus.WARN: "⚠",
+        CheckStatus.FAIL: "✗",
+        CheckStatus.SKIP: "○",
+        CheckStatus.ERROR: "✗",
+    }
+    
+    # ASCII fallback symbols for systems that don't support UTF-8
+    STATUS_SYMBOLS_ASCII = {
+        CheckStatus.PASS: "[OK]",
+        CheckStatus.WARN: "[!]",
+        CheckStatus.FAIL: "[X]",
+        CheckStatus.SKIP: "[-]",
+        CheckStatus.ERROR: "[X]",
+    }
+    
+    # Divider character with ASCII fallback for legacy (cp1252) consoles
+    DIVIDER_UNICODE = "━"
+    DIVIDER_ASCII = "-"
+
+    def _color(self, text: str, color: str) -> str:
+        """Apply color to text if colors are enabled."""
+        if self.no_color:
+            return text
+        return f"{self.COLORS.get(color, '')}{text}{self.COLORS['reset']}"
+
+    def _divider(self, width: int = 70) -> str:
+        """Return a horizontal divider, using ASCII on non-Unicode consoles."""
+        char = self.DIVIDER_UNICODE if self._unicode_supported else self.DIVIDER_ASCII
+        return char * width
+    
+    def _can_encode_unicode(self) -> bool:
+        """Check if stdout can encode Unicode symbols."""
+        try:
+            # Get stdout encoding
+            encoding = getattr(sys.stdout, 'encoding', 'ascii') or 'ascii'
+            
+            # UTF-8 always supports Unicode
+            if encoding.lower() in ('utf-8', 'utf8'):
+                return True
+                
+            # Test if we can encode our specific Unicode symbols
+            test_symbols = ["✓", "⚠", "✗", "○", self.DIVIDER_UNICODE]
+            for symbol in test_symbols:
+                try:
+                    symbol.encode(encoding, errors='strict')
+                except (UnicodeEncodeError, LookupError):
+                    return False
+            return True
+        except (AttributeError, TypeError):
+            # If we can't determine encoding, assume ASCII-only is safer
+            return False
+    
+    def _status_symbol(self, status: CheckStatus) -> str:
+        """Get colored status symbol with encoding safety."""
+        if self._unicode_supported:
+            symbol = self.STATUS_SYMBOLS.get(status, "?")
+        else:
+            symbol = self.STATUS_SYMBOLS_ASCII.get(status, "[?]")
+        color = self.STATUS_COLORS.get(status, "white")
+        return self._color(symbol, color)
+    
+    def format_result(self, result: CheckResult) -> str:
+        """Format a single check result."""
+        symbol = self._status_symbol(result.status)
+        message = result.message
+        if self.redact:
+            message = redact_secrets(message, self.show_prefix_suffix)
+        
+        line = f"{symbol} {result.title}: {message}"
+        
+        if result.details and not self.quiet:
+            details = result.details
+            if self.redact:
+                details = redact_secrets(details, self.show_prefix_suffix)
+            line += f"\n    {self._color(details, 'dim')}"
+        
+        if result.remediation and result.status in (CheckStatus.FAIL, CheckStatus.ERROR):
+            line += f"\n    {self._color('Fix:', 'yellow')} {result.remediation}"
+        
+        return line
+    
+    def format_summary(self, summary: ReportSummary, strict: bool = False) -> str:
+        """Format the summary section."""
+        parts = []
+        
+        if summary.passed > 0:
+            parts.append(self._color(f"{summary.passed} passed", "green"))
+        if summary.warnings > 0:
+            color = "red" if strict else "yellow"
+            parts.append(self._color(f"{summary.warnings} warnings", color))
+        if summary.failed > 0:
+            parts.append(self._color(f"{summary.failed} failed", "red"))
+        if summary.skipped > 0:
+            parts.append(self._color(f"{summary.skipped} skipped", "dim"))
+        if summary.errors > 0:
+            parts.append(self._color(f"{summary.errors} errors", "red"))
+        
+        return f"{summary.total} checks: " + ", ".join(parts)
+
+    def format_next_steps(self, report: DoctorReport) -> str:
+        """Format a numbered list of remediation steps (Hermes-style footer).
+
+        Returns an empty string when there are no warnings or failures.
+        """
+        actionable = [
+            r for r in report.results
+            if r.status in (CheckStatus.WARN, CheckStatus.FAIL, CheckStatus.ERROR)
+        ]
+        if not actionable:
+            return ""
+
+        lines = [self._color("Next steps:", "bold")]
+        for idx, result in enumerate(actionable, start=1):
+            remediation = result.remediation or result.message
+            if self.redact:
+                remediation = redact_secrets(remediation, self.show_prefix_suffix)
+            symbol = self._status_symbol(result.status)
+            lines.append(f"  {idx}. {symbol} {result.title}: {remediation}")
+        return "\n".join(lines)
+
+    def format_report(self, report: DoctorReport) -> str:
+        """Format a complete report."""
+        lines = []
+        
+        # Header
+        if not self.quiet:
+            header = f"PraisonAI Doctor v{report.version}"
+            lines.append(self._color(header, "bold"))
+            lines.append(self._divider())
+        
+        # Results
+        for result in report.results:
+            lines.append(self.format_result(result))
+        
+        # Summary
+        if not self.quiet:
+            lines.append(self._divider())
+        lines.append(self.format_summary(report.summary))
+        
+        # Duration
+        if not self.quiet and report.duration_ms > 0:
+            lines.append(self._color(f"Completed in {report.duration_ms:.0f}ms", "dim"))
+
+        # Numbered next steps footer (only when there are warnings/failures)
+        if not self.quiet:
+            next_steps = self.format_next_steps(report)
+            if next_steps:
+                lines.append(self._divider())
+                lines.append(next_steps)
+
+        return "\n".join(lines)
+
+
+class JsonFormatter(BaseFormatter):
+    """JSON formatter with deterministic output."""
+    
+    def format_result(self, result: CheckResult) -> str:
+        """Format a single check result as JSON."""
+        data = result.to_dict()
+        if self.redact:
+            data = redact_dict(data, self.show_prefix_suffix)
+        return json.dumps(data, indent=2, sort_keys=True)
+    
+    def format_report(self, report: DoctorReport) -> str:
+        """Format a complete report as JSON."""
+        data = report.to_dict()
+        if self.redact:
+            data = redact_dict(data, self.show_prefix_suffix)
+        
+        # Ensure deterministic ordering
+        return json.dumps(data, indent=2, sort_keys=True)
+    
+    # write() is inherited from BaseFormatter: it appends a trailing newline
+    # when absent (json.dumps never emits one) and routes through _safe_write,
+    # so the behaviour is identical and no override is needed.
+
+
+def get_formatter(
+    format_type: str = "text",
+    no_color: bool = False,
+    quiet: bool = False,
+    redact: bool = True,
+    show_prefix_suffix: bool = False,
+) -> BaseFormatter:
+    """
+    Get a formatter instance.
+    
+    Args:
+        format_type: "text" or "json"
+        no_color: Disable ANSI colors
+        quiet: Minimal output
+        redact: Redact secrets
+        show_prefix_suffix: Show partial secrets
+        
+    Returns:
+        Formatter instance
+    """
+    if format_type == "json":
+        return JsonFormatter(
+            no_color=True,  # JSON never has colors
+            quiet=quiet,
+            redact=redact,
+            show_prefix_suffix=show_prefix_suffix,
+        )
+    return TextFormatter(
+        no_color=no_color,
+        quiet=quiet,
+        redact=redact,
+        show_prefix_suffix=show_prefix_suffix,
+    )

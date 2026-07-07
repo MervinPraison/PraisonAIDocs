@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from ..errors import AgentErrorKind, FailoverDecision, IdleTimeoutBreaker
 # Gap 2: Tool call execution imports
 from ..tools.call_executor import ToolCall, create_tool_call_executor
-from ..tools.schema import annotation_to_json_schema, get_parameter_requirements
+from ..tools.schema import build_tool_definition
 # Display functions - lazy loaded to avoid importing rich at startup
 # These are only needed when output=verbose
 _display_module = None
@@ -286,6 +286,19 @@ Respond with ONLY a valid JSON tool call in this format:
             # If litellm not installed, we'll handle it in __init__
             pass
 
+    def _should_log_config(self, verbose=None):
+        """Cheap predicate for whether debug config logging is enabled.
+
+        Lets callers skip building large debug-only argument dicts (including
+        ``str(kwargs)``) on the common non-debug path.
+
+        Args:
+            verbose: Optional per-call verbose value; falls back to ``self.verbose``.
+        """
+        if verbose is None:
+            verbose = self.verbose if hasattr(self, 'verbose') else False
+        return get_logger().getEffectiveLevel() == logging.DEBUG or (not isinstance(verbose, bool) and verbose >= 10)
+
     def _log_llm_config(self, method_name: str, **config):
         """Centralized debug logging for LLM configuration and parameters.
         
@@ -295,7 +308,7 @@ Respond with ONLY a valid JSON tool call in this format:
         """
         # Check for debug logging - either global debug level OR explicit verbose mode
         verbose = config.get('verbose', self.verbose if hasattr(self, 'verbose') else False)
-        should_log = get_logger().getEffectiveLevel() == logging.DEBUG or (not isinstance(verbose, bool) and verbose >= 10)
+        should_log = self._should_log_config(verbose)
         
         if should_log:
             # Mask sensitive information
@@ -417,6 +430,10 @@ Respond with ONLY a valid JSON tool call in this format:
         self._claude_memory_tool = None  # Lazy initialized
         self._console = None  # Lazy load console when needed
         self.max_iter = max_iter or 20  # Default to 20 to match ExecutionConfig default
+        # Structured stop reason for the last tool-execution loop:
+        # "completed" | "max_steps" | "error". Lets callers distinguish a finished
+        # task from one truncated by the step budget (see ExecutionConfig.max_steps).
+        self._last_stop_reason = "completed"
         self._idle_timeout_breaker = IdleTimeoutBreaker()  # Circuit breaker for idle timeouts
         self.chat_history = []
         self.verbose = extra_settings.get('verbose', True)
@@ -2198,6 +2215,16 @@ Now provide your final answer using this result. Summarize the information natur
         """Enhanced get_response with all OpenAI-like features"""
         logging.debug(f"Getting response from {self.model}")
         
+        # G2: Cooperative cancellation - honour InterruptController between tool iterations
+        # so /stop (and cancellation generally) halts mid-flight runs on every provider.
+        cancel_token = kwargs.pop("cancel_token", None)
+
+        def _is_cancelled() -> bool:
+            return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
+
+        def _cancel_reason() -> str:
+            return getattr(cancel_token, "reason", None) or "user"
+
         # Variable to store final response for token usage extraction
         _final_llm_response = None
 
@@ -2210,54 +2237,56 @@ Now provide your final answer using this result. Summarize the information natur
                 token_usage = TokenUsage()
             return text, token_usage
 
-        # Log all self values when in debug mode
-        self._log_llm_config(
-            'LLM instance',
-            model=self.model,
-            timeout=self.timeout,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            n=self.n,
-            max_tokens=self.max_tokens,
-            presence_penalty=self.presence_penalty,
-            frequency_penalty=self.frequency_penalty,
-            logit_bias=self.logit_bias,
-            response_format=self.response_format,
-            seed=self.seed,
-            logprobs=self.logprobs,
-            top_logprobs=self.top_logprobs,
-            api_version=self.api_version,
-            stop_phrases=self.stop_phrases,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            verbose=self.verbose,
-            markdown=self.markdown,
-            reflection=self.self_reflect,
-            max_reflect=self.max_reflect,
-            min_reflect=self.min_reflect,
-            reasoning_steps=self.reasoning_steps
-        )
-        
-        # Log the parameter values passed to get_response
-        self._log_llm_config(
-            'get_response parameters',
-            prompt=prompt,
-            system_prompt=system_prompt,
-            chat_history=chat_history,
-            temperature=temperature,
-            tools=tools,
-            output_json=output_json,
-            output_pydantic=output_pydantic,
-            verbose=verbose,
-            markdown=markdown,
-            reflection=self_reflect,
-            max_reflect=max_reflect,
-            min_reflect=min_reflect,
-            agent_name=agent_name,
-            agent_role=agent_role,
-            agent_tools=agent_tools,
-            kwargs=str(kwargs)
-        )
+        # Log all self values when in debug mode (skip building dicts otherwise)
+        if self._should_log_config(self.verbose):
+            self._log_llm_config(
+                'LLM instance',
+                model=self.model,
+                timeout=self.timeout,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                n=self.n,
+                max_tokens=self.max_tokens,
+                presence_penalty=self.presence_penalty,
+                frequency_penalty=self.frequency_penalty,
+                logit_bias=self.logit_bias,
+                response_format=self.response_format,
+                seed=self.seed,
+                logprobs=self.logprobs,
+                top_logprobs=self.top_logprobs,
+                api_version=self.api_version,
+                stop_phrases=self.stop_phrases,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                verbose=self.verbose,
+                markdown=self.markdown,
+                reflection=self.self_reflect,
+                max_reflect=self.max_reflect,
+                min_reflect=self.min_reflect,
+                reasoning_steps=self.reasoning_steps
+            )
+
+        # Log the parameter values passed to get_response (skip str(kwargs) otherwise)
+        if self._should_log_config(verbose):
+            self._log_llm_config(
+                'get_response parameters',
+                prompt=prompt,
+                system_prompt=system_prompt,
+                chat_history=chat_history,
+                temperature=temperature,
+                tools=tools,
+                output_json=output_json,
+                output_pydantic=output_pydantic,
+                verbose=verbose,
+                markdown=markdown,
+                reflection=self_reflect,
+                max_reflect=max_reflect,
+                min_reflect=min_reflect,
+                agent_name=agent_name,
+                agent_role=agent_role,
+                agent_tools=agent_tools,
+                kwargs=str(kwargs)
+            )
         try:
             import litellm
             # This below **kwargs** is passed to .completion() directly. so reasoning_steps has to be popped. OR find alternate best way of handling this.
@@ -2318,8 +2347,17 @@ Now provide your final answer using this result. Summarize the information natur
             response_text = ""  # Initialize to prevent UnboundLocalError on API errors
             stored_reasoning_content = None  # Store reasoning content from tool execution
             accumulated_tool_results = []  # Store all tool results across iterations
+            # Structured stop reason so callers can distinguish completion from
+            # truncation (unified with the OpenAI-native path). "completed" default.
+            self._last_stop_reason = "completed"
 
             while iteration_count < max_iterations:
+                # G2: Check for cancellation at the top of each tool iteration so a
+                # /stop request promptly halts a mid-flight run on every provider.
+                if _is_cancelled():
+                    reason = _cancel_reason()
+                    logging.debug(f"LLM tool loop cancelled: {reason}")
+                    return _prepare_return_value(f"Task interrupted: {reason}")
                 try:
                     # Get response from LiteLLM
                     current_time = time.time()
@@ -2495,6 +2533,7 @@ Now provide your final answer using this result. Summarize the information natur
 
                             # Safety: break after max_iter iterations
                             if iteration_count >= self.max_iter:
+                                self._last_stop_reason = "max_steps"
                                 final_response_text = self._finalise_on_limit(
                                     messages, response_text, temperature=temperature,
                                     **{k: v for k, v in kwargs.items() if k != 'reasoning_steps'}
@@ -3180,7 +3219,9 @@ Now provide your final answer using this result. Summarize the information natur
                         # Allow execution if we haven't reached the limit yet, but limit the batch size
                         if tool_call_count >= max_tool_calls_per_turn:
                             logging.warning(f"Tool call limit reached ({max_tool_calls_per_turn}). Stopping to prevent infinite loop.")
-                            final_response_text = f"Tool call limit reached ({max_tool_calls_per_turn} calls). Task may be too complex or there may be a broken tool causing repeated calls."
+                            self._last_stop_reason = "max_steps"
+                            if not (final_response_text and final_response_text.strip()):
+                                final_response_text = f"Tool call limit reached ({max_tool_calls_per_turn} calls). Task may be too complex or there may be a broken tool causing repeated calls."
                             break
                         elif tool_call_count + len(tool_calls) > max_tool_calls_per_turn:
                             # Limit the batch to stay within the total limit
@@ -3320,6 +3361,7 @@ Now provide your final answer using this result. Summarize the information natur
                         
                         # Safety check: prevent infinite loops for any provider
                         if iteration_count >= self.max_iter:
+                            self._last_stop_reason = "max_steps"
                             final_response_text = self._finalise_on_limit(
                                 messages, response_text, temperature=temperature,
                                 **{k: v for k, v in kwargs.items() if k != 'reasoning_steps'}
@@ -4072,57 +4114,69 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         **kwargs
     ) -> str:
         """Async version of get_response with identical functionality."""
+        # G2: Cooperative cancellation - honour InterruptController between tool iterations
+        # so /stop (and cancellation generally) halts mid-flight runs on every provider.
+        cancel_token = kwargs.pop("cancel_token", None)
+
+        def _is_cancelled() -> bool:
+            return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
+
+        def _cancel_reason() -> str:
+            return getattr(cancel_token, "reason", None) or "user"
+
         try:
             import litellm
             logging.debug(f"Getting async response from {self.model}")
-            # Log all self values when in debug mode
-            self._log_llm_config(
-                'get_response_async',
-                model=self.model,
-                timeout=self.timeout,
-                temperature=self.temperature,
-                top_p=self.top_p,
-                n=self.n,
-                max_tokens=self.max_tokens,
-                presence_penalty=self.presence_penalty,
-                frequency_penalty=self.frequency_penalty,
-                logit_bias=self.logit_bias,
-                response_format=self.response_format,
-                seed=self.seed,
-                logprobs=self.logprobs,
-                top_logprobs=self.top_logprobs,
-                api_version=self.api_version,
-                stop_phrases=self.stop_phrases,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                verbose=self.verbose,
-                markdown=self.markdown,
-                reflection=self.self_reflect,
-                max_reflect=self.max_reflect,
-                min_reflect=self.min_reflect,
-                reasoning_steps=self.reasoning_steps
-            )
-            
-            # Log the parameter values passed to get_response_async
-            self._log_llm_config(
-                'get_response_async parameters',
-                prompt=prompt,
-                system_prompt=system_prompt,
-                chat_history=chat_history,
-                temperature=temperature,
-                tools=tools,
-                output_json=output_json,
-                output_pydantic=output_pydantic,
-                verbose=verbose,
-                markdown=markdown,
-                reflection=self_reflect,
-                max_reflect=max_reflect,
-                min_reflect=min_reflect,
-                agent_name=agent_name,
-                agent_role=agent_role,
-                agent_tools=agent_tools,
-                kwargs=str(kwargs)
-            )
+            # Log all self values when in debug mode (skip building dicts otherwise)
+            if self._should_log_config(self.verbose):
+                self._log_llm_config(
+                    'get_response_async',
+                    model=self.model,
+                    timeout=self.timeout,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    n=self.n,
+                    max_tokens=self.max_tokens,
+                    presence_penalty=self.presence_penalty,
+                    frequency_penalty=self.frequency_penalty,
+                    logit_bias=self.logit_bias,
+                    response_format=self.response_format,
+                    seed=self.seed,
+                    logprobs=self.logprobs,
+                    top_logprobs=self.top_logprobs,
+                    api_version=self.api_version,
+                    stop_phrases=self.stop_phrases,
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                    verbose=self.verbose,
+                    markdown=self.markdown,
+                    reflection=self.self_reflect,
+                    max_reflect=self.max_reflect,
+                    min_reflect=self.min_reflect,
+                    reasoning_steps=self.reasoning_steps
+                )
+
+            # Log the parameter values passed to get_response_async (skip str(kwargs) otherwise)
+            if self._should_log_config(verbose):
+                self._log_llm_config(
+                    'get_response_async parameters',
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    chat_history=chat_history,
+                    temperature=temperature,
+                    tools=tools,
+                    output_json=output_json,
+                    output_pydantic=output_pydantic,
+                    verbose=verbose,
+                    markdown=markdown,
+                    reflection=self_reflect,
+                    max_reflect=max_reflect,
+                    min_reflect=min_reflect,
+                    agent_name=agent_name,
+                    agent_role=agent_role,
+                    agent_tools=agent_tools,
+                    kwargs=str(kwargs)
+                )
             reasoning_steps = kwargs.pop('reasoning_steps', self.reasoning_steps)
             litellm.set_verbose = False
 
@@ -4150,8 +4204,16 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             final_response_text = ""
             stored_reasoning_content = None  # Store reasoning content from tool execution
             accumulated_tool_results = []  # Store all tool results across iterations
+            # Structured stop reason (unified with the OpenAI-native path).
+            self._last_stop_reason = "completed"
 
             while iteration_count < max_iterations:
+                # G2: Check for cancellation at the top of each tool iteration so a
+                # /stop request promptly halts a mid-flight run on every provider.
+                if _is_cancelled():
+                    reason = _cancel_reason()
+                    logging.debug(f"Async LLM tool loop cancelled: {reason}")
+                    return f"Task interrupted: {reason}"
                 response_text = ""
                 reasoning_content = None
                 tool_calls = []
@@ -4223,7 +4285,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # Allow execution if we haven't reached the limit yet, but limit the batch size
                         if tool_call_count >= max_tool_calls_per_turn:
                             logging.warning(f"Tool call limit reached ({max_tool_calls_per_turn}). Stopping to prevent infinite loop.")
-                            final_response_text = f"Tool call limit reached ({max_tool_calls_per_turn} calls). Task may be too complex or there may be a broken tool causing repeated calls."
+                            self._last_stop_reason = "max_steps"
+                            if not (final_response_text and final_response_text.strip()):
+                                final_response_text = f"Tool call limit reached ({max_tool_calls_per_turn} calls). Task may be too complex or there may be a broken tool causing repeated calls."
                             break
                         elif tool_call_count + len(tool_calls) > max_tool_calls_per_turn:
                             # Limit the batch to stay within the total limit
@@ -4260,6 +4324,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             })
 
                         if iteration_count >= self.max_iter:
+                            self._last_stop_reason = "max_steps"
                             final_response_text = await self._finalise_on_limit_async(
                                 messages, response_text, temperature=temperature,
                                 **{k: v for k, v in kwargs.items() if k != 'reasoning_steps'}
@@ -4452,7 +4517,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # Allow execution if we haven't reached the limit yet, but limit the batch size
                     if tool_call_count >= max_tool_calls_per_turn:
                         logging.warning(f"Tool call limit reached ({max_tool_calls_per_turn}). Stopping to prevent infinite loop.")
-                        final_response_text = f"Tool call limit reached ({max_tool_calls_per_turn} calls). Task may be too complex or there may be a broken tool causing repeated calls."
+                        self._last_stop_reason = "max_steps"
+                        if not (final_response_text and final_response_text.strip()):
+                            final_response_text = f"Tool call limit reached ({max_tool_calls_per_turn} calls). Task may be too complex or there may be a broken tool causing repeated calls."
                         break
                     elif tool_call_count + len(tool_calls) > max_tool_calls_per_turn:
                         # Limit the batch to stay within the total limit
@@ -4672,6 +4739,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Safety check: prevent infinite loops for any provider
                     if iteration_count >= self.max_iter:
+                        self._last_stop_reason = "max_steps"
                         final_response_text = await self._finalise_on_limit_async(
                             messages, response_text, temperature=temperature,
                             **{k: v for k, v in kwargs.items() if k != 'reasoning_steps'}
@@ -6087,86 +6155,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     logging.debug(f"Function {function_name} not found or not callable")
                     return None
 
-        import inspect
-        from typing import get_type_hints
-        
-        # Handle Langchain and CrewAI tools
-        if inspect.isclass(func) and hasattr(func, 'run') and not hasattr(func, '_run'):
-            original_func = func
-            func = func.run
-            function_name = original_func.__name__
-        elif inspect.isclass(func) and hasattr(func, '_run'):
-            original_func = func
-            func = func._run
-            function_name = original_func.__name__
-
-        sig = inspect.signature(func)
-        logging.debug(f"Function signature: {sig}")
-        
-        # Skip self, *args, **kwargs
-        parameters_list = []
-        for name, param in sig.parameters.items():
-            if name == "self":
-                continue
-            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                continue
-            parameters_list.append((name, param))
-
-        parameters = {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-        
-        # Parse docstring for parameter descriptions
-        docstring = inspect.getdoc(func)
-        logging.debug(f"Function docstring: {docstring}")
-        
-        param_descriptions = {}
-        if docstring:
-            import re
-            param_section = re.split(r'\s*Args:\s*', docstring)
-            logging.debug(f"Param section split: {param_section}")
-            if len(param_section) > 1:
-                param_lines = param_section[1].split('\n')
-                for line in param_lines:
-                    line = line.strip()
-                    if line and ':' in line:
-                        param_name, param_desc = line.split(':', 1)
-                        param_descriptions[param_name.strip()] = param_desc.strip()
-        
-        logging.debug(f"Parameter descriptions: {param_descriptions}")
-
-        # Get type hints for proper schema generation
-        try:
-            hints = get_type_hints(func) if getattr(func, "__annotations__", None) else {}
-        except (NameError, TypeError, AttributeError):
-            hints = getattr(func, "__annotations__", {}) or {}
-
-        for name, param in parameters_list:
-            # Get type annotation
-            param_type = hints.get(name, param.annotation if param.annotation != inspect.Parameter.empty else str)
-            
-            # Use new schema utility for proper type handling
-            prop_schema = annotation_to_json_schema(param_type)
-            
-            # Add description from docstring
-            prop_schema["description"] = param_descriptions.get(name, "Parameter description not available")
-            
-            parameters["properties"][name] = prop_schema
-            
-            # Check if required using improved logic
-            if get_parameter_requirements(sig, name):
-                parameters["required"].append(name)
-        
-        logging.debug(f"Generated parameters: {parameters}")
-        tool_def = {
-            "type": "function",
-            "function": {
-                "name": function_name,
-                "description": docstring.split('\n\n')[0] if docstring else "No description available",
-                "parameters": self._fix_array_schemas(parameters)
-            }
-        }
+        # Delegate signature introspection + schema generation to the shared
+        # core helper so all layers produce identical, provider-safe schemas
+        # (including array 'items' normalisation via fix_array_schemas).
+        from ..tools.schema import build_tool_definition
+        tool_def = build_tool_definition(func, function_name)
         logging.debug(f"Generated tool definition: {tool_def}")
         return tool_def

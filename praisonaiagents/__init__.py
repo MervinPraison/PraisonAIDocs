@@ -183,10 +183,7 @@ _LAZY_IMPORTS = {
     'Include': ('praisonaiagents.workflows', 'Include'),
     'MAX_NESTING_DEPTH': ('praisonaiagents.workflows', 'MAX_NESTING_DEPTH'),
     'YAMLWorkflowParser': ('praisonaiagents.workflows', 'YAMLWorkflowParser'),
-    'WorkflowManager': ('praisonaiagents.workflows', 'WorkflowManager'),
     'WorkflowHooksConfig': ('praisonaiagents.workflows', 'WorkflowHooksConfig'),
-    'WorkflowPlanningConfig': ('praisonaiagents.workflows', 'WorkflowPlanningConfig'),
-    'WorkflowMemoryConfig': ('praisonaiagents.workflows', 'WorkflowMemoryConfig'),
     
     # Conditions (Protocol-driven condition evaluation)
     'ConditionProtocol': ('praisonaiagents.conditions.protocols', 'ConditionProtocol'),
@@ -408,6 +405,7 @@ _LAZY_IMPORTS = {
     'KnowledgeConfig': ('praisonaiagents.config.feature_configs', 'KnowledgeConfig'),
     'PlanningConfig': ('praisonaiagents.config.feature_configs', 'PlanningConfig'),
     'ReflectionConfig': ('praisonaiagents.config.feature_configs', 'ReflectionConfig'),
+    'RulesConfig': ('praisonaiagents.config.feature_configs', 'RulesConfig'),
     'GuardrailConfig': ('praisonaiagents.config.feature_configs', 'GuardrailConfig'),
     'WebConfig': ('praisonaiagents.config.feature_configs', 'WebConfig'),
     'OutputConfig': ('praisonaiagents.config.feature_configs', 'OutputConfig'),
@@ -526,6 +524,9 @@ _LAZY_IMPORTS = {
     'BotConfig': ('praisonaiagents.bots.config', 'BotConfig'),
     'BotOSProtocol': ('praisonaiagents.bots.protocols', 'BotOSProtocol'),
     'BotOSConfig': ('praisonaiagents.bots.config', 'BotOSConfig'),
+    'PlatformCapabilities': ('praisonaiagents.bots.protocols', 'PlatformCapabilities'),
+    'BasePlatformAdapter': ('praisonaiagents.bots.base', 'BasePlatformAdapter'),
+    'SendResult': ('praisonaiagents.bots.base', 'SendResult'),
     
     # Sandbox protocols and config (implementations in praisonai wrapper)
     'SandboxProtocol': ('praisonaiagents.sandbox.protocols', 'SandboxProtocol'),
