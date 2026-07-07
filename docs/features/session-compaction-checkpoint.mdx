@@ -1,0 +1,188 @@
+---
+title: "Compacted Session Resume"
+sidebarTitle: "Compacted Resume"
+description: "Cheap --continue / session resume via persistent compaction checkpoints"
+icon: "bookmark"
+---
+
+When context compaction runs mid-conversation, the summary is now persisted so a later resume replays the compacted working history (summary + tail) instead of the full raw transcript.
+
+```mermaid
+graph LR
+    subgraph "Cheap resume"
+        Raw[📝 Raw transcript] --> Compact[📊 In-run compaction]
+        Compact --> Anchor[🔖 Persisted checkpoint]
+        Anchor --> Resume[⚡ Cheap resume]
+    end
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    class Raw input
+    class Compact,Anchor process
+    class Resume output
+```
+
+```python
+from praisonaiagents import Agent, ExecutionConfig
+
+agent = Agent(
+    name="LongChat",
+    instructions="Help across many sessions.",
+    memory={"session_id": "user-42-chat"},
+    execution=ExecutionConfig(context_compaction=True),
+)
+agent.start("Continue from yesterday.")  # resumes from summary + tail
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Enable compaction on a session-bound agent">
+
+Bind a `session_id` and turn on context compaction. When the window fills, the summary is written to the session automatically — no extra code.
+
+```python
+from praisonaiagents import Agent, ExecutionConfig
+
+agent = Agent(
+    name="LongChat",
+    instructions="Help across many sessions.",
+    memory={"session_id": "user-42-chat"},
+    execution=ExecutionConfig(context_compaction=True),
+)
+agent.start("Let's keep chatting for hours.")
+```
+
+</Step>
+
+<Step title="Resume later — cheaply">
+
+Recreate the agent with the same `session_id`. Resume replays the persisted summary plus any turns appended after compaction, instead of the whole raw log.
+
+```python
+from praisonaiagents import Agent, ExecutionConfig
+
+agent = Agent(
+    name="LongChat",
+    instructions="Help across many sessions.",
+    memory={"session_id": "user-42-chat"},
+    execution=ExecutionConfig(context_compaction=True),
+)
+agent.start("Pick up where we left off.")  # summary + tail, no window overflow
+```
+
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+The compactor produces a summary during the run; the store anchors that summary to the current end of the transcript. On resume the store hands back the summary followed by the retained tail.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Compactor
+    participant Store
+
+    User->>Agent: Long chat over many turns
+    Agent->>Compactor: Context near limit → compact
+    Compactor-->>Agent: summary + tail
+    Agent->>Store: append_compaction_checkpoint(summary)
+    User->>Agent: Later run — resume same session_id
+    Agent->>Store: get_working_history()
+    Store-->>Agent: [summary_message, *tail]
+    Agent-->>User: Continues cheaply, no window overflow
+```
+
+The checkpoint records `message_index` — the length of the transcript at compaction time. Anything appended after that index is the **tail** that follows the summary on resume. If the head is later trimmed, the anchor shifts by the same amount so the tail stays aligned.
+
+---
+
+## What Gets Persisted
+
+A single checkpoint is stored on `SessionData.last_compaction`. It carries the summary plus the anchor and observability counters.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `summary` | `str` | *(required)* | The condensed history the compactor produced |
+| `message_index` | `int` | `0` | Transcript length at compaction time; anything after this index is the tail |
+| `role` | `str` | `"system"` | Role used when replaying the summary as an LLM message |
+| `tokens_before` | `int` | `0` | Token count before compaction (observability) |
+| `tokens_after` | `int` | `0` | Token count after compaction (observability) |
+| `timestamp` | `float` | `time.time()` | When the checkpoint was written |
+| `metadata` | `Dict[str, Any]` | `{}` | Free-form extension slot |
+
+`SessionData` also gains two helpers:
+
+| Method | What it does |
+|---|---|
+| `trim_messages(max_messages)` | Trims the transcript head, shifting the checkpoint anchor so the tail stays aligned |
+| `get_working_history(max_messages=None)` | Reconstructs `[summary_message, *tail]`; falls back to `get_chat_history` when no checkpoint exists. The summary is always kept at the head — only the tail is truncated to `max_messages` |
+
+---
+
+## Advanced — Direct Store Access
+
+Persist and read a checkpoint yourself via the store. `CompactionCheckpoint` is a top-level export.
+
+```python
+from praisonaiagents import CompactionCheckpoint
+from praisonaiagents.session import DefaultSessionStore
+
+store = DefaultSessionStore()
+store.append_compaction_checkpoint("chat-42", "Earlier: we discussed X, Y, Z.")
+history = store.get_working_history("chat-42")   # summary + tail
+
+# Render a checkpoint as an LLM-compatible message
+checkpoint = CompactionCheckpoint(summary="Earlier: we discussed X, Y, Z.")
+message = checkpoint.as_message()   # {"role": "system", "content": "Earlier: ..."}
+```
+
+`append_compaction_checkpoint(session_id, summary, *, role="system", tokens_before=0, tokens_after=0, metadata=None)` returns `False` and is a no-op for a blank/whitespace summary, so an empty `{"role": "system", "content": ""}` is never replayed. See [Session Store](/docs/features/session-store#compaction-checkpoints) for the full method reference.
+
+---
+
+## Backward Compatibility
+
+Sessions without a checkpoint resume from their raw messages exactly as before — `get_working_history` falls back to `get_chat_history`. Third-party stores that implement only the old protocol keep working; the agent checks for `get_working_history` / `append_compaction_checkpoint` with `hasattr` before using them.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Bind a session_id">
+The checkpoint is persisted to the bound session. Without a `session_id`, compaction still runs in-memory but nothing is saved for a cheap resume.
+</Accordion>
+
+<Accordion title="Enable compaction on long-lived agents">
+Turn on `execution=ExecutionConfig(context_compaction=True)` for agents that run for hours or across many sessions — that's where checkpoint-backed resume pays off.
+</Accordion>
+
+<Accordion title="Don't hand-edit the checkpoint anchor">
+`message_index` is kept aligned by the store whenever the head is trimmed. Editing it by hand will misalign the retained tail on resume.
+</Accordion>
+
+<Accordion title="set_chat_history intentionally invalidates the checkpoint">
+Replacing the whole transcript with `set_chat_history()` clears `last_compaction` — the old anchor no longer applies. `clear_session()` clears it too.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={3}>
+  <Card title="Session Persistence" icon="floppy-disk" href="/docs/features/session-persistence">
+    Automatic session save and restore
+  </Card>
+  <Card title="Session Store" icon="database" href="/docs/features/session-store">
+    Store methods and checkpoint API
+  </Card>
+  <Card title="Context Compaction" icon="compress" href="/docs/features/context-compaction">
+    How summaries are produced in-run
+  </Card>
+</CardGroup>
