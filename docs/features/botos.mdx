@@ -346,6 +346,57 @@ supervision:
   enabled: true   # default; set false to opt out
 ```
 
+## Multi-Process / HA Deployments
+
+Running more than one `BotOS` process — for high availability, horizontal scaling, or a brief rolling-restart overlap — used to double-fire every scheduled job, double-posting messages, double-charging tokens, and duplicating side effects.
+
+Each due job is now claimed atomically before it runs, so exactly one `BotOS` process fires it; the others skip silently. This needs no config change as long as the schedule store supports atomic claim — the default `FileScheduleStore` does, via an advisory-locked `claim_due`.
+
+```mermaid
+sequenceDiagram
+    participant procA as BotOS proc A
+    participant procB as BotOS proc B
+    participant store as Schedule Store
+
+    procA->>store: claim_due_jobs(owner="A")
+    procB->>store: claim_due_jobs(owner="B")
+    store-->>procA: [report] (won claim + lease)
+    store-->>procB: [] (lost claim, skips)
+    procA->>procA: run report job
+    procA->>store: complete_run(report, owner="A")
+    Note over procB: sleeps until next tick
+```
+
+Verify the guarantee is engaged from the startup log — every ticker prints one line when its schedule loop starts:
+
+```
+BotOS: schedule loop started (30s tick, atomic_claim=True)
+```
+
+`atomic_claim=True` confirms cross-process at-most-once is active. `atomic_claim=False` means the current store does not implement `claim_due`, so the legacy non-atomic path is in use and a job can fire once per process.
+
+Start two processes against the same store and watch the log — only one fires each job:
+
+```python
+from praisonai.bots import BotOS
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", instructions="Be helpful.")
+botos = BotOS(agent=agent, platforms=["telegram"])
+botos.run()  # run this same script in two processes; each due job fires once
+```
+
+| Store | At-most-once | How |
+|-------|-------------|-----|
+| `FileScheduleStore` (default) | ✅ | Advisory-locked `claim_due` |
+| Custom store | Depends | Only when it implements `claim_due` on `ScheduleStoreProtocol` |
+
+<Note>
+If a `BotOS` process crashes mid-run, its 300-second lease expires and another ticker re-claims the job — no permanent job loss. Single-process behaviour is unchanged.
+</Note>
+
+Related: [Bot Lifecycle Hooks → SCHEDULE_TRIGGER](/docs/features/bot-lifecycle-hooks), [Scheduled Run Policy](/docs/features/scheduled-run-policy), [Proactive Delivery](/docs/features/proactive-delivery).
+
 ## Operator Controls
 
 When supervision is enabled, use Python API controls (BotOS has no CLI for these):
