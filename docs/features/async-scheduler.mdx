@@ -181,6 +181,58 @@ sequenceDiagram
 
 ---
 
+## Multi-process safety (at-most-once)
+
+Without an atomic claim, two workers polling the same store could each fire the same due job — causing double-posts, double-charges, or duplicated side effects.
+
+Since [PraisonAI PR #2628](https://github.com/MervinPraison/PraisonAI/pull/2628), `FileScheduleStore` claims each due job under an OS advisory file lock (`fcntl` on POSIX, `msvcrt` on Windows) and hands it back to only one worker per tick. Losers receive an empty list and skip silently.
+
+```mermaid
+sequenceDiagram
+    participant WorkerA as Worker A
+    participant WorkerB as Worker B
+    participant Store as FileScheduleStore
+
+    WorkerA->>Store: tick() → claim_due(now, owner_A)
+    WorkerB->>Store: tick() → claim_due(now, owner_B)
+    Note over Store: OS advisory file lock (fcntl / msvcrt)
+    Store-->>WorkerA: [job] (won the claim + lease)
+    Store-->>WorkerB: [] (empty — job already claimed)
+    WorkerA->>WorkerA: run job
+    WorkerA->>Store: complete(job_id, owner_A) → release lease
+```
+
+Under the lock the store re-reads on-disk state, pre-advances `last_run_at`, and takes a short lease atomically. One-shot jobs are removed on claim. An unfinished claim releases automatically once its lease expires — this is the crash-safety mechanism.
+
+| Concept | What it is | Default |
+|---------|-----------|---------|
+| `owner_id` | Unique per-worker identifier | `f"{hostname}:{pid}:{uuid}"` (auto) |
+| `lease_seconds` | How long a claim is held before it can be re-claimed | `300.0` |
+| `supports_atomic_claim()` | Runner feature-detect flag; when `False`, the wrapper falls back to non-atomic `get_due_jobs` | auto-detected from the store |
+
+```python
+from praisonaiagents.scheduler import ScheduleRunner, FileScheduleStore
+
+store = FileScheduleStore()
+runner = ScheduleRunner(store)
+
+if runner.supports_atomic_claim():
+    jobs = runner.claim_due_jobs(owner_id="worker-1", lease_seconds=300.0)
+    for job in jobs:
+        # ... run the job ...
+        runner.complete_run(job.id, owner_id="worker-1")
+else:
+    jobs = runner.get_due_jobs()
+```
+
+The wrapper's `ScheduledAgentExecutor.tick()` does this automatically: it claims under the lock when the store supports it (default `owner_id = f"{hostname}:{pid}:{uuid}"`), releases the lease after each run, and falls back to `get_due_jobs` otherwise.
+
+<Warning>
+`fcntl` / `msvcrt` locks are honored per host. Sharing one `FileScheduleStore` path across hosts only works on a filesystem that honors the lock — network filesystems like NFS do not reliably do so. Use a shared database-backed store for cross-host at-most-once instead.
+</Warning>
+
+---
+
 ## Configuration Options
 
 <Card title="AsyncAgentScheduler API Reference" icon="code" href="/docs/sdk/reference/praisonai/classes/AgentScheduler">
@@ -420,6 +472,20 @@ scheduler = AsyncAgentScheduler(
 ```
 
 `timeout=None` (the default) imposes no limit.
+</Accordion>
+
+<Accordion title="Multi-process lease tuning">
+Pick a `lease_seconds` long enough to cover your slowest job, but short enough to recover quickly after a crash — an unfinished claim only re-runs after its lease expires.
+
+```python
+# Long-running jobs: hold the claim for the full worst-case run time
+runner.claim_due_jobs(owner_id="worker-1", lease_seconds=600.0)
+
+# Fast jobs: shorter lease recovers sooner from a crashed worker
+runner.claim_due_jobs(owner_id="worker-1", lease_seconds=60.0)
+```
+
+Don't share a `FileScheduleStore` path across hosts unless the filesystem honors the lock (NFS does not). Leave `owner_id` on its auto default (`f"{hostname}:{pid}:{uuid}"`) unless you need a stable value for observability.
 </Accordion>
 </AccordionGroup>
 
