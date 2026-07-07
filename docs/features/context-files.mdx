@@ -122,6 +122,124 @@ Context:
 
 ---
 
+## On-demand Subtree Attachment
+
+On-demand attachment picks up per-subtree `AGENTS.md` / `CLAUDE.md` files the up-front walk-up missed, only when a file inside that subtree is actually touched.
+
+```mermaid
+graph LR
+    subgraph "Session start"
+        A[📁 cwd walk-up] --> B[📄 already_loaded]
+    end
+    subgraph "During the session"
+        C[✍️ Touch packages/foo/main.py] --> D{Walk up}
+        D --> E{Dedup vs<br/>already_loaded<br/>+ seen files}
+        E --> F{Budget<br/>remaining?}
+        F -->|Yes| G[📎 Attach nearest<br/>AGENTS.md / CLAUDE.md]
+        F -->|No| H[⏭ Skip]
+    end
+
+    classDef upfront fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef touch fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef attach fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef skip fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class A,B upfront
+    class C touch
+    class D,E,F decision
+    class G attach
+    class H skip
+```
+
+<Steps>
+<Step title="Zero-config in a monorepo">
+
+When your host wires the attacher into the CLI auto-loader, on-demand attachment runs for you — drop a `packages/foo/AGENTS.md` and it appears the first time the agent edits a file inside `packages/foo/`. If your host has not wired it in yet, reach for the stateless helper or the session class below.
+
+</Step>
+
+<Step title="Attach for a single path (stateless)">
+
+```python
+from praisonaiagents import Agent
+from praisonai.integration.context_files import (
+    load_context_files,
+    load_context_files_for_path,
+)
+
+up_front = load_context_files()  # existing walk-up from cwd to root
+
+agent = Agent(
+    name="Monorepo Refactorer",
+    instructions=up_front + "\n\n" + load_context_files_for_path(
+        "packages/foo/main.py",
+        already_loaded=up_front,
+    ),
+)
+agent.start("Refactor packages/foo/main.py to use the new logger.")
+```
+
+</Step>
+
+<Step title="Attach across many touches (session-scoped)">
+
+```python
+from praisonaiagents import Agent
+from praisonai.integration.context_files import (
+    load_context_files,
+    PathContextAttacher,
+)
+
+up_front = load_context_files()
+attacher = PathContextAttacher(already_loaded=up_front, max_chars=8000)
+
+for path in ["packages/foo/main.py", "packages/foo/util.py", "packages/bar/api.py"]:
+    extra = attacher.attach_for_path(path)
+    if extra:
+        # feed `extra` into the agent (e.g. via instructions or a system message)
+        ...
+```
+
+</Step>
+</Steps>
+
+### Behaviour guarantees
+
+| Guarantee | Plain language |
+|-----------|----------------|
+| Subtree file attached only after a file under it is touched | Nothing loads until the agent opens something in that folder. |
+| Files already in the up-front load are not re-attached | No duplicate rules from what loaded at startup. |
+| A file emitted for one directory is not re-emitted for another | The same rules file never shows up twice. |
+| Repeated touches of the same directory hit the cache | Re-opening a folder costs nothing — no disk re-read. |
+| A sibling directory with no `AGENTS.md` returns an empty string | Empty folders add nothing. |
+| Total emitted text is bounded by `max_chars` | The attached context can never grow past the budget. |
+| `load_context_files_for_path(...)` is a stateless one-shot | Use it when you touch a single path. |
+| Returns `""` when nothing new is found | Silent when there is nothing to add. |
+
+### When do I need on-demand attachment?
+
+```mermaid
+graph TB
+    Q1{"Are all instruction files inside cwd or above it?"}
+    Q1 -->|Yes| UPFRONT["✅ Up-front load_context_files is enough<br/>(no attacher)"]
+    Q1 -->|No| Q2{"Does the session touch<br/>many files or one?"}
+    Q2 -->|One| ONESHOT["🎯 load_context_files_for_path(path)<br/>(stateless helper)"]
+    Q2 -->|Many| CLASS["🔁 PathContextAttacher(...)<br/>(session-scoped cache + dedup)"]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q1,Q2 q
+    class UPFRONT,ONESHOT,CLASS pick
+```
+
+<Note>
+`PathContextAttacher` is session-scoped by design. Create a new instance per session/agent run so cache and dedup state do not leak between users. Not thread-safe.
+</Note>
+
+---
+
 ## CLI Auto-loading
 
 As of PraisonAI PR #2358, `praisonai chat`, `praisonai run`, `praisonai code`, and `praisonai tui` automatically discover and inject AGENTS.md-style project context into the system prompt — no flag required.
@@ -246,6 +364,7 @@ When no `context_paths` is given, these filenames are checked at every directory
 | Git/project root | Root-level candidates | Low |
 | Intermediate dirs | Each dir between root and cwd | Medium |
 | cwd | Current working directory candidates | Highest (loaded last) |
+| Touched-file subtree (on-demand) | Nearest `AGENTS.md`/`CLAUDE.md` above the touched file | Appended after all up-front layers |
 
 <Note>
 When no git root is found, the walk-up is **capped at 10 levels** to avoid scanning unrelated system directories.
@@ -395,6 +514,52 @@ else:
 configure_host(agents=[agent], context_paths=context_files)
 ```
 
+### Monorepo with sibling subtrees
+
+Start a session at the repo root, then let the agent open files in different packages — each package's own `AGENTS.md` attaches the moment the agent touches a file there.
+
+```
+monorepo/
+├── AGENTS.md                    # Org-wide guidelines
+└── packages/
+    ├── foo/
+    │   ├── AGENTS.md            # Foo conventions
+    │   └── main.py
+    └── bar/
+        ├── AGENTS.md            # Bar conventions
+        └── api.py
+```
+
+```mermaid
+graph BT
+    FILE["✍️ packages/foo/main.py"] --> FOO["📄 packages/foo/AGENTS.md"]
+    FOO --> ROOT["📁 monorepo/AGENTS.md<br/>(git root)"]
+
+    classDef touch fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef attach fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef root fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class FILE touch
+    class FOO attach
+    class ROOT root
+```
+
+```python
+from praisonai.integration.context_files import (
+    load_context_files,
+    PathContextAttacher,
+)
+
+up_front = load_context_files()  # session starts at the repo root
+attacher = PathContextAttacher(already_loaded=up_front)
+
+attacher.attach_for_path("packages/foo/main.py")  # attaches packages/foo/AGENTS.md
+attacher.attach_for_path("packages/bar/api.py")   # attaches packages/bar/AGENTS.md
+attacher.attach_for_path("packages/foo/util.py")  # cached — no disk re-read, nothing new
+```
+
+The agent picks up each package's conventions the moment it opens a file there.
+
 ### Conditional Context Loading
 
 ```python
@@ -485,6 +650,25 @@ git commit -m "Update agent communication guidelines"
 
 # Review context impact
 git diff HEAD~1 context/
+```
+</Accordion>
+
+<Accordion title="Use PathContextAttacher in long-running sessions">
+When the agent will touch many files across a monorepo, create one
+`PathContextAttacher` per session and reuse it. The per-directory cache
+means repeated touches of the same subtree cost nothing, and the char
+budget stops the attached context from growing unbounded across the run.
+Pass `already_loaded=up_front` (the string returned by `load_context_files()`)
+so files discovered up front are not re-attached.
+
+```python
+from praisonai.integration.context_files import (
+    load_context_files,
+    PathContextAttacher,
+)
+
+up_front = load_context_files()
+attacher = PathContextAttacher(already_loaded=up_front, max_chars=8000)
 ```
 </Accordion>
 
