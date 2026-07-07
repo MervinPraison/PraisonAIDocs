@@ -1,0 +1,295 @@
+---
+title: "Run Status Controller"
+sidebarTitle: "Run Status Controller"
+description: "Transport-agnostic run-progress state machine with a stall watchdog for custom bot channels"
+icon: "gauge-simple"
+---
+
+Drive an in-chat status through a run's lifecycle — from your own bot, channel adapter, or gateway — with a single transport-agnostic controller.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.bots import RunStatusController, RunPhase
+
+agent = Agent(name="assistant", instructions="Helpful assistant")
+
+async def send_reaction(emoji: str) -> None:
+    await my_channel.set_reaction(message_id, emoji)   # your transport
+
+controller = RunStatusController(
+    set_status_reaction=send_reaction,
+    enabled=True,
+)
+
+await controller.on_phase(RunPhase.THINKING)
+response = await agent.astart("Hello!")
+await controller.on_phase(RunPhase.DONE)
+```
+
+```mermaid
+graph LR
+    Q[👀 Queued] --> T[🧠 Thinking] --> Tool[🛠️ Tool] --> D[✅ Done]
+    T -.quiet 20s.-> Soft[⏳ Still working…]
+    Soft -.quiet 60s.-> Hard[⚠️ Taking longer]
+    T --> E[❌ Error]
+    Tool --> E
+
+    classDef phase fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef stall fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    class Q,T,Tool phase
+    class D done
+    class Soft,Hard stall
+    class E error
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Reactions only">
+
+```python
+from praisonaiagents.bots import RunStatusController, RunPhase
+
+async def send_reaction(emoji: str) -> None:
+    await my_channel.set_reaction(message_id, emoji)
+
+controller = RunStatusController(
+    set_status_reaction=send_reaction,
+    enabled=True,
+)
+
+await controller.on_phase(RunPhase.QUEUED)
+await controller.on_phase(RunPhase.THINKING)
+await controller.on_phase(RunPhase.DONE)
+```
+
+</Step>
+
+<Step title="Reactions + label fallback + custom thresholds">
+
+```python
+from praisonaiagents.bots import RunStatusController, RunPhase
+
+async def send_reaction(emoji: str) -> None:
+    await my_channel.set_reaction(message_id, emoji)
+
+async def edit_label(label: str) -> None:
+    await my_channel.edit_message(status_message_id, label)
+
+controller = RunStatusController(
+    caps=my_channel.capabilities,
+    set_status_reaction=send_reaction,
+    edit_status_label=edit_label,
+    stall_soft_s=15.0,
+    stall_hard_s=45.0,
+    enabled=True,
+)
+
+await controller.on_phase(RunPhase.THINKING)
+await controller.tick(elapsed_s=15.0)   # ⏳ still working…
+await controller.on_phase(RunPhase.DONE)
+```
+
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+The controller renders through a reaction OR a label, chosen from platform capabilities plus which callbacks you injected.
+
+```mermaid
+graph TB
+    Start[Render phase] --> HasReact{set_status_reaction set?}
+    HasReact -->|No| Label[Edit status label]
+    HasReact -->|Yes| HasLabel{edit_status_label set?}
+    HasLabel -->|No| React[Set emoji reaction]
+    HasLabel -->|Yes| Caps{caps present?}
+    Caps -->|No| React
+    Caps -->|Yes| Signal{supports_reactions / reactions signal}
+    Signal -->|truthy or absent| React
+    Signal -->|falsy| Label
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef react fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef label fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class HasReact,HasLabel,Caps,Signal decision
+    class React react
+    class Label label
+```
+
+`on_phase(...)` reports progress and resets the watchdog; `tick(elapsed_s)` flushes debounced phases and arms the stall signal.
+
+```mermaid
+sequenceDiagram
+    participant Run
+    participant Controller
+    participant Watchdog
+    participant Channel
+
+    Run->>Controller: on_phase(THINKING)
+    Controller->>Watchdog: reset()
+    Controller->>Channel: React 🧠
+    Run->>Controller: tick(elapsed_s=20)
+    Controller->>Watchdog: evaluate(20) → SOFT
+    Controller->>Channel: React ⏳
+    Run->>Controller: tick(elapsed_s=60)
+    Controller->>Watchdog: evaluate(60) → HARD
+    Controller->>Channel: React ⚠️
+    Run->>Controller: on_phase(DONE)
+    Controller->>Watchdog: reset()
+    Controller->>Channel: React ✅
+```
+
+Phases and stall states map to fixed emoji and labels.
+
+| Phase | Emoji | Label | `is_terminal` |
+|---|---|---|---|
+| `RunPhase.QUEUED` | 👀 | `queued` | `False` |
+| `RunPhase.THINKING` | 🧠 | `thinking…` | `False` |
+| `RunPhase.TOOL` | 🛠️ | `using a tool…` | `False` |
+| `RunPhase.DONE` | ✅ | `done` | `True` |
+| `RunPhase.ERROR` | ❌ | `error` | `True` |
+
+| Stall state | Emoji | Label |
+|---|---|---|
+| `StallState.OK` | — | — |
+| `StallState.SOFT` | ⏳ | `still working…` |
+| `StallState.HARD` | ⚠️ | `this is taking longer than expected` |
+
+Intermediate phases debounce by `debounce_ms` (default `700`); the latest pending phase wins and flushes on the next `tick`. Terminal phases (`DONE`/`ERROR`) render immediately and clear any pending phase or stall signal.
+
+---
+
+## StallWatchdog standalone
+
+`StallWatchdog` maps elapsed-since-progress seconds to a `StallState` and needs no controller.
+
+```python
+from praisonaiagents.bots import StallWatchdog, StallState
+
+watchdog = StallWatchdog(soft_s=20.0, hard_s=60.0)
+
+watchdog.evaluate(5.0)    # StallState.OK
+watchdog.evaluate(25.0)   # StallState.SOFT
+watchdog.evaluate(70.0)   # StallState.HARD
+watchdog.state            # StallState.HARD
+watchdog.reset()          # back to StallState.OK
+```
+
+<Warning>
+If `hard_s < soft_s`, `hard_s` is clamped up to `soft_s` and a warning is logged — `SOFT` becomes unreachable. Keep `hard_s >= soft_s`.
+</Warning>
+
+---
+
+## Configuration Options
+
+Every option comes straight from `RunStatusController.__init__`.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `caps` | `Optional[PlatformCapabilities]` | `None` | Platform capabilities used to gate reaction vs label rendering |
+| `set_status_reaction` | `Optional[Callable[[str], Awaitable[None]]]` | `None` | Async callback that sets the single status reaction |
+| `edit_status_label` | `Optional[Callable[[str], Awaitable[None]]]` | `None` | Async callback that edits a single status line/label |
+| `debounce_ms` | `int` | `700` | Minimum spacing between intermediate renders; terminal phases always render immediately |
+| `stall_soft_s` | `float` | `20.0` | Seconds without progress before the soft stall signal |
+| `stall_hard_s` | `float` | `60.0` | Seconds without progress before the hard stall signal |
+| `enabled` | `bool` | `False` | Master switch — off by default; adapters opt in |
+| `now` | `Optional[Callable[[], float]]` | `time.monotonic` | Monotonic clock callable (injectable for tests) |
+
+The controller is `enabled` only when `enabled=True` **and** at least one of `set_status_reaction` / `edit_status_label` is present.
+
+| `enabled=` | Has a callback? | `controller.enabled` |
+|---|---|---|
+| `True` | Yes | `True` |
+| `True` | No | `False` |
+| `False` | Yes | `False` |
+| `False` | No | `False` |
+
+Pick reaction vs label rendering per this decision flow.
+
+```mermaid
+graph TB
+    Which[Which callback do I pass?] --> R{Channel has reactions?}
+    R -->|Only reactions| OnlyR[set_status_reaction]
+    R -->|Only text edits| OnlyL[edit_status_label]
+    R -->|Depends on channel| Both[Pass both + caps]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef react fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef label fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Which,R q
+    class OnlyR react
+    class OnlyL label
+    class Both react
+```
+
+`RunStatusController` also exposes `phase` (last phase passed to `on_phase`, possibly un-rendered) and `watchdog` (the underlying `StallWatchdog`, so you can `reset()` it on external progress signals).
+
+---
+
+## User interaction flow
+
+A user sends a message and watches one emoji move through the run without reading any reply text.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Adapter
+    participant Controller
+    participant Channel
+
+    User->>Adapter: Send message
+    Adapter->>Controller: on_phase(THINKING)
+    Controller->>Channel: React 🧠
+    User-->>Channel: sees 🧠
+    Adapter->>Controller: on_phase(TOOL)
+    Controller->>Channel: React 🛠️
+    User-->>Channel: sees 🛠️
+    Adapter->>Controller: on_phase(DONE)
+    Controller->>Channel: React ✅
+    User-->>Channel: sees ✅
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Keep thresholds above your slowest legit tool">
+If a real tool call takes 40s (web scraping, image generation), set `stall_soft_s` to 45–60s so users don't see ⏳ while everything is healthy.
+</Accordion>
+
+<Accordion title="Let on_phase reset the watchdog for you">
+Any phase change is treated as progress and resets the stall watchdog automatically — you rarely need to call `watchdog.reset()` yourself.
+</Accordion>
+
+<Accordion title="Inject now= in tests">
+Pass `now=` a controllable monotonic clock to test debounce and stall behavior deterministically without real sleeps.
+</Accordion>
+
+<Accordion title="Provide BOTH callbacks">
+Supply `set_status_reaction` and `edit_status_label` so channels without reactions degrade to a label automatically, driven by `caps`.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Bot Status Reactions" icon="face-smile" href="/docs/features/bot-status-reactions">
+  The one-flag `TelegramBot(status_reactions=True)` opt-in
+</Card>
+<Card title="Bot Platform Adapter" icon="plug" href="/docs/features/bot-platform-adapter">
+  Build a custom channel adapter that wires this controller
+</Card>
+</CardGroup>
