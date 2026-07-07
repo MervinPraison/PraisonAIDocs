@@ -183,7 +183,10 @@ _LAZY_IMPORTS = {
     'Include': ('praisonaiagents.workflows', 'Include'),
     'MAX_NESTING_DEPTH': ('praisonaiagents.workflows', 'MAX_NESTING_DEPTH'),
     'YAMLWorkflowParser': ('praisonaiagents.workflows', 'YAMLWorkflowParser'),
+    'WorkflowManager': ('praisonaiagents.workflows', 'WorkflowManager'),
     'WorkflowHooksConfig': ('praisonaiagents.workflows', 'WorkflowHooksConfig'),
+    'WorkflowPlanningConfig': ('praisonaiagents.workflows', 'WorkflowPlanningConfig'),
+    'WorkflowMemoryConfig': ('praisonaiagents.workflows', 'WorkflowMemoryConfig'),
     
     # Conditions (Protocol-driven condition evaluation)
     'ConditionProtocol': ('praisonaiagents.conditions.protocols', 'ConditionProtocol'),
