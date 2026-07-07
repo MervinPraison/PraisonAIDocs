@@ -1,27 +1,52 @@
 ---
-title: "Bot-to-Bot Loop Protection"
-sidebarTitle: "Bot Loop Protection"
-description: "Break runaway bot-to-bot reply loops with a sliding-window pair-budget guard"
-icon: "rotate"
+title: "Bot Loop Protection"
+sidebarTitle: "Loop Protection"
+description: "Break runaway bot-to-bot reply loops with a sliding-window pair budget"
+icon: "shield-halved"
 ---
 
-`BotLoopGuard` stops two bots from replying to each other forever by capping how many bot-authored exchanges a pair can trade in a rolling window.
+`BotLoopGuard` breaks runaway bot-to-bot reply loops — two bots answering each other forever — by budgeting how many exchanges a pair may have inside a sliding window.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.bots import BotLoopGuard, BotLoopPolicy
+
+agent = Agent(
+    name="Group Helper",
+    instructions="Answer questions posted in the room.",
+)
+
+guard = BotLoopGuard(BotLoopPolicy(max_events_per_window=20, window_seconds=60))
+
+# In your bot inbound handler, before dispatching to the agent:
+if sender_is_bot and not guard.observe(
+    self_bot_id="mybot",
+    sender_bot_id=inbound_sender_id,
+):
+    return  # drop the turn — pair is over budget / in cooldown
+
+agent.start(inbound_text)
+```
+
+Two bots ping-pong replies; the guard counts each exchange and, once a pair passes its budget, drops the turn and opens a cooldown.
 
 ```mermaid
 graph LR
-    Inbound[📨 Bot-authored inbound] --> Guard[🛡 BotLoopGuard]
-    Guard -->|allow| Reply[✅ Agent replies]
-    Guard -->|suppress| Drop[🚫 Turn dropped]
+    A[🤖 Bot A reply] --> Guard{🛡️ Pair budget?}
+    B[🤖 Bot B reply] --> Guard
+    Guard -->|Under budget| Send[✅ Reply sent]
+    Guard -->|Over budget| Drop[⛔ Turn dropped]
+    Drop --> Cool[❄️ Cooldown]
 
-    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef halt fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef drop fill:#189AB4,stroke:#7C90A0,color:#fff
 
-    class Inbound input
-    class Guard process
-    class Reply ok
-    class Drop halt
+    class A,B agent
+    class Guard check
+    class Send ok
+    class Drop,Cool drop
 ```
 
 <Note>
@@ -94,15 +119,20 @@ sequenceDiagram
     participant Guard
     participant BotB
 
-    BotA->>Gateway: reply to BotB
+    loop Under budget
+        BotA->>Gateway: reply
+        Gateway->>Guard: observe(A, B)
+        Guard-->>Gateway: True
+        Gateway->>BotB: dispatch
+        BotB->>Gateway: reply
+        Gateway->>Guard: observe(B, A)
+        Guard-->>Gateway: True
+    end
+    Note over Guard: budget exceeded
+    BotA->>Gateway: reply
     Gateway->>Guard: observe(A, B)
-    Guard-->>Gateway: True (1..20 within budget)
-    Gateway->>BotB: deliver reply
-    BotB->>Gateway: reply to BotA
-    Gateway->>Guard: observe(B, A) #21
-    Guard-->>Gateway: False (budget exceeded)
-    Note over Gateway: drop the turn
-    Note over Guard: pair suppressed for cooldown_seconds
+    Guard-->>Gateway: False
+    Note over Gateway: turn dropped, cooldown open
 ```
 
 `A → B` and `B → A` collapse to the same pair key, so a ping-pong loop accrues one budget instead of two independent streams.
@@ -113,6 +143,34 @@ sequenceDiagram
 | Sliding window | Events older than `window_seconds` are evicted before the budget check |
 | Cooldown | Once exceeded, the pair is dropped for `cooldown_seconds` without recording |
 | Distinct pairs | `A↔B` at budget does not affect `A↔C` |
+
+---
+
+## When to Enable
+
+`BotLoopGuard` only matters when your gateway accepts bot-authored inbound messages and multiple bots can share a room.
+
+```mermaid
+graph TB
+    Start([Configure loop protection?]) --> Q1{Gateway accepts<br/>bot-authored inbound?}
+    Q1 -->|No| Skip[No guard needed]
+    Q1 -->|Yes| Q2{Multi-bot rooms<br/>possible?}
+    Q2 -->|No| Skip
+    Q2 -->|Yes| Enable[Enable default policy]
+    Enable --> Q3{High-volume<br/>workflow bots?}
+    Q3 -->|Yes| Raise[Raise max_events_per_window]
+    Q3 -->|No| Keep[Keep defaults]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1,Q2,Q3 check
+    class Enable,Raise,Keep config
+    class Skip ok
+```
 
 ---
 
@@ -211,6 +269,10 @@ Use a shorter `window_seconds` with a higher `cooldown_seconds` for chatty rooms
 
 <Accordion title="Share one guard per gateway process">
 The deque/dict state is per-instance and per-pair, so a single shared `BotLoopGuard` tracks the whole gateway.
+</Accordion>
+
+<Accordion title="Combine with Intentional Silence">
+Pair the guard with `allow_silence` and Intentional Silence for full ambient-channel safety — the agent chooses to stay quiet, and the guard stops runaway loops.
 </Accordion>
 </AccordionGroup>
 
