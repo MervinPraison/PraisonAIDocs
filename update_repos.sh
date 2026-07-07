@@ -10,7 +10,12 @@ echo "📥 Fetching latest PraisonAI folders..."
 git clone --filter=blob:none --no-checkout https://github.com/MervinPraison/PraisonAI.git temp_update_praisonai
 cd temp_update_praisonai
 git sparse-checkout init --cone
-git sparse-checkout set src/praisonai-agents/praisonaiagents src/praisonai/praisonai examples/python
+git sparse-checkout set \
+  src/praisonai-agents/praisonaiagents \
+  src/praisonai/praisonai \
+  src/praisonai-bot/praisonai_bot \
+  src/praisonai-code/praisonai_code \
+  examples/python
 git checkout main
 cd ..
 
@@ -23,6 +28,16 @@ cp -r temp_update_praisonai/src/praisonai-agents/praisonaiagents praisonaiagents
 echo "📦 Updating praisonai files..."
 rm -rf praisonai
 cp -r temp_update_praisonai/src/praisonai/praisonai praisonai
+
+# Update praisonai-bot package
+echo "📦 Updating praisonai_bot files..."
+rm -rf praisonai_bot
+cp -r temp_update_praisonai/src/praisonai-bot/praisonai_bot praisonai_bot
+
+# Update praisonai-code package
+echo "📦 Updating praisonai_code files..."
+rm -rf praisonai_code
+cp -r temp_update_praisonai/src/praisonai-code/praisonai_code praisonai_code
 
 # Update examples files
 echo "📦 Updating examples files..."
