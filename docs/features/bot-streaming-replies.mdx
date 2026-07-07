@@ -218,10 +218,121 @@ Live streaming (`draft` mode) works on **Telegram, Slack, and Discord** — each
 | `min_delta` | `int` | `120` | Minimum new characters in the buffer before an edit fires |
 | `placeholder_text` | `str` | `"🤔 Thinking..."` | Initial message text sent before any content arrives |
 | `progress_prefix` | `str` | `"🤔 "` | Prefix used in `progress` mode tool-status updates |
+| `progress_style` | `str` | `"line"` | Progress-mode rendering style: `"line"` (single overwritten tool label, unchanged default) or `"feed"` (bounded multi-line rolling status feed with per-step ⏳/✓/✗ glyphs) |
+| `progress_max_lines` | `int` | `8` | Max trailing lines shown when `progress_style="feed"`; older lines scroll off the top of the window |
+| `progress_max_line_chars` | `int` | `120` | Per-line character cap in `feed` style (includes the leading glyph); words are truncated at a boundary with an ellipsis |
 | `disable_progressive_edits_after` | `int` | `3` | Consecutive recoverable edit failures before progressive editing is turned off for the rest of the stream — the completed answer is then delivered as a single final send |
 | `flood_backoff_factor` | `float` | `2.0` | Multiplier applied to the edit interval on each recoverable (flood / 429 / transient) failure |
 | `max_interval` | `float` | `30.0` | Cap in seconds for the adaptively widened edit interval — backoff stops growing past this |
 | `strip_reasoning_tags` | `bool` | `True` | Strip `<think>…</think>` and `<reasoning>…</reasoning>` spans from streamed and final output. Default ON — set to `false` to opt out |
+
+---
+
+## Progress feed style
+
+Set `progress_style: feed` to render tool calls as a bounded rolling multi-line status view instead of a single overwritten label.
+
+A research agent on Telegram chains `web_search`, `fetch_url`, and `summarize`. With the default `progress_style="line"`, each tool overwrites the last, so a failed `fetch_url` vanishes. With `feed`, every step keeps its own line and outcome glyph:
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import TelegramBot, StreamingConfig, StreamingMode
+from praisonaiagents.bots import BotConfig
+
+agent = Agent(
+    name="research-assistant",
+    instructions="Research the user's question with web tools and summarise.",
+    tools=[web_search, fetch_url, summarize],
+)
+
+bot = TelegramBot(
+    token="...",
+    agent=agent,
+    config=BotConfig(token="...", streaming=True),
+)
+bot.configure_streaming(StreamingConfig(
+    mode=StreamingMode.PROGRESS,
+    progress_style="feed",     # enable the multi-line rolling feed
+    progress_max_lines=6,      # keep it short on mobile
+    progress_max_line_chars=100,
+))
+bot.start()
+```
+
+The user's Telegram message updates in place with a live per-step audit trail:
+
+```
+✓ web_search — 5 results
+✗ fetch_url — timeout
+⏳ summarize
+```
+
+Each tool gets its own line with a state glyph — `⏳` running, `✓` done, `✗` error — instead of one label that overwrites itself.
+
+```mermaid
+graph LR
+    subgraph "progress_style: line"
+        L1["🤔 Running web_search…"] -.overwrites.-> L2["🤔 Running fetch_url…"]
+        L2 -.overwrites.-> L3["🤔 Running summarize…"]
+    end
+
+    subgraph "progress_style: feed"
+        F1["✓ web_search — 5 results"]
+        F2["✗ fetch_url — timeout"]
+        F3["⏳ summarize"]
+    end
+
+    classDef line fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef err fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef run fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class L1,L2,L3 line
+    class F1 ok
+    class F2 err
+    class F3 run
+```
+
+### When to use which style
+
+```mermaid
+graph TB
+    A{Does your agent<br/>chain many tools?} --> B[One or two tools<br/>Short runs]
+    A --> C[Many tools<br/>Users want an audit trail]
+
+    B --> D["progress_style: line<br/>(default)"]
+    C --> E["progress_style: feed<br/>per-step glyphs"]
+
+    classDef question fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef line fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef feed fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,B,C question
+    class D line
+    class E feed
+```
+
+### How one tool flows through the feed
+
+A tool's start event and its matching finish event share one correlation id, so the line updates in place instead of duplicating.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Compositor as merge_progress_line
+    participant Feed as Rendered feed
+
+    Agent->>Compositor: TOOL_CALL_START (id=abc, web_search)
+    Compositor->>Feed: ⏳ web_search
+    Agent->>Compositor: TOOL_CALL_RESULT (id=abc)
+    Compositor->>Feed: ✓ web_search — 5 results
+    Agent->>Compositor: TOOL_CALL_START (id=xyz, fetch_url)
+    Compositor->>Feed: ✓ web_search — 5 results<br/>⏳ fetch_url
+```
+
+<Note>
+The `feed` style activates only when `mode: progress` **and** `progress_style: feed`. The default `progress_style="line"` preserves the existing single-line behaviour bit-for-bit — `feed` is strictly opt-in per channel.
+</Note>
 
 ---
 
@@ -294,7 +405,10 @@ channels:
   telegram:
     token: ${TELEGRAM_BOT_TOKEN}
     streaming:
-      mode: draft
+      mode: progress
+      progress_style: feed          # "line" (default) or "feed"
+      progress_max_lines: 8
+      progress_max_line_chars: 120
       min_interval: 1.5
       min_delta: 120
       placeholder_text: "🤔 Thinking..."
@@ -325,6 +439,14 @@ bot.configure_streaming(StreamingConfig(
     min_delta=200,
     placeholder_text="Working...",
     progress_prefix="⚡ "
+))
+
+# Multi-line feed style (per-step ⏳/✓/✗ glyphs)
+bot.configure_streaming(StreamingConfig(
+    mode=StreamingMode.PROGRESS,
+    progress_style="feed",
+    progress_max_lines=6,
+    progress_max_line_chars=100,
 ))
 ```
 
@@ -385,6 +507,28 @@ bot.configure_streaming(StreamingConfig(
 ```
 </Accordion>
 
+<Accordion title="Use `feed` when your agent chains many tools">
+`progress_style: feed` turns a black-box "still thinking…" indicator into a live per-step audit trail. Every tool call keeps its own line with a `⏳`/`✓`/`✗` glyph, so users see which step failed instead of watching one label overwrite itself. See the [line-vs-feed comparison](#progress-feed-style).
+
+```python
+bot.configure_streaming(StreamingConfig(
+    mode=StreamingMode.PROGRESS,
+    progress_style="feed",
+))
+```
+</Accordion>
+
+<Accordion title="Keep `progress_max_lines` small on mobile channels">
+Telegram mobile crops long messages. Set `progress_max_lines` to `4`–`6` so the feed stays readable — older lines scroll off the top of the window while the newest steps stay visible.
+
+```yaml
+streaming:
+  mode: progress
+  progress_style: feed
+  progress_max_lines: 6
+```
+</Accordion>
+
 <Accordion title="Streaming is off by default — opt in per channel">
 The feature has zero impact on existing bots. Only channels with explicit `streaming:` configuration will use the new behavior. All other channels continue with the original single-message approach.
 </Accordion>
@@ -424,6 +568,14 @@ Fixed in [PR #2356](https://github.com/MervinPraison/PraisonAI/pull/2356). Reaso
 <Accordion title="Bot reply got stuck mid-edit on a busy chat?">
 Fixed in [PR #2356](https://github.com/MervinPraison/PraisonAI/pull/2356). The streamer now backs off on 429/flood, and after 3 consecutive failures falls back to a single final send so you always get the completed answer. Tune `disable_progressive_edits_after` / `flood_backoff_factor` / `max_interval` per channel if your platform's rate limits differ.
 </Accordion>
+
+<Accordion title="My `progress_style: feed` config was rejected at startup">
+The schema validator only accepts `"line"` or `"feed"`. Any other value raises `Invalid progress_style '<v>'. Must be one of: feed, line` at load time. Check for typos like `feeds` or `multiline`.
+</Accordion>
+
+<Accordion title="An errored tool still shows the ✓ glyph">
+Impossible by design. Once a line reaches `error` (`✗`) the compositor never downgrades it to `done` (`✓`), and a late `done` event never overwrites an `error`. If you ever see this, please file a bug against `praisonai`.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -439,6 +591,9 @@ Fixed in [PR #2356](https://github.com/MervinPraison/PraisonAI/pull/2356). The s
 </Card>
 <Card title="Streaming Tool Events" icon="wrench" href="/docs/features/streaming-tool-events">
   Understand tool-event details used in progress mode
+</Card>
+<Card title="Progress Compositor" icon="layer-group" href="/docs/features/streaming-progress-compositor">
+  Fold typed StreamEvents into your own multi-line status view
 </Card>
 <Card title="Bot Gateway" icon="gateway" href="/docs/features/bot-gateway">
   Set up and run channel bots with gateway configuration
