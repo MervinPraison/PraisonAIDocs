@@ -243,6 +243,66 @@ for job_id, info in manager.list_jobs().items():
 manager.cancel_job(job_id)
 ```
 
+<Tip>Need jobs to survive a process restart? Pass a `store=` and call `reconcile_on_start()` — see [Durability](#durability-survive-a-restart) below.</Tip>
+
+## Durability — survive a restart
+
+An in-memory-only runner drops every in-flight job on a restart, including the promised deliver-back — pass a `store=` to persist jobs and recover them on boot.
+
+Durability is opt-in: omit `store=` and behaviour is byte-for-byte as before (pure in-memory, zero overhead); supply a store and every state transition is persisted.
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Manager as BackgroundJobManager
+    participant Store as BackgroundJobStore
+
+    App->>Manager: start_job(func, origin=...)
+    Manager->>Store: upsert(PENDING)
+    Manager->>Store: upsert(RUNNING)
+    Note over Manager: 💥 process crashes mid-job
+    App->>Manager: restart + reconcile_on_start(redeliver)
+    Manager->>Store: list_unreconciled()
+    Store-->>Manager: orphaned + undelivered jobs
+    Manager->>Store: upsert(LOST)
+    Manager->>App: redeliver(job_info) for undelivered
+```
+
+<Steps>
+<Step title="Enable persistence (opt-in)">
+
+```python
+from praisonaiagents.background.job_manager import BackgroundJobManager
+
+# Your app supplies a store that implements the BackgroundJobStore protocol
+manager = BackgroundJobManager(store=my_store)
+```
+</Step>
+<Step title="Reconcile once at startup">
+
+Call `reconcile_on_start()` once at boot, after wiring the deliver-back handler:
+
+```python
+counts = manager.reconcile_on_start(redeliver=on_job_complete)
+# {"lost": 0, "redelivered": 0, "rehydrated": 0} on a clean start
+```
+</Step>
+</Steps>
+
+### New API surface
+
+| Symbol | Kind | Purpose |
+|--------|------|---------|
+| `BackgroundJobStore` | Protocol | Implement this to plug in your own durable store |
+| `store=` | `BackgroundJobManager.__init__` kwarg | Enable persistence (opt-in, keyword-only) |
+| `reconcile_on_start(redeliver)` | method | Reconcile orphans + replay undelivered on startup |
+| `JobStatus.LOST` | enum value | Terminal state for `RUNNING`/`PENDING` jobs interrupted by a crash |
+| `JobInfo.delivered` | field (`bool`, default `False`) | Whether the deliver-back has fired |
+
+`reconcile_on_start(redeliver)` passes the persisted `JobInfo` to your `redeliver` callback — make it idempotent, since a raised exception means "retry on the next restart" (the job is left undelivered, never lost).
+
+<Note>`LOST` jobs are age-evictable by `cleanup_completed(max_age=...)`, so reconciled orphans don't leak across restarts.</Note>
+
 ## Architecture
 
 The sync wrappers and `ScheduleLoop` bridge the gap between disconnected modules:
