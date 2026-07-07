@@ -1,0 +1,303 @@
+---
+title: "Bot Platform Adapter"
+sidebarTitle: "Platform Adapter"
+description: "Build a new chat channel by subclassing BasePlatformAdapter — chunking, retries, typing, and edit-fallbacks come for free"
+icon: "puzzle-piece"
+---
+
+Subclass `BasePlatformAdapter` to add a new chat channel: implement four methods, declare capabilities, and inherit robust chunking, retry, typing, and edit-fallback delivery.
+
+```mermaid
+graph LR
+    subgraph "Your Adapter"
+        C[🔌 connect] --> S[✉️ send]
+        S --> D[📴 disconnect]
+    end
+    subgraph "Inherited for free"
+        F[📝 format] --> K[✂️ chunk]
+        K --> T[⌨️ typing]
+        T --> R[🔁 retry]
+    end
+    Cap[⚙️ capabilities] -.gates.-> F
+    Cap -.gates.-> T
+    Cap -.gates.-> K
+
+    classDef contract fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef inherited fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class C,S,D contract
+    class F,K,T,R inherited
+    class Cap config
+```
+
+## Quick Start
+
+A minimal adapter implements four methods and calls `deliver()` to send.
+
+<Steps>
+<Step title="Minimal adapter (4 methods)">
+
+Subclass `BasePlatformAdapter`, declare `capabilities`, and implement `connect`, `disconnect`, `send`, and `get_chat_info`.
+
+```python
+from praisonaiagents import BasePlatformAdapter, SendResult
+from praisonaiagents.bots import PlatformCapabilities
+
+
+class AcmeBot(BasePlatformAdapter):
+    capabilities = PlatformCapabilities(max_message_length=4096)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # open your websocket / HTTP session here
+        return True
+
+    async def disconnect(self) -> None:
+        # tear down cleanly
+        ...
+
+    async def send(self, chat_id, content, *, reply_to=None, metadata=None) -> SendResult:
+        message_id = await acme_api.send(chat_id, content, reply_to=reply_to)
+        return SendResult(ok=True, message_id=message_id, chat_id=chat_id)
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+# Chunking, retry, typing, edit-fallback — all inherited.
+adapter = AcmeBot()
+await adapter.connect()
+result = await adapter.deliver(chat_id="C123", content="…very long text…")
+print(result.ok, result.message_ids)
+```
+
+</Step>
+
+<Step title="Declare more capabilities to unlock defaults">
+
+Turn on `supports_edit` and `supports_typing`, then override only what the platform genuinely does — here a lightweight `edit_message`.
+
+```python
+from praisonaiagents import BasePlatformAdapter, SendResult
+from praisonaiagents.bots import PlatformCapabilities
+
+
+class AcmeBot(BasePlatformAdapter):
+    capabilities = PlatformCapabilities(
+        supports_edit=True,
+        supports_typing=True,
+        max_message_length=4096,
+    )
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        ...
+
+    async def send(self, chat_id, content, *, reply_to=None, metadata=None) -> SendResult:
+        message_id = await acme_api.send(chat_id, content, reply_to=reply_to)
+        return SendResult(ok=True, message_id=message_id, chat_id=chat_id)
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+    async def send_typing(self, chat_id) -> None:
+        await acme_api.typing(chat_id)
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        await acme_api.edit(chat_id, message_id, content)
+        return SendResult(ok=True, message_id=message_id, chat_id=chat_id)
+```
+
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+`deliver()` formats, chunks, sends a typing heartbeat, then sends each chunk with retry — all keyed off capabilities.
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Adapter as deliver()
+    participant Send as send()
+
+    Caller->>Adapter: deliver(chat_id, content)
+    Note over Adapter: dict content skips format + chunk
+    Adapter->>Adapter: send_typing() if supports_typing
+    Adapter->>Adapter: format_message(text)
+    Adapter->>Adapter: chunk(text) → [c1, c2, c3]
+    loop each chunk (reply_to on chunk #1 only)
+        Adapter->>Send: send(chat_id, chunk)
+        Send-->>Adapter: SendResult
+        Note over Adapter: on failure, wait retry_after<br/>(else base * 2**attempt)
+    end
+    Adapter-->>Caller: SendResult(ok, message_ids)
+```
+
+---
+
+## What Do I Need to Override?
+
+Start with the four abstract methods, then reach for defaults only when the platform can do better.
+
+```mermaid
+graph TB
+    Start[✏️ New channel] --> Q1{Just send text?}
+    Q1 -->|Yes| Four[Override the 4<br/>abstract methods only]
+    Q1 -->|Long messages| Chunk[Keep default chunk<br/>or override for markdown]
+    Q1 -->|Supports edits| Edit[Set supports_edit=True<br/>+ override edit_message]
+    Q1 -->|Rate-limited| Retry[Return SendResult with<br/>retry_after from send]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef action fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1 decision
+    class Four,Chunk,Edit,Retry action
+```
+
+---
+
+## User Interaction Flow
+
+A long user reply flows through `deliver()` as three chunks, with one retry honouring `retry_after`.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Wrapper as Bot Wrapper
+    participant Adapter as deliver()
+
+    User->>Wrapper: sends a long message
+    Wrapper->>Adapter: deliver(chat_id, reply_text)
+    Adapter->>Adapter: format → chunk → 3 chunks
+    Adapter->>User: chunk #1 (with reply_to)
+    Adapter->>User: chunk #2 → fails (retry_after=1.5)
+    Note over Adapter: sleep 1.5s
+    Adapter->>User: chunk #2 (retry) → ok
+    Adapter->>User: chunk #3 → ok
+    Adapter-->>Wrapper: SendResult(ok=True, message_ids=[m1, m2, m3])
+```
+
+Four behaviours are worth calling out:
+
+1. **Chunking is text-only.** Dict content passes straight through to `send()` without chunking or formatting — ideal for rich payloads like attachments or buttons.
+2. **Reply-to only on the first chunk.** In a multi-chunk reply, chunk #1 carries `reply_to`; chunks 2..N are ordinary messages.
+3. **Typing is best-effort.** Failures in `send_typing()` are swallowed, so a broken indicator never breaks delivery.
+4. **`edit_message` declares "not supported" instead of crashing.** Callers on channels without edits use the `edit_not_supported` fallback to decide whether to re-send.
+
+---
+
+## Configuration Options
+
+`SendResult` is the transport-neutral value returned by every send/edit path.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ok` | `bool` | `True` | Whether the send succeeded. |
+| `message_id` | `Optional[str]` | `None` | Platform message id of the last message sent. For chunked delivery this is the final chunk. |
+| `chat_id` | `Optional[str]` | `None` | The chat/channel the message was delivered to. |
+| `message_ids` | `List[str]` | `[]` | All platform message ids produced (one per chunk). |
+| `error` | `Optional[str]` | `None` | Human-readable error string when `ok=False`. |
+| `retry_after` | `Optional[float]` | `None` | Suggested seconds to wait before retrying, from the platform's rate-limit response. Honoured by the default retry loop. |
+| `metadata` | `Dict[str, Any]` | `{}` | Additional platform-specific result details. |
+
+`SendResult.to_dict()` returns a plain dict for logging and observability.
+
+`BasePlatformAdapter` class attributes declare adapter behaviour.
+
+| Attribute | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `capabilities` | `PlatformCapabilities` | `PlatformCapabilities()` | Platform features. Every default behaviour keys off this, degrading gracefully when a flag is absent. |
+| `max_retries` | `int` | `3` | Retry attempts for the default resilient delivery loop. |
+| `retry_base_delay` | `float` | `0.5` | Base backoff (seconds) for exponential retry when `retry_after` is not supplied. |
+
+The four abstract methods every subclass must implement:
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `connect` | `async def connect(*, is_reconnect: bool = False) -> bool` | Establish the platform connection. |
+| `disconnect` | `async def disconnect() -> None` | Tear down the connection and release resources. |
+| `send` | `async def send(chat_id, content, *, reply_to=None, metadata=None) -> SendResult` | Send one message (no chunking, no retry). |
+| `get_chat_info` | `async def get_chat_info(chat_id) -> Dict[str, Any]` | Return chat/channel metadata (at least an `id` key). |
+
+<Card title="BasePlatformAdapter SDK Reference" icon="code" href="/docs/sdk/reference/python/modules">
+  Full auto-generated Python API surface for `BasePlatformAdapter` and `SendResult`.
+</Card>
+
+---
+
+## Common Patterns
+
+Override `chunk()` when the platform needs code-fence-aware splitting.
+
+```python
+class AcmeBot(BasePlatformAdapter):
+    def chunk(self, text: str):
+        blocks, buf, fence = [], [], False
+        for line in text.splitlines(keepends=True):
+            if line.lstrip().startswith("```"):
+                fence = not fence
+            buf.append(line)
+            if not fence and sum(len(b) for b in buf) >= self.max_message_length:
+                blocks.append("".join(buf))
+                buf = []
+        if buf:
+            blocks.append("".join(buf))
+        return blocks
+```
+
+Send a dict payload to pass rich content straight through — `deliver()` skips chunking and formatting.
+
+```python
+await adapter.deliver(
+    chat_id="C123",
+    content={"text": "Choose an option", "buttons": ["Yes", "No"]},
+)
+```
+
+Register the adapter at runtime via the platform registry — see [Bot Platform Plugins](/docs/features/bot-platform-plugins) for `register_platform(name, cls)`.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Keep send() a single API call">
+Chunking, retry, and typing belong to `deliver()`. Keep `send()` a thin wrapper around one platform API call so the shared machinery stays in control.
+</Accordion>
+
+<Accordion title="Return retry_after when the platform tells you to">
+Populate `SendResult(ok=False, retry_after=X)` from `send()` when the platform reports a rate limit. The default retry loop honours it and beats fixed backoff.
+</Accordion>
+
+<Accordion title="Declare only what your platform actually does">
+A truthful `PlatformCapabilities` gives the shared code the best information for graceful degradation. Overstating a capability breaks the fallback path.
+</Accordion>
+
+<Accordion title="Don't override edit_message unless supports_edit=True">
+Callers rely on the built-in `edit_not_supported` fallback to decide whether to re-send. Setting `supports_edit=True` without an override raises `NotImplementedError`.
+</Accordion>
+
+<Accordion title="Advanced: override format_message for markup">
+Slack `mrkdwn`, Telegram MarkdownV2, and Discord embeds each have quirks. `format_message` is the single method to apply platform-specific markup.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Bot Platform Capabilities" icon="sliders" href="/docs/features/bot-platform-capabilities">
+  The `PlatformCapabilities` descriptor that gates adapter defaults.
+</Card>
+<Card title="Bot Platform Plugins" icon="puzzle-piece" href="/docs/features/bot-platform-plugins">
+  Runtime registration and discovery of platform adapters.
+</Card>
+</CardGroup>
