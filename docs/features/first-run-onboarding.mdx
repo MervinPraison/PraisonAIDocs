@@ -5,7 +5,7 @@ description: "Auto-detects missing credentials and routes new users into the set
 icon: "key-round"
 ---
 
-When you run PraisonAI for the first time without API keys, it detects the unconfigured environment and offers to launch the setup wizard instead of failing on the first LLM call.
+PraisonAI leads you to a verified, working agent in as few keystrokes as possible — auto-detecting any provider key you already have, validating the one you enter, and smoke-testing before it hands back the prompt.
 
 `praisonai --init` is now safe to run before `setup` — if no provider is configured it prints provider guidance and exits cleanly rather than throwing a stack trace. Either order works for onboarding.
 
@@ -20,28 +20,36 @@ The user launches PraisonAI without API keys; the CLI offers the setup wizard in
 
 
 ```mermaid
-graph LR
+graph TB
     A[🚀 praisonai / praisonai run] --> B{Credentials<br/>configured?}
     B -->|Yes| C[✅ Run normally]
-    B -->|No, TTY| D[🧙 Offer setup wizard]
-    B -->|No, non-TTY| E[❌ stderr + exit 1]
-    D -->|User says Yes| F[⚙️ praisonai setup]
-    D -->|User says No| G[💡 Exit 0 with hint]
-    F --> H[✅ Run continues]
+    B -->|No| D[🧙 Setup Wizard]
+    D --> AD{Provider key<br/>in env?}
+    AD -->|Detected| CF["Confirm: Use Anthropic? [Y/n]"]
+    AD -->|Nothing detected| MENU[Provider menu]
+    CF --> K[⌨️ Enter key]
+    MENU --> K
+    K --> V{validate_api_key}
+    V -->|fail| K
+    V -->|pass| P[💾 Persist to ~/.praisonai/.env]
+    P --> S["🧪 Agent.start('Say hello in one sentence')"]
+    S --> DONE[✅ Verified — prints reply]
 
     classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef wizard fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef validate fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef wizard fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class A start
-    class B check
-    class C,H success
-    class E error
-    class D,F wizard
-    class G wizard
-
+    class B,AD check
+    class C,DONE success
+    class D,CF,MENU wizard
+    class K,P input
+    class V validate
+    class S validate
 ```
 
 ## Quick Start
@@ -88,6 +96,62 @@ praisonai "What is 2+2?"
 
 ---
 
+## Wizard flow (post-#2680)
+
+The wizard moves through three stages: auto-detect, validate, and smoke-test.
+
+<Steps>
+<Step title="Auto-detect a key you already have">
+If a `*_API_KEY` is already exported, the first prompt is a confirmation — not a numeric menu:
+
+```
+Detected ANTHROPIC_API_KEY in your environment.
+Use Anthropic (claude-sonnet-4-20250514)? [Y/n]:
+```
+
+Answer `n` to fall through to the full provider menu. The provider menu only appears when no key is detected.
+</Step>
+
+<Step title="Validate the key before it persists">
+Entered keys run through the same `validate_api_key()` check as `praisonai auth login`. A bad key re-prompts instead of silently writing a broken credential:
+
+```
+2. Enter your OpenAI API key:
+Enter API key (hidden):
+Invalid API key for OpenAI: OpenAI keys start with "sk-"
+Try again? [Y/n]: y
+Enter API key (hidden):
+```
+
+After up to three attempts the wizard proceeds with the last entry so you're never stuck in a loop.
+</Step>
+
+<Step title="Smoke-test before handing back the prompt">
+After the config is written, the wizard runs one live call and prints the reply:
+
+```
+Verifying your setup...
+✅ Verified — your agent is working!
+Hello! How can I help you today?
+```
+
+A failed smoke test is a **warning**, not an error — your config is already saved, so you can run `praisonai doctor` to diagnose the key or model.
+</Step>
+</Steps>
+
+<Note>
+Pass `--no-verify` to skip the smoke test when running offline or in CI:
+
+```bash
+praisonai setup --no-verify --non-interactive \
+  --provider openai --api-key "$OPENAI_API_KEY"
+```
+
+The wizard still writes the config; it just doesn't dial the LLM.
+</Note>
+
+---
+
 ## How It Works
 
 Both `praisonai` (bare) and `praisonai run` perform a credential check before doing any work.
@@ -99,6 +163,7 @@ sequenceDiagram
     participant CredCheck as Credential Check
     participant Store as CredentialStore
     participant Wizard as Setup Wizard
+    participant LLM
 
     User->>CLI: praisonai run "hello"
     CLI->>CredCheck: is_configured()?
@@ -112,6 +177,9 @@ sequenceDiagram
         User->>CLI: Y
         CLI->>Wizard: praisonai setup
         Wizard-->>CLI: Credentials stored
+        Wizard->>LLM: Agent.start("Say hello in one sentence")
+        LLM-->>Wizard: reply
+        Wizard->>User: prints reply + ✅ Verified
         CLI->>User: Continues with run
     else non-TTY / --quiet / --output json
         CLI->>User: stderr: "No API key configured. Run: praisonai auth login"
@@ -135,7 +203,7 @@ sequenceDiagram
 | Scenario | Old behaviour | New behaviour |
 |----------|--------------|--------------|
 | Configured user (env var or stored credential) | Works normally | Works — **no extra prompts, no added latency** |
-| New TTY user, no credentials, `praisonai` | Launched TUI, failed on first LLM call | Prints prompt, offers setup wizard |
+| New TTY user, no credentials, `praisonai` | Launched TUI, failed on first LLM call | Auto-detects any provider key already in the environment (confirm to use), otherwise prompts the menu; validates the key; runs a smoke-test with `Agent.start(...)`; prints the reply. |
 | New TTY user, no credentials, `praisonai run "hi"` | Ran agent, failed on first LLM call | Same prompt as above; on success continues the run |
 | CI / piped stdin / `--output json` | Cryptic LLM failure | Writes error to `stderr`, exits `1` |
 
@@ -200,6 +268,10 @@ On shared developer machines, stored credentials (`praisonai setup`) are scoped 
 
 <Accordion title="Test your setup with a quick prompt before piping through automation">
 Run `praisonai run "ping"` manually before wiring the command into a pipeline or CI job. A successful response confirms credentials are configured and the model is reachable.
+</Accordion>
+
+<Accordion title="Skip the smoke test in CI">
+The smoke test is convenient locally but wastes a token round-trip in CI. Skip it with `--no-verify` on both `setup` and `setup wizard`.
 </Accordion>
 </AccordionGroup>
 
