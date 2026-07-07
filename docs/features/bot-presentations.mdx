@@ -1,7 +1,7 @@
 ---
 title: "Interactive Bot Messages"
 sidebarTitle: "Interactive Messages"
-description: "Reply with buttons, dropdowns, and approval prompts that render as native widgets on Telegram, Slack, and Discord"
+description: "Reply with buttons, dropdowns, and approval prompts that render as native widgets on Telegram, Slack, Discord, and WhatsApp"
 icon: "display"
 ---
 
@@ -23,11 +23,12 @@ The user taps an inline button or dropdown; each channel renders the same struct
 
 ```mermaid
 graph LR
-    subgraph "One model, three channels"
+    subgraph "One model, four channels"
         A[Agent] --> P[MessagePresentation]
         P --> T[Telegram<br/>Inline Keyboard]
         P --> S[Slack<br/>Block Kit]
         P --> D[Discord<br/>Components]
+        P --> W[WhatsApp<br/>Interactive Buttons/List]
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -36,7 +37,7 @@ graph LR
 
     class A agent
     class P model
-    class T,S,D channel
+    class T,S,D,W channel
 
 ```
 
@@ -144,7 +145,7 @@ sequenceDiagram
 | Telegram | Inline keyboard | `select` → button column |
 | Slack | Block Kit | `web_app` action → URL button |
 | Discord | Components | `web_app` action → URL button |
-| WhatsApp | Plain text only | All interactive → plain text |
+| WhatsApp | Reply buttons (≤3) / List messages (≤10 rows) | Buttons >3 or `select` → list message; URL buttons inlined as text links |
 
 ## Block Types
 
@@ -212,10 +213,86 @@ The input `presentation` is never mutated — `adapt_presentation()` always retu
 | Telegram | 8 | 100 | 800 | 64 | 0 (none) | — | No | Yes |
 | Slack | 5 | 1 | 5 | 75 | 100 | 75 | Yes | No |
 | Discord | 5 | 5 | 25 | 80 | 25 | 100 | Yes | No |
+| WhatsApp | 10 (list rows) / 3 (reply buttons) | 1 | 10 (list) / 3 (reply) | 24 (list) / 20 (reply) | 10 | 24 | Yes (native list) | No |
 
 <Note>
 Telegram has no native select menu (`supports_select=False`). Any `select` block is automatically converted to a column of callback buttons by `adapt_presentation()`.
 </Note>
+
+<Note>
+WhatsApp uses split caps: `≤3` non-URL tappable buttons render as native **reply buttons** (title cap 20). More than 3 buttons — or any `select` block — promotes to a native **list message** (row title cap 24, up to 10 rows). URL buttons are never tappable widgets; their links are inlined into the message body as `Label: URL` lines.
+</Note>
+
+## Renderer Registry
+
+Every channel plugs into a platform-keyed registry so adapters resolve a renderer uniformly and unknown channels degrade to readable text.
+
+```mermaid
+graph LR
+    P[MessagePresentation] --> R["render_for(platform, presentation)"]
+    R --> L["get_renderer(platform)"]
+    L -->|registered| N[Native payload]
+    L -->|unknown| F["fallback_text()"]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fallback fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class P input
+    class R,L process
+    class N output
+    class F fallback
+```
+
+`render_for(platform, presentation)` resolves the registered renderer and returns its native payload; channels with no renderer fall back to `fallback_text(presentation)`.
+
+```python
+from praisonai_bot.bots._presentation_renderer import (
+    get_renderer,
+    render_for,
+    fallback_text,
+)
+from praisonaiagents.bots import MessagePresentation
+
+presentation = MessagePresentation.approval("Allow file delete?", "appr-1")
+
+# Resolve + render for a known channel
+payload = render_for("whatsapp", presentation)   # native interactive payload
+
+# Unknown channels degrade to readable text
+render_for("email", presentation)                # → {"text": "...\n• Allow Once\n• Deny"}
+
+get_renderer("slack")   # → SlackPresentationRenderer
+get_renderer("email")   # → None
+```
+
+Each renderer implements the `PresentationRenderer` `Protocol` — two static methods, `get_limits()` and `render()`. Register a new channel by adding a class with these methods to `_RENDERERS`.
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `get_limits()` | `PresentationLimits` | Channel capability caps used by `adapt_presentation()` |
+| `render(presentation)` | `Dict[str, Any]` | Native, platform-specific payload |
+
+`fallback_text(presentation)` flattens a presentation for channels without a registered renderer: text/context/divider blocks become lines, buttons and select options become `• Label` bullets, and URL buttons inline as `• Label: URL` so nothing is silently dropped.
+
+<Note>
+See [Presentation Renderers](/docs/features/presentation-renderers) for the full registry API, the built-in renderer table, and an "add a channel" recipe.
+</Note>
+
+### Native rendering per channel
+
+Call a renderer directly to preview the exact native payload a channel receives.
+
+```python
+from praisonai_bot.bots._presentation_renderer import WhatsAppPresentationRenderer
+from praisonaiagents.bots import MessagePresentation
+
+rendered = WhatsAppPresentationRenderer.render(
+    MessagePresentation.approval("Allow file delete?", "appr-1")
+)
+# rendered["interactive"]["type"] == "button"  → 2 tappable reply buttons
+```
 
 ## Capability Degradation
 
@@ -300,7 +377,7 @@ Give **Deny** or **Cancel** higher priority so they survive truncation on Discor
 </Accordion>
 
 <Accordion title="Provide plain-text content as fallback">
-Always set `MessagePresentation` text content so WhatsApp and email channels still deliver a readable message.
+Always set `MessagePresentation` text content so channels without a registered renderer (e.g. Email) still deliver a readable message. WhatsApp now renders interactive presentations natively.
 </Accordion>
 
 <Accordion title="Use MessagePresentation.approval for tool gates">
