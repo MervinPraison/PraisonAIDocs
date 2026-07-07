@@ -1,0 +1,218 @@
+---
+title: "Piped Input"
+sidebarTitle: "Piped Input"
+description: "Compose praisonai run/code/chat in Unix pipelines and CI"
+icon: "terminal"
+---
+
+Pipe any text into `praisonai run`, `code`, or `chat` and it is merged with your prompt before the agent runs.
+
+```mermaid
+graph LR
+    subgraph "Piped Input"
+        Shell[💻 cat file] --> Merge[🔀 prompt + piped body]
+        Prompt[✍️ prompt arg] --> Merge
+        Merge --> Agent[🤖 Agent]
+        Agent --> Result[✅ Result]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Shell,Prompt input
+    class Merge process
+    class Agent agent
+    class Result output
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Pipe a file into run">
+```bash
+cat error.log | praisonai run "Diagnose the root cause"
+```
+</Step>
+
+<Step title="Pipe into code">
+```bash
+cat data.json | praisonai code "Write a parser for this shape"
+```
+</Step>
+
+<Step title="Pipe into chat">
+```bash
+echo "$STACKTRACE" | praisonai chat "Explain this"
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+The prompt argument and piped stdin are merged before dispatch.
+
+```mermaid
+sequenceDiagram
+    participant Shell
+    participant CLI
+    participant Resolve as resolve_cli_input
+    participant Agent
+
+    Shell->>CLI: cat file | praisonai run "prompt"
+    CLI->>Resolve: prompt + piped stdin
+    Resolve-->>CLI: "prompt\n<piped body>"
+    CLI->>Agent: merged input
+    Agent-->>Shell: Response
+```
+
+| Component | Role |
+|-----------|------|
+| `resolve_cli_input(prompt)` | Merges the prompt argument with piped stdin (prompt first). |
+| `read_stdin_if_available()` | Non-blocking read with a 10 MB cap. |
+| `select.select` guard | Prevents stalls when stdin is an open pipe with no EOF (common in CI). |
+
+---
+
+## Merge Order
+
+The prompt argument comes first, then the piped body, joined with `\n`.
+
+| Prompt arg | Piped stdin | Final input to agent |
+|------------|-------------|----------------------|
+| Set | Set | `prompt + "\n" + piped` |
+| Set | Empty / no pipe | `prompt` (unchanged) |
+| None | Set | `piped` (becomes the prompt) |
+| None | Empty / no pipe | `None` (interactive REPL if TTY) |
+
+---
+
+## Decision Diagram
+
+`praisonai run` chooses one path per invocation — only the default text path merges piped stdin.
+
+```mermaid
+graph TB
+    Start[💻 praisonai run] --> YAML{📄 Target is<br/>a YAML file?}
+    YAML -->|Yes| RunYAML[▶️ Run the YAML<br/>no stdin merge]
+    YAML -->|No| Named{⚙️ --agent or<br/>--command set?}
+    Named -->|Yes| Dispatch[▶️ Dispatch definition<br/>no stdin merge]
+    Named -->|No| Merge[🔀 resolve_cli_input target<br/>merge piped stdin]
+    Merge --> Run[🤖 Agent]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef skip fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class YAML,Named decision
+    class RunYAML,Dispatch,Merge skip
+    class Run agent
+```
+
+---
+
+## Skip Rules for `praisonai run`
+
+`praisonai run` skips the stdin merge when merging a piped body would be meaningless.
+
+- **YAML target** — an existing `.yaml` / `.yml` file (case-insensitive, so `AGENTS.YAML` counts). Concatenating a piped body into a YAML path would be nonsense.
+- **`--agent`** — a named custom agent runs its own definition.
+- **`--command`** — a named custom command uses `TARGET` as `$ARGUMENTS`.
+- **`--restore`** — the command exits before ingestion, so `... | praisonai run --restore last` never drains the pipe.
+
+`praisonai code` and `praisonai chat` call `resolve_cli_input(prompt)` unconditionally at the top of the handler, so they always merge piped stdin.
+
+---
+
+## Size Cap & Platform Notes
+
+Piped input is capped at **10 MB**. Larger streams are truncated to 10 MB before merging.
+
+Windows: the piped-read path is skipped, because Python's `select.select` is socket-only on Windows. Attach files instead with `--file` on `praisonai code` / `praisonai chat`:
+
+```bash
+praisonai code --file error.log "Diagnose the root cause"
+```
+
+---
+
+## CI / Scripting Examples
+
+<CodeGroup>
+```yaml GitHub Actions
+- name: AI review of the diff
+  run: git diff origin/main...HEAD | praisonai run "Review these changes for bugs"
+  env:
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+```
+
+```bash Kubernetes logs
+kubectl logs deploy/api --tail=200 | praisonai run "Explain these errors"
+```
+
+```bash Remote log
+curl -s https://api.example.com/log | praisonai code "Add tests for the failing calls"
+```
+</CodeGroup>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Put the prompt first, pipe the context second">
+The merge order is prompt then piped body, so a leading prompt produces the clearest instruction for the agent.
+
+```bash
+cat error.log | praisonai run "Diagnose the root cause"
+```
+</Accordion>
+
+<Accordion title="For YAML agents, do not pipe — use --file or an inline instruction">
+The YAML skip rule means a pipe into a YAML target is silently ignored. Pass context with `--file` or write the instruction inline.
+
+```bash
+praisonai code --file config.yaml "Validate this config"
+```
+</Accordion>
+
+<Accordion title="In CI, do not pipe more than 10 MB — split large logs">
+The 10 MB cap truncates silently. Trim or `tail` large streams before piping.
+
+```bash
+tail -n 500 huge.log | praisonai run "Summarize the recent failures"
+```
+</Accordion>
+
+<Accordion title="Prefer named custom agents for repeatable pipelines">
+A named agent (`--agent`) keeps repeatable pipelines cleaner than reshaping stdin every invocation.
+
+```bash
+praisonai run --agent reviewer "Audit the latest changes"
+```
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Run" icon="play" href="/docs/cli/run">
+Run agents from files or prompts.
+</Card>
+<Card title="Code" icon="code" href="/docs/cli/code">
+Code assistant mode for programming tasks.
+</Card>
+<Card title="Chat" icon="comments" href="/docs/cli/chat">
+Interactive chat mode with AI agents.
+</Card>
+<Card title="CLI Dispatch" icon="terminal" href="/docs/cli/cli-reference">
+Command dispatch overview.
+</Card>
+</CardGroup>
