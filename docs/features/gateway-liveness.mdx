@@ -1,0 +1,208 @@
+---
+title: "Gateway Liveness"
+sidebarTitle: "Liveness"
+description: "Reap half-open gateway connections with ping/pong heartbeats"
+icon: "heart-pulse"
+---
+
+<Note>
+The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` still works exactly as documented here; for a standalone install see [praisonai-bot Migration](/docs/guides/praisonai-bot-migration).
+</Note>
+
+Liveness closes half-open gateway connections by heartbeating over the wire and reaping any peer that misses too many beats.
+
+```mermaid
+graph LR
+    subgraph "Liveness"
+        Server[🖥️ Gateway] -->|PING| Client[💻 Peer]
+        Client -->|PONG| Server
+        Server -->|no PONG| Reaper{🔍 evaluate}
+        Reaper -->|REAP| Close[🔒 LIVENESS_TIMEOUT]
+    end
+
+    classDef server fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Server,Client server
+    class Reaper proc
+    class Close warn
+```
+
+## Quick Start
+
+<Steps>
+
+<Step title="Enable liveness on an agent's gateway">
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import GatewayConfig, LivenessConfig
+from praisonai_bot.gateway import WebSocketGateway
+
+gateway = WebSocketGateway(
+    config=GatewayConfig(liveness=LivenessConfig(enabled=True))
+)
+gateway.register_agent(Agent(name="Support", instructions="Reply to users"))
+```
+
+</Step>
+
+<Step title="Tune the cadence">
+
+```python
+from praisonaiagents.gateway import GatewayConfig, LivenessConfig
+
+config = GatewayConfig(
+    liveness=LivenessConfig(
+        enabled=True,
+        interval_ms=15_000,
+        missed_beats_before_reap=3,
+    )
+)
+```
+
+</Step>
+
+<Step title="Or configure it in gateway.yaml">
+
+```yaml
+gateway:
+  liveness:
+    enabled: true
+    interval_ms: 15000
+    missed_beats_before_reap: 3
+```
+
+</Step>
+
+</Steps>
+
+---
+
+## How It Works
+
+The gateway emits a `PING` on each interval; any inbound frame (a `PONG`, a peer `PING`, or a normal message) refreshes `last_activity`. A silent peer misses beats until the reaper closes it.
+
+```mermaid
+sequenceDiagram
+    participant Server as Gateway<br/>(reaper task)
+    participant Policy as LivenessPolicy
+    participant Client as Peer
+
+    Server->>Client: PING
+    Client-->>Server: PONG
+    Note over Server: last_activity refreshed
+    Server->>Policy: evaluate(last_activity, now)
+    Policy-->>Server: KEEP
+
+    Note over Client: peer goes silent
+    Server->>Client: PING
+    Note over Server: no PONG for<br/>interval × missed_beats
+    Server->>Policy: evaluate(last_activity, now)
+    Policy-->>Server: REAP
+    Server->>Client: close LIVENESS_TIMEOUT
+```
+
+| Piece | Owner | Role |
+|---|---|---|
+| `EventType.PING` / `EventType.PONG` | Protocol | Wire frame both peers agree on |
+| `LivenessPolicy.evaluate(last_activity, now)` | Core (pure) | Returns `KEEP` or `REAP` |
+| Gateway reaper task | Wrapper server | Emits `PING`, calls `evaluate`, closes with `LIVENESS_TIMEOUT` |
+| Client watchdog | Reference client | Sends `PING`, force-reconnects on silence |
+| `GatewayCloseCode.LIVENESS_TIMEOUT` | Protocol | Typed close code the client can recognise |
+
+A connection is reaped once `now > last_activity + interval_seconds × missed_beats_before_reap`. Setting `enabled=False` (the default) makes `evaluate` always return `KEEP`, so upgrading changes nothing.
+
+---
+
+## Configuration Options
+
+`LivenessConfig` is the user-facing config; `to_policy()` bridges it to the pure `LivenessPolicy` the reaper consumes.
+
+<Card icon="code" href="/docs/sdk/reference/python/gateway/LivenessConfig">
+  Full field, type, and default reference
+</Card>
+
+---
+
+## Common Patterns
+
+Pick a cadence from the peer's network profile — the default is a no-op until you turn it on.
+
+```mermaid
+graph TB
+    Start{Do you see stuck<br/>'online' sessions?} -->|No| Off[enabled=False<br/>default, no-op]
+    Start -->|Yes| Net{Peer network?}
+    Net -->|Mobile / NAT| Def[interval_ms=30000<br/>missed_beats=2]
+    Net -->|LAN / low-latency| Ag[interval_ms=5000<br/>missed_beats=2]
+    Net -->|Mixed| Bal[interval_ms=15000<br/>missed_beats=3]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef opt fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef off fill:#7C90A0,stroke:#7C90A0,color:#fff
+
+    class Start,Net q
+    class Def,Ag,Bal opt
+    class Off off
+```
+
+### Disabled (default)
+
+```python
+from praisonaiagents.gateway import GatewayConfig
+
+config = GatewayConfig()  # liveness disabled, behaviour unchanged
+```
+
+### Mobile / NAT peers
+
+```python
+from praisonaiagents.gateway import GatewayConfig, LivenessConfig
+
+config = GatewayConfig(liveness=LivenessConfig(enabled=True))  # 30s × 2 beats
+```
+
+### Aggressive reaping for high-turnover realtime
+
+```python
+from praisonaiagents.gateway import GatewayConfig, LivenessConfig
+
+config = GatewayConfig(
+    liveness=LivenessConfig(enabled=True, interval_ms=5_000, missed_beats_before_reap=2)
+)
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+
+<Accordion title="Leave it off until presence lies">
+Default is `enabled=False` — behaviour is unchanged. Only enable it when presence stays online after a peer vanishes.
+</Accordion>
+
+<Accordion title="Honour the advertised interval on custom clients">
+The server advertises `heartbeat_ms`; the reference client's watchdog trips at ~2× that. If you build your own client, honour the advertised value so both sides derive the same window from `reap_deadline` / `interval_seconds`.
+</Accordion>
+
+<Accordion title="Treat LIVENESS_TIMEOUT as expected">
+Treat this close code as expected. Reconnect and resume — don't surface it as a fatal error to the user.
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Reliability Preset" icon="shield-check" href="/docs/features/gateway-reliability">
+  Related resilience knobs
+</Card>
+<Card title="Session Continuity" icon="link" href="/docs/features/gateway-session-continuity">
+  What survives a reap
+</Card>
+</CardGroup>
