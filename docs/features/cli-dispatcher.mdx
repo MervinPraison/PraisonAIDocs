@@ -28,19 +28,22 @@ graph TB
     F --> K{🧠 in registered<br/>Typer commands?}
     K -->|Yes| Typer3[🧰 Typer subcommand]
     K -->|No| Legacy[🤖 Legacy<br/>PraisonAI().main]
+    Legacy --> C{🔍 single-word<br/>bare positional?}
+    C -->|No / multi-word| Prompt[🤖 Direct prompt → LLM]
+    C -->|Yes| G{🛡 Reserved verb<br/>or close typo?}
+    G -->|No| Prompt
+    G -->|Yes| Guard[❌ Print hint stderr<br/>exit 2]
 
     classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef route fill:#10B981,stroke:#7C90A0,color:#fff
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
 
-    classDef agent fill:#8B0000,color:#fff
-    classDef tool fill:#189AB4,color:#fff
     class Start input
-    class V,H,E,K check
+    class V,H,E,K,C,G check
     class F input
-    class Print,Typer1,Typer2,Typer3 route
-    class Legacy agent
+    class Print,Typer1,Typer2,Typer3,Prompt route
+    class Legacy,Guard agent
 ```
 
 ## Quick Start
@@ -131,9 +134,11 @@ sequenceDiagram
 | 3 | `praisonai` (no argv) | Typer | Drops into Typer's interactive TUI. |
 | 4 | `praisonai --verbose` / `praisonai -o json` (only flags) | Typer | `_find_first_command` returns `None` → Typer handles global-flag-only cases. |
 | 5 | `praisonai chat ...` (first positional ∈ registered commands) | Typer | Auto-discovered via Click introspection of `app`. Adding a new subcommand to `cli/app.py` makes it routable here with **zero dispatcher changes**. |
-| 6 | `praisonai "Build a weather agent"` (free-text — token contains a space) | Legacy `PraisonAI().main()` | Free-text prompts always fall through to legacy. |
-| 7 | `praisonai agents.yaml` (filename, not a registered command) | Legacy `PraisonAI().main()` | Routing decision is by **command-set membership**, NOT by `os.path.isfile()`. A typo'd YAML path also routes to legacy and surfaces there. |
-| 8 | `praisonai totally-unknown` (unknown positional) | Legacy `PraisonAI().main()` | Same as row 7 — anything not in the discovered command set falls through. |
+| 6 | `praisonai "Build a weather agent"` (free-text — token contains a space) | Legacy → direct prompt | Multi-word prompts skip the guard and run as a one-shot prompt. |
+| 7 | `praisonai agents.yaml` (filename, not a registered command) | Legacy → direct prompt | Routing decision is by **command-set membership**, NOT by `os.path.isfile()`. A typo'd YAML path also routes to legacy and surfaces there. |
+| 8 | `praisonai hello` (single word, not a typo of any command) | Legacy → direct prompt | An unrecognised single word still runs as a prompt (backward-compatible). |
+| 9 | `praisonai show` (reserved verb) | Guard → stderr hint, exit 2 | `classify_unknown_command` catches reserved verbs and prints a suggestions list instead of a paid LLM call. |
+| 10 | `praisonai memoyr` (single-word typo of `memory`) | Guard → stderr hint, exit 2 | `difflib.get_close_matches(cutoff=0.8)` matches the typo and prints `Did you mean: memory?`. |
 
 ---
 
@@ -186,6 +191,59 @@ praisonai --verbose chat "Hello world"
 
 ---
 
+## Unknown-command guard
+
+The dispatcher intercepts single-word command-like tokens so a mistyped verb never becomes a paid LLM call.
+
+```mermaid
+graph TB
+    Token[🔎 bare positional] --> C{🔍 single-word?}
+    C -->|No / multi-word| Prompt[🤖 Direct prompt → LLM]
+    C -->|Yes| G{🛡 Reserved verb<br/>or close typo?}
+    G -->|No| Prompt
+    G -->|Yes| Guard[❌ Print hint stderr<br/>exit 2]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef route fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Token input
+    class C,G check
+    class Prompt route
+    class Guard agent
+```
+
+`classify_unknown_command` in `praisonai/cli/legacy/dispatch/argparse_builder.py` returns a hint string only when a lone token looks like a mistyped or reserved command; otherwise it returns `None` and the token runs as a prompt.
+
+| Input token | Classification | Result |
+|---|---|---|
+| `""` / `None` | Not guarded | Runs as prompt |
+| `"write a poem"` (contains a space) | Not guarded | Runs as prompt |
+| `show` (reserved verb, case-insensitive) | Guarded | `Unknown command: 'show'` + suggestions |
+| `memoyr` (close typo of `memory`, cutoff `0.8`) | Guarded | `Unknown command: 'memoyr'` + `Did you mean: memory?` |
+| `hello` (single word, no match) | Not guarded | Runs as prompt |
+
+### When it fires
+
+| You type | Guard fires? | What happens |
+|---|---|---|
+| `praisonai show` | ✅ reserved verb | stderr hint listing `paths` / `version show` / `memory show` / `config show`, exit 2 |
+| `praisonai memoyr` | ✅ close typo (cutoff 0.8) | stderr `Did you mean: memory?` + `praisonai run "<prompt>"` hint, exit 2 |
+| `praisonai hello` | ❌ single word, unmatched | routed as a direct prompt |
+| `praisonai "write a poem"` | ❌ multi-word | routed as a direct prompt |
+| `praisonai run "show"` | ❌ argument to `run`, not a top-level token | LLM sees `"show"` as a prompt |
+
+<Warning>
+The hint prints to **stderr** with **exit code 2**. Shell scripts must not swallow stderr if they need the diagnostic.
+</Warning>
+
+<Tip>
+To send a single word to the model, wrap it in `praisonai run "<word>"` — arguments to `run` bypass the guard by construction.
+</Tip>
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
@@ -198,7 +256,7 @@ To add a new subcommand, simply register it in `praisonai/cli/app.py` using `app
 </Accordion>
 
 <Accordion title="Free-text prompts vs. typo'd command names">
-When you mistype a command name, it routes to legacy mode instead of showing a Typer "command not found" error. This design choice ensures that typo'd commands behave like free-text prompts, maintaining backward compatibility while still allowing auto-discovery of new commands.
+Multi-word bare positionals (e.g. `praisonai "build a weather agent"`) still fall through to legacy and run as a direct prompt. Single-word tokens go through `classify_unknown_command` first: a reserved verb like `show` or a close typo like `memoyr` fails fast with a hint on **stderr** and exits with code **2**, while an unrecognised single word (e.g. `hello`) still runs as a prompt for backward compatibility. Use `praisonai run "hello"` to send a genuine single-word prompt.
 </Accordion>
 
 <Accordion title="Failure visibility">
