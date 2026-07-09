@@ -56,16 +56,24 @@ graph LR
 
 ## How It Works
 
+Two seams enforce a deny rule: the schema-hide seam at build time and the call-time gate — both for native and MCP tools.
+
 ```mermaid
 sequenceDiagram
-    participant User
+    participant Model as LLM
     participant Agent
-    participant PermissionsModule
+    participant Mgr as PermissionManager
+    participant Tool as Tool (native or MCP)
 
-    User->>Agent: Request
-    Agent->>PermissionsModule: Process
-    PermissionsModule-->>Agent: Result
-    Agent-->>User: Response
+    Note over Agent,Mgr: Schema build
+    Agent->>Mgr: is_denied(tool_name)?
+    Mgr-->>Agent: deny -> drop from schema
+
+    Note over Model,Tool: Call time (native OR MCP)
+    Model->>Agent: call(tool_name, args)
+    Agent->>Mgr: is_denied(tool_name)?
+    Mgr-->>Agent: deny -> block
+    Agent->>Tool: execute (when allowed)
 ```
 
 
@@ -122,6 +130,79 @@ For YAML and CLI surfaces, see [Declarative Permissions](/docs/features/declarat
 
 </Step>
 </Steps>
+
+---
+
+## Auto-wiring from approval config
+
+Passing `approval={"permissions": {...}}` to `Agent(...)` now attaches a `PermissionManager` automatically, so pattern-based rules both hide denied tools from the model and block them at call time.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="CI Worker",
+    instructions="Ship safely",
+    approval={
+        "permissions": {
+            "read:*": "allow",
+            "bash:rm *": "deny",   # hidden from the model + blocked at call time
+            "*": "ask",
+        },
+    },
+)
+agent.start("Check the deployment status")
+```
+
+The agent accepts three shapes for `permissions`:
+
+| Shape | Behaviour |
+|-------|-----------|
+| `dict` (flat `"pattern": "action"`) | Loaded via `PermissionManager(agent_name=...).load_rules_from_config(dict)` |
+| `list` / `tuple` of `PermissionRule` | Each rule added via `add_rule` |
+| `PermissionManager` instance | **Reused as-is** — no throwaway manager, no `~/.praisonai/permissions/` disk I/O |
+
+Pass a pre-built manager to reuse it directly:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.permissions import PermissionManager
+
+mgr = PermissionManager(storage_dir="/tmp/policy")
+mgr.load_rules_from_config({"bash:rm *": "deny", "read:*": "allow"})
+
+agent = Agent(
+    name="Deployer",
+    instructions="Deploy safely",
+    approval={"permissions": mgr},   # reused as-is
+)
+```
+
+Wiring failures are non-fatal — logged at DEBUG. The preset frozenset tier and the call-time gate stay in effect.
+
+---
+
+## MCP tools are gated uniformly
+
+The same deny gate applies to MCP tools: both native functions and MCP tools flow through `_execute_tool_impl`, so `deny` hides and blocks them identically. MCP tools using a `tool:<name>` prefix are matched by rules against either the bare name or the prefixed form.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.mcp import MCP
+
+agent = Agent(
+    name="Ops",
+    instructions="Run ops tasks",
+    tools=MCP("http://localhost:8000/sse"),
+    approval={
+        "permissions": {
+            "tool:delete_*": "deny",   # matches MCP-namespaced tool names
+        },
+    },
+)
+# delete_* MCP tools never appear in the schema and are blocked at call time
+# with {"permission_denied": True}.
+```
 
 ---
 
@@ -208,6 +289,47 @@ Record an approval decision. Returns a `PersistentApproval`.
 | `agent_name` | `str` \| `None` | `None` | Restrict this approval to one agent |
 | `reusable_scope` | `bool` | `False` | Opt in to store a generalised prefix glob instead of the literal `target` (see [Reusable command-prefix approvals](#reusable-command-prefix-approvals)). Ignored when `scope="once"`. |
 | `pattern` | `str` \| `None` | `None` | Explicit pattern to store. Overrides both `target` and `reusable_scope` — useful when CLI/UI displays a suggested scope for the user to edit before saving. |
+
+---
+
+### PermissionManager.is_denied()
+
+Cheap, callback-free helper used at schema-build time to hide tools the model can't call.
+
+```python
+def is_denied(self, tool_name: str, agent_name: Optional[str] = None) -> bool:
+    """Return True if tool_name resolves to a hard deny.
+
+    Only DENY hides the tool; ask/allow/no-match keep it visible so approval
+    can still happen at execution time (defence in depth).
+
+    Checks both bare and tool:<name> forms. Never consults the interactive
+    approval callback — safe to call while assembling the schema.
+    """
+```
+
+Returns `True` **only** when a matching rule resolves to a hard `DENY`. `allow`, `ask`, and the no-matching-rule default of `ask` all return `False` — those tools stay visible so approval can still run at call time. It checks both the bare name and the `tool:<name>` form, so a rule against either convention takes effect (important for MCP-namespaced names). Deny-wins is global: the first target form that resolves to `DENY` returns `True`.
+
+| Arg | Type | Default | Description |
+|-----|------|---------|-------------|
+| `tool_name` | `str` | — | Tool name to check — bare (`"write_file"`) or namespaced (`"tool:write_file"`) |
+| `agent_name` | `str` \| `None` | `None` | Restrict the check to one agent's rules |
+
+```python
+from praisonaiagents.permissions import PermissionManager
+
+mgr = PermissionManager()
+mgr.load_rules_from_config({"write_file": "deny", "read_file": "allow"})
+
+mgr.is_denied("write_file")       # True   -> hidden from the schema
+mgr.is_denied("read_file")        # False  -> allow, stays advertised
+mgr.is_denied("edit_file")        # False  -> no matching rule = ask, not deny
+mgr.is_denied("tool:write_file")  # True   -> namespaced form
+```
+
+<Note>
+`PermissionManager.is_denied(...)` is a **manager method** — an exposure-time helper. `PermissionResult.is_denied` (documented above at the `check()` result) is a **result attribute** describing a single `check()` outcome. The method never calls the interactive approval callback; the attribute reflects an already-resolved decision.
+</Note>
 
 ---
 
