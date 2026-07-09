@@ -56,6 +56,7 @@ praisonai config [OPTIONS] COMMAND [ARGS]...
 |---------|-------------|
 | `show` | Show fully resolved configuration |
 | `sources` | List configuration layers in precedence order |
+| `provenance [KEY]` | Show the resolved value of each key **and** which layer/file supplied it |
 | `validate [FILE]` | Validate YAML syntax and schema |
 | `list` | List all configuration values |
 | `get KEY` | Get a value by dotted path (e.g. `agent.model`) |
@@ -109,6 +110,59 @@ praisonai config sources
 ```
 
 Prints the five-layer hierarchy and which global/project/env sources are currently active.
+
+### `provenance`
+
+```bash
+praisonai config provenance                     # all keys, text output
+praisonai config provenance agent.model         # one key
+praisonai config provenance agent.model --json  # machine-readable
+```
+
+Prints the reconciled resolved view: every key that survived the deep-merge, its winning value, its layer (`defaults` / `global` / `project` / `environment` / `cli`), and the absolute path of the file that supplied it (`(runtime)` for env / CLI / built-in defaults).
+
+Reach for this when `praisonai config show` returns a value you did not expect and you need to find *which* file set it.
+
+Single key, text output:
+
+```
+$ praisonai config provenance agent.model
+agent.model = gpt-4o-mini
+  layer: project  source: /home/alice/proj/.praisonai/config.yaml
+```
+
+All keys, text output:
+
+```
+$ praisonai config provenance
+Resolved configuration (per-key provenance):
+
+  agent.model = gpt-4o-mini
+      project · /home/alice/proj/.praisonai/config.yaml
+  agent.temperature = 0.7
+      defaults · (defaults)
+  telemetry = true
+      global · /home/alice/.praisonai/config.yaml
+```
+
+JSON output (via the global `--json` flag):
+
+```json
+{
+  "agent.model": {
+    "value": "gpt-4o-mini",
+    "layer": "project",
+    "source": "/home/alice/proj/.praisonai/config.yaml"
+  },
+  "agent.temperature": {
+    "value": 0.7,
+    "layer": "defaults",
+    "source": null
+  }
+}
+```
+
+A missing key exits `1` with `Key not found: <key>`.
 
 ### `set` / `get` / `reset` / `path`
 
@@ -190,6 +244,71 @@ From `cwd`, the resolver walks up to the git root searching:
 2. `.praisonai/config.yml`
 3. `praison.yaml` / `praison.yml`
 4. `.praison/config.toml` (legacy)
+
+---
+
+## Value Interpolation
+
+Every value in every discovered config file is interpolated at load time, so secrets and reused prompt bodies can live outside your tracked config.
+
+```mermaid
+graph LR
+    subgraph "Value Interpolation"
+        FILE[📄 config.yaml] --> LOAD[🔧 _read_config_file]
+        LOAD --> INT[✨ interpolate]
+        INT --> ENV["${VAR} / {env:...}"]
+        INT --> INC["{file:./path}"]
+        ENV --> MERGED[✅ Resolved value]
+        INC --> MERGED
+    end
+
+    classDef file fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef dir fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class FILE file
+    class LOAD,INT process
+    class ENV,INC dir
+    class MERGED output
+```
+
+| Directive | Meaning | If the value is missing |
+|-----------|---------|-------------------------|
+| `${VAR}` | Legacy environment variable substitution | Directive kept literally when unset |
+| `{env:VAR}` | Environment variable, no default | Directive kept literally when unset |
+| `{env:VAR:-default}` | Environment variable with shell-style fallback (`:-`) | Returns `default` (may be empty) |
+| `{file:./path}` | Read the referenced file's contents into the value (trailing newline stripped); path resolves **relative to the directory of the config file** | Directive kept literally on read failure or security refusal |
+
+All four in one file:
+
+```yaml
+agent:
+  model: ${PRAISONAI_MODEL}                  # legacy shell form
+  provider: "{env:PRAISONAI_PROVIDER:-openai}"  # with default
+  system_prompt: "{file:./prompts/system.md}"   # file include
+
+telemetry: "{env:PRAISONAI_TELEMETRY:-true}"
+```
+
+<Warning>
+`{file:}` reads are confined to the directory of the config file being loaded. Absolute paths, home-relative (`~/…`) paths, and `../` traversals that escape that directory are all refused — the literal directive stays in the value and no file is read. Interpolation runs in a **single pass**, so an expanded `${VAR}` that itself contains `{file:…}` is never re-scanned (no chained-directive injection). A `{file:}` directive with no base directory (e.g. an ad-hoc string) is refused entirely.
+</Warning>
+
+<Note>
+`${VAR}` and `{env:VAR}` with no default are preserved as-is when the variable is unset — the directive stays visible in `praisonai config show` so a typo doesn't silently become an empty string.
+</Note>
+
+### From Python
+
+```python
+from praisonai_code.cli.configuration.resolver import ConfigResolver
+
+provenance = ConfigResolver().resolve_with_provenance()
+print(provenance["agent.model"])
+# {'value': 'gpt-4o-mini', 'layer': 'project',
+#  'source': '/home/alice/proj/.praisonai/config.yaml'}
+```
 
 ---
 
