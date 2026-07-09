@@ -99,6 +99,9 @@ Each channel bot gets an isolated agent via `Agent.clone_for_channel()` — fres
     channels:
       telegram:
         token: ${TELEGRAM_BOT_TOKEN}
+        allowed_users: []                        # or a list of allowed user IDs
+        unknown_user_policy: deny                # deny (default, secure) | pair | allow
+        owner_user_id: ${TELEGRAM_OWNER_ID}      # required if unknown_user_policy: pair
         streaming:
           mode: draft       # off | draft | progress — see /features/bot-streaming-replies
         routes:
@@ -107,6 +110,9 @@ Each channel bot gets an isolated agent via `Agent.clone_for_channel()` — fres
           default: personal
       discord:
         token: ${DISCORD_BOT_TOKEN}
+        allowed_users: []
+        unknown_user_policy: deny
+        owner_user_id: ${DISCORD_OWNER_ID}
         routes:
           default: personal
     ```
@@ -200,6 +206,8 @@ Each channel maps to a bot platform:
 channels:
   telegram:
     token: ${TELEGRAM_BOT_TOKEN}    # Environment variable
+    unknown_user_policy: deny        # deny (default) | pair | allow
+    owner_user_id: ${TELEGRAM_OWNER_ID}  # required if unknown_user_policy: pair
     routes:
       dm: personal                   # DMs → personal agent
       group: support                 # Groups → support agent
@@ -212,7 +220,25 @@ Use `${ENV_VAR_NAME}` syntax in token fields. The gateway automatically reads fr
 
 ### Channel Security
 
-Each channel enforces the same access-control pipeline as standalone bots.
+Each channel enforces the same access-control pipeline as standalone bots. Every key below is read per-channel from `gateway.yaml` — including `unknown_user_policy` and `owner_user_id`, which the gateway now wires through at start and on hot-reload ([PR #2856](https://github.com/MervinPraison/PraisonAI/pull/2856)).
+
+```python
+# Same effect from Python — for consumers building custom adapters
+from praisonaiagents.bots import BotConfig
+
+config = BotConfig(
+    token="...",
+    allowed_users=["telegram:123456"],
+    unknown_user_policy="pair",     # deny | pair | allow
+    owner_user_id="telegram:987654",
+)
+
+# is_explicitly_allowed skips the pairing flow for whitelisted users
+config.is_explicitly_allowed("telegram:123456")  # True
+config.is_explicitly_allowed("telegram:99999")   # False → policy decides
+```
+
+The same configuration comes straight from `gateway.yaml`:
 
 | YAML Key | Type | Default | Purpose |
 |----------|------|---------|---------|
@@ -221,6 +247,8 @@ Each channel enforces the same access-control pipeline as standalone bots.
 | `routing` / `routes` | `dict` | `{"default": "default"}` | Route map: `dm`, `group`, `default` → agent id. |
 | `allowed_users` | `list[str]` \| `str` | `[]` | User-ID allowlist. Comma-separated string also accepted (env-expansion friendly). |
 | `allowed_channels` | `list[str]` \| `str` | `[]` | Channel/group-ID allowlist. Same string handling. |
+| `unknown_user_policy` | `"deny" \| "pair" \| "allow"` | `"deny"` | What to do with users not in `allowed_users`. `deny` silently drops. `pair` runs the owner-approval flow (`owner_user_id` required). `allow` lets everyone through (trusted networks only). |
+| `owner_user_id` | `str` | `null` | Platform user ID of the channel owner. Required when `unknown_user_policy: "pair"` — the owner receives approval prompts for new users. |
 | `group_policy` | `str` | `"mention_only"` | One of `"mention_only"`, `"command_only"`, `"respond_all"`. Sets `mention_required` automatically. |
 | `auto_approve_tools` | `bool` \| `str` | `True` | Auto-approve safe tools. Strings `"1"/"true"/"yes"/"on"` are truthy. |
 | `default_tools` | `list[str]` | (BotConfig default) | Per-channel override for default safe tools. |
@@ -234,6 +262,8 @@ channels:
       - "987654321"
     allowed_channels:             # Group/channel allowlist (empty = anywhere)
       - "-1001234567890"
+    unknown_user_policy: deny     # deny (default, secure) | pair | allow
+    owner_user_id: ${TELEGRAM_OWNER_ID}  # required if unknown_user_policy: pair
     group_policy: "mention_only"  # mention_only | command_only | respond_all
     auto_approve_tools: true      # Auto-approve safe tools (default true)
     routes:
@@ -283,6 +313,48 @@ graph TB
 
 Earlier releases incorrectly treated empty `allowed_users` as "allow everyone" on Telegram, bypassing the policy entirely. Fixed in [PR #1885](https://github.com/MervinPraison/PraisonAI/pull/1885). Discord and Slack were already correct.
 </Warning>
+
+### Startup warnings
+
+An empty `allowed_users` triggers a policy-aware warning at gateway start and on hot-reload. Grep these exact strings in your logs:
+
+<CodeGroup>
+```text deny (default — secure)
+Channel 'telegram' has no allowed_users AND unknown_user_policy='deny' — inbound DMs from unknown users are SILENTLY DROPPED. Set unknown_user_policy: pair (with owner_user_id) or allow to change this.
+```
+
+```text pair
+Channel 'telegram' has no allowed_users AND unknown_user_policy='pair' — unknown users go through the owner-approval pairing flow. Ensure owner_user_id is set.
+```
+
+```text allow
+Channel 'telegram' has no allowed_users AND unknown_user_policy='allow' — bot accepts messages from everyone. This is intentional only in trusted networks.
+```
+</CodeGroup>
+
+If you see the `deny` warning and expected messages to flow through, your config is secure-by-default and DMs are intentionally dropped. Add IDs to `allowed_users`, or set `unknown_user_policy: pair` (with `owner_user_id`) or `allow`.
+
+```mermaid
+graph TB
+    subgraph "Unknown user hits the bot"
+        In[📨 Message from user_id] --> Check{On allowed_users?}
+        Check -->|Yes| Pass[✅ Runs as normal user]
+        Check -->|No — empty or missing| Pol{unknown_user_policy?}
+        Pol -->|deny default| Drop[⛔ Silently drop]
+        Pol -->|pair| Pair[📨 Notify owner_user_id → approve/reject]
+        Pol -->|allow| Trust[✅ Runs as unknown user]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class In input
+    class Check,Pol gate
+    class Pass,Pair,Trust ok
+    class Drop fail
+```
 
 <Note>
 As of PR #1791, gateway-mode bots enforce the same security pipeline as standalone bots (`praisonai bot start`). Previous versions silently bypassed `allowed_users`, pairing, and `group_policy` in gateway mode.
