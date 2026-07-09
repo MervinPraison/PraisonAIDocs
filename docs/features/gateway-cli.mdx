@@ -195,6 +195,12 @@ Examples:
 <Note>
 `--reliability` overrides the `reliability:` / `gateway.reliability:` key in YAML. See [Gateway Reliability Presets](/docs/features/gateway-reliability) for profile details and precedence rules.
 </Note>
+
+<Note>
+**Corporate proxies / SSL-inspecting networks.** A preflight failure caused only by `SSLCertVerificationError` / `certificate_verify_failed` does **not** abort the start — the token is usually valid and the runtime adapter's SSL stack is more permissive. The gateway prints a one-line warning naming the three CA-bundle env vars and continues.
+
+If any channel also fails for a non-SSL reason (bad token, unreachable host, timeout), preflight still hard-aborts — fix that channel or pass `--no-preflight`. See [Corporate CA bundle (SSL-inspecting networks)](#corporate-ca-bundle-ssl-inspecting-networks).
+</Note>
 </Tab>
 
 <Tab title="stop">
@@ -342,6 +348,15 @@ Quick health check:
 ```bash
 $ praisonai gateway doctor
 telegram     ✓  @my_support_bot
+slack        ✗  SSL certificate verify failed (network/proxy?). Token may still be valid. Try SSL_CERT_FILE=/path/to/corp-ca.pem or gateway start --no-preflight
+discord      ✓  @MySupport
+```
+
+A non-SSL failure keeps the bare error string:
+
+```bash
+$ praisonai gateway doctor
+telegram     ✓  @my_support_bot
 slack        ✗  invalid_auth (token expired)
 discord      ✓  @MySupport
 ```
@@ -379,6 +394,79 @@ To bypass during local dev (e.g. flaky probe network):
 
 ```bash
 praisonai gateway start --config gateway.yaml --no-preflight
+```
+
+### Corporate CA bundle (SSL-inspecting networks)
+
+On networks that intercept TLS with a corporate CA (proxy / MITM), the probe's HTTP client can reject the certificate chain even though the token is valid and the runtime adapter connects fine. Preflight classifies these SSL cert-verify failures separately and **soft-fails** when they are the only failures.
+
+```bash
+$ praisonai gateway start --config gateway.yaml
+slack        ✗  SSL certificate verify failed (network/proxy?). Token may still be valid. Try SSL_CERT_FILE=/path/to/corp-ca.pem or gateway start --no-preflight
+
+Pre-flight found SSL certificate-verify failures only (likely a proxy/MITM
+network). Tokens may still be valid — continuing start. Set SSL_CERT_FILE /
+REQUESTS_CA_BUNDLE / PRAISONAI_SSL_CA_BUNDLE to your corporate CA, or pass
+--no-preflight to skip this check.
+```
+
+The probe decides its action from the mix of failures:
+
+| Probe outcome (across all channels) | Preflight action |
+|-------------------------------------|------------------|
+| All channels `ok` | Start proceeds silently. |
+| ≥1 channel fails with a non-SSL error (token, network, timeout) | Hard-abort, exit `1`. |
+| All failures are SSL cert-verify only | **Soft-fail** — print the SSL warning, continue to start, exit `0`. |
+| Mixed: ≥1 SSL cert-verify **and** ≥1 token/network failure | Hard-abort (the non-SSL failure wins), exit `1`. |
+
+<Warning>
+Only certificate-verify failures soft-fail. Other TLS handshake failures — `WRONG_VERSION_NUMBER`, `NO_SHARED_CIPHER`, `HANDSHAKE_FAILURE` — still hard-abort, because they usually indicate a real bug that also breaks the channel at runtime.
+</Warning>
+
+Point the probe at your corporate CA with one of three env vars, highest precedence first:
+
+| Variable | Precedence | Behaviour |
+|----------|------------|-----------|
+| `PRAISONAI_SSL_CA_BUNDLE` | Highest — explicit PraisonAI override | Overrides pre-existing `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` for the probe. |
+| `REQUESTS_CA_BUNDLE` | Middle | Used only if `PRAISONAI_SSL_CA_BUNDLE` is unset. Left alone when the winner came from elsewhere. |
+| `SSL_CERT_FILE` | Lowest — Python default | Read by Python's default `ssl` context (used by `aiohttp`). Used only if the two above are unset. |
+
+```bash
+export PRAISONAI_SSL_CA_BUNDLE=/path/to/corp-ca.pem
+praisonai gateway start --config gateway.yaml
+```
+
+A configured-but-missing path warns and leaves the SSL env vars untouched:
+
+```
+Warning: CA bundle path '<path>' does not exist — SSL_CERT_FILE / REQUESTS_CA_BUNDLE not updated for probe.
+```
+
+<Tip>
+The runtime adapter reads the same three env vars, so setting one fixes both the preflight probe and long-lived channel connections.
+</Tip>
+
+```mermaid
+graph TB
+    subgraph "Preflight failure classification"
+        Fail[❌ Probe failure] --> Kind{Failure kind?}
+        Kind -->|Only SSL cert-verify| Soft[⚠️ Warn + continue]
+        Kind -->|Any non-SSL failure| Hard[⛔ Abort — exit 1]
+        Kind -->|Mixed SSL + non-SSL| Hard
+        Soft --> Hint[💡 Set SSL_CERT_FILE / REQUESTS_CA_BUNDLE / PRAISONAI_SSL_CA_BUNDLE]
+    end
+
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef soft fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef hard fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Fail fail
+    class Kind gate
+    class Soft soft
+    class Hard hard
+    class Hint ok
 ```
 
 ### Token resolution
