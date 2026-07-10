@@ -505,6 +505,10 @@ Or turn them on in `.praisonai/config.toml`:
 enabled = true          # or false, or ["logging", "metrics"]
 ```
 
+<Tip>
+Want each plugin to receive its own options from one file? See [Configure Plugins from `.praisonai/config.yaml`](#configure-plugins-from-praisonai-config-yaml) for per-plugin option blocks.
+</Tip>
+
 Under the hood, Agent init calls `plugins.maybe_enable_from_config()`, which reads the env var and config file, then runs `enable(get_enabled_plugins())` exactly once per process.
 
 ```mermaid
@@ -524,7 +528,7 @@ graph TB
     class R1,R2 result
 ```
 
-Precedence: **explicit `plugins.enable(...)` > `PRAISONAI_PLUGINS` env var > `[plugins]` in `config.toml` > disabled**.
+Precedence: **explicit `plugins.enable(...)` > `PRAISONAI_PLUGINS` env var > `[plugins]` in `config.yaml` / `config.toml` > disabled**.
 
 <Note>
 `maybe_enable_from_config()` is idempotent and runs at most once per process, so instantiating multiple agents is safe — plugins are wired a single time.
@@ -544,6 +548,171 @@ Agent(name="probe", instructions="noop")   # triggers maybe_enable_from_config
 print(plugins.is_enabled(), plugins.list_plugins())
 ```
 </Tip>
+
+---
+
+## Configure Plugins from `.praisonai/config.yaml`
+
+Turn plugins on and hand each one its own options from a single YAML file — no code.
+
+`~/.praisonai/config.yaml`:
+
+```yaml
+plugins:
+  enabled: true
+  pii_guardrail:
+    redact: [email, phone]
+  memory_watchdog:
+    interval: 30
+```
+
+`app.py`:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Assistant", instructions="Help users.")
+agent.start("My email is user@example.com")   # pii_guardrail redacts before the LLM sees it
+```
+
+<Note>
+Agent construction auto-loads the config, enables plugins, and hands `pii_guardrail` its `{redact: [email, phone]}` dict via `on_config`. Nothing else to wire up.
+</Note>
+
+```mermaid
+graph LR
+    Config[".praisonai/config.yaml"] --> Loader["maybe_enable_from_config"]
+    Loader --> Enable["enable(names, options_by_name)"]
+    Enable --> Apply["apply_plugin_options"]
+    Apply --> OnConfig["plugin.on_config(options)"]
+
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef loader fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef manager fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef plugin fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Config config
+    class Loader,Enable loader
+    class Apply manager
+    class OnConfig plugin
+```
+
+### Where the config file is found
+
+```
+1. .praisonai/config.toml   then .praisonai/config.yaml   (project-local)
+2. praisonai.toml           then praisonai.yaml           (project root)
+3. ~/.praisonai/config.toml then ~/.praisonai/config.yaml (user global)
+```
+
+<Info>
+The first file found wins — TOML and YAML have equal standing; whichever appears first in the search stops the walk.
+</Info>
+
+<Warning>
+PyYAML is an *optional* dependency. Without it, `.yaml` configs return empty (debug log only) — install with `pip install pyyaml` to enable the YAML surface.
+</Warning>
+
+### The four shapes of `enabled`
+
+| `enabled` value | Meaning | Example |
+|-----------------|---------|---------|
+| `true` | Enable every discovered plugin | `enabled: true` |
+| `false` | Disable every plugin — **wins over per-plugin blocks** | `enabled: false` |
+| `[names]` (non-empty list) | Enable exactly these plugins | `enabled: [pii_guardrail, metrics]` |
+| `"name"` (bare string, TOML) | Enable exactly this one plugin | `enabled = "pii_guardrail"` |
+| *omitted* + per-plugin blocks | Enable each plugin block whose own `enabled` is not `false` | (see below) |
+
+<Info>
+The JSON config schema advertises `boolean` and `array` for `enabled`; the loader also accepts a bare string at runtime for TOML users who prefer `enabled = "pii_guardrail"`.
+</Info>
+
+### Per-plugin option blocks
+
+Reserved keys (`enabled`, `auto_discover`, `directories`) configure the plugin *system*; **any other key whose value is a mapping is treated as a per-plugin option map** delivered to that plugin's `on_config` hook.
+
+```yaml
+plugins:
+  pii_guardrail:
+    redact: [email, phone]
+    enabled: true
+  memory_watchdog:
+    interval: 30
+    enabled: false     # disable just this one; pii_guardrail still runs
+```
+
+<Note>
+An explicit top-level `enabled: false` wins over any per-plugin block. Omit `enabled` at the top level and per-plugin blocks decide.
+</Note>
+
+### Reading options inside a plugin — `on_config`
+
+`apply_plugin_options()` invokes `plugin.on_config(options)` for every enabled plugin that has a configured option map — errors in a single plugin are logged and do not abort delivery to the others.
+
+Create `~/.praisonai/plugins/pii_guardrail.py`:
+
+```python
+"""
+Plugin Name: PII Guardrail
+Description: Redacts configured fields before the LLM sees them
+Version: 1.0.0
+"""
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class PIIGuardrail(Plugin):
+    def __init__(self):
+        self._fields = []
+
+    @property
+    def info(self):
+        return PluginInfo(
+            name="pii_guardrail",
+            hooks=[PluginHook.ON_CONFIG, PluginHook.BEFORE_LLM],
+        )
+
+    def on_config(self, config):
+        # config is the exact dict from `plugins.pii_guardrail:` in YAML.
+        self._fields = list(config.get("redact", []))
+        return config
+
+    def before_llm(self, messages, params):
+        # Use self._fields to scrub before the LLM call...
+        return messages, params
+
+def create_plugin():
+    return PIIGuardrail()
+```
+
+<Note>
+`on_config` fires once per enable — the reserved `enabled` flag (if present in the plugin block) is preserved so plugins can read it too.
+</Note>
+
+### Precedence
+
+**Explicit `plugins.enable(...)` in code > `PRAISONAI_PLUGINS` env var > `[plugins]` in `config.yaml` / `config.toml` > disabled by default.**
+
+```mermaid
+graph TB
+    Code["plugins.enable(...) in code"] --> Env["PRAISONAI_PLUGINS env var"]
+    Env --> File["[plugins] in config.yaml / config.toml"]
+    File --> Off["disabled by default"]
+
+    classDef top fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef mid fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef low fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef off fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Code top
+    class Env,File mid
+    class Off off
+```
+
+### Edge cases
+
+- **PyYAML missing** — YAML configs silently return empty (debug log only); install `pyyaml` to enable.
+- **Unknown reserved key** — the wrapper resolver's typo-suggestion validator only checks against `{enabled, auto_discover, directories}`; per-plugin blocks (dicts) are always accepted.
+- **Removed plugin block on reload** — the manager stores options with `replace=True` by default, so a block dropped from a later config no longer delivers stale options.
+- **Plugin `on_config` raises** — logged as a warning; delivery to other plugins is not aborted.
 
 ---
 
