@@ -15,23 +15,24 @@ def memory_show(
     limit: int = typer.Option(10, "--limit", "-l", help="Number of memories to show"),
 ):
     """Show stored memories."""
-    from praisonai_code.cli.main import PraisonAI
-    import sys
+    from praisonai_code._wrapper_bridge import run_wrapper_command
     
     argv = ['memory', 'show']
     if user_id:
         argv.extend(['--user-id', user_id])
+    if limit is not None:
+        argv.extend(['--limit', str(limit)])
     
-    original_argv = sys.argv
-    sys.argv = ['praisonai'] + argv
-    
-    try:
-        praison = PraisonAI()
-        praison.main()
-    except SystemExit:
-        pass
-    finally:
-        sys.argv = original_argv
+    run_wrapper_command(argv, feature="memory")
+
+
+@app.command("list")
+def memory_list(
+    user_id: str = typer.Option(None, "--user-id", help="User ID for memory isolation"),
+    limit: int = typer.Option(10, "--limit", "-l", help="Number of memories to show"),
+):
+    """List stored memories (alias for 'show')."""
+    memory_show(user_id=user_id, limit=limit)
 
 
 @app.command("add")
@@ -40,23 +41,13 @@ def memory_add(
     user_id: str = typer.Option(None, "--user-id", help="User ID for memory isolation"),
 ):
     """Add a memory."""
-    from praisonai_code.cli.main import PraisonAI
-    import sys
+    from praisonai_code._wrapper_bridge import run_wrapper_command
     
     argv = ['memory', 'add', content]
     if user_id:
         argv.extend(['--user-id', user_id])
     
-    original_argv = sys.argv
-    sys.argv = ['praisonai'] + argv
-    
-    try:
-        praison = PraisonAI()
-        praison.main()
-    except SystemExit:
-        pass
-    finally:
-        sys.argv = original_argv
+    run_wrapper_command(argv, feature="memory")
 
 
 @app.command("search")
@@ -65,23 +56,13 @@ def memory_search(
     user_id: str = typer.Option(None, "--user-id", help="User ID for memory isolation"),
 ):
     """Search memories."""
-    from praisonai_code.cli.main import PraisonAI
-    import sys
+    from praisonai_code._wrapper_bridge import run_wrapper_command
     
     argv = ['memory', 'search', query]
     if user_id:
         argv.extend(['--user-id', user_id])
     
-    original_argv = sys.argv
-    sys.argv = ['praisonai'] + argv
-    
-    try:
-        praison = PraisonAI()
-        praison.main()
-    except SystemExit:
-        pass
-    finally:
-        sys.argv = original_argv
+    run_wrapper_command(argv, feature="memory")
 
 
 @app.command("clear")
@@ -90,23 +71,13 @@ def memory_clear(
     force: bool = typer.Option(False, "--force", "-f", help="Force clear without confirmation"),
 ):
     """Clear all memories."""
-    from praisonai_code.cli.main import PraisonAI
-    import sys
+    from praisonai_code._wrapper_bridge import run_wrapper_command
     
     argv = ['memory', 'clear']
     if user_id:
         argv.extend(['--user-id', user_id])
     
-    original_argv = sys.argv
-    sys.argv = ['praisonai'] + argv
-    
-    try:
-        praison = PraisonAI()
-        praison.main()
-    except SystemExit:
-        pass
-    finally:
-        sys.argv = original_argv
+    run_wrapper_command(argv, feature="memory")
 
 
 # Learn subcommand group

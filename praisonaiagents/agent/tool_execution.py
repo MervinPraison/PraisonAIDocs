@@ -475,6 +475,7 @@ class ToolExecutionMixin:
                 _event.agent_id = self.name
                 _stream_emitter.emit(_event)
         
+        blocked_result = None
         try:
             # Check for steering messages before tool execution
             if hasattr(self, '_check_steering_messages'):
@@ -550,7 +551,6 @@ class ToolExecutionMixin:
                     logging.debug(f"Tool validator raised; skipping validation: {_ve}")
 
             # Check if loop guard blocked execution
-            blocked_result = locals().get('blocked_result')
             if blocked_result is not None:
                 result = blocked_result
             else:
@@ -764,10 +764,13 @@ class ToolExecutionMixin:
                     # Get configured limit
                     limit = getattr(self, 'tool_output_limit', DEFAULT_TOOL_OUTPUT_LIMIT)
                     
+                    # Initialize artifact reference before limit check so downstream
+                    # `if artifact_ref:` guards remain valid on short-result paths.
+                    artifact_ref = None
+
                     # Check if we need to spill to artifact store
                     if len(result_str) > limit:
                         # Try to use artifact store if available
-                        artifact_ref = None
                         if hasattr(self, '_artifact_store') and self._artifact_store is not None:
                             try:
                                 from ..context.artifacts import ArtifactMetadata
@@ -812,7 +815,7 @@ class ToolExecutionMixin:
                     
                     if self.context_manager and hasattr(self, '_truncate_tool_output'):
                         # Use context-aware truncation if available, but preserve artifact reference
-                        if 'artifact_ref' in locals() and artifact_ref:
+                        if artifact_ref:
                             # Extract the artifact reference from the truncated string
                             artifact_inline = artifact_ref.to_inline()
                             # Remove the artifact reference before context truncation
@@ -831,7 +834,7 @@ class ToolExecutionMixin:
                             max_field_chars = getattr(self, 'tool_output_limit', DEFAULT_TOOL_OUTPUT_LIMIT) if not self.context_manager else None
                             result = self._truncate_dict_fields(result, function_name, max_field_chars, tool_call_id)
                             # Add artifact reference to dict result if available
-                            if 'artifact_ref' in locals() and artifact_ref:
+                            if artifact_ref:
                                 result["_artifact_ref"] = artifact_ref.to_dict()
                         else:
                             result = truncated
@@ -1307,6 +1310,28 @@ class ToolExecutionMixin:
                     getattr(self, 'name', None), tool_name, tool_args,
                 )
 
+    def _check_permission_manager_deny(self, function_name):
+        """Return an error dict if the PermissionManager hard-denies the tool.
+
+        Ensures the pattern-based ``PermissionManager`` (rules from
+        ``.praisonai/permissions/``, YAML or Python) gates every tool-call path
+        uniformly — native functions **and** MCP tools — since both flow through
+        ``_execute_tool_impl``. Returns ``None`` when no manager is attached or
+        the tool is not denied, preserving backward compatibility.
+        """
+        manager = getattr(self, "_permission_manager", None)
+        if manager is None:
+            return None
+        try:
+            if manager.is_denied(function_name, getattr(self, "name", None)):
+                return {
+                    "error": f"Tool '{function_name}' blocked by permission policy",
+                    "permission_denied": True,
+                }
+        except Exception as e:
+            logging.debug("permission manager is_denied failed for %s: %s", function_name, e)
+        return None
+
     def _check_tool_approval_sync(self, function_name, arguments):
         """Check tool approval synchronously. Returns (decision, arguments) or error dict."""
         # Permission tier fast-path (O(1) frozenset lookup, resolved at __init__)
@@ -1314,6 +1339,11 @@ class ToolExecutionMixin:
             return {"error": f"Tool '{function_name}' blocked by permission policy", "permission_denied": True}
         if self._perm_allow is not None and function_name not in self._perm_allow:
             return {"error": f"Tool '{function_name}' not in allowed tools list", "permission_denied": True}
+
+        # Pattern-based PermissionManager deny gate (native + MCP, uniform).
+        manager_denial = self._check_permission_manager_deny(function_name)
+        if manager_denial is not None:
+            return manager_denial
 
         decision = self._resolve_approval_decision(function_name, arguments, is_async=False)
         
@@ -1337,6 +1367,11 @@ class ToolExecutionMixin:
             return {"error": f"Tool '{function_name}' blocked by permission policy", "permission_denied": True}
         if self._perm_allow is not None and function_name not in self._perm_allow:
             return {"error": f"Tool '{function_name}' not in allowed tools list", "permission_denied": True}
+
+        # Pattern-based PermissionManager deny gate (native + MCP, uniform).
+        manager_denial = self._check_permission_manager_deny(function_name)
+        if manager_denial is not None:
+            return manager_denial
 
         decision_coro = self._resolve_approval_decision(function_name, arguments, is_async=True)
         decision = await decision_coro
