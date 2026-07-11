@@ -1,0 +1,198 @@
+---
+title: "Outbound Ordering"
+sidebarTitle: "Outbound Ordering"
+description: "Keep messages to the same chat delivered in the order they were sent, even under retries"
+icon: "arrow-down-1-0"
+---
+
+Per-conversation FIFO ordering keeps a bot's messages arriving in the same order the agent produced them — so users never see "part 2" before "part 1".
+
+```mermaid
+graph LR
+    subgraph "best_effort (default)"
+        A1[msg 1<br/>retrying] -.-> Chat1[💬 User]
+        A2[msg 2] --> Chat1
+    end
+    subgraph "strict"
+        B1[msg 1<br/>retrying] --> B2[msg 2<br/>held]
+        B1 --> Chat2[💬 User]
+        B2 --> Chat2
+    end
+
+    classDef held fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef sent fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A1,B1,B2 held
+    class A2 sent
+    class Chat1,Chat2 user
+```
+
+Under retries, `Retry-After` back-off, rate limiting, or multi-worker drains, `best_effort` can deliver a later message to a chat before an earlier one that is still backing off. `strict` holds later same-lane messages until the head reaches `sent` or `permanent_failure`.
+
+## Quick Start
+
+<Steps>
+<Step title="Enable via the production preset">
+The `production` reliability preset turns on strict per-conversation FIFO automatically:
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import BotOS
+
+agent = Agent(name="assistant", instructions="Help the user.")
+bot = BotOS(agent=agent, platforms=["slack"], reliability="production")
+bot.start()
+```
+</Step>
+
+<Step title="Or opt in explicitly">
+An explicit `outbound_ordering` always wins over the preset:
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import BotOS
+
+agent = Agent(name="assistant", instructions="Help the user.")
+bot = BotOS(
+    agent=agent,
+    platforms=["slack"],
+    reliability="production",
+    outbound_ordering="strict",
+)
+bot.start()
+```
+</Step>
+
+<Step title="Group by a custom lane">
+By default, all messages to the same channel/DM share a lane. Group by thread id, user id, or anything you want:
+
+```python
+await outbox.enqueue(
+    idempotency_key="msg-abc",
+    target="slack:C0123456",
+    payload={"text": "Hello!"},
+    lane_key=f"slack:C0123456:thread:{thread_ts}",
+)
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Agent as 🤖 Agent
+    participant Outbox as 💾 OutboundQueue
+    participant Slack as 📱 Slack
+
+    Agent->>Outbox: enqueue msg 1 (lane=chat-42)
+    Agent->>Outbox: enqueue msg 2 (lane=chat-42)
+    Outbox->>Slack: send msg 1
+    Slack-->>Outbox: 429 Retry-After 5s
+    Note over Outbox: msg 2 HELD (same lane)
+    Outbox->>Slack: retry msg 1 → ✅
+    Outbox->>Slack: send msg 2 → ✅
+```
+
+In `strict` mode, only the earliest non-terminal entry of each lane is eligible to send. Later same-lane entries wait until the head reaches `sent` or `permanent_failure`. Different lanes still drain in parallel, so throughput is unaffected. In `best_effort` mode, pending entries drain in global wall-clock order with no per-lane gate.
+
+| Mode | Behaviour |
+|---|---|
+| `best_effort` | Global `ts` order, no per-lane gate. A later message can overtake an earlier one that is retrying. |
+| `strict` | Per-lane FIFO gate. Later same-lane messages held until the head is terminal. Lanes drain concurrently. |
+
+---
+
+## Choosing a Mode
+
+```mermaid
+graph TB
+    Start([What do I need?]) --> Q1{Conversational coherence<br/>under retries?}
+    Q1 -->|No, best throughput| BE[best_effort<br/>default]
+    Q1 -->|Yes| Q2{Order per-thread<br/>inside a channel?}
+    Q2 -->|No| Strict[strict]
+    Q2 -->|Yes| Lane[strict + custom lane_key]
+
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q1,Q2 decision
+    class BE,Strict,Lane result
+```
+
+| I want… | Setting |
+|---|---|
+| Backward-compatible behaviour (best throughput, may reorder under retries) | `outbound_ordering="best_effort"` *(default)* |
+| Conversational coherence under retries / rate limits / multi-worker drain | `outbound_ordering="strict"` *(production preset)* |
+| Per-thread ordering inside a shared channel | `strict` + custom `lane_key` |
+
+---
+
+## Configuration Options
+
+Set on the outbox directly, via `resolve_reliability`, or via the `reliability=` preset.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `ordering` (on `OutboundQueue`) | `"strict" \| "best_effort"` | `"best_effort"` | Per-lane FIFO gate. `strict` holds later same-lane messages until the head reaches `sent` or `permanent_failure`. |
+| `lane_key` (on `enqueue`) | `str \| None` | `None` (= `target`) | Custom conversation grouping. Defaults to `target` so messages to the same chat share a lane. |
+| `outbound_ordering` (on `resolve_reliability`) | `"strict" \| "best_effort" \| None` | `None` (preset decides) | Preset override. Explicit value always wins; unknown values raise `ValueError`. |
+
+**Precedence (highest → lowest):**
+
+1. Explicit `outbound_ordering=` — e.g. `"strict"`
+2. `reliability=` preset — `production` → `strict`, otherwise `best_effort`
+3. SDK default — `best_effort`
+
+<Note>
+On first open, older `outbox.sqlite` files are auto-migrated to add a `lane_key` column, backfilled to `target`. No user action required — existing outbox files continue to work.
+</Note>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+
+<Accordion title="Use strict when message order is user-visible">
+Multi-part replies, streamed follow-ups, and "greeting then answer" flows all break if a later message overtakes an earlier one under retry. Turn on `strict` (or the `production` preset) for these.
+</Accordion>
+
+<Accordion title="Keep best_effort for independent, order-agnostic sends">
+Notifications, alerts, and one-off messages that do not depend on each other get the best throughput with `best_effort`. Strict adds a per-lane gate you do not need here.
+</Accordion>
+
+<Accordion title="Use a custom lane_key for per-thread ordering">
+Inside a shared channel, group by thread id so unrelated threads still drain in parallel while each thread stays ordered:
+
+```python
+await outbox.enqueue(
+    idempotency_key=f"reply-{msg_id}",
+    target="slack:C0123456",
+    payload={"text": reply},
+    lane_key=f"slack:C0123456:thread:{thread_ts}",
+)
+```
+</Accordion>
+
+<Accordion title="Let explicit outbound_ordering override the preset">
+The `production` preset defaults to `strict`. Pass `outbound_ordering="best_effort"` explicitly if you deliberately want throughput over ordering on a production deployment — the explicit value wins.
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Durable Outbound Delivery" icon="shield-check" href="/docs/features/durable-delivery">
+  The outbox this feature lives on
+</Card>
+<Card title="Gateway Reliability Preset" icon="shield-check" href="/docs/features/gateway-reliability-preset">
+  How `reliability="production"` composes drain + admission + ordering
+</Card>
+</CardGroup>
