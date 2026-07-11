@@ -9,8 +9,10 @@ Evaluator Types:
     - PerformanceEvaluator: Measure runtime and memory usage
     - ReliabilityEvaluator: Verify expected tool calls are made
     - CriteriaEvaluator: Evaluate against custom criteria
+    - ContextEvaluator: Score context budget compliance and multi-agent handoff fidelity
     - ComparisonEval: Side-by-side comparison of two agent outputs
     - SafetyEval: Detect harmful, biased, or inappropriate outputs
+    - LoopEvaluator: Score loop health (convergence, wasted iterations, doom-loop guards)
     - EvalSuite: Orchestrator for running multiple evaluations
 
 Example:
@@ -29,14 +31,21 @@ __all__ = [
     "PerformanceEvaluator",
     "ReliabilityEvaluator",
     "CriteriaEvaluator",
+    "ContextEvaluator",
     "MediaEvaluator",
     "ComparisonEval",
     "SafetyEval",
+    "HarnessEvaluator",
+    "harness_row_to_eval_case",
+    "HarnessResult",
     "EvalSuite",
     "AccuracyResult",
     "PerformanceResult",
     "ReliabilityResult",
     "CriteriaResult",
+    "ContextHandoffResult",
+    "BudgetComplianceResult",
+    "ContextEvalResult",
     "MediaEvaluationResult",
     "ComparisonResult",
     "SafetyResult",
@@ -92,6 +101,9 @@ __all__ = [
     "EvaluationLoopResult",
     "EvaluationLoopProtocol",
     "EvaluationLoopResultProtocol",
+    # LoopEvaluator (loop health: convergence, waste, doom-loop guards)
+    "LoopEvaluator",
+    "LoopHealthResult",
 ]
 
 _LAZY_IMPORTS = {
@@ -100,14 +112,21 @@ _LAZY_IMPORTS = {
     "PerformanceEvaluator": ("performance", "PerformanceEvaluator"),
     "ReliabilityEvaluator": ("reliability", "ReliabilityEvaluator"),
     "CriteriaEvaluator": ("criteria", "CriteriaEvaluator"),
+    "ContextEvaluator": ("context_eval", "ContextEvaluator"),
     "MediaEvaluator": ("media", "MediaEvaluator"),
     "ComparisonEval": ("comparison", "ComparisonEval"),
     "SafetyEval": ("safety", "SafetyEval"),
+    "HarnessEvaluator": ("harness_eval", "HarnessEvaluator"),
+    "harness_row_to_eval_case": ("harness_eval", "harness_row_to_eval_case"),
+    "HarnessResult": ("results", "HarnessResult"),
     "EvalSuite": ("suite", "EvalSuite"),
     "AccuracyResult": ("results", "AccuracyResult"),
     "PerformanceResult": ("results", "PerformanceResult"),
     "ReliabilityResult": ("results", "ReliabilityResult"),
     "CriteriaResult": ("results", "CriteriaResult"),
+    "ContextHandoffResult": ("context_eval", "ContextHandoffResult"),
+    "BudgetComplianceResult": ("context_eval", "BudgetComplianceResult"),
+    "ContextEvalResult": ("context_eval", "ContextEvalResult"),
     "MediaEvaluationResult": ("media", "MediaEvaluationResult"),
     "ComparisonResult": ("comparison", "ComparisonResult"),
     "SafetyResult": ("safety", "SafetyResult"),
@@ -163,6 +182,9 @@ _LAZY_IMPORTS = {
     "EvaluationLoopResult": ("results", "EvaluationLoopResult"),
     "EvaluationLoopProtocol": ("protocols", "EvaluationLoopProtocol"),
     "EvaluationLoopResultProtocol": ("protocols", "EvaluationLoopResultProtocol"),
+    # LoopEvaluator (loop health: convergence, waste, doom-loop guards)
+    "LoopEvaluator": ("loop_eval", "LoopEvaluator"),
+    "LoopHealthResult": ("loop_eval", "LoopHealthResult"),
 }
 
 
