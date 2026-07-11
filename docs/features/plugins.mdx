@@ -5,7 +5,7 @@ description: "Extend agent functionality with single-file plugins"
 icon: "puzzle-piece"
 ---
 
-Plugins add tools, hooks, and guardrails to agents — drop a Python file in `~/.praisonai/plugins/` and load it in one line.
+Plugins add tools, hooks, and guardrails that can rewrite — or now block — what an agent sees and does; drop a Python file in `~/.praisonai/plugins/` and load it in one line.
 
 ```python
 from praisonaiagents import Agent, discover_and_load_plugins
@@ -756,6 +756,10 @@ graph TB
 
 `plugins.enable()` auto-calls `wire_into_hook_registry()` — no manual step. Only lifecycle methods a plugin actually overrides (or declares in `PluginInfo.hooks`) are bridged, so a plugin with one guardrail never fires on every event. Return a new value and the bridge writes it back onto the payload in place. Errors in a lifecycle method are non-fatal, and `plugins.disable([...])` calls `unwire_from_hook_registry(name)` so the plugin truly stops firing.
 
+<Note>
+The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `before_tool_definitions`, `before_message`) also accept a deny/block decision instead of a rewrite — see [Blocking Plugins](#blocking-plugins-guardrails--policies).
+</Note>
+
 | Plugin method | Hook event | In-place mutation |
 |---------------|-----------|-------------------|
 | `before_agent(prompt, ctx)` | `BEFORE_AGENT` | Return a `str` → rewrites `data.prompt` |
@@ -775,6 +779,231 @@ graph TB
 | `on_error(error_type, error_message, context)` | `ON_ERROR` | Observational (`stack_trace`, nested `context`, `session_id`) |
 
 `on_config` and `on_auth` write their returned dict back onto the payload even when the target attribute starts as `None` — so a plugin can inject credentials the first time they're requested, not only edit an existing dict.
+
+---
+
+## Blocking Plugins (Guardrails & Policies)
+
+Guardrail and policy plugins can now stop an action before it happens, not just rewrite it — refuse a dangerous tool call, drop a spam message, or decline an LLM request.
+
+```mermaid
+graph LR
+    subgraph "Blocking Plugin"
+        Request[📥 Action] --> Guard{🛡️ Guardrail}
+        Guard -->|allow / rewrite| Run[✅ Execute]
+        Guard -->|deny / block| Stop[🛑 Skipped]
+    end
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef guard fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef stop fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Request input
+    class Guard guard
+    class Run ok
+    class Stop stop
+```
+
+### Quick Start
+
+<Steps>
+<Step title="Block a tool call">
+Return `PluginDecision.block(reason)` from `before_tool` to skip a forbidden tool.
+
+```python
+from praisonaiagents import Agent, plugins
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, PluginDecision
+
+class BlockDeleteFiles(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="block_delete_files",
+            hooks=[PluginHook.BEFORE_TOOL],
+        )
+
+    def before_tool(self, tool_name, args):
+        if tool_name == "delete_file":
+            return PluginDecision.block("File deletion is not permitted")
+        return args
+
+plugins.get_plugin_manager().register(BlockDeleteFiles())
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Help users.", tools=["delete_file", "read_file"])
+agent.start("Delete /etc/hosts")   # tool call skipped; block reason surfaced
+```
+</Step>
+
+<Step title="Refuse an LLM request">
+Return `PluginDecision.deny(reason)` from `before_llm` and the agent returns `"[LLM request blocked by hook: <reason>]"` without calling the model.
+
+```python
+from praisonaiagents import Agent, plugins
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, PluginDecision
+
+class BlockLLM(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="block_llm",
+            hooks=[PluginHook.BEFORE_LLM],
+        )
+
+    def before_llm(self, messages, params):
+        return PluginDecision.deny("LLM request refused by policy")
+
+plugins.get_plugin_manager().register(BlockLLM())
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Help users.")
+print(agent.start("Hello"))   # [LLM request blocked by hook: LLM request refused by policy]
+```
+</Step>
+
+<Step title="Drop an inbound message">
+Return `PluginDecision.deny(reason)` from `before_message` to drop a message before the agent sees it.
+
+```python
+from praisonaiagents import Agent, plugins
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, PluginDecision
+
+class BlockSpam(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="block_spam",
+            hooks=[PluginHook.MESSAGE_RECEIVED],
+        )
+
+    def before_message(self, message):
+        if "spam" in message.get("content", ""):
+            return PluginDecision.deny("Spam blocked")
+        return message
+
+plugins.get_plugin_manager().register(BlockSpam())
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Help users.")
+agent.start("buy spam now")   # message dropped before the agent runs
+```
+</Step>
+</Steps>
+
+### Three Ways to Block
+
+The same block, written three ways — pick the one that reads cleanest in your code.
+
+| Style | Return / raise | When to prefer |
+|-------|----------------|----------------|
+| `PluginDecision` | `return PluginDecision.deny(reason)` / `.block(reason)` | Default. One import, reads like data. |
+| `HookResult` | `return HookResult.deny(reason)` / `.block(reason)` | You already work with `HookResult` elsewhere. |
+| `GuardrailBlocked` | `raise GuardrailBlocked(reason)` | Deep in a validator that would otherwise `raise` anyway. |
+
+<CodeGroup>
+```python PluginDecision
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, PluginDecision
+
+class BlockDelete(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="block_delete", hooks=[PluginHook.BEFORE_TOOL])
+
+    def before_tool(self, tool_name, args):
+        if tool_name == "delete_file":
+            return PluginDecision.block("File deletion not permitted")
+        return args
+```
+
+```python HookResult
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+from praisonaiagents.hooks.types import HookResult
+
+class BlockDelete(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="block_delete", hooks=[PluginHook.BEFORE_TOOL])
+
+    def before_tool(self, tool_name, args):
+        if tool_name == "delete_file":
+            return HookResult.deny("Denied via HookResult")
+        return args
+```
+
+```python GuardrailBlocked
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, GuardrailBlocked
+
+class BlockDelete(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="block_delete", hooks=[PluginHook.BEFORE_TOOL])
+
+    def before_tool(self, tool_name, args):
+        if tool_name == "delete_file":
+            raise GuardrailBlocked("File deletion not permitted")
+        return args
+```
+</CodeGroup>
+
+`PluginDecision.deny(reason)` and `PluginDecision.block(reason)` both stop the action (`is_denied()` is `True` for each); `allow(reason=None)` is an explicit no-op. `GuardrailBlocked(reason: str = "Blocked by guardrail plugin")` is caught by the bridge and converted to a block.
+
+### Where Blocks Fire
+
+Five `before_*` methods can block; `after_*` methods are observational and cannot.
+
+| Plugin method | Can rewrite? | Can block? | Runtime effect of block |
+|---------------|:------------:|:----------:|-------------------------|
+| `before_agent` | ✅ | ✅ | Agent run aborts before the first LLM call |
+| `before_llm` | ✅ | ✅ | Model call skipped; agent returns `"[LLM request blocked by hook: <reason>]"` |
+| `before_tool_definitions` | ✅ | ✅ | Tool surface dropped for this turn (LLM sees no tools) |
+| `before_tool` | ✅ | ✅ | Tool call skipped; reason surfaced |
+| `before_message` | ✅ | ✅ | Inbound message dropped |
+| `after_*` | ✅ | ❌ | *(observational — no block path)* |
+
+### How a Block Flows
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Plugin as Guardrail Plugin
+    participant Runner as HookRunner
+    participant Target as LLM/Tool
+
+    User->>Agent: request
+    Agent->>Runner: fire BEFORE_TOOL
+    Runner->>Plugin: before_tool(name, args)
+    alt allow / rewrite
+        Plugin-->>Runner: dict (new args) OR None
+        Runner-->>Agent: HookResult.allow()
+        Agent->>Target: execute
+        Target-->>Agent: result
+    else deny / block
+        Plugin-->>Runner: PluginDecision.deny(reason) / raise GuardrailBlocked
+        Runner-->>Agent: HookResult.deny(reason) — is_blocked=True
+        Agent-->>User: blocked (reason surfaced)
+    end
+```
+
+### Which Style Should I Use?
+
+```mermaid
+graph TB
+    Start[🛡️ Need to block?] --> Q1{Inside a validator<br/>that already raises?}
+    Q1 -->|Yes| Raise[raise GuardrailBlocked]
+    Q1 -->|No| Q2{Already import<br/>HookResult?}
+    Q2 -->|Yes| HR[return HookResult.deny]
+    Q2 -->|No| PD[return PluginDecision.deny]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1,Q2 question
+    class Raise,HR,PD answer
+```
 
 ---
 
@@ -830,6 +1059,9 @@ Enable `logging` and `metrics` without writing plugin files.
 <Accordion title="Call plugins.enable() to activate lifecycle methods">
 Tools and guardrails work without `plugins.enable()`. But lifecycle-method plugins (subclasses of `Plugin` that override `before_llm`, `after_llm`, and so on) only fire after they are wired into the runtime hook registry. Call `plugins.enable()` explicitly, or set `PRAISONAI_PLUGINS=true` / `[plugins] enabled = true` and Agent construction wires them automatically.
 </Accordion>
+<Accordion title="Reach for PluginDecision before HookResult">
+`PluginDecision.deny(reason)` reads as one line and only needs the plugin import. Use `HookResult.deny(reason)` only when you already import it for another reason, and `raise GuardrailBlocked(reason)` only when you're inside a validator that already raises on failure. Prefer `block` over `deny` when the action is categorically forbidden; use `deny` when it's contextually refused (this input, this user, this time).
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -848,5 +1080,8 @@ Tools and guardrails work without `plugins.enable()`. But lifecycle-method plugi
 </Card>
 <Card title="Tool Discovery" icon="list-tree" href="/docs/features/tool-discovery-order">
   How Agent resolves tool names at runtime
+</Card>
+<Card title="Guardrails" icon="shield-halved" href="/docs/features/guardrails">
+  Validate agent output — automatic retry on failure
 </Card>
 </CardGroup>
