@@ -124,6 +124,81 @@ The new classifier recognizes seven distinct error categories with specific reco
 | `permanent` | Unrecoverable error | Surface to user | ❌ |
 | `unknown` | Unclassified error | Default retry with backoff | ✅ |
 
+<Note>
+Budget exhaustion (`BudgetExceededError`) now routes to `permanent` and surfaces immediately without retries. It was previously reachable via `rate_limit`, which burned retry attempts on a billing state that will never recover on its own.
+</Note>
+
+---
+
+## How Errors Are Classified
+
+The classifier picks a category using three signals, in order of precedence — stable signals first, message text last.
+
+```mermaid
+graph LR
+    Error[❌ Exception] --> Status{🔢 HTTP status code?}
+    Status -->|Match| Category[📋 Category]
+    Status -->|No| Type{🏷️ Exception class name?}
+    Type -->|Match| Category
+    Type -->|No| Message[🔤 Message regex]
+    Message --> Category
+
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef check fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Error error
+    class Status,Type,Message check
+    class Category result
+```
+
+1. **HTTP status code** — read from `error.status_code`, `error.http_status`, `error.status`, an integer `error.code`, or `error.response.status_code`.
+2. **Exception class name** — matched case-insensitively across the class hierarchy (MRO), so provider SDK subclasses are caught without importing those SDKs.
+3. **Message regex** — used only when steps 1 and 2 don't match.
+
+This makes classification reliable across providers whose error messages don't include the expected keyword — a `429` rate limit whose message never says "rate" is still classified as `rate_limit`.
+
+### Status code mapping
+
+| Status | Category |
+|--------|----------|
+| 400 | `invalid_request` (refined — see below) |
+| 401, 403 | `auth` |
+| 404, 422 | `invalid_request` |
+| 408 | `overloaded` (transient) |
+| 413 | `context_overflow` |
+| 429 | `rate_limit` |
+| 500, 502, 503, 504 | `overloaded` (transient) |
+| 529 | `overloaded` (transient — Anthropic "overloaded") |
+
+### Exception class mapping
+
+Provider SDK exception classes are matched by class name across the MRO, so subclasses in provider SDKs are handled without importing those SDKs.
+
+| Exception class | Category |
+|-----------------|----------|
+| `RateLimitError` | `rate_limit` |
+| `AuthenticationError`, `PermissionDeniedError` | `auth` |
+| `BadRequestError`, `NotFoundError`, `UnprocessableEntityError`, `ContentPolicyViolationError` | `invalid_request` |
+| `ConflictError`, `InternalServerError`, `APIConnectionError`, `APITimeoutError`, `OverloadedError`, `ServiceUnavailableError` | `overloaded` (transient) |
+| `ContextWindowExceededError` | `context_overflow` |
+| `BudgetExceededError` | `permanent` |
+| `TimeoutError`, `ConnectionError`, `ConnectError`, `ConnectTimeout`, `ReadTimeout` | `overloaded` (transient) |
+
+### Ambiguous status codes (HTTP 400)
+
+Some providers overload HTTP 400 — OpenAI returns `context_length_exceeded` as a 400, and some auth failures also come back as 400. The classifier refines a broad 400 using message signals before falling back to `invalid_request`.
+
+| 400 message signal | Refined category | Effect |
+|--------------------|------------------|--------|
+| "maximum context length" / "context window" | `context_overflow` | Triggers `should_compress_context=True` |
+| "invalid api key" / "unauthorized" | `auth` | Not retried |
+| Generic body | `invalid_request` | Unchanged |
+
+<Note>
+Canonical examples live in the SDK tests: `tests/unit/llm/test_error_classifier.py::TestTypeAndCodeClassification` and `TestStructuredRetryAfter`.
+</Note>
+
 ---
 
 ## LLMErrorClassification Structure
@@ -171,6 +246,17 @@ Different providers have different rate limiting patterns, so the classifier use
 | Default | 30 seconds | 15 seconds |
 
 Backoff times include ±50% jitter to prevent thundering herd problems when multiple agents hit rate limits simultaneously.
+
+### Retry-After header
+
+The classifier reads a provider's `Retry-After` signal before falling back to message parsing, in this order:
+
+1. `error.response.headers["retry-after"]` (or `Retry-After` — case-insensitive)
+2. `error.headers["retry-after"]`
+3. `error.retry_after` attribute
+4. Regex over the message text
+
+Numeric values are capped at 300 s. Non-numeric values (e.g. an HTTP-date `Retry-After`) fall through to the regex step, so existing behaviour is preserved.
 
 ---
 
@@ -412,18 +498,15 @@ agent = Agent(
 
 ## Retry Depth Limits
 
-The system limits retry depth to prevent infinite loops:
+The recursive recovery loop (after context compression and after transient-error backoff) is bounded by the agent's configured retry policy:
 
-- **Maximum retry depth**: 2 attempts
-- **Context compression**: Triggered on `context_overflow` category
-- **Bounded recovery**: After 2 failed retries, errors become non-retryable
+- **With `retry=` set**: the loop honours `RetryBackoffConfig.max_retries` (e.g. `retry=True` → 3, `max_retries=0` → recursion disabled).
+- **Without `retry=` set**: the loop falls back to 2, preserving prior behaviour.
+- **Context compression**: triggered on the `context_overflow` category.
 
-```python
-# Retry behavior:
-# 1st failure: Classify and retry with recovery action
-# 2nd failure: Classify and retry with recovery action  
-# 3rd failure: Mark as non-retryable and surface to user
-```
+<Note>
+This bound is read from `Agent._max_retry_depth()`, which returns `RetryBackoffConfig.max_retries` when a retry config is present and `2` otherwise. See [Agent Retry](/docs/features/agent-retry) for how to configure it.
+</Note>
 
 ---
 
