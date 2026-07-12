@@ -28,12 +28,13 @@ graph LR
     A[Agent] --> P[SessionStoreProtocol]
     P --> D[DefaultSessionStore]
     P --> H[HierarchicalSessionStore]
+    P --> S[SqliteSessionStore]
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
 
     class A agent
-    class P,D,H store
+    class P,D,H,S store
 ```
 
 ## How It Works
@@ -91,6 +92,7 @@ store.add_message(session_id, "assistant", agent.start("Summarise our chat"))
 | Export | Purpose |
 |---|---|
 | `DefaultSessionStore` | JSON-on-disk default backend |
+| `SqliteSessionStore` | Indexed variant of the default store — stdlib `sqlite3` + FTS5 for scalable cross-session recall (Issue #2927). See [SqliteSessionStore](#sqlitesessionstore). |
 | `SessionMessage`, `SessionData` | Typed message and session payloads |
 | `CompactionCheckpoint` | Persisted compaction summary + resume anchor — see [Compaction Checkpoints](#compaction-checkpoints) |
 | `get_default_session_store()` | Process-wide store accessor |
@@ -98,6 +100,53 @@ store.add_message(session_id, "assistant", agent.start("Summarise our chat"))
 | `HierarchicalSessionStore`, `get_hierarchical_session_store()` | Forks, snapshots, parent-child — see [Session Hierarchy](/features/session-hierarchy) |
 | `IdentityResolverProtocol`, `FileIdentityResolver` | Map anonymous → known user IDs across sessions |
 | `SessionContext`, `set_session_context()`, `get_session_context()` | Task-local session context for async flows |
+
+## SqliteSessionStore
+
+`SqliteSessionStore` is a drop-in subclass of `DefaultSessionStore` that keeps JSON transcripts as the durable record but maintains a stdlib `sqlite3` + FTS5 index of message content. `search()` becomes a bounded `MATCH ... ORDER BY bm25` lookup rather than an `O(all sessions)` directory scan.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.session import SqliteSessionStore
+
+store = SqliteSessionStore(db_path="~/.praisonai/sessions.db")
+agent = Agent(name="Gateway", session_store=store)
+```
+
+### Constructor
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `session_dir` | `Optional[str]` | `None` | Directory for session JSON files (as in `DefaultSessionStore`). |
+| `db_path` | `Optional[str]` | `<session_dir>/sessions_index.db` | Path to the SQLite index file. Use `":memory:"` for an ephemeral in-process index. Supports `~` expansion. |
+| `**kwargs` | — | — | Forwarded to `DefaultSessionStore(...)`. |
+
+### Behaviour
+
+| Aspect | Detail |
+|--------|--------|
+| Backend | Stdlib `sqlite3` (lazy-imported); FTS5 virtual table `session_fts(session_id UNINDEXED, content)` + `session_meta(session_id, updated_at)` |
+| Query | `SELECT session_id FROM session_fts WHERE session_fts MATCH ? ORDER BY bm25(session_fts) LIMIT ?` |
+| Fallback | If FTS5 is unavailable → plain `LIKE` table. If `sqlite3` fails entirely → parent `DefaultSessionStore.search` scan. |
+| Backfill | Legacy JSON transcripts are indexed once, on first `search()` (guarded by a one-time flag; only session ids not already in the index are (re)indexed). |
+| Write sync | `_save_session`, `add_message`, `_modify_session_locked` (covers `set_chat_history` and `append_compaction_checkpoint`), `clear_session`, and `delete_session` all keep the index in sync. |
+| Query rewrite | Free text is tokenised on alphanumerics into an `OR` of quoted terms for a safe FTS5 `MATCH` expression. |
+| Candidate fan-out | Over-fetches `max(limit * 5, limit)` candidates so lineage dedup / automated demotion can still promote the right sessions into the final `limit`. |
+
+### Fallback matrix
+
+| Environment | Behaviour |
+|-------------|-----------|
+| `sqlite3` + FTS5 present (default) | Bounded FTS5 `MATCH` lookup + bm25 ranking |
+| `sqlite3` present, FTS5 unavailable | Bounded `LIKE` lookup against a plain table |
+| `sqlite3` unavailable or index open fails | Transparent fallback to `DefaultSessionStore.search` full-directory scan |
+
+### Sizing
+
+- Each row in `session_fts` holds the flattened concatenation of a session's message content (newline-joined). Large transcripts increase index size roughly linearly.
+- Use `":memory:"` for ephemeral tests; use the default disk path for gateway bots that need durability across restarts.
+
+Bookends, automated demotion, and lineage dedup apply to results from both stores — see [Cross-Session Recall](/docs/features/cross-session-recall#anchored-demoted-deduped-results).
 
 ## Compaction Checkpoints
 
@@ -168,5 +217,8 @@ Call `set_session_context()` at the start of each async task so downstream code 
   </Card>
   <Card title="Session Hierarchy" icon="sitemap" href="/docs/features/session-hierarchy">
     Forking and snapshots
+  </Card>
+  <Card title="Cross-Session Recall" icon="magnifying-glass-clock" href="/docs/features/cross-session-recall">
+    Search past sessions — anchored, demoted, deduped results
   </Card>
 </CardGroup>

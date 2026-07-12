@@ -74,6 +74,26 @@ session_search(session_id="abc-123", around_message_id="42", window=10)
 session_search()
 ```
 </Step>
+
+<Step title="Scale to thousands of sessions">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.session import SqliteSessionStore
+
+# Indexed store: FTS5 lookup instead of full-directory scan.
+# Falls back to a substring scan if sqlite3/FTS5 is unavailable.
+store = SqliteSessionStore(db_path="~/.praisonai/sessions.db")
+
+agent = Agent(
+    name="Gateway Assistant",
+    instructions="Recall past conversations across thousands of stored sessions.",
+    tools=["session_search"],
+    session_store=store,
+)
+
+agent.start("What did we decide about the billing migration?")
+```
+</Step>
 </Steps>
 
 ---
@@ -85,20 +105,19 @@ sequenceDiagram
     participant U as 👤 User
     participant A as 🤖 Agent
     participant T as 🔧 session_search
-    participant S as 📁 Session Store
+    participant I as 🗂️ Index (SqliteSessionStore)
+    participant S as 📁 JSON sessions
     U->>A: "What did we decide about billing?"
     A->>T: session_search(query="billing migration")
-    T->>S: scan ~/.praisonai/sessions/*.json
-    S-->>T: matching messages + score
-    T-->>A: SessionHits with context windows
-    A->>T: session_search(session_id="abc", around_message_id="42")
-    T->>S: read session "abc"
-    S-->>T: ±5 surrounding messages
-    T-->>A: scrollable window
+    T->>I: MATCH "billing OR migration" ORDER BY bm25
+    I-->>T: candidate session_ids
+    T->>S: read only matched sessions
+    S-->>T: messages + score + bookends
+    T-->>A: SessionHits (anchored, deduped)
     A-->>U: "On 2026-06-10 we decided to migrate Stripe → ..."
 ```
 
-Sessions live at `~/.praisonai/sessions/*.json` — one JSON file per session. The default search is a dependency-free substring/keyword scan with no extra setup required.
+Sessions live at `~/.praisonai/sessions/*.json` — one JSON file per session. The default `DefaultSessionStore` search is a dependency-free substring/keyword scan with no setup. The index hop above appears only when a `SqliteSessionStore` is active; the default flow reads the JSON files directly.
 
 **Picking the right shape:**
 
@@ -112,6 +131,23 @@ graph TD
     classDef a fill:#10B981,stroke:#7C90A0,color:#fff
     class Q1 q
     class DISC,SCRO,BROW a
+```
+
+**Which store should I use?**
+
+```mermaid
+graph TD
+    Q["How many stored sessions?"]
+    Q -->|"Hundreds"| D["DefaultSessionStore<br/>(default; substring scan)"]
+    Q -->|"Thousands+ / a long-lived gateway"| S["SqliteSessionStore<br/>(FTS5 index)"]
+    D --> R["Bookends, demotion, lineage dedup<br/>apply to both stores"]
+    S --> R
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef a fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef r fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q q
+    class D,S a
+    class R r
 ```
 
 ---
@@ -151,11 +187,23 @@ Returned when `query` is set:
       "messages": [
         {"index": 7, "role": "user", "content": "...", "timestamp": "..."},
         {"index": 8, "role": "assistant", "content": "...", "timestamp": "..."}
-      ]
+      ],
+      "bookends": {
+        "opening": [
+          {"index": 0, "role": "user", "content": "Kick off billing review", "timestamp": "..."},
+          {"index": 1, "role": "assistant", "content": "Here is the plan...", "timestamp": "..."}
+        ],
+        "closing": [
+          {"index": 22, "role": "user", "content": "Confirm we're going with Adyen", "timestamp": "..."},
+          {"index": 23, "role": "assistant", "content": "Confirmed — migrating to Adyen.", "timestamp": "..."}
+        ]
+      }
     }
   ]
 }
 ```
+
+The `bookends` key is present only when the session has more than `BOOKEND_SIZE` (2) user+assistant messages — mirroring `SessionHit.as_dict()`.
 </Tab>
 <Tab title="Scroll">
 Returned when `session_id` is set (no `query`):
@@ -205,6 +253,40 @@ Discovery mode scores hits using keyword matching:
 Ties are broken by recency (`updated_at` descending). Scores are heuristic — treat them as relative rankings, not probabilities.
 
 Snippets are centred on the first match and trimmed to ~120 characters with `…` ellipses.
+
+---
+
+## Anchored, Demoted, Deduped Results
+
+Every discovery hit — from either store — carries anchored context, demotes noisy automated runs, and collapses continuations of the same conversation.
+
+- **Bookends**: `{"opening": [...], "closing": [...]}` — the first and last 2 user+assistant messages of the session, so the agent sees goal → match → resolution in one call.
+- **Automated demotion**: sessions tagged as automated/scheduled or whose message rate exceeds ~60 msg/hour have their score multiplied by `0.25`.
+- **Lineage dedup**: reset/compacted continuations sharing `lineage_id` / `root_session_id` / `thread_id` collapse to the single best-scoring hit.
+
+### Automated-session heuristics
+
+| Signal | Trigger |
+|--------|---------|
+| `data["source"]` or `data["metadata"]["source"]` | one of `scheduled`, `automated`, `cron`, `system`, `batch` |
+| `data["metadata"]["automated"]` | `True` |
+| Message rate | `> 60 messages / hour` over the session span (needs ≥ 4 timestamped messages) |
+
+Demotion multiplies the session's total score by `0.25` (constant `AUTOMATED_DEMOTION`).
+
+### Bookends
+
+Bookends return the first / last **2** user+assistant messages (`BOOKEND_SIZE = 2`). They are omitted when the session has ≤ 2 conversational messages, to avoid duplicating messages already in the context window.
+
+### Lineage keys
+
+| Key | Read from | Note |
+|-----|-----------|------|
+| `lineage_id` | `data` or `metadata` | Explicit chain identifier |
+| `root_session_id` | `data` or `metadata` | Root of a continuation chain |
+| `thread_id` | `data` or `metadata` | Thread identifier |
+
+`parent_session_id` is **intentionally not** a lineage key — it points at an immediate parent, so sibling sessions forked from one parent stay distinct instead of suppressing each other.
 
 ---
 
@@ -286,8 +368,8 @@ Scores are heuristic keyword counts, not probability-calibrated relevance scores
 The default search is per-store, not per-user. In multi-user deployments, prefix `session_id` values with a user identifier (e.g. `user_42_session_xyz`) and search within those sessions explicitly.
 </Accordion>
 
-<Accordion title="Scale-out: swap in an FTS-backed store">
-The default dependency-free substring scan works well for personal agents with hundreds of sessions. For large deployments, a wrapper FTS5/SQLite-backed store implementing `SearchableSessionStoreProtocol` is the planned upgrade path — swap it in without changing agent code.
+<Accordion title="Scale-out: swap in SqliteSessionStore">
+For long-lived gateway bots with thousands of sessions, swap in `SqliteSessionStore` — a stdlib `sqlite3` + FTS5 index turns recall into a bounded `MATCH ... ORDER BY bm25` lookup instead of a full-directory scan. It transparently falls back to the substring scan if `sqlite3` or FTS5 is unavailable, so nothing breaks. See [Session Store](/docs/features/session-store#sqlitesessionstore).
 </Accordion>
 </AccordionGroup>
 
@@ -324,6 +406,7 @@ assert isinstance(store, SearchableSessionStoreProtocol)
 | `score` | `float` | `0.0` | Match score (higher = better) |
 | `anchor_index` | `int` | `-1` | Index of the best-matching message |
 | `messages` | `List[Dict]` | `[]` | Context window around the hit |
+| `bookends` | `Dict[str, List[Dict]]` | `{}` | `{"opening": [...], "closing": [...]}` — first/last user+assistant turns; empty when the session has ≤ `BOOKEND_SIZE` conversational messages |
 
 ### `SessionSummary` Fields
 
