@@ -79,6 +79,9 @@ def _start_interactive_mode(self, args):
             'error_tasks': [],  # Queue of error tasks to display
             'tool_activity': None,  # Current tool being used
             'last_status_line': None,  # For transient status updates
+            'stream_deltas': queue_module.Queue(),  # Real streaming deltas (worker -> display)
+            'stream_active': False,  # True while a turn is actively streaming
+            'stream_header_shown': False,  # Whether the streaming header was printed
         }
         
         # Task counter for unique IDs (FIFO position tracking)
@@ -220,17 +223,50 @@ def _start_interactive_mode(self, args):
             """
             while display_running['value']:
                 try:
-                    # Check for completed tasks to display (FIFO order guaranteed)
-                    if worker_state['completed_tasks']:
+                    # Render real streaming deltas as they arrive from the worker.
+                    # This replaces the previous post-hoc simulated word replay:
+                    # text now appears incrementally, in real time-to-first-token.
+                    stream_deltas = worker_state.get('stream_deltas')
+                    if stream_deltas is not None:
+                        drained_any = False
+                        while True:
+                            try:
+                                delta = stream_deltas.get_nowait()
+                            except queue_module.Empty:
+                                break
+                            if delta is None:
+                                continue
+                            # First delta of a turn: clear status line + print header.
+                            if not worker_state.get('stream_header_shown'):
+                                if worker_state.get('last_status_line'):
+                                    console.print("\r" + " " * 80 + "\r", end="")
+                                    worker_state['last_status_line'] = None
+                                console.print()  # New line before response
+                                if verbose_mode:
+                                    console.print("[bold blue]A:[/bold blue] ", end="")
+                                worker_state['stream_header_shown'] = True
+                            console.print(delta, end="")
+                            sys.stdout.flush()
+                            drained_any = True
+                        if drained_any:
+                            # Yield briefly so input/status threads stay responsive.
+                            time.sleep(0.001)
+
+                    # Check for completed tasks to display (FIFO order guaranteed).
+                    # Defer finalisation until the delta queue is fully drained so the
+                    # last streamed chunks are not clipped by the completion path.
+                    deltas_pending = (
+                        stream_deltas is not None and not stream_deltas.empty()
+                    )
+                    if worker_state['completed_tasks'] and not deltas_pending:
                         task = worker_state['completed_tasks'].pop(0)
                         response = task.get('response', '')
+                        streamed = task.get('streamed', False)
                         
                         # Clear any transient status line
                         if worker_state.get('last_status_line'):
                             console.print("\r" + " " * 80 + "\r", end="")
                             worker_state['last_status_line'] = None
-                        
-                        console.print()  # New line before response
                         
                         if verbose_mode:
                             # VERBOSE: Full task lifecycle with metadata
@@ -240,18 +276,22 @@ def _start_interactive_mode(self, args):
                             word_count = len(response.split()) if response else 0
                             q_display = question[:80] + "..." if len(question) > 80 else question
                             
-                            console.print(f"[bold cyan]─── Task #{task_id} completed ({elapsed:.1f}s, {word_count} words) ───[/bold cyan]")
+                            if not streamed:
+                                console.print()  # New line before response
+                            console.print(f"\n[bold cyan]─── Task #{task_id} completed ({elapsed:.1f}s, {word_count} words) ───[/bold cyan]")
                             console.print(f"[bold green]Q:[/bold green] {q_display}")
-                            console.print(f"[bold blue]A:[/bold blue] ", end="")
+                            if not streamed:
+                                console.print(f"[bold blue]A:[/bold blue] ", end="")
                         
-                        # Stream response (both modes)
-                        if response:
-                            words = response.split()
-                            for i, word in enumerate(words):
-                                console.print(word + " ", end="")
-                                if i % 20 == 19:
-                                    time.sleep(0.003)
-                        console.print()
+                        if streamed:
+                            # Text already rendered live via stream_deltas; just finalise.
+                            console.print()
+                        else:
+                            # Fallback path (streaming unavailable): print the full text.
+                            console.print()  # New line before response
+                            if response:
+                                console.print(response, end="")
+                            console.print()
                         
                         if verbose_mode:
                             task_id = task.get('task_id', 0)
@@ -860,6 +900,121 @@ Provide a concise summary (max 200 words):"""
     except Exception as e:
         console.print(f"[red]Error compacting: {e}[/red]")
 
+
+# Coarse per-model context-window map used only as a fallback when a precise
+# lookup is unavailable. Values are conservative (input side); the output
+# reserve is subtracted separately by _usable_context_budget().
+_MODEL_CONTEXT_WINDOW = {
+    'gpt-4o': 128000,
+    'gpt-4o-mini': 128000,
+    'gpt-4-turbo': 128000,
+    'gpt-4': 8192,
+    'gpt-3.5-turbo': 16385,
+    'o1': 200000,
+    'o1-mini': 128000,
+    'claude-3-5-sonnet': 200000,
+    'claude-3-5-haiku': 200000,
+    'claude-3-opus': 200000,
+    'claude-3-sonnet': 200000,
+    'claude-3-haiku': 200000,
+    'gemini-1.5-pro': 1000000,
+    'gemini-1.5-flash': 1000000,
+    'gemini-2.0-flash': 1000000,
+}
+
+
+def _model_context_window(model):
+    """Best-effort context-window size (in tokens) for a model name.
+
+    Prefers litellm's model registry when available, then falls back to a
+    coarse built-in map, then a safe default. Never raises.
+    """
+    if not model:
+        return 128000
+    name = str(model).lower().split('/')[-1]
+    try:
+        import litellm  # type: ignore
+        info = litellm.get_model_info(name)
+        window = info.get('max_input_tokens') or info.get('max_tokens')
+        if window:
+            return int(window)
+    except Exception:
+        pass
+    for key, window in _MODEL_CONTEXT_WINDOW.items():
+        if name.startswith(key) or key in name:
+            return window
+    return 128000
+
+
+def _usable_context_budget(session_state):
+    """Usable input-token budget = context window minus the output reserve."""
+    config = session_state.get('context_config', {}) or {}
+    model = session_state.get('current_model')
+    window = _model_context_window(model)
+    output_reserve = int(config.get('output_reserve', 8000) or 8000)
+    # Never let the output reserve swallow the whole window; on small-context
+    # models (e.g. gpt-4 with an 8192 window) an 8000-token reserve would leave
+    # almost no usable input budget and trigger compaction on nearly every turn.
+    output_reserve = min(output_reserve, max(1, window // 4))
+    return max(1, window - output_reserve)
+
+
+def _maybe_auto_compact(self, console, session_state):
+    """Proactively compact conversation history when nearing the context budget.
+
+    Honours session_state['context_config']['auto_compact'] (write-only until
+    now) and the configured threshold. Reuses the existing _handle_compact_command
+    summariser rather than reimplementing compaction. Returns True if a
+    compaction ran, else False. Never raises.
+    """
+    try:
+        config = session_state.get('context_config', {}) or {}
+        if not config.get('auto_compact', True):
+            return False
+
+        history = session_state.get('conversation_history', []) or []
+        if len(history) < 4:
+            return False
+
+        try:
+            from praisonaiagents.context.tokens import estimate_messages_tokens
+            used_tokens = estimate_messages_tokens(history)
+        except Exception:
+            used_tokens = sum(len(str(m.get('content', ''))) for m in history) // 4
+
+        budget = _usable_context_budget(session_state)
+        threshold = float(config.get('threshold', 0.8) or 0.8)
+
+        if used_tokens < budget * threshold:
+            return False
+
+        console.print(
+            f"[dim]Auto-compacting: ~{used_tokens} tokens ≈ "
+            f"{int(100 * used_tokens / budget)}% of usable budget "
+            f"({budget}).[/dim]"
+        )
+        _handle_compact_command(self, console, session_state)
+        return True
+    except Exception:
+        return False
+
+
+def _is_context_length_error(exc):
+    """Heuristically detect context-window/token-limit errors from a provider."""
+    message = str(exc).lower()
+    markers = (
+        'context length',
+        'context window',
+        'maximum context',
+        'context_length_exceeded',
+        'too many tokens',
+        'reduce the length',
+        'prompt is too long',
+        'string too long',
+    )
+    return any(marker in message for marker in markers)
+
+
 def _handle_context_command(self, console, args, session_state):
     """
     Handle /context command - manage context budgeting and monitoring.
@@ -1229,43 +1384,110 @@ def _start_execution_worker(self, tools_list, console, session_state):
                         warnings.filterwarnings("ignore")
                         
                         model = session_state.get('current_model')
-                        conversation_history = session_state.get('conversation_history', [])
-                        
+
+                        # Proactive auto-compaction: if the running history is
+                        # nearing the model's usable context budget and
+                        # auto_compact is enabled, summarise older turns before
+                        # building the agent so the turn stays within budget.
+                        _maybe_auto_compact(self, console, session_state)
+
                         live_status.update_status("Creating agent...")
-                        
-                        # Build backstory with context
-                        backstory = "You are a helpful AI assistant with access to tools for file operations, code intelligence, and shell commands."
 
                         # Auto-load AGENTS.md/CLAUDE.md project context (unless --no-context)
+                        _project_context = None
                         if not getattr(getattr(self, 'args', None), 'no_context', False):
-                            project_context = _load_cli_project_context(self)
-                            if project_context:
-                                backstory += "\n\n# Project Context\n" + project_context
+                            _project_context = _load_cli_project_context(self)
 
-                        if conversation_history:
-                            recent = conversation_history[-10:]
-                            context_lines = []
-                            for msg in recent:
-                                role = msg.get('role', 'unknown')
-                                content = msg.get('content', '')[:200]
-                                context_lines.append(f"{role}: {content}")
-                            if context_lines:
-                                backstory += "\n\nRecent conversation context:\n" + "\n".join(context_lines)
-                        
-                        agent = Agent(
-                            name="Assistant",
-                            role="Helpful AI Assistant",
-                            goal="Help the user with their tasks",
-                            backstory=backstory,
-                            tools=tools_list if tools_list else None,
-                            output="minimal",
-                            llm=model
-                        )
-                        
+                        def _build_agent():
+                            # Build the agent from the CURRENT conversation history
+                            # so that a post-compaction retry rebuilds with the
+                            # summarised (smaller) context rather than reusing the
+                            # stale, oversized backstory baked in before compaction.
+                            backstory = "You are a helpful AI assistant with access to tools for file operations, code intelligence, and shell commands."
+                            if _project_context:
+                                backstory += "\n\n# Project Context\n" + _project_context
+
+                            history = session_state.get('conversation_history', [])
+                            if history:
+                                recent = history[-10:]
+                                context_lines = []
+                                for msg in recent:
+                                    role = msg.get('role', 'unknown')
+                                    content = msg.get('content', '')[:200]
+                                    context_lines.append(f"{role}: {content}")
+                                if context_lines:
+                                    backstory += "\n\nRecent conversation context:\n" + "\n".join(context_lines)
+
+                            return Agent(
+                                name="Assistant",
+                                role="Helpful AI Assistant",
+                                goal="Help the user with their tasks",
+                                backstory=backstory,
+                                tools=tools_list if tools_list else None,
+                                output="minimal",
+                                llm=model
+                            )
+
+                        agent = _build_agent()
+
                         live_status.update_status(f"Task #{task_id}: Calling LLM...")
                         
-                        response = agent.chat(prompt, stream=False)
-                        response_str = str(response) if response else ""
+                        # Consume REAL token streaming from core (iter_stream yields
+                        # incremental chunks) and push each delta to the display thread
+                        # so text renders as it is generated — real time-to-first-token
+                        # instead of the previous post-hoc simulated word replay.
+                        response_str = ""
+                        streamed = False
+                        stream_deltas = worker_state.get('stream_deltas')
+                        try:
+                            worker_state['stream_header_shown'] = False
+                            worker_state['stream_active'] = True
+                            for chunk in agent.iter_stream(prompt):
+                                if chunk:
+                                    response_str += chunk
+                                    if stream_deltas is not None:
+                                        stream_deltas.put(chunk)
+                            streamed = True
+                        except Exception:
+                            # If chunks were already emitted to the live display,
+                            # do NOT re-run the prompt via chat() — that would show
+                            # partial streamed tokens followed by a full second
+                            # answer. Keep the partial streamed text as-is and let
+                            # the display finalise it. Only fall back to the
+                            # non-streamed path when nothing streamed yet.
+                            if response_str:
+                                streamed = True
+                            else:
+                                try:
+                                    response = agent.chat(prompt, stream=False)
+                                except Exception as chat_exc:
+                                    # Reactive safety net: on a context-length
+                                    # error, force a compaction (ignoring the
+                                    # proactive threshold) and retry the turn once
+                                    # instead of surfacing the raw provider error.
+                                    # Skipped when the user has disabled
+                                    # auto-compaction so their history is never
+                                    # rewritten without consent.
+                                    _auto_compact_enabled = (
+                                        session_state.get('context_config', {}) or {}
+                                    ).get('auto_compact', True)
+                                    if _is_context_length_error(chat_exc) and _auto_compact_enabled:
+                                        console.print(
+                                            "[yellow]Context limit hit; compacting "
+                                            "and retrying...[/yellow]"
+                                        )
+                                        _handle_compact_command(self, console, session_state)
+                                        # Rebuild the agent so the retry uses the
+                                        # compacted history instead of the stale
+                                        # oversized backstory.
+                                        agent = _build_agent()
+                                        response = agent.chat(prompt, stream=False)
+                                    else:
+                                        raise
+                                response_str = str(response) if response else ""
+                                streamed = False
+                        finally:
+                            worker_state['stream_active'] = False
                         
                         # Calculate elapsed time
                         elapsed = time.time() - start_time
@@ -1277,6 +1499,7 @@ def _start_execution_worker(self, tools_list, console, session_state):
                             'response': response_str,
                             'elapsed': elapsed,
                             'status': 'completed',
+                            'streamed': streamed,
                         }
                         worker_state['completed_tasks'].append(completed_task)
                         
@@ -1421,29 +1644,43 @@ def _process_interactive_prompt(self, prompt, tools_list, console, show_profilin
         
         timings['llm_start'] = time.time()
         
-        # Use chat method (streaming is handled internally by verbose mode)
-        response = agent.chat(prompt, stream=False)
-        
+        # Consume REAL token streaming from core: render each incremental chunk
+        # as it is generated (real time-to-first-token) rather than replaying a
+        # finished string word-by-word with fixed sleeps.
+        timings['display_start'] = time.time()
+        response_str = ""
+        streamed = False
+        try:
+            for chunk in agent.iter_stream(prompt):
+                if chunk:
+                    response_str += chunk
+                    console.print(chunk, end="")
+                    sys.stdout.flush()
+            streamed = True
+            if response_str:
+                console.print()  # Final newline
+        except Exception:
+            if response_str:
+                # Chunks were already printed to the console — do NOT re-run the
+                # prompt via chat(), otherwise the user sees partial streamed
+                # output followed by a full second answer. Keep the partial
+                # streamed text and just terminate the line.
+                streamed = True
+                console.print()  # Final newline
+            else:
+                # Nothing streamed yet: fall back to the non-streamed path.
+                response = agent.chat(prompt, stream=False)
+                response_str = str(response) if response else ""
+                if response_str:
+                    console.print(response_str)
         timings['llm_end'] = time.time()
+        timings['display_end'] = time.time()
         
         # Check if tools were used by looking at agent's tool execution history
-        if hasattr(agent, '_tool_calls') and agent._tool_calls:
+        if not streamed and hasattr(agent, '_tool_calls') and agent._tool_calls:
             for tool_call in agent._tool_calls:
                 tool_name = tool_call.get('name', 'unknown')
                 console.print(f"[dim]⚙ Used tool: {tool_name}[/dim]")
-        
-        # Print response with simulated streaming effect
-        timings['display_start'] = time.time()
-        response_str = str(response) if response else ""
-        if response_str:
-            words = response_str.split()
-            for i, word in enumerate(words):
-                console.print(word + " ", end="")
-                sys.stdout.flush()
-                if i % 15 == 14:  # Small pause every 15 words for streaming effect
-                    time.sleep(0.005)
-            console.print()  # Final newline
-        timings['display_end'] = time.time()
         
         # Update session state with token estimates and history
         if session_state is not None:
