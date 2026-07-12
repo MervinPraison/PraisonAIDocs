@@ -202,6 +202,74 @@ for path in ["packages/foo/main.py", "packages/foo/util.py", "packages/bar/api.p
 ```
 
 </Step>
+
+<Step title="Wire it into an agent (auto-attach as tools run)">
+
+Register the hook on an agent and the nearest `AGENTS.md` attaches automatically the first time the agent reads or edits a file in a new subtree — no manual `attach_for_path()` calls.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookEvent, HookRegistry
+from praisonai.integration.context_files import (
+    load_context_files,
+    build_subtree_context_hook,
+    file_tool_matcher,
+)
+
+up_front = load_context_files()
+
+hooks = HookRegistry()
+hooks.register_function(
+    HookEvent.AFTER_TOOL,
+    build_subtree_context_hook(already_loaded=up_front),
+    matcher=file_tool_matcher(),
+)
+
+agent = Agent(
+    name="Monorepo Refactorer",
+    instructions=up_front,
+    hooks=hooks,
+)
+agent.start("Refactor packages/foo/main.py to use the new logger.")
+```
+
+The hook fires after each file tool, reads the touched path from `filepath`, `file_path`, `path`, `filename`, or `target_file`, and returns the nearest subtree rules as `additional_context` the first time that subtree is touched.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Tool
+    participant Hook as AFTER_TOOL hook<br/>(build_subtree_context_hook)
+    participant Attacher as PathContextAttacher
+
+    User->>Agent: start("edit packages/foo/main.py")
+    Agent->>Tool: edit_file(file_path="packages/foo/main.py")
+    Tool-->>Agent: result
+    Agent->>Hook: AFTER_TOOL(tool_input)
+    Hook->>Attacher: attach_for_path("packages/foo/main.py")
+    Attacher-->>Hook: packages/foo/AGENTS.md
+    Hook-->>Agent: additional_context
+    Agent-->>User: reply (now aware of foo's rules)
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef hook fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef attach fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class User user
+    class Agent agent
+    class Tool tool
+    class Hook hook
+    class Attacher attach
+```
+
+<Note>
+The hook is session-scoped — its attacher owns the dedup and per-directory cache. Create one hook per session/agent run so state does not leak between users.
+</Note>
+
+</Step>
 </Steps>
 
 ### Behaviour guarantees
@@ -223,15 +291,16 @@ for path in ["packages/foo/main.py", "packages/foo/util.py", "packages/bar/api.p
 graph TB
     Q1{"Are all instruction files inside cwd or above it?"}
     Q1 -->|Yes| UPFRONT["✅ Up-front load_context_files is enough<br/>(no attacher)"]
-    Q1 -->|No| Q2{"Does the session touch<br/>many files or one?"}
-    Q2 -->|One| ONESHOT["🎯 load_context_files_for_path(path)<br/>(stateless helper)"]
-    Q2 -->|Many| CLASS["🔁 PathContextAttacher(...)<br/>(session-scoped cache + dedup)"]
+    Q1 -->|No| Q2{"How does the session touch files?"}
+    Q2 -->|"One known path"| ONESHOT["🎯 load_context_files_for_path(path)<br/>(stateless helper)"]
+    Q2 -->|"Many paths, I call attach_for_path myself"| CLASS["🔁 PathContextAttacher(...)<br/>(session-scoped cache + dedup)"]
+    Q2 -->|"An agent + tools — auto-attach as tools run"| HOOK["🪝 build_subtree_context_hook()<br/>+ file_tool_matcher()"]
 
     classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Q1,Q2 q
-    class UPFRONT,ONESHOT,CLASS pick
+    class UPFRONT,ONESHOT,CLASS,HOOK pick
 ```
 
 <Note>
@@ -428,6 +497,22 @@ context = load_context_files(paths=["AGENTS.md", "STYLE.md"])
 ```
 
 De-duplication is automatic: if `cwd` equals the git root, the same file is read only once (matched by inode, safe on case-insensitive volumes).
+
+### New public helpers
+
+Two helpers wire the attacher into an agent's hooks so subtree rules attach automatically as file tools run.
+
+| Helper | Signature | Purpose |
+|--------|-----------|---------|
+| `build_subtree_context_hook` | `(already_loaded=None, *, max_chars=8000) -> Callable` | `AFTER_TOOL` hook that auto-attaches subtree instruction files as file tools run. Session-scoped. |
+| `file_tool_matcher` | `() -> str` | Regex that limits the hook to file-touching tool names — pass as `matcher=` when registering. |
+
+Options for `build_subtree_context_hook`:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `already_loaded` | `Optional[str]` | `None` | Up-front instruction text (used only to seed dedup so files already loaded at session start are not re-attached). |
+| `max_chars` | `int` | `8000` | Character budget across the whole session; `0` disables it. |
 
 ---
 
@@ -669,6 +754,27 @@ from praisonai.integration.context_files import (
 
 up_front = load_context_files()
 attacher = PathContextAttacher(already_loaded=up_front, max_chars=8000)
+```
+</Accordion>
+
+<Accordion title="Prefer the hook for interactive/agentic sessions">
+For interactive sessions where the agent decides which files to touch, register `build_subtree_context_hook()` on `HookEvent.AFTER_TOOL` instead of calling `attach_for_path()` manually. The hook fires exactly when a file is touched, so the agent gets the nearest subtree rules just-in-time without you having to predict its path list up front. Pair with `matcher=file_tool_matcher()` so the hook skips non-file tools cheaply.
+
+```python
+from praisonaiagents.hooks import HookEvent, HookRegistry
+from praisonai.integration.context_files import (
+    load_context_files,
+    build_subtree_context_hook,
+    file_tool_matcher,
+)
+
+up_front = load_context_files()
+hooks = HookRegistry()
+hooks.register_function(
+    HookEvent.AFTER_TOOL,
+    build_subtree_context_hook(already_loaded=up_front),
+    matcher=file_tool_matcher(),
+)
 ```
 </Accordion>
 
