@@ -51,7 +51,7 @@ graph LR
 cd ~/code/my-app && praisonai run "Build a TODO app"
 ```
 
-Project context comes from the git root (or current directory if not in a repo).
+Project context comes from the git repository — its remote or root commit — falling back to a path hash only outside a repo.
 </Step>
 
 <Step title="Continue later">
@@ -66,8 +66,12 @@ Prior user and assistant messages replay before your new prompt — no need to s
 <Step title="List this project's sessions">
 
 ```bash
-praisonai session list
+$ praisonai session list
+Project: my-app (ID: a1b2c3d4, identity: git-remote)
+...
 ```
+
+The `identity:` label tells you which resolver won — useful when explaining why two clones share sessions or why a fresh repo has none.
 
 Shows every session `--continue` could resume for this project — the project's own sessions **plus** any globally-stored sessions (from `chat`, gateway, TUI, API, or a bare `Agent(session_id=...)`). Duplicates are collapsed; the freshest record wins.
 </Step>
@@ -105,13 +109,74 @@ sequenceDiagram
 
 `find_last_session()` merges the **project-scoped store** and the **global default store** so `--continue` resolves the most-recent session regardless of how it was created (`run`, `chat`, gateway, TUI, API, or a bare `Agent(session_id=...)`). Sub-agent / forked children are skipped — the last **root** session wins. It falls back to a child only if the project has none. Each store is scanned with a `limit` window (default `50`).
 
-| Where you are | Project ID from |
-|---|---|
-| Inside a git repo | `git rev-parse --show-toplevel` |
-| Outside a git repo | Current working directory |
-| Stored hash | First 8 chars of `sha256(absolute_path)` |
+The CLI now follows the repository, not the folder — cloning, moving, or `git worktree`-ing a repo keeps the same session history.
+
+| Priority | Where the id comes from | Identity source | When it applies |
+|---|---|---|---|
+| 1 | Normalised **git remote URL** (`origin` first, then any configured remote) | `git-remote` | Any repo with a remote |
+| 2 | Repository **root commit SHA** (across all refs, deterministic) | `root-commit` | Repo has commits but no remote |
+| 3 | Cached id persisted at **`.git/praisonai-project`** | `cached-id` | Git repo with neither remote nor commits |
+| 4 | Absolute-path SHA-256 hash (legacy behaviour) | `path` | Non-git directories only |
+
+All four sources collapse to the same 8-char `sha256` short hash, so the on-disk session layout is unchanged.
+
+```mermaid
+graph TB
+    Start[📁 Where are you running praisonai?] --> InGit{Inside a git repo?}
+    InGit -->|No| Path[📄 path<br/>legacy path-hash]
+    InGit -->|Yes| Remote{Has a remote?}
+    Remote -->|Yes| GitRemote[🌐 git-remote<br/>Follows the remote]
+    Remote -->|No| Commits{Has commits?}
+    Commits -->|Yes| RootCommit[🌱 root-commit<br/>Follows the first commit]
+    Commits -->|No| Cached[💾 cached-id<br/>Stored in .git/praisonai-project]
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef primary fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef secondary fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef fallback fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef legacy fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start,InGit,Remote,Commits question
+    class GitRemote primary
+    class RootCommit secondary
+    class Cached fallback
+    class Path legacy
+```
+
+### What survives
+
+Session history follows the repository, not the folder.
+
+| Scenario | Session history follows you? | Why |
+|---|---|---|
+| `mv myrepo mynewrepo` (rename directory) | ✅ Yes | Identity comes from remote / root commit, not the path |
+| Clone the same repo to `~/work/a` and `~/work/b` | ✅ Yes (shared history) | Both resolve to the same normalised remote |
+| `git worktree add ../feature-x` | ✅ Yes | Worktrees share `--git-common-dir`, so the same identity resolves |
+| `pip install` a project into `/venvs/foo/src/myrepo` | ✅ Yes | Same remote resolves the same id |
+| Delete `.git` and `git init` again with no remote | ⚠️ New identity (root commit changes) | Legacy sessions are auto-migrated on first `--continue` |
+| Non-git directory renamed | ❌ Old behaviour: new id | Path hash changes |
+
+<Note>
+When a repo gains a remote or its first commit, existing sessions from the previous `path`-based id are copied into the new identity directory on the next run — no manual action needed.
+</Note>
+
+**Upgrading from an earlier CLI?** Your existing project sessions are stored under a directory named after a hash of the repo's absolute path. On the first `--continue` / `praisonai run` after upgrading, sessions are **copied** (not moved) into the new identity-based directory automatically. No configuration, no data loss — just re-run in the same repo and prior history is there.
 
 History restore and save wiring landed in [PR #1963](https://github.com/MervinPraison/PraisonAI/pull/1963). If no prior session exists, a warning appears and a new session starts.
+
+**Reading the identity source programmatically:**
+
+```python
+from praisonai_code.cli.utils.project import (
+    get_project_id,
+    get_project_identity_source,
+    resolve_project_identity,
+)
+
+pid = get_project_id()                     # 8-char hash — unchanged public API
+source = get_project_identity_source()     # "git-remote" / "root-commit" / "cached-id" / "path"
+pid, source = resolve_project_identity()   # both in one call
+```
 
 ---
 
@@ -179,6 +244,9 @@ Quick questions or PII-sensitive input: `praisonai run --no-save "How do I hash 
 </Accordion>
 <Accordion title="Clean up with session list --all">
 Review and delete stale sessions across projects periodically.
+</Accordion>
+<Accordion title="Clones and moves keep their history">
+Two clones of the same repo — for example, one on your laptop and one on a build box — automatically share session history because the id comes from the git remote. Renaming or moving a checkout does not change the id either.
 </Accordion>
 </AccordionGroup>
 
