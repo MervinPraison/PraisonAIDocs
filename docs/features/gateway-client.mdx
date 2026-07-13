@@ -180,9 +180,13 @@ sequenceDiagram
 | **Connect** | TCP/WS opened; `join` includes `min_version`, `max_version`, optional `agent_id`, `token` |
 | **Negotiate** | Server picks `min(client_max, MAX_PROTOCOL_VERSION)` or rejects with `version_unsupported` |
 | **Stream** | Each event carries a monotonic `sequence`; client tracks `_expected_sequence` |
-| **Drop** | `on_state_change("reconnecting")` fires; backoff with jitter (`initial * multiplier^attempts`, clamped to `max`) |
+| **Drop** | `on_state_change("reconnecting")` fires; backoff with jitter (`initial * multiplier^attempts`, clamped to `max`). A server-supplied `retry_after_seconds` from the last rejection is honoured **once** as a lower bound on the next backoff delay, then cleared |
 | **Resume** | Re-`join` with `session_id` + `since=cursor`; server replays from cursor; `presence` + `health` returned |
 | **Gap** | If received `sequence` ≠ expected, `on_gap(expected, received)` fires; caller can `await client.resync()` |
+
+<Note>
+Calling `client.connect()` on an instance whose previous loop had a server-supplied `retry_after` floor **clears** that floor before the new loop starts. Reusing a `GatewayClient` after a terminal failure will not inherit a stale backoff from the prior connection cycle — the clear happens on **every** `connect()` call, not only the first.
+</Note>
 
 ---
 
@@ -223,6 +227,7 @@ sequenceDiagram
 |-----------|-----------|---------------|
 | `on_gap` | `Callable[[int, int], None]` | A monotonic sequence gap is detected (`expected`, `received`) |
 | `on_state_change` | `Callable[[str], None]` | Connection state changes |
+| `on_reconnect_paused` | `Callable[[ConnectErrorCode, Optional[str]], None]` | The reconnect loop stopped on a **terminal** connect rejection (e.g. `auth_required`, `agent_not_found`). Receives `(code, next_step)` so callers can surface the reason and drive re-auth / re-pair / re-configure. Not fired for transient failures — those keep backing off. |
 
 ---
 
@@ -257,6 +262,77 @@ graph LR
 </Warning>
 
 Invalid `min_version`/`max_version` fields (non-integer, or `min > max`) produce `code: "invalid_protocol_hello"` and raise `ConnectionError`.
+
+---
+
+## Terminal vs Transient Connect Errors
+
+Not every connect failure should be retried. The client uses a single classifier — `is_recoverable(code)` from `praisonaiagents.gateway.protocols` — to decide whether to back off and try again, or stop the reconnect loop and surface the failure through `on_reconnect_paused`.
+
+```mermaid
+graph LR
+    Reject[🚫 Connect Rejected] --> Classify{is_recoverable code?}
+    Classify -->|Transient<br/>rate_limited / unknown| Backoff[⏱ Backoff + Jitter]
+    Backoff --> Retry[🔄 Reconnect]
+    Classify -->|Terminal<br/>auth / pairing / agent_not_found| Stop[🛑 Stop Loop]
+    Stop --> Callback[📣 on_reconnect_paused code, next_step]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Reject input
+    class Classify,Backoff process
+    class Retry output
+    class Stop,Callback tool
+```
+
+| `ConnectErrorCode` | Classification | Client behaviour |
+|--------------------|----------------|------------------|
+| `rate_limited` | **Transient** | Back off (honouring `retry_after_seconds` as a lower bound), then reconnect |
+| `auth_required` | **Terminal** | Stop loop, fire `on_reconnect_paused(code, next_step="reauthenticate")` |
+| `auth_unauthorized` | **Terminal** | Stop loop, fire `on_reconnect_paused(code, next_step="reauthenticate")` |
+| `pairing_required` | **Terminal** | Stop loop, fire `on_reconnect_paused(code, next_step="repair")` |
+| `protocol_unsupported` | **Terminal** | Stop loop, fire `on_reconnect_paused(code, next_step="upgrade_client"` or `"downgrade_client")` |
+| `agent_not_found` | **Terminal** | Stop loop, fire `on_reconnect_paused(code, next_step="do_not_retry")` |
+| `origin_not_allowed` | **Terminal** | Stop loop, fire `on_reconnect_paused(code, next_step="do_not_retry")` |
+| `configuration_error` | **Terminal** | Stop loop, fire `on_reconnect_paused(code, next_step="do_not_retry")` |
+| *(unknown/future code)* | **Transient (fail-open)** | Back off and retry — better to retry a new code than silently strand |
+
+<Note>
+`agent_not_found` is terminal because the gateway emits it with a `do_not_retry` recovery step — the agent id in your `hello` frame does not exist on the server, so retrying will not help until a human fixes the id or registers the agent. The client used to loop forever on this code; it now pauses immediately.
+</Note>
+
+Surface a terminal reason and drive re-pairing without silently looping:
+
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+from praisonaiagents.gateway.protocols import ConnectErrorCode
+
+async def main():
+    client = GatewayClient(url="ws://localhost:8765", agent_id="assistant")
+
+    def on_reconnect_paused(code: ConnectErrorCode, next_step):
+        if code in (ConnectErrorCode.AUTH_REQUIRED, ConnectErrorCode.AUTH_UNAUTHORIZED):
+            alert_ops(f"Re-authenticate required ({code}): {next_step}")
+        elif code == ConnectErrorCode.PAIRING_REQUIRED:
+            trigger_pairing_flow()
+        elif code == ConnectErrorCode.AGENT_NOT_FOUND:
+            alert_ops(f"agent_id not registered on gateway (next_step={next_step})")
+        else:
+            alert_ops(f"Terminal connect failure: {code} → {next_step}")
+
+    client.on_reconnect_paused = on_reconnect_paused
+    await client.connect()
+
+asyncio.run(main())
+```
+
+<Warning>
+Once `on_reconnect_paused` fires, `client.connect()` has already set `_running = False`. To resume connecting after the operator fixes the underlying condition (re-auth, re-pair, correct `agent_id`), call `await client.connect()` again — it will start a fresh loop with a cleared backoff floor.
+</Warning>
 
 ---
 
@@ -470,8 +546,17 @@ lan_backoff = BackoffConfig(initial=0.1, max=5.0, multiplier=2.0, jitter=0.1)
 ```
 </Accordion>
 
+<Accordion title="Handle terminal failures with on_reconnect_paused">
+The reconnect loop stops on terminal codes (`auth_*`, `pairing_required`, `protocol_unsupported`, `agent_not_found`, `origin_not_allowed`, `configuration_error`). Without a callback you have no way to know it stopped — logs are the only signal. Always set `on_reconnect_paused` before `connect()` and route the code to re-auth, re-pair, or an ops alert. See [Terminal vs Transient Connect Errors](#terminal-vs-transient-connect-errors) for the full classification.
+
+```python
+client.on_reconnect_paused = lambda code, step: alert_ops(f"Connect abandoned: {code} → {step}")
+await client.connect()
+```
+</Accordion>
+
 <Accordion title="Treat version_unsupported as a permanent failure">
-`connect()` raises `ValueError` on `version_unsupported` and stops retrying. Wrap it and alert your ops team — this means the server and client are incompatible and need a coordinated upgrade.
+`connect()` raises `ValueError` on `version_unsupported` and stops retrying. Wrap it and alert your ops team — this means the server and client are incompatible and need a coordinated upgrade. This is the protocol-negotiation counterpart to the other terminal codes covered in [Terminal vs Transient Connect Errors](#terminal-vs-transient-connect-errors).
 
 ```python
 try:
