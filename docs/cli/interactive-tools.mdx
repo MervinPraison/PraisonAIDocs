@@ -6,22 +6,28 @@ icon: "toolbox"
 
 ## Overview
 
-PraisonAI interactive modes (`praisonai tui launch` and `praison "prompt"`) now include **ACP (Agentic Change Plan)** and **LSP (Language Server Protocol)** tools by default.
+PraisonAI interactive modes (`praisonai tui launch` and `praison "prompt"`) now include **ACP (Agentic Change Plan)**, **Edit (targeted/fuzzy edits)**, and **LSP (Language Server Protocol)** tools by default.
 
 This enables agents to:
 - **Create, edit, and delete files** with plan/approve/apply/verify flow (ACP)
+- **Precisely edit files** with a targeted find-and-replace engine (`edit_file`) and atomic multi-file patches (`apply_patch`), backed by a 5-strategy fuzzy match ladder, SHA-256 staleness guard, BOM/CRLF preservation, and post-edit LSP/linter diagnostics. See [File Editing](/docs/features/file-editing) for the engine details.
 - **Analyze code** with symbol listing, definition lookup, and reference finding (LSP)
 - **Execute commands** with safety guardrails
+
+<Note>
+**Backward compatible.** Agents that pin `--tools <list>` or pass `groups=[...]` keep behaving exactly as before — the default union only changes what runs when nothing is pinned. The whole-file rewrite path (`write_file`, `acp_create_file`) is unchanged and still available. To restore the old default, set `PRAISON_TOOLS_DISABLE=edit` or `ToolConfig(enable_edit=False)`.
+</Note>
 
 ## Default Tool Groups
 
 | Group | Tools | Description |
 |-------|-------|-------------|
 | **ACP** | `acp_create_file`, `acp_edit_file`, `acp_delete_file`, `acp_execute_command` | Safe file operations with plan/approve/apply |
+| **Edit** | `edit_file`, `apply_patch` | Targeted/fuzzy atomic edits with rollback (replaces whole-file rewrites as the primary edit path) |
 | **LSP** | `lsp_list_symbols`, `lsp_find_definition`, `lsp_find_references`, `lsp_get_diagnostics` | Code intelligence |
 | **Basic** | `read_file`, `write_file`, `list_files`, `execute_command`, `internet_search` | Standard tools |
 
-All groups are enabled by default in interactive modes.
+All groups are enabled by default in interactive modes; you can disable individual groups per **Disabling Tool Groups** below.
 
 ## Quick Start
 
@@ -51,16 +57,24 @@ praison "Search the web" --no-acp --no-lsp
 praisonai tui launch --no-acp --no-lsp
 ```
 
+The `--no-acp` / `--no-lsp` flags disable those groups. There is **no `--no-edit` flag** — disable the edit group with the env var below or `ToolConfig(enable_edit=False)` from Python.
+
 ### Environment Variables
 
 ```bash
-# Disable specific groups via env
-export PRAISON_TOOLS_DISABLE=acp,lsp
+# Disable the fuzzy/atomic edit engine only (restores old whole-file-rewrite default)
+export PRAISON_TOOLS_DISABLE=edit
+praison "Hello world"
+
+# Disable multiple groups
+export PRAISON_TOOLS_DISABLE=acp,edit,lsp
 praison "Hello world"
 
 # Set workspace
 export PRAISON_WORKSPACE=/path/to/project
 ```
+
+To disable per-invocation, prefer the env var above; `ToolConfig(enable_edit=False)` from Python has the same effect.
 
 ## Tool Details
 
@@ -83,6 +97,50 @@ User Request → Create Plan → Approve → Apply → Verify
 - All destructive operations require approval
 - Changes are tracked and can be verified
 - Workspace boundary enforcement
+
+### Edit Tools (targeted, atomic edits)
+
+The `edit` group wires the core `edit_file` / `apply_patch` engine into the default interactive toolset.
+
+| Tool | Description |
+|------|-------------|
+| `edit_file` | Targeted find-and-replace with a 5-strategy fuzzy match ladder; SHA-256 staleness guard via `expected_hash`; per-file lock; preserves LF/CRLF/BOM |
+| `apply_patch` | Atomic multi-file Add/Update/Delete with rollback on any failure |
+
+**When they run:**
+- `approval_mode="auto"` — context-approved (matching the ACP tools). No blocking console prompt. The loader **merges** `edit_file`/`apply_patch` into the YAML-approved set via `add_yaml_approved_tools(...)`, so pre-existing approvals are preserved (never clobbered).
+- `approval_mode="manual"` / `"scoped"` — the normal HIGH-risk approval flow with diff preview still applies.
+
+**Fail-closed on workspace containment:** If `Workspace(root=<workspace>)` cannot be built, `edit_file`/`apply_patch` are not exposed at all and a `WARNING` is logged. Combined with auto-approval, an unbounded workspace could let an absolute path (e.g. `/etc/hosts`) escape the configured directory, so the loader refuses to expose the tools rather than exposing them unsafely. You will see:
+
+```
+WARNING praisonai_code.cli.features.interactive_tools: Edit tools disabled: workspace containment unavailable: <reason>
+```
+
+See [File Editing](/docs/features/file-editing) for the full engine — fuzzy ladder, staleness guard, post-edit diagnostics and formatting, and the `apply_patch` grammar. That page also covers `force=True` and `expected_hash=...` for advanced use.
+
+### Which file-editing path fires by default?
+
+Both ACP file tools and the targeted-edit tools are available by default. This is which one runs when you don't pin anything:
+
+```mermaid
+graph TB
+    Q[🤖 Agent needs to change files] --> D{What kind of change?}
+    D -->|Edit one spot in a file| EF[edit_file — targeted, fuzzy, atomic<br/>NEW default]
+    D -->|Rename across files| AP[apply_patch — multi-file atomic]
+    D -->|Plan → approve → apply flow| ACP[acp_edit_file — unchanged]
+    D -->|Whole-file rewrite| WF[write_file / acp_create_file<br/>still available]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef new fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef existing fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q agent
+    class D decision
+    class EF,AP new
+    class ACP,WF existing
+```
 
 ### LSP Tools (Code Intelligence)
 
@@ -127,6 +185,7 @@ tools = get_interactive_tools()
 config = ToolConfig(
     workspace="/path/to/project",
     enable_acp=True,
+    enable_edit=True,
     enable_lsp=True,
     approval_mode="auto",  # or "manual"
 )
@@ -134,6 +193,9 @@ tools = get_interactive_tools(config=config)
 
 # Disable specific groups
 tools = get_interactive_tools(disable=["acp"])
+
+# Restore old whole-file-rewrite default (no targeted-edit tools)
+tools = get_interactive_tools(config=ToolConfig(enable_edit=False))
 
 # Get only specific groups
 tools = get_interactive_tools(groups=["basic"])
@@ -147,6 +209,7 @@ tools = get_interactive_tools(groups=["basic"])
 |--------|---------|-------------|
 | `workspace` | `os.getcwd()` | Working directory |
 | `enable_acp` | `True` | Enable ACP tools |
+| `enable_edit` | `True` | Enable the `edit_file` / `apply_patch` targeted-edit tools |
 | `enable_lsp` | `True` | Enable LSP tools |
 | `enable_basic` | `True` | Enable basic tools |
 | `approval_mode` | `"auto"` | Approval mode: auto, manual, scoped |
@@ -159,13 +222,13 @@ tools = get_interactive_tools(groups=["basic"])
 | `manual` | All write operations require explicit approval |
 | `scoped` | Safe operations auto-approved, dangerous ones (delete, shell) require approval |
 
-**Important**: When `approval_mode=auto`, write operations work even without ACP subsystem running. This enables seamless automation and testing.
+**Important**: When `approval_mode=auto`, write operations work even without ACP subsystem running. This enables seamless automation and testing. In `auto` mode the edit-tools loader also context-approves `edit_file` and `apply_patch` (via `add_yaml_approved_tools(...)`, which merges rather than clobbers), so these HIGH-risk tools don't block on a console prompt. In `manual` / `scoped` modes the normal HIGH-risk approval flow with diff preview still applies.
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `PRAISON_TOOLS_DISABLE` | Comma-separated groups to disable |
+| `PRAISON_TOOLS_DISABLE` | Comma-separated groups to disable. Accepts: `acp`, `edit`, `lsp`, `basic`. |
 | `PRAISON_WORKSPACE` | Override workspace path |
 | `PRAISON_APPROVAL_MODE` | Set approval mode (auto, manual, scoped) |
 | `PYTHONIOENCODING` | Set to `utf-8` for Windows automation subprocess compatibility |
@@ -202,6 +265,8 @@ praison "prompt" / praisonai tui launch
     │
     ├── ACP Tools → ActionOrchestrator → Plan/Apply/Verify
     │
+    ├── Edit Tools → EditTools engine (fuzzy ladder + staleness guard + rollback)
+    │
     ├── LSP Tools → CodeIntelligenceRouter → LSP/Fallback
     │
     └── Basic Tools → Direct execution
@@ -236,7 +301,10 @@ id,name,prompts,expected_tools,forbidden_tools
 test_01,Create File,"Create hello.py",acp_create_file,acp_delete_file
 test_02,Read Only,"Read the README",read_file,"acp_create_file,acp_edit_file"
 test_03,Code Analysis,"List symbols in main.py",lsp_list_symbols,
+test_04,Targeted Edit,"Rename getName to getEmail in user.py",edit_file,write_file
 ```
+
+The `expected_tools` / `forbidden_tools` mechanism applies to `edit_file` and `apply_patch` too — assert the targeted-edit path fires instead of a whole-file `write_file`.
 
 ### Tool Assertions
 
