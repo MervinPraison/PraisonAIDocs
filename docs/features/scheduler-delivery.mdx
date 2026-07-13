@@ -1,0 +1,288 @@
+---
+title: "Scheduler Delivery"
+sidebarTitle: "Scheduler Delivery"
+description: "Push scheduled agent results to Telegram, Discord, Slack, or WhatsApp with one param"
+icon: "paper-plane"
+---
+
+Set `deliver=` on a scheduled agent and each result is pushed to a chat target — no gateway required.
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+AgentScheduler(agent, task="Morning brief", deliver="telegram:123456").start("hourly")
+```
+
+```mermaid
+graph LR
+    subgraph "Scheduler Delivery"
+        A[⏰ Scheduled Agent] --> B[📤 deliver token]
+        B --> C[🔀 DeliveryRouter]
+        C --> D[✅ Telegram / Discord / Slack / WhatsApp]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class B,C process
+    class D output
+```
+
+"Run this agent every hour and text me the result on Telegram." That used to mean wiring up the scheduler **and** the full BotOS gateway. Now it's one parameter — the scheduler talks to the shared `DeliveryRouter` directly.
+
+<Note>
+If `praisonai-bot` isn't installed, delivery logs a single warning and no-ops. The scheduled run itself never fails because delivery failed.
+</Note>
+
+## Quick Start
+
+<Steps>
+<Step title="Deliver to a specific chat">
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+
+scheduler = AgentScheduler(agent, task="Morning brief", deliver="telegram:123456")
+scheduler.start("hourly")
+```
+</Step>
+
+<Step title="Deliver to the platform home channel">
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+
+# Bare platform token → router resolves the platform's home channel
+scheduler = AgentScheduler(agent, task="Morning brief", deliver="telegram")
+scheduler.start("daily")
+```
+</Step>
+
+<Step title="Async scheduler">
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonai.scheduler import AsyncAgentScheduler
+
+async def main():
+    agent = Agent(name="Brief", instructions="Summarise the morning news")
+    scheduler = AsyncAgentScheduler(agent, task="Morning brief", deliver="telegram:123456")
+    await scheduler.start("hourly")
+
+asyncio.run(main())
+```
+</Step>
+</Steps>
+
+---
+
+## Three Ways to Set the Target
+
+The same delivery token works from Python, YAML, and the CLI.
+
+<Tabs>
+<Tab title="Python">
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+AgentScheduler(agent, task="Morning brief", deliver="telegram:123456").start("hourly")
+```
+</Tab>
+
+<Tab title="YAML">
+```yaml
+# agents.yaml
+framework: praisonai
+
+agents:
+  - name: "Brief"
+    instructions: "Summarise the morning news"
+
+task: "Morning brief"
+
+schedule:
+  every: "hourly"          # alias for `interval` — new in PR #2934
+  deliver: "telegram:123456"
+```
+</Tab>
+
+<Tab title="CLI">
+```bash
+praisonai schedule add "morning-brief" \
+  -s hourly \
+  -m "Morning brief" \
+  --deliver telegram:123456
+```
+</Tab>
+</Tabs>
+
+<Note>
+`every:` is a new alias for `interval:` in the YAML `schedule:` block — both accept `hourly`, `daily`, `weekly`, `*/30m`, or raw seconds.
+</Note>
+
+### Which surface fits which scenario?
+
+```mermaid
+graph TB
+    Start{How do you run it?} -->|In your Python app| Py[Python: AgentScheduler deliver=]
+    Start -->|Config file, no code| Yaml[YAML: schedule.deliver]
+    Start -->|One-off from terminal| Cli[CLI: --deliver / -d]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start q
+    class Py,Yaml,Cli opt
+```
+
+---
+
+## Delivery Target Tokens
+
+The `deliver` value is parsed by `DeliveryTarget.parse()` — the same serialisable model reused from the existing delivery machinery.
+
+| Token | Meaning |
+|-------|---------|
+| `"telegram"` | Default (home) channel of that platform |
+| `"telegram:123456"` | Specific channel / chat ID |
+| `"telegram:123456:789"` | Channel `123456` with thread `789` |
+| `"origin"` | Reply to the same channel the schedule was created from |
+
+<Warning>
+`origin` (and `all`) need request/session context from the full BotOS gateway. The lightweight scheduler path logs a warning and skips them — use an explicit `platform` or `platform:chat_id` token instead, or run under the gateway.
+</Warning>
+
+Swap `telegram` for `discord`, `slack`, or `whatsapp` — the grammar is identical.
+
+---
+
+## How It Works
+
+The scheduler runs the agent, then hands the result to `SchedulerDelivery`, which resolves the token and sends through the shared `DeliveryRouter`.
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant Agent
+    participant SchedulerDelivery
+    participant DeliveryRouter
+    participant Telegram
+    Scheduler->>Agent: run task
+    Agent-->>Scheduler: result
+    Scheduler->>SchedulerDelivery: send(result, "telegram:123456")
+    SchedulerDelivery->>DeliveryRouter: deliver(idempotency_key, target, payload)
+    DeliveryRouter->>Telegram: bot.send_message(...)
+    Telegram-->>DeliveryRouter: ok
+```
+
+`SchedulerDelivery` is built once per scheduler and reused across runs, so the router's idempotency cache and rate limiters persist between ticks.
+
+---
+
+## Reliability Guarantees
+
+Delivery reuses the existing `DeliveryRouter`, so scheduled sends inherit the gateway's guarantees.
+
+| Guarantee | What it means |
+|-----------|---------------|
+| **Rate limiting** | Inherits the router's per-platform token-bucket limits |
+| **Idempotency dedup** | Each success carries a stable idempotency key; a re-fired job delivering the same result to the same target is deduplicated in-process |
+| **Dead-target self-heal** | The router retries and skips/marks dead targets |
+| **Graceful degradation** | When `praisonai-bot` is not installed, a single warning is logged and delivery no-ops — the scheduled run itself never fails |
+
+```mermaid
+graph LR
+    Result[✅ Result] --> Router[🔀 DeliveryRouter]
+    Router --> Rate[⏱️ Rate limit]
+    Router --> Dedup[🔁 Idempotency dedup]
+    Router --> Heal[🩹 Dead-target self-heal]
+    Missing[📦 bot not installed] --> NoOp[⚠️ Warn + no-op]
+
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Result ok
+    class Router,Rate,Dedup,Heal proc
+    class Missing,NoOp warn
+```
+
+---
+
+## Common Patterns
+
+### Deliver from a blueprint
+
+```python
+from praisonai.scheduler import AgentScheduler
+
+scheduler = AgentScheduler.from_blueprint(
+    "morning-brief",
+    slots={"hour": 8, "weekdays": "mon-fri"},
+    deliver="telegram",
+)
+scheduler.start(scheduler._yaml_schedule_config["interval"])
+```
+
+`deliver=` on `from_blueprint` overrides the blueprint's default delivery target.
+
+### Deliver to a thread
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Standup", instructions="Post the daily standup summary")
+AgentScheduler(agent, task="Standup", deliver="discord:555:thread-42").start("daily")
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Use an explicit channel ID for scheduled jobs">
+`telegram:123456` targets a fixed chat and works without any request context. Reserve `origin` for interactive flows running under the full gateway — the lightweight scheduler path cannot resolve it.
+</Accordion>
+
+<Accordion title="Install the bot extra to enable delivery">
+Delivery needs the `praisonai-bot` package. Without it, the scheduled run still executes — only the push is skipped, with one warning. Install the bot extra to turn delivery on.
+</Accordion>
+
+<Accordion title="Reuse one scheduler instance per job">
+The router's idempotency cache and rate limiters live on the scheduler's delivery helper. Keep a single scheduler running so repeated identical results to the same target are deduplicated instead of re-sent.
+</Accordion>
+
+<Accordion title="Pick the surface that matches how you deploy">
+Use Python inside an app, YAML for a config-file deploy, and the CLI for one-off terminal jobs — all three accept the same `deliver` token grammar.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Async Agent Scheduler" icon="clock" href="/docs/features/async-agent-scheduler">
+  Run agents on a recurring schedule with async execution
+</Card>
+<Card title="Pre-Run Gate" icon="filter" href="/docs/features/scheduler-pre-run-gate">
+  Skip ticks when a cheap check says nothing to do
+</Card>
+<Card title="Schedule CLI" icon="terminal" href="/docs/cli/schedule">
+  The `--deliver` / `-d` flag and other schedule commands
+</Card>
+<Card title="Gateway Inbound Hooks" icon="webhook" href="/docs/features/gateway-inbound-hooks">
+  Shares the same delivery target format
+</Card>
+</CardGroup>
