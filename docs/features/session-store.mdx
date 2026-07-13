@@ -103,7 +103,12 @@ store.add_message(session_id, "assistant", agent.start("Summarise our chat"))
 
 ## SqliteSessionStore
 
-`SqliteSessionStore` is a drop-in subclass of `DefaultSessionStore` that keeps JSON transcripts as the durable record but maintains a stdlib `sqlite3` + FTS5 index of message content. `search()` becomes a bounded `MATCH ... ORDER BY bm25` lookup rather than an `O(all sessions)` directory scan.
+`SqliteSessionStore` is a drop-in subclass of `DefaultSessionStore` that keeps JSON transcripts as the durable record and maintains a stdlib `sqlite3` index alongside them. It gives you two indexed hot paths instead of directory scans:
+
+- **Cross-session search** — FTS5 index of message content, used by `search()` (Issue #2927).
+- **Gateway/agent routing** — `session_route` index of `gateway_session_id` and `agent_id`, used by `get_by_gateway_session()` and `list_sessions_by_gateway_agent()` (Issue #2956).
+
+Both stay independent of the number of stored sessions, so a long-lived gateway bot with thousands of sessions still routes an inbound message in a single indexed lookup.
 
 ```python
 from praisonaiagents import Agent
@@ -111,6 +116,41 @@ from praisonaiagents.session import SqliteSessionStore
 
 store = SqliteSessionStore(db_path="~/.praisonai/sessions.db")
 agent = Agent(name="Gateway", session_store=store)
+```
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.session import SqliteSessionStore
+
+store = SqliteSessionStore(db_path="~/.praisonai/sessions.db")
+
+# Long-lived gateway bot: inbound message arrives tagged with a gateway_session_id.
+# Routing back to the right session is an indexed lookup, not a directory scan.
+agent = Agent(name="Gateway", session_store=store)
+agent.start("Handle inbound message", session_id="chat-42")
+
+# Later — resolve the local session for an inbound gateway event:
+session = store.get_by_gateway_session("gw-abc-123")
+recent = store.list_sessions_by_gateway_agent("agent-support", limit=20)
+```
+
+```mermaid
+graph LR
+    subgraph "SqliteSessionStore"
+        W[📝 Write] --> M[(session_meta<br/>+ session_fts)]
+        W --> R[(session_route)]
+        S[🔍 search] --> M
+        G[🌐 gateway lookup] --> R
+        A[🤖 agent lookup] --> R
+    end
+
+    classDef write fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef read fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class W write
+    class M,R store
+    class S,G,A read
 ```
 
 ### Constructor
@@ -125,11 +165,13 @@ agent = Agent(name="Gateway", session_store=store)
 
 | Aspect | Detail |
 |--------|--------|
-| Backend | Stdlib `sqlite3` (lazy-imported); FTS5 virtual table `session_fts(session_id UNINDEXED, content)` + `session_meta(session_id, updated_at)` |
-| Query | `SELECT session_id FROM session_fts WHERE session_fts MATCH ? ORDER BY bm25(session_fts) LIMIT ?` |
-| Fallback | If FTS5 is unavailable → plain `LIKE` table. If `sqlite3` fails entirely → parent `DefaultSessionStore.search` scan. |
-| Backfill | Legacy JSON transcripts are indexed once, on first `search()` (guarded by a one-time flag; only session ids not already in the index are (re)indexed). |
-| Write sync | `_save_session`, `add_message`, `_modify_session_locked` (covers `set_chat_history` and `append_compaction_checkpoint`), `clear_session`, and `delete_session` all keep the index in sync. |
+| Backend | Stdlib `sqlite3` (lazy-imported). Content index: FTS5 virtual table `session_fts(session_id UNINDEXED, content)` + `session_meta(session_id, updated_at)`. Routing index: `session_route(session_id PRIMARY KEY, gateway_session_id, agent_id)` with `idx_route_gateway` and `idx_route_agent`. |
+| Search query | `SELECT session_id FROM session_fts WHERE session_fts MATCH ? ORDER BY bm25(session_fts) LIMIT ?` |
+| Gateway lookup | `SELECT session_id FROM session_route WHERE gateway_session_id = ?` (overrides parent's O(N) directory scan) |
+| Agent lookup | `SELECT session_id FROM session_route WHERE agent_id = ? LIMIT ?` (overrides parent's O(N) directory scan) |
+| Fallback | If FTS5 is unavailable → plain `LIKE` table. If the routing query fails or `sqlite3` is unavailable → transparent fallback to `DefaultSessionStore.get_by_gateway_session` / `list_sessions_by_gateway_agent` scan. |
+| Backfill | Legacy JSON transcripts are indexed once, on first `search()` **or** first routing lookup. A session is treated as indexed only if it appears in **both** `session_meta` **and** `session_route`, so stores upgraded from a prior release re-populate route rows on first read. |
+| Write sync | `_save_session`, `add_message`, `_modify_session_locked` (covers `set_chat_history`, `set_gateway_info`, `append_compaction_checkpoint`), `clear_session`, and `delete_session` all keep both indexes in sync. Route rows are `INSERT OR REPLACE`d when either `gateway_session_id` or `agent_id` is set, and `DELETE`d when both are cleared. |
 | Query rewrite | Free text is tokenised on alphanumerics into an `OR` of quoted terms for a safe FTS5 `MATCH` expression. |
 | Candidate fan-out | Over-fetches `max(limit * 5, limit)` candidates so lineage dedup / automated demotion can still promote the right sessions into the final `limit`. |
 
@@ -137,9 +179,9 @@ agent = Agent(name="Gateway", session_store=store)
 
 | Environment | Behaviour |
 |-------------|-----------|
-| `sqlite3` + FTS5 present (default) | Bounded FTS5 `MATCH` lookup + bm25 ranking |
-| `sqlite3` present, FTS5 unavailable | Bounded `LIKE` lookup against a plain table |
-| `sqlite3` unavailable or index open fails | Transparent fallback to `DefaultSessionStore.search` full-directory scan |
+| `sqlite3` + FTS5 present (default) | Bounded FTS5 `MATCH` lookup for search, indexed `SELECT` on `session_route` for gateway/agent routing |
+| `sqlite3` present, FTS5 unavailable | Bounded `LIKE` lookup for search; routing index still active |
+| `sqlite3` unavailable or index open fails | Transparent fallback to `DefaultSessionStore.search` and `DefaultSessionStore.get_by_gateway_session` / `list_sessions_by_gateway_agent` full-directory scans |
 
 ### Sizing
 
