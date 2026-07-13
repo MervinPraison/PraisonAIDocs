@@ -1,27 +1,24 @@
 ---
 title: "Installer Internals"
 sidebarTitle: "Installer"
-description: "How the PraisonAI install.sh works — three isolation backends, shell completions, and PATH management"
+description: "How the PraisonAI install.sh works — uv/pipx detection, uv bootstrap, and PATH management"
 icon: "gear"
 ---
 
-The PraisonAI installer automatically picks the best isolation backend (`uv tool` → `pipx` → venv fallback) so you get a working `praisonai` CLI without touching your global Python environment.
+The PraisonAI installer picks a tool manager (`uv tool` → `pipx` → bootstrap `uv`) so you get a working `praisonai` CLI in an isolated environment without touching your global Python.
 
 ```mermaid
 flowchart TD
-    A[curl praison.ai/install.sh | bash]:::tool --> B{Detect Backend}:::agent
-    B -->|uv found| C[uv tool install praisonai\[all\]]:::tool
-    B -->|pipx found| D[pipx install praisonai\[all\]]:::tool
-    B -->|neither| E[Create venv at ~/.praisonai/venv]:::tool
-    E --> F[pip install praisonai\[all\]]:::tool
-    F --> G[Shim → ~/.local/bin/praisonai]:::process
-    C --> H[Ensure ~/.local/bin on PATH]:::process
-    D --> H
-    G --> H
-    H --> I[Verify install]:::agent
-    I --> J[Offer shell completions]:::process
-    J --> K[Interactive onboarding]:::process
-    K --> L[✅ Ready]:::success
+    A[curl install.sh | sh]:::tool --> B[Detect platform via uname]:::agent
+    B --> C{Have uv?}:::agent
+    C -->|Yes| U[uv tool install --force praisonai]:::tool
+    C -->|No| D{Have pipx?}:::agent
+    D -->|Yes| P[pipx install --force praisonai]:::tool
+    D -->|No| E[Bootstrap uv from astral.sh]:::process
+    E --> U
+    U --> H[Wire ~/.local/bin onto PATH]:::process
+    P --> H
+    H --> K[Print Get started panel]:::success
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
@@ -31,50 +28,51 @@ flowchart TD
 
 ## install.sh (macOS / Linux / WSL)
 
+Run it with:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/install.sh | sh
+```
+
 ### How It Works
 
 <Steps>
-  <Step title="Detect OS">
-    Identifies macOS, Linux distro, or WSL via `uname -s` and `/proc/version`.
+  <Step title="Detect platform">
+    Reads `uname -s` / `uname -m` to report the OS and architecture.
   </Step>
-  <Step title="Detect isolation backend">
-    Checks `PRAISONAI_BACKEND` / `--backend` first. In `auto` mode (default), prefers `uv tool` → `pipx` → venv fallback.
+  <Step title="Require curl">
+    Errors out immediately if `curl` is not available.
   </Step>
-  <Step title="Build package spec">
-    Defaults to `praisonai[all]` for a full install. Respects `PRAISONAI_EXTRAS` / `--extras` and `PRAISONAI_VERSION` / `--version`.
+  <Step title="Check PRAISONAI_INSTALLER override">
+    If set to `uv` or `pipx`, forces that manager. `pipx` errors if not installed; `uv` bootstraps itself when missing. Any other value errors.
+  </Step>
+  <Step title="Pick a tool manager">
+    In auto mode: use `uv tool` if `uv` is present → else `pipx` if present → else bootstrap `uv`.
+  </Step>
+  <Step title="Bootstrap uv (only if neither exists)">
+    Downloads `https://astral.sh/uv/install.sh` to a temp file first, so a failed or empty download fails loudly instead of a later `uv: command not found`. Runs it, then verifies `uv` is on PATH.
+  </Step>
+  <Step title="Install praisonai">
+    - **uv**: `uv tool install --force praisonai`
+    - **pipx**: `pipx install --force praisonai` + `pipx ensurepath`
 
-    <Note>
-    The installer always installs the full `praisonai` wrapper (which pulls `praisonai-code` and `praisonaiagents` as dependencies). To install the lighter standalone runtime without the wrapper, bypass the installer and run `pip install praisonai-code` directly. The installer does not currently support a package selector flag.
-    </Note>
+    Add `PRAISONAI_VERSION=x.y.z` to install `praisonai==x.y.z`.
   </Step>
-  <Step title="Install via chosen backend">
-    - **uv**: `uv tool install --force praisonai[all]` + `uv tool update-shell`
-    - **pipx**: `pipx install --force praisonai[all]` + `pipx ensurepath`
-    - **venv**: Python check → `python -m venv ~/.praisonai/venv` → `pip install praisonai[all]` → symlink `~/.local/bin/praisonai → ~/.praisonai/venv/bin/praisonai`
+  <Step title="Wire ~/.local/bin onto PATH">
+    Appends an idempotent block (grepped for the bin dir before writing) to the correct rc file(s):
+    - **zsh** → `~/.zshrc`
+    - **fish** → `~/.config/fish/config.fish` (`fish_add_path` when available, POSIX-safe fallback otherwise)
+    - **bash** → both `~/.bashrc` **and** the applicable login profile (`~/.bash_profile` → `~/.bash_login` → `~/.profile`, first that exists)
+    - anything else → `~/.profile`
   </Step>
-  <Step title="Ensure ~/.local/bin on PATH">
-    Adds `~/.local/bin` to the current shell session and appends an idempotent block to your shell rc (unless `--no-modify-path`):
-    ```
-    # >>> PraisonAI PATH >>>
-    export PATH="$HOME/.local/bin:$PATH"
-    # <<< PraisonAI PATH <<<
-    ```
-  </Step>
-  <Step title="Verify installation">
-    - **venv backend**: imports `praisonaiagents` via the venv python.
-    - **uv / pipx backends**: checks that the resolved `praisonai` CLI runs (isolated env, not system Python).
-  </Step>
-  <Step title="Offer shell completions">
-    Prompts once (TTY only, skipped under `--no-prompt` / `--no-onboard` / `--dry-run`) to install tab-completions for bash, zsh, or fish.
-  </Step>
-  <Step title="Interactive onboarding">
-    Runs `praisonai setup` for LLM API key configuration, then offers `praisonai onboard` for Telegram / Discord / Slack / WhatsApp bot setup.
-
-    <Tip>
-    Any one of the supported provider keys is enough — OpenAI is no longer required. PraisonAI auto-selects a model that matches whichever credential you set (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, `OLLAMA_HOST`, etc.).
-    </Tip>
+  <Step title="Print Get started panel">
+    Points at `praisonai setup`, `praisonai upgrade`, `praisonai upgrade --check`, and `praisonai uninstall`.
   </Step>
 </Steps>
+
+<Note>
+Bash gets **both** `~/.bashrc` **and** a login profile wired, so login shells find the binary too. Fish uses `fish_add_path` when available with a POSIX-safe fallback for older fish. A failed `uv` bootstrap surfaces a clear error rather than a later "uv: command not found".
+</Note>
 
 ---
 
@@ -84,59 +82,36 @@ flowchart TD
 sequenceDiagram
     participant U as User
     participant I as Installer
-    participant B as Backend (uv/pipx/venv)
+    participant M as Manager (uv/pipx)
     participant S as Shell rc
 
-    U->>I: curl praison.ai/install.sh | bash
-    I->>I: detect_backend() → uv / pipx / venv
-    I->>B: install praisonai[all]
-    B-->>I: binary at ~/.local/bin/praisonai
-    I->>S: append PraisonAI PATH block (idempotent)
-    I->>I: verify_installation()
-    I->>U: Install shell completions? [Y/n]
-    I->>U: praisonai setup (LLM key wizard)
-    I->>U: Set up messaging bot? [Y/n]
-    I-->>U: ✅ Done
+    U->>I: curl install.sh | sh
+    I->>I: detect platform, require curl
+    I->>M: uv tool / pipx install praisonai
+    M-->>I: binary at ~/.local/bin/praisonai
+    I->>S: append PATH block (idempotent)
+    I-->>U: "Get started: praisonai setup / upgrade / uninstall"
 ```
 
 ---
 
-## CLI Flags
+## Environment Variables (the only knobs)
+
+The installer has **no CLI flags**. Its only inputs are three environment variables.
+
+| Variable | Values | Behaviour |
+|----------|--------|-----------|
+| `PRAISONAI_VERSION` | `x.y.z` | Pin a specific version. Appended as `praisonai==VERSION` (default: latest from PyPI). |
+| `PRAISONAI_INSTALLER` | `uv` \| `pipx` | Force a tool manager. `pipx` errors if not installed; `uv` bootstraps itself if missing. Any other value errors. |
+| `PRAISONAI_NONINTERACTIVE` | any truthy | Non-interactive/CI mode (only changes an info message during `uv` bootstrap; the script never prompts). |
 
 ```bash
-curl -fsSL https://praison.ai/install.sh | bash -s -- --help
+# Pin a version
+PRAISONAI_VERSION=0.14.0 curl -fsSL https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/install.sh | sh
+
+# Force pipx
+PRAISONAI_INSTALLER=pipx curl -fsSL https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/install.sh | sh
 ```
-
-| Flag | Description |
-|------|-------------|
-| `--version VERSION` | Install specific version (default: `latest`) |
-| `--extras EXTRAS` | Install with extras, e.g. `ui,chat` (default: `all`) |
-| `--backend BACKEND` | Force isolation backend: `uv`, `pipx`, `venv`, `system`, or `auto` |
-| `--install-dir DIR` | Base dir for the venv fallback (default: `~/.praisonai`) |
-| `--no-modify-path` | Do not append a PATH block to your shell rc |
-| `--no-venv` | Skip isolation — install into the active Python environment |
-| `--no-onboard` | Skip interactive onboarding after install |
-| `--python PATH` | Use a specific Python executable |
-| `--dry-run` | Print what would happen without making any changes |
-| `--no-prompt` | Non-interactive mode — skip all prompts |
-| `-h, --help` | Show help |
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PRAISONAI_VERSION` | `latest` | Version to install |
-| `PRAISONAI_EXTRAS` | `""` | Comma-separated extras (defaults to `all`) |
-| `PRAISONAI_BACKEND` | `auto` | Force backend: `uv` / `pipx` / `venv` / `system` / `auto` |
-| `PRAISONAI_INSTALL_DIR` | `~/.praisonai` | Base dir for the venv fallback |
-| `PRAISONAI_NO_MODIFY_PATH` | `0` | Skip shell rc PATH modification (`1` to enable) |
-| `PRAISONAI_SKIP_VENV` | `0` | Skip isolation entirely (`1` to enable, same as `--no-venv`) |
-| `PRAISONAI_PYTHON` | auto-detect | Path to Python executable |
-| `PRAISONAI_DRY_RUN` | `0` | Preview mode (`1` to enable) |
-| `PRAISONAI_NO_PROMPT` | `0` | Skip all prompts (`1` to enable) |
-| `PRAISONAI_NO_ONBOARD` | `0` | Skip interactive onboarding (`1` to enable) |
 
 ---
 
@@ -157,42 +132,34 @@ pip install praisonai
 
 ---
 
-## Shell Completions
+## Manage Your Install
 
-The installer offers to install tab-completions after a successful install:
-
-```
-Install bash shell completions for praisonai? [Y/n]
-```
-
-The prompt is **auto-skipped** when any of the following apply: `--no-onboard`, `--no-prompt`, `--dry-run`, or no TTY is available (e.g. CI).
-
-Re-run anytime:
+After installation, the installer's "Get started" panel points at these self-management commands:
 
 ```bash
-praisonai completion bash    # append to ~/.bashrc
-praisonai completion zsh     # append to ~/.zshrc
-praisonai completion fish    # write ~/.config/fish/completions/praisonai.fish
+praisonai upgrade          # update in place
+praisonai upgrade --check  # is a newer version available?
+praisonai uninstall        # remove cleanly
 ```
 
-**Idempotency**: bash/zsh completions are only appended if `_praisonai_completion` or `#compdef praisonai` is not already present. Fish completions are overwritten.
+See [praisonai upgrade](/docs/features/praisonai-upgrade) and [praisonai uninstall](/docs/features/praisonai-uninstall).
 
 ---
 
-## Choosing a Backend
+## Choosing a Manager
 
 <Note>
-Not sure which backend to pick? The installer chooses the best one automatically. Read more in [Isolation Backends](/docs/install/isolation-backends).
+Not sure which manager to pick? The installer chooses automatically. Read more in [Isolation Backends](/docs/install/isolation-backends).
 </Note>
 
 ```mermaid
 graph TB
-    Start([Which backend?]):::agent
+    Start([Which manager?]):::agent
     Start --> Q1{Have uv?}
     Q1 -->|Yes| UV[uv tool — fastest,\nzero extra install]:::success
     Q1 -->|No| Q2{Have pipx?}
     Q2 -->|Yes| PIPX[pipx — well-known,\nbroad ecosystem]:::tool
-    Q2 -->|No| VENV[venv fallback —\nalways available]:::process
+    Q2 -->|No| BOOT[bootstrap uv —\nauto-installed]:::process
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
@@ -208,24 +175,25 @@ graph TB
   <Tab title="GitHub Actions">
     ```yaml
     - name: Install PraisonAI
-      run: curl -fsSL https://praison.ai/install.sh | bash -s -- --no-prompt
+      run: curl -fsSL https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/install.sh | sh
       env:
-        PRAISONAI_SKIP_VENV: "1"
+        PRAISONAI_NONINTERACTIVE: "1"
     ```
   </Tab>
   <Tab title="GitLab CI">
     ```yaml
     install:
       script:
-        - curl -fsSL https://praison.ai/install.sh | bash -s -- --no-prompt
+        - curl -fsSL https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/install.sh | sh
       variables:
-        PRAISONAI_SKIP_VENV: "1"
+        PRAISONAI_NONINTERACTIVE: "1"
     ```
   </Tab>
   <Tab title="Docker">
     ```dockerfile
     FROM python:3.12-slim
-    RUN curl -fsSL https://praison.ai/install.sh | bash -s -- --no-venv
+    RUN apt-get update && apt-get install -y curl \
+      && curl -fsSL https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/install.sh | sh
     ```
   </Tab>
 </Tabs>
@@ -234,34 +202,14 @@ graph TB
 
 ## Uninstall
 
-<Tabs>
-  <Tab title="uv">
-    ```bash
-    uv tool uninstall praisonai
-    ```
-  </Tab>
-  <Tab title="pipx">
-    ```bash
-    pipx uninstall praisonai
-    ```
-  </Tab>
-  <Tab title="venv">
-    ```bash
-    # Remove venv and shim
-    rm -rf ~/.praisonai
-    rm -f ~/.local/bin/praisonai
+Use the built-in self-management command, which removes the managed install via the detected manager:
 
-    # Remove the PATH block from your shell rc
-    # Edit ~/.zshrc or ~/.bashrc and remove the lines between:
-    # # >>> PraisonAI PATH >>> ... # <<< PraisonAI PATH <<<
-    ```
-  </Tab>
-  <Tab title="pip only">
-    ```bash
-    pip uninstall praisonaiagents praisonai
-    ```
-  </Tab>
-</Tabs>
+```bash
+praisonai uninstall        # confirms first
+praisonai uninstall --yes  # CI-safe, no prompt
+```
+
+See the [praisonai uninstall](/docs/features/praisonai-uninstall) page for details and JSON output.
 
 ---
 
@@ -280,115 +228,32 @@ graph TB
     ```
   </Accordion>
 
-  <Accordion title="Force a specific backend">
+  <Accordion title="Force a specific manager">
     ```bash
-    # Via flag
-    curl -fsSL https://praison.ai/install.sh | bash -s -- --backend pipx
-
-    # Via env var
-    PRAISONAI_BACKEND=pipx curl -fsSL https://praison.ai/install.sh | bash
+    PRAISONAI_INSTALLER=pipx curl -fsSL https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/install.sh | sh
     ```
-  </Accordion>
-
-  <Accordion title="Don't want PATH modified">
-    ```bash
-    curl -fsSL https://praison.ai/install.sh | bash -s -- --no-modify-path
-    # or
-    PRAISONAI_NO_MODIFY_PATH=1 curl -fsSL https://praison.ai/install.sh | bash
-    ```
-    Then add `~/.local/bin` to PATH manually in your shell rc.
   </Accordion>
 
   <Accordion title="I have both uv and pipx — which runs?">
-    The installer picks `uv` first in `auto` mode. Override with `--backend pipx` or `PRAISONAI_BACKEND=pipx`.
+    The installer picks `uv` first. Override with `PRAISONAI_INSTALLER=pipx`.
   </Accordion>
 
-  <Accordion title="Python version too old">
-    The installer requires Python 3.10+. If auto-install fails:
+  <Accordion title="uv bootstrap failed (network/DNS)">
+    The installer downloads `astral.sh/uv/install.sh` to a temp file and fails loudly if the download is empty or the network is unreachable. Install `uv` or `pipx` manually, then re-run:
     ```bash
-    # macOS
-    brew install python@3.12
-
-    # Ubuntu/Debian
-    sudo apt install python3.12
-
-    # Then re-run installer
-    curl -fsSL https://praison.ai/install.sh | bash
-    ```
-  </Accordion>
-
-  <Accordion title="Permission denied on Linux">
-    ```bash
-    # Install into active env without root
-    curl -fsSL https://praison.ai/install.sh | bash -s -- --no-venv
-    # or
-    pip install --user praisonai
+    # https://docs.astral.sh/uv/getting-started/installation/
+    curl -fsSL https://raw.githubusercontent.com/MervinPraison/PraisonAI/main/install.sh | sh
     ```
   </Accordion>
 </AccordionGroup>
 
 ---
 
-## install.ps1 (Windows)
-
-### What It Does
-
-<Steps>
-  <Step title="Detect Package Manager">
-    Checks for winget, Chocolatey, or Scoop.
-  </Step>
-  <Step title="Check Python">
-    Looks for Python 3.10+ using the `py` launcher.
-  </Step>
-  <Step title="Install Python (if needed)">
-    - **winget**: `winget install Python.Python.3.12`
-    - **Chocolatey**: `choco install python`
-    - **Scoop**: `scoop install python`
-  </Step>
-  <Step title="Create Virtual Environment">
-    Creates at `%USERPROFILE%\.praisonai\venv`.
-  </Step>
-  <Step title="Install PraisonAI">
-    Runs `pip install praisonai[all]`.
-  </Step>
-  <Step title="Configure PATH">
-    Adds venv Scripts folder to user PATH.
-  </Step>
-</Steps>
-
-### PowerShell Parameters
-
-```powershell
-& ([scriptblock]::Create((iwr -useb https://praison.ai/install.ps1))) -Help
-```
-
-| Parameter | Description |
-|-----------|-------------|
-| `-Version` | Install specific version |
-| `-Extras` | Install with extras |
-| `-NoVenv` | Skip virtual environment |
-| `-Python` | Use specific Python |
-| `-DryRun` | Preview without changes |
-| `-Help` | Show help |
-
----
-
-## Post-Install Flow
-
-After installation and verification, the installer runs an interactive onboarding sequence:
-
-1. **Shell completions** — offered once, idempotent
-2. **Setup wizard** (`praisonai setup`) — configure LLM API keys
-3. **Bot onboarding** (`praisonai onboard`) — set up Telegram / Discord / Slack / WhatsApp (default: Yes). See the [onboard guide](/docs/features/onboard).
-4. **Final summary** — the onboard wizard's ✅ Done panel, or the installer's Next Steps block if onboarding was skipped.
+## Windows
 
 <Note>
-If you skip the setup wizard (`--no-prompt`), the next `praisonai` invocation will detect missing credentials and offer to launch the wizard — or exit with a clear error in CI.
+There is **no `install.ps1`** shipped yet. On Windows, install with `pipx install praisonai` or `pip install praisonai` (or use the one-liner inside WSL).
 </Note>
-
-<Tip>
-If you have not configured an LLM provider yet, run `praisonai setup` first, or follow the on-screen guidance from `--init`. Running `praisonai --init "task"` without a provider key now prints step-by-step setup instructions instead of crashing.
-</Tip>
 
 ---
 
@@ -399,12 +264,12 @@ If you have not configured an LLM provider yet, run `praisonai setup` first, or 
     One-liner install with options
   </Card>
   <Card title="Isolation Backends" icon="box" href="/docs/install/isolation-backends">
-    Choose between uv, pipx, and venv
+    Choose between uv and pipx
   </Card>
-  <Card title="Onboarding" icon="rocket" href="/docs/features/onboard">
-    Bot setup wizard
+  <Card title="Upgrade" icon="arrow-up" href="/docs/features/praisonai-upgrade">
+    Update the CLI in place
   </Card>
-  <Card title="Scripts Reference" icon="terminal" href="/docs/developers/scripts">
-    All developer scripts
+  <Card title="Uninstall" icon="trash" href="/docs/features/praisonai-uninstall">
+    Remove the managed install
   </Card>
 </CardGroup>
