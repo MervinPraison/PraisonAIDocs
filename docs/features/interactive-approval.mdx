@@ -25,8 +25,8 @@ graph LR
     A[Agent] --> B[Tool call]
     B --> C{Needs approval?}
     C -->|Yes| D[Terminal prompt]
-    D --> E[Allow / Deny]
-    E -->|Always| F[Persist rule]
+    D --> E[once / session / always / no]
+    E -->|always| F[Persist rule]
     C -->|No| G[Execute]
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -74,18 +74,21 @@ Tool: bash(command='git status -s')
 Risk: medium
 Agent: Coder
 
-Options:
-  [a] Allow once
-  [A] Always allow this command (bash:git status *)
-  [T] Always allow ALL uses of bash (bash:*)
-  [d] Deny
-  [D] Always deny (persist rule)
-
-Your choice:
+Allow execute_command?  [o] once   [s] this session   [a] always (bash:git status *)   [n] no
+Choice [n]:
 ```
 
+The four choices:
+
+| Key | Scope | What happens |
+|-----|-------|--------------|
+| `o` | Once | Approve **this call only**. |
+| `s` | This session | Auto-approve every matching call for the rest of the run. **Never written to disk** — vanishes when the process exits. |
+| `a` | Always | Persist an allow-rule to `approvals.json`. The suggested pattern in parentheses is the exact rule saved (e.g. `bash:git status *` — every `git status …` variant, but not `git push`). |
+| `n` | No (default when you hit Enter) | Deny **this call only**. |
+
 <Note>
-`[A]` persists the **narrowest reasonable** pattern (command-prefix for shell tools, first-arg literal for others). Only the explicit `[T]` choice grants blanket `bash:*`.
+`always` is the *only* choice that writes to disk. `session` grants are in-memory-only by design — the prompt says "this session," so persisting them would silently outlive the run.
 </Note>
 
 </Step>
@@ -111,25 +114,26 @@ sequenceDiagram
     A->>T: tool call
     A->>B: request_approval
     B->>PM: check rules
-    alt Existing rule
+    alt Existing rule (always or session)
         PM-->>B: allow / deny
     else Prompt
-        B->>U: [a] / [A] / [T] / [d] / [D]
-        U-->>B: decision
-        opt Persist [A] or [T]
-            B->>PM: save narrow or blanket rule
+        B->>U: [o] once  [s] session  [a] always  [n] no
+        U-->>B: choice
+        opt Persist [a] always
+            B->>PM: approve(target, scope="always", reusable_scope=True)
+            PM->>PM: write approvals.json
         end
-        opt Denial reason
-            U-->>B: optional feedback
+        opt In-memory [s] session
+            B->>B: _session_scoped_targets.add(...)
         end
     end
-    B-->>A: ApprovalDecision (+ metadata.feedback on deny)
-    A->>T: execute · skip · re-plan
+    B-->>A: ApprovalDecision(approved, scope, scope_pattern)
+    A->>T: execute · skip
 ```
 
 ## Change Preview
 
-Before you press `[A]` on a file-mutating tool, PraisonAI prints a preview so you approve the actual change — not just the tool name.
+Before you press `[a]` on a file-mutating tool, PraisonAI prints a preview so you approve the actual change — not just the tool name.
 
 For `edit` / `apply_patch` (unified diff supplied by the caller):
 
@@ -173,30 +177,6 @@ graph LR
     class F ok
 ```
 
-## Denial Steering
-
-Pressing `[d]` or `[D]` opens a follow-up prompt for an optional reason, which is passed back to the agent as feedback so it can correct course instead of aborting.
-
-```
-Your choice: d
-Reason for denial (optional, steers the agent): use `git diff --stat` instead — this diff is too noisy
-```
-
-Empty input skips feedback. Non-interactive shells (CI, `PRAISONAI_NON_INTERACTIVE=1`) skip the prompt entirely — the run stays fail-closed and denials carry no feedback.
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant B as ApprovalBackend
-    participant A as Agent
-
-    U->>B: [d]
-    B->>U: Reason for denial?
-    U->>B: use git diff --stat instead
-    B->>A: metadata.feedback = reason
-    A->>A: re-plan with correction
-```
-
 ## Approval modes
 
 ```mermaid
@@ -229,14 +209,18 @@ The CLI uses `--approval bypass` but the enum value is `bypass_permissions`.
 
 ## Persistence
 
-Press `[A]`, `[T]`, or `[D]` to write a `PermissionRule` to `.praisonai/permissions/rules.json` (priority `100`, scoped to the project directory). The two allow choices persist different scopes:
+Only `[a] always` writes to disk. It calls `PermissionManager.approve(..., scope="always", reusable_scope=True)` under the hood, so the persisted pattern uses the same command-prefix / path derivation as the CLI and YAML rules — approving one variant of `git status` covers every trailing-arg variant, but never spills into other subcommands.
 
-| Choice | Scope | Persisted pattern example |
-|--------|-------|---------------------------|
-| `[A] Always allow this command` | Narrow command-prefix | `bash:git status *`, `edit:utils.py`, `write:.env` |
-| `[T] Always allow ALL uses of <tool>` | Blanket | `bash:*`, `edit:*`, `write:*` |
+| Choice | Scope | Persisted? | Example rule saved |
+|--------|-------|------------|--------------------|
+| `[o] once` | This call only | No | — |
+| `[s] this session` | Rest of this run | No (in-memory) | — |
+| `[a] always` | All future runs | Yes → `approvals.json` | `bash:git status *`, `edit:src/app.py` |
+| `[n] no` | This call only | No | — |
 
-`[A]` uses the shared `derive_pattern` helper so the CLI, YAML `--allow`/`--deny`, and Python `PermissionManager` all scope identically. Compound commands (`&&`, `|`, `;`, `$(...)`) fall back to a **literal single-use** pattern so a persisted rule can only match the exact invocation you approved.
+Session grants live in an in-memory `_session_scoped_targets` set and are cleared by `clear_approved()` at run teardown. Always grants persist across restarts and survive `clear_approved()`.
+
+Compound commands (`&&`, `|`, `;`, `$(...)`) fall back to a **literal single-use** pattern so a persisted rule can only match the exact invocation you approved.
 
 <Tip>
 Tune the derived pattern with [Reusable Approval Scopes](/docs/features/reusable-approval-scopes) — call `PermissionManager.suggest_scope_pattern(target)` for a custom UI, or hand-author `bash:git *` via `praisonai permissions allow`.
@@ -287,16 +271,16 @@ Tools marked `external` always prompt — verify third-party integrations before
 Team-wide allow/deny patterns belong in version control.
 </Accordion>
 
-<Accordion title="[A] is safe by default — only [T] grants blanket access">
-`[A]` scopes to the specific command-prefix (shell tools) or first-arg literal (other tools), while `[T]` is the only path to `<tool>:*` — use `[A]` for daily work and reserve `[T]` for tools you already trust project-wide.
+<Accordion title="[a] always narrows automatically — no blanket-tool option any more">
+The suggested pattern shown in parentheses (`always (bash:git status *)`) is the exact rule that will be saved — it covers every `git status …` variant but never expands to `git push` or other subcommands. There is no longer a blanket "allow ALL uses of `bash`" keystroke in the interactive prompt — grant blanket access explicitly via `praisonai permissions allow "bash:*"` when you actually want it.
 </Accordion>
 
-<Accordion title="Skim the change preview before pressing [A]">
+<Accordion title="Prefer [s] this session over [a] always for one-off runs">
+`[s]` covers matching calls for the rest of the run without touching disk — ideal when you only need to unblock the current task. Reserve `[a] always` for commands you trust across every future run.
+</Accordion>
+
+<Accordion title="Skim the change preview before pressing [a]">
 The preview is your last chance to catch an unintended edit. It renders for `edit`, `write`, and `apply_patch` so you approve the actual change, not just the tool name.
-</Accordion>
-
-<Accordion title="Give a denial reason instead of pressing Ctrl-C">
-A reason turns a rejection into a correction — the agent can re-plan rather than abort the whole run.
 </Accordion>
 
 </AccordionGroup>
