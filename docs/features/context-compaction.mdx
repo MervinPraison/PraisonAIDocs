@@ -735,6 +735,154 @@ agent = Agent(
 
 ---
 
+## In-Loop Compaction (Two-Tier)
+
+<a id="in-loop-compaction" />
+
+In-loop compaction runs **between tool iterations** inside a single turn, so tool results never accumulate unbounded and blow past the context window mid-run.
+
+```python
+from praisonaiagents import Agent
+
+# In-loop two-tier compaction is ON by default — nothing to configure
+agent = Agent(
+    name="LongRunner",
+    instructions="You do multi-step research with lots of tool calls.",
+)
+
+agent.start("Research 20 vendors, compare pricing, and summarise trade-offs.")
+```
+
+The tool loop iterates up to `max_iter` times; the hook fires each iteration and does nothing while the conversation stays below threshold. Above threshold it applies up to two tiers in order.
+
+```mermaid
+graph TB
+    Iter[🔁 Tool-loop iteration] --> Count[🧮 Count tokens accurately]
+    Count --> Q1{Above 50% of window?}
+    Q1 -->|No| Pass[⚡ No-op — pass through]
+    Q1 -->|Yes| Clear[🧹 Tier 1: Clear old tool results<br/>keep last 6 verbatim]
+    Clear --> Q2{Still above 80%?}
+    Q2 -->|No| Continue[✅ Continue loop]
+    Q2 -->|Yes| Summarise[📝 Tier 2: LLM summarise dialogue<br/>anti-injection framing]
+    Summarise --> Continue
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    class Iter,Count input
+    class Q1,Q2 decision
+    class Clear,Summarise process
+    class Pass,Continue output
+```
+
+### The Two Tiers
+
+| Tier | Trigger | Action | What it preserves |
+|------|---------|--------|-------------------|
+| **Tier 1 — Clear** | Tokens ≥ `clear_threshold_pct` × window (default **50%**) | Replace old `role: "tool"` message contents with a short placeholder | Assistant `tool_calls` stay intact, so the model still sees which tool was called with which args; the most recent `keep_recent_tool_results` (default `6`) tool results stay verbatim |
+| **Tier 2 — Summarise** | After tier 1, tokens still ≥ `compact_threshold_pct` × window (default **80%**) | Run the structured LLM summariser (`CompactionStrategy.SUMMARIZE`) with anti-injection framing | System messages + last `preserve_recent` messages stay verbatim |
+
+Cleared tool results are replaced with this exact placeholder:
+
+```
+[tool result cleared to save context; re-fetch if needed]
+```
+
+### Custom Thresholds
+
+The in-loop knobs are passed via `llm=` extra settings on the Agent.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="LongRunner",
+    instructions="...",
+    llm={
+        "model": "gpt-4o",
+        # Two-tier in-loop compaction knobs
+        "in_loop_compaction": True,      # default True
+        "clear_threshold_pct": 0.5,      # default 0.5 — clear at 50% of window
+        "compact_threshold_pct": 0.8,    # default 0.8 — summarise at 80% of window
+        "keep_recent_tool_results": 6,   # default 6 — preserve most-recent N tool results
+    },
+)
+```
+
+### Disable (Restore Prior Behaviour)
+
+```python
+agent = Agent(name="…", instructions="…", llm={"in_loop_compaction": False})
+```
+
+With `in_loop_compaction=False`, compaction runs only once before the turn — the pre-#2995 behaviour.
+
+<Tip>
+`in_loop_compaction`, `clear_threshold_pct`, `compact_threshold_pct`, and `keep_recent_tool_results` are stripped from LiteLLM completion params before dispatch. Set them alongside real provider params without leaking local knobs downstream.
+</Tip>
+
+<Note>
+When the active model changes mid-run (auth failover, model failover), the cached loop compactor is rebuilt automatically so the token budget and tokeniser stay aligned with the new provider's window. Nothing to configure.
+</Note>
+
+### New CompactionConfig Fields
+
+These extend the reactive `CompactionConfig` — same class, new fields.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `model` | `Optional[str]` | `None` | Model name used to pick the correct tiktoken encoding for accurate token counts. When unset, falls back to `gpt-4` encoding when tiktoken is locally available, otherwise the `len//4` heuristic. |
+| `in_loop_compaction` | `bool` | `True` | Enable the two-tier clear-then-compact pass between tool iterations. `False` restores pre-#2995 behaviour. |
+| `clear_threshold_pct` | `float` | `0.5` | Fraction of the model context window at which tier 1 (clear old tool results) fires. |
+| `compact_threshold_pct` | `float` | `0.8` | Fraction of the window at which tier 2 (LLM summarise) fires, after tier 1 has run. |
+| `keep_recent_tool_results` | `int` | `6` | Number of most-recent `role: "tool"` messages preserved verbatim during a tier-1 clear pass. |
+
+### Accurate Token Counting
+
+Every threshold decision above uses `estimate_tokens()`, which now uses tiktoken when it is available offline, otherwise the character heuristic.
+
+- Tiktoken downloads its BPE vocab from the network on first use.
+- To stay offline-safe (CI, air-gapped hosts), the accurate path is probed once in a short-lived, timeout-bounded daemon thread. If the tokeniser is not locally cached, the code permanently falls back to the `len//4` heuristic — never blocks.
+- `count_message_tokens()` now includes the `tool_calls` payload (function name + arguments), which the old heuristic silently dropped.
+- For guaranteed-accurate counts, `pip install tiktoken` and run once with the model set on `CompactionConfig(model=...)` to warm the cache.
+
+### clear_tool_results() API
+
+```python
+compactor.clear_tool_results(
+    messages,
+    *,
+    keep_recent: int = 6,
+    placeholder: str = "[tool result cleared to save context; re-fetch if needed]",
+) -> list[dict]
+```
+
+- Only mutates entries with `role == "tool"`.
+- Rewrites their `content` string to `placeholder`, leaving all other fields intact.
+- Assistant `tool_calls` messages are never touched, so the model still sees the call structure (name, args, id) needed for coherent tool loops.
+- Preserves the last `keep_recent` tool results.
+
+### When To Tune
+
+```mermaid
+graph TB
+    Start[When should I change thresholds?]
+    Start --> Q1{Tool loops hit context limit?}
+    Q1 -->|Yes, often| Lower[Lower clear_threshold_pct to 0.4<br/>or raise keep_recent_tool_results]
+    Q1 -->|No, but summariser is chatty| Raise[Raise compact_threshold_pct to 0.9<br/>defer summarisation]
+    Q1 -->|Never hits| Default[Leave defaults — no-op below threshold]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    class Start input
+    class Q1 decision
+    class Lower,Raise,Default output
+```
+
+---
+
 ## Configuration Options
 
 ### Strategies Available
@@ -1124,5 +1272,8 @@ from praisonaiagents.compaction import ContextCompactor
 </Card>
 <Card title="Agent Configuration" icon="settings" href="/docs/features/agent-profiles">
   Complete agent configuration options
+</Card>
+<Card title="Context Budgeter" icon="gauge" href="/features/context-budgeter">
+  Model context-window limits that drive in-loop thresholds
 </Card>
 </CardGroup>
