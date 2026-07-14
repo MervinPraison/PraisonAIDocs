@@ -65,6 +65,28 @@ class ChatMixin:
             return int(getattr(execution, "max_tool_calls_per_turn", default))
         return default
 
+    def _resolve_harness_base_prompt(self):
+        """Resolve the model-family harness base-prompt fragment, if any.
+
+        Honours an explicit ``harness_base_prompt`` override on the agent when
+        set; otherwise resolves lazily from the active model id. Returns an
+        empty string when no fragment applies (behaviour-preserving default).
+        Never raises: any resolution error collapses to no fragment.
+        """
+        override = getattr(self, "harness_base_prompt", None)
+        if override is not None:
+            return override
+        try:
+            from ..model_harness import resolve_harness
+            # self.llm may be a string model id or an LLM object; resolve the
+            # string form only (unknown/object models keep the default profile).
+            model = getattr(self, "llm", None)
+            model_id = model if isinstance(model, str) else None
+            profile = resolve_harness(model_id)
+            return profile.base_prompt or ""
+        except Exception:
+            return ""
+
     def _build_system_prompt(self, tools=None):
         """Build the system prompt with tool information.
         
@@ -91,6 +113,13 @@ class ChatMixin:
         system_prompt = f"""{self.backstory}\n
 Your Role: {self.role}\n
 Your Goal: {self.goal}"""
+
+        # Prepend the model-family harness base prompt when one applies.
+        # Resolution is lazy and falls back to a behaviour-preserving default
+        # (no fragment) for unknown models, so output is unchanged by default.
+        harness_prompt = self._resolve_harness_base_prompt()
+        if harness_prompt:
+            system_prompt = f"{harness_prompt}\n\n{system_prompt}"
         
         # Add rules context when rules are enabled (default). Discovery is
         # lazy and gated: accessing self.rules_manager triggers a cheap
@@ -114,11 +143,12 @@ Your Goal: {self.goal}"""
                         include_cache_boundary=True
                     )
                     memory_context = cache_result.get('stable_prefix', '')
-                    cache_boundary = cache_result.get('cache_boundary', '')
                     if memory_context:
                         system_prompt += f"\n\n## Memory (Information you remember about the user)\n{memory_context}"
-                        if cache_boundary:
-                            system_prompt += cache_boundary
+                        # Note: the cache boundary marker is intentionally NOT
+                        # appended to the prompt text. No provider currently
+                        # consumes it as structured cache metadata, so injecting
+                        # the raw sentinel would only pollute the system prompt.
                         # Display memory info to user if verbose
                         if self.verbose:
                             self._display_memory_info()
@@ -2573,6 +2603,11 @@ Your Goal: {self.goal}"""
                     if cancel_token is not None:
                         llm_kwargs['cancel_token'] = cancel_token
 
+                    # G2 - thread steering drain so pending steering messages are
+                    # injected between tool iterations of an in-flight run
+                    if hasattr(self, '_drain_steering_messages') and getattr(self, '_message_steering', None) is not None:
+                        llm_kwargs['steering_drain'] = self._drain_steering_messages
+
                     response_text = self.llm_instance.get_response(**llm_kwargs)
 
                     self._add_to_chat_history("assistant", response_text)
@@ -3067,6 +3102,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # mid-flight runs between tool iterations on every provider
                     if _cancel is not None:
                         llm_kwargs['cancel_token'] = _cancel
+
+                    # G2 - thread steering drain so pending steering messages are
+                    # injected between tool iterations of an in-flight run
+                    if hasattr(self, '_drain_steering_messages') and getattr(self, '_message_steering', None) is not None:
+                        llm_kwargs['steering_drain'] = self._drain_steering_messages
 
                     response_text = await self.llm_instance.get_response_async(**llm_kwargs)
 

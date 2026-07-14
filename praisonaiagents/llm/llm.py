@@ -1,6 +1,7 @@
 import logging
 from praisonaiagents._logging import get_logger
 import os
+import copy
 import warnings
 import re
 import inspect
@@ -452,6 +453,11 @@ Respond with ONLY a valid JSON tool call in this format:
         self._force_tool_usage_explicit = 'force_tool_usage' in extra_settings
         self.max_tool_repairs = extra_settings.get('max_tool_repairs', 0)  # Will be set to 2 for Ollama if not explicit
         self.force_tool_usage = extra_settings.get('force_tool_usage', 'never')  # Will be set to 'auto' for Ollama if not explicit
+        # Optional per-tool timeout (ms). When set, a hung tool is abandoned and
+        # surfaced as a typed timeout result instead of blocking the turn.
+        # Opt-in via extra_settings (no new required param); defaults to None
+        # for zero regression.
+        self.tool_timeout_ms = extra_settings.get('tool_timeout_ms', None)
         
         # Initialize provider adapter for dispatch logic
         self._provider_adapter = self._initialize_provider_adapter()
@@ -1974,6 +1980,100 @@ Now provide your final answer using this result. Summarize the information natur
         # Fallback to conservative default if adapter not initialized
         return False
     
+    def _explicit_cache_breakpoints(self) -> bool:
+        """Whether this provider needs explicit ``cache_control`` breakpoints.
+
+        Anthropic requires manual ``cache_control`` markers on the request
+        prefix. OpenAI/Gemini use automatic prefix caching, so no explicit
+        markers are emitted (keeping the prefix byte-stable is enough).
+        """
+        return bool(
+            self.prompt_caching
+            and self._supports_prompt_caching()
+            and self._is_anthropic_model()
+        )
+
+    @staticmethod
+    def _make_cached_system_message(system_prompt: str) -> dict:
+        """Build a system message carrying an ephemeral cache breakpoint."""
+        return {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+
+    @staticmethod
+    def _mark_message_cache_control(message: dict) -> bool:
+        """Attach an ephemeral ``cache_control`` marker to a chat message.
+
+        Converts string content into Anthropic's content-array form. Returns
+        ``True`` if a marker was applied, ``False`` if the message shape is
+        unsupported (already marked or non-text content).
+        """
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = [
+                {
+                    "type": "text",
+                    "text": content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+            return True
+        if isinstance(content, list):
+            for block in reversed(content):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    if "cache_control" in block:
+                        # Already marked: no new breakpoint was applied.
+                        return False
+                    block["cache_control"] = {"type": "ephemeral"}
+                    return True
+        return False
+
+    @staticmethod
+    def _count_cache_markers(messages: list) -> int:
+        """Count existing ``cache_control`` markers across message content."""
+        count = 0
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "cache_control" in block:
+                        count += 1
+        return count
+
+    def _mark_history_prefix(self, messages: list, history_start: int, preserve_recent: int = 2) -> None:
+        """Mark the end of the stable history prefix with a cache breakpoint.
+
+        Leaves the most recent ``preserve_recent`` messages (the volatile tail)
+        uncached and places a single breakpoint on the last stable message.
+        Respects the provider 4-breakpoint budget by counting markers already
+        present (e.g. the system block, or markers in caller-supplied history)
+        before adding a new one. To avoid mutating caller-owned history dicts,
+        the boundary message is replaced with a shallow copy before marking.
+        """
+        history_len = len(messages) - history_start
+        if history_len <= preserve_recent:
+            return
+        boundary_index = len(messages) - preserve_recent - 1
+        if boundary_index <= history_start - 1:
+            return
+        # Respect the provider 4-breakpoint budget, accounting for any markers
+        # already present in the system block or caller-supplied history.
+        if self._count_cache_markers(messages) >= 4:
+            return
+        # Copy the boundary message so marking does not mutate the caller's
+        # history, which may be reused for OpenAI/Gemini (which reject
+        # Anthropic cache metadata).
+        boundary = copy.deepcopy(messages[boundary_index])
+        if self._mark_message_cache_control(boundary):
+            messages[boundary_index] = boundary
+
     def _build_messages(self, prompt, system_prompt=None, chat_history=None, output_json=None, output_pydantic=None, tools=None):
         """Build messages list for LLM completion. Works for both sync and async.
         
@@ -2015,24 +2115,21 @@ Now provide your final answer using this result. Summarize the information natur
             # Skip system messages for legacy o1 models as they don't support them
             if not self._needs_system_message_skip():
                 # Apply prompt caching for Anthropic models if enabled
-                if self.prompt_caching and self._supports_prompt_caching() and self._is_anthropic_model():
+                if self._explicit_cache_breakpoints():
                     # Anthropic requires cache_control in content array format
-                    messages.append({
-                        "role": "system",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": system_prompt,
-                                "cache_control": {"type": "ephemeral"}
-                            }
-                        ]
-                    })
+                    messages.append(self._make_cached_system_message(system_prompt))
                 else:
                     messages.append({"role": "system", "content": system_prompt})
         
         # Add chat history if provided
         if chat_history:
+            history_start = len(messages)
             messages.extend(chat_history)
+            # Place a cache breakpoint at the end of the stable history prefix
+            # (all but the most recent messages), keeping the request prefix
+            # byte-stable across turns so cached reads are reused.
+            if self._explicit_cache_breakpoints():
+                self._mark_history_prefix(messages, history_start)
         
         # Handle prompt modifications for JSON output
         original_prompt = prompt
@@ -2218,12 +2315,25 @@ Now provide your final answer using this result. Summarize the information natur
         # G2: Cooperative cancellation - honour InterruptController between tool iterations
         # so /stop (and cancellation generally) halts mid-flight runs on every provider.
         cancel_token = kwargs.pop("cancel_token", None)
+        # Mid-run steering: optional callable() -> list[str] draining pending
+        # steering notes so they can be injected as user messages between iterations.
+        steering_drain = kwargs.pop("steering_drain", None)
 
         def _is_cancelled() -> bool:
             return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
 
         def _cancel_reason() -> str:
             return getattr(cancel_token, "reason", None) or "user"
+
+        def _inject_steering(msgs) -> None:
+            if steering_drain is None:
+                return
+            try:
+                for note in (steering_drain() or []):
+                    if note:
+                        msgs.append({"role": "user", "content": f"[steering] {note}"})
+            except Exception as _steer_err:
+                logging.debug(f"Steering drain failed (ignored): {_steer_err}")
 
         # Variable to store final response for token usage extraction
         _final_llm_response = None
@@ -2358,6 +2468,9 @@ Now provide your final answer using this result. Summarize the information natur
                     reason = _cancel_reason()
                     logging.debug(f"LLM tool loop cancelled: {reason}")
                     return _prepare_return_value(f"Task interrupted: {reason}")
+                # G2: Mid-run steering - drain any pending steering notes and inject
+                # them as user messages so the model sees them on its next step.
+                _inject_steering(messages)
                 try:
                     # Get response from LiteLLM
                     current_time = time.time()
@@ -2465,6 +2578,12 @@ Now provide your final answer using this result. Summarize the information natur
 
                         # ── Handle tool calls ───────────────────────────────
                         if tool_calls and execute_tool_fn:
+                            # G2: Second cancel check immediately before dispatching
+                            # tools so a /stop mid-iteration skips running them.
+                            if _is_cancelled():
+                                reason = _cancel_reason()
+                                logging.debug(f"LLM tool loop cancelled before tool dispatch: {reason}")
+                                return _prepare_return_value(f"Task interrupted: {reason}")
                             serializable_tool_calls = self._serialize_tool_calls(tool_calls)
                             messages.append({
                                 "role": "assistant",
@@ -2489,8 +2608,11 @@ Now provide your final answer using this result. Summarize the information natur
                             # Create appropriate executor based on parallel_tool_calls setting
                             executor = create_tool_call_executor(parallel=parallel_tool_calls)
                             
-                            # Execute batch
-                            tool_results_batch = executor.execute_batch(tool_calls_batch, execute_tool_fn)
+                            # Execute batch (forward optional per-tool timeout)
+                            tool_results_batch = executor.execute_batch(
+                                tool_calls_batch, execute_tool_fn,
+                                timeout_ms=self.tool_timeout_ms,
+                            )
                             
                             tool_results = []
                             for tool_call_obj, tool_result_obj in zip(tool_calls_batch, tool_results_batch):
@@ -3194,6 +3316,12 @@ Now provide your final answer using this result. Summarize the information natur
 
                     # Handle tool calls - Sequential tool calling logic
                     if tool_calls and execute_tool_fn:
+                        # G2: Second cancel check immediately before dispatching
+                        # tools so a /stop mid-iteration skips running them.
+                        if _is_cancelled():
+                            reason = _cancel_reason()
+                            logging.debug(f"LLM tool loop cancelled before tool dispatch: {reason}")
+                            return _prepare_return_value(f"Task interrupted: {reason}")
                         # Convert tool_calls to a serializable format for all providers
                         serializable_tool_calls = self._serialize_tool_calls(tool_calls)
                         # Check if this is Ollama provider
@@ -3965,7 +4093,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         executor = create_tool_call_executor(parallel=parallel_tool_calls)
                         
                         # Execute batch and add results to conversation
-                        tool_results = executor.execute_batch(tool_calls_batch, execute_tool_fn)
+                        # (forward optional per-tool timeout)
+                        tool_results = executor.execute_batch(
+                            tool_calls_batch, execute_tool_fn,
+                            timeout_ms=self.tool_timeout_ms,
+                        )
                         
                         for tool_result in tool_results:
                             if tool_result.error is None:
@@ -4117,12 +4249,25 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # G2: Cooperative cancellation - honour InterruptController between tool iterations
         # so /stop (and cancellation generally) halts mid-flight runs on every provider.
         cancel_token = kwargs.pop("cancel_token", None)
+        # Mid-run steering: optional callable() -> list[str] draining pending
+        # steering notes so they can be injected as user messages between iterations.
+        steering_drain = kwargs.pop("steering_drain", None)
 
         def _is_cancelled() -> bool:
             return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
 
         def _cancel_reason() -> str:
             return getattr(cancel_token, "reason", None) or "user"
+
+        def _inject_steering(msgs) -> None:
+            if steering_drain is None:
+                return
+            try:
+                for note in (steering_drain() or []):
+                    if note:
+                        msgs.append({"role": "user", "content": f"[steering] {note}"})
+            except Exception as _steer_err:
+                logging.debug(f"Steering drain failed (ignored): {_steer_err}")
 
         try:
             import litellm
@@ -4214,6 +4359,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     reason = _cancel_reason()
                     logging.debug(f"Async LLM tool loop cancelled: {reason}")
                     return f"Task interrupted: {reason}"
+                # G2: Mid-run steering - drain any pending steering notes and inject
+                # them as user messages so the model sees them on its next step.
+                _inject_steering(messages)
                 response_text = ""
                 reasoning_content = None
                 tool_calls = []
@@ -4274,6 +4422,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
                     # ── Handle tool calls ────────────────────────────
                     if tool_calls and execute_tool_fn:
+                        # G2: Second cancel check immediately before dispatching
+                        # tools so a /stop mid-iteration skips running them.
+                        if _is_cancelled():
+                            reason = _cancel_reason()
+                            logging.debug(f"Async LLM tool loop cancelled before tool dispatch: {reason}")
+                            return f"Task interrupted: {reason}"
                         serializable_tool_calls = self._serialize_tool_calls(tool_calls)
                         messages.append({
                             "role": "assistant",
@@ -4496,6 +4650,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 
                 # Now handle tools if we have them (either from streaming or non-streaming)
                 if tools and execute_tool_fn and tool_calls:
+                    # G2: Second cancel check immediately before dispatching
+                    # tools so a /stop mid-iteration skips running them.
+                    if _is_cancelled():
+                        reason = _cancel_reason()
+                        logging.debug(f"Async LLM tool loop cancelled before tool dispatch: {reason}")
+                        return f"Task interrupted: {reason}"
                     # Convert tool_calls to a serializable format for all providers
                     serializable_tool_calls = self._serialize_tool_calls(tool_calls)
                     # Check if it's Ollama provider

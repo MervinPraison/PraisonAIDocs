@@ -54,17 +54,18 @@ def _rewrite_query(self, query: str, rewrite_tools: str = None, verbose: bool = 
             if os.path.isfile(rewrite_tools):
                 # Load from file
                 try:
-                    import inspect
-                    from praisonai_code._safe_loader import load_user_module
-                    module = load_user_module(rewrite_tools, name="rewrite_tools_module", allow_outside_cwd=True)
-                    if module is not None:
-                        for name, obj in inspect.getmembers(module):
-                            if inspect.isfunction(obj) and not name.startswith('_'):
-                                rewrite_tools_list.append(obj)
-                        if rewrite_tools_list:
-                            print(f"[cyan]Loaded {len(rewrite_tools_list)} tools for query rewriter[/cyan]")
+                    from praisonai_code.tool_resolver import ToolResolver
+                    funcs = ToolResolver().load_functions_from_module(
+                        rewrite_tools,
+                        functions_only=True,
+                        skip_private=True,
+                        module_name="rewrite_tools_module",
+                    )
+                    if funcs:
+                        rewrite_tools_list.extend(funcs.values())
+                        print(f"[cyan]Loaded {len(rewrite_tools_list)} tools for query rewriter[/cyan]")
                     else:
-                        print(f"[yellow]Warning: Rewrite tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
+                        print(f"[yellow]Warning: No rewrite tools loaded from {rewrite_tools} (module has no public functions, or local tools loading is disabled — set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable).[/yellow]")
                 except Exception as e:
                     print(f"[yellow]Warning: Failed to load rewrite tools: {e}[/yellow]")
             else:
@@ -149,17 +150,18 @@ def _expand_prompt(self, prompt: str, expand_tools: str = None, verbose: bool = 
             if os.path.isfile(expand_tools):
                 # Load from file
                 try:
-                    import inspect
-                    from praisonai_code._safe_loader import load_user_module
-                    module = load_user_module(expand_tools, name="expand_tools_module", allow_outside_cwd=True)
-                    if module is not None:
-                        for name, obj in inspect.getmembers(module):
-                            if inspect.isfunction(obj) and not name.startswith('_'):
-                                expand_tools_list.append(obj)
-                        if expand_tools_list:
-                            print(f"[cyan]Loaded {len(expand_tools_list)} tools for prompt expander[/cyan]")
+                    from praisonai_code.tool_resolver import ToolResolver
+                    funcs = ToolResolver().load_functions_from_module(
+                        expand_tools,
+                        functions_only=True,
+                        skip_private=True,
+                        module_name="expand_tools_module",
+                    )
+                    if funcs:
+                        expand_tools_list.extend(funcs.values())
+                        print(f"[cyan]Loaded {len(expand_tools_list)} tools for prompt expander[/cyan]")
                     else:
-                        print(f"[yellow]Warning: Expand tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
+                        print(f"[yellow]Warning: No expand tools loaded from {expand_tools} (module has no public functions, or local tools loading is disabled — set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable).[/yellow]")
                 except Exception as e:
                     print(f"[yellow]Warning: Failed to load expand tools: {e}[/yellow]")
             else:
@@ -237,17 +239,17 @@ def _load_tools(self, tools_path: str) -> list:
     if os.path.isfile(tools_path):
         # Load from file
         try:
-            import inspect
-            from praisonai_code._safe_loader import load_user_module
-            module = load_user_module(tools_path, name="tools_module", allow_outside_cwd=True)
-            if module is not None:
-                for name, obj in inspect.getmembers(module):
-                    if inspect.isfunction(obj) and not name.startswith('_'):
-                        tools_list.append(obj)
-                if tools_list:
-                    print(f"[cyan]Loaded {len(tools_list)} tools from {tools_path}[/cyan]")
+            from praisonai_code.tool_resolver import ToolResolver
+            funcs = ToolResolver().load_functions_from_module(
+                tools_path,
+                functions_only=True,
+                skip_private=True,
+            )
+            if funcs:
+                tools_list.extend(funcs.values())
+                print(f"[cyan]Loaded {len(tools_list)} tools from {tools_path}[/cyan]")
             else:
-                print(f"[yellow]Warning: Tools loading disabled. Set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable.[/yellow]")
+                print(f"[yellow]Warning: No tools loaded from {tools_path} (module has no public functions, or local tools loading is disabled — set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable).[/yellow]")
         except Exception as e:
             print(f"[yellow]Warning: Failed to load tools from {tools_path}: {e}[/yellow]")
     else:
@@ -325,6 +327,68 @@ def _save_output(self, prompt: str, result: str):
         f.write(f"# Output\n\n{result}\n")
     
     print(f"[green]✅ Output saved to: {filepath}[/green]")
+
+def _run_direct_prompt_via_adapter(self, prompt):
+    """Run a one-shot direct prompt through the FrameworkAdapterRegistry.
+
+    This keeps default framework selection in a single place (the registry's
+    priority + entry-point discovery) and routes execution through the adapter
+    contract so telemetry suppression, ``_resolve_llm`` normalisation and
+    ``expected_output`` handling all apply — none of which the previous
+    hardcoded ``from crewai import ...`` / ``from autogen import ...`` chain did.
+    """
+    from praisonai.framework_adapters.registry import get_default_registry
+
+    registry = get_default_registry()
+    try:
+        framework = registry.pick_default()
+    except RuntimeError as e:
+        print(f"[red]ERROR: {e}[/red]")
+        sys.exit(1)
+
+    adapter = registry.create(framework)
+    # AutoGen exposes a family router that resolves to a concrete version.
+    if hasattr(adapter, "resolve"):
+        adapter = adapter.resolve(config={})
+
+    llm = getattr(getattr(self, "args", None), "llm", None)
+    config_list = getattr(self, "config_list", None) or [{"model": llm or "gpt-4o"}]
+    # Preserve the full first config entry so credentials/endpoint fields
+    # (base_url, api_key, api_type, ...) that the adapter's _resolve_llm and the
+    # AutoGen config_list depend on survive. Only the explicit --llm override
+    # replaces the model; a missing model falls back to a sane default.
+    llm_config = [dict(config_list[0])]
+    if llm:
+        llm_config[0]["model"] = llm
+    llm_config[0].setdefault("model", "gpt-4o")
+
+    # Canonical one-shot config shape shared with the YAML path; the adapter's
+    # spec builder turns this into agents/tasks with a proper expected_output.
+    config = {
+        "roles": {
+            "director": {
+                "role": "Assistant",
+                "goal": "Complete the given task",
+                "backstory": "You are a helpful AI assistant",
+                "tasks": {
+                    "direct_task": {
+                        "description": prompt,
+                        "expected_output": "A complete response to the task.",
+                    }
+                },
+                "tools": [],
+            }
+        }
+    }
+
+    return adapter.run(
+        config,
+        llm_config,
+        prompt,
+        tools_dict={},
+        cli_config=vars(self.args) if hasattr(self, "args") and self.args else None,
+    )
+
 
 def handle_direct_prompt(self, prompt):
     """
@@ -523,7 +587,29 @@ def handle_direct_prompt(self, prompt):
                         agent_config["tools"] = existing_tools
                     else:
                         agent_config["tools"] = tools_list
-            
+
+            # Auto-discover project-local .praisonai/tools/*.py (additive; mirrors
+            # the agents/commands convention). Explicit --tools above take
+            # precedence; discovery is gated by PRAISONAI_ALLOW_LOCAL_TOOLS and
+            # skipped when --no-tools is set.
+            if not getattr(self.args, 'no_tools', False):
+                try:
+                    from praisonai_code.cli.features.custom_definitions import (
+                        discover_project_tools,
+                    )
+                    project_tools = discover_project_tools()
+                except Exception:
+                    project_tools = []
+                if project_tools:
+                    existing_tools = agent_config.get('tools', [])
+                    if not isinstance(existing_tools, list):
+                        existing_tools = [existing_tools] if existing_tools else []
+                    seen = {id(t) for t in existing_tools}
+                    existing_tools.extend(
+                        t for t in project_tools if id(t) not in seen
+                    )
+                    agent_config["tools"] = existing_tools
+
             # Load toolsets if specified (--toolset flag)
             if getattr(self.args, 'toolset', None):
                 toolset_names = [name.strip() for name in self.args.toolset.split(',') if name.strip()]
@@ -1243,47 +1329,13 @@ Now, {final_instruction.lower()}:"""
                 print(json.dumps({"cost_usd": 0.0, "tokens_in": 0, "tokens_out": 0, "model": "unknown", "request_count": 0}))
         
         return result
-    elif _availability_flag("CREWAI_AVAILABLE"):
-        from crewai import Agent, Task, Crew
-        agent_config = {
-            "name": "DirectAgent",
-            "role": "Assistant",
-            "goal": "Complete the given task",
-            "backstory": "You are a helpful AI assistant"
-        }
-        
-        # Add llm if specified
-        if hasattr(self, 'args') and self.args.llm:
-            agent_config["llm"] = self.args.llm
-        
-        agent = Agent(**agent_config)
-        task = Task(
-            description=prompt,
-            agent=agent
-        )
-        crew = Crew(
-            agents=[agent],
-            tasks=[task]
-        )
-        return crew.kickoff()
-    elif _availability_flag("AUTOGEN_AVAILABLE"):
-        # Lazy import autogen only when needed
-        autogen = _get_autogen()
-        config_list = self.config_list
-        # Add llm if specified
-        if hasattr(self, 'args') and self.args.llm:
-            config_list[0]['model'] = self.args.llm
-            
-        assistant = autogen.AssistantAgent(
-            name="DirectAgent",
-            llm_config={"config_list": config_list}
-        )
-        user_proxy = autogen.UserProxyAgent(
-            name="UserProxy",
-            code_execution_config={"work_dir": "coding"}
-        )
-        user_proxy.initiate_chat(assistant, message=prompt)
-        return "Task completed"
+    elif _availability_flag("CREWAI_AVAILABLE") or _availability_flag("AUTOGEN_AVAILABLE"):
+        # Route non-praisonai frameworks through the FrameworkAdapterRegistry so
+        # the single source of truth for selection (priority + entry-point
+        # plugins) and the full adapter contract (scoped_telemetry_disable,
+        # _resolve_llm, expected_output, cli_config/callbacks) apply here too —
+        # instead of a hardcoded chain that bypassed every adapter.
+        return _run_direct_prompt_via_adapter(self, prompt)
     else:
         print("[red]ERROR: No framework is installed. Please install at least one framework:[/red]")
         print("\npip install \"praisonai-frameworks\\[crewai]\"  # For CrewAI")

@@ -1,15 +1,18 @@
 """
 Custom agent and command definitions discovery system.
 
-Discovers and loads custom agents and commands from project and user directories:
+Discovers and loads custom agents, commands and tools from project and user
+directories:
 - .praisonai/agents/*.md|*.yaml - Reusable named agents
 - .praisonai/commands/*.md - Reusable named commands with template interpolation
+- .praisonai/tools/*.py - Project-local Python tools (auto-loaded)
 
 Discovery order (later wins on name collision):
-1. User-global: ~/.praisonai/{agents,commands}/
-2. Project-level: ./.praisonai/{agents,commands}/ (walk up to repo root)
+1. User-global: ~/.praisonai/{agents,commands,tools}/
+2. Project-level: ./.praisonai/{agents,commands,tools}/ (walk up to repo root)
 """
 
+import inspect
 import os
 import re
 import secrets
@@ -215,12 +218,28 @@ class CustomCommand:
     source: str = "unknown"  # 'user' or 'project'
 
 
+@dataclass
+class CustomTool:
+    """Represents a project-local tool callable discovered from ``.praisonai/tools/*.py``.
+
+    ``name`` is namespaced by module filename (``module.func``) to avoid
+    collisions between tools of the same function name in different files.
+    ``callable`` is the resolved callable (a ``@tool``-decorated function or a
+    plain public callable) that is handed directly to the Agent.
+    """
+    name: str
+    path: Path
+    callable: Any
+    source: str = "unknown"  # 'user' or 'project'
+
+
 class CustomDefinitionsDiscovery:
     """Discovers and manages custom agents and commands from filesystem."""
     
     def __init__(self):
         self._agents: Dict[str, CustomAgent] = {}
         self._commands: Dict[str, CustomCommand] = {}
+        self._tools: Dict[str, CustomTool] = {}
         self._discovered = False
     
     def discover(self, force: bool = False) -> None:
@@ -235,6 +254,7 @@ class CustomDefinitionsDiscovery:
         
         self._agents.clear()
         self._commands.clear()
+        self._tools.clear()
         
         # Register built-in presets first (lowest precedence)
         self._register_builtin_presets()
@@ -305,6 +325,16 @@ class CustomDefinitionsDiscovery:
                     command = self._load_command(file_path, source)
                     if command:
                         self._commands[command.name] = command
+
+        # Discover tools (project-local Python modules). Loading executes
+        # user code, so it is gated by the same PRAISONAI_ALLOW_LOCAL_TOOLS
+        # opt-in the rest of the wrapper enforces via load_user_module.
+        tools_dir = base_dir / "tools"
+        if tools_dir.exists() and tools_dir.is_dir():
+            for file_path in sorted(tools_dir.iterdir()):
+                if file_path.suffix == ".py" and not file_path.name.startswith("_"):
+                    for tool in self._load_tools(file_path, source):
+                        self._tools[tool.name] = tool
     
     def _load_agent(self, file_path: Path, source: str) -> Optional[CustomAgent]:
         """Load an agent definition from a file."""
@@ -374,6 +404,70 @@ class CustomDefinitionsDiscovery:
             logging.warning(f"Failed to load command from {file_path}: {e}")
             return None
     
+    def _load_tools(self, file_path: Path, source: str) -> List[CustomTool]:
+        """Load tool callables from a project-local ``.praisonai/tools/*.py`` module.
+
+        Each public (non-underscore) callable is exposed as a tool, preferring
+        ``@tool``-decorated functions when any are present so a helper module
+        can keep private helpers alongside its exported tools. Tools are
+        namespaced ``<module>.<func>`` to avoid collisions across files.
+
+        Executing the module is gated by ``PRAISONAI_ALLOW_LOCAL_TOOLS`` via the
+        shared safe loader; when disabled or on error this returns an empty list.
+
+        User-global tools (``~/.praisonai/tools/``, ``source="user"``) live
+        outside the project CWD by design, so the safe loader's CWD boundary is
+        opted out for that explicitly user-owned location — mirroring how an
+        explicit ``--tools`` path is trusted. Project-local tools keep the
+        default CWD check so an untrusted checkout cannot escape it.
+        """
+        try:
+            from praisonai_code._safe_loader import load_user_module
+
+            module = load_user_module(
+                file_path,
+                name=f"praisonai_tools_{file_path.stem}",
+                allow_outside_cwd=(source == "user"),
+            )
+            if module is None:
+                return []
+
+            # Prefer the core @tool marker when available so a helper module can
+            # keep private helpers alongside its exported tools; fall back to a
+            # structural check so this works even if core is not importable.
+            try:
+                from praisonaiagents.tools.decorator import is_tool as _is_tool
+            except Exception:
+                def _is_tool(obj: Any) -> bool:  # pragma: no cover - fallback
+                    return hasattr(obj, "run") and hasattr(obj, "name")
+
+            # Only members defined in this module (skip imported names) that are
+            # public callables. FunctionTool/BaseTool instances lack a matching
+            # __module__, so accept them whenever is_tool() recognises them.
+            members = []
+            for name, obj in inspect.getmembers(module, callable):
+                if name.startswith("_"):
+                    continue
+                if _is_tool(obj) or getattr(obj, "__module__", None) == module.__name__:
+                    members.append((name, obj))
+
+            decorated = [(n, o) for n, o in members if _is_tool(o)]
+            selected = decorated or members
+
+            return [
+                CustomTool(
+                    name=f"{file_path.stem}.{name}",
+                    path=file_path,
+                    callable=obj,
+                    source=source,
+                )
+                for name, obj in selected
+            ]
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to load tools from {file_path}: {e}")
+            return []
+
     def _parse_markdown_frontmatter(self, file_path: Path) -> Tuple[Dict[str, Any], str]:
         """Parse Markdown file with YAML frontmatter."""
         with open(file_path, 'r') as f:
@@ -420,6 +514,16 @@ class CustomDefinitionsDiscovery:
         """List all discovered commands."""
         self.discover()
         return list(self._commands.values())
+
+    def get_tool(self, name: str) -> Optional[CustomTool]:
+        """Get a discovered project-local tool by its namespaced name."""
+        self.discover()
+        return self._tools.get(name)
+
+    def list_tools(self) -> List[CustomTool]:
+        """List all discovered project-local tools."""
+        self.discover()
+        return list(self._tools.values())
 
 
 class TemplateInterpolator:
@@ -673,6 +777,21 @@ class TemplateInterpolator:
         return text
 
 
+def discover_project_tools() -> List[Any]:
+    """Auto-discover project-local tool callables from ``.praisonai/tools/*.py``.
+
+    Walks the same user-global + project walk-up layers as agents/commands and
+    returns the resolved tool callables ready to hand to an ``Agent``. Loading
+    is gated by ``PRAISONAI_ALLOW_LOCAL_TOOLS`` (enforced by the shared safe
+    loader), so this returns an empty list when the opt-in is not set.
+
+    Returns:
+        A list of tool callables (possibly empty).
+    """
+    discovery = CustomDefinitionsDiscovery()
+    return [t.callable for t in discovery.list_tools()]
+
+
 def load_agent_from_name(name: str) -> Optional[Dict[str, Any]]:
     """
     Load an agent configuration by name.
@@ -711,11 +830,147 @@ def load_agent_from_name(name: str) -> Optional[Dict[str, Any]]:
 
     # Translate declarative permission/mode block into a flat permission
     # config that maps onto the Agent's existing approval/permission engine.
-    permission_config = resolve_permission_config(agent.permission, agent.mode)
+    # ``mode: subagent`` is a delegatability marker (not a permission mode) and
+    # must be ignored here so it is never rejected as an unknown mode.
+    permission_mode = agent.mode
+    if permission_mode and str(permission_mode).strip().lower() == "subagent":
+        permission_mode = None
+    permission_config = resolve_permission_config(agent.permission, permission_mode)
     if permission_config:
         config["permissions"] = permission_config
 
     return config
+
+
+def _agent_config_from_definition(agent: CustomAgent) -> Dict[str, Any]:
+    """Build an ``Agent(**config)`` kwargs dict from a discovered definition.
+
+    Mirrors :func:`load_agent_from_name` but works from an already-resolved
+    ``CustomAgent`` so the same frontmatter (model/tools/permission/mode) is
+    honoured when the agent is instantiated as a delegation target.
+    """
+    config: Dict[str, Any] = {"name": agent.name}
+
+    if agent.model:
+        config["llm"] = agent.model
+    if agent.role:
+        config["role"] = agent.role
+    if agent.goal:
+        config["goal"] = agent.goal
+    if agent.instructions:
+        config["instructions"] = agent.instructions
+    if agent.system_prompt:
+        config["backstory"] = agent.system_prompt
+    if agent.tools:
+        config["tools"] = agent.tools
+
+    # ``mode: subagent`` is a delegatability marker, not a permission mode, so
+    # it must not be fed to resolve_permission_config (which would reject it as
+    # an unknown mode). Treat it as "no permission mode" here.
+    permission_mode = agent.mode
+    if permission_mode and str(permission_mode).strip().lower() == "subagent":
+        permission_mode = None
+
+    permission_config = resolve_permission_config(agent.permission, permission_mode)
+    if permission_config:
+        config["permissions"] = permission_config
+
+    return config
+
+
+def list_delegatable_agents(
+    allow_list: Optional[List[str]] = None,
+) -> List[CustomAgent]:
+    """Return discovered agents that may be offered as delegation targets.
+
+    An agent is delegatable when it is either explicitly named in
+    ``allow_list`` (e.g. from ``--subagents a,b,c``) or, when no allow-list is
+    given, when its frontmatter marks it with ``mode: subagent``.
+
+    Args:
+        allow_list: Optional explicit list of agent names to expose. When
+            provided it takes precedence over the ``mode: subagent`` marker so
+            a user can opt any named agent in from the CLI without editing it.
+
+    Returns:
+        The matching ``CustomAgent`` definitions.
+    """
+    discovery = CustomDefinitionsDiscovery()
+    agents = discovery.list_agents()
+
+    if allow_list:
+        wanted = {name.strip() for name in allow_list if name and name.strip()}
+        return [a for a in agents if a.name in wanted]
+
+    return [
+        a
+        for a in agents
+        if a.mode and str(a.mode).strip().lower() == "subagent"
+    ]
+
+
+def build_subagent_resolver(
+    allow_list: Optional[List[str]] = None,
+) -> Tuple[Optional[Any], Dict[str, str]]:
+    """Build a named-agent resolver for ``create_subagent_tool``.
+
+    Bridges the wrapper's ``.praisonai/agents`` discovery to the core
+    delegation seam: returns a ``resolver(name) -> Agent`` callback plus a
+    ``{name: description}`` map for the tool description. The resolver lazily
+    imports and instantiates the core ``Agent`` from each definition's
+    frontmatter so no agents are constructed unless actually delegated to.
+
+    Args:
+        allow_list: Optional explicit list of delegatable agent names. When
+            omitted, agents marked ``mode: subagent`` are used.
+
+    Returns:
+        A ``(resolver, descriptions)`` tuple. ``resolver`` is ``None`` when
+        there are no delegatable agents (so callers can skip wiring the tool).
+    """
+    delegatable = list_delegatable_agents(allow_list)
+    if not delegatable:
+        return None, {}
+
+    configs = {a.name: _agent_config_from_definition(a) for a in delegatable}
+    descriptions = {
+        a.name: (a.description if hasattr(a, "description") else None)
+        or a.goal
+        or a.role
+        or ""
+        for a in delegatable
+    }
+
+    def resolver(name: str) -> Optional[Any]:
+        config = configs.get(name)
+        if config is None:
+            return None
+        from praisonaiagents import Agent
+
+        # ``permissions`` is a declarative block, not an ``Agent`` kwarg. Mirror
+        # the primary-run path (_run_custom_agent) and convert it into an
+        # ``approval`` config so the delegated agent runs under its own
+        # restrictions instead of failing at construction.
+        agent_config = dict(config)
+        agent_permissions = agent_config.pop("permissions", None) or {}
+        if agent_permissions:
+            from praisonai_code.cli.features._approval_bridge import (
+                resolve_approval_config,
+            )
+
+            has_ask_rules = any(
+                str(action).strip().lower() == "ask"
+                for action in agent_permissions.values()
+            )
+            agent_config["approval"] = resolve_approval_config(
+                "console",
+                non_interactive=not has_ask_rules,
+                permissions_config=agent_permissions,
+            )
+
+        return Agent(**agent_config)
+
+    return resolver, descriptions
 
 
 def _env_flag(name: str) -> bool:
