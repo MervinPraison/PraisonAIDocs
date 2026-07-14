@@ -11,7 +11,9 @@ The Custom Provider Registry allows you to register custom LLM providers that ex
 <Note>
 **Updated in PR #1624**: Built-in providers (`openai`, `anthropic`, `google`) plus aliases (`oai`, `claude`, `gemini`, `google_genai`) are now auto-registered and backed by LiteLLM. You add custom providers when you need a non-LiteLLM backend or a custom routing/caching/mocking layer.
 
-**Verified end-to-end in [PR #2171](https://github.com/MervinPraison/PraisonAI/pull/2171):** alias registration previously checked the resolved-provider cache (empty at init) instead of the loader map, so `oai`, `claude`, `gemini`, and `google_genai` silently raised `ValueError`. Resolving via any of these prefixes now succeeds.
+**Verified end-to-end in [PR #2171](https://github.com/MervinPraison/PraisonAI/pull/2171) and [PR #3011](https://github.com/MervinPraison/PraisonAI/pull/3011):**
+- PR #2171 wired built-in aliases (`oai`, `claude`, `gemini`, `google_genai`) through the loader map so alias-based `create_llm_provider(...)` calls resolve.
+- PR #3011 wired the wrapper's two hot LLM paths (framework-adapter resolver + structured-completion generator) to consult the registry first, so a registered non-built-in provider is now the one that actually serves `Agent(llm="…/…")` calls — not just standalone `create_llm_provider(...)`.
 </Note>
 
 ## Built-in providers
@@ -132,6 +134,100 @@ create_llm_provider("cloudflare/workers-ai-model")
 create_llm_provider("cloudflare/workers-ai")
 # Resolves to your registered CloudflareProvider
 ```
+
+## Where registered providers take effect
+
+Registering a provider makes it reachable from every entry point that resolves models through the wrapper — not just direct `create_llm_provider(...)` calls.
+
+```mermaid
+graph LR
+    Register["register_llm_provider('bedrock', BedrockProvider)"] --> Registry[(praisonai.llm.registry)]
+
+    subgraph "Hot paths (added in PR #3011)"
+        Adapter["PraisonAIModel.get_model()<br/>Agent(llm='bedrock/…') via<br/>AutoGen / CrewAI adapters"]
+        Auto["BaseAutoGenerator._completion_impl<br/>YAML auto-gen + structured completion"]
+    end
+
+    Registry --> Adapter
+    Registry --> Auto
+
+    Adapter --> Client["provider.get_client() or provider"]
+    Auto --> Struct["await provider.generate_structured(...)"]
+
+    classDef reg fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef store fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef hot fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef out fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Register reg
+    class Registry store
+    class Adapter,Auto hot
+    class Client,Struct out
+```
+
+Two wrapper hot paths now consult the registry before falling back to the built-in ladder.
+
+| Hot path | What it calls on your provider | Opt-in |
+|---|---|---|
+| **`PraisonAIModel.get_model()`** — every `Agent(llm="myprov/…")` call routed through a framework adapter (AutoGen, CrewAI, etc.) | `provider.get_client()` if defined, otherwise the provider instance itself is returned as the "client" | Passive — any registered provider works |
+| **`BaseAutoGenerator._completion_impl`** — YAML auto-generation and any generator inheriting from `BaseAutoGenerator` | `await provider.generate_structured(response_model, messages, **kwargs)` | Explicit — providers without `generate_structured` fall through to the built-in LiteLLM ladder |
+
+<Note>
+Registering a provider under a built-in prefix (`openai/`, `groq/`, `cohere/`, `ollama/`, `anthropic/`, `google/`, `openrouter/`) does **not** hijack the built-in path. Both hot paths gate against a shared `_BUILTIN_MODEL_PREFIXES` set so the built-in ladder always wins for those prefixes. Use a unique namespace (e.g. `mycompany-openai/`) if you need custom routing under an OpenAI-like protocol.
+</Note>
+
+<Warning>
+The wrapper drops empty `api_key`/`base_url` entries from the config it forwards to your provider so the provider's own environment/credential chain still applies. If you rely on `AWS_REGION` / `AWS_PROFILE` (Bedrock), `CLOUDFLARE_ACCOUNT_ID` (Workers AI), or similar env-driven auth, you do not need to thread anything through the registry — resolve credentials inside your provider's `__init__`.
+</Warning>
+
+<Warning>
+A registered provider that raises during construction now surfaces its real error — it is **not** silently replaced by the OpenAI-key `ValueError` from the built-in ladder. Before PR #3011 a broken Bedrock provider looked like a missing `OPENAI_API_KEY`; the error message now points at the actual provider that failed to construct.
+</Warning>
+
+### End-to-end Bedrock example
+
+```python
+# 1. Define a Bedrock-shaped provider.
+from praisonai.llm import register_llm_provider
+
+class BedrockProvider:
+    provider_id = "bedrock"
+
+    def __init__(self, model_id, config=None):
+        self.model_id = model_id
+        self.config = config or {}
+        import boto3
+        self._client = boto3.client(
+            "bedrock-runtime",
+            region_name=self.config.get("region_name", "us-east-1"),
+        )
+
+    # Framework-adapter hot path (PraisonAIModel.get_model)
+    def get_client(self):
+        return self._client
+
+    # AutoGenerator hot path (BaseAutoGenerator._completion_impl)
+    async def generate_structured(self, response_model, messages, **kwargs):
+        # Call Bedrock, parse into response_model, return the pydantic model instance.
+        ...
+
+register_llm_provider("bedrock", BedrockProvider)
+
+# 2. Now every wrapper entry point resolves through the provider — no OPENAI_API_KEY needed.
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Claude on Bedrock",
+    instructions="Answer using Claude on AWS Bedrock.",
+    llm="bedrock/anthropic.claude-3-sonnet-20240229-v1:0",   # <- was previously an OpenAI-key ValueError
+)
+
+result = agent.start("Summarise the latest PR in one sentence.")
+```
+
+<Tip>
+Skip `generate_structured` if you only need chat completion — `PraisonAIModel.get_client()` is enough for framework adapters. Add `generate_structured` when you also need YAML auto-generation (`praisonai --auto ...`) or another generator that produces pydantic models.
+</Tip>
 
 ## Provider Aliases
 
@@ -469,7 +565,13 @@ register_llm_provider("provider-b", ProviderB, aliases=["alias-b"])
 - **O(1) operations**: `has()`, `resolve()`, and `register()` are all O(1)
 - **No LiteLLM coupling**: The registry is completely independent of LiteLLM
 
+## Migration note
+
+**Before PR #3011**, `register_llm_provider("bedrock", ...)` succeeded but `Agent(llm="bedrock/…")` raised `ValueError: OPENAI_API_KEY environment variable is required for the default OpenAI service.` — because the framework-adapter resolver never consulted the registry. If you worked around this by shipping `OPENAI_API_KEY=not-needed` or a shim adapter, you can now delete the workaround: the registered provider is used directly.
+
 ## See Also
 
 - [Models Overview](/docs/models) - Built-in provider configuration
+- [LLM Gateways](/docs/features/llm-gateways) - Pre-registered gateway providers
+- [Advanced Multi-Provider Patterns](/docs/features/multi-provider-advanced) - Routing across providers
 - [LiteLLM Models](https://docs.litellm.ai/docs/providers) - Providers supported by LiteLLM
