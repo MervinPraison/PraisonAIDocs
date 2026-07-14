@@ -91,6 +91,22 @@ agent = Agent(
 )
 ```
 </Step>
+
+<Step title="Background Mode">
+For long-lived chatbots or gateway agents, defer the review so the user reply is not gated on an extra LLM turn.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Support Bot",
+    instructions="Answer customer questions.",
+    self_improve="background",
+)
+agent.start("How do I reset my password?")
+# Reply returns immediately; the skill-review runs after, in the background.
+```
+</Step>
 </Steps>
 
 ---
@@ -131,10 +147,14 @@ After each task, if `self_improve` is enabled:
 
 | Value | Behavior |
 |-------|----------|
-| `False` (default) | Off. No review pass runs. |
-| `True` | On with `DefaultSkillReviewPolicy()` (reviews when ≥1 tool was used). |
-| `DefaultSkillReviewPolicy(min_tool_calls=N)` | On, requires at least N tool calls before a review fires. |
-| Any object implementing `SkillReviewProtocol` | On, with your custom policy. |
+| `False` *(default)* | Off. No review pass runs. |
+| `True` | On, review runs **inline** (blocks the reply) with `DefaultSkillReviewPolicy()` (reviews when ≥1 tool was used). |
+| `"inline"` / `"blocking"` | Same as `True`. |
+| `"background"` / `"async"` | On, review runs **after the reply** on the shared background job runner. Recommended for gateways/bots. |
+| `DefaultSkillReviewPolicy(min_tool_calls=N)` | On (inline), requires at least N tool calls before a review fires. |
+| Any object implementing `SkillReviewProtocol` | On (inline), with your custom policy. |
+
+Unknown strings (e.g. typos like `"backround"`) disable self-improvement and log a warning.
 
 ### `DefaultSkillReviewPolicy`
 
@@ -172,6 +192,42 @@ graph TB
     class On,Tune,Custom opt
     class Off off
 ```
+
+---
+
+## Inline vs Background
+
+Choose based on how latency-sensitive the reply is.
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User
+    participant A as 🤖 Agent
+    participant R as 🪞 Review<br/>(skill_manage only)
+
+    rect rgb(245, 158, 11)
+    Note over U,R: Inline (default)
+    U->>A: Task
+    A->>A: Do work + tools
+    A->>R: Review
+    R-->>A: Skill saved / NO_SKILL
+    A-->>U: Reply
+    end
+
+    rect rgb(16, 185, 129)
+    Note over U,R: Background ("background")
+    U->>A: Task
+    A->>A: Do work + tools
+    A-->>U: Reply (immediate)
+    A->>R: Review (off hot path)
+    R-->>A: Skill saved / NO_SKILL
+    end
+```
+
+| Mode | Reply latency | Best for |
+|------|--------------|----------|
+| `True` / `"inline"` *(default)* | Includes one extra LLM turn | Batch scripts, short-lived agents, tests |
+| `"background"` | Immediate | Chatbots, gateway/long-lived agents, Slack/Discord bots |
 
 ---
 
@@ -253,6 +309,16 @@ agent = Agent(name="Worker", self_improve=TimedReviewPolicy())
 - **Distinct from `reflection`** — `reflection` retries for answer quality within a task; `self_improve` captures durable skills for next time. They are independent flags and compose cleanly.
 </Note>
 
+<Note>
+**Background mode guarantees**
+
+- **Reply first** — the user-visible response returns before the review LLM turn starts.
+- **Serialized per agent** — a background review holds a per-agent lock, so the next turn on the same agent waits its turn instead of racing chat-history state.
+- **Unique job id** — every review gets a fresh id, so overlapping reviews never overwrite each other in the background job map.
+- **Falls back to inline** — if the background job runner is unreachable, the review runs inline instead of being silently dropped.
+- **Same guardrails as inline** — restricted-tool review turn, chat-history isolation, best-effort failure swallowing all still apply.
+</Note>
+
 ---
 
 ## Best Practices
@@ -272,6 +338,16 @@ Skills written by the review go to the first existing skill directory (project `
 
 <Accordion title="Use the protocol for fully custom policies">
 Any object with `should_review` and `review_prompt` satisfies `SkillReviewProtocol`. Use this to gate on cost, time-of-day, session length, or any other signal.
+</Accordion>
+
+<Accordion title="Use background mode for chatbots and gateways">
+If your agent lives inside a chatbot, gateway, or bot process where users notice reply latency, pass `self_improve="background"` instead of `True`. The review still runs after every task — it just doesn't sit in front of the reply.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Bot", self_improve="background")
+```
 </Accordion>
 </AccordionGroup>
 
