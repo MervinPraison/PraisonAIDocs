@@ -1,7 +1,7 @@
 ---
-title: "Custom Agents & Commands"
-sidebarTitle: "Custom Agents & Commands"
-description: "Define reusable agents and commands from Markdown files — no Python required"
+title: "Custom Agents, Commands & Tools"
+sidebarTitle: "Custom Agents, Commands & Tools"
+description: "Define reusable agents, slash commands, and Python tools from files in .praisonai/ — no packaging required"
 icon: "file-code"
 ---
 
@@ -13,9 +13,9 @@ agent.start("Register /summarise as a custom command that summarises the chat.")
 ```
 
 
-Drop Markdown or YAML files into `.praisonai/agents/` and `.praisonai/commands/` to extend the CLI without writing Python.
+Drop Markdown, YAML, or Python files into `.praisonai/agents/`, `.praisonai/commands/`, and `.praisonai/tools/` to extend the CLI without writing packaging code.
 
-The user runs `praisonai run --agent researcher`; discovery loads custom agents and slash commands from `.praisonai/`.
+The user runs `praisonai run --agent researcher`; discovery loads custom agents, slash commands, and project-local tools from `.praisonai/`.
 
 
 ```mermaid
@@ -24,8 +24,10 @@ graph LR
     P[./.praisonai/] --> D
     D --> A[Custom agents]
     D --> C[Custom commands]
+    D --> T[Custom tools]
     A --> R[praisonai run --agent]
     C --> RC[praisonai run --command]
+    T --> RT[praisonai run auto-loaded]
 
     classDef dir fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef discover fill:#F59E0B,stroke:#7C90A0,color:#fff
@@ -33,7 +35,7 @@ graph LR
 
     class U,P dir
     class D discover
-    class A,C,R,RC run
+    class A,C,T,R,RC,RT run
 
 ```
 
@@ -116,8 +118,8 @@ praisonai run --command summarise "Long article text here..."
 
 | Location | Scope |
 |----------|-------|
-| `~/.praisonai/agents/` / `commands/` | User-global |
-| `./.praisonai/agents/` / `commands/` | Project (walks up to git root) |
+| `~/.praisonai/agents/` / `commands/` / `tools/` | User-global |
+| `./.praisonai/agents/` / `commands/` / `tools/` | Project (walks up to git root) |
 
 Project definitions **override** user definitions on name collision.
 
@@ -238,6 +240,112 @@ Review this diff:
 
 Safety bounds: 30s timeout, 100KB max stdout, runs in the template's working directory. Non-zero exit raises `ShellSubstitutionError`. `` !`cmd` `` inside `$ARGUMENTS` or `@file` contents is never executed — only markers in the original template run.
 
+## Project-local tools
+
+Drop any `.py` file into `.praisonai/tools/` and every `praisonai run` in that project auto-loads its tools — no `--tools` flag, no packaging, no imports in your agent code.
+
+```python
+# .praisonai/tools/greet.py
+from praisonaiagents import tool
+
+@tool
+def hello(name: str) -> str:
+    """Say hello to name."""
+    return f"Hello, {name}!"
+```
+
+```bash
+export PRAISONAI_ALLOW_LOCAL_TOOLS=true
+praisonai run "Say hello to Alex"
+# → agent auto-discovers greet.hello and calls it
+```
+
+That is the whole feature. The rest of this section is detail.
+
+<Warning>
+Loading a tool file executes its Python. Auto-load is gated by `PRAISONAI_ALLOW_LOCAL_TOOLS=true` — the same opt-in that guards every local tool in the CLI. Without it, `.praisonai/tools/` is skipped entirely.
+</Warning>
+
+### How discovery works
+
+| Location | Scope | Overrides on collision? |
+|----------|-------|:-----------------------:|
+| `~/.praisonai/tools/*.py` | User-global (all your projects) | — |
+| `./.praisonai/tools/*.py` | Project (walks up to the git root) | ✅ wins |
+
+```mermaid
+graph TB
+    subgraph "Discovery order"
+        U[~/.praisonai/tools/*.py] --> S[Safe loader]
+        P[./.praisonai/tools/*.py] --> S
+        S --> M[Merge by name<br/>project wins]
+        M --> REG[Tool registry<br/>module.func]
+    end
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef project fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef loader fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class U user
+    class P project
+    class S,M loader
+    class REG result
+```
+
+### What gets loaded
+
+| Rule | Behaviour |
+|------|-----------|
+| Preferred exports | Functions decorated with `@tool` — private helpers live safely alongside as plain `def`s |
+| Fallback exports | If no `@tool` functions exist in a file, all top-level public callables are loaded |
+| Namespace | Every callable is exposed as `<module_stem>.<function_name>` (e.g. `greet.hello`) |
+| Skipped files | Any file whose name starts with `_` (e.g. `_helpers.py`) is ignored |
+| Skipped members | Any callable whose name starts with `_`, and names imported from other modules |
+| Safety gate | Requires `PRAISONAI_ALLOW_LOCAL_TOOLS=true` (same gate as explicit local `--tools`) |
+
+### Precedence & opt-out
+
+| Situation | Result |
+|-----------|--------|
+| `PRAISONAI_ALLOW_LOCAL_TOOLS=true`, `.praisonai/tools/` present | Auto-loaded — callables added to the run's tool list |
+| `praisonai run --tools my_tool` | Explicit `--tools` wins; auto-loaded tools still merge in (de-duped by identity) |
+| `PRAISONAI_ALLOW_LOCAL_TOOLS` unset | Auto-load disabled — behaviour identical to before this feature |
+| No `.praisonai/tools/` directory | No-op |
+
+### A richer example — private helpers stay private
+
+```python
+# .praisonai/tools/pricing.py
+from praisonaiagents import tool
+
+def _cents(usd: float) -> int:            # skipped — no @tool
+    return int(round(usd * 100))
+
+@tool
+def quote(item: str, usd: float) -> str:
+    """Return a formatted price quote for item at usd dollars."""
+    return f"{item}: ${_cents(usd) / 100:.2f}"
+```
+
+```bash
+export PRAISONAI_ALLOW_LOCAL_TOOLS=true
+praisonai run "Quote espresso at 3.50"
+# → calls pricing.quote; _cents is never exposed to the LLM
+```
+
+### Scaffold with `praisonai init`
+
+```bash
+praisonai init
+# writes:
+#   .praisonai/agents/assistant.md
+#   .praisonai/commands/review.md
+#   .praisonai/tools/example.py   ← new
+```
+
+The scaffolded `example.py` is a commented `@tool` stub — uncomment or replace it in place.
+
 ## Making an agent delegatable
 
 Mark an agent with `mode: subagent` so a running primary agent can hand it sub-tasks by name.
@@ -260,6 +368,7 @@ graph TB
     Q{What do you need?}
     Q -->|Named persona + tools| A[Custom agent]
     Q -->|Reusable prompt template| C[Custom command]
+    Q -->|Python callable for agents to use| T[Custom tool]
     Q -->|Project instructions file| R[Rules / AGENTS.md]
     Q -->|Packaged capability bundle| S[Skill]
 
@@ -286,21 +395,29 @@ This runs the exact interpolated template that `praisonai run --command mydeploy
 ## Python API
 
 ```python
-from praisonai.cli.features.custom_definitions import (
+from praisonai_code.cli.features.custom_definitions import (
     load_agent_from_name,
     interpolate_command_template,
+    discover_project_tools,      # NEW — returns loaded tool callables
 )
 
 config = load_agent_from_name("researcher")
 prompt = interpolate_command_template("summarise", "Long text...")
+tools = discover_project_tools()  # [<greet.hello>, <pricing.quote>, ...]
 ```
+
+`discover_project_tools()` returns a `list` of tool callables (empty unless `PRAISONAI_ALLOW_LOCAL_TOOLS=true`). For metadata, `CustomDefinitionsDiscovery().list_tools()` returns `CustomTool(name, path, callable, source)` records where `name` is the namespaced `<module>.<func>`.
 
 ## Best Practices
 
 <AccordionGroup>
 
 <Accordion title="Use project files for team sharing">
-Commit `.praisonai/agents/` and `.praisonai/commands/` to git.
+Commit `.praisonai/agents/`, `.praisonai/commands/`, and `.praisonai/tools/` to git. Every teammate and CI run picks up the same tool set on the next `praisonai run` — no `pip install` and no `--tools` flag.
+</Accordion>
+
+<Accordion title="Decorate public tools, keep helpers private">
+`.praisonai/tools/_helpers.py` is skipped entirely. Inside a loaded file, functions without `@tool` are only fallback-loaded when the file has no `@tool` at all — so decorating your public entry points keeps private helpers off the LLM's tool list.
 </Accordion>
 
 <Accordion title="Keep user-global files personal">
@@ -312,7 +429,7 @@ Use `~/.praisonai/` for personal shortcuts that should not override team agents.
 </Accordion>
 
 <Accordion title="Start with praisonai init">
-Run [`praisonai init`](/docs/cli/init) to scaffold `.praisonai/agents/` and `.praisonai/commands/` before hand-writing files.
+Run [`praisonai init`](/docs/cli/init) to scaffold `.praisonai/agents/`, `.praisonai/commands/`, **and** `.praisonai/tools/` before hand-writing files.
 </Accordion>
 
 </AccordionGroup>
@@ -334,6 +451,9 @@ Run [`praisonai init`](/docs/cli/init) to scaffold `.praisonai/agents/` and `.pr
   </Card>
   <Card title="Init CLI" icon="wand-magic-sparkles" href="/docs/cli/init">
     Scaffold .praisonai/ in one command
+  </Card>
+  <Card title="Tools" icon="wrench" href="/docs/features/tools">
+    The @tool decorator and building custom tools
   </Card>
   <Card title="Agent Presets & Modes" icon="shield-check" href="/docs/features/agent-presets-and-modes">
     Built-in presets and per-agent permission scoping
