@@ -18,7 +18,7 @@ agent = Agent(
 agent.start("Fix the deployment issue")
 ```
 
-The user watches the agent work; doom-loop detection escalates when cycles repeat.
+Every `Agent` you create has this protection on by default — no import, no flag. Polling a status endpoint that actually changes state is **not** flagged; a genuine stall or `A -> B -> A -> B` oscillation is.
 
 ```mermaid
 graph LR
@@ -42,37 +42,63 @@ graph LR
 
 ```
 
+<Note>
+Result-aware tool-loop detection is wired into every `Agent` as of [PR #3005](https://github.com/MervinPraison/PraisonAI/pull/3005) (release after 2026-07-14). Earlier releases required `import praisonaiagents.plugins.loop_detection_plugin` to activate the `BEFORE_TOOL` hook — that plugin still works but is no longer necessary. Upgrade to pick up the built-in detection plus the fixed doom-loop consecutive-failure signal.
+</Note>
+
 ## Quick Start
 
 <Steps>
-<Step title="Enable the plugin">
-Import the plugin once — it registers a global `BEFORE_TOOL` hook.
+<Step title="It's already on">
+Result-aware tool-loop detection runs on every `Agent`. No import, no configuration.
 
 ```python
-import praisonaiagents.plugins.loop_detection_plugin  # noqa: F401
 from praisonaiagents import Agent
 
-agent = Agent(instructions="You are a helpful assistant.")
+agent = Agent(
+    name="assistant",
+    instructions="You are a helpful assistant.",
+)
+
+# Result-aware tool-loop detection is enabled on every Agent.
+# No import, no configuration - just run the agent.
 agent.start("Read config.yaml and summarise it.")
 ```
 </Step>
 
-<Step title="Custom thresholds before import">
-```python
-from praisonaiagents.agent.loop_detection import LoopDetectionConfig
-import praisonaiagents.plugins.loop_detection_plugin as ldp
+<Step title="Tune the thresholds">
+Override the per-agent config before the first tool call.
 
-ldp.DEFAULT_CONFIG = LoopDetectionConfig(
+```python
+from praisonaiagents import Agent
+from praisonaiagents.agent.loop_detection import LoopDetectionConfig
+
+agent = Agent(instructions="Poll a job status endpoint.")
+
+agent._loop_detector_config = LoopDetectionConfig(
     enabled=True,
     warn_threshold=5,
     critical_threshold=10,
 )
 
-from praisonaiagents import Agent
-
-agent = Agent(instructions="Poll a job status endpoint.")
 agent.start("Check whether job-42 finished.")
 ```
+</Step>
+
+<Step title="Turn it off">
+Disable detection for deterministic replay agents that repeat identical calls on purpose.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.agent.loop_detection import LoopDetectionConfig
+
+agent = Agent(instructions="Deterministic replay agent")
+agent._loop_detector_config = LoopDetectionConfig(enabled=False)
+```
+
+<Warning>
+Disabling loop detection removes the safety net for tools that get stuck in identical-argument loops.
+</Warning>
 </Step>
 </Steps>
 
@@ -80,27 +106,34 @@ agent.start("Check whether job-42 finished.")
 
 ## How It Works
 
+The detector records each tool call before execution, checks three detectors, then back-fills the result hash after execution so progress breaks the streak.
+
 ```mermaid
 sequenceDiagram
+    participant User
     participant Agent
-    participant Tool
     participant Detector
+    participant Tool
 
+    User->>Agent: agent.start("...")
     loop Each tool call
         Agent->>Detector: record_tool_call(name, args)
-        Agent->>Tool: Execute
-        Tool-->>Agent: Result
-        Agent->>Detector: record_tool_outcome(result)
-        Detector->>Detector: Check 3 detectors
-        alt No loop
-            Detector-->>Agent: stuck=False ✅
+        Detector-->>Agent: verdict
+        alt Not stuck
+            Agent->>Tool: Execute
+            Tool-->>Agent: Result
+            Agent->>Detector: record_tool_outcome(result-hash)
         else Warning
-            Detector-->>Agent: ⚠️ "Try a different approach"
+            Agent->>Tool: Execute anyway (one chance)
+            Tool-->>Agent: Result
+            Agent->>Agent: Queue self-correction nudge<br/>for next autonomous turn
         else Critical
-            Detector-->>Agent: 🛑 "Execution blocked"
+            Agent-->>Agent: Skip tool<br/>Result = { error, loop_blocked: true }
         end
     end
 ```
+
+A warning fires once per autonomous turn — the next iteration's prompt is prefixed with `[System: repeated <detector> detected. Try a different approach. …]`, giving the model one chance to change course before a critical verdict blocks execution entirely.
 
 ---
 
@@ -122,76 +155,126 @@ sequenceDiagram
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `enabled` | `bool` | `False` | Opt-in on `LoopDetectionConfig`; plugin sets `True` when imported |
+| `enabled` | `bool` | `True` (per-`Agent`) / `False` (bare `LoopDetectionConfig()`) | `Agent._ensure_loop_detector()` constructs a config with `enabled=True`. Constructing `LoopDetectionConfig()` directly still defaults to `False`, matching the module docstring. |
 | `history_size` | `int` | `30` | Sliding window of recent tool calls |
 | `warn_threshold` | `int` | `10` | Identical calls before warning |
-| `critical_threshold` | `int` | `20` | Identical calls before blocking (auto-corrected to > warn) |
-| `detectors` | `dict` | all three `True` | Enable or disable individual detectors |
+| `critical_threshold` | `int` | `20` | Identical calls before blocking (auto-corrected to `critical > warn`) |
+| `detectors` | `dict[str, bool]` | `{generic_repeat: True, poll_no_progress: True, ping_pong: True}` | Enable / disable individual detectors |
+
+<Note>
+Per-`Agent` detection is created lazily on the first tool call, so `Agent(...)` init has zero overhead. Set `agent._loop_detector_config = LoopDetectionConfig(...)` before the first tool call to override defaults.
+</Note>
 
 ---
 
 ## Common Patterns
 
-### Disable a Specific Detector
+### Polling a status endpoint
+
+Raise thresholds and keep detection on.
 
 ```python
-from praisonaiagents.agent.loop_detection import LoopDetectionConfig
-import praisonaiagents.plugins.loop_detection_plugin as ldp
-
-ldp.DEFAULT_CONFIG = LoopDetectionConfig(
-    enabled=True,
-    detectors={"generic_repeat": True, "poll_no_progress": False, "ping_pong": True},
-)
-
 from praisonaiagents import Agent
+from praisonaiagents.agent.loop_detection import LoopDetectionConfig
 
-agent = Agent(instructions="Monitor server health")
-agent.start("Is the API healthy?")
+agent = Agent(instructions="Poll deployment status every second.")
+agent._loop_detector_config = LoopDetectionConfig(
+    enabled=True,
+    warn_threshold=30,
+    critical_threshold=60,
+)
+agent.start("Wait for deployment-42 to finish.")
 ```
 
-### Aggressive Detection
+### Aggressive detection for short-lived agents
 
 ```python
+from praisonaiagents import Agent
 from praisonaiagents.agent.loop_detection import LoopDetectionConfig
-import praisonaiagents.plugins.loop_detection_plugin as ldp
 
-ldp.DEFAULT_CONFIG = LoopDetectionConfig(
+agent = Agent(instructions="Quick web scraper")
+agent._loop_detector_config = LoopDetectionConfig(
     enabled=True,
     warn_threshold=3,
     critical_threshold=5,
 )
-
-from praisonaiagents import Agent
-
-agent = Agent(instructions="Quick task agent")
 agent.start("Fetch the homepage title.")
+```
+
+### Disable a specific detector
+
+Turn off `ping_pong` when two tools legitimately alternate.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.agent.loop_detection import LoopDetectionConfig
+
+agent = Agent(instructions="Two-tool workflow")
+agent._loop_detector_config = LoopDetectionConfig(
+    enabled=True,
+    detectors={"generic_repeat": True, "poll_no_progress": True, "ping_pong": False},
+)
 ```
 
 ---
 
-## Related to Loop Guard
+## User Interaction Flow
 
-Loop Detection is opt-in (import the plugin) and catches identical-argument / no-progress patterns. **Loop Guard** ([docs](/docs/features/loop-guard)) is always-on and counts per-turn tool calls with idempotent-vs-mutating thresholds. Use both for autonomous agents — Loop Guard as the safety net, Loop Detection for deeper pattern matching.
+Here's what a user sees when the detector fires during an autonomous run.
+
+```mermaid
+graph TB
+    Turn1["Turn 1: agent calls read_file'missing.txt' 10x"] --> Warn["Warning verdict<br/>Streak reaches warn_threshold"]
+    Warn --> Nudge["Queue self-correction:<br/>System: repeated generic_repeat detected"]
+    Nudge --> Turn2["Turn 2 starts with the nudge<br/>injected as a user message"]
+    Turn2 --> Correct{Agent changes<br/>approach?}
+    Correct -->|Yes| Done["Continue as normal"]
+    Correct -->|No, hits critical_threshold| Block["Tool call blocked<br/>result = error, loop_blocked=true"]
+
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Turn1,Turn2,Nudge step
+    class Warn,Correct warn
+    class Done ok
+    class Block stop
+```
+
+- After the warning fires, the next autonomous turn's prompt is prefixed with `[System: repeated <detector> detected. Try a different approach. <message>]`.
+- If the agent still cannot break out of the pattern and hits `critical_threshold` on the same `(tool, args)` fingerprint, the offending call is skipped and the tool result becomes `{"error": "...", "loop_blocked": True}` — the model sees this on its next observation and typically self-corrects.
+- The whole path is a soft-block, not an exception — trace spans, stream events, and `AFTER_TOOL` hooks all still fire, so telemetry stays consistent.
+
+---
+
+## Relationship to Loop Guard
+
+Loop Detection is now always-on alongside **Loop Guard** ([docs](/docs/features/loop-guard)). Loop Detection catches identical-argument / no-progress / ping-pong fingerprints at any frequency and back-fills result hashes so polling with progress is not flagged. Loop Guard counts per-turn tool calls with idempotent-vs-mutating thresholds. Both fire through the same `blocked_result` path, so trace spans, stream events, and `AFTER_TOOL` hooks stay consistent regardless of which one triggers.
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Import the plugin for autonomous agents">
-Long-running agents with many tool calls benefit most from loop detection — add the import at process startup.
+<Accordion title="Trust the defaults">
+Every `Agent` already has result-aware detection with reasonable thresholds. Only tune when a legitimate use case (long polling, deterministic replay) requires it.
 </Accordion>
 
-<Accordion title="Adjust thresholds for polling tools">
-If your agent legitimately polls a status endpoint, increase thresholds or disable `poll_no_progress`.
+<Accordion title="Tune thresholds, not the on/off switch">
+Set `agent._loop_detector_config = LoopDetectionConfig(enabled=True, warn_threshold=...)` before the first tool call. Disabling entirely removes the safety net.
 </Accordion>
 
-<Accordion title="Zero overhead when not imported">
-The detector uses stdlib only (`hashlib`, `json`). Without importing the plugin, no hook is registered.
+<Accordion title="Polling != loop">
+The detector uses **name + args + result-hash**, so a poll that returns changing output does not increment the streak. If your polling tool returns *identical* output while it waits, disable the `poll_no_progress` detector for that agent.
 </Accordion>
 
-<Accordion title="Do not confuse with autonomy doom loops">
-Autonomy mode has separate [doom loop detection](/docs/features/autonomy-loop) for repeated actions during self-directed runs.
+<Accordion title="Zero overhead">
+The detector is stdlib-only (`hashlib`, `json`) and lazy-constructed on the first tool call. `Agent(...)` init is unaffected.
+</Accordion>
+
+<Accordion title="Legacy plugin (advanced)">
+The `praisonaiagents.plugins.loop_detection_plugin` module still exists as an advanced hook-based override — most users no longer need it. Use it only to override thresholds globally via the `BEFORE_TOOL` hook without per-agent code.
 </Accordion>
 </AccordionGroup>
 
