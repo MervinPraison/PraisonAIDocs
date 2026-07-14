@@ -40,6 +40,10 @@ graph LR
     class R result
 ```
 
+<Note>
+Mid-tool-loop steering is fully wired as of [PR #2997](https://github.com/MervinPraison/PraisonAI/pull/2997) (release after 2026-07-14). Earlier releases only checked pending steering at chat/tool boundaries, so a long multi-tool run could not be steered until the loop returned to a boundary — and `INTERRUPT`/`URGENT` priorities were silently downgraded on any mid-run injection path. Upgrade to pick up per-iteration steering + preserved priorities across LiteLLM and OpenAI-native providers, sync and async.
+</Note>
+
 ## Quick Start
 
 <Steps>
@@ -103,30 +107,111 @@ async def main():
 asyncio.run(main())
 ```
 </Step>
+
+<Step title="Steering a Long Multi-Tool Run">
+Steer an agent while it is deep inside a multi-step tool loop — the guidance lands on the next loop iteration, not only when a chat step returns.
+
+```python
+import threading, time
+from praisonaiagents import Agent
+from praisonaiagents.tools import duckduckgo  # any tool works — this is illustrative
+
+agent = Agent(
+    name="researcher",
+    instructions="Research topics and write a structured report.",
+    tools=[duckduckgo],
+    message_steering=True,
+)
+
+def run():
+    return agent.start("Research solar market trends and write a 500-word summary")
+
+t = threading.Thread(target=run); t.start()
+
+# Agent is now in a multi-step tool loop (search → read → search → summarise).
+# The steer lands on the next loop iteration, not only when the chat step returns.
+time.sleep(1.0); agent.steer("Focus on the EU market only", priority=20)   # URGENT
+time.sleep(2.0); agent.steer("Skip anything before 2024", priority=30)     # INTERRUPT
+
+t.join()
+```
+
+Example user flow:
+
+```
+User: research solar market trends and write a 500-word summary
+Agent: (tool loop: searching → reading → summarising …)
+User: (mid-run) focus on the EU market only          [URGENT]
+Agent: (next iteration picks up guidance, re-scopes the next search)
+User: (mid-run) skip anything before 2024            [INTERRUPT]
+Agent: ✅ 500-word EU Solar Market Trends (2024+) summary
+```
+</Step>
 </Steps>
 
 ---
 
 ## How It Works
 
+Message steering injects guidance at the top of every chat step **and every tool-loop iteration**, so a long multi-tool run picks up new user guidance on its very next model call — without restarting the run.
+
 ```mermaid
 sequenceDiagram
     participant User
     participant Agent
-    participant Queue
+    participant Loop as Tool Loop
     participant LLM
+    participant Tools
 
     User->>Agent: agent.start("long task")
     Agent->>LLM: prompt
-    User->>Queue: agent.steer("be brief", priority=10)
-    Agent->>Queue: poll (next chat step)
-    Queue-->>Agent: [URGENT USER GUIDANCE]: be brief
-    Agent->>LLM: prompt + steering
-    LLM-->>Agent: shorter response
+    LLM-->>Agent: tool_calls
+    Agent->>Loop: enter tool-calling loop
+
+    Note over User,Loop: user steers mid-run
+    User->>Agent: agent.steer("focus on EU market", priority=20)
+
+    Loop->>Loop: drain pending steering notes
+    Loop->>LLM: prompt + [URGENT USER GUIDANCE]: focus on EU market
+    LLM-->>Loop: revised tool_calls
+    Loop->>Loop: cancel_token.is_set()? (before tool dispatch)
+    Loop->>Tools: dispatch tools (only if not cancelled)
+    Tools-->>Loop: results
+    Loop-->>Agent: final response
     Agent-->>User: result
 ```
 
-Message steering injects guidance at chat and tool execution boundaries without interrupting the agent's workflow.
+Steering messages are drained at the start of each chat step and each tool-loop iteration, then injected as `user` messages with a priority-aware header. The agent picks them up on its very next model call, whether it is between chat turns or deep inside a multi-tool loop.
+
+---
+
+## Mid-Tool-Loop Steering
+
+Steering messages land on the very next tool-loop iteration, so multi-step tool runs pick up new guidance without a restart.
+
+```mermaid
+graph TB
+    Iter[🔁 Next tool-loop iteration] --> CancelChk{🛑 /stop received?}
+    CancelChk -->|Yes| Halt[✅ Abort — skip tools]
+    CancelChk -->|No| Drain{📬 Pending steering<br/>messages?}
+    Drain -->|Yes| Inject[🧭 Inject as user messages<br/>with priority-aware headers]
+    Drain -->|No| Continue[▶ Continue as normal]
+    Inject --> Continue
+    Continue --> LLMCall[🤖 Next LLM call]
+
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef halt fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Iter,LLMCall,Continue,Inject step
+    class CancelChk,Drain decision
+    class Halt halt
+```
+
+- Steering messages queued via `agent.steer(...)` are checked at the top of every tool-loop iteration, so multi-step tool runs pick them up without a restart.
+- `INTERRUPT` and `URGENT` priorities keep their headers when injected mid-loop, so the model sees `[INTERRUPT USER GUIDANCE]` / `[URGENT USER GUIDANCE]` instead of being silently downgraded to plain guidance.
+- `/stop` (via `cancel_token` or `agent.interrupt_controller`) is re-checked immediately before dispatching tool calls, so a cancel mid-iteration skips running the pending tools instead of executing them first.
 
 ---
 
@@ -157,8 +242,8 @@ graph TB
 | LOW | 1 | Whispered guidance |
 | NORMAL | 5 | Default priority |
 | HIGH | 10 | Acknowledged urgently in next chat step |
-| URGENT | 20 | Can interrupt tool execution |
-| INTERRUPT | 30 | Bypasses rate limiting; immediate stop of current tool |
+| URGENT | 20 | Injected mid tool-loop as `[URGENT USER GUIDANCE]` — the model acknowledges and adjusts on its very next model call |
+| INTERRUPT | 30 | Injected mid tool-loop as `[INTERRUPT USER GUIDANCE]` — the model is told to stop current work and follow the new guidance immediately |
 
 ---
 
@@ -233,6 +318,8 @@ class RedisSteering:  # Implements MessageSteeringProtocol structurally
 
 agent = Agent(name="bg", message_steering=RedisSteering())
 ```
+
+Mid-loop drains rely on repeated `has_pending_messages()` + dequeue calls, so a custom backend must implement both correctly for mid-run injection to work.
 
 ---
 
