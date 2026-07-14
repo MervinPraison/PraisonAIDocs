@@ -282,6 +282,128 @@ Use this to tailor delivery — e.g. only enqueue `token_stream` events when `"s
 
 ---
 
+## Client-side wiring (`praisonai-bot`)
+
+The bundled `praisonai-bot[gateway]` client speaks the modern handshake for you — construct it with the capabilities you handle, `connect()`, then read the negotiated manifest off the instance.
+
+```python
+import asyncio
+from praisonai_bot.gateway import GatewayClient, PayloadTooLarge
+
+async def main():
+    client = GatewayClient(
+        url="ws://localhost:8765",
+        agent_id="assistant",
+        capabilities=["streaming", "ack"],   # what to advertise in `hello`
+    )
+    await client.connect()
+
+    # Read the negotiated manifest — empty on legacy gateways.
+    print("protocol   :", client.features)               # {"methods": [...], "events": [...]}
+    print("policy     :", client.policy)                 # {"max_payload": ..., "heartbeat_ms": ...}
+    print("heartbeat  :", client.heartbeat_ms, "ms")     # convenience getter
+
+    # Gate optional behaviour on the negotiated event set instead of probing.
+    if client.supports_event("token_stream"):
+        # enable streaming UI
+        pass
+
+    # Self-guarded send — oversized frame fails locally, never hits the wire.
+    try:
+        await client.send({"type": "message", "content": "hello"})
+    except PayloadTooLarge as e:
+        print("dropped:", e)
+
+asyncio.run(main())
+```
+
+The client **always** sends `hello` first — `capabilities=` controls *what* it advertises, not whether the modern handshake is used.
+
+### Client construction
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `capabilities` | `Optional[List[str]]` | `None` → `["streaming", "ack"]` | Capability tokens advertised in the outbound `hello` frame. `None` uses the default; `[]` explicitly opts out of every capability. The list is defensively copied into `self.capabilities`. |
+
+### Negotiated accessors
+
+`connect()` populates these from the server's `hello_ok`. Against a legacy gateway they stay at permissive defaults so existing code keeps working.
+
+| Attribute | Type | Legacy default | Description |
+|-----------|------|----------------|-------------|
+| `client.capabilities` | `List[str]` | echoed from constructor | The capability tokens actually sent in `hello`. Client intent, never mutated by the handshake. |
+| `client.features` | `Dict[str, List[str]]` | `{}` | Negotiated feature manifest: `{"methods": [...], "events": [...]}`. Empty dict on a legacy gateway. |
+| `client.policy` | `Dict[str, int]` | `{}` | Negotiated transport policy (`max_payload`, `max_buffered_bytes`, `max_queued_frames`, `heartbeat_ms`). Empty dict on legacy. |
+| `client.heartbeat_ms` | `Optional[int]` | `None` | Convenience getter → `policy["heartbeat_ms"]` coerced to a non-negative `int`. Strings and floats coerce; booleans and unparseable values yield `None`. |
+
+### `supports_event(event)`
+
+Gate optional behaviour on the negotiated event set instead of `try: … except:` probing.
+
+```python
+from praisonaiagents.gateway import EventType
+
+client.supports_event("token_stream")     # str lookup
+client.supports_event(EventType.MESSAGE)  # EventType — uses .value
+```
+
+- Accepts a `str` (e.g. `"token_stream"`) or an `EventType` member; the enum's `.value` is used for lookup.
+- Returns `True` for **legacy gateways** (empty `features["events"]`) so code that assumed everything worked keeps working — this is the intentional permissive default.
+- Otherwise returns `True` iff `event in client.features["events"]`.
+
+### Handshake flow — client branch on the server's first reply
+
+The wire is documented server-side above; this is what the *client* does with each reply.
+
+```mermaid
+graph TB
+    Hello[📤 send hello] --> Reply{First reply?}
+    Reply -->|hello_ok| OK[✅ Adopt HelloResult<br/>features, policy, session]
+    Reply -->|hello_error| Err{Recoverable?}
+    Err -->|terminal| Raise[🛑 GatewayConnectError]
+    Err -->|transient| Retry[🔁 ConnectionError → backoff]
+    Reply -->|error version_unsupported| Ver[🛑 ValueError]
+    Reply -->|error other code| Legacy1[↩️ fall back to legacy join]
+    Reply -->|joined bare| Legacy2[↩️ adopt legacy join<br/>_negotiated=False]
+    Reply -->|anything else| Guard[🛑 ConnectionError]
+
+    classDef send fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fallback fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef error fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Hello send
+    class Reply,Err decision
+    class OK success
+    class Legacy1,Legacy2 fallback
+    class Raise,Retry,Ver,Guard error
+```
+
+| Server's reply to `hello` | Client action | Notes |
+|---------------------------|---------------|-------|
+| `hello_ok` | Adopt `HelloResult` → populate `features`, `policy`, `session_id`, `cursor`, `protocol_version`. Set `_negotiated=True`. | Canonical modern path. |
+| `hello_error` | Classify via `ConnectErrorCode`: terminal → raise `GatewayConnectError`, transient → raise `ConnectionError` (reconnect loop backs off, honouring `retry_after_seconds`). | Same classification, now reachable via `hello_error`. |
+| `error` (bare), `code="version_unsupported"` | Raise `ValueError("Protocol version unsupported: …")`. | Preserved legacy behaviour. |
+| `error` (bare), any other code | **Fall back to legacy `join`** (`_legacy_join`). | Older gateway that doesn't understand `hello`. Compatibility fallback #1. |
+| `joined` (bare) | Adopt legacy join → session bookkeeping populated, `_negotiated=False`, `features`/`policy` stay `{}`. | Server treated `hello` as `join`. Compatibility fallback #2. |
+| Anything else | Raise `ConnectionError("Unexpected handshake reply: …")`. | Guard against a broken server. |
+
+### `PayloadTooLarge`
+
+```python
+from praisonai_bot.gateway import PayloadTooLarge
+```
+
+Raised inside `client.send(...)`, **before** the WebSocket write, when `len(payload.encode("utf-8")) > client.policy["max_payload"]`.
+
+- The frame never leaves the client — nothing reaches the server and no round-trip is spent.
+- Size is measured in **UTF-8 bytes**, not `len(str)`, matching how the server counts. Size payloads by encoded length, not string length.
+- Catch it and shrink/split the payload or accept the loss — retrying the same frame fails identically.
+- A `max_payload` of `0` is honoured as "reject everything"; `None`/missing means unbounded. On a legacy gateway (`policy == {}`) this exception is unreachable and the previous server-side reject still applies.
+
+---
+
 ## Policy Limits
 
 | Key | Default | Description |
@@ -356,6 +478,22 @@ Requesting `streaming` without handling `token_stream` events wastes bandwidth a
 
 <Accordion title="Use session_id + since on reconnect">
 Resume cleanly after disconnect and process `replay` envelopes before sending new messages.
+</Accordion>
+
+<Accordion title="Advertise only the capabilities you handle">
+Requesting `streaming` you don't consume wastes bandwidth *and* the server advertises `token_stream` back at you — you'll get events your loop drops silently.
+</Accordion>
+
+<Accordion title="Prefer client.supports_event(...) over try/except probing">
+The manifest is the source of truth once negotiated; probing races the server's advertisement. Use `client.supports_event("token_stream")` to gate optional behaviour.
+</Accordion>
+
+<Accordion title="Catch PayloadTooLarge around client.send(...) for user-generated content">
+The local guard is the fast-fail seam; without a catch, a single oversized user message crashes the send loop.
+</Accordion>
+
+<Accordion title="Do not depend on client.features being populated on a legacy gateway">
+Fall through to `supports_event(...)`'s permissive `True` default so a mixed-version fleet keeps working.
 </Accordion>
 
 <Accordion title="Branch on (code, next_step) from hello_error">
