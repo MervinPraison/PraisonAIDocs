@@ -376,12 +376,12 @@ mgr.patch("weekly-summary", old_string="v1", new_string="v2", propose=False)
 
 ## Pending Store & Audit Log
 
-Both artefacts live under the user-owned skills base directory (honouring `PRAISONAI_HOME`):
+Both artefacts **always live in the user-owned skills directory** (`~/.praisonai/skills/`, honouring `PRAISONAI_HOME`), regardless of cwd — so a proposal staged from one project is discoverable when the approver runs from another:
 
 | Path | Format | Purpose |
 |------|--------|---------|
-| `<skills_dir>/.pending_skills.json` | JSON map `{id: record}` | Staged mutations awaiting approval |
-| `<skills_dir>/.skill_audit.log` | JSON-lines | Append-only audit: `proposed` / `approved` / `approval_failed` / `rejected` events |
+| `~/.praisonai/skills/.pending_skills.json` | JSON map `{id: record}` | Staged mutations awaiting approval |
+| `~/.praisonai/skills/.skill_audit.log` | JSON-lines | Append-only audit: `proposed` / `approved` / `approval_failed` / `rejected` events |
 
 **Pending record shape:**
 ```json
@@ -391,7 +391,11 @@ Both artefacts live under the user-owned skills base directory (honouring `PRAIS
   "name": "weekly-summary",
   "status": "pending",
   "created_at": "2026-06-24T11:00:00Z",
-  "payload": { … }
+  "payload": {
+    "content": "…",
+    "category": "reporting",
+    "base_dir": "/path/to/project-a/.praisonai/skills"
+  }
 }
 ```
 
@@ -420,16 +424,75 @@ Both artefacts live under the user-owned skills base directory (honouring `PRAIS
 
 ## Storage Location
 
+`SkillManager` uses **different** rules for where it writes mutations versus where it discovers existing skills for read.
+
 <Note>
-**Base-dir change (PR #2236):** `create_skill` now always writes to the user-owned `get_skills_dir()` (which honours `PRAISONAI_HOME`). Previously it could fall back to an admin-managed location like `/etc/praison/skills`. Set `PRAISONAI_HOME` to control where skills land.
+**Write-path change (PR #3040):** `create_skill` now prefers the project-scoped `./.praisonai/skills/` when that directory exists in the current working directory, falling back to user home otherwise. Previously it always wrote to the user-owned `get_skills_dir()`.
 </Note>
 
-Skills are stored in directories according to this precedence order (highest to lowest):
+### Write path (mutations)
+
+`create_skill`, `edit_skill`, `patch_skill`, `write_skill_file`, and their aliases resolve their destination via `_skills_base_dir()`:
+
+1. **Project (preferred):** `./.praisonai/skills/` — used when that directory already exists in the current working directory.
+2. **User home (fallback):** `~/.praisonai/skills/` — used otherwise. Honours `PRAISONAI_HOME`.
+
+Writes never walk ancestor directories and never touch `/etc/praison/skills` — those apply to discovery only.
+
+<Tip>
+To make a project accumulate its own skills, create the folder once: `mkdir -p .praisonai/skills`. From then on, every mutation from that cwd lands in the project.
+</Tip>
+
+<Note>
+**Where did the file land?** On a successful direct create, the SDK emits an INFO log:
+
+```
+INFO praisonaiagents.skills.manager: Skill created: weekly-summary (SKILL.md at /path/to/.praisonai/skills/weekly-summary/SKILL.md)
+```
+
+Enable it with `logging.basicConfig(level=logging.INFO)`. This is the definitive signal for whether the write went to the project or the user-home fallback.
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+
+from praisonaiagents import SkillManager
+
+mgr = SkillManager()
+mgr.create_skill("weekly-summary", "# Weekly Summary", propose=False)
+# INFO praisonaiagents.skills.manager: Skill created: weekly-summary (SKILL.md at …/.praisonai/skills/weekly-summary/SKILL.md)
+```
+</Note>
+
+### Approval writes back to the origin project
+
+Staging a create with `propose=True` **pins the resolved destination** into the pending record (`payload.base_dir`). Approving that record later — even from a completely different working directory — writes the `SKILL.md` back to the project the proposal originated in.
+
+```mermaid
+sequenceDiagram
+    participant DevA as 🤖 Dev in project A
+    participant Store as 💾 ~/.praisonai/skills/.pending_skills.json
+    participant DevB as 👤 Approver (any cwd)
+    participant DiskA as ✅ project-A/.praisonai/skills/
+
+    DevA->>Store: create_skill(propose=True)<br/>pins base_dir = project-A/.praisonai/skills
+    DevB->>Store: approve(id)
+    Store-->>DevB: payload.base_dir = project-A/.praisonai/skills
+    DevB->>DiskA: writes SKILL.md at the pinned path
+
+    %% #8B0000 agents, #189AB4 store, #10B981 destination
+```
+
+### Discovery path (read)
+
+Discovery (`get_default_skill_dirs()`) walks a **broader** list — unchanged, and applies to *read* only:
 
 1. **Project:** `./.praisonai/skills/` — and `./.claude/skills/` for compatibility
 2. **Ancestor walk:** any `.praisonai/skills` or `.claude/skills` in parent directories
 3. **User:** `~/.praisonai/skills/` (or `$PRAISONAI_HOME/skills/`)
 4. **System (Unix):** `/etc/praison/skills/`
+
+Writes deliberately skip steps 2 and 4 so mutations can never land in an ancestor or admin-managed location.
 
 **Archive store:** Archived skills are moved to `<first_skill_dir>/../skills_archive/`. If a name already exists in the archive, a UTC timestamp suffix is appended (e.g. `weekly-summary.20240624153012`).
 
