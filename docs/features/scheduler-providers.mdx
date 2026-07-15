@@ -1,0 +1,250 @@
+---
+title: "Scheduler Providers"
+sidebarTitle: "Scheduler Providers"
+description: "Choose when scheduled jobs fire — in-process poll (default), systemd/launchd timer, cloud webhook, cron, or serverless"
+icon: "clock"
+---
+
+A scheduler provider decides **when** to fire. The default polls in-process; swap it for systemd, a cloud scheduler webhook, or a cron trigger without changing what fires.
+
+```mermaid
+graph LR
+    P[⏰ Provider — when] -->|on_due| R[⚙️ ScheduleRunner.claim_due]
+    R --> S[🗄️ ScheduleStore]
+    S --> T[🔔 on_trigger job]
+
+    classDef provider fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class P provider
+    class R process
+    class S store
+    class T ok
+```
+
+A provider never decides *what* fires — it just calls `on_due` whenever a tick should occur, and the shared runner and store claim and fire due jobs.
+
+## Which Provider?
+
+Pick in-process when one host runs all the time; pick an external provider when firing should come from elsewhere.
+
+```mermaid
+graph TD
+    Q{How does your app run?}
+    Q -->|Always-on process, one host| InProc[In-process default<br/>daemon poll thread]
+    Q -->|Many hosts / serverless / existing scheduler| Ext[External provider<br/>webhook · systemd · cron · K8s CronJob]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+    class Q q
+    class InProc,Ext opt
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Default — in-process poll (nothing to configure)">
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.scheduler import ScheduleLoop
+
+agent = Agent(name="assistant", instructions="You set reminders.")
+
+loop = ScheduleLoop(on_trigger=lambda job: agent.start(job.message))
+loop.start()  # zero-arg — same as before
+```
+
+</Step>
+<Step title="External / serverless — event-driven, no always-on thread">
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.scheduler import ScheduleLoop
+
+agent = Agent(name="assistant", instructions="You set reminders.")
+
+# Reuse the built-in loop as a pure "claim + fire" engine — do NOT call start().
+engine = ScheduleLoop(on_trigger=lambda job: agent.start(job.message))
+
+# In your webhook / cron / systemd-timer handler:
+def on_cloud_scheduler_ping():
+    engine.fire_due()  # one tick — no daemon thread
+```
+
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+The provider owns the trigger; the runner and store own the firing.
+
+```mermaid
+sequenceDiagram
+    participant Provider
+    participant Runner
+    participant Store
+    participant Agent
+
+    Provider->>Runner: on_due() (tick)
+    Runner->>Store: claim_due()
+    Store-->>Runner: due jobs
+    Runner->>Agent: on_trigger(job)
+    Agent-->>Runner: done
+```
+
+`on_due` is the seam: the provider calls it whenever its trigger fires, and everything downstream — claiming due jobs and firing them — happens in the runner and store.
+
+| Piece | Owns |
+|-------|------|
+| Provider (`SchedulerProviderProtocol`) | *When* a tick happens |
+| `ScheduleRunner` + store | *What* is due and *how* it fires |
+
+---
+
+## Provider Options
+
+Two ways to drive firing — one always-on, one event-driven.
+
+| Provider | When to use | Always-on thread? |
+|----------|-------------|-------------------|
+| `InProcessScheduleProvider` (default, alias for `ScheduleLoop`) | Single always-on process | Yes (daemon) |
+| External (webhook / systemd / cron / K8s CronJob / APScheduler) | Multi-host, serverless, or delegate to existing scheduler | No |
+
+Any object with `start(on_due, store=...)` and `stop()` satisfies `SchedulerProviderProtocol`.
+
+```python
+from praisonaiagents.scheduler import (
+    SchedulerProviderProtocol,
+    InProcessScheduleProvider,
+    ScheduleLoop,
+)
+
+assert InProcessScheduleProvider is ScheduleLoop
+assert isinstance(ScheduleLoop(on_trigger=lambda job: None), SchedulerProviderProtocol)
+```
+
+---
+
+## User Interaction Flow
+
+A reminder set through the agent still fires even when a cloud scheduler drives the tick.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Cloud as Cloud Scheduler
+    participant Engine as ScheduleLoop
+
+    User->>Agent: "Remind me at 9am"
+    Agent->>Engine: schedule_add(...)
+    Note over Cloud: 09:00 — external trigger
+    Cloud->>Engine: POST → fire_due()
+    Engine->>Agent: on_trigger(job)
+    Agent-->>User: "Here's your 9am reminder"
+```
+
+---
+
+## Configuration Options
+
+Providers are protocol-only — see the auto-generated SDK reference for full signatures.
+
+<CardGroup cols={2}>
+  <Card title="Scheduler Protocols" icon="code" href="/docs/sdk/praisonai/scheduler">
+    `SchedulerProviderProtocol`, `ScheduleStoreProtocol`, `JobConditionProtocol`, `GateResult`
+  </Card>
+  <Card title="Schedule Tools" icon="clock" href="/docs/tools/schedule-tools">
+    Agent-callable `schedule_add` / `schedule_list` / `schedule_remove`
+  </Card>
+</CardGroup>
+
+---
+
+## Common Patterns
+
+### Cloud webhook
+
+Cloud Scheduler, EventBridge, or a GitHub Actions cron posts to an HTTP handler that calls `fire_due()`.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.scheduler import ScheduleLoop
+
+agent = Agent(name="assistant", instructions="You set reminders.")
+engine = ScheduleLoop(on_trigger=lambda job: agent.start(job.message))
+
+# e.g. FastAPI / Flask route the cloud scheduler pings on a schedule
+def handle_scheduler_webhook():
+    engine.fire_due()
+    return {"ok": True}
+```
+
+### systemd / launchd timer
+
+A timer unit runs a short command on schedule; the command fires one tick and exits.
+
+```python
+# fire_once.py — invoked by a systemd timer (OnCalendar=*:0/5)
+from praisonaiagents import Agent
+from praisonaiagents.scheduler import ScheduleLoop
+
+agent = Agent(name="assistant", instructions="You set reminders.")
+ScheduleLoop(on_trigger=lambda job: agent.start(job.message)).fire_due()
+```
+
+### Kubernetes CronJob
+
+A short-lived pod runs `fire_due()` and exits — no long-running scheduler pod.
+
+```python
+# entrypoint.py — the CronJob pod's command
+from praisonaiagents import Agent
+from praisonaiagents.scheduler import ScheduleLoop
+
+agent = Agent(name="assistant", instructions="You set reminders.")
+ScheduleLoop(on_trigger=lambda job: agent.start(job.message)).fire_due()
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Never call start() twice on the same loop">
+    `start()` on a running loop is a no-op by design. Treat one loop as one provider — don't try to reconfigure it mid-run.
+  </Accordion>
+  <Accordion title="Use fire_due() directly for serverless">
+    In webhook, cron, or systemd handlers call `engine.fire_due()` and never call `start()` — you get one tick's work with no daemon thread.
+  </Accordion>
+  <Accordion title="Concurrency is safe by default">
+    `fire_due()` runs its claim + fire step under a per-instance lock, so an external caller and the loop thread can't double-fire on non-atomic stores.
+  </Accordion>
+  <Accordion title="Pair external providers with claim_due stores">
+    When firing from multiple hosts, use a store that implements `claim_due` for cross-host at-most-once delivery.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Background Tasks — ScheduleLoop" icon="clock" href="/docs/features/background-tasks#scheduleloop">
+    The in-process poll loop and combined recipes
+  </Card>
+  <Card title="Schedule Tools" icon="wrench" href="/docs/tools/schedule-tools">
+    Let agents create schedules via tool calls
+  </Card>
+  <Card title="Scheduled Run Policy" icon="shield" href="/docs/features/scheduled-run-policy">
+    Safety gate for unattended scheduled runs
+  </Card>
+  <Card title="Scheduler Pre-Run Gate" icon="filter" href="/docs/features/scheduler-pre-run-gate">
+    Skip ticks cheaply before spending tokens
+  </Card>
+</CardGroup>
