@@ -367,65 +367,64 @@ class BaseAutoGenerator:
         # Resolve LLM endpoint configuration from environment variables
         from praisonai.llm.config import build_config_list
         self.config_list = config_list or build_config_list(include_api_type=False)
-        self._openai_client = None  # lazy, per-instance
-        self._async_openai_client = None  # lazy, per-instance async client
+        self._core_client = None  # lazy, per-instance core OpenAIClient
         self._client_lock = threading.Lock()
-        
-    def _get_openai_client(self):
-        """Get or create the OpenAI client for this instance.
+
+    def _get_core_client(self):
+        """Get or create the core-owned ``OpenAIClient`` for this instance.
+
+        The OpenAI leg of the structured-completion ladder is owned by the core
+        SDK (``praisonaiagents.llm.openai_client.OpenAIClient``), which manages
+        sync/async client construction, lifecycle, and the
+        ``beta.chat.completions.parse`` structured-output path. The wrapper
+        delegates to it rather than maintaining a parallel copy.
 
         Lazy-init AND snapshot the client under the same lock so the returned
-        local reference survives a concurrent close() that nulls the attribute,
-        closing the shutdown-during-request race (mirrors the async path).
+        local reference survives a concurrent close()/aclose() that nulls the
+        attribute, closing the shutdown-during-request race.
         """
         with self._client_lock:
-            client = self._openai_client
+            client = self._core_client
             if client is None:
                 try:
-                    from openai import OpenAI
+                    from praisonaiagents.llm.openai_client import OpenAIClient
                 except ImportError as e:
                     raise ImportError("Install with: pip install openai") from e
                 cfg = self.config_list[0]
-                client = self._openai_client = OpenAI(
+                client = self._core_client = OpenAIClient(
                     api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
                     base_url=cfg.get("base_url"),
                 )
             return client
 
     def close(self):
-        """Close the sync OpenAI client if it exists."""
+        """Close the core OpenAI client if it exists."""
         if not hasattr(self, '_client_lock'):
             return  # Object was never fully initialized
         # Snapshot under the lock, close OUTSIDE it, and only null the attribute
         # after a successful close so a failed close can be retried.
         with self._client_lock:
-            client = getattr(self, '_openai_client', None)
+            client = getattr(self, '_core_client', None)
         if client is not None:
             client.close()
         with self._client_lock:
-            if getattr(self, '_openai_client', None) is client:
-                self._openai_client = None
-    
+            if getattr(self, '_core_client', None) is client:
+                self._core_client = None
+
     async def aclose(self):
-        """Close both sync and async OpenAI clients if they exist."""
+        """Close the core OpenAI client if it exists."""
         if not hasattr(self, '_client_lock'):
             return  # Object was never fully initialized
-        # Snapshot under the lock, close OUTSIDE it, and only null each attribute
-        # after its successful close so a failed close can be retried.
+        # Snapshot under the lock, close OUTSIDE it, and only null the attribute
+        # after a successful close so a failed close can be retried.
         with self._client_lock:
-            sync_client = getattr(self, '_openai_client', None)
-            async_client = getattr(self, '_async_openai_client', None)
-        if sync_client is not None:
-            await asyncio.to_thread(sync_client.close)
+            client = getattr(self, '_core_client', None)
+        if client is not None:
+            await client.aclose()
             with self._client_lock:
-                if getattr(self, '_openai_client', None) is sync_client:
-                    self._openai_client = None
-        if async_client is not None:
-            await async_client.close()
-            with self._client_lock:
-                if getattr(self, '_async_openai_client', None) is async_client:
-                    self._async_openai_client = None
-    
+                if getattr(self, '_core_client', None) is client:
+                    self._core_client = None
+
     def __enter__(self):
         return self
     
@@ -440,27 +439,73 @@ class BaseAutoGenerator:
         await self.aclose()
         return False
 
-    
-    def _get_async_openai_client(self):
-        """Get or create the async OpenAI client for this instance.
+    async def _structured_via_registered_provider(
+        self,
+        response_model: Type[T],
+        messages: List[Dict],
+        model_name: str,
+        **kwargs,
+    ):
+        """Delegate structured completion to a user-registered LLM provider.
 
-        Lazy-init AND snapshot the client under the same lock so the returned
-        local reference survives a concurrent aclose() that nulls the attribute,
-        closing the shutdown-during-request race (mirrors the sync path).
+        Consults ``praisonai.llm.registry`` so a provider registered via
+        ``register_llm_provider(...)`` becomes reachable from AutoGenerator (and
+        every generator inheriting from it). Only providers that are (a) NOT a
+        built-in litellm/gateway prefix and (b) opt in by exposing an async
+        ``generate_structured(response_model, messages, **kwargs)`` are used;
+        everything else returns ``None`` so the existing LiteLLM/OpenAI ladder
+        runs unchanged. Never raises for registry issues — returns ``None``.
         """
-        with self._client_lock:
-            client = self._async_openai_client
-            if client is None:
-                try:
-                    from openai import AsyncOpenAI
-                except ImportError as e:
-                    raise ImportError("Install with: pip install openai") from e
-                cfg = self.config_list[0]
-                client = self._async_openai_client = AsyncOpenAI(
-                    api_key=cfg.get("api_key") or os.environ.get("OPENAI_API_KEY"),
-                    base_url=cfg.get("base_url"),
-                )
-            return client
+        if "/" not in model_name:
+            return None
+        provider_id = model_name.split("/", 1)[0].lower()
+        # Built-in prefixes keep the fast, direct LiteLLM/OpenAI ladder below and
+        # are never resolved through the registry — reuse the SAME set as
+        # PraisonAIModel._is_registered_provider() so both hot paths agree on
+        # which providers are "registered" (a custom "openai"/"anthropic"
+        # registration must not hijack the built-in path here).
+        try:
+            from praisonai.inc.models import _BUILTIN_MODEL_PREFIXES
+        except ImportError:
+            _BUILTIN_MODEL_PREFIXES = frozenset(
+                {"openai", "groq", "cohere", "ollama",
+                 "anthropic", "google", "openrouter"}
+            )
+        if provider_id in _BUILTIN_MODEL_PREFIXES:
+            return None
+        try:
+            from praisonai.llm import create_llm_provider, has_llm_provider
+        except ImportError:
+            return None
+        # Forward the selected generator's config so a provider that needs it for
+        # generate_structured() authenticates correctly — mirrors what
+        # PraisonAIModel passes. Preserve provider-specific fields (e.g.
+        # aws_region, timeout, model_kwargs) but drop empty credential entries so
+        # a provider's own credential chain is not shadowed by empty values.
+        cfg = self.config_list[0]
+        provider_config = {
+            k: v
+            for k, v in cfg.items()
+            if k != "model" and not (k in ("api_key", "base_url") and not v)
+        }
+        try:
+            if not has_llm_provider(provider_id):
+                return None
+            provider = create_llm_provider(
+                model_name, config=provider_config or None
+            )
+        except Exception as exc:
+            logger.debug(
+                "Registered provider lookup for %r failed (%s); "
+                "using built-in completion ladder.", model_name, exc
+            )
+            return None
+        generate_structured = getattr(provider, "generate_structured", None)
+        if not callable(generate_structured):
+            return None
+        return await _maybe_await(
+            generate_structured(response_model, messages, **kwargs)
+        )
 
     async def _completion_impl(
         self,
@@ -479,6 +524,16 @@ class BaseAutoGenerator:
         paths into one place so the ladder can only ever be changed once.
         """
         model_name = self.config_list[0]['model']
+
+        # Extension point: if the model resolves to a user-registered provider
+        # (praisonai.llm.registry) that opts in by exposing generate_structured,
+        # delegate to it so custom providers (e.g. "bedrock/...") take effect
+        # here. Built-in providers are untouched and keep the ladder below.
+        registered = await self._structured_via_registered_provider(
+            response_model, messages, model_name, **kwargs
+        )
+        if registered is not None:
+            return registered
 
         # Try LiteLLM first (preferred - supports 100+ providers)
         if is_available("litellm"):
@@ -513,27 +568,30 @@ class BaseAutoGenerator:
                     "falling back to OpenAI SDK.", e
                 )
 
-        # Fallback to OpenAI SDK (uses beta.chat.completions.parse)
+        # Fallback to the core-owned OpenAI client (uses beta.chat.completions.parse).
+        # Delegating to praisonaiagents.llm.openai_client.OpenAIClient keeps the
+        # OpenAI structured-output path in a single, core-owned place instead of a
+        # parallel wrapper copy that can silently drift from core.
         if is_available("openai"):
-            client = (
-                self._get_async_openai_client() if is_async
-                else self._get_openai_client()
+            client = self._get_core_client()
+            # The async path awaits the core coroutine directly. The sync path
+            # offloads the blocking core call via asyncio.to_thread so it never
+            # blocks the bridge event loop this coroutine runs on.
+            if is_async:
+                return await client.aparse_structured_output(
+                    messages=messages,
+                    response_format=response_model,
+                    model=model_name,
+                    **kwargs,
+                )
+            return await asyncio.to_thread(
+                lambda: client.parse_structured_output(
+                    messages=messages,
+                    response_format=response_model,
+                    model=model_name,
+                    **kwargs,
+                )
             )
-            parse = client.beta.chat.completions.parse
-            parse_kwargs = dict(
-                model=model_name,
-                messages=messages,
-                response_format=response_model,
-                **kwargs,
-            )
-            # As above: await directly when async, otherwise offload the blocking
-            # sync parse() so the bridge event loop is never blocked.
-            response = (
-                await _maybe_await(parse(**parse_kwargs))
-                if is_async
-                else await asyncio.to_thread(lambda: parse(**parse_kwargs))
-            )
-            return response.choices[0].message.parsed
 
         # Neither available - raise helpful error
         raise ImportError(

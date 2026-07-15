@@ -28,6 +28,7 @@ from .unified_execution_mixin import UnifiedExecutionMixin
 from .sandbox_mixin import SandboxMixin
 from .message_steering import SteeringMixin
 from .skill_review import SkillReviewMixin
+from ..goal.loop import GoalLoopMixin
 
 # Module-level logger for thread safety errors and debugging
 logger = get_logger(__name__)
@@ -221,7 +222,7 @@ from ..errors import BudgetExceededError
 # Import retry configuration
 from .retry_utils import RetryBackoffConfig
 
-class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
+class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
     _agent_counter_lock = threading.Lock()
@@ -360,6 +361,20 @@ class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin
             from ..escalation.loop_guard import LoopGuard, LoopGuardConfig
             self._loop_guard = LoopGuard(LoopGuardConfig(enabled=True))
         return self._loop_guard
+
+    def _ensure_loop_detector(self):
+        """Lazy-create the result-aware tool-loop detector on first tool call.
+
+        Returns a (history, config) pair. The detector is enabled by default so
+        that name+args+result-hash fingerprinting actually runs in the tool loop.
+        A polling tool returning changing output is NOT flagged (streak breaks on
+        result-hash change); a genuinely stuck repeat or A->B->A->B oscillation is.
+        """
+        if self._loop_detector_config is None:
+            from .loop_detection import LoopDetectionConfig
+            self._loop_detector_config = LoopDetectionConfig(enabled=True)
+            self._loop_detector_history = []
+        return self._loop_detector_history, self._loop_detector_config
     
     @classmethod
     def _configure_logging(cls):
@@ -522,7 +537,7 @@ class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin
         caching: Optional[Union[bool, str, Dict[str, Any], 'CachingConfig']] = None,
         hooks: Optional[Union[List[Any], Dict[str, Any], 'HooksConfig']] = None,
         skills: Optional[Union[List[str], str, Dict[str, Any], 'SkillsConfig']] = None,
-        self_improve: Optional[Union[bool, 'SkillReviewProtocol']] = False,  # Autonomous skill self-improvement loop (off by default)
+        self_improve: Optional[Union[bool, str, 'SkillReviewProtocol']] = False,  # Autonomous skill self-improvement loop (off by default)
         approval: Optional[Union[bool, str, Dict[str, Any], 'ApprovalConfig', 'ApprovalProtocol']] = None,
         tool_config: Optional[Union[bool, 'ToolConfig']] = None,  # Tool execution configuration (timeout, retry, parallel)
         learn: Optional[Union[bool, str, Dict[str, Any], 'LearnConfig']] = None,  # Continuous learning (peer to memory)
@@ -580,6 +595,11 @@ class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin
                 ``skill_manage`` tool that asks the agent to capture a reusable
                 technique as a new/patched skill. Accepts:
                 - bool: True enables with the default review policy, False disables
+                - str: "inline"/"blocking" runs the review synchronously (same
+                  as True); "background" delivers the reply first and runs the
+                  review + auto-memory/auto-learning extraction off the hot path
+                  on the core BackgroundJobManager (recommended for long-lived
+                  gateway/bot agents, issue #2985).
                 - SkillReviewProtocol: Custom review policy
                 This is distinct from ``reflection`` (which is answer-quality
                 retry) — it captures durable capability across runs.
@@ -1490,6 +1510,14 @@ class Agent(SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin
         # Initialize loop guard lazily on first tool execution (zero init overhead)
         self._loop_guard = None
 
+        # Result-aware tool-loop detector (name + args + result-hash fingerprints).
+        # History and detector are created lazily on first tool call to keep
+        # init overhead at zero. See _ensure_loop_detector().
+        self._loop_detector_history = None
+        self._loop_detector_config = None
+        self._loop_warned_this_turn = False
+        self._pending_self_correction = None
+
         # If instructions are provided, use them to set role, goal, and backstory
         if instructions:
             # Only use explicitly provided name, don't auto-generate from instructions
@@ -1913,6 +1941,9 @@ Your Goal: {self.goal}
         # rules both hide tools from the advertised schema and block them at
         # call time (native + MCP, uniformly). None = no pattern rules consulted.
         self._permission_manager = None
+        # Optional Claude-Code-parity PermissionMode (bypass/plan/dont_ask/…).
+        # None = normal rule flow. Consulted at tool-call approval time.
+        self._permission_mode = None
         if isinstance(approval, str) and approval not in ('True', 'False'):
             # Permission preset: "safe", "read_only", "full"
             from ..approval.registry import PERMISSION_PRESETS
@@ -1992,6 +2023,7 @@ Your Goal: {self.goal}
             self._approval_timeout = approval.timeout  # None = indefinite, 0 = backend default
             # Store permissions if provided (for CI-safe declarative policies)
             self._approval_permissions = getattr(approval, 'permissions', None)
+            self._permission_mode = getattr(approval, 'permission_mode', None)
         elif isinstance(approval, dict):
             # Dict config: convert to ApprovalConfig
             approval_config = ApprovalConfig(**approval)
@@ -1999,6 +2031,7 @@ Your Goal: {self.goal}
             self._approve_all_tools = approval_config.all_tools
             self._approval_timeout = approval_config.timeout
             self._approval_permissions = getattr(approval_config, 'permissions', None)
+            self._permission_mode = getattr(approval_config, 'permission_mode', None)
         else:
             # Plain backend object — dangerous tools only, backend default timeout
             self._approval_backend = approval
@@ -2119,7 +2152,33 @@ Your Goal: {self.goal}
         # Autonomous skill self-improvement loop (issue #2231). Off by default;
         # when enabled, a guarded review pass restricted to skill_manage runs
         # after each task. A SkillReviewProtocol instance customises the policy.
-        if self_improve is True or self_improve is False or self_improve is None:
+        # Execution mode for the after-agent self-improvement side-effects
+        # (skill-review + auto-memory + auto-learning). "inline" (default)
+        # preserves today's synchronous behaviour; "background" delivers the
+        # reply first and runs the extra LLM work off the hot path on the core
+        # BackgroundJobManager (issue #2985).
+        self._self_improve_mode = "inline"
+        if isinstance(self_improve, str):
+            mode = self_improve.strip().lower()
+            if mode in ("background", "async"):
+                self._self_improve = True
+                self._self_improve_policy = None
+                self._self_improve_mode = "background"
+            elif mode in ("inline", "blocking", "sync", "true", "on", "yes", "1"):
+                self._self_improve = True
+                self._self_improve_policy = None
+            else:
+                # Falsy ("false"/"off"/"no"/"0"/""), or an unrecognised value
+                # (e.g. a typo like "backround"): default to disabled rather
+                # than silently enabling an extra review turn on every reply.
+                if mode not in ("false", "off", "no", "0", ""):
+                    logger.warning(
+                        "Unknown self_improve mode %r; disabling self-improvement. "
+                        "Use 'inline', 'background', or a bool.", self_improve,
+                    )
+                self._self_improve = False
+                self._self_improve_policy = None
+        elif self_improve is True or self_improve is False or self_improve is None:
             self._self_improve = bool(self_improve)
             self._self_improve_policy = None
         else:
@@ -2296,10 +2355,16 @@ Your Goal: {self.goal}
             'approval': getattr(self, '_approval_config', None),
             'learn': getattr(self, '_learn_config', None),
             # Autonomous skill self-improvement: forward the custom policy when
-            # set, else the opt-in boolean, so clones keep the same behavior.
+            # set, else the execution-mode string ("background") when enabled so
+            # clones keep the same hot-path behaviour, else the opt-in boolean.
             'self_improve': (
                 getattr(self, '_self_improve_policy', None)
-                or getattr(self, '_self_improve', False)
+                or (
+                    getattr(self, '_self_improve_mode', 'inline')
+                    if getattr(self, '_self_improve', False)
+                    and getattr(self, '_self_improve_mode', 'inline') == 'background'
+                    else getattr(self, '_self_improve', False)
+                )
             ),
             'tool_search': getattr(self, '_tool_search_config', None),
             # Tool configuration - use consolidated config when available  
@@ -2477,6 +2542,71 @@ Your Goal: {self.goal}
                 "cost": self._total_cost,
                 "llm_calls": self._llm_call_count,
             }
+
+    def _run_spend(self) -> tuple:
+        """Return cumulative (usd, tokens) spent by this agent so far.
+
+        Reuses the per-run cost/token accounting already accumulated in
+        ``chat``/``achat`` (``_total_cost``, ``_total_tokens_in/out``). Used by
+        ``run_autonomous`` to enforce the spend kill-switch each iteration.
+        """
+        with self._cost_lock:
+            return (
+                self._total_cost,
+                self._total_tokens_in + self._total_tokens_out,
+            )
+
+    def _autonomy_budget_result(self, iterations, stage, actions_taken,
+                                start_time, started_at, last_output,
+                                spend_baseline=(0.0, 0)):
+        """Return an AutonomyResult if the run's spend cap is exceeded, else None.
+
+        Compares *this run's* spend against the autonomy
+        ``max_budget_usd``/``max_tokens`` caps. ``spend_baseline`` is the
+        ``(usd, tokens)`` snapshot taken at the start of the autonomous loop, so
+        prior usage on a reused Agent (earlier ``chat``/``run_autonomous`` calls
+        accumulated in the lifetime counters) does not count against this run's
+        cap. Either/both caps unset = unlimited, preserving today's behaviour
+        (returns None → run continues). On exceed, returns a typed
+        ``budget_exhausted`` outcome carrying spend-so-far and the partial
+        result; ``budget_action='pause'`` marks it recoverable.
+        """
+        cap_usd = self.autonomy_config.get("max_budget_usd")
+        cap_tok = self.autonomy_config.get("max_tokens")
+        if cap_usd is None and cap_tok is None:
+            return None
+        raw_usd, raw_toks = self._run_spend()
+        base_usd, base_toks = spend_baseline
+        usd = raw_usd - base_usd
+        toks = raw_toks - base_toks
+        exceeded = (
+            (cap_usd is not None and usd >= cap_usd)
+            or (cap_tok is not None and toks >= cap_tok)
+        )
+        if not exceeded:
+            return None
+        import time as _time_module
+        from .autonomy import AutonomyResult
+        from ..run_outcome import TerminationReason
+        action = self.autonomy_config.get("budget_action", "pause")
+        status = "paused" if action == "pause" else "stopped"
+        return AutonomyResult(
+            success=False,
+            output=last_output or "",
+            completion_reason=TerminationReason.BUDGET_EXHAUSTED.value,
+            iterations=iterations,
+            stage=stage,
+            actions=actions_taken,
+            duration_seconds=_time_module.time() - start_time,
+            started_at=started_at,
+            metadata={
+                "spend_usd": usd,
+                "tokens": toks,
+                "max_budget_usd": cap_usd,
+                "max_tokens": cap_tok,
+                "status": status,
+            },
+        )
 
     @property
     def context_manager(self) -> Optional[Any]:
@@ -2898,7 +3028,10 @@ Summary:"""
         """
         # Initialize verification hooks (always available, even without autonomy)
         self._verification_hooks = verification_hooks or []
-        
+
+        # Goal-loop state (default: disabled → autonomous loop unchanged)
+        self._init_goal_state()
+
         if autonomy is None or autonomy is False:
             self.autonomy_enabled = False
             self.autonomy_config = {}
@@ -2975,6 +3108,9 @@ Summary:"""
             "track_changes": config.effective_track_changes,
             "snapshot_dir": config.snapshot_dir,
             "default_tools": config.default_tools,
+            "max_budget_usd": config.max_budget_usd,
+            "max_tokens": config.max_tokens,
+            "budget_action": config.budget_action,
         }
         # Also preserve any extra user-provided keys from dict input
         if isinstance(autonomy, dict):
@@ -3153,6 +3289,31 @@ Summary:"""
         if self._doom_loop_tracker is not None:
             self._doom_loop_tracker.record(action_type, args, result, success)
     
+    @staticmethod
+    def _response_indicates_failure(response_str: str) -> bool:
+        """Best-effort per-iteration failure signal for doom-loop tracking.
+
+        Replaces the old hard-coded ``success=True`` fed to the DoomLoopTracker,
+        which made the consecutive-failure detector impossible to fire. This is a
+        lightweight heuristic on the visible response text; the authoritative
+        result-aware loop detection now runs in the tool-execution path.
+        """
+        if not response_str:
+            return True
+        lowered = response_str.strip().lower()
+        # Only unambiguous hard-failure markers. Phrases like "i am/was unable
+        # to <X>" are deliberately excluded: an agent can complete a task via an
+        # alternate path while noting it could not obtain some optional data, so
+        # treating those as failures would trip consecutive-failure recovery even
+        # while progress is being made.
+        _markers = (
+            "traceback (most recent call last)",
+            "an error occurred",
+            "i encountered an error",
+            "failed to complete the task",
+        )
+        return any(m in lowered for m in _markers)
+
     def _is_doom_loop(self) -> bool:
         """Check if we're in a doom loop.
         
@@ -3167,6 +3328,29 @@ Summary:"""
         """Reset doom loop tracking."""
         if self._doom_loop_tracker is not None:
             self._doom_loop_tracker.reset()
+
+    def _reset_loop_warnings(self) -> None:
+        """Clear stale loop-warning latch/nudge from a prior autonomous run.
+
+        Called at the top of run_autonomous(_async) so a self-correction
+        queued near the end of a previous run never leaks into an unrelated
+        task's first prompt.
+        """
+        self._pending_self_correction = None
+        self._loop_warned_this_turn = False
+
+    def _consume_self_correction(self, prompt: str) -> str:
+        """Reset the per-turn warning latch and inject any queued nudge.
+
+        Two-tier response: if the result-aware tool-loop detector queued a
+        self-correction nudge last turn, append it to this turn's prompt (one
+        chance to adapt before the critical hard-stop fires on persistence).
+        """
+        self._loop_warned_this_turn = False
+        if getattr(self, '_pending_self_correction', None):
+            prompt = f"{prompt}\n\n{self._pending_self_correction}"
+            self._pending_self_correction = None
+        return prompt
     
     @staticmethod
     def _is_completion_signal(response_text: str) -> bool:
@@ -3311,6 +3495,9 @@ Summary:"""
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         iterations = 0
         actions_taken = []
+        # Spend baseline: snapshot lifetime spend so the budget cap measures
+        # only THIS run (reused Agents keep prior chat/run spend in the counters).
+        spend_baseline = self._run_spend()
         
         # Get config values
         config_max_iter = self.autonomy_config.get("max_iterations", 20)
@@ -3331,6 +3518,8 @@ Summary:"""
         
         # Reset doom loop tracker for new task
         self._reset_doom_loop()
+        # Clear any stale loop-warning latch/nudge from a previous run.
+        self._reset_loop_warnings()
         
         # P3/G2: Import callback helper for autonomy events
         from ..main import execute_sync_callback
@@ -3378,8 +3567,10 @@ Summary:"""
                 # Always use the original prompt (prompt re-injection)
                 # Reset per-turn tool count for no-tool-call detection
                 self._autonomy_turn_tool_count = 0
+                # Reset the per-turn warning latch and inject any queued nudge.
+                turn_prompt = self._consume_self_correction(prompt)
                 try:
-                    response = self.chat(prompt)
+                    response = self.chat(turn_prompt)
                 except Exception as e:
                     return AutonomyResult(
                         success=False,
@@ -3395,18 +3586,37 @@ Summary:"""
                 
                 response_str = str(response)
                 
+                # Spend kill-switch: halt if cumulative cost/tokens exceed cap.
+                # Zero overhead when no cap is set (returns None immediately).
+                _budget_result = self._autonomy_budget_result(
+                    iterations, stage, actions_taken, start_time, started_at,
+                    response_str, spend_baseline
+                )
+                if _budget_result is not None:
+                    execute_sync_callback('autonomy_complete',
+                        completion_reason=_budget_result.completion_reason,
+                        iterations=iterations,
+                        duration_seconds=time_module.time() - start_time
+                    )
+                    return _budget_result
+                
                 # Record response text for content streaming loop detection
                 if self._doom_loop_tracker is not None:
                     self._doom_loop_tracker.record_response(response_str)
                 
-                # Record the action for doom loop tracking (G1 fix: was missing)
-                # Use response hash only — iteration was removed because it made
-                # every fingerprint unique, preventing doom loop detection.
+                # Record the action for doom loop tracking (G1 fix: was missing).
+                # The result-aware tool-loop detector (name+args+result-hash,
+                # ping-pong) now owns per-tool-call loop detection in the
+                # tool-execution path; DoomLoopDetector is kept for the
+                # content-loop/"chanting" and time checks it does uniquely.
+                # Derive a REAL success signal instead of the old hard-coded True
+                # (which made the failure-streak detector impossible to fire).
+                iteration_success = not self._response_indicates_failure(response_str)
                 self._record_action(
-                    "chat", 
-                    {"response_hash": hash(response_str[:500])}, 
-                    response_str[:200], 
-                    True
+                    "chat",
+                    {"response_hash": hash(response_str[:500])},
+                    response_str[:200],
+                    iteration_success,
                 )
                 
                 # Check doom loop AFTER recording action so detector sees
@@ -3491,7 +3701,36 @@ Summary:"""
                 
                 # Auto-save session after each iteration (memory integration)
                 self._auto_save_session()
-                
+
+                # ─────────────────────────────────────────────────────────────
+                # GOAL COMPLETION JUDGE (opt-in): when a goal loop is active,
+                # an independent judge gates termination on the goal's
+                # acceptance criteria instead of the keyword/promise heuristics.
+                # When no goal is set, this is a no-op (behaviour unchanged).
+                # ─────────────────────────────────────────────────────────────
+                _goal_gate = self._goal_gate(response_str)
+                if _goal_gate is not None:
+                    _outcome, _reason = _goal_gate
+                    if _outcome == "done":
+                        return AutonomyResult(
+                            success=True, output=response_str,
+                            completion_reason="goal_met", iterations=iterations,
+                            stage=stage, actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                    if _outcome == "budget_paused":
+                        return AutonomyResult(
+                            success=False, output=response_str,
+                            completion_reason="budget_paused",
+                            iterations=iterations, stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                    prompt = self._goal_continuation_prompt(self._goal_state)
+                    continue
+
                 # ─────────────────────────────────────────────────────────────
                 # TOOL-CALL COMPLETION: If the model used tools this turn AND
                 # produced a substantive response, the inner loop completed
@@ -3731,6 +3970,9 @@ Summary:"""
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         iterations = 0
         actions_taken = []
+        # Spend baseline: snapshot lifetime spend so the budget cap measures
+        # only THIS run (reused Agents keep prior chat/run spend in the counters).
+        spend_baseline = self._run_spend()
         
         # Get config values
         config_max_iter = self.autonomy_config.get("max_iterations", 20)
@@ -3751,6 +3993,8 @@ Summary:"""
         
         # Reset doom loop tracker for new task
         self._reset_doom_loop()
+        # Clear any stale loop-warning latch/nudge from a previous run.
+        self._reset_loop_warnings()
         
         try:
             # Execute the autonomous loop
@@ -3789,8 +4033,10 @@ Summary:"""
                 # Always use the original prompt (prompt re-injection)
                 # Reset per-turn tool count for no-tool-call detection
                 self._autonomy_turn_tool_count = 0
+                # Reset the per-turn warning latch and inject any queued nudge.
+                turn_prompt = self._consume_self_correction(prompt)
                 try:
-                    response = await self.achat(prompt)
+                    response = await self.achat(turn_prompt)
                 except Exception as e:
                     return AutonomyResult(
                         success=False,
@@ -3806,18 +4052,32 @@ Summary:"""
                 
                 response_str = str(response)
                 
+                # Spend kill-switch: halt if cumulative cost/tokens exceed cap.
+                # Zero overhead when no cap is set (returns None immediately).
+                _budget_result = self._autonomy_budget_result(
+                    iterations, stage, actions_taken, start_time, started_at,
+                    response_str, spend_baseline
+                )
+                if _budget_result is not None:
+                    return _budget_result
+                
                 # Record response text for content streaming loop detection
                 if self._doom_loop_tracker is not None:
                     self._doom_loop_tracker.record_response(response_str)
                 
-                # Record the action for doom loop tracking (G1 fix: was missing)
-                # Use response hash only — iteration was removed because it made
-                # every fingerprint unique, preventing doom loop detection.
+                # Record the action for doom loop tracking (G1 fix: was missing).
+                # The result-aware tool-loop detector (name+args+result-hash,
+                # ping-pong) now owns per-tool-call loop detection in the
+                # tool-execution path; DoomLoopDetector is kept for the
+                # content-loop/"chanting" and time checks it does uniquely.
+                # Derive a REAL success signal instead of the old hard-coded True
+                # (which made the failure-streak detector impossible to fire).
+                iteration_success = not self._response_indicates_failure(response_str)
                 self._record_action(
-                    "chat", 
-                    {"response_hash": hash(response_str[:500])}, 
-                    response_str[:200], 
-                    True
+                    "chat",
+                    {"response_hash": hash(response_str[:500])},
+                    response_str[:200],
+                    iteration_success,
                 )
                 
                 # Check doom loop AFTER recording action so detector sees
@@ -3895,7 +4155,35 @@ Summary:"""
                 
                 # Auto-save session after each async iteration (memory integration)
                 self._auto_save_session()
-                
+
+                # ─────────────────────────────────────────────────────────────
+                # GOAL COMPLETION JUDGE (opt-in): independent acceptance-criteria
+                # gate. No-op when no goal loop is active (behaviour unchanged).
+                # ─────────────────────────────────────────────────────────────
+                _goal_gate = self._goal_gate(response_str)
+                if _goal_gate is not None:
+                    _outcome, _reason = _goal_gate
+                    if _outcome == "done":
+                        return AutonomyResult(
+                            success=True, output=response_str,
+                            completion_reason="goal_met", iterations=iterations,
+                            stage=stage, actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                    if _outcome == "budget_paused":
+                        return AutonomyResult(
+                            success=False, output=response_str,
+                            completion_reason="budget_paused",
+                            iterations=iterations, stage=stage,
+                            actions=actions_taken,
+                            duration_seconds=time_module.time() - start_time,
+                            started_at=started_at,
+                        )
+                    prompt = self._goal_continuation_prompt(self._goal_state)
+                    await asyncio.sleep(0)
+                    continue
+
                 # ─────────────────────────────────────────────────────────────
                 # TOOL-CALL COMPLETION: If the model used tools this turn AND
                 # produced a substantive response, the inner loop completed
@@ -4074,19 +4362,26 @@ Summary:"""
     def run_until(
         self,
         prompt: str,
-        criteria: str,
+        criteria: str = "",
         threshold: float = 8.0,
         max_iterations: int = 5,
         mode: str = "optimize",
         on_iteration: Optional[Callable[[Any], None]] = None,
         verbose: bool = False,
+        goal: Optional[str] = None,
+        goal_criteria: Optional[Any] = None,
+        judge_model: Optional[str] = None,
     ) -> "EvaluationLoopResult":
         """
         Run agent iteratively until output meets quality criteria.
         
         This method implements the "Ralph Loop" pattern: run agent → judge output
         → improve based on feedback → repeat until threshold met.
-        
+
+        When ``goal`` is provided, delegates to the tool-using goal loop
+        (:meth:`run_goal`) so the acceptance-criteria completion judge gates a
+        real tool-iteration loop (rather than re-generating a whole answer).
+
         Args:
             prompt: The prompt to send to the agent
             criteria: Evaluation criteria for the Judge (e.g., "Response is thorough")
@@ -4095,10 +4390,19 @@ Summary:"""
             mode: "optimize" (stop on success) or "review" (run all iterations)
             on_iteration: Optional callback called after each iteration
             verbose: Enable verbose logging
+            goal: Optional goal text — enables the tool-using goal loop
+            goal_criteria: Optional structured GoalCriteria for the goal loop
+            judge_model: Optional independent judge model for the goal loop
             
         Returns:
-            EvaluationLoopResult with iteration history and final score
-            
+            EvaluationLoopResult with iteration history and final score.
+
+            NOTE: when ``goal`` is provided this delegates to the tool-using
+            goal loop and returns an
+            :class:`~praisonaiagents.agent.autonomy.AutonomyResult` instead
+            (``success``/``output``/``completion_reason``), which is a
+            different shape from the default ``EvaluationLoopResult``.
+
         Example:
             ```python
             agent = Agent(name="analyzer", instructions="Analyze systems")
@@ -4111,6 +4415,17 @@ Summary:"""
             print(result.success)      # True
             ```
         """
+        if goal is not None:
+            # Prefer explicit structured criteria; otherwise fold the string
+            # ``criteria`` into a GoalCriteria so it is not silently dropped.
+            effective_criteria = goal_criteria
+            if effective_criteria is None and criteria:
+                from ..goal.models import GoalCriteria
+                effective_criteria = GoalCriteria(outcome=criteria)
+            return self.run_goal(
+                prompt, goal, criteria=effective_criteria,
+                max_turns=max_iterations, judge_model=judge_model,
+            )
         from ..eval.loop import EvaluationLoop
         
         loop = EvaluationLoop(

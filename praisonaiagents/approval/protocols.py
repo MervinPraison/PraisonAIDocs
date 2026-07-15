@@ -53,6 +53,18 @@ class ApprovalDecision:
         modified_args: Optional replacement arguments (empty = use originals).
         approver:      Who/what approved (user, system, webhook, …).
         metadata:      Backend-specific metadata (timestamps, IPs, …).
+        scope:         How long the decision should be remembered:
+                       ``"once"`` (default — this call only, backward
+                       compatible), ``"session"`` (auto-approve matching calls
+                       for the rest of this run) or ``"always"`` (persist an
+                       allow-rule to disk so future runs don't re-ask). The
+                       registry bridges ``session``/``always`` into the durable
+                       :class:`PermissionManager` store; ``once`` keeps the
+                       existing in-memory fast-path.
+        scope_pattern: Optional reusable target/pattern to persist for
+                       ``session``/``always`` scopes (e.g. ``"bash:git status *"``
+                       or ``"edit:src/app.py"``). When ``None`` the registry
+                       derives one from the tool call.
     """
 
     approved: bool
@@ -60,6 +72,8 @@ class ApprovalDecision:
     modified_args: Dict[str, Any] = field(default_factory=dict)
     approver: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    scope: str = "once"
+    scope_pattern: Optional[str] = None
 
 
 @dataclass
@@ -87,12 +101,18 @@ class ApprovalConfig:
         permissions: Declarative permission rules mapping patterns to actions
                     (e.g., {"read:*": "allow", "bash:rm *": "deny"}).
                     Used for CI-safe, non-interactive permission policies.
+        permission_mode: Optional Claude-Code-parity mode controlling the
+                    overall permission behaviour (``PermissionMode`` enum or its
+                    string value). ``bypass_permissions`` skips all checks,
+                    ``plan`` denies write operations, ``dont_ask`` auto-denies
+                    prompts. ``None``/``default`` uses the normal rule flow.
     """
 
     backend: Any = None
     all_tools: bool = False
     timeout: Optional[float] = 0
     permissions: Optional[Dict[str, Any]] = None
+    permission_mode: Optional[Any] = None
 
 
 @runtime_checkable

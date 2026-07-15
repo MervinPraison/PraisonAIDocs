@@ -535,6 +535,40 @@ class ToolExecutionMixin:
                         is_retryable=False
                     )
 
+            # Result-aware tool-loop detection (name + args + result-hash).
+            # Record this call, then run the detector on the pre-execution
+            # history. On a CRITICAL verdict, block before executing (a genuine
+            # stuck stall or A->B->A->B oscillation). A WARNING queues a
+            # one-shot self-correction nudge for the next autonomous turn.
+            # Zero overhead when disabled; polling with changing output is NOT
+            # flagged (streaks break on result-hash change).
+            if hasattr(self, '_ensure_loop_detector'):
+                from . import loop_detection as _loop_detection
+                _ld_history, _ld_config = self._ensure_loop_detector()
+                if _ld_config.enabled:
+                    _loop_detection.record_tool_call(
+                        _ld_history, function_name, arguments, _ld_config
+                    )
+                    _verdict = _loop_detection.detect_tool_loop(
+                        _ld_history, function_name, arguments, _ld_config
+                    )
+                    if _verdict.get("stuck"):
+                        if _verdict.get("level") == "critical":
+                            # Block via the shared blocked_result path so trace
+                            # spans, stream events, AFTER_TOOL hooks, doom-loop
+                            # and loop-guard teardown still run (matches the
+                            # loop_guard BLOCK behaviour at line ~524).
+                            blocked_result = {
+                                "error": _verdict.get("message", "loop detected"),
+                                "loop_blocked": True,
+                            }
+                        elif not getattr(self, '_loop_warned_this_turn', False):
+                            self._loop_warned_this_turn = True
+                            self._pending_self_correction = (
+                                f"[System: repeated {_verdict.get('detector')} detected. "
+                                f"Try a different approach. {_verdict.get('message', '')}]"
+                            )
+
             # C4 — optional tool-argument validation via ToolValidatorProtocol.
             # Zero overhead when not set. Users wire via `agent._tool_validator = MyValidator()`.
             _validator = getattr(self, '_tool_validator', None)
@@ -921,6 +955,17 @@ class ToolExecutionMixin:
                     else:
                         result = {"value": result, "_additional_context": extra_context}
             
+            # Back-fill the result hash so the result-aware detector can tell a
+            # genuine stall (identical output) from legitimate polling (changing
+            # output). This is the key data-fix: fingerprints now include output.
+            if hasattr(self, '_ensure_loop_detector'):
+                from . import loop_detection as _loop_detection
+                _ld_history, _ld_config = self._ensure_loop_detector()
+                if _ld_config.enabled:
+                    _loop_detection.record_tool_outcome(
+                        _ld_history, function_name, arguments, result, _ld_config
+                    )
+
             # G10 fix: Mark progress after successful tool execution
             # This prevents false doom loop detection when tools succeed
             if self._doom_loop_tracker is not None and result is not None:
@@ -968,16 +1013,15 @@ class ToolExecutionMixin:
                 ) from e
             raise  # Re-raise if already wrapped
 
-    def _trigger_after_agent_hook(self, prompt, response, start_time, tools_used=None):
-        """Trigger AFTER_AGENT hook and return response."""
-        # During a guarded skill-review turn, skip the entire after-agent
-        # side-effect pipeline (hooks, auto-memory, auto-learning, nudge,
-        # skill-review). The review turn is internal and must not re-fire
-        # these effects or recurse into another review.
-        if getattr(self, "_in_skill_review", False):
-            return response
+    def _build_after_agent_input(self, prompt, response, start_time, tools_used=None):
+        """Build the AfterAgentInput payload shared by sync/async hook dispatch.
+
+        Loop-agnostic (no ``await``, no event-loop interaction) so it can be
+        reused by both ``_trigger_after_agent_hook`` and
+        ``_atrigger_after_agent_hook`` without any async-safety change.
+        """
         from ..hooks import HookEvent, AfterAgentInput
-        after_agent_input = AfterAgentInput(
+        return AfterAgentInput(
             session_id=getattr(self, '_session_id', 'default'),
             cwd=os.getcwd(),
             event_name=HookEvent.AFTER_AGENT,
@@ -989,13 +1033,20 @@ class ToolExecutionMixin:
             total_tokens=0,
             execution_time_ms=(time.time() - start_time) * 1000
         )
-        self._hook_runner.execute_sync(HookEvent.AFTER_AGENT, after_agent_input)
-        
+
+    def _after_agent_side_effects(self, prompt, response):
+        """Run loop-agnostic after-agent side effects (no ``await`` inside).
+
+        Covers auto-memory extraction, auto-learning extraction, and the
+        periodic learning nudge. Skill-review and hook dispatch remain in the
+        respective sync/async public methods because they differ on the async
+        boundary.
+        """
         # Auto-memory extraction (opt-in via MemoryConfig(auto_memory=True))
         if response:
             prompt_str = prompt if isinstance(prompt, str) else str(prompt)
             self._process_auto_memory(prompt_str, str(response))
-        
+
         # Auto-learning extraction (opt-in via LearnConfig(mode=LearnMode.AGENTIC))
         self._process_auto_learning()
 
@@ -1011,13 +1062,32 @@ class ToolExecutionMixin:
             # Log learning nudge failures for debugging
             logger.warning("Learning nudge generation failed: %s", e, exc_info=True)
 
+    def _trigger_after_agent_hook(self, prompt, response, start_time, tools_used=None):
+        """Trigger AFTER_AGENT hook and return response."""
+        # During a guarded skill-review turn, skip the entire after-agent
+        # side-effect pipeline (hooks, auto-memory, auto-learning, nudge,
+        # skill-review). The review turn is internal and must not re-fire
+        # these effects or recurse into another review.
+        if getattr(self, "_in_skill_review", False):
+            return response
+        # Trigger AFTER_AGENT hook (only build the input if a hook is actually registered)
+        from ..hooks import HookEvent
+        if self._hook_runner.registry.has_hooks(HookEvent.AFTER_AGENT):
+            after_agent_input = self._build_after_agent_input(prompt, response, start_time, tools_used)
+            self._hook_runner.execute_sync(HookEvent.AFTER_AGENT, after_agent_input)
+
+        self._after_agent_side_effects(prompt, response)
+
         # Autonomous skill self-improvement loop (opt-in via self_improve=True).
         # Runs a guarded review pass restricted to skill_manage. No-op when
-        # disabled or already inside a review (re-entrancy guarded).
+        # disabled or already inside a review (re-entrancy guarded). In
+        # "background" mode (self_improve="background") the extra LLM review
+        # turn is deferred to the core background runner so the reply is not
+        # gated on it (issue #2985).
         try:
             run_review = getattr(self, "_run_skill_review", None)
             if run_review is not None:
-                run_review(prompt, response, tools_used)
+                self._dispatch_skill_review(run_review, prompt, response, tools_used)
         except Exception as e:
             logger.warning(
                 "Skill self-improvement review failed for agent=%s session_id=%s; "
@@ -1030,49 +1100,51 @@ class ToolExecutionMixin:
 
         return response
 
+    def _dispatch_skill_review(self, run_review, prompt, response, tools_used):
+        """Run the guarded skill review inline or in the background per mode.
+
+        Central routing so the sync and async after-agent paths stay in
+        lock-step. When ``self._self_improve_mode == "background"`` the review
+        (a full extra LLM turn) is enqueued on the core background runner via
+        the mixin's :meth:`_schedule_self_improvement`; otherwise it runs
+        inline exactly as before (default, backward compatible).
+        """
+        if getattr(self, "_self_improve_mode", "inline") == "background":
+            schedule = getattr(self, "_schedule_self_improvement", None)
+            if schedule is not None:
+                schedule(lambda: run_review(prompt, response, tools_used))
+                return
+        run_review(prompt, response, tools_used)
+
     async def _atrigger_after_agent_hook(self, prompt, response, start_time, tools_used=None):
         """Async version: Trigger AFTER_AGENT hook and return response."""
         # During a guarded skill-review turn, skip the entire after-agent
         # side-effect pipeline (see sync variant for rationale).
         if getattr(self, "_in_skill_review", False):
             return response
-        from ..hooks import HookEvent, AfterAgentInput
-        after_agent_input = AfterAgentInput(
-            session_id=getattr(self, '_session_id', 'default'),
-            cwd=os.getcwd(),
-            event_name=HookEvent.AFTER_AGENT,
-            timestamp=str(time.time()),
-            agent_name=self.name,
-            prompt=prompt if isinstance(prompt, str) else str(prompt),
-            response=response or "",
-            tools_used=tools_used or [],
-            total_tokens=0,
-            execution_time_ms=(time.time() - start_time) * 1000
-        )
-        await self._hook_runner.execute(HookEvent.AFTER_AGENT, after_agent_input)
-        
-        # Auto-memory extraction (opt-in via MemoryConfig(auto_memory=True))
-        if response:
-            prompt_str = prompt if isinstance(prompt, str) else str(prompt)
-            self._process_auto_memory(prompt_str, str(response))
-        
-        # Auto-learning extraction (opt-in via LearnConfig(mode=LearnMode.AGENTIC))
-        self._process_auto_learning()
+        # Trigger AFTER_AGENT hook (only build the input if a hook is actually registered)
+        from ..hooks import HookEvent
+        if self._hook_runner.registry.has_hooks(HookEvent.AFTER_AGENT):
+            after_agent_input = self._build_after_agent_input(prompt, response, start_time, tools_used)
+            await self._hook_runner.execute(HookEvent.AFTER_AGENT, after_agent_input)
 
-        # Periodic nudge (opt-in via LearnConfig(nudge_interval>0)).
-        try:
-            nudge = self._maybe_emit_nudge(prompt if isinstance(prompt, str) else str(prompt))
-            if nudge and hasattr(self, "chat_history") and isinstance(self.chat_history, list):
-                self._append_to_chat_history({"role": "system", "content": nudge.strip()})
-        except Exception as e:
-            # Log learning nudge failures for debugging
-            logger.warning("Learning nudge generation failed: %s", e, exc_info=True)
+        self._after_agent_side_effects(prompt, response)
 
         # Autonomous skill self-improvement loop (opt-in via self_improve=True).
+        # In "background" mode the review runs off the hot path on the core
+        # background runner (issue #2985); otherwise it is awaited inline.
         try:
-            arun_review = getattr(self, "_arun_skill_review", None)
-            if arun_review is not None:
-                await arun_review(prompt, response, tools_used)
+            if getattr(self, "_self_improve_mode", "inline") == "background":
+                run_review = getattr(self, "_run_skill_review", None)
+                schedule = getattr(self, "_schedule_self_improvement", None)
+                if run_review is not None and schedule is not None:
+                    schedule(lambda: run_review(prompt, response, tools_used))
+                elif run_review is not None:
+                    run_review(prompt, response, tools_used)
+            else:
+                arun_review = getattr(self, "_arun_skill_review", None)
+                if arun_review is not None:
+                    await arun_review(prompt, response, tools_used)
         except Exception as e:
             logger.warning(
                 "Skill self-improvement review failed for agent=%s session_id=%s; "
@@ -1228,7 +1300,18 @@ class ToolExecutionMixin:
         from ..approval.protocols import ApprovalRequest, ApprovalDecision
         from ..approval.registry import DEFAULT_DANGEROUS_TOOLS
         from ..tools import get_registry as get_tool_registry
-        
+
+        # PermissionMode / PermissionManager gate. This must run *before* the
+        # backend/registry approval logic so an explicit ``ask`` rule actually
+        # prompts, a ``deny`` rejects, ``PermissionMode.BYPASS`` short-circuits
+        # to always-allow, and ``PLAN``/``DONT_ASK`` deny as documented.
+        mode_decision = self._resolve_permission_mode_decision(
+            tool_name, is_async=is_async
+        )
+        if mode_decision is not None:
+            return mode_decision
+        manager_forces_approval = self._permission_manager_requires_approval(tool_name)
+
         backend = getattr(self, '_approval_backend', None)
         approve_all = getattr(self, '_approve_all_tools', False)
         
@@ -1249,6 +1332,7 @@ class ToolExecutionMixin:
                 approve_all 
                 or tool_name in DEFAULT_DANGEROUS_TOOLS
                 or registry_required
+                or manager_forces_approval  # explicit PermissionManager ``ask`` rule
                 or (trust_level == "external")  # External tools need approval
             )
             if needs_approval:
@@ -1320,6 +1404,15 @@ class ToolExecutionMixin:
                 else:
                     return ApprovalDecision(approved=True, reason="Not a dangerous tool")
         else:
+            # No approval backend configured. An explicit PermissionManager
+            # ``ask`` rule must still gate the call, so mark it required in the
+            # approval registry (idempotent) before delegating so the registry
+            # prompts instead of silently allowing.
+            if manager_forces_approval:
+                try:
+                    get_approval_registry().add_requirement(tool_name)
+                except Exception:  # noqa: BLE001
+                    pass
             if is_async:
                 return get_approval_registry().approve_async(
                     getattr(self, 'name', None), tool_name, tool_args,
@@ -1328,6 +1421,144 @@ class ToolExecutionMixin:
                 return get_approval_registry().approve_sync(
                     getattr(self, 'name', None), tool_name, tool_args,
                 )
+
+    def _permission_manager_requires_approval(self, function_name) -> bool:
+        """Return ``True`` when an explicit ``ask`` rule gates *function_name*.
+
+        Consults the attached ``PermissionManager`` so a rule with
+        ``action="ask"`` actually drives the approval prompt at execution time
+        (previously only a hard ``deny`` had any effect). ``allow``/``deny`` and
+        the "no matching rule" default are not treated as approval-forcing here
+        (``deny`` is already handled by ``_check_permission_manager_deny``).
+        """
+        manager = getattr(self, "_permission_manager", None)
+        if manager is None:
+            return False
+        try:
+            from ..permissions import PermissionAction
+            action = manager.resolve_tool_action(
+                function_name, getattr(self, "name", None)
+            )
+            return action == PermissionAction.ASK
+        except Exception as e:  # noqa: BLE001
+            logging.debug(
+                "permission manager resolve_tool_action failed for %s: %s",
+                function_name, e,
+            )
+            return False
+
+    def _resolve_permission_mode_decision(self, function_name, is_async=False):
+        """Apply ``PermissionMode`` to *function_name*, if a mode is set.
+
+        Returns an ``ApprovalDecision`` (or its awaitable in async context) when
+        the mode determines the outcome, else ``None`` to defer to the normal
+        approval flow.
+
+        - ``BYPASS``: skip all permission checks → always allow.
+        - ``PLAN``: read-only exploration → deny any tool not tagged read-only.
+        - ``DONT_ASK``: auto-deny anything that would otherwise prompt for input
+          (an explicit ``ask`` rule or a known dangerous tool).
+        - ``DEFAULT``/``ACCEPT_EDITS``/unset: defer (return ``None``).
+        """
+        mode = getattr(self, "_permission_mode", None)
+        if mode is None:
+            return None
+        try:
+            from ..permissions import PermissionMode
+        except Exception:  # noqa: BLE001
+            return None
+
+        # Normalise string values to the enum for robustness.
+        if isinstance(mode, str):
+            try:
+                mode = PermissionMode(mode)
+            except ValueError:
+                return None
+
+        from ..approval.protocols import ApprovalDecision
+
+        def _wrap(decision):
+            if is_async:
+                async def _coro():
+                    return decision
+                return _coro()
+            return decision
+
+        if mode == PermissionMode.BYPASS:
+            return _wrap(ApprovalDecision(
+                approved=True, reason="PermissionMode.BYPASS: permission checks skipped"
+            ))
+
+        if mode == PermissionMode.PLAN:
+            # PLAN allows only side-effect-free exploration. A tool is treated as
+            # read-only only when its name has no mutation marker *and* it is not
+            # flagged as approval-worthy elsewhere (dangerous / external /
+            # registry-required / explicit ``ask`` rule). This closes the gap
+            # where a write-capable tool (e.g. ``send_email``) whose name misses
+            # the marker list would otherwise be allowed in plan mode.
+            if self._is_read_only_tool(function_name) and not self._tool_would_prompt(function_name):
+                return _wrap(ApprovalDecision(
+                    approved=True, reason="PermissionMode.PLAN: read-only tool allowed"
+                ))
+            return _wrap(ApprovalDecision(
+                approved=False,
+                reason=f"PermissionMode.PLAN: '{function_name}' is not read-only; write operations are not allowed",
+            ))
+
+        if mode == PermissionMode.DONT_ASK:
+            # Auto-deny anything that would otherwise prompt so a non-interactive
+            # run never hangs — including tools that prompt only because of their
+            # ``external`` trust level or a registry approval requirement.
+            if self._tool_would_prompt(function_name):
+                return _wrap(ApprovalDecision(
+                    approved=False,
+                    reason=f"PermissionMode.DONT_ASK: auto-denied prompt for '{function_name}'",
+                ))
+            return None
+
+        return None
+
+    def _tool_would_prompt(self, function_name) -> bool:
+        """Return ``True`` when *function_name* would trigger an approval prompt.
+
+        Mirrors the ``needs_approval`` criteria in ``_resolve_approval_decision``
+        so ``DONT_ASK`` and ``PLAN`` see the same set of prompt-worthy tools:
+        an explicit ``ask`` rule, a built-in dangerous tool, a registry-required
+        tool, or an ``external`` trust level.
+        """
+        try:
+            from ..approval.registry import DEFAULT_DANGEROUS_TOOLS
+            if function_name in DEFAULT_DANGEROUS_TOOLS:
+                return True
+            if self._permission_manager_requires_approval(function_name):
+                return True
+            from ..approval import get_approval_registry
+            if get_approval_registry().is_required(function_name):
+                return True
+            from ..tools import get_registry as get_tool_registry
+            if get_tool_registry().get_trust_level(function_name) == "external":
+                return True
+        except Exception as e:  # noqa: BLE001
+            logging.debug("_tool_would_prompt failed for %s: %s", function_name, e)
+        return False
+
+    @staticmethod
+    def _is_read_only_tool(function_name) -> bool:
+        """Best-effort heuristic for whether a tool only reads (no writes).
+
+        Used by ``PermissionMode.PLAN``. Tools whose names imply mutation
+        (write/edit/delete/create/run/exec/…) are treated as non-read-only.
+        """
+        if not function_name:
+            return True
+        name = str(function_name).lower()
+        write_markers = (
+            "write", "edit", "append", "delete", "remove", "create", "mkdir",
+            "rm", "put", "post", "patch", "update", "insert", "save", "move",
+            "rename", "chmod", "chown", "exec", "run", "shell", "bash", "command",
+            "kill", "apply_patch", "install", "deploy",
+        )
+        return not any(marker in name for marker in write_markers)
 
     def _check_permission_manager_deny(self, function_name):
         """Return an error dict if the PermissionManager hard-denies the tool.
@@ -1351,6 +1582,27 @@ class ToolExecutionMixin:
             logging.debug("permission manager is_denied failed for %s: %s", function_name, e)
         return None
 
+    def _is_bypass_mode(self) -> bool:
+        """Return ``True`` when ``PermissionMode.BYPASS`` is active.
+
+        BYPASS means *skip all permission checks*, so it must short-circuit
+        even the pattern-based ``PermissionManager`` deny gate (which otherwise
+        runs before the approval decision and would block the tool first).
+        """
+        mode = getattr(self, "_permission_mode", None)
+        if mode is None:
+            return False
+        try:
+            from ..permissions import PermissionMode
+            if isinstance(mode, str):
+                try:
+                    mode = PermissionMode(mode)
+                except ValueError:
+                    return False
+            return mode == PermissionMode.BYPASS
+        except Exception:  # noqa: BLE001
+            return False
+
     def _check_tool_approval_sync(self, function_name, arguments):
         """Check tool approval synchronously. Returns (decision, arguments) or error dict."""
         # Permission tier fast-path (O(1) frozenset lookup, resolved at __init__)
@@ -1360,9 +1612,11 @@ class ToolExecutionMixin:
             return {"error": f"Tool '{function_name}' not in allowed tools list", "permission_denied": True}
 
         # Pattern-based PermissionManager deny gate (native + MCP, uniform).
-        manager_denial = self._check_permission_manager_deny(function_name)
-        if manager_denial is not None:
-            return manager_denial
+        # BYPASS mode skips this gate as its contract requires.
+        if not self._is_bypass_mode():
+            manager_denial = self._check_permission_manager_deny(function_name)
+            if manager_denial is not None:
+                return manager_denial
 
         decision = self._resolve_approval_decision(function_name, arguments, is_async=False)
         
@@ -1388,9 +1642,11 @@ class ToolExecutionMixin:
             return {"error": f"Tool '{function_name}' not in allowed tools list", "permission_denied": True}
 
         # Pattern-based PermissionManager deny gate (native + MCP, uniform).
-        manager_denial = self._check_permission_manager_deny(function_name)
-        if manager_denial is not None:
-            return manager_denial
+        # BYPASS mode skips this gate as its contract requires.
+        if not self._is_bypass_mode():
+            manager_denial = self._check_permission_manager_deny(function_name)
+            if manager_denial is not None:
+                return manager_denial
 
         decision_coro = self._resolve_approval_decision(function_name, arguments, is_async=True)
         decision = await decision_coro
