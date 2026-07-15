@@ -31,6 +31,17 @@ agent.start(
 )
 ```
 
+<Note>
+**Supported invocation paths.** `self_improve` triggers the review after any of these end-of-turn moments — pick whichever fits your app:
+
+- `agent.start(prompt)` — the task-execution path.
+- `agent.chat(prompt)` — the conversational path (chatbots, REPLs).
+- `agent.achat(prompt)` — the async conversational path (gateways, servers).
+- Any custom loop that ends by returning through the after-agent hook.
+
+Async tool calls (via `execute_tool_async` or async tool functions) are tracked identically to sync ones. Requires **`praisonaiagents >= 1.6.151`** — earlier versions silently skipped the review on `chat` / `achat` paths (see Troubleshooting below).
+</Note>
+
 
 The user assigns a task; after each run the agent may write or patch a skill when it learns something reusable.
 
@@ -130,6 +141,30 @@ agent.start("How do I reset my password? Check reset-playbook.md if needed.")
 # Reply returns immediately; the skill review runs in the background after tool use.
 ```
 </Step>
+
+<Step title="Chat and Async Chat">
+The same `self_improve` flag works with `chat()` / `achat()` — the review fires after any turn that used at least one tool.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Support",
+    instructions="Answer customer questions. Use read_file for playbooks when needed.",
+    self_improve=True,
+    tools=["read_file"],
+)
+
+# Sync chat — review runs after the reply
+agent.chat("How do I reset my password? Check reset-playbook.md if needed.")
+
+# Async chat — same behaviour, non-blocking
+asyncio.run(agent.achat("Escalate this ticket. Check escalation-rules.md first."))
+```
+
+The review pass is scheduled after every chat turn that used ≥1 tool — inline for `self_improve=True`, off the hot path for `self_improve="background"`.
+</Step>
 </Steps>
 
 ---
@@ -139,16 +174,16 @@ agent.start("How do I reset my password? Check reset-playbook.md if needed.")
 ```mermaid
 sequenceDiagram
     participant U as 👤 User
-    participant A as 🤖 Agent
-    participant T as 🛠️ Tools
+    participant A as 🤖 Agent<br/>start / chat / achat
+    participant T as 🛠️ Tools<br/>sync or async
     participant R as 🪞 Skill Reviewer<br/>(skill_manage only)
     participant S as 📋 Skills
 
-    U->>A: "Debug this flaky deploy"
-    A->>T: shell, read_file, ...
+    U->>A: task or message
+    A->>T: tool call(s)
     T-->>A: output
     A-->>U: Final answer
-    Note over A,R: After-task guarded review (opt-in)
+    Note over A,R: After-turn guarded review (opt-in)
     A->>R: Reflect: did this reveal a reusable technique?
     R->>S: skill_manage(action="create", name="diagnose-flaky-deploy", content="...")
     S-->>R: ✅ Skill saved
@@ -159,7 +194,7 @@ sequenceDiagram
 The task phase requires `tools=` on the Agent. Without a tool call, the default review gate exits early and no skill is written.
 </Note>
 
-After each task, if `self_improve` is enabled:
+After each **turn** — whether you called `agent.start()`, `agent.chat()`, or `agent.achat()`, and whether the tool ran sync or async — if `self_improve` is enabled:
 
 1. The policy checks `should_review(trajectory)` — by default, only when ≥1 tool was called
 2. The agent runs one extra turn with **only** `skill_manage` available
@@ -442,6 +477,31 @@ On a direct write the SDK logs the exact path — grep for `Skill created:` afte
 <Accordion title="4. The review pass never ran">
 Self-improve only reviews when the task used **at least one tool** — the guarded review skips tool-less tasks. Confirm the agent has `tools=` and that the task actually invoked one.
 </Accordion>
+
+<Accordion title="5. Review not firing on agent.chat() / agent.achat()?">
+On `praisonaiagents < 1.6.151`, the chat and async-chat paths returned without wiring `tools_used` into the review hook, so the default policy always saw an empty tools list and skipped the review — silently, with no warning. Upgrade to fix:
+
+```bash
+pip install -U "praisonaiagents>=1.6.151"
+```
+
+Confirm the fix with a one-line reproducer:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    instructions="Read files before answering.",
+    self_improve=True,
+    tools=["read_file"],
+)
+agent.chat("Read deploy.sh in the current directory and summarize.")
+print("tools_used after turn:", agent._turn_tools_used)
+# Expect [] here (buffer is consumed by the hook), but you should see the review turn run.
+```
+
+If the review still doesn't run on 1.6.151+, check the other accordions — the most common causes are (a) no `tools=` on the Agent, (b) the task didn't actually call a tool, or (c) `SKILL_WRITE_APPROVAL` staged the create rather than writing directly.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -489,6 +549,8 @@ agent.start("Read deploy.sh and fix the flake.")
 ```
 
 When staging is on, the destination for each proposal is **pinned at staging time**. If you later run `SkillManager.approve(id)` from a different working directory — from `~`, from a CI job, from another project — the approved skill is still written back to the original project's `.praisonai/skills/`. You never lose the origin by approving elsewhere.
+
+Async tool calls made from `achat` or `execute_tool_async` are tracked identically to sync calls — the review fires whether the tool ran sync or async, and pending creates staged from an async turn behave the same as those staged from a sync turn.
 </Accordion>
 </AccordionGroup>
 
