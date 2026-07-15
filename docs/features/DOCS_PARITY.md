@@ -27,7 +27,7 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Autonomy | 3 | 7 | 2705 |
 | ✅ Bots | 7 | 28 | 10942 |
 | ✅ Budget | 1 | 1 | 287 |
-| ✅ CLI | 5 | 116 | 31452 |
+| ✅ CLI | 5 | 116 | 31572 |
 | ✅ Chunking | 2 | 2 | 385 |
 | ✅ Citations | 2 | 1 | 202 |
 | ✅ Code Execution | 2 | 13 | 3893 |
@@ -37,7 +37,7 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Database | 1 | 40 | 6124 |
 | ✅ Deep Research | 8 | 2 | 587 |
 | ✅ Display | 6 | 3 | 741 |
-| ✅ Embeddings | 6 | 23 | 2036 |
+| ✅ Embeddings | 6 | 23 | 2049 |
 | ✅ Evaluation | 1 | 7 | 2829 |
 | ✅ Events | 1 | 2 | 749 |
 | ✅ Execution | 3 | 4 | 1528 |
@@ -52,8 +52,8 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Knowledge | 4 | 13 | 4160 |
 | ✅ LLM | 3 | 14 | 4767 |
 | ✅ Loops | 4 | 4 | 1075 |
-| ✅ MCP | 1 | 55 | 12132 |
-| ✅ Memory | 6 | 17 | 6460 |
+| ✅ MCP | 1 | 55 | 12276 |
+| ✅ Memory | 6 | 17 | 6475 |
 | ✅ OCR | 2 | 1 | 237 |
 | ✅ Observability | 2 | 23 | 2771 |
 | ✅ Optimizer | 1 | 2 | 792 |
@@ -72,11 +72,11 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Sandbox | 5 | 6 | 2559 |
 | ✅ Security | 1 | 3 | 2863 |
 | ✅ Sessions | 4 | 13 | 4971 |
-| ✅ Skills | 6 | 13 | 4830 |
+| ✅ Skills | 6 | 13 | 4893 |
 | ✅ Tasks | 2 | 6 | 2743 |
 | ✅ Telemetry | 1 | 2 | 604 |
 | ✅ Templates | 1 | 8 | 1657 |
-| ✅ Tools | 12 | 130 | 36467 |
+| ✅ Tools | 12 | 131 | 36741 |
 | ✅ Tracing | 3 | 2 | 139 |
 | ✅ Vector Store | 1 | 12 | 1193 |
 | ✅ Video | 2 | 6 | 649 |
