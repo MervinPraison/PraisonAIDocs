@@ -218,6 +218,10 @@ await client.connect()
 
 The `gateway.yaml` schema accepts three optional top-level blocks alongside `channels` and `agents`. All three are optional and ignored when not present.
 
+<Note>
+Since PraisonAI [PR #3079](https://github.com/MervinPraison/PraisonAI/pull/3079), the `gateway:` and `hooks:` blocks are validated field-by-field at load time. Unknown keys (`drain_timout`), wrong types (`reload_drain_timeout: "quick"`), out-of-range values (`port: 99999`), and invalid `overflow_policy` values are rejected with a friendly, field-named error instead of running silently with the default.
+</Note>
+
 ### `gateway:` block
 
 Global gateway settings — reliability preset, drain timeout, health monitor:
@@ -245,6 +249,41 @@ Inbound voice notes on Telegram, Slack, and WhatsApp are transcribed automatical
 Discord and Slack channels are auto-discovered on every refresh — your bot can address a channel before anyone messages it. See [Channel Directory](/docs/features/gateway-channel-directory).
 </Tip>
 
+The `gateway:` block validates every knob below. Extra keys are rejected (`extra="forbid"`), so a typo like `drain_timout` fails at load with a field-named error instead of silently running with the default.
+
+| Option | Type | Default | Notes |
+|--------|------|---------|-------|
+| `host` | `str` | `None` | Public host name. |
+| `port` | `int` | `None` | 1–65535. Rejected outside the range. |
+| `bind_host` | `str` | `None` | Bind interface. |
+| `cors_origins` | `list[str]` | `None` | |
+| `allowed_origins` | `list[str]` | `None` | |
+| `auth_token` | `str` | `None` | See [Rotating the shared secret](#rotating-the-shared-secret). |
+| `auth` | `dict` | `None` | |
+| `auth_scopes` | `dict[str, list[str]]` | `None` | |
+| `max_connections` | `int` | `None` | ≥ 0 |
+| `max_sessions_per_agent` | `int` | `None` | ≥ 0 |
+| `session_config` | `dict` | `None` | |
+| `heartbeat_interval` | `int` | `None` | ≥ 0 |
+| `reconnect_timeout` | `int` | `None` | ≥ 0 |
+| `ssl_cert` | `str` | `None` | |
+| `ssl_key` | `str` | `None` | |
+| `max_buffered_bytes` | `int` | `None` | ≥ 0 |
+| `max_queued_frames` | `int` | `None` | ≥ 0 |
+| `max_concurrent_runs` | `int` | `None` | ≥ 0 — admission control. |
+| `queue_depth` | `int` | `None` | ≥ 0 — admission control. |
+| `overflow_policy` | `str` | `None` | Exactly one of `"reject"`, `"queue"`, `"shed_oldest"`. |
+| `preauth_max_connections_per_ip` | `int` | `None` | ≥ 0 — see [Pre-auth edge protections](#pre-auth-edge-protections). |
+| `max_unauthorized_frames` | `int` | `None` | ≥ 0 — same. |
+| `drain_timeout` | `float` | `None` | ≥ 0 seconds. |
+| `reload_drain_timeout` | `float` | `None` | ≥ 0 seconds — drain window applied on config reload. |
+| `reliability` | `str` | `None` | See [Gateway Reliability](/docs/features/gateway-reliability). |
+| `api` | `dict` | `None` | See the [`api:` block](#api-block) below. |
+| `liveness` | `dict` | `None` | Liveness probe settings. |
+| `health` | `dict` | `None` | Health monitor — see the [`health:` block](#health-block) below. |
+| `forensics` | `dict` | `None` | Crash/shutdown forensics. |
+| `hooks` | `list` | `None` | Same shape as top-level [`hooks:`](#hooks-block) — nest under `gateway:` for grouping. |
+
 ### `api:` block
 
 Serve OpenAI-compatible and MCP HTTP endpoints from the same gateway process, sharing the live agents and sessions that chat users reach:
@@ -258,17 +297,52 @@ gateway:
 
 Both surfaces are opt-in and off by default. See [Gateway API Endpoints](/docs/features/gateway-api-endpoints) for the endpoint list, auth, and client examples.
 
+### `health:` block
+
+Nest a `health:` block under `gateway:` to configure the worker health monitor. Extra keys are rejected (`extra="forbid"`):
+
+```yaml
+gateway:
+  health:
+    enabled: true
+    interval: 60
+    stale_after: 90
+    stuck_after: 600
+    max_restarts_per_hour: 5
+```
+
+| Field | Type | Default | Constraint |
+|-------|------|---------|------------|
+| `enabled` | `bool` | `true` | |
+| `interval` | `float` | `300.0` | `> 0` |
+| `startup_grace` | `float` | `60.0` | `≥ 0` |
+| `stale_after` | `float` | `120.0` | `> 0` |
+| `stuck_after` | `float` | `900.0` | `> 0` |
+| `max_restarts_per_hour` | `int` | `10` | `≥ 0` |
+
 ### `hooks:` block
 
-Register shell-command hooks that fire at gateway and message lifecycle events:
+Register inbound trigger hooks that expose an authenticated `POST /hooks/<path>` endpoint and run an agent (or wake a session) on each request. Each hook requires a non-empty `path:`:
 
 ```yaml
 hooks:
-  - event: message_received
-    command: /usr/local/bin/rate-check.sh
-  - event: gateway_start
-    command: "curl -s https://monitoring.example.com/ping"
+  - path: gmail
+    agent: assistant
+    action: agent           # optional; "agent" or "wake"
 ```
+
+| Field | Type | Default | Required | Notes |
+|-------|------|---------|----------|-------|
+| `path` | `str` | — | **yes** | Path segment for the inbound trigger (e.g. `"gmail"`). |
+| `action` | `str` | `"agent"` | no | Only `"agent"` or `"wake"`. |
+| `agent` | `str` | `None` | no | Target agent id. |
+| `auth` | `str` | `None` | no | Bearer token for the trigger endpoint. |
+| `session_key` | `str` | `None` | no | Template for the session id. |
+| `idempotency_key` | `str` | `None` | no | Template for the dedup key. |
+| `deliver_to` | `str` | `None` | no | `channel:target` delivery spec for the reply. |
+| `message` | `str` | `None` | no | Template for the agent message. |
+| `enabled` | `bool` | `true` | no | |
+| `metadata` | `dict` | `{}` | no | Free-form extra settings. |
 
 ### `BotOS.from_config` and tool names
 
