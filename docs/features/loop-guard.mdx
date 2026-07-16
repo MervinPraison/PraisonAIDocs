@@ -50,6 +50,10 @@ graph LR
     class Block,Halt halt
 ```
 
+<Note>
+No-progress detection became **result-aware** in [PR #3080](https://github.com/MervinPraison/PraisonAI/pull/3080) (release after 2026-07-16, fixes [#3073](https://github.com/MervinPraison/PraisonAI/issues/3073)). Async / long-running tool workflows that return **changing** results (polling a job `IN_PROGRESS → COMPLETE`, pacing with a `wait` tool) are no longer falsely halted at 8 tool calls. Only a genuinely stuck loop of identical results still trips `no_progress_halt`. No config changes required to pick this up.
+</Note>
+
 ## Quick Start
 
 <Steps>
@@ -148,26 +152,28 @@ Here's what happens when an agent repeatedly calls the same tool:
 
 ```mermaid
 graph TB
-    Start[Agent calls read_file 1st time] --> A1[✅ ALLOW - Normal execution]
-    A1 --> A2[Agent calls read_file 2nd time]
-    A2 --> A3[✅ ALLOW - Normal execution]
-    A3 --> A4[Agent calls read_file 5th time]
-    A4 --> W1[⚠️ WARN - Tool runs + warning attached]
-    W1 --> A5[Agent calls read_file 8th time]
-    A5 --> B1[🛑 BLOCK - Tool replaced with error]
-    B1 --> A6[Agent calls read_file 12th time]
-    A6 --> H1[🔥 HALT - ToolExecutionError raised]
+    Start[Agent calls a tool repeatedly] --> Split{What are the<br/>results doing?}
+    Split -->|Results changing<br/>progressing| Chg1[✅ ALLOW every call<br/>Even past the count threshold,<br/>BLOCK/HALT is downgraded to WARN]
+    Split -->|Same result each time<br/>stuck| Sk1[Streak grows]
+    Sk1 --> Sk2{Streak reaches<br/>no_progress_warn?}
+    Sk2 -->|Yes| W1[⚠️ WARN attached]
+    W1 --> Sk3{Streak reaches<br/>no_progress_halt?}
+    Sk3 -->|Yes| H1[🔥 HALT — ToolExecutionError]
 
-    classDef allow fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
     classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef block fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
 
-    class A1,A2,A3 allow
+    class Start,Sk1 step
+    class Split,Sk2,Sk3 question
+    class Chg1 ok
     class W1 warn
-    class B1,H1 block
+    class H1 stop
 ```
 
-The agent experiences escalating resistance: warnings first, then blocked execution, then complete halt.
+Two signals now drive the outcome: how many times the tool has been called this turn, and whether the results are still changing. A busy-but-progressing tool sees at most a `WARN`; a stuck-with-identical-results tool escalates through `WARN` to `HALT`.
 
 ---
 
@@ -215,12 +221,103 @@ If you can't move your tool into the explicit set, **name it well** — Loop Gua
 | `mutating_block_threshold` | `int` | `5` | Block threshold for mutating tools |
 | `mutating_halt_threshold` | `int` | `7` | Halt threshold for mutating tools |
 | `max_time_per_turn` | `float` | `120.0` | Maximum seconds per turn before timeout |
-| `no_progress_warn` | `int` | `4` | Warning threshold for no-progress detection |
-| `no_progress_halt` | `int` | `8` | Halt threshold for no-progress detection |
+| `no_progress_warn` | `int` | `4` | Warn once the trailing run of *identical* tool-result fingerprints reaches this length. Changing results reset the streak. |
+| `no_progress_halt` | `int` | `8` | Halt once the trailing run of *identical* tool-result fingerprints reaches this length. Changing results reset the streak. |
 
 **GuardAction values**: `ALLOW`, `WARN`, `BLOCK`, `HALT`
 
 **LoopGuardDecision fields**: `action`, `code`, `message`, `metadata`
+
+---
+
+## No-Progress Detection
+
+No-progress detection watches for *identical repeated results*, not raw tool-call counts.
+
+```mermaid
+graph TB
+    Call[🛠️ Tool call recorded] --> Fingerprint[🔑 Fingerprint = tool + args + result-hash]
+    Fingerprint --> Compare{Same as previous<br/>tool + result-hash?}
+    Compare -->|No — result changed| Reset[✅ Streak resets<br/>Progress detected]
+    Compare -->|Yes| Streak[📊 Streak + 1]
+    Streak --> WarnCheck{Streak ≥<br/>no_progress_warn?}
+    WarnCheck -->|No| Continue[⏭️ Continue]
+    WarnCheck -->|Yes| Warn[⚠️ WARN]
+    Warn --> HaltCheck{Streak ≥<br/>no_progress_halt?}
+    HaltCheck -->|No| Continue
+    HaltCheck -->|Yes| Halt[🔥 HALT]
+
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Call input
+    class Fingerprint,Streak,Continue step
+    class Compare,WarnCheck,HaltCheck question
+    class Reset ok
+    class Warn question
+    class Halt stop
+```
+
+**What counts as progress (resets the streak):**
+
+- The **result changes** for the same tool + same args (e.g. `check_status(job=42)` returning `"IN_PROGRESS"` then `"COMPLETE"`).
+- A **different tool** is called (streaks require the same tool, not just the same result value).
+- `agent._loop_guard.mark_progress("...")` is called — marks the current position so only later tool calls can contribute to a future streak.
+
+**What does NOT reset the streak:**
+
+- The same tool returning the same result over and over — that *is* the "stuck" pattern the guard exists to catch.
+- Falsy repeated results (`""`, `[]`, `{}`, `0`, `False`) — these are wrapped internally so they still fingerprint, closing a loophole that used to disable no-progress detection.
+
+**Count thresholds are also stuck-aware.** The idempotent (`5 / 8 / 12`) and mutating (`3 / 5 / 7`) thresholds still count tool calls, but a `BLOCK` or `HALT` from those thresholds is downgraded to a `WARN` when the trailing identical-result run is below `no_progress_warn`. So a legitimately busy but *progressing* tool (many calls, changing output) will not be blocked purely on frequency.
+
+### Example: polling that used to be halted, now allowed
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Deployment Watcher",
+    instructions="Poll the deployment status until it finishes.",
+)
+
+# check_deploy(job='X') returns 'IN_PROGRESS', 'IN_PROGRESS', 'RUNNING', 'COMPLETE'.
+# Each transition changes the result-hash, so the no-progress streak stays at 1.
+agent.start("Watch deploy-42 until it is done.")
+```
+
+### Example: genuine stall, still halted
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Config Reader",
+    instructions="Read a config file that never appears.",
+)
+
+# read_file('missing.yaml') returns the same error result every time.
+# The streak grows to no_progress_halt=8 and the tool is halted with
+# ToolExecutionError.
+agent.start("Read missing.yaml.")
+```
+
+### Manually marking progress
+
+If your agent completes a logical sub-step (a checkpoint, a milestone), call `mark_progress()` so any future no-progress streak starts fresh from that point:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="Multi-step data pipeline")
+
+# ... run some tools ...
+agent._loop_guard.mark_progress("stage-1-complete")
+# Only tool calls made AFTER this marker can contribute to a future streak.
+```
 
 ---
 
@@ -236,6 +333,32 @@ If you can't move your tool into the explicit set, **name it well** — Loop Gua
 ---
 
 ## Common Patterns
+
+### Async polling with changing results
+
+Polling tools whose output actually transitions state (e.g. `pending → running → done`) do **not** need any config change — the no-progress guard sees each transition as progress and never trips. Only the count-based idempotent thresholds (`5 / 8 / 12`) could otherwise fire on high call volume, and those are now downgraded to `WARN` while results keep changing.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Job Poller",
+    instructions="Call check_job_status until it returns COMPLETE.",
+)
+
+# Default LoopGuardConfig is fine — no tuning required.
+agent.start("Wait for job-42 to complete.")
+```
+
+If your polling tool paces itself with a `wait` / `sleep` tool that returns the same value each call, wrap the pair (`check_job_status` + `wait`) with an explicit progress marker between transitions so `wait`'s identical returns do not build a stuck streak:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="Poll and pace")
+# ... after each observed status change ...
+agent._loop_guard.mark_progress("status-transition")
+```
 
 ### Polling a slow status endpoint
 
@@ -307,6 +430,10 @@ If your custom tool isn't in the explicit `IDEMPOTENT_TOOLS` or `MUTATING_TOOLS`
 
 <Accordion title="Use get_stats() for observability">
 Monitor your agents' tool usage patterns with `agent._loop_guard.get_stats()`. High tool counts might indicate the agent is struggling with a task and needs different instructions or tools.
+</Accordion>
+
+<Accordion title="Reach for mark_progress() only at real checkpoints">
+No-progress detection is result-aware, so a tool that keeps producing new output is trusted even past the count thresholds. Reach for `mark_progress()` only when your workflow has a natural checkpoint (a sub-step completed, a milestone reached) that the result-hash on its own would not reflect.
 </Accordion>
 
 </AccordionGroup>
