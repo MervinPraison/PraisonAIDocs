@@ -1,0 +1,217 @@
+---
+title: "Workspace Isolation"
+sidebarTitle: "Workspace Isolation"
+description: "Give each agent its own git worktree so concurrent edits never clobber each other"
+icon: "code-branch"
+---
+
+Workspace isolation gives every agent its own working directory on its own branch, so agents editing the same repository never overwrite each other's changes.
+
+```mermaid
+graph LR
+    subgraph "Workspace Isolation"
+        Repo[📁 Repository] --> Alice[🤖 Alice Worktree]
+        Repo --> Bob[🤖 Bob Worktree]
+        Alice --> Merge[✅ Merge Back]
+        Bob --> Merge
+    end
+
+    classDef repo fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tree fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Repo repo
+    class Alice,Bob tree
+    class Merge result
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Default (No Isolation)">
+Every run shares the same directory — the behaviour you already have.
+
+```python
+from praisonaiagents.workspace import NoIsolationAdapter
+
+workspace = NoIsolationAdapter()
+workspace.create("alice")  # -> current working directory
+```
+</Step>
+
+<Step title="Concurrent Agents With Isolation">
+Give each agent its own git worktree — edits stay independent.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.workspace import GitWorktreeAdapter
+
+workspace = GitWorktreeAdapter()
+
+alice = Agent(name="Alice", instructions="Edit README.md")
+bob = Agent(name="Bob", instructions="Also edit README.md")
+
+alice_dir = workspace.create("alice")  # -> ./.praisonai/worktrees/alice-<hash>
+bob_dir = workspace.create("bob")      # -> ./.praisonai/worktrees/bob-<hash>
+```
+</Step>
+
+<Step title="Reset or Remove">
+Restore a worktree to a clean state, or tear it down when the run ends.
+
+```python
+workspace.reset("alice")   # git clean + checkout inside alice's worktree
+workspace.remove("alice")  # remove the worktree and its branch
+```
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+`GitWorktreeAdapter` runs real `git worktree` commands to provision a fresh branch and directory per run.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant GitWorktreeAdapter
+    participant git
+    participant Worktree as Isolated Worktree
+
+    User->>Agent: Run task on repo
+    Agent->>GitWorktreeAdapter: create("alice")
+    GitWorktreeAdapter->>git: git worktree add -B praisonai/alice
+    git-->>Worktree: New branch + directory
+    Worktree-->>Agent: Isolated path
+    Agent-->>User: Edits stay contained
+```
+
+| Method | What it does |
+|--------|--------------|
+| `create(name)` | Provision the isolated directory and return its path (idempotent — reused if it exists). |
+| `path(name)` | Return the directory path for `name` without creating it. |
+| `reset(name)` | Restore tracked files and drop untracked files inside the worktree. |
+| `remove(name)` | Tear down the worktree and delete its branch. |
+
+When the directory is not a git repository, every method degrades gracefully — `create` and `path` return the original directory, and `reset` and `remove` do nothing.
+
+---
+
+## Choosing an Adapter
+
+Both adapters share the same interface, so you can swap them without changing your code.
+
+```mermaid
+graph TB
+    Start{Agents editing<br/>the same repo<br/>in parallel?} -->|Yes| Git[GitWorktreeAdapter]
+    Start -->|No| CwdCheck{Is cwd<br/>a git repo?}
+    CwdCheck -->|Yes| Git
+    CwdCheck -->|No| NoIso[NoIsolationAdapter]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef git fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef none fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Start,CwdCheck question
+    class Git git
+    class NoIso none
+```
+
+`GitWorktreeAdapter` is always safe — if the directory is not a git repo it falls back to `NoIsolationAdapter` behaviour automatically.
+
+---
+
+## Configuration Options
+
+`GitWorktreeAdapter` accepts three options.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `root` | `str \| Path \| None` | `Path.cwd()` | Repository root to isolate. |
+| `branch_prefix` | `str` | `"praisonai"` | Prefix for worktree branches — branches are named `{branch_prefix}/{slug(name)}`. |
+| `worktrees_dir` | `str \| Path \| None` | `{root}/.praisonai/worktrees` | Directory where per-run worktrees are created. |
+
+```python
+from praisonaiagents.workspace import GitWorktreeAdapter
+
+workspace = GitWorktreeAdapter(
+    root=".",
+    branch_prefix="team",
+    worktrees_dir=".worktrees",
+)
+
+if workspace.available:
+    workspace.create("alice")
+```
+
+The `available` attribute is `True` only when `root` is inside a git repository and `git` is on the PATH.
+
+`NoIsolationAdapter` accepts a single `root` option (`str | Path | None`, default `Path.cwd()`) that it returns from `create` and `path`.
+
+---
+
+## Common Patterns
+
+Give parallel sub-agents their own worktrees.
+
+```python
+from praisonaiagents.workspace import GitWorktreeAdapter
+
+workspace = GitWorktreeAdapter()
+
+for name in ("researcher", "writer", "reviewer"):
+    workspace.create(name)  # each gets an independent branch + directory
+```
+
+Reuse the same worktree for a named agent — `create` is idempotent.
+
+```python
+first = workspace.create("alice")
+second = workspace.create("alice")
+assert first == second  # same worktree reused, no duplicate created
+```
+
+Clean up when the run finishes.
+
+```python
+workspace.create("alice")
+# ... agent does its work ...
+workspace.remove("alice")  # removes worktree and branch
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Use GitWorktreeAdapter unconditionally">
+It degrades gracefully outside git repos, so you can always reach for it. No need to detect git yourself — `available` reports the state and non-git directories simply fall back to shared behaviour.
+</Accordion>
+
+<Accordion title="Name worktrees by agent or run, not by task">
+Names are hashed into collision-resistant slugs, so `"agent one"` and `"agent-one"` never share a worktree. Stable names keep `create` idempotent across retries.
+</Accordion>
+
+<Accordion title="Clean up with remove() when the run ends">
+Each worktree lives under `.praisonai/worktrees/`. Call `remove()` on completion to stop that directory from growing over long-running sessions.
+</Accordion>
+
+<Accordion title="Requires git ≥ 2.5">
+`git worktree` was introduced in git 2.5. On older git or non-git directories, isolation is unavailable and the adapter falls back to the shared directory.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Multi-Agent Context Safety" icon="shield-check" href="/docs/features/multi-agent-context-safety">
+Isolate per-agent runtime and resolver state — the context half of concurrency.
+</Card>
+<Card title="Code & Workspace Access" icon="code" href="/docs/features/code">
+Contain file operations to a workspace with read/write access controls.
+</Card>
+</CardGroup>
