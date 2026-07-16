@@ -571,6 +571,170 @@ graph LR
 
 ---
 
+## Per-Task Worktree Isolation
+
+Give every kanban worker its own git worktree so parallel tasks never overwrite each other's files.
+
+```python
+from praisonaiagents import Agent
+from praisonai.tools.kanban_tools import kanban_create
+
+# Opt this task into per-task worktree isolation
+task = kanban_create(
+    "Refactor auth module",
+    workspace_kind="worktree",   # <-- the whole feature
+)
+```
+
+One keyword moves a task onto its own branch and working directory. Everything else — creation, merge-back, and cleanup — happens automatically.
+
+```mermaid
+graph LR
+    subgraph "Per-Task Worktree"
+        Task[📋 Task<br/>workspace_kind=worktree] --> Fork[🌱 git worktree<br/>kanban/&lt;id&gt;]
+        Fork --> Worker[⚡ Worker cwd=worktree]
+        Worker --> Result{Result?}
+        Result -->|clean merge| Done[✅ done + teardown]
+        Result -->|conflict| Blocked[🛑 blocked<br/>worktree kept]
+    end
+
+    classDef task fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef blocked fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Task task
+    class Fork,Worker process
+    class Result decision
+    class Done done
+    class Blocked blocked
+```
+
+### How It Works
+
+The dispatcher forks a worktree from the base branch, runs the worker inside it, then merges the branch back on success.
+
+```mermaid
+sequenceDiagram
+    participant Dispatcher
+    participant Git
+    participant Worker
+    participant Store as Kanban Store
+    participant Human
+
+    Dispatcher->>Git: git worktree add kanban/<id> from base
+    Dispatcher->>Store: persist branch + worktree_path
+    Dispatcher->>Worker: spawn (cwd = worktree)
+    Worker-->>Dispatcher: exit 0
+    Dispatcher->>Git: commit worker edits, merge --no-ff
+    alt Clean merge
+        Git-->>Dispatcher: merged
+        Dispatcher->>Git: remove worktree
+        Dispatcher->>Store: task → done
+    else Merge conflict
+        Git-->>Dispatcher: conflict (merge aborted)
+        Dispatcher->>Store: task → blocked + conflicted files
+        Dispatcher-->>Human: KANBAN_TASK_BLOCKED (conflicted_files)
+        Note over Human: resolve in kept worktree, then re-ready
+    end
+```
+
+On success the dispatcher auto-commits any uncommitted worker edits as `kanban worker output for kanban/<task_id>`, merges the branch into the base with `git merge --no-ff`, then tears the worktree down. On conflict the merge is aborted, so the base branch is never left half-merged.
+
+### Choosing `default` vs `worktree`
+
+Pick isolation only when workers actually edit files in a git repo.
+
+```mermaid
+graph TB
+    Start{How do workers run?} -->|Single worker, one repo edit| Default1[workspace_kind=default]
+    Start -->|Many workers editing overlapping files| Tree[workspace_kind=worktree]
+    Start -->|API calls / reports, no file edits| Default2[workspace_kind=default]
+    Start -->|Non-git working directory| Default3[workspace_kind=default]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef default fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef tree fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start decision
+    class Default1,Default2,Default3 default
+    class Tree tree
+```
+
+### New `Task` fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `workspace_kind` | `str` | `"default"` | `"worktree"` opts the task into per-task git worktree isolation. Any other value keeps the shared-cwd behaviour. |
+| `branch` | `str \| None` | `None` | Populated by the dispatcher on worktree tasks — `kanban/<task_id>`. Read it via `kanban_show`. |
+| `worktree_path` | `str \| None` | `None` | Populated by the dispatcher — filesystem path of the worktree (`~/.praisonai/kanban/worktrees/<task_id>`). |
+
+<Note>
+Existing SQLite boards **auto-migrate** to add the `branch` and `worktree_path` columns on first open — no user action required.
+</Note>
+
+### Environment configuration
+
+Add these to the [Environment Configuration](#environment-configuration) table when the dispatcher runs outside the repo.
+
+| Variable | Effect | Example |
+|----------|--------|---------|
+| `PRAISONAI_KANBAN_REPO_DIR` | Base repo path for worktree / merge operations | `export PRAISONAI_KANBAN_REPO_DIR=/repos/service-a` |
+| `PRAISONAI_KANBAN_BASE_BRANCH` | Fallback branch to fork from / integrate into when HEAD cannot be detected | `export PRAISONAI_KANBAN_BASE_BRANCH=develop` |
+
+The dispatcher branches from the current HEAD of `PRAISONAI_KANBAN_REPO_DIR` (defaulting to the process working directory). When HEAD cannot be detected, it falls back to `PRAISONAI_KANBAN_BASE_BRANCH` (default `main`).
+
+### Merge conflict handling
+
+A conflict never touches the base branch — it routes the task to `blocked` for a human to resolve.
+
+- The merge is **aborted**; the base branch is left untouched.
+- The task moves to `blocked` with a comment listing the conflicted files.
+- The `KANBAN_TASK_BLOCKED` hook fires with `conflicted_files: list[str]`.
+- The worktree is **preserved** on disk for inspection.
+
+To recover, resolve the conflicts inside the kept worktree, then re-run or discard it:
+
+```python
+from praisonai.tools.kanban_tools import kanban_move
+
+# After resolving conflicts inside ~/.praisonai/kanban/worktrees/<task_id>
+kanban_move("task_abc123", "ready")   # re-dispatch the task
+```
+
+Or discard the worktree entirely from the base repo:
+
+```bash
+git worktree remove --force ~/.praisonai/kanban/worktrees/task_abc123
+```
+
+<Note>
+Task IDs are validated (`^[A-Za-z0-9._-]+$`, no leading `.`, no path traversal) before use as a branch ref or path. An unsafe ID **fails closed** — the task refuses to spawn a worker rather than falling back to the shared cwd.
+</Note>
+
+### Best Practices
+
+<AccordionGroup>
+<Accordion title="Enable worktree isolation only when workers edit files">
+Tasks that only call APIs or print reports gain nothing from isolation and pay the git overhead. Keep `workspace_kind="default"` for read-only work; reserve `"worktree"` for concurrent file edits.
+</Accordion>
+
+<Accordion title="Set PRAISONAI_KANBAN_REPO_DIR outside the repo">
+The dispatcher falls back to `os.getcwd()` at start, which is wrong under systemd/supervisord. Export `PRAISONAI_KANBAN_REPO_DIR=/path/to/repo` so worktrees and merges run against the right checkout.
+</Accordion>
+
+<Accordion title="Use short, git-ref-safe task IDs">
+The dispatcher rejects `..`, `/`, leading `.`, spaces, and other invalid chars. Unsafe IDs fail closed (no isolation, no worker) — keep IDs to `[A-Za-z0-9._-]`.
+</Accordion>
+
+<Accordion title="Sweep stuck worktrees under ~/.praisonai/kanban/worktrees/">
+Every `blocked`-on-conflict task leaves its worktree behind by design. Clean them up with `git worktree remove --force` once the conflict is resolved.
+</Accordion>
+</AccordionGroup>
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
