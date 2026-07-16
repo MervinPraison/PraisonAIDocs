@@ -436,25 +436,33 @@ sequenceDiagram
     participant User
     participant ToolResolver
     participant SafeLoader
+    participant Discovery as CustomDefinitionsDiscovery
     participant LocalFiles
 
     User->>ToolResolver: resolve_all_from_yaml(config)
     ToolResolver->>ToolResolver: Walk roles[*].tools + tasks[*].tools
     loop For each tool name
         ToolResolver->>ToolResolver: resolve(name)
-        ToolResolver->>ToolResolver: Instantiate if class
     end
-    ToolResolver->>SafeLoader: get_local_tool_classes() (tools.py)
-    SafeLoader->>LocalFiles: load tools.py (if allowed)
-    LocalFiles-->>SafeLoader: classes
+    ToolResolver->>SafeLoader: cwd tools.py XOR tools/ classes
     SafeLoader-->>ToolResolver: classes (or empty)
-    Note over ToolResolver: If tools.py empty, try tools/ directory
+    ToolResolver->>ToolResolver: gate: PRAISONAI_ALLOW_LOCAL_TOOLS?
+    alt gate on
+        ToolResolver->>Discovery: discover_project_tools() (.praisonai/tools/*.py)
+        Discovery-->>ToolResolver: @tool callables keyed by tool name
+    else gate off (default)
+        Note over ToolResolver: short-circuit — no directory walk, no git subprocess
+    end
     ToolResolver-->>User: {name: callable} dict
 ```
 
+<Note>
+**The `.praisonai/tools/` merge is additive and gated.** With `PRAISONAI_ALLOW_LOCAL_TOOLS=true`, `@tool` functions in `.praisonai/tools/*.py` are merged into the resolved dict keyed by tool name — so a `@tool(name="weather_lookup")` is referenceable from a YAML `tools:` list as `weather_lookup`. When the gate is off (default), the resolver skips the directory walk-up and `git rev-parse` subprocess entirely (perf guard from commit `12df267`). See [#3107](https://github.com/MervinPraison/PraisonAI/issues/3107).
+</Note>
+
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `resolve_all_from_yaml(yaml_config)` | `Dict[str, Callable]` | One call returns every tool referenced in a parsed YAML config, with classes instantiated and `tools.py` / `tools/` merged in. |
+| `resolve_all_from_yaml(yaml_config)` | `Dict[str, Callable]` | One call returns every tool referenced in a parsed YAML config. Additively merges (a) cwd `tools.py` **or** cwd `tools/` classes (mutual-XOR, unchanged) and (b) `.praisonai/tools/*.py` `@tool`-decorated functions keyed by their tool name — gated by `PRAISONAI_ALLOW_LOCAL_TOOLS=true`. See [#3107](https://github.com/MervinPraison/PraisonAI/issues/3107). |
 | `load_functions_from_module(path, *, functions_only=False, skip_private=False, module_name="tools_module")` | `Dict[str, Callable]` | Load callables from a single `.py` file. Pass `functions_only=True` to keep only `inspect.isfunction` members (drops callable class instances). Pass `skip_private=True` to drop members whose name starts with `_`. `module_name` names the module inside `sys.modules` so multiple simultaneous loads (e.g. `--tools` + `--rewrite-tools`) don't shadow each other. |
 | `load_classes_from_module(path)` | `Dict[str, Callable]` | Load and instantiate `BaseTool` subclasses and `langchain_community.tools.*` classes from a single `.py` file. |
 | `load_functions_from_package(path)` | `Dict[str, Callable]` | Iterate `*.py` in a directory (skipping `__*.py`) and union the functions. |
@@ -471,6 +479,17 @@ sequenceDiagram
 <Note>
 **PR #2017 security fix.** `load_functions_from_package()` now goes through `_safe_loader`, honouring `PRAISONAI_ALLOW_LOCAL_TOOLS` and the CWD path constraint. The previous `AgentsGenerator.load_tools_from_package` used `importlib.import_module()` directly and bypassed these checks.
 </Note>
+
+### Naming key: YAML vs `praisonai run`
+
+The key used to reference a `.praisonai/tools/` callable differs between the two surfaces — this is the single most common source of "why doesn't my tool show up?" confusion.
+
+| Path | Key used to reference the callable |
+|------|------------------------------------|
+| `praisonai run` (direct-prompt / `--agent`) | `<module>.<function>` — e.g. `math.add`, `greet.greet` |
+| YAML `resolve_all_from_yaml` (agents.yaml `tools:` list) | Tool name only — `@tool(name="…")` or `__name__` — e.g. `add`, `weather_lookup` |
+
+The YAML resolver keys everything by tool name so YAML lists stay flat, so a `@tool(name="weather_lookup")` is referenceable as `weather_lookup`, **not** `weather.weather_lookup`. Fixed in [#3107](https://github.com/MervinPraison/PraisonAI/issues/3107).
 
 ---
 
@@ -870,6 +889,12 @@ export PRAISONAI_ALLOW_LOCAL_TOOLS=true
 ## Related
 
 <CardGroup cols={2}>
+<Card title="Project-Local Tools" icon="folder-tree" href="/docs/features/project-local-tools">
+  Drop `@tool` functions in `.praisonai/tools/` and reference them from YAML agents
+</Card>
+<Card title="Tool Discovery Order" icon="list-tree" href="/docs/features/tool-discovery-order">
+  The tier order that resolves a tool name across every surface
+</Card>
 <Card title="Tool Source Registry" icon="puzzle-piece" href="/docs/features/tool-source-registry">
   Plug third-party tool sources via entry points
 </Card>
