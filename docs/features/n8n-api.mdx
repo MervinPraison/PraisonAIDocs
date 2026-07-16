@@ -128,9 +128,82 @@ Invoke a specific PraisonAI agent with input data.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `session_id` | `string` | Session ID for conversation continuity |
+| `session_id` | `string` | Optional. Pass a stable per-user or per-conversation id to persist and resume that conversation across requests. Isolation across different `session_id`s is enforced — each request gets an isolated clone of the registered agent. Omit the field to get an ephemeral per-request agent (no history load, no persistence). |
 | `agent_config` | `object` | Override agent configuration |
 | `context` | `object` | Additional context data |
+
+### Session semantics
+
+`session_id` isolates conversations per id, resumes history within an id, and runs ephemerally when omitted.
+
+```python
+# Serve the agent
+# agents.yaml is loaded and mounted on http://localhost:8005
+```
+
+```bash
+praisonai serve agents.yaml --port 8005
+```
+
+```bash
+# Same session_id → continuous conversation for one user
+curl -s http://localhost:8005/api/v1/agents/researcher/invoke \
+  -X POST -H "content-type: application/json" \
+  -d '{"message": "my name is Sam", "session_id": "user-42"}'
+
+curl -s http://localhost:8005/api/v1/agents/researcher/invoke \
+  -X POST -H "content-type: application/json" \
+  -d '{"message": "what is my name?", "session_id": "user-42"}'
+# → "Sam"
+
+# Different session_id → isolated; never sees user-42's history
+curl -s http://localhost:8005/api/v1/agents/researcher/invoke \
+  -X POST -H "content-type: application/json" \
+  -d '{"message": "what is my name?", "session_id": "user-99"}'
+# → no idea
+
+# No session_id at all → ephemeral; nothing is persisted
+curl -s http://localhost:8005/api/v1/agents/researcher/invoke \
+  -X POST -H "content-type: application/json" \
+  -d '{"message": "hello"}'
+```
+
+```mermaid
+sequenceDiagram
+    participant Client as HTTP Client
+    participant API as /invoke handler
+    participant Resolve as resolve_session_agent
+    participant Store as DefaultSessionStore (file-locked)
+    participant Clone as Agent clone
+
+    Client->>API: POST {message, session_id?}
+    API->>Resolve: (agent_id, session_id)
+    alt session_id present
+        Resolve->>Store: load history for session_id
+        Store-->>Resolve: chat_history
+        Resolve->>Clone: template.clone_for_channel()
+        Clone-->>API: isolated agent with loaded history
+        API->>Clone: start(message)
+        Clone->>Store: persist updated history
+    else session_id omitted
+        Resolve->>Clone: template.clone_for_channel()
+        Clone-->>API: ephemeral agent (no history)
+        API->>Clone: start(message)
+    end
+    API-->>Client: {result, session_id, status}
+```
+
+| Request has `session_id`? | Behaviour |
+|---------------------------|-----------|
+| Yes, unseen value | Fresh conversation is created and persisted under that id |
+| Yes, previously used value | That conversation resumes — full history is loaded, appended to, and re-persisted |
+| No `session_id` | Ephemeral per-request clone — history is neither loaded nor persisted |
+| Two concurrent requests, different `session_id`s | Fully isolated — history never interleaves |
+| Two concurrent requests, same `session_id` | Serialized against a shared file lock — safe, not interleaved |
+
+<Warning>
+Do NOT pass a hard-coded fallback like `session_id || "default"` — that single bucket becomes one continuous conversation shared by every caller who lacks a real id, silently defeating the isolation this endpoint provides. Either pass a **per-user / per-conversation** id, or omit the field entirely to get the ephemeral (isolated, non-persistent) mode.
+</Warning>
 
 **Response:**
 
@@ -223,14 +296,28 @@ Check API server health status.
 
 <Tab title="With Session Management">
 ```json
+// Persistent conversation — pass the real per-user session id
 {
   "method": "POST",
   "url": "http://localhost:8005/api/v1/agents/researcher/invoke",
   "sendBody": true,
   "specifyBody": "json",
-  "jsonBody": "{\"message\": \"{{ $json.query }}\", \"session_id\": \"{{ $json.session_id || 'default' }}\"}"
+  "jsonBody": "{\"message\": \"{{ $json.query }}\", \"session_id\": \"{{ $json.user_id }}\"}"
 }
 ```
+
+```json
+// Ephemeral / stateless — omit session_id entirely
+{
+  "method": "POST",
+  "url": "http://localhost:8005/api/v1/agents/researcher/invoke",
+  "sendBody": true,
+  "specifyBody": "json",
+  "jsonBody": "{\"message\": \"{{ $json.query }}\"}"
+}
+```
+
+Pick the first when the workflow already has a stable per-user identifier; pick the second for one-shot processing.
 </Tab>
 
 <Tab title="With Authentication">
@@ -557,12 +644,14 @@ Implement robust error handling in n8n workflows:
 <Accordion title="Data Validation">
 Validate data before sending to agents:
 
+When your workflow already knows *who* is talking (a user id, a customer id, a chat id), pass that stable value as `session_id`. When it doesn't, **omit the field** — the endpoint's ephemeral mode is the correct default. Do not synthesise ids per-run.
+
 ```json
-// Set Node for validation
+// Set Node for validation — pass a stable id, or omit session_id
 {
   "values": {
     "message": "{{ $json.input || 'Default message' }}",
-    "session_id": "{{ $json.session_id || $runIndex }}",
+    "session_id": "{{ $json.user_id }}",
     "timestamp": "{{ new Date().toISOString() }}"
   }
 }
@@ -649,6 +738,14 @@ Secure your API integration:
 // Solution: Check available agents
 // GET http://localhost:8005/api/v1/agents
 ```
+</Tab>
+
+<Tab title="Conversations Mixing">
+**Symptom:** two users' conversations mix together.
+
+**Cause:** both requests share the same `session_id` (often a hard-coded `"default"` or an empty string). Each `session_id` is one conversation — reusing it across users is what the endpoint interprets as "resume that user's chat".
+
+**Fix:** send a per-user id, or omit `session_id`.
 </Tab>
 </Tabs>
 
