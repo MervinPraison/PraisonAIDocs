@@ -55,11 +55,25 @@ graph LR
     agent.start("Refactor the codebase to improve readability")
     ```
   </Step>
+  <Step title="Undo the last turn in one line">
+    ```python
+    from praisonaiagents import Agent
+    from praisonaiagents.checkpoints import CheckpointService
+
+    checkpoints = CheckpointService(workspace_dir="./my_project")
+    agent = Agent(name="RefactorBot", instructions="Refactor code.", checkpoints=checkpoints)
+    agent.start("Refactor the auth module")
+
+    # Something went wrong — undo the last turn's file edits in one line
+    await checkpoints.rewind()
+    ```
+  </Step>
   <Step title="Save and restore from CLI">
     ```bash
     praisonai checkpoint save "Before major changes"
     praisonai checkpoint list
     praisonai checkpoint restore last
+    praisonai checkpoint rewind        # undo the most recent checkpoint in one command
     ```
   </Step>
   <Step title="One-liner undo after a run">
@@ -76,8 +90,62 @@ Checkpoints allow you to:
 
 - **Save** snapshots of your workspace before changes
 - **Restore** files to any previous checkpoint
+- **Rewind** N checkpoints back from the latest
 - **Diff** between checkpoints to see what changed
 - **Track** all file modifications made by agents
+
+## Rewind vs Restore
+
+Both rewind the workspace, but they target checkpoints differently.
+
+| You want to… | Use | Example |
+|--------------|-----|---------|
+| Undo the *very last* set of changes | `rewind` (default 1) | `praisonai checkpoint rewind` |
+| Step back N checkpoints from now | `rewind N` | `praisonai checkpoint rewind 3` |
+| Go to a specific checkpoint you remember | `restore <id\|last>` | `praisonai checkpoint restore abc1234` |
+| Go to a checkpoint tagged with a step index | `restore --step N` | `praisonai checkpoint restore --step 3` |
+
+```mermaid
+graph TB
+    Q[Need to rewind?] -->|Undo last change| R1[praisonai checkpoint rewind]
+    Q -->|Step back N| R2[praisonai checkpoint rewind N]
+    Q -->|Known checkpoint id| R3[praisonai checkpoint restore &lt;id&gt;]
+    Q -->|Tagged by step index| R4[praisonai checkpoint restore --step N]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+    class Q q
+    class R1,R2,R3,R4 opt
+```
+
+## How It Works
+
+A user rewinds the workspace to a pre-turn state after a bad edit.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Checkpoints as CheckpointService
+
+    User->>Agent: "Refactor auth"
+    Agent->>Checkpoints: save("before turn 1")
+    Agent->>Agent: edit files
+    User->>Agent: "This broke tests"
+    User->>Checkpoints: rewind()
+    Checkpoints-->>User: workspace restored to pre-turn-1 state
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef agent fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef cp fill:#F59E0B,stroke:#7C90A0,color:#fff
+    class User user
+    class Agent agent
+    class Checkpoints cp
+```
+
+<Note>
+A checkpoint is not guaranteed to map 1:1 with an agent turn — manual saves and auto-checkpoints both create checkpoints — so `rewind` counts checkpoints, the closest turn-addressable primitive without a stored turn↔checkpoint map.
+</Note>
 
 ## In-session `/undo` and `/revert`
 
@@ -170,7 +238,10 @@ praisonai checkpoint diff abc12345 def67890
 praisonai checkpoint restore last
 praisonai checkpoint restore abc12345
 
-# Rewind N checkpoints back — no id lookup needed (default: 1 = undo last)
+# Restore by per-step index (checkpoints saved with save(step=N))
+praisonai checkpoint restore --step 3
+
+# Rewind N checkpoints back from the latest (default: 1 = undo last checkpoint)
 praisonai checkpoint rewind
 praisonai checkpoint rewind 3
 
@@ -231,6 +302,26 @@ service = CheckpointService(
 - `auto_checkpoint`: Auto-checkpoint before file modifications
 - `max_checkpoints`: Maximum checkpoints to keep
 
+## Step-Indexed Checkpoints
+
+Tag checkpoints with an agent step index so you can rewind back to a specific step by number instead of remembering a hash.
+
+```python
+from praisonaiagents.checkpoints import CheckpointService
+
+service = CheckpointService(workspace_dir="./my_project")
+await service.initialize()
+
+# Save one checkpoint per step
+for step in range(5):
+    await service.save(f"After step {step}", step=step)
+
+# Later — jump straight back to step 2
+await service.restore(step=2)
+```
+
+The step index is stored in the shadow-git commit message as `[step-N]`; no extra storage. `Checkpoint.step` is surfaced by `list_checkpoints()` for filtering.
+
 ## Data Types
 
 ### Checkpoint
@@ -238,10 +329,11 @@ service = CheckpointService(
 ```python
 @dataclass
 class Checkpoint:
-    id: str           # Full commit hash
-    short_id: str     # Short hash (8 chars)
-    message: str      # Checkpoint message
+    id: str                   # Full commit hash
+    short_id: str             # Short hash (8 chars)
+    message: str              # Checkpoint message
     timestamp: datetime
+    step: Optional[int]       # Populated when save(step=N) was used
     files_changed: int
     insertions: int
     deletions: int
@@ -276,6 +368,9 @@ class CheckpointDiff:
   </Accordion>
   <Accordion title="Prefer /undo over /clear after a bad edit">
     With the session store wired in, `/undo` rewinds files **and** chat history to the same turn boundary, so the agent's memory stays consistent with the workspace. `/clear` only truncates history and leaves reverted edits invisible to the agent.
+  </Accordion>
+  <Accordion title="Reach for rewind first, tag steps for precise jumps">
+    `rewind` is the shortest path to undo the last change. When an agent loop wants to jump back to a specific point (e.g. "back to step 2"), tag checkpoints with `save(step=N)` and use `restore(step=N)`.
   </Accordion>
 </AccordionGroup>
 
@@ -320,7 +415,7 @@ Initialize the checkpoint service:
 success = await service.initialize()
 ```
 
-#### save(message, allow_empty=False, quiet=False)
+#### save(message, allow_empty=False, step=None)
 
 Save a checkpoint:
 
@@ -337,18 +432,24 @@ else:
 |-----------|------|---------|-------------|
 | `message` | `str` | — | Checkpoint message |
 | `allow_empty` | `bool` | `False` | Allow saving even when no files changed |
-| `quiet` | `bool` | `False` | Suppress output (used by machine-readable run modes) |
+| `step` | `Optional[int]` | `None` | Tag this checkpoint with an agent step index (must be `>= 0`) |
 
-#### restore(checkpoint_id)
+#### restore(checkpoint_id=None, step=None)
 
-Restore to a checkpoint:
+Restore the workspace to a checkpoint by id or step index. Providing both is an error.
 
 ```python
 result = await service.restore("abc123")
+result = await service.restore(step=2)   # restore the checkpoint tagged step 2
 
 if result.success:
     print("Restored successfully")
 ```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `checkpoint_id` | `Optional[str]` | `None` | Commit hash / short id |
+| `step` | `Optional[int]` | `None` | Restore the checkpoint tagged with this step index |
 
 #### rewind(steps=1)
 
@@ -386,6 +487,18 @@ else:
 `rewind` is not capped by `max_checkpoints` — pruning only trims the in-memory
 listing, and shadow-git retains every commit, so older commits stay reachable.
 </Note>
+
+#### get_checkpoint_by_step(step)
+
+Return the most recent checkpoint tagged with the given step index, or `None`.
+
+```python
+cp = await service.get_checkpoint_by_step(2)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `step` | `int` | — | Step index to look up |
 
 #### diff(from_id=None, to_id=None)
 
