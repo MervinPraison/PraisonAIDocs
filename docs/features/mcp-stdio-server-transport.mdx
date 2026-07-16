@@ -1,0 +1,147 @@
+---
+title: "MCP STDIO Server Transport"
+sidebarTitle: "MCP STDIO Transport"
+description: "The STDIO transport that powers 'praisonai-mcp serve --transport stdio'"
+icon: "terminal"
+---
+
+The STDIO server transport lets `praisonai-mcp` talk to Claude Desktop, Cursor, and Windsurf over stdin/stdout — reliably, on every platform.
+
+```mermaid
+graph LR
+    Client[📋 MCP Client] --> Stdin[📥 stdin<br/>byte lines]
+    Stdin --> Reader[🧵 mcp-stdio-reader<br/>thread]
+    Reader --> Queue[📦 bounded queue<br/>maxsize 1000]
+    Queue --> Loop[⚙️ asyncio loop]
+    Loop --> Handler[🤖 server handler]
+    Handler --> Stdout[📤 stdout buffer]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Client,Stdin input
+    class Reader,Loop,Handler process
+    class Queue config
+    class Stdout output
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Install the host">
+
+```bash
+pip install "praisonai-mcp"
+```
+
+</Step>
+<Step title="Serve over STDIO">
+
+```bash
+praisonai-mcp serve --transport stdio
+```
+
+Works on Linux, macOS, and Windows — including Windows + Python 3.13.
+
+</Step>
+<Step title="Point your MCP client at it">
+
+```json
+{
+  "mcpServers": {
+    "praisonai": {
+      "command": "praisonai-mcp",
+      "args": ["serve", "--transport", "stdio"]
+    }
+  }
+}
+```
+
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+The host reads stdin on a dedicated thread and hands lines to the asyncio loop, so the async pipe API is never touched.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Stdin as stdin.buffer
+    participant Reader as mcp-stdio-reader thread
+    participant Queue as queue.Queue(maxsize=1000)
+    participant Loop as asyncio loop
+    participant Server as server.handle_message
+    participant Stdout as sys.stdout.buffer
+
+    Client->>Stdin: JSON-RPC line (bytes)
+    Stdin->>Reader: read line
+    Reader->>Queue: put(line) — backpressure if full
+    Loop->>Queue: run_in_executor(get)
+    Queue-->>Loop: line
+    Loop->>Server: handle_message(parsed)
+    Server-->>Loop: response
+    Loop->>Stdout: write(response) + flush
+    Stdout-->>Client: JSON-RPC response
+```
+
+Reading stdin on a background thread — instead of `loop.connect_read_pipe(sys.stdin)` — is why the host runs on Windows `ProactorEventLoop` + Python 3.13, where the async pipe API raises `OSError: [WinError 6] The handle is invalid`.
+
+---
+
+## Reliability Guarantees
+
+| Guarantee | What it means |
+|-----------|---------------|
+| **Cross-platform** | Runs on Linux, macOS, and Windows (including Windows + Python 3.13, previously broken). |
+| **Malformed input is safe** | Non-UTF-8 or invalid JSON becomes a JSON-RPC `-32700` parse error; the server keeps running. |
+| **Bounded memory** | The stdin queue is capped at `1000` lines with backpressure, so a fast or hostile client can't grow memory without limit. |
+| **Clean shutdown** | `stop()` wakes a reader blocked on idle-but-open stdin, so Ctrl+C and client disconnect never hang. |
+
+A malformed line produces this response, and the transport continues:
+
+```json
+{"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error: ..."}}
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Platform support">
+    STDIO transport runs the same on Linux, macOS, and Windows. On Windows it works under the `ProactorEventLoop` on Python 3.13 — no workarounds needed.
+  </Accordion>
+  <Accordion title="Backpressure and queue size">
+    The intake queue is fixed at `1000` lines. When it fills, the reader thread applies backpressure until the loop drains it — the server stays responsive instead of buffering without limit.
+  </Accordion>
+  <Accordion title="What happens on malformed input">
+    Invalid UTF-8 or bad JSON is reported as a JSON-RPC `-32700` parse error. The server logs it to stderr and keeps serving; it never exits on bad bytes.
+  </Accordion>
+  <Accordion title="What happens on client disconnect">
+    When stdin closes (client disconnect) or you press Ctrl+C, `stop()` enqueues an EOF sentinel that unblocks the reader, so `run()` exits cleanly without hanging.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="PraisonAI MCP Server" icon="server" href="/docs/mcp/praisonai-mcp-server">
+    Heavy MCP host reference and client setup.
+  </Card>
+  <Card title="MCP Transports" icon="network-wired" href="/docs/mcp/transports">
+    All MCP transport mechanisms compared.
+  </Card>
+  <Card title="praisonai-mcp Package" icon="plug" href="/docs/features/praisonai-mcp-package">
+    Standalone host package guide.
+  </Card>
+  <Card title="Windows SDK Quickstart" icon="windows" href="/docs/features/windows-sdk-quickstart">
+    Run the MCP host on Windows.
+  </Card>
+</CardGroup>
