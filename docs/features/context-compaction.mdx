@@ -998,8 +998,9 @@ print(f"Skipped due to low savings: {result.was_skipped_due_to_low_savings}")
 savings_pct = result.calculate_savings_pct()
 print(f"Manual calculation: {savings_pct:.1f}%")
 
-# Export full metrics
+# Export full metrics — to_dict() now includes "summary"
 metrics = result.to_dict()
+print(f"Summary: {metrics['summary'][:120]}")
 print(f"All metrics: {metrics}")
 ```
 
@@ -1011,6 +1012,46 @@ print(f"All metrics: {metrics}")
 | `tool_results_pruned` | `int` | Number of tool results that were pruned in the pre-pass |
 | `previous_summary_reused` | `bool` | True when iterative summary feature was used |
 | `was_skipped_due_to_low_savings` | `bool` | True when anti-thrashing protection aborted compaction |
+| `summary` | `str` | The summary text produced by the summarising strategy this pass (`""` for `TRUNCATE`/`SLIDING`/`PRUNE`). Persisted via the session store's `append_compaction_checkpoint` when `session_id` is bound. Populated in `1.6.152+` — previously always `""`. |
+
+Only summarising strategies fill `result.summary`:
+
+```mermaid
+graph TB
+    A[Which strategy did you pick?] --> B[LLM iterative /<br/>naive summarise]
+    A --> C[TRUNCATE / SLIDING /<br/>PRUNE]
+    B --> D[result.summary populated<br/>→ persisted to session store]
+    C --> E["result.summary == ''<br/>→ nothing persisted (by design)"]
+
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef neutral fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class A decision
+    class B,C neutral
+    class D good
+    class E neutral
+```
+
+Inspect the populated summary directly:
+
+```python
+from praisonaiagents import Agent, CompactionConfig
+from praisonaiagents.compaction import CompactionStrategy
+
+agent = Agent(
+    name="Inspector",
+    context=CompactionConfig(
+        strategy=CompactionStrategy.LLM_SUMMARIZE,  # summarising strategy required
+        enable_iterative_summary=True,
+    ),
+)
+
+compacted, result = agent.compactor.compact(messages)
+print(bool(result.summary))         # True — populated by _extract_summary_text
+print(result.summary[:120])         # peek at the distilled context
+print(result.to_dict()["summary"])  # same value, via to_dict()
+```
 
 ### Monitoring Compaction Health
 
@@ -1032,6 +1073,11 @@ def monitor_compaction_health(agent):
 
 # Usage
 health = monitor_compaction_health(agent)
+
+# Observe the summary a compaction pass produced
+compacted, result = agent.compactor.compact(agent.conversation_history)
+print(f"Has summary: {bool(result.summary)}")   # True for summarising strategies
+print(f"Summary peek: {result.summary[:120]}")
 ```
 
 ---
@@ -1187,11 +1233,17 @@ Since [PR #1980](https://github.com/MervinPraison/PraisonAI/pull/1980), `_trunca
 
 ### Hooks
 
-> `BEFORE_COMPACTION` and `AFTER_COMPACTION` hook events now fire consistently around every compaction (both sync and async). See [Hooks](/docs/features/hooks#compaction-events).
+> `BEFORE_COMPACTION` and `AFTER_COMPACTION` hook events now fire consistently around every compaction (both sync and async). See [Hook Events](/docs/features/hook-events#system-events).
+
+<Note>
+`AFTER_COMPACTION` now receives a populated `CompactionResult.summary` for summarising strategies (previously always `""`), so plugin persisters that subscribe to `AFTER_COMPACTION` can finally read the summary text. See [Reading the summary from a hook](/docs/features/hook-events#system-events).
+</Note>
 
 ## Persistence
 
 When the agent is bound to a `session_id`, a successful in-run compaction now writes its summary to the session automatically as a compaction checkpoint. On the next run, resume replays that summary plus the retained tail instead of the full raw transcript.
+
+As of `1.6.152+`, this applies to **both** `agent.start(...)` and `agent.astart(...)` / `agent.achat(...)` / `agent.arun(...)`. Prior versions silently skipped persistence for async proactive compaction; [PR #3081](https://github.com/MervinPraison/PraisonAI/pull/3081) fixed it and routes the checkpoint write through `asyncio.to_thread` so the event loop is not blocked.
 
 ```python
 from praisonaiagents import Agent, ExecutionConfig
