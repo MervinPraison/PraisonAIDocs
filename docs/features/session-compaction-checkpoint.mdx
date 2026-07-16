@@ -7,6 +7,10 @@ icon: "bookmark"
 
 When context compaction runs mid-conversation, the summary is now persisted so a later resume replays the compacted working history (summary + tail) instead of the full raw transcript.
 
+<Note>
+Persistence now works for both sync and async agents. Prior versions silently no-op'd for async agents (`astart` / `achat` / `arun`) and for any sync agent whose `AFTER_COMPACTION` hook read `result.summary` — the persister was fed an empty string. Both fixed in `1.6.152+` ([PR #3081](https://github.com/MervinPraison/PraisonAI/pull/3081)).
+</Note>
+
 ```mermaid
 graph LR
     subgraph "Cheap resume"
@@ -76,6 +80,30 @@ agent.start("Pick up where we left off.")  # summary + tail, no window overflow
 
 ---
 
+## Async Agents
+
+`agent.astart(...)` / `agent.achat(...)` / `agent.arun(...)` now persist checkpoints identically to the sync path (`1.6.152+`). Use the same `execution=ExecutionConfig(context_compaction=True)` and `memory={"session_id": ...}` setup.
+
+```python
+import asyncio
+from praisonaiagents import Agent, ExecutionConfig
+
+async def main():
+    agent = Agent(
+        name="LongChat",
+        instructions="Help across many sessions.",
+        memory={"session_id": "user-42-chat"},
+        execution=ExecutionConfig(context_compaction=True),
+    )
+    # Prior versions silently skipped checkpoint persistence on this path.
+    # 1.6.152+ persists via asyncio.to_thread so the event loop keeps flowing.
+    await agent.astart("Let's keep chatting for hours.")
+
+asyncio.run(main())
+```
+
+---
+
 ## How It Works
 
 The compactor produces a summary during the run; the store anchors that summary to the current end of the transcript. On resume the store hands back the summary followed by the retained tail.
@@ -85,17 +113,22 @@ sequenceDiagram
     participant User
     participant Agent
     participant Compactor
+    participant Loop as asyncio.to_thread
     participant Store
 
-    User->>Agent: Long chat over many turns
+    User->>Agent: start / astart (long chat)
     Agent->>Compactor: Context near limit → compact
-    Compactor-->>Agent: summary + tail
-    Agent->>Store: append_compaction_checkpoint(summary)
+    Compactor-->>Agent: (compacted, result) — result.summary populated
+    Agent->>Loop: async path offloads persistence
+    Loop->>Store: append_compaction_checkpoint(summary)
+    Store-->>Loop: OK
     User->>Agent: Later run — resume same session_id
     Agent->>Store: get_working_history()
     Store-->>Agent: [summary_message, *tail]
     Agent-->>User: Continues cheaply, no window overflow
 ```
+
+The sync path calls `append_compaction_checkpoint` directly; the async path routes it through `asyncio.to_thread` so the locked JSON write never stalls the event loop.
 
 The checkpoint records `message_index` — the length of the transcript at compaction time. Anything appended after that index is the **tail** that follows the summary on resume. If the head is later trimmed, the anchor shifts by the same amount so the tail stays aligned.
 
@@ -107,7 +140,7 @@ A single checkpoint is stored on `SessionData.last_compaction`. It carries the s
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `summary` | `str` | *(required)* | The condensed history the compactor produced |
+| `summary` | `str` | *(required)* | The condensed history the compactor produced, read from [`CompactionResult.summary`](/docs/features/context-compaction#new-compactionresult-fields) (previously `""` for all real runs; populated for summarising strategies in `1.6.152+`) |
 | `message_index` | `int` | `0` | Transcript length at compaction time; anything after this index is the tail |
 | `role` | `str` | `"system"` | Role used when replaying the summary as an LLM message |
 | `tokens_before` | `int` | `0` | Token count before compaction (observability) |
@@ -169,6 +202,14 @@ Turn on `execution=ExecutionConfig(context_compaction=True)` for agents that run
 <Accordion title="set_chat_history intentionally invalidates the checkpoint">
 Replacing the whole transcript with `set_chat_history()` clears `last_compaction` — the old anchor no longer applies. `clear_session()` clears it too.
 </Accordion>
+
+<Accordion title="Which compaction strategies actually produce a summary?">
+Only summarising strategies (LLM iterative / naive summarise) populate `result.summary` and therefore persist a checkpoint. `TRUNCATE`, `SLIDING`, and `PRUNE` leave `result.summary` as `""` and — by design — persist nothing. See [Context Compaction](/docs/features/context-compaction#new-compactionresult-fields).
+</Accordion>
+
+<Accordion title="Reusing a compactor across passes">
+When you reuse a single `ContextCompactor` across mixed strategies, the checkpoint reflects only the current pass — not the last summarising pass. A later `TRUNCATE`/`SLIDING`/`PRUNE` pass persists `""` (nothing) rather than leaking a stale summary that would drop intervening turns on resume.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -184,5 +225,8 @@ Replacing the whole transcript with `set_chat_history()` clears `last_compaction
   </Card>
   <Card title="Context Compaction" icon="compress" href="/docs/features/context-compaction">
     How summaries are produced in-run
+  </Card>
+  <Card title="Hook Events" icon="webhook" href="/docs/features/hook-events#system-events">
+    Read the summary from an AFTER_COMPACTION hook
   </Card>
 </CardGroup>
