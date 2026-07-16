@@ -241,6 +241,7 @@ If you use the module-level helpers (`resolve()`, `resolve_many()`, `list_availa
 | Long-running server with hot-reload of tools | ✅ Yes, after tools change |
 | Test setup/teardown | ✅ Yes, in a fixture |
 | You always pass an explicit `tools_py_path` | ❌ No |
+| Explicit resolver injection into `AgentsGenerator(tool_resolver=...)` | ❌ Not needed — you already own the instance |
 
 ```mermaid
 sequenceDiagram
@@ -258,6 +259,56 @@ sequenceDiagram
     Tenant B->>Process: resolve("my_tool") ✅ /tenants/b/tools.py
 ```
 
+
+---
+
+## Sharing one resolver across the run
+
+Tool discovery — scanning `tools.py`, `praisonaiagents.tools`, `praisonai-tools`, wrapper `ToolRegistry` registrations, and the core plugin registry — is not cheap. PraisonAI reuses **one** resolver per context (per agent / per request / per CLI run) so this discovery happens once, not once per generator construction.
+
+```python
+from praisonai.tool_resolver import _get_default_resolver
+
+resolver = _get_default_resolver()   # cached in a ContextVar
+tools_dict = resolver.list_available()
+```
+
+Under the hood, `_get_default_resolver()` is backed by a `contextvars.ContextVar`. Every code path that used to build a fresh `ToolResolver()` now flows through this helper by default:
+
+| Caller | Behaviour |
+|---|---|
+| `BaseAutoGenerator._get_tool_resolver()` — used by `AutoGenerator`, `WorkflowAutoGenerator`, `JobWorkflowAutoGenerator` for the `--auto` planner prompt | Reuses the context-local resolver. |
+| `AgentsGenerator.__init__(...)` (no `tool_resolver=` passed) | Reuses the context-local resolver. |
+| `AgentsGenerator.__init__(..., tool_resolver=my_resolver)` | Uses your explicit resolver — for tests or multi-tenant runtimes. |
+| Module-level helpers `resolve()`, `resolve_many()`, `list_available()`, `has_tool()`, `validate_yaml_tools()` | Already used the context-local resolver — unchanged. |
+
+### Passing an explicit resolver (DI)
+
+For tests or multi-tenant code, pass your own resolver into `AgentsGenerator`:
+
+```python
+from praisonai.agents_generator import AgentsGenerator
+from praisonai.tool_resolver import ToolResolver
+
+my_resolver = ToolResolver(tools_py_path="tools.py")
+
+gen = AgentsGenerator(
+    agent_file="agents.yaml",
+    framework="praisonai",
+    config_list=[{"model": "gpt-4o", "api_key": "sk-..."}],
+    tool_resolver=my_resolver,   # ← new in PR #3067
+)
+```
+
+This composes with the existing `adapter_registry=` and `tool_timeout_executor=` DI parameters and works identically for the sync (`generate_crew_and_kickoff`) and async (`agenerate_crew_and_kickoff`) paths.
+
+<Note>
+If you're switching tenants mid-process, prefer `reset_default_resolver()` (covered above under **Multi-tenant usage**) plus a fresh `AgentsGenerator` per tenant. Passing `tool_resolver=` gives you tighter control when you already manage resolver lifetimes yourself.
+</Note>
+
+<Tip>
+`praisonai --auto` builds an `AutoGenerator` for planning **and** an `AgentsGenerator` for execution in the same process. Since PR #3067 both share one warm resolver cache via the context-local default — installed-tool discovery runs once per run, not twice.
+</Tip>
 
 ---
 
