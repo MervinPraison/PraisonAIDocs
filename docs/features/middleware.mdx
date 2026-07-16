@@ -6,6 +6,10 @@ icon: "webhook"
 ---
 Middleware lets your agent intercept every LLM call and every tool call — log them, modify inputs, retry on failure, or block execution entirely.
 
+<Note>
+As of PraisonAI [#3086](https://github.com/MervinPraison/PraisonAI/pull/3086) (2026-07-16), tool middleware (`before_tool` / `after_tool` / `wrap_tool_call`) gates **async** tool calls as well — the same hooks fire around `agent.astart(...)` and `execute_tool_async(...)`. No API change; existing hooks work unmodified.
+</Note>
+
 ```python
 from praisonaiagents import Agent
 from praisonaiagents.hooks import before_model
@@ -111,6 +115,32 @@ result = agent.start("Search for today's news.")
 ```
 
 </Step>
+
+<Step title="Async parity">
+
+The same hooks gate async tool calls — write them once and they fire for both `agent.start(...)` and `agent.astart(...)`.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonaiagents.hooks import before_tool, ToolRequest
+
+@before_tool
+def audit(request: ToolRequest):
+    print(f"[audit] {request.tool_name}({request.arguments})")
+    return request
+
+agent = Agent(name="AsyncAudited", instructions="Answer with tools.", hooks=[audit])
+
+async def main():
+    await agent.astart("Look up the weather in Paris.")
+
+asyncio.run(main())
+```
+
+Under the hood the synchronous `wrap_tool_call` chain runs in a thread-pool worker and the actual async tool execution is scheduled back on the event loop — so you write hooks the same way for sync and async.
+
+</Step>
 </Steps>
 
 ---
@@ -141,7 +171,27 @@ Execution order for a model call:
 3. The real LLM call executes
 4. All `after_model` hooks run in **reverse** registration order
 
-The same order applies for tool calls with `before_tool`, `wrap_tool_call`, and `after_tool`.
+The same order applies for tool calls with `before_tool`, `wrap_tool_call`, and `after_tool` — including **async** tool calls:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Middleware as wrap_tool_call chain (sync)
+    participant Worker as Thread-pool worker
+    participant Tool as async tool
+
+    User->>Agent: await agent.astart(...)
+    Agent->>Worker: schedule middleware chain
+    Worker->>Middleware: run(request, call_next)
+    Middleware->>Worker: call_next(request)
+    Worker->>Tool: asyncio.run_coroutine_threadsafe(...)
+    Tool-->>Worker: result
+    Worker-->>Middleware: ToolResponse
+    Middleware-->>Worker: ToolResponse
+    Worker-->>Agent: ToolResponse
+    Agent-->>User: response
+```
 
 | Decorator | Receives | Returns | Use for |
 |-----------|----------|---------|---------|
@@ -250,7 +300,7 @@ def cache_results(request, call_next):
 </Accordion>
 
 <Accordion title="Zero overhead when hooks are empty">
-  The middleware manager checks for registered hooks before executing any code. When `hooks=[]` (the default), the fast path skips all hook processing entirely.
+  The middleware manager checks for registered hooks before executing any code. When `hooks=[]` (the default), the fast path skips all hook processing entirely — for both sync (`execute_tool`) and async (`execute_tool_async`) tool calls. The async path only spins up the thread-pool middleware worker when tool-level hooks are actually registered.
 </Accordion>
 </AccordionGroup>
 
