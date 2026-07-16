@@ -151,44 +151,120 @@ Run a browser agent with a specific goal:
 praisonai browser run "Search for the latest AI news and summarize"
 ```
 
-### If the bridge is not running
-
-`run` connects to the local bridge server. If that server is not up, it prints an actionable message instead of a cryptic connection error:
-
-```
-Cannot connect to PraisonAI Browser bridge at ws://localhost:8765/ws
-
-The bridge server is not running. In a separate terminal, start it with:
-
-  praisonai browser start --port 8765
-
-Then verify it is up:
-  curl http://localhost:8765/health
-
-Note: this is the local bridge server, not your target site (--url).
-```
-
-<Note>
-The failing layer is the **local bridge server** on port 8765, not the site named in `--url`. This message replaces the raw `WinError 1225` (Windows), `errno 111` (Linux), and `errno 61` (macOS) connection-refused errors, so those still land here when searched.
-</Note>
-
-Fix it by starting the server (see [Chrome Management → Start Server](#start-server)), then run again in a second terminal:
+`run` fails fast: it checks the bridge, honours typed exit codes, and aborts a stalled session in 30 seconds instead of hanging silently.
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant TermA as Terminal A
-    participant TermB as Terminal B
-    participant Bridge as ws://localhost:8765
-
-    User->>TermA: praisonai browser start --port 8765
-    TermA->>Bridge: listen
-    Bridge-->>TermA: PraisonAI Browser Server (blocks)
-    User->>TermB: praisonai browser run "…"
-    TermB->>Bridge: WebSocket connect
-    Bridge-->>TermB: session accepted
-    TermB-->>User: Step 0, Step 1, Task completed
+    participant CLI
+    participant Bridge
+    participant Ext as Chrome Extension
+    User->>CLI: praisonai browser run "…"
+    CLI->>Bridge: GET /health (3s timeout)
+    Bridge-->>CLI: extension_connections >= 1
+    CLI->>Bridge: WebSocket /ws + start_session
+    Bridge->>Ext: start_automation
+    Bridge-->>CLI: status:running, start_automation_sent:true
+    Ext-->>Bridge: step / action
+    Bridge-->>CLI: session DB updates
+    CLI-->>User: Step 1… Step N… exit 0
 ```
+
+### Pre-flight check
+
+`run` hits `GET http://127.0.0.1:8765/health` with a 3-second timeout **before** opening the WebSocket, so a missing bridge or extension fails in seconds instead of hanging on the full `--timeout`. Three failures land here:
+
+| Failure | Message | Exit |
+|---------|---------|------|
+| Bridge unreachable or malformed body | `Cannot reach PraisonAI Browser bridge` | `2` |
+| No extension connected | `Bridge is up but no extension is connected` | `2` |
+| Invalid health response | `Bridge returned an unexpected health response` / `Bridge returned an invalid connection count` | `2` |
+
+The "no extension" message lists four recovery steps: open Chrome with the PraisonAI extension and side panel, verify with `curl http://127.0.0.1:8765/health` (expect `extension_connections >= 1`), use the side panel **or** the CLI (not both), and — as a tip — use `--engine cdp` for extension-free automation.
+
+### Exit codes
+
+`run` returns a **stable** exit code you can script against in CI, cron, or make targets.
+
+| Exit code | Meaning | When |
+|-----------|---------|------|
+| `0` | Success | Session completed, or you hit Ctrl+C |
+| `1` | Task failure | Session ended in `failed` or `stopped` state |
+| `2` | Infra failure | Bridge unreachable, no extension, server error, or watchdog fired |
+| `3` | Timeout | Session exceeded `--timeout` seconds |
+
+These codes apply to both normal and `--debug` runs, so `2` always means "fix the environment" and `1` always means "the prompt or page didn't work out."
+
+### First-step watchdog
+
+When the server can't confirm the task reached an extension, `run` aborts after 30 seconds if no automation step has appeared:
+
+```
+No automation steps in 30s
+  Check: extension connected? side panel stopped? sessions=0?
+```
+
+This maps to exit code `2`. The watchdog applies **only** when delivery is unconfirmed — a confirmed run honours `--timeout` fully, so a slow first step from a cold browser or slow initial model call is legitimate. Steps that arrive right at the deadline are shown before the watchdog fires.
+
+### Verbose delivery indicator
+
+Add `-v` to see whether the task reached an extension once the session starts:
+
+```
+start_automation delivered to extension      # confirmed
+Warning: start_automation not confirmed      # unconfirmed
+```
+
+If the server reports delivery as `False`, `run` fails fast with `Extension automation did not start.` (exit `2`) instead of polling an empty session until timeout.
+
+### Common failures
+
+<AccordionGroup>
+  <Accordion title="Bridge down">
+    The bridge server is not running. Start it in a separate terminal, then verify:
+
+    ```bash
+    praisonai browser start --port 8765
+    curl http://localhost:8765/health
+    ```
+
+    ```
+    Cannot connect to PraisonAI Browser bridge at ws://localhost:8765/ws
+
+    The bridge server is not running. In a separate terminal, start it with:
+
+      praisonai browser start --port 8765
+
+    Then verify it is up:
+      curl http://localhost:8765/health
+
+    Note: this is the local bridge server, not your target site (--url).
+    ```
+
+    <Note>
+    The failing layer is the **local bridge server** on port 8765, not the site named in `--url`. This message replaces the raw `WinError 1225` (Windows), `errno 111` (Linux), and `errno 61` (macOS) connection-refused errors, so those still land here when searched.
+    </Note>
+  </Accordion>
+  <Accordion title="No extension connected">
+    The bridge is up but no extension is attached. Open Chrome with the PraisonAI extension and side panel, then confirm the count:
+
+    ```bash
+    curl http://127.0.0.1:8765/health    # expect extension_connections >= 1
+    ```
+
+    For extension-free automation, use `--engine cdp` instead.
+  </Accordion>
+  <Accordion title="Side panel busy">
+    The side panel agent and the CLI can't drive the same extension at once. `run` surfaces server errors with a friendly message and exits `2`:
+
+    ```
+    <server error message>
+      Stop the side panel agent and retry.
+    ```
+
+    Stop the side panel run, then retry from the CLI.
+  </Accordion>
+</AccordionGroup>
 
 ---
 
