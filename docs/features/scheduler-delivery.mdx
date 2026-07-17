@@ -156,13 +156,77 @@ The `deliver` value is parsed by `DeliveryTarget.parse()` — the same serialisa
 | `"telegram"` | Default (home) channel of that platform |
 | `"telegram:123456"` | Specific channel / chat ID |
 | `"telegram:123456:789"` | Channel `123456` with thread `789` |
-| `"origin"` | Reply to the same channel the schedule was created from |
+| `"origin"` | Reply to the same channel the schedule was created from (uses `ScheduleJob.origin`) |
+| `"all"` | Every configured bot — **requires the full BotOS gateway** |
+
+<Note>
+`deliver="origin"` **does** work on the lightweight scheduler path — it delivers back to the same channel the schedule was created from, using the origin persisted on `ScheduleJob.origin` at creation. No live gateway session is required. The warning is only logged if the job was created **without** an origin channel.
+</Note>
 
 <Warning>
-`origin` (and `all`) need request/session context from the full BotOS gateway. The lightweight scheduler path logs a warning and skips them — use an explicit `platform` or `platform:chat_id` token instead, or run under the gateway.
+`deliver="all"` still needs the full BotOS gateway (it must enumerate every configured bot). On the lightweight path it logs a warning and no-ops — use an explicit `platform` or `platform:channel_id` token instead, or run under the gateway.
 </Warning>
 
 Swap `telegram` for `discord`, `slack`, or `whatsapp` — the grammar is identical.
+
+```mermaid
+graph TB
+    A[Where should the result go?] --> B{Fixed target or same chat as creation?}
+    B -->|A fixed chat / channel| C[deliver='telegram:123456']
+    B -->|Same chat the schedule was created from| D[deliver='origin']
+    B -->|Platform's default/home channel| E[deliver='telegram']
+    B -->|Every configured bot| F[deliver='all'<br/>requires BotOS gateway]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef choice fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef gated fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A,B question
+    class C,D,E choice
+    class F gated
+```
+
+---
+
+## Deliver back to the origin channel
+
+Use `deliver="origin"` when the schedule was created from a chat and you want the recurring result to land back in that same chat — without wiring up a specific `platform:channel_id` token.
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+
+# Job was created from a Telegram chat — its origin is persisted on
+# ScheduleJob.origin at creation. deliver="origin" delivers back to it.
+scheduler = AgentScheduler(agent, task="Morning brief", deliver="origin")
+scheduler.start("hourly")
+```
+
+**How origin resolution works:**
+
+```mermaid
+sequenceDiagram
+    participant Job as ScheduleJob (persisted)
+    participant Sched as AgentScheduler
+    participant Delivery as SchedulerDelivery
+    participant Router as DeliveryRouter
+    participant Chat as Origin channel
+
+    Job->>Sched: config.origin = DeliveryTarget(channel="telegram", channel_id="123456")
+    Sched->>Delivery: SchedulerDelivery(deliver="origin", origin=…)
+    Note over Delivery: _resolve_origin_target rewrites<br/>"origin" → "telegram:123456"
+    Delivery->>Router: deliver(idempotency_key, target, payload)
+    Router->>Chat: bot.send_message(...)
+    Chat-->>Router: ok
+```
+
+`SchedulerDelivery.origin_from_config()` normalises the origin whether it is a live `DeliveryTarget` **or** its persisted `dict` form (from `to_dict()`), so scheduled jobs restored from disk resolve correctly too.
+
+<Tip>
+`deliver="origin"` still logs a warning and no-ops if the job was created without an origin channel — for example, a job created purely from Python code with no chat context. In that case, use an explicit `platform:channel_id` token.
+</Tip>
 
 ---
 
@@ -176,13 +240,19 @@ sequenceDiagram
     participant Agent
     participant SchedulerDelivery
     participant DeliveryRouter
-    participant Telegram
+    participant Channel
+
     Scheduler->>Agent: run task
     Agent-->>Scheduler: result
-    Scheduler->>SchedulerDelivery: send(result, "telegram:123456")
-    SchedulerDelivery->>DeliveryRouter: deliver(idempotency_key, target, payload)
-    DeliveryRouter->>Telegram: bot.send_message(...)
-    Telegram-->>DeliveryRouter: ok
+    Scheduler->>SchedulerDelivery: send(result, deliver)
+    alt deliver == "origin"
+        Note over SchedulerDelivery: rewrite via _resolve_origin_target<br/>using ScheduleJob.origin
+        SchedulerDelivery->>DeliveryRouter: deliver(key, resolved_target, payload)
+    else explicit target
+        SchedulerDelivery->>DeliveryRouter: deliver(key, target, payload)
+    end
+    DeliveryRouter->>Channel: bot.send_message(...)
+    Channel-->>DeliveryRouter: ok
 ```
 
 `SchedulerDelivery` is built once per scheduler and reused across runs, so the router's idempotency cache and rate limiters persist between ticks.
@@ -251,8 +321,8 @@ AgentScheduler(agent, task="Standup", deliver="discord:555:thread-42").start("da
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Use an explicit channel ID for scheduled jobs">
-`telegram:123456` targets a fixed chat and works without any request context. Reserve `origin` for interactive flows running under the full gateway — the lightweight scheduler path cannot resolve it.
+<Accordion title="Pick between an explicit target and origin">
+Use `telegram:123456` when the job should always land in one fixed chat, regardless of where it was created. Use `deliver="origin"` when the schedule was created from a chat and should reply back into that same chat — this works on the lightweight path as long as the job was created with an origin channel. Reserve `deliver="all"` for flows running under the full BotOS gateway.
 </Accordion>
 
 <Accordion title="Install the bot extra to enable delivery">
