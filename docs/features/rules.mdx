@@ -71,6 +71,30 @@ sequenceDiagram
     LLM-->>Dev: def sort_list(items: list[int]) -> list[int]: ...
 ```
 
+`always` rules ship in the cached base prompt above; `glob` rules follow a second, per-turn path shown next.
+
+#### Glob rules — per-turn
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Chat as ChatMixin
+    participant RM as RulesManager
+    participant LLM
+
+    User->>Agent: agent.start("open foo.py …")
+    Agent->>Chat: _build_system_prompt()
+    Chat->>Chat: base prompt (cached, always+manual)
+    Chat->>RM: has_glob_rules()?
+    RM-->>Chat: True
+    Chat->>Chat: scan chat_history → {"foo.py"}
+    Chat->>RM: get_glob_rules_for_paths(["foo.py"], exclude=always)
+    RM-->>Chat: [python.md]
+    Chat->>LLM: base prompt + "## Path-Scoped Rules …" + python.md
+    LLM-->>User: type-hinted code
+```
+
 ```mermaid
 graph TB
     subgraph "Rule Sources"
@@ -276,14 +300,85 @@ priority: 100
 ```
 </CodeGroup>
 
+<Note>
+Glob rules are appended **after** the cached base prompt on every turn. This means:
+- Cache hits are unaffected — your `always` rules stay in the cached prefix.
+- Glob rules can appear or disappear between turns as the touched-files set changes — no restart needed.
+</Note>
+
+<Note>
+Recursive globs (`**/*.py`) match both full paths (`src/main.py`) **and** bare filenames (`foo.py`). A user prompt like *"open foo.py"* is enough to activate the rule; a full path is not required.
+</Note>
+
 ## Activation Modes
 
 | Mode | Description | Use Case |
 |------|-------------|----------|
-| `always` | Always applied (default) | General guidelines |
-| `glob` | Applied when file matches pattern | Language-specific rules |
+| `always` | Always applied (default) — ships in the cached base prompt | General guidelines |
+| `glob` | Injected **only for files the agent has actually touched this turn**; matches paths that appear in the running conversation | Language-specific rules |
 | `manual` | Only via @mention | Security checklists, special procedures |
 | `ai_decision` | AI decides when to apply | Context-dependent rules |
+
+<Note>
+`always` rules ship in the cached base prompt. `glob` rules are evaluated **per-turn** and appended after the cache, so they can change from turn to turn as the agent opens new files. This is intentional — it keeps the cached prefix stable and lets path-scoped guidance follow the work.
+</Note>
+
+## Path-Scoped Rules in Action
+
+Author a `glob` rule and it fires the moment the agent touches a matching file during a run.
+
+```python
+from praisonaiagents import Agent
+
+# File on disk: .praisonai/rules/python.md
+# ---
+# description: Python style
+# globs: ["**/*.py"]
+# activation: glob
+# ---
+# Use type hints on every function.
+
+agent = Agent(
+    name="Coder",
+    instructions="Help with code.",
+)
+agent.start("Open foo.py and describe it")
+# ↑ mentions foo.py → python.md rule is injected this turn.
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Chat as ChatMixin
+    participant RM as RulesManager
+    participant LLM
+
+    User->>Agent: agent.start("open foo.py …")
+    Agent->>Chat: _build_system_prompt()
+    Chat->>Chat: base prompt (cached, always+manual)
+    Chat->>RM: has_glob_rules()?
+    RM-->>Chat: True
+    Chat->>Chat: scan chat_history → {"foo.py"}
+    Chat->>RM: get_glob_rules_for_paths(["foo.py"], exclude=always)
+    RM-->>Chat: [python.md]
+    Chat->>LLM: base prompt + "## Path-Scoped Rules …" + python.md
+    LLM-->>User: type-hinted code
+```
+
+A rule with `globs: ["**/*.py"]` fires only when a filename token actually appears in the conversation:
+
+| User / tool text mentions | Rule (`globs: ["**/*.py"]`) fires? |
+|---------------------------|-------------------------------------|
+| `"open foo.py"`           | ✅ yes                              |
+| `"src/main.py"`           | ✅ yes                              |
+| `"the .py file"`          | ❌ no (no filename token)           |
+| `"hello world"`           | ❌ no                               |
+| Agent reads `foo.js`      | ❌ no (extension does not match)    |
+
+<Info>
+Path collection is heuristic — it scans user prompts and tool result strings for tokens that look like a filename (`something.ext`, plus paths and quoted forms). Any tool that includes the file path in its result — the built-in file tools do — is enough for the matching glob rule to fire on the next turn. There is no need to thread paths through your own tools.
+</Info>
 
 ## Configuration (`RulesConfig`)
 
@@ -465,6 +560,17 @@ active = rules.get_active_rules()
 # Get rules for a specific file (includes glob matches)
 python_rules = rules.get_rules_for_file("src/main.py")
 
+# Cheap gate — True if any activation: glob rule is loaded.
+if rules.has_glob_rules():
+    # Return glob rules matching any of these paths,
+    # skipping names already emitted in the base prompt.
+    matching = rules.get_glob_rules_for_paths(
+        ["foo.py", "src/main.py"],
+        exclude_names={"root", "python"},
+    )
+    for rule in matching:  # sorted by priority, highest first
+        print(rule.name, rule.description)
+
 # Get a specific rule by name (for @mention)
 security_rule = rules.get_rule_by_name("security")
 
@@ -480,6 +586,13 @@ context = rules.build_rules_context(
 added = rules.add_rule_file("docs/CONVENTIONS.md")            # concrete path
 added = rules.add_rule_file(".praisonai/team-rules/*.md")     # glob
 ```
+
+The two glob helpers power the per-turn path-scoped injection shown in [Path-Scoped Rules in Action](#path-scoped-rules-in-action).
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `has_glob_rules` | `() -> bool` | `True` if any glob-activation rule is loaded. Cheap gate used to short-circuit per-turn work when no glob rules exist. |
+| `get_glob_rules_for_paths` | `(file_paths: List[str], exclude_names: Optional[set] = None) -> List[Rule]` | Glob rules matching any of the given paths, deduped by name, `exclude_names` skipped, sorted by priority descending. |
 
 ## Creating Rules Programmatically
 
