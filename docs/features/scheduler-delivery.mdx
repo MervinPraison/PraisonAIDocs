@@ -66,6 +66,27 @@ scheduler.start("daily")
 ```
 </Step>
 
+<Step title="Reply back to the origin chat">
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+
+# Inside a bot handler: the incoming request's origin is persisted on the job
+# config, so deliver="origin" resolves it on the lightweight path.
+scheduler = AgentScheduler(
+    agent,
+    task="Daily brief",
+    deliver="origin",
+    config={"origin": incoming_origin},  # persisted ScheduleJob.origin (DeliveryTarget or dict)
+)
+scheduler.start("daily")
+# Fires every day and delivers back to the same channel/thread the user
+# scheduled it from — no gateway required.
+```
+</Step>
+
 <Step title="Async scheduler">
 ```python
 import asyncio
@@ -151,21 +172,47 @@ graph TB
 
 The `deliver` value is parsed by `DeliveryTarget.parse()` — the same serialisable model reused from the existing delivery machinery.
 
+```
+platform                          # bare platform, uses configured default channel
+platform:channel_id               # concrete channel
+platform:channel_id:thread_id     # threaded delivery (Slack thread ts,
+                                  #   Telegram forum topic id, Discord thread id)
+origin                            # persisted job origin (resolves on the lightweight path)
+all                               # fan out to every bot (gateway only)
+```
+
 | Token | Meaning |
 |-------|---------|
 | `"telegram"` | Default (home) channel of that platform |
 | `"telegram:123456"` | Specific channel / chat ID |
-| `"telegram:123456:789"` | Channel `123456` with thread `789` |
-| `"origin"` | Reply to the same channel the schedule was created from (uses `ScheduleJob.origin`) |
-| `"all"` | Every configured bot — **requires the full BotOS gateway** |
+| `"telegram:123456:789"` | Channel `123456`, delivered into thread `789` |
+| `"origin"` | Reply to the same channel/thread the schedule was created from |
+| `"all"` | Fan out to every configured bot (**gateway only**) |
 
 <Note>
-`deliver="origin"` **does** work on the lightweight scheduler path — it delivers back to the same channel the schedule was created from, using the origin persisted on `ScheduleJob.origin` at creation. No live gateway session is required. The warning is only logged if the job was created **without** an origin channel.
+`origin` now works on the lightweight scheduler path when the job has a persisted origin (`ScheduleJob.origin` — set automatically when a job is created from a bot/webhook request). It resolves to the same channel/thread the request came in on, no gateway required. If the job has **no** persisted origin, the lightweight path logs a warning and skips delivery. Only `all` still needs the full gateway — it enumerates every registered bot.
 </Note>
 
-<Warning>
-`deliver="all"` still needs the full BotOS gateway (it must enumerate every configured bot). On the lightweight path it logs a warning and no-ops — use an explicit `platform` or `platform:channel_id` token instead, or run under the gateway.
-</Warning>
+### Thread semantics per platform
+
+The third `:thread_id` segment threads the outbound message. `DeliveryRouter.resolve()` returns `(platform, channel_id, thread_id)` and `deliver()` passes `thread_id` into `bot.send_message(...)`. Adapters without a `thread_id` kwarg are unaffected — a guard introspects the adapter first.
+
+| Platform | `thread_id` semantics |
+|----------|-----------------------|
+| Slack | Parent message `ts` (thread timestamp) |
+| Telegram | Forum topic `message_thread_id` |
+| Discord | Thread channel ID |
+| WhatsApp | Ignored (no thread concept) |
+| Others | Silently ignored — adapters without a `thread_id` kwarg are unaffected |
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Notify", instructions="Post the hourly status")
+AgentScheduler(agent, task="Notify", deliver="slack:C0123456:1728987654.001234").start("hourly")
+# Delivers into the Slack thread rooted at message ts 1728987654.001234.
+```
 
 Swap `telegram` for `discord`, `slack`, or `whatsapp` — the grammar is identical.
 
@@ -323,8 +370,10 @@ Attachments produced by the job (media returned by the agent) now travel into th
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Pick between an explicit target and origin">
-Use `telegram:123456` when the job should always land in one fixed chat, regardless of where it was created. Use `deliver="origin"` when the schedule was created from a chat and should reply back into that same chat — this works on the lightweight path as long as the job was created with an origin channel. Reserve `deliver="all"` for flows running under the full BotOS gateway.
+<Accordion title="Use an explicit channel ID for scheduled jobs">
+`telegram:123456` targets a fixed chat and works without any request context.
+
+`origin` now works on the lightweight scheduler path **when the job has a persisted origin** (`ScheduleJob.origin`, set automatically when the job is created from a bot/webhook request) — it resolves to the same channel/thread the request came in on, no gateway required. `all` still needs the full gateway. For jobs created outside a bot request (no persisted origin), prefer an explicit `platform:channel_id` token.
 </Accordion>
 
 <Accordion title="Install the bot extra to enable delivery">
