@@ -5,18 +5,22 @@ description: "Automatically retry LLM API calls with jittered exponential backof
 icon: "clock-rotate-left"
 ---
 
-Agent retry automatically re-runs failed LLM calls — across single-shot, streaming, tool-iteration and reflection turns — with jittered exponential backoff so transient rate limits, overloads, and network blips don't break your agent.
+Agent retry automatically re-runs failed LLM calls — across single-shot, streaming, tool-iteration and reflection turns — with jittered exponential backoff so transient rate limits, overloads, and network blips don't break your agent. **Retry is on by default** (`max_retries=3`) on both the native OpenAI-client path and the LiteLLM path.
 
 ```python
 from praisonaiagents import Agent
 
+# Retry is on by default — no retry= needed.
 agent = Agent(
     name="Researcher",
     instructions="Research topics on the web",
-    retry=True,
 )
 agent.start("Find recent papers on diffusion models")
 ```
+
+<Note>
+Only errors classified as retryable by `LLMError.is_retryable` are retried — non-retryable errors (authentication failures, invalid-request errors) still raise immediately. The `ON_RETRY` hook fires once per retry attempt, on **both** the native and LiteLLM paths.
+</Note>
 
 The user runs an agent; transient LLM failures retry automatically with jittered backoff.
 
@@ -39,21 +43,33 @@ graph LR
 ## Quick Start
 
 <Steps>
-<Step title="Enable with True (simplest)">
+<Step title="Default retry (do nothing)">
 ```python
 from praisonaiagents import Agent
 
+# No retry= — retry is on by default with sensible settings.
 agent = Agent(
     name="Researcher",
     instructions="Research topics on the web",
-    retry=True,
 )
 agent.start("Find recent papers on diffusion models")
 ```
 
-The user sends a research query; transient LLM failures trigger automatic retries with backoff.
+Omitting `retry=` (or passing `retry=True`) enables retry with sensible defaults: 3 retries, 5 s → 10 s → 20 s exponential schedule, capped at 120 s, with 50% additive jitter — on both the native and LiteLLM paths.
+</Step>
 
-`retry=True` enables retry with sensible defaults: 3 retries, 5 s → 10 s → 20 s exponential schedule, capped at 120 s, with 50% additive jitter.
+<Step title="Disable retry (fast fail)">
+```python
+from praisonaiagents import Agent
+
+# retry=False turns off the retry loop on both paths.
+agent = Agent(
+    name="Fast Checker",
+    instructions="Surface transient failures immediately",
+    retry=False,
+)
+agent.start("Quick health check")
+```
 </Step>
 
 <Step title="Tune with a dict (no extra import)">
@@ -136,7 +152,7 @@ sequenceDiagram
 | Async equivalents (`agent.astart(...)`) | ✅ |
 | Reasoning-steps single-shot | ✅ |
 
-`max_retries` also caps the **recursive** retries the LLM path performs after context compression and after backing off on a transient error. These were previously fixed at 2; they now follow the configured policy, and fall back to 2 only when `retry=` is not set.
+`max_retries` also caps the **recursive** retries the LLM path performs after context compression and after backing off on a transient error. These were previously fixed at 2; they now follow the configured policy, and fall back to 2 only when retry is disabled (`retry=False`). Since retry is on by default, the recursive bound follows `max_retries=3` unless you override it.
 
 <Note>
 Coverage across streaming and tool-iteration paths was made consistent in [PraisonAI PR #2665](https://github.com/MervinPraison/PraisonAI/pull/2665). Before that release, streaming/tool-iter/reflection turns silently bypassed retry — a transient `429` on those paths surfaced raw. On current versions, `retry=` applies uniformly.
@@ -169,7 +185,7 @@ graph TB
 | `base_delay` | `float` | `5.0` | Base delay in seconds for the first retry. |
 | `max_delay` | `float` | `120.0` | Upper cap on any single backoff (after jitter). |
 | `jitter_ratio` | `float` | `0.5` | Adds `uniform(0, jitter_ratio × delay)` on top of exponential delay. Set `0.0` to disable jitter. |
-| `max_retries` | `int` | `3` | Maximum number of retries. Bounds **both** the outer `LLMError`-throwing retry loop (up to 4 total attempts by default) **and** the recursive `_chat_completion` retries after context compression / transient backoff. When `retry=` is not set, the internal loop caps at 2 for backwards compatibility. |
+| `max_retries` | `int` | `3` | Maximum number of retries. Bounds **both** the outer `LLMError`-throwing retry loop (up to 4 total attempts by default) **and** the recursive `_chat_completion` retries after context compression / transient backoff. When retry is disabled (`retry=False`), the internal loop caps at 2 for backwards compatibility. |
 
 **Validation** — the constructor raises `ValueError` if:
 - `base_delay <= 0`
@@ -177,11 +193,25 @@ graph TB
 - `jitter_ratio` outside `[0, 1]`
 - `max_retries < 0`
 
-### Precedence
+### Precedence & Defaults
+
+| You pass | What happens |
+|----------|--------------|
+| Nothing (omit `retry=`) or `retry=None` | **`RetryBackoffConfig()` with `max_retries=3`** — retries transient errors on both native and LiteLLM paths |
+| `retry=False` | **Off** — no retry loop on either path (fast fail) |
+| `retry=True` | Same as default (`RetryBackoffConfig()`, `max_retries=3`) |
+| `retry=RetryBackoffConfig(...)` | Fully custom |
+| `retry={"max_retries": N, ...}` (dict) | Converted to `RetryBackoffConfig(**dict)` |
 
 ```python
-# Bool — enable with defaults
+# Default — retry ON with sensible defaults (max_retries=3)
+agent = Agent(name="A", instructions="...")
+
+# retry=True — same as default
 agent = Agent(name="A", instructions="...", retry=True)
+
+# retry=False — OFF, fast fail on both paths
+agent = Agent(name="A", instructions="...", retry=False)
 
 # Dict — constructed from field names
 agent = Agent(name="A", instructions="...", retry={"max_retries": 5, "base_delay": 2.0})
@@ -194,9 +224,6 @@ agent = Agent(
     instructions="...",
     retry=RetryBackoffConfig(max_retries=5, base_delay=2.0),
 )
-
-# None (default) — no retry
-agent = Agent(name="A", instructions="...")
 ```
 
 ---
@@ -320,7 +347,7 @@ The `OnRetry` hook is the right place to log metrics and send alerts. Retries ar
 ## Related
 
 <Note>
-Agent retry covers the LiteLLM-backed agent loop. For the native `OpenAIClient` path used by `AutoAgents` and direct `get_openai_client()` callers, see [OpenAI Client Retries](/docs/features/openai-client-retries).
+Agent retry now applies to **both** the LiteLLM-backed agent loop **and** the native OpenAI-client path by default (`max_retries=3`). For the SDK-level `Retry-After` + backoff on the native `OpenAIClient` used by `AutoAgents` and direct `get_openai_client()` callers, see [OpenAI Client Retries](/docs/features/openai-client-retries).
 </Note>
 
 <CardGroup cols={2}>
