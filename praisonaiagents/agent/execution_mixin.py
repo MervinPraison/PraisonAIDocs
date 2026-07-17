@@ -985,6 +985,83 @@ Write the complete compiled report:"""
         """Backward-compatible async alias for :meth:`alearn_skill`."""
         return await self.alearn_skill(request, **kwargs)
 
+    def optimize_instructions(
+        self,
+        evalset: List[Any],
+        *,
+        metric: Optional[Any] = None,
+        scorer: Optional[Any] = None,
+        criteria: str = "",
+        n_candidates: int = 6,
+        apply: bool = True,
+    ) -> Any:
+        """Optimise this agent's own ``instructions`` against an eval set.
+
+        Opt-in, off by default. Generates ``n_candidates`` instruction variants,
+        scores each over ``evalset`` (LLM ``Judge`` by default, or a numeric
+        ``metric`` you supply), keeps the highest-scoring one, and — when
+        ``apply=True`` — writes it back to ``self.instructions``.
+
+        Args:
+            evalset: List of ``(prompt, expected)`` cases to score candidates on.
+            metric: Optional numeric metric ``(output, expected) -> float``.
+                When set, empirical scoring replaces the LLM Judge.
+            scorer: Optional custom ``Judge`` instance (ignored if ``metric`` set).
+            criteria: Optional criteria for the default Judge.
+            n_candidates: Number of instruction variants to try (default: 6).
+            apply: Write the winning instructions back to the agent (default: True).
+
+        Returns:
+            ``OptimizeResult`` with ``best_instructions``, ``best_score``,
+            ``base_score`` and the full ``trials`` list.
+
+        Example::
+
+            result = agent.optimize_instructions(
+                evalset=[("summarise X", gold_x)], metric=rouge_l,
+            )
+            print(result.best_score, result.best_instructions)
+        """
+        from praisonaiagents.eval.prompt_optimizer import PromptOptimizer
+
+        return PromptOptimizer(
+            self,
+            evalset,
+            scorer=scorer,
+            metric=metric,
+            criteria=criteria,
+            n_candidates=n_candidates,
+            apply=apply,
+        ).optimize()
+
+    async def aoptimize_instructions(
+        self,
+        evalset: List[Any],
+        *,
+        metric: Optional[Any] = None,
+        scorer: Optional[Any] = None,
+        criteria: str = "",
+        n_candidates: int = 6,
+        apply: bool = True,
+    ) -> Any:
+        """Async twin of :meth:`optimize_instructions`.
+
+        The optimiser runs synchronous agent calls internally; this variant
+        offloads the run to a worker thread so async callers never block the
+        event loop.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(
+            self.optimize_instructions,
+            evalset,
+            metric=metric,
+            scorer=scorer,
+            criteria=criteria,
+            n_candidates=n_candidates,
+            apply=apply,
+        )
+
     def _ensure_skill_management_tools(self) -> None:
         """Ensure the agent has the ``skill_manage`` tool for authoring skills.
 
@@ -1046,7 +1123,14 @@ Write the complete compiled report:"""
         return await self.achat(prompt, task_name=task_name, task_description=task_description, task_id=task_id)
 
     async def execute_tool_async(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
-        """Async version of execute_tool with retry policy support"""
+        """Async version of execute_tool with retry policy support.
+
+        Routes through the user-supplied tool middleware (``Agent(hooks=[...])``)
+        when present so ``before_tool``/``after_tool``/``wrap_tool_call`` gate
+        async tool calls exactly as they do sync ones (security parity). The
+        fast path (no tool hooks) calls straight into the retry loop with zero
+        overhead.
+        """
 
         # Record the tool name for this turn so the self-improve review policy
         # sees async tool usage too (issue #3037). Mirrors the sync path in
@@ -1058,6 +1142,63 @@ Write the complete compiled report:"""
                 self._turn_tools_used = []
                 turn_tools = self._turn_tools_used
             turn_tools.append(function_name)
+
+        # Route async tool calls through the same tool middleware chain as the
+        # sync path. The chain (before_tool/after_tool/wrap_tool_call) is
+        # synchronous, so we run it in a worker thread and bridge its final
+        # handler back to this event loop via run_coroutine_threadsafe.
+        manager = self._get_tool_middleware_manager()
+        if manager is not None:
+            return await self._execute_tool_async_via_middleware(
+                manager, function_name, arguments, tool_call_id, tools_override
+            )
+        return await self._execute_tool_async_with_retry(
+            function_name, arguments, tool_call_id, tools_override
+        )
+
+    async def _execute_tool_async_via_middleware(
+        self, manager, function_name, arguments, tool_call_id, tools_override
+    ):
+        """Drive the (sync) tool middleware chain around an async tool call.
+
+        The middleware manager and its ``wrap_tool_call`` chain are synchronous
+        by contract, so they run in a thread-pool worker; the innermost handler
+        schedules the actual async execution back on the current running loop
+        and blocks the worker on the result. This preserves short-circuit,
+        audit, and argument-mutation semantics for async tools.
+        """
+        from ..hooks import ToolRequest, ToolResponse, InvocationContext
+
+        loop = asyncio.get_running_loop()
+        request = ToolRequest(
+            tool_name=function_name,
+            arguments=arguments,
+            context=InvocationContext(
+                agent_id=self.name,
+                run_id=getattr(self, '_current_run_id', 'unknown'),
+                session_id=getattr(self, '_session_id', None) or 'default',
+                tool_name=function_name,
+            ),
+        )
+
+        def _final_handler(req):
+            future = asyncio.run_coroutine_threadsafe(
+                self._execute_tool_async_with_retry(
+                    req.tool_name, req.arguments, tool_call_id, tools_override
+                ),
+                loop,
+            )
+            result = future.result()
+            return ToolResponse(tool_name=req.tool_name, result=result)
+
+        def _run_chain():
+            return manager.execute_tool_call(request, _final_handler)
+
+        response = await loop.run_in_executor(None, _run_chain)
+        return response.result if isinstance(response, ToolResponse) else response
+
+    async def _execute_tool_async_with_retry(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
+        """Async tool execution with retry policy (middleware-agnostic core)."""
 
         # Get retry policy (tool-level > agent-level > default)
         retry_policy = self._get_tool_retry_policy(function_name)
@@ -1144,7 +1285,17 @@ Write the complete compiled report:"""
                 error_msg = f"Error during approval process: {str(e)}"
                 logging.error(error_msg)
                 return {"error": error_msg, "approval_error": True}
-            
+
+            # Policy/guardrail gate (protocol-driven). Mirrors the sync path in
+            # _execute_tool_impl so async callers cannot bypass a PolicyEngine
+            # deny or a tool-call guardrail. The check is pure/sync (no awaits).
+            check = getattr(self, "_check_tool_policy_and_guardrails", None)
+            if check is not None:
+                policy_result = check(function_name, arguments)
+                if isinstance(policy_result, dict):
+                    return policy_result  # Error dict
+                _, arguments = policy_result
+
             # Try to find the function in the override tools list first, then agent's tools list
             func = None
             tools_to_search = tools_override if tools_override is not None else self.tools

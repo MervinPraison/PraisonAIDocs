@@ -1132,6 +1132,7 @@ Your Goal: {self.goal}"""
 
     async def _apply_compaction_async(self, messages, compactor, policy):
         """Async version of _apply_compaction."""
+        import asyncio
         from ..compaction.strategy import CompactionStrategy as LegacyStrategy
         from ..hooks import HookEvent as _HookEvent
         import logging
@@ -1161,7 +1162,18 @@ Your Goal: {self.goal}"""
             f"[proactive-compaction-async] {self.name}: {result.original_tokens}→{result.compacted_tokens} tokens "
             f"({result.messages_removed} messages removed, strategy: {policy.strategy.value})"
         )
-        
+
+        # Issue #2741/#3062: persist the summary so async resume is cheap too,
+        # matching the sync proactive-compaction path above. No-op unless a
+        # session store + session_id are bound and a summary was produced.
+        # append_compaction_checkpoint() does a locked read/modify/write to
+        # disk, so offload it to a worker thread to avoid stalling the event
+        # loop (streaming, tool calls, other agents) during the file I/O.
+        try:
+            await asyncio.to_thread(self._persist_compaction_checkpoint, result)
+        except Exception as e:
+            logging.debug(f"Failed to persist compaction checkpoint (async): {e}")
+
         try:
             await self._hook_runner.execute(_HookEvent.AFTER_COMPACTION, result)
         except Exception as e:
@@ -4021,7 +4033,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 } for tc in tool_calls_data if tc['id']
                             ]
                         self._append_to_chat_history(assistant_message)
-                        
+                        # Persist the assistant tool-call turn so resume replays
+                        # it (Issue #3089).
+                        self._persist_message(
+                            "assistant",
+                            response_text,
+                            tool_calls=assistant_message.get("tool_calls"),
+                        )
+
                         # Execute tool calls and add results to chat history.
                         # Media-bearing follow-up messages are deferred until all
                         # tool replies for this turn are appended, keeping the
@@ -4058,6 +4077,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             "tool_call_id": tool_call['id'],
                                             "content": str(tool_result)
                                         })
+                                    # Persist the tool-result turn (Issue #3089).
+                                    self._persist_message(
+                                        "tool",
+                                        str(tool_result),
+                                        tool_call_id=tool_call['id'],
+                                    )
                                 except Exception as tool_error:
                                     logging.error(f"Tool execution error in streaming: {tool_error}")
                                     # Add error result to chat history
@@ -4066,6 +4091,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         "tool_call_id": tool_call['id'],
                                         "content": f"Error: {str(tool_error)}"
                                     })
+                                    self._persist_message(
+                                        "tool",
+                                        f"Error: {str(tool_error)}",
+                                        tool_call_id=tool_call['id'],
+                                    )
 
                         # Flush deferred media follow-ups after all tool replies.
                         for _m in _deferred_media_followups:
