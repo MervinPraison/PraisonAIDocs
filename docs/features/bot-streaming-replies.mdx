@@ -178,7 +178,7 @@ For `progress` mode, custom placeholder text, or fine-grained `min_delta` contro
 
 ### Streaming Modes
 
-Three modes are available to match different use cases:
+Four modes are available to match different use cases:
 
 ```mermaid
 graph TB
@@ -186,17 +186,21 @@ graph TB
         A{What's your priority?} --> B[Long answers<br/>Low edit cost]
         A --> C[Tool-heavy agents<br/>User wants progress]
         A --> D[Rate limits<br/>Shared channels]
-        
+        A --> H[Mixed channels<br/>Not sure which edit]
+
         B --> E[draft mode]
         C --> F[progress mode]
         D --> G[off mode]
+        H --> I[auto mode]
     end
     
     classDef mode fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef choice fill:#189AB4,stroke:#7C90A0,color:#fff
-    
+    classDef auto fill:#F59E0B,stroke:#7C90A0,color:#fff
+
     class E,F,G mode
-    class A,B,C,D choice
+    class A,B,C,D,H choice
+    class I auto
 ```
 
 | Mode | Behavior | Best For |
@@ -204,16 +208,98 @@ graph TB
 | `off` | Single final message after completion | Default behavior, zero impact |
 | `draft` | Progressive edits with growing answer | Long responses, platforms like Telegram |
 | `progress` | Tool status updates, then final answer | Tool-heavy agents, user wants progress |
+| `auto` | Resolves to `draft` where the channel can edit, else `off`; other config fields are preserved | Multi-channel bots where you don't want to hard-code per-channel modes |
 
 <Note>
-Live streaming (`draft` mode) works on **Telegram, Slack, and Discord** — each adapter honours its own `edit_rate_limit` and `text_limit` from [Channel Capabilities](/docs/features/channel-capabilities). **WhatsApp** and **Email** fall back to a single final message (`live_edit=False`). The simple `streaming: true` / `--stream` form enables `draft` mode automatically.
+Live streaming (`draft` mode) works on **Telegram, Slack, and Discord** — each adapter honours its own `edit_rate_limit` and `text_limit` from [Channel Capabilities](/docs/features/channel-capabilities). **WhatsApp** and **Email** can't edit (`live_edit=False`): an explicit `draft`/`progress` mode degrades to `off` there, now logged at **WARNING** so the fallback is visible. Use [`auto`](#auto-mode) to opt into "stream where supported, otherwise single-message" without raising a warning. The simple `streaming: true` / `--stream` form enables `draft` mode automatically.
+</Note>
+
+### Auto mode
+
+`auto` picks the right mode per channel: it streams (`draft`) where the channel can edit and falls back to `off` where it can't — one config, no per-channel branching.
+
+The same `StreamingConfig` runs on both an editable and a non-editable channel. Telegram streams live; WhatsApp delivers a single final message.
+
+```python
+from praisonaiagents import Agent, BotConfig
+from praisonai.bots import TelegramBot, WhatsAppBot, StreamingConfig, StreamingMode
+
+agent = Agent(name="assistant", instructions="Be helpful and concise.")
+
+# Same StreamingConfig works on both channels — Telegram streams live,
+# WhatsApp delivers a single final message. No per-channel branching.
+cfg = StreamingConfig(mode=StreamingMode.AUTO, min_interval=1.0)
+
+telegram = TelegramBot(token="...", agent=agent, config=BotConfig(token="..."))
+telegram.configure_streaming(cfg)
+
+whatsapp = WhatsAppBot(token="...", agent=agent, config=BotConfig(token="..."))
+whatsapp.configure_streaming(cfg)
+```
+
+The same YAML block drops onto every channel — each resolves on its own capabilities:
+
+```yaml
+channels:
+  telegram:                 # live_edit=True → resolves to draft
+    token: ${TELEGRAM_BOT_TOKEN}
+    streaming:
+      mode: auto
+      min_interval: 1.0
+  whatsapp:                 # live_edit=False → resolves to off
+    token: ${WHATSAPP_BOT_TOKEN}
+    streaming:
+      mode: auto
+      min_interval: 1.0
+```
+
+On Telegram the user sees a placeholder that edits in place; on WhatsApp the same agent replies with one final message. Tail the bot log to confirm: `INFO  ... 'auto' resolved to 'draft'` for Telegram, `WARNING ... 'auto' resolved to 'off'` for WhatsApp.
+
+```mermaid
+graph TB
+    A{Channel supports<br/>live edits?} --> B[Yes<br/>e.g. Telegram/Slack/Discord]
+    A --> C[No<br/>e.g. WhatsApp/Email]
+    A --> D[Mixed / not sure]
+
+    B --> E[draft or progress]
+    C --> F[off]
+    D --> G[auto<br/>resolves per channel]
+
+    classDef question fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef simple fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef advanced fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class A,B,C,D question
+    class E,F simple
+    class G advanced
+```
+
+At init time, `auto` resolves against the channel's `can_edit` capability and logs the outcome:
+
+```mermaid
+graph TB
+    A["mode: auto"] --> B{can_edit?}
+    B -->|True| C["→ draft<br/>INFO: resolved to 'draft'"]
+    B -->|False| D["→ off<br/>WARNING: resolved to 'off'"]
+
+    classDef question fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A,B question
+    class C ok
+    class D warn
+```
+
+<Note>
+`auto` only rewrites `mode`. All your other settings — `min_interval`, `min_delta`, `placeholder_text`, `strip_reasoning_tags`, … — are preserved via `dataclasses.replace()`. Earlier degradation reset the whole config to defaults; that no longer happens.
 </Note>
 
 ### StreamingConfig options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `mode` | `StreamingMode` | `StreamingMode.OFF` | Streaming mode: `OFF`, `DRAFT`, or `PROGRESS` |
+| `mode` | `StreamingMode` | `StreamingMode.OFF` | Streaming mode: `OFF`, `DRAFT`, `PROGRESS`, or `AUTO` |
 | `min_interval` | `float` | `1.5` | Minimum seconds between message edits (rate-limit safe) |
 | `min_delta` | `int` | `120` | Minimum new characters in the buffer before an edit fires |
 | `placeholder_text` | `str` | `"🤔 Thinking..."` | Initial message text sent before any content arrives |
@@ -405,7 +491,7 @@ channels:
   telegram:
     token: ${TELEGRAM_BOT_TOKEN}
     streaming:
-      mode: progress
+      mode: progress                # off | draft | progress | auto (see Auto mode)
       progress_style: feed          # "line" (default) or "feed"
       progress_max_lines: 8
       progress_max_line_chars: 120
@@ -575,6 +661,14 @@ The schema validator only accepts `"line"` or `"feed"`. Any other value raises `
 
 <Accordion title="An errored tool still shows the ✓ glyph">
 Impossible by design. Once a line reaches `error` (`✗`) the compositor never downgrades it to `done` (`✓`), and a late `done` event never overwrites an `error`. If you ever see this, please file a bug against `praisonai`.
+</Accordion>
+
+<Accordion title="Why is my channel not streaming even though I set `streaming: true`?">
+That channel probably can't edit messages. `draft`/`progress` on a channel without `live_edit` support (WhatsApp, Email) degrades to `off`, now logged at **WARNING**: `Channel <id> doesn't support live editing; degrading streaming mode '<mode>' to 'off'`. Switch to `mode: auto` so the fallback is expected — `auto` resolves to `off` there without treating it as an error you configured wrong.
+</Accordion>
+
+<Accordion title="How do I tell whether `auto` resolved to `draft` or `off`?">
+Check the bot log for `Channel <id> streaming mode 'auto' resolved to '<mode>' (can_edit=<bool>)`. It's logged at **INFO** when it resolves to `draft` (`can_edit=True`) and at **WARNING** when it resolves to `off` (`can_edit=False`).
 </Accordion>
 </AccordionGroup>
 
