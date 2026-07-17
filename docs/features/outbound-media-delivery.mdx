@@ -20,6 +20,10 @@ chart_agent.start("Draw a sales chart for Q1 and send it to the user.")
 The user messages the bot; generated images and files upload through the channel adapter automatically.
 
 <Note>
+Outbound media now honours threaded targets: when the delivery route names a thread — Slack `thread_ts`, Telegram forum topic, or Discord thread — the attachment lands in the same thread as the text reply. Adapters that don't support threads are completely unaffected.
+</Note>
+
+<Note>
 Outbound media delivery uses the same `OutboundResilienceMixin` now applied to all six channels: Slack, Discord, WhatsApp, Email, Linear, AgentMail, and Telegram. See [Durable Delivery](/docs/features/durable-delivery) for retry and crash-safe persistence.
 </Note>
 
@@ -30,8 +34,11 @@ graph LR
         B --> C[validate_media_delivery_path]
         C --> D{Safe?}
         D -->|no| E[⛔ Skip + log]
-        D -->|yes| F[📤 Adapter primitive]
+        D -->|yes| R{Route names a thread?}
+        R -->|platform:channel| F[📤 Adapter primitive]
+        R -->|platform:channel:thread| T[🧵 Adapter primitive + thread]
         F --> G[Telegram / Slack / Discord]
+        T --> G
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -41,8 +48,8 @@ graph LR
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
 
     class A agent
-    class B,C,F process
-    class D decision
+    class B,C,F,T process
+    class D,R decision
     class E skip
     class G result
 ```
@@ -109,7 +116,8 @@ sequenceDiagram
     A->>DM: return media path: /tmp/agent-media/chart.png
     DM->>PG: validate path
     PG-->>DM: ✅ safe (within allowlist, under size cap)
-    DM->>ADP: deliver_media_to_adapter(path)
+    DM->>ADP: deliver_media_to_adapter(path, thread_id?)
+    Note over ADP: thread_id forwarded via native kwarg<br/>(thread_ts / message_thread_id) when supported
     ADP->>ADP: send_photo / files_upload_v2 / file send
     ADP-->>A: N attachment(s) delivered, M skipped
 
@@ -189,6 +197,35 @@ media_delivery:
 | Discord | File attachment | Any file type |
 
 `PlatformCapabilities.supports_media` is checked per adapter — platforms that don't support file uploads receive text-only replies and the attachment is skipped with a log entry.
+
+---
+
+## Threaded media delivery
+
+Attachments follow the same `platform:channel_id:thread_id` grammar the text path uses. When a route names a thread, both the text reply and any uploaded file land in that thread.
+
+```python
+from praisonai.bots import DeliveryRouter
+
+# Scheduled attachment into a Slack thread
+router.send_media("slack:C0123456:1728987654.001234", "/tmp/report.pdf",
+                  caption="Weekly report")
+# → Slack files_upload_v2(..., thread_ts="1728987654.001234")
+
+# Telegram forum topic
+router.send_media("telegram:-1001234567890:42", "/tmp/chart.png",
+                  caption="Q1 chart")
+# → bot.send_photo(..., message_thread_id=42)
+```
+
+| Platform | `thread_id` becomes | Ignored on non-threaded adapters |
+|----------|---------------------|----------------------------------|
+| Slack    | `thread_ts` on `files_upload_v2` | ✅ |
+| Telegram | `message_thread_id` on `send_photo` / `send_document` | ✅ |
+| Discord  | Thread channel id used as the send target | ✅ |
+| WhatsApp / Email / custom | — (no thread concept) | ✅ silently dropped |
+
+`DeliveryRouter.send_media` resolves the thread from the target and forwards it to `deliver_media_to_adapter`, which passes it through each transport's native keyword only when the primitive accepts it — so non-threaded adapters never raise.
 
 ---
 
@@ -285,6 +322,10 @@ Default is 25 MB. Telegram and Slack have their own size limits — set `max_siz
 
 <Accordion title="Never save credentials near the output directory">
 The basename denylist blocks common credential filenames, but keep your output directory completely separate from config directories. Symlink attacks are also blocked (symlinks are resolved before path checks).
+</Accordion>
+
+<Accordion title="Target the thread for reports that belong to a conversation">
+Use `platform:channel_id:thread_id` — not just `platform:channel_id` — for reports and charts that belong to an ongoing thread. Text and attachment now land together in the same thread; the `:channel_id` form still posts to the parent chat.
 </Accordion>
 
 </AccordionGroup>
