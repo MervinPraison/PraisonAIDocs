@@ -228,6 +228,148 @@ If you already use `praisonai pairing approve <platform> <code> --label <canonic
 
 ---
 
+## In the gateway (`praisonai gateway start`)
+
+The flagship `WebSocketGateway` daemon accepts the same resolver, so a paired user keeps one continuous session across every channel served by one gateway process.
+
+Wire it three ways — YAML block, CLI flag, or Python override.
+
+<Tabs>
+<Tab title="YAML (recommended for daemons)">
+```yaml
+# gateway.yaml
+identity:
+  enabled: true                          # default when block is present
+  store: ~/.praisonai/identity.json      # optional link-map path (also accepts `path:`)
+
+agents:
+  assistant:
+    instructions: "Be helpful."
+
+channels:
+  telegram:  { token: "${TELEGRAM_BOT_TOKEN}" }
+  discord:   { token: "${DISCORD_BOT_TOKEN}" }
+```
+
+- A missing block, a non-mapping block, or `enabled: false` keeps today's default — per-platform session keys.
+- `enabled` accepts `true`/`false`/`"1"`/`"true"`/`"yes"`/`"on"` (strings coerced case-insensitively).
+- `store` is `~`-expanded; `path` is accepted as an alias.
+- Any failure to build the resolver degrades gracefully to per-platform keys and logs a warning — startup never aborts.
+</Tab>
+
+<Tab title="CLI (--identity-store)">
+```bash
+praisonai gateway start --config gateway.yaml \
+  --identity-store ~/.praisonai/identity.json
+```
+
+- The CLI value overrides the YAML `identity:` block.
+- The value is `~`-expanded.
+- If `StoreBackedIdentityResolver` can't be imported (optional deps missing), a warning is logged and the gateway continues without the resolver.
+</Tab>
+
+<Tab title="Python override (always wins)">
+```python
+from praisonai_bot.gateway.server import WebSocketGateway
+from praisonai_bot.bots import StoreBackedIdentityResolver
+
+resolver = StoreBackedIdentityResolver.from_env()
+gateway = WebSocketGateway(
+    host="127.0.0.1",
+    port=8765,
+    identity_resolver=resolver,   # #3020 — stamped onto every channel bot
+)
+await gateway.start_with_config("gateway.yaml")
+```
+
+A constructor resolver is marked explicit and is **never** rebuilt from YAML, even on hot-reload.
+</Tab>
+</Tabs>
+
+### Precedence
+
+`WebSocketGateway(identity_resolver=…) > --identity-store > identity: YAML block > default (per-platform keys)`
+
+An explicit constructor or CLI resolver is never clobbered by the YAML block, even on hot-reload.
+
+```mermaid
+graph TB
+    Q{Resolver source?} -->|WebSocketGateway arg| P1[🐍 Python override<br/>always wins]
+    Q -->|--identity-store| P2[💻 CLI flag]
+    Q -->|identity: block| P3[📄 YAML block]
+    Q -->|none| P4[🪪 per-platform keys<br/>bot_platform_userid]
+
+    P1 --> Win[✅ Stamped onto every channel bot]
+    P2 --> Win
+    P3 --> Win
+
+    classDef decide fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef py fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef cli fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef yaml fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q decide
+    class P1 py
+    class P2 cli
+    class P3,P4 yaml
+    class Win good
+```
+
+The gateway stamps the resolver onto each channel bot's session manager at startup and on every hot-reload:
+
+```mermaid
+sequenceDiagram
+    participant GW as 🗼 Gateway
+    participant Res as 🪪 IdentityResolver
+    participant Ch1 as 📱 Telegram bot
+    participant Ch2 as 💬 Discord bot
+
+    GW->>Res: build from YAML / CLI / constructor
+    GW->>Ch1: start_channels → _stamp_identity_resolver(bot)
+    Ch1->>Res: bot._session._identity_resolver = resolver
+    GW->>Ch2: start_channels → _stamp_identity_resolver(bot)
+    Ch2->>Res: bot._session._identity_resolver = resolver
+    Note over GW,Ch2: Hot-reload restarts a channel → re-stamped in _start_single_channel
+```
+
+<Note>
+**Gateway process:** In the `praisonai gateway start` daemon, the resolver is stamped onto each channel bot's session manager via `WebSocketGateway._stamp_identity_resolver()` (mirrors `_stamp_admission_gate`). Restarted channels during hot-reload keep the resolver too — see [Gateway Config Reload](/docs/features/gateway-config-reload#reloadable-sections-identity).
+</Note>
+
+### End-to-end: one session across two platforms
+
+1. Operator approves both channels for the same label:
+   ```bash
+   praisonai pairing approve telegram <code> --label alice
+   praisonai pairing approve discord  <code> --label alice
+   ```
+2. Operator adds `identity: { enabled: true }` to `gateway.yaml` (or passes `--identity-store`).
+3. Alice on Telegram: `"my favourite colour is octarine"`.
+4. Hours later, Alice on Discord: `"what's my favourite colour?"`.
+5. The gateway resolves both to `alice`, loads the same session history, and replies `"Octarine."`.
+
+```mermaid
+sequenceDiagram
+    participant Alice as 👤 Alice
+    participant TG as 📱 Telegram
+    participant DC as 💬 Discord
+    participant GW as 🗼 Gateway
+    participant Hist as 💾 Unified History
+
+    Alice->>TG: "My favourite colour is octarine."
+    TG->>GW: chat(user_id=12345)
+    GW->>Hist: append (key=alice)
+    GW-->>TG: "Got it!"
+    Note over Alice,Hist: Hours later, different platform
+    Alice->>DC: "What's my favourite colour?"
+    DC->>GW: chat(user_id=snowflake-1)
+    GW->>Hist: load (key=alice — same!)
+    GW-->>DC: "Octarine."
+```
+
+---
+
 ## CLI: praisonai identity
 
 Four subcommands manage identity links from the command line.
@@ -352,6 +494,10 @@ Identity links are **explicit and opt-in**. No automatic linking — wire the re
 Without a resolver, the legacy `bot_{platform}_{user_id}` storage key is preserved bit-for-bit — fully backward compatible.
 </Tip>
 
+<Note>
+Running the flagship daemon? See [In the gateway (`praisonai gateway start`)](#in-the-gateway-praisonai-gateway-start) for wiring the same resolver via the `identity:` YAML block, `--identity-store`, or the `WebSocketGateway` constructor.
+</Note>
+
 ---
 
 ## Best Practices
@@ -433,5 +579,11 @@ Secure unknown-user onboarding
 </Card>
 <Card title="Unknown-User Pairing" icon="user-check" href="/docs/features/bot-unknown-user-pairing">
 Inline-button approval for bots
+</Card>
+<Card title="Gateway CLI" icon="tower-broadcast" href="/docs/features/gateway-cli">
+`--identity-store` and other `gateway start` flags
+</Card>
+<Card title="Gateway Config Reload" icon="arrows-rotate" href="/docs/features/gateway-config-reload">
+Hot-reload the `identity:` block without dropping turns
 </Card>
 </CardGroup>
