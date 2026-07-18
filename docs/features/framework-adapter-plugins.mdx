@@ -691,9 +691,11 @@ def setup(self, *, framework_tag: str) -> None:
     pass
 ```
 
-### Orchestrator Pipeline (Post-#1763, updated for #2086)
+As of PR #3152, `setup()` is invoked **inside** `observability_session`, so any events emitted by `setup()` — and any exception it raises — are captured and finalized. Custom adapters should therefore **not** open their own observability session inside `setup()`.
 
-The orchestrator (`AgentsGenerator.generate_crew_and_kickoff`) now follows this sequence:
+### Orchestrator Pipeline (Post-#3152)
+
+As of PR #3152, `AgentsGenerator` owns the observability lifecycle. Both the sync (`generate_crew_and_kickoff`) and async (`agenerate_crew_and_kickoff`) run paths bracket `adapter.setup()` **and** `adapter.run()`/`adapter.arun()` in a single `observability_session`, so setup and run share one session and finalize is impossible to forget. The orchestrator now follows this sequence:
 
 ```mermaid
 sequenceDiagram
@@ -701,18 +703,20 @@ sequenceDiagram
     participant Reg as Registry
     participant Adapter
     participant FamilyAdapter as FamilyAdapter (router)
-    participant Obs as init_observability
+    participant Obs as observability_session
 
     Gen->>Reg: resolve(framework)
     Reg-->>Gen: initial_adapter
     Gen->>Adapter: resolve(config=config)
     Note over Adapter,FamilyAdapter: Family adapters read autogen_version<br/>from config, then return concrete adapter
     Adapter-->>Gen: concrete_adapter
-    Gen->>Gen: assert_framework_available(adapter.name)
-    Gen->>Obs: init_observability(adapter.name)
+    Gen->>Gen: assert_framework_available(adapter.name, registry=self._adapter_registry)
+    Gen->>Obs: enter observability_session(adapter.name)
     Gen->>Adapter: setup(framework_tag=adapter.name)
+    Note over Gen,Adapter: setup now runs inside the session
     Gen->>Adapter: run(config, llm_config, topic)
     Adapter-->>Gen: result
+    Gen->>Obs: exit observability_session (auto-finalize)
 ```
 
 ---
@@ -1018,7 +1022,7 @@ from praisonai.framework_adapters.registry import (
 |---|---|---|
 | `list_framework_choices(*, include_unavailable=False)` | `list[str]` | Build the CLI `--framework` choice list (registered adapters; pass `include_unavailable=True` for the full list) |
 | `list_available_frameworks()` | `list[str]` | Filter to just those whose `is_available()` returns `True` |
-| `get_install_hint(name)` | `str` | Adapter-aware install hint string (e.g. `pip install 'praisonai-frameworks[autogen]'`) |
+| `get_install_hint(name, *, registry=None)` | `str` | Adapter-aware install hint string (e.g. `pip install 'praisonai-frameworks[autogen]'`). Pass `registry=` to derive the hint from an injected registry (DI-friendly); defaults to the process-default. |
 | `framework_option_help()` | `str` | Auto-generated `--help` text for the `--framework` flag |
 
 ```python
@@ -1139,6 +1143,31 @@ auto = AutoGenerator(
 ```
 
 For workflow YAML, use `WorkflowAutoGenerator` — its `framework=` kwarg is honoured end-to-end (see [AutoAgents](/docs/features/autoagents)).
+
+### Framework validation honours the injected registry
+
+As of PR #3152, framework-availability validation is DI-aware — a scoped/per-tenant adapter registered on the generator's own registry is no longer rejected just because it is absent from the process-default registry.
+
+- `assert_framework_available(name, *, registry=None)` and `get_install_hint(name, *, registry=None)` now accept an optional `registry` kwarg (default: process-default).
+- `AgentsGenerator._prepare_for_run` threads its injected `_adapter_registry` through into `assert_framework_available`, so validation consults the tenant registry, not the process-default.
+- The install hint is derived from the same registry that failed validation (DI end to end).
+- **Fallback for resolved built-in names:** if the injected registry does not know a name but the process-default does (typical when a family router resolves `autogen → autogen_v2`), validation falls back to the default and the framework is accepted. This preserves the DI seam without rejecting resolved built-ins.
+
+```python
+from praisonai.framework_adapters.registry import FrameworkAdapterRegistry
+from praisonai.agents_generator import AgentsGenerator
+
+tenant_registry = FrameworkAdapterRegistry()
+tenant_registry.register("tenant_scoped_fw", TenantScopedAdapter)
+
+gen = AgentsGenerator(
+    agent_file="agents.yaml",
+    framework="tenant_scoped_fw",
+    config_list=[...],
+    adapter_registry=tenant_registry,   # DI seam
+)
+# Validation now consults tenant_registry, not the process-default.
+```
 
 ---
 
