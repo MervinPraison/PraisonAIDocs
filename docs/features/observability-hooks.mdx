@@ -18,12 +18,13 @@ agent.start("Process this request and emit trace events.")
 
 Observability Hooks provide a centralized entry and exit point for observability providers (AgentOps, future Langfuse, W&B) in PraisonAI and custom framework adapters.
 
-The user starts an orchestrated run; init and finalize hooks emit traces to AgentOps and other providers.
+As of PR #3152, `AgentsGenerator` owns the observability lifecycle. Both the sync (`generate_crew_and_kickoff`) and async (`agenerate_crew_and_kickoff`) run paths bracket `adapter.setup()` **and** `adapter.run()`/`adapter.arun()` in a single `observability_session`. Adapters no longer initialise or finalize observability themselves — this closes the AutoGen leak (the v0.4 adapter never called `finalize`, so every run leaked a session) and makes finalize impossible to forget for any future adapter.
 
 ```mermaid
 graph LR
-    A[🚀 Orchestrator] --> B[🪝 init_observability]
-    B --> D[🤖 Agent run]
+    A[🚀 AgentsGenerator] --> B[🪝 observability_session]
+    B --> S[🛠️ adapter.setup]
+    S --> D[🤖 adapter.run / arun]
     D -->|success| ES[finalize: Success]:::success
     D -->|exception| EF[finalize: Failure]:::failure
     ES --> F[✅ AgentOps session end]
@@ -31,19 +32,21 @@ graph LR
 
     classDef orch fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef hook fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef setup fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
     classDef failure fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef run fill:#189AB4,stroke:#7C90A0,color:#fff
 
     class A orch
     class B hook
+    class S setup
     class D run
     class ES success
     class EF failure
     class F success
 ```
 
-`praisonai.observability.hooks.init_observability(framework_tag, *, tags=None)` and `finalize_observability(_framework_tag, *, status=...)` are **public hooks**. The orchestrator calls both automatically; custom framework adapters should use `observability_session()` as the recommended pattern.
+`praisonai.observability.hooks.init_observability(framework_tag, *, tags=None)` and `finalize_observability(_framework_tag, *, status=...)` are **public hooks**. The generator drives both automatically through `observability_session()`; custom adapters called directly (not via `AgentsGenerator`) should use `observability_session()` themselves.
 
 ---
 
@@ -95,18 +98,18 @@ class MyAdapter(BaseFrameworkAdapter):
 `observability_session` calls `init_observability` on entry and `finalize_observability` on exit. Status is derived from `sys.exc_info()` automatically, so success/failure is tagged correctly with no boilerplate.
 
 <AccordionGroup>
-<Accordion title="Alternative: manual try/except pattern">
+<Accordion title="Standalone: manual finalize for callers not going through the generator">
+This pattern is valid **only** for standalone callers that invoke an adapter directly, outside `AgentsGenerator`. Do **not** copy it into a custom adapter that will be called by `AgentsGenerator` — the generator already owns init+finalize via `observability_session`, and a self-finalizing adapter would double-finalize.
+
 ```python
 from praisonai.framework_adapters.base import BaseFrameworkAdapter
 from praisonai.observability.hooks import init_observability, finalize_observability
 
-class MyAdapter(BaseFrameworkAdapter):
+class MyStandaloneRunner:
     name = "myframework"
 
-    def setup(self, *, framework_tag: str) -> None:
-        init_observability(framework_tag, tags=["tenant=acme"])
-
     def run(self, *args, **kwargs):
+        init_observability(self.name, tags=["tenant=acme"])
         try:
             result = my_framework.execute(...)
             return result
@@ -137,14 +140,18 @@ if is_agentops_available():
 
 `init_observability(framework_tag, *, tags=None)` centralizes observability initialization:
 
-- **Auto-call site:** orchestrator calls `init_observability(adapter.name)` immediately after `assert_framework_available(...)` and before `adapter.setup(...)`
+- **Auto-call site:** the generator opens `observability_session(adapter.name)` and runs `_run_adapter_setup(adapter)` **inside** the session, so setup events and any setup/import failure are recorded and finalized instead of slipping outside observability. The call sequence is:
+  1. `_prepare_for_run(config)` → validates, resolves adapter; **does not run setup, does not init observability**
+  2. `with observability_session(adapter.name):`
+     - `_run_adapter_setup(adapter)` (calls `adapter.setup(framework_tag=adapter.name)`)
+     - `adapter.run(...)` / `await adapter.arun(...)`
 - **AgentOps init guard:** `agentops.init(...)` only fires if both (a) `is_agentops_available()` returns true, and (b) `AGENTOPS_API_KEY` is set in the env. Init is centralised here — `agents_generator` no longer double-inits AgentOps (PR #2062).
 - **Failure mode:** `ImportError` (no agentops) is logged at `DEBUG`; any other exception is logged at `WARNING` and never propagated
 - **`is_agentops_available()`** lazy function — prefer over the removed eager `AGENTOPS_AVAILABLE` constant in this module
 
 `finalize_observability(_framework_tag, *, status=...)` closes observability sessions symmetrically:
 
-- **Auto-call site:** built-in adapters (`praisonai_adapter`, `crewai_adapter`, AutoGen v0.4, AG2) now wrap `run()`/`arun()` in a `try: ... finally:` block. `finalize_observability(self.name, status=status)` is called from that `finally`, with `status` derived from `sys.exc_info()`. AgentOps sessions are tagged `"Success"` on the happy path and `"Failure"` whenever an exception is propagating (including `KeyboardInterrupt`, LLM errors, rate limits, cancellation).
+- **Auto-call site:** `AgentsGenerator.generate_crew_and_kickoff` (sync) and `agenerate_crew_and_kickoff` (async) bracket the entire adapter lifecycle — `setup` + `run`/`arun` — in `observability_session(adapter.name)`. On context exit the session finalizes with `status="Failure"` when an exception is propagating and `status="Success"` otherwise. **Adapters must not finalize themselves.** This closes the AutoGen leak: the AutoGen adapter previously never called `finalize_observability`, so every AutoGen run left an `ObservabilityRun`, a `_swapped_runs` entry, and sink handles alive.
 - **AgentOps end guard:** `agentops.end_session(...)` only fires if `agentops` is importable
 - **Failure mode:** `ImportError` returns silently; any other exception is logged at `WARNING` and never propagated
 - **Why symmetric calls matter:** without `finalize_observability`, AgentOps dashboard sessions stay stuck "in progress"
@@ -153,20 +160,17 @@ The hook also leaves room for future providers (the source already has placehold
 
 ```mermaid
 sequenceDiagram
-    participant Orch as Orchestrator
+    participant Gen as AgentsGenerator
     participant Hook as observability.hooks
     participant Adapter as Framework Adapter
     participant AOps as AgentOps
 
-    Orch->>Hook: init_observability(adapter.name)
-    Hook->>AOps: agentops.init(...)
-    Orch->>Adapter: adapter.run(...)
-    alt success
-        Adapter-->>Hook: finalize_observability(adapter.name, status="Success")
-    else exception / KeyboardInterrupt / rate-limit
-        Adapter-->>Hook: finalize_observability(adapter.name, status="Failure")
-    end
-    Hook->>AOps: agentops.end_session(status)
+    Gen->>Hook: enter observability_session(adapter.name)
+    Hook->>AOps: init_observability → agentops.init(...)
+    Gen->>Adapter: _run_adapter_setup(adapter)  (adapter.setup)
+    Gen->>Adapter: adapter.run(...) / await adapter.arun(...)
+    Gen->>Hook: exit observability_session (auto-finalize)
+    Hook->>AOps: finalize_observability(status derived from sys.exc_info())
 ```
 
 ---
@@ -252,13 +256,17 @@ for factory in discover_observability_sinks():
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Use observability_session for custom adapters">
-`observability_session` is the recommended pattern for custom adapters. It guarantees `finalize_observability` always runs — on success and on any failure — with the correct status derived from `sys.exc_info()`. This prevents AgentOps/other sessions from being orphaned in an "in progress" state on error, `KeyboardInterrupt`, or rate-limit paths.
+<Accordion title="Use observability_session for custom adapters called directly">
+For custom adapters that are called **directly** (not via `AgentsGenerator`), `observability_session` is required. It guarantees `finalize_observability` always runs — on success and on any failure — with the correct status derived from `sys.exc_info()`. This prevents AgentOps/other sessions from being orphaned in an "in progress" state on error, `KeyboardInterrupt`, or rate-limit paths.
+
+When invoked via `AgentsGenerator`, the generator's own session already covers the run — an adapter that opens its own inner `observability_session` will nest / double-init and should not.
 
 ```python
 from praisonai.observability.hooks import observability_session
 
-class MyAdapter(BaseFrameworkAdapter):
+class MyStandaloneRunner:
+    name = "myframework"
+
     def run(self, *args, **kwargs):
         with observability_session(self.name, tags=["tenant=acme"]):
             return my_framework.execute(...)
@@ -270,7 +278,7 @@ Use `status="Success"` for the happy path and `status="Failure"` in exception ca
 </Accordion>
 
 <Accordion title="Use for run-scoped tags only">
-The orchestrator calls `init_observability(adapter.name)` once per run. If you call it again from `setup()`, you'll re-init with your tags (last call wins for AgentOps). Use this for run-scoped tags only:
+The generator opens `observability_session(adapter.name)` once per run, which calls `init_observability(adapter.name)`. Because `setup()` runs **inside** that session, calling `init_observability` again from `setup()` re-inits with your tags (last call wins for AgentOps). Use this for run-scoped tags only:
 
 ```python
 def setup(self, *, framework_tag: str) -> None:
