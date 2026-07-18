@@ -2085,15 +2085,18 @@ Your Goal: {self.goal}
         # Store tool retry policy for tool execution with exponential backoff
         self._tool_retry_policy = _tool_config.retry_policy if _tool_config else None
         
-        # Retry configuration with jittered exponential backoff
+        # Retry configuration with jittered exponential backoff.
+        # Default (retry is None) applies RetryBackoffConfig() so the native
+        # OpenAI-client path retries transient errors by default, matching the
+        # LiteLLM path (max_retries=3). Only retry=False disables retries.
         if isinstance(retry, RetryBackoffConfig):
             self._retry_config = retry
         elif isinstance(retry, dict):
             self._retry_config = RetryBackoffConfig(**retry)
-        elif retry is True:
-            self._retry_config = RetryBackoffConfig()  # Use defaults
+        elif retry is False:
+            self._retry_config = None  # Explicitly disabled
         else:
-            self._retry_config = None  # No retry configuration
+            self._retry_config = RetryBackoffConfig()  # Use defaults (retry is True or None)
         
         # Cache for system prompts and formatted tools with eager thread-safe lock
         # Use OrderedDict for LRU behavior
@@ -4702,6 +4705,27 @@ Summary:"""
                 logger.warning(f"Runtime MCP server '{name}' cleanup failed: {e}")
         servers.clear()
 
+    def _cleanup_circuit_breakers(self) -> None:
+        """Remove this agent's instance-scoped tool circuit breakers.
+
+        Breakers are keyed on ``id(self)`` in a process-global registry. Since
+        CPython may reuse an object id after this agent is collected, leaving the
+        entries behind could let a future agent inherit a stale OPEN breaker.
+        Removing them on close keeps the registry bounded and correct.
+        """
+        try:
+            from ..tools.circuit_breaker import _get_global_registry
+        except Exception:
+            return
+        try:
+            registry = _get_global_registry()
+            prefix = f"tool_{id(self)}_"
+            for name in registry.list_services():
+                if name.startswith(prefix):
+                    registry.remove(name)
+        except Exception as e:
+            logger.warning(f"Circuit breaker cleanup failed: {e}")
+
     def _model_supports_web_search(self) -> bool:
         """
         Check if the agent's model supports native web search via LiteLLM.
@@ -5507,7 +5531,9 @@ Answer:"""
         elif isinstance(self.guardrail, str):
             # Create LLM-based guardrail
             from ..guardrails import LLMGuardrail
-            llm = getattr(self, 'llm', None) or getattr(self, 'llm_instance', None)
+            # Prefer the configured LLM instance (with api_key/base_url/client
+            # overrides) over the bare model-name string in self.llm.
+            llm = getattr(self, 'llm_instance', None) or getattr(self, 'llm', None)
             self._guardrail_fn = LLMGuardrail(description=self.guardrail, llm=llm)
         else:
             raise ValueError("Agent guardrail must be either a callable or a string description")
@@ -6141,18 +6167,25 @@ Answer:"""
         except Exception as e:
             logger.warning(f"LLM client cleanup failed: {e}")
 
-        # MCP cleanup  
+        # MCP cleanup — shut down MCP clients passed via tools=[MCP(...)]
+        # (mirrors remove_mcp_server()'s best-effort shutdown)
         try:
-            if hasattr(self, '_mcp_clients') and self._mcp_clients:
-                for client_name, client in self._mcp_clients.items():
-                    if hasattr(client, 'close'):
-                        client.close()
-                self._mcp_clients.clear()
+            if isinstance(self.tools, list):
+                for t in self.tools:
+                    if hasattr(t, 'shutdown'):
+                        try:
+                            t.shutdown()
+                        except Exception as e:
+                            logger.warning(f"MCP tool cleanup failed: {e}")
         except Exception as e:
             logger.warning(f"MCP cleanup failed: {e}")
 
         # Runtime-attached MCP servers cleanup (each guarded individually)
         self._shutdown_runtime_mcp_servers()
+
+        # Circuit breaker cleanup — remove this agent's instance-scoped breakers
+        # so a reused id(self) can't inherit a stale OPEN breaker.
+        self._cleanup_circuit_breakers()
 
         # Server registry cleanup
         try:
@@ -6194,17 +6227,26 @@ Answer:"""
                 elif hasattr(self.memory, 'close_connections'):
                     self.memory.close_connections()
             
-            # Close MCP sessions asynchronously if supported
-            if hasattr(self, '_mcp_clients') and self._mcp_clients:
-                for client in self._mcp_clients.values():
-                    if hasattr(client, 'aclose'):
-                        await client.aclose()
-                    elif hasattr(client, 'close'):
-                        client.close()
-                self._mcp_clients.clear()
+            # Close MCP clients passed via tools=[MCP(...)]
+            # (mirrors remove_mcp_server()'s best-effort shutdown)
+            if isinstance(self.tools, list):
+                for t in self.tools:
+                    if hasattr(t, 'aclose'):
+                        try:
+                            await t.aclose()
+                        except Exception as e:
+                            logger.warning(f"MCP tool cleanup failed: {e}")
+                    elif hasattr(t, 'shutdown'):
+                        try:
+                            t.shutdown()
+                        except Exception as e:
+                            logger.warning(f"MCP tool cleanup failed: {e}")
 
             # Runtime-attached MCP servers cleanup (each guarded individually)
             self._shutdown_runtime_mcp_servers()
+
+            # Circuit breaker cleanup — remove this agent's instance-scoped breakers
+            self._cleanup_circuit_breakers()
 
             # Clean up server registrations and tasks
             self._cleanup_server_registrations()
