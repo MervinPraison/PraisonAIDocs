@@ -144,13 +144,19 @@ sequenceDiagram
     participant CB as Channel Bot
     participant US as User
 
-    ES->>GW: POST /hooks/gmail (JSON body)
+    ES->>GW: POST /hooks/gmail (raw body + signature header)
     GW->>GW: 1. Authenticate bearer token
-    GW->>GW: 2. Reserve idempotency key (atomic)
-    GW->>GW: 3. Resolve session_key template
-    GW->>AG: 4. Run agent on templated message (action: agent)
-    AG-->>GW: Agent reply
-    GW->>CB: 5. Deliver reply to telegram:123456789
+    GW->>GW: 2. Verify signature (401 if invalid, before any agent)
+    GW->>GW: 3. Event filter (200 skipped if not allowed)
+    GW->>GW: 4. Reserve idempotency key (atomic)
+    GW->>GW: 5. Resolve session_key template
+    alt deliver_only
+        GW->>CB: Deliver rendered message (no LLM turn)
+    else action: agent
+        GW->>AG: Run agent on templated message
+        AG-->>GW: Agent reply
+        GW->>CB: Deliver reply to telegram:123456789
+    end
     CB-->>US: Message delivered
     GW->>GW: 6. Record idempotency key (success)
     GW-->>ES: 200 {"ok": true}
@@ -167,6 +173,13 @@ sequenceDiagram
 | Delivery target | `deliver_to` | `deliver_to=` | `--deliver-to` |
 | Agent message template | `message` | `message_template=` | `--message` |
 | Active? | `enabled` | `enabled=` | — |
+| HMAC signing secret | `secret` | `secret=` | — |
+| Signature header | `signature_header` | `signature_header=` | — |
+| Signature algorithm | `signature_algo` | `signature_algo=` | — |
+| Signature prefix | `signature_prefix` | `signature_prefix=` | — |
+| Event allow-list | `events` | `events=` | — |
+| Event type source | `event_header` | `event_header=` | — |
+| Deliver without a turn | `deliver_only` | `deliver_only=` | — |
 
 ---
 
@@ -261,6 +274,101 @@ hooks:
     auth: "${GITHUB_WEBHOOK_SECRET}"    # per-hook secret
     agent: triage
 ```
+
+---
+
+## Verifying Provider Signatures (HMAC)
+
+Set `secret` to verify the provider's HMAC signature over the raw request body — a missing or invalid signature returns `401 {"error": "invalid signature"}` before any agent runs.
+
+Verification is **fail-closed** and **opt-in**: without `secret`, nothing changes. When `secret` is set with no explicit `signature_header`, the header defaults to `X-Hub-Signature-256` (the GitHub convention).
+
+```yaml
+hooks:
+  - path: github
+    agent: triage
+    secret: "${GITHUB_WEBHOOK_SECRET}"
+    signature_prefix: "sha256="          # signature_header defaults to X-Hub-Signature-256
+    deliver_to: "slack:#triage"
+    message: "New {{ payload.action }} on #{{ payload.issue.number }}: {{ payload.issue.title }}"
+```
+
+| Field | Purpose |
+|-------|---------|
+| `secret` | Signing secret; enables verification. |
+| `signature_header` | Header carrying the signature (auto-defaults to `X-Hub-Signature-256`). |
+| `signature_algo` | HMAC digest, defaults to `sha256`. |
+| `signature_prefix` | Optional prefix on the signature, e.g. `sha256=`. |
+
+Sign the exact body you POST to test locally:
+
+```bash
+SECRET="my-signing-secret"
+BODY='{"action":"opened","issue":{"number":42,"title":"Bug"}}'
+SIG="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')"
+
+curl -X POST http://localhost:8765/hooks/github \
+  -H "Content-Type: application/json" \
+  -H "X-Hub-Signature-256: $SIG" \
+  -H "X-GitHub-Event: issues" \
+  -d "$BODY"
+```
+
+---
+
+## Event Filtering
+
+Set `events` to an allow-list so only matching deliveries run a turn — everything else is a cheap `200 {"ok": true, "skipped": "event"}` with no LLM cost.
+
+The event type is read from `event_header` (a request header) or, when absent, from the payload as a dotted path (defaulting to `"event"`).
+
+```yaml
+hooks:
+  - path: github
+    agent: triage
+    event_header: "X-GitHub-Event"
+    events: ["issues.opened", "pull_request.opened"]
+    deliver_to: "slack:#triage"
+    message: "New {{ payload.action }} on #{{ payload.issue.number }}"
+```
+
+A namespaced filter like `issues.opened` matches only when the payload's `action == "opened"` — **fail-closed**: a delivery that omits `action` is never admitted, so a bare `issues` event cannot pass a filter that only allows `issues.opened`.
+
+Read the event from a payload field by pointing `event_header` at a dotted path:
+
+```yaml
+hooks:
+  - path: stripe
+    event_header: "type"                 # read payload["type"]
+    events: ["invoice.payment_failed"]
+    deliver_to: "slack:#billing"
+    message: "⚠️ Payment failed for {{ payload.data.object.customer }}"
+```
+
+---
+
+## Deliver-Only Mode (no LLM turn)
+
+Set `deliver_only: true` to route the rendered `message` straight to `deliver_to` — no agent, no LLM cost, sub-second forwarding. Requires `deliver_to`.
+
+```yaml
+hooks:
+  - path: sentry
+    deliver_only: true
+    deliver_to: "telegram:${OPS_CHAT_ID}"
+    secret: "${SENTRY_WEBHOOK_SECRET}"
+    signature_header: "Sentry-Signature"
+    message: "🚨 {{ payload.project }}: {{ payload.event.title }}\n{{ payload.url }}"
+```
+
+| Outcome | Response |
+|---|---|
+| Delivered | `{"ok": true, "action": "deliver", "delivered": true}` |
+| Empty rendered message | `{"ok": true, "action": "deliver", "delivered": false, "skipped": "empty message"}` |
+| Missing `deliver_to` | `{"ok": false, "error": "deliver_only hook requires 'deliver_to'"}` |
+| Delivery failed | `{"ok": false, "error": "hook delivery failed", "delivered": false}` |
+
+`deliver_only` composes with signature verification and event filtering — forward alerts (Sentry → Telegram, CI → Slack) at near-instant latency with zero LLM cost.
 
 ---
 
