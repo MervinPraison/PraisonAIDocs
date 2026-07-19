@@ -831,6 +831,11 @@ class WebSocketGateway:
         
         # Multi-bot lifecycle
         self._channel_bots: Dict[str, Any] = {}  # channel_name -> bot instance
+        # Issue #3159: channels configured but skipped at startup because their
+        # credential was unavailable (empty token) are tracked here so they stay
+        # visible in ``health()`` as ``degraded`` instead of vanishing — a
+        # skipped channel must be distinguishable from one never configured.
+        self._degraded_channels: Dict[str, str] = {}  # channel_name -> reason
         # Issue #2624: resilient outbound delivery for the gateway's own
         # scheduled/hook path. Lazily built (see ``delivery_router``) so the
         # scheduled-job and hook replies share the same token-bucket rate
@@ -1789,8 +1794,25 @@ class WebSocketGateway:
             if auth_err:
                 return auth_err
 
+            import json
+
+            # Read the raw body once so an HMAC signature can be verified over
+            # the exact bytes the provider signed, then parse it as JSON.
+            raw_body = await request.body()
+
+            # Provider signature verification (#3165). Fail-closed: when a
+            # ``secret`` is configured, a missing/invalid signature is rejected
+            # with 401 before any agent runs. A hook without ``secret`` is
+            # unaffected (backward compatible).
+            verify = getattr(hook, "verify_signature", None)
+            if callable(verify) and getattr(hook, "secret", None):
+                if not verify(raw_body, dict(request.headers)):
+                    return JSONResponse(
+                        {"error": "invalid signature"}, status_code=401,
+                    )
+
             try:
-                payload = await request.json()
+                payload = json.loads(raw_body) if raw_body else {}
             except ValueError:
                 # Malformed JSON: reject rather than silently running on {} so a
                 # bad request never triggers an agent with an unintended message.
@@ -1800,6 +1822,15 @@ class WebSocketGateway:
                 )
             if not isinstance(payload, dict):
                 payload = {"value": payload}
+
+            # Event-type filter (#3165): a delivery whose event is not in the
+            # configured allow-list is acknowledged (200) without spending a
+            # turn, so an unrelated webhook event is a cheap no-op.
+            event_allowed = getattr(hook, "event_allowed", None)
+            if callable(event_allowed) and not event_allowed(
+                payload, dict(request.headers)
+            ):
+                return JSONResponse({"ok": True, "skipped": "event"})
 
             # Atomically reserve the idempotency key. ``_hook_reserve`` rejects
             # keys already recorded *or* currently in flight, so concurrent
@@ -3387,6 +3418,45 @@ class WebSocketGateway:
         """
         session_key = hook.resolve_session_key(payload)
 
+        # deliver_only (#3165): the rendered message *is* the delivered content
+        # — route it straight through ``deliver_to`` with no LLM turn, for
+        # zero-cost, sub-second notification forwarding. Independent of
+        # ``action`` so it composes with either.
+        if getattr(hook, "deliver_only", False):
+            message = hook.resolve_message(payload) or ""
+            if not hook.deliver_to:
+                return {
+                    "ok": False,
+                    "error": "deliver_only hook requires 'deliver_to'",
+                    "session": session_key,
+                }
+            # An empty rendered message is a no-op: never hand ""  to the
+            # delivery backend (channels that reject it would 500 → retry loop;
+            # channels that accept it would record a contentless delivery).
+            if not message.strip():
+                return {
+                    "ok": True,
+                    "action": "deliver",
+                    "session": session_key,
+                    "delivered": False,
+                    "skipped": "empty message",
+                }
+            delivered = await self._deliver_hook_reply(hook.deliver_to, message)
+            if not delivered:
+                return {
+                    "ok": False,
+                    "error": "hook delivery failed",
+                    "action": "deliver",
+                    "session": session_key,
+                    "delivered": False,
+                }
+            return {
+                "ok": True,
+                "action": "deliver",
+                "session": session_key,
+                "delivered": True,
+            }
+
         # action == "wake": just nudge an existing session, no new turn.
         if hook.action == "wake":
             session = self._sessions.get(session_key)
@@ -3924,7 +3994,21 @@ class WebSocketGateway:
                     "platform": platform,
                     "running": running,
                 }
-                
+
+        # Issue #3159: surface channels that were configured but skipped at
+        # startup because their credential was unavailable. Without this a
+        # degraded channel silently disappears from health() and can't be told
+        # apart from one that was never configured.
+        for name, reason in self._degraded_channels.items():
+            if name in channel_status:
+                continue
+            channel_status[name] = {
+                "platform": name,
+                "running": False,
+                "status": "degraded",
+                "reason": reason,
+            }
+
         result = {
             "status": "healthy" if self._is_running else "stopped",
             "uptime": uptime,
@@ -4729,7 +4813,14 @@ class WebSocketGateway:
             is_email_platform = channel_type in ("email", "agentmail")
             if not token and not wa_web_mode and not is_email_platform:
                 logger.warning(f"No token for channel '{channel_name}', skipping")
+                # Issue #3159: keep the skipped channel queryable as degraded so
+                # a monitor can tell "configured-but-unavailable" apart from
+                # "never configured". Healthy channels keep serving unaffected.
+                self._degraded_channels[channel_name] = "credential unavailable"
                 continue
+            # Recovered on (re)start: a channel that previously degraded but now
+            # has a token must not linger in the degraded set.
+            self._degraded_channels.pop(channel_name, None)
 
             routes = ch_cfg.get("routing") or ch_cfg.get("routes") or {"default": "default"}
             self._routing_rules[channel_name] = routes
@@ -5691,8 +5782,12 @@ class WebSocketGateway:
         
         if not token and not wa_web_mode and not is_email_platform:
             logger.warning(f"No token for channel '{channel_name}', skipping")
+            # Issue #3159: a channel that degrades on hot-reload stays queryable.
+            self._degraded_channels[channel_name] = "credential unavailable"
             return
-        
+        # Recovered on hot-reload: clear any prior degraded marker.
+        self._degraded_channels.pop(channel_name, None)
+
         routes = ch_cfg.get("routing") or ch_cfg.get("routes") or {"default": "default"}
         self._routing_rules[channel_name] = routes
         self._routing_bindings[channel_name] = self._parse_bindings(
