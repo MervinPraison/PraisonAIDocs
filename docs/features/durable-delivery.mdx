@@ -335,6 +335,38 @@ async def enqueue(
 |---|---|---|---|
 | `lane_key` | `str \| None` | `None` (= `target`) | Custom conversation grouping. Pass a thread id or user id to order sends within a shared channel. See [Outbound Ordering](/docs/features/outbound-ordering). |
 
+#### `OutboundQueue.status_for()` signature
+
+`status_for()` returns the current status of the entry for an idempotency key.
+
+```python
+def status_for(self, idempotency_key: str) -> Optional[str]:
+    ...
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `idempotency_key` | `str` | The stable key used at `enqueue()` time. |
+
+**Returns** — the current entry status (`"pending"`, `"sending"`, `"recovered"`, `"sent"`, `"failed"`, or `"permanent_failure"`), or `None` if no entry exists for that key.
+
+Use it to tell an already-delivered duplicate (status `"sent"`) apart from a genuine delivery failure after a drain — so a deduplicated re-fire is reported as a suppressed success rather than a spurious failure.
+
+```python
+from praisonai.bots import OutboundQueue
+
+outbox = OutboundQueue(path="~/.praisonai/state/gateway_outbox.sqlite")
+await outbox.enqueue(
+    idempotency_key="daily-brief-2026-07-20",
+    target="telegram:-100123",
+    payload={"text": "Morning brief ready."},
+)
+await outbox.drain(sender)
+
+if outbox.status_for("daily-brief-2026-07-20") == "sent":
+    print("Delivered (or suppressed as a duplicate of a prior send).")
+```
+
 ### `DurableDelivery`
 
 Wraps an `OutboundQueue` and an adapter to provide a simple `.send()` / `.drain_pending()` API.
@@ -554,18 +586,18 @@ asyncio.create_task(delivery.drain_pending())
 
 ## Proactive Path
 
-The proactive path (`BotOS.deliver`) shares the reply-path rate limiter — but does not support idempotency deduplication. For durable, deduped sends use the reply-path outbox (`delivery.send`).
+Direct `BotOS.deliver(...)` shares the reply-path rate limiter but is fire-and-forget. When the gateway itself performs the scheduled/proactive send, it runs through a durable outbox instead.
 
-| Property | Reply-path outbox (`delivery.send`) | Proactive path (`BotOS.deliver`) |
-|----------|------------------------------------|----------------------------------|
-| Persistence | SQLite outbox, survives restart | Not persisted — fire-and-forget |
-| Cross-worker dedup | Yes (`UNIQUE` on `idempotency_key`) | ❌ not supported |
-| Idempotency key | ✅ | ❌ not a parameter |
-| Rate limiter shared | ✅ same bucket | ✅ same bucket (post PraisonAI #2578) |
-| Adapter `was_delivered` reconciliation | ✅ | ❌ not applicable |
+| Property | Reply-path outbox (`delivery.send`) | Direct `BotOS.deliver(...)` | Gateway-hosted scheduled / proactive |
+|----------|------------------------------------|-----------------------------|--------------------------------------|
+| Persistence | SQLite outbox, survives restart | Not persisted — fire-and-forget | SQLite outbox at `~/.praisonai/state/gateway_outbox.sqlite`, survives restart |
+| Cross-worker dedup | Yes (`UNIQUE` on `idempotency_key`) | ❌ not supported | ✅ Yes (`UNIQUE` on the derived idem key) |
+| Idempotency key | ✅ | ❌ not a parameter | ✅ derived from `sched:<channel>:<channel_id>:<session_id>:<text_digest>` |
+| Rate limiter shared | ✅ same bucket | ✅ same bucket (post PraisonAI #2578) | ✅ same bucket |
+| Adapter `was_delivered` reconciliation | ✅ | ❌ not applicable | Available if the adapter opts in (same `OutboundQueue.drain(reconciler=…)` API) |
 
 <Note>
-Use `delivery.send(...)` when you need durability across restarts, workers, or deduplication. Use `BotOS.deliver(...)` for simple agent-initiated sends where rate-limiting is enough.
+Use `delivery.send(...)` when you need durability across restarts, workers, or deduplication on the reply path. The gateway's own scheduled/proactive deliveries now get durability automatically — no extra API required. Reach for direct `BotOS.deliver(...)` (agent-initiated fire-and-forget, no gateway) only when rate-limiting is enough and durability across restart is not required.
 </Note>
 
 ---
