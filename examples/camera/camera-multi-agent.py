@@ -86,7 +86,8 @@ def analyze_with_multiple_agents():
         4. Assess overall security status of the area""",
         expected_output="Detailed security assessment with threat level and recommendations",
         agent=security_agent,
-        images=[image_path]
+        images=[image_path],
+        async_execution=True
     )
     
     object_task = Task(
@@ -98,7 +99,8 @@ def analyze_with_multiple_agents():
         4. Provide a comprehensive inventory""",
         expected_output="Detailed object inventory with locations and descriptions",
         agent=object_detector,
-        images=[image_path]
+        images=[image_path],
+        async_execution=True
     )
     
     scene_task = Task(
@@ -110,14 +112,15 @@ def analyze_with_multiple_agents():
         4. Provide context about what type of location this appears to be""",
         expected_output="Complete scene description with environmental context",
         agent=scene_analyst,
-        images=[image_path]
+        images=[image_path],
+        async_execution=True
     )
     
     # Run multi-agent analysis
     agents = AgentTeam(
         agents=[security_agent, object_detector, scene_analyst],
         tasks=[security_task, object_task, scene_task],
-        process="parallel",  # Run all analyses in parallel
+        process="workflow",  # async_execution=True fans the tasks out in parallel
     )
     
     result = agents.start()
