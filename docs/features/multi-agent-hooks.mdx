@@ -10,16 +10,16 @@ Multi-Agent Hooks let you run custom code when tasks start, complete, or when yo
 ```python
 from praisonaiagents import Agent, Task, PraisonAIAgents, MultiAgentHooksConfig
 
-def on_task_start(task):
-    print(f"Starting: {task.name}")
+def on_task_start(task, task_id):
+    print(f"Starting: {task.name} (id={task_id})")
 
-def on_task_complete(task, result):
+def on_task_complete(task, task_output):
     print(f"Done: {task.name}")
 
 agent = Agent(name="Researcher", instructions="Research topics thoroughly.")
 task = Task(description="Research quantum computing", agent=agent)
 
-workflow = PraisonAIAgents(
+team = PraisonAIAgents(
     agents=[agent],
     tasks=[task],
     hooks=MultiAgentHooksConfig(
@@ -27,10 +27,14 @@ workflow = PraisonAIAgents(
         on_task_complete=on_task_complete,
     ),
 )
-workflow.start()
+team.start()
 ```
 
 The user registers hooks; the workflow fires them as each task starts and completes.
+
+<Note>
+Multi-agent lifecycle hooks fire on **both** sync (`team.start()`) and async (`team.astart()`) workflows, and callbacks may be either regular functions or `async def` coroutines. See [Async and Sync Callbacks](#async-and-sync-callbacks) below.
+</Note>
 
 ```mermaid
 graph LR
@@ -69,11 +73,11 @@ import time
 
 start_times = {}
 
-def on_start(task):
+def on_start(task, task_id):
     start_times[task.name] = time.time()
-    print(f"[START] {task.name}")
+    print(f"[START] {task.name} (id={task_id})")
 
-def on_complete(task, result):
+def on_complete(task, task_output):
     duration = time.time() - start_times.get(task.name, time.time())
     print(f"[DONE]  {task.name} ({duration:.1f}s)")
 
@@ -96,6 +100,36 @@ team.start()
 ```
 </Step>
 
+<Step title="Async Workflow with async def Hooks">
+Run the team with `astart()` and use `async def` callbacks to `await` I/O directly:
+
+```python
+import asyncio
+from praisonaiagents import Agent, Task, PraisonAIAgents, MultiAgentHooksConfig
+
+async def on_start(task, task_id):
+    print(f"[START] {task.name} (id={task_id})")
+
+async def on_complete(task, task_output):
+    # await your async I/O directly — no wrapper needed
+    print(f"[DONE]  {task.name}: {task_output.raw[:80]}")
+
+agent = Agent(name="Researcher", instructions="Research topics thoroughly.")
+task  = Task(description="Research quantum computing", agent=agent)
+
+team = PraisonAIAgents(
+    agents=[agent],
+    tasks=[task],
+    hooks=MultiAgentHooksConfig(
+        on_task_start=on_start,       # async def — awaited
+        on_task_complete=on_complete, # async def — awaited
+    ),
+)
+
+asyncio.run(team.astart())  # fires the same hooks as .start()
+```
+</Step>
+
 <Step title="Custom Completion Checker">
 Override the default completion logic with your own validation:
 
@@ -103,12 +137,12 @@ Override the default completion logic with your own validation:
 from praisonaiagents import Agent, Task, PraisonAIAgents
 from praisonaiagents import MultiAgentHooksConfig
 
-def quality_checker(task, result):
+def quality_checker(task, task_output):
     """Return True if output meets quality standards."""
-    if len(result) < 100:
-        print(f"Output too short ({len(result)} chars), retrying...")
+    if len(task_output) < 100:
+        print(f"Output too short ({len(task_output)} chars), retrying...")
         return False
-    if "error" in result.lower():
+    if "error" in task_output.lower():
         print("Output contains error, retrying...")
         return False
     return True
@@ -121,10 +155,10 @@ team = PraisonAIAgents(
     tasks=[task],
     hooks=MultiAgentHooksConfig(
         completion_checker=quality_checker,
-        on_task_complete=lambda t, r: print(f"✅ {t.name} passed quality check"),
+        on_task_complete=lambda t, o: print(f"✅ {t.name} passed quality check"),
     ),
 )
-workflow.start()
+team.start()
 ```
 </Step>
 </Steps>
@@ -136,28 +170,66 @@ workflow.start()
 ```mermaid
 sequenceDiagram
     participant User
-    participant Workflow
-    participant Hooks
+    participant Team as PraisonAIAgents
+    participant Hook as on_task_complete
     participant Agent
 
-    User->>Workflow: Start workflow
-    loop Each task
-        Workflow->>Hooks: on_task_start(task)
-        Hooks-->>Workflow: Continue
-        Workflow->>Agent: Execute task
-        Agent-->>Workflow: Result
-        Workflow->>Hooks: completion_checker(task, result)
-        Hooks-->>Workflow: Pass/fail
-        Workflow->>Hooks: on_task_complete(task, result)
+    Note over User,Agent: Sync path — team.start()
+    User->>Team: start()
+    Team->>Agent: run_task(id)
+    Agent-->>Team: TaskOutput
+    Team->>Hook: on_task_complete(task, output)
+    Hook-->>Team: return
+    Team-->>User: results
+
+    Note over User,Agent: Async path — team.astart()
+    User->>Team: await astart()
+    Team->>Agent: await arun_task(id)
+    Agent-->>Team: TaskOutput
+    alt async def hook
+        Team->>Hook: await on_task_complete(task, output)
+    else sync def hook
+        Team->>Hook: run_in_executor(hook, task, output)
     end
-    Workflow-->>User: Final results
+    Hook-->>Team: return
+    Team-->>User: results
 ```
 
-| Hook | When it fires | Use case |
-|---|---|---|
-| `on_task_start` | Before each task begins | Logging, resource allocation |
-| `on_task_complete` | After each task succeeds | Notifications, result storage |
-| `completion_checker` | After task, before marking done | Quality gates, validation |
+| Hook | When it fires | Sync? | Async? | Use case |
+|---|---|---|---|---|
+| `on_task_start` | Before each task begins | ✅ `start()` / `run_task()` | ✅ `astart()` / `arun_task()` | Logging, resource allocation |
+| `on_task_complete` | After each task succeeds | ✅ | ✅ | Notifications, result storage |
+| `completion_checker` | After task, before marking done | ✅ | ✅ | Quality gates, validation |
+
+### Async and Sync Callbacks
+
+`MultiAgentHooksConfig` accepts either regular functions or `async def` coroutines for `on_task_start` and `on_task_complete`.
+
+- In sync workflows (`team.start()`), only sync callables are meaningful — an `async def` here would return an un-awaited coroutine.
+- In async workflows (`team.astart()` / `arun_task()`), the framework detects the callable type and does the right thing:
+  - `async def` callbacks are `await`ed inline.
+  - Sync callbacks are offloaded to the default executor via `loop.run_in_executor(None, ...)`, so a blocking hook can't stall the event loop.
+- Exceptions raised by either callback are logged (`logger.error`) and swallowed — they never abort the task.
+
+### Global Variables Propagation
+
+Pass `variables=` once at the team level and every task substitutes them into its description at runtime:
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+agent = Agent(name="Writer", instructions="Write a paragraph on {topic} for {audience}.")
+task  = Task(description="Write on {topic}", agent=agent)
+
+team = PraisonAIAgents(
+    agents=[agent],
+    tasks=[task],
+    variables={"topic": "quantum computing", "audience": "beginners"},
+)
+team.start()
+```
+
+Values passed to `variables=` are shallow-copied into `task.variables` before each task runs (unless the task defines its own `variables`), then substituted into `task.description`. The shallow copy means a task mutating its own `variables` no longer leaks back into the team-level dict, so parallel tasks in a `process="parallel"` team don't stomp on each other.
 
 ---
 
@@ -169,9 +241,9 @@ sequenceDiagram
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `on_task_start` | `Callable \| None` | `None` | Called before a task begins. Signature: `(task) -> None` |
-| `on_task_complete` | `Callable \| None` | `None` | Called after a task finishes. Signature: `(task, result) -> None` |
-| `completion_checker` | `Callable \| None` | `None` | Custom validator. Signature: `(task, result) -> bool` |
+| `on_task_start` | `Callable \| None` | `None` | Called before a task begins. Signature: `(task, task_id) -> None`. May be sync or `async def`. |
+| `on_task_complete` | `Callable \| None` | `None` | Called after a task finishes. Signature: `(task, task_output) -> None`. May be sync or `async def`. |
+| `completion_checker` | `Callable \| None` | `None` | Custom validator. Signature: `(task, task_output) -> bool` |
 
 ---
 
@@ -184,31 +256,31 @@ import time
 
 start_times = {}
 
-def log_start(task):
+def log_start(task, task_id):
     start_times[task.name] = time.time()
     print(f"[START] {task.name}")
 
-def log_complete(task, result):
+def log_complete(task, task_output):
     elapsed = time.time() - start_times.get(task.name, 0)
     print(f"[DONE] {task.name} in {elapsed:.1f}s")
 
 agent = Agent(name="Worker", instructions="Complete tasks efficiently.")
 task = Task(description="Analyze quarterly sales data", agent=agent)
 
-workflow = PraisonAIAgents(
+team = PraisonAIAgents(
     agents=[agent],
     tasks=[task],
     hooks=MultiAgentHooksConfig(on_task_start=log_start, on_task_complete=log_complete),
 )
-workflow.start()
+team.start()
 ```
 
 ### Pattern 2 — Quality gate with retry logic
 ```python
 from praisonaiagents import Agent, Task, PraisonAIAgents, MultiAgentHooksConfig
 
-def length_checker(task, result):
-    return len(result.raw) >= 200
+def length_checker(task, task_output):
+    return len(task_output) >= 200
 
 agent = Agent(name="Analyst", instructions="Write comprehensive analyses.")
 task = Task(description="Analyze the impact of remote work on productivity", agent=agent)
@@ -221,13 +293,37 @@ response = PraisonAIAgents(
 print(response)
 ```
 
+### Pattern 3 — Async I/O in a completion hook
+```python
+import asyncio
+from praisonaiagents import Agent, Task, PraisonAIAgents, MultiAgentHooksConfig
+
+async def notify(task, task_output):
+    # await a DB write or HTTP call directly inside the hook
+    print(f"Notifying downstream: {task.name}")
+
+agent = Agent(name="Worker", instructions="Do the work.")
+task = Task(description="Process batch #42", agent=agent)
+
+team = PraisonAIAgents(
+    agents=[agent],
+    tasks=[task],
+    hooks=MultiAgentHooksConfig(on_task_complete=notify),
+)
+asyncio.run(team.astart())
+```
+
 ---
 
 ## Best Practices
 
 <AccordionGroup>
 <Accordion title="Keep hooks lightweight">
-Hook callbacks run synchronously in the orchestrator loop. Expensive operations (database writes, HTTP requests) should be done asynchronously or offloaded to a background thread to avoid slowing down task execution.
+Callbacks are invoked on the orchestrator's task-completion path. In **sync workflows**, an expensive hook blocks the next task. In **async workflows**, sync hooks are offloaded to a thread executor and `async def` hooks are awaited, so blocking work is safer — but a slow hook still increases end-to-end task latency. Prefer `async def` for I/O-bound work (DB writes, HTTP notifications) and keep CPU-bound work off the hook path entirely.
+</Accordion>
+
+<Accordion title="Prefer async def hooks with astart()">
+When you run the team with `astart()`, use `async def` callbacks for `on_task_start` / `on_task_complete` so you can `await` I/O directly. Sync callbacks still work — the framework offloads them to the default executor — but writing them as coroutines is clearer and avoids an unnecessary executor hop.
 </Accordion>
 
 <Accordion title="Use completion_checker for quality gates">
@@ -244,14 +340,14 @@ Hook callbacks receive task references. Mutating task properties during executio
 ## Related
 
 <CardGroup cols={2}>
+<Card title="Async Agents" icon="clock" href="/docs/features/async">
+  Run multi-agent workflows with astart()
+</Card>
 <Card title="Hooks" icon="webhook" href="/docs/features/hooks">
   Single-agent lifecycle hooks
 </Card>
 <Card title="Callbacks" icon="rotate-cw" href="/docs/features/callbacks">
   Agent callback system
-</Card>
-<Card title="Multi-Agent Output" icon="display" href="/docs/features/multi-agent-output">
-  Control output verbosity across agents
 </Card>
 <Card title="Multi-Agent Execution" icon="play" href="/docs/features/multi-agent-execution">
   Configure iteration and retry limits
