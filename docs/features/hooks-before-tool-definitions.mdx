@@ -157,19 +157,27 @@ agent = Agent(
 sequenceDiagram
     participant Agent
     participant ChatMixin
+    participant Registry as HookRegistry
     participant Hook as BEFORE_TOOL_DEFINITIONS Hook
     participant LLM
 
     Agent->>ChatMixin: chat(user_message)
     ChatMixin->>ChatMixin: format_tools() → tool_definitions
-    ChatMixin->>ChatMixin: deep copy tool_definitions
-    ChatMixin->>Hook: BeforeToolDefinitionsInput(tool_definitions, model, agent_name, session_id)
-    Hook->>Hook: mutate tool_definitions in-place
-    ChatMixin->>LLM: request with (possibly modified) tool_definitions
+    ChatMixin->>Registry: has_hooks(BEFORE_TOOL_DEFINITIONS)?
+    alt no hook registered
+        Registry-->>ChatMixin: false
+        ChatMixin->>LLM: request with unchanged tool_definitions (no deep-copy)
+    else hook registered
+        Registry-->>ChatMixin: true
+        ChatMixin->>ChatMixin: deep copy tool_definitions
+        ChatMixin->>Hook: BeforeToolDefinitionsInput(tool_definitions, model, agent_name, session_id)
+        Hook->>Hook: mutate tool_definitions in-place
+        ChatMixin->>LLM: request with (possibly modified) tool_definitions
+    end
     LLM-->>Agent: response
 ```
 
-**Deep copy guarantee:** The agent deep-copies `tool_definitions` before passing them to the hook. This means:
+**Deep copy guarantee (when a hook is registered):** The agent deep-copies `tool_definitions` before passing them to the hook. This means:
 - Hook mutations cannot accidentally poison the agent's internal tool cache.
 - Each request starts from the clean, registered tool list.
 - Only in-place mutations (`data.tool_definitions[:] = ...`) are adopted.
@@ -207,6 +215,43 @@ def hook(data: BeforeToolDefinitionsInput) -> None:
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Zero overhead when no hook is registered">
+`BEFORE_TOOL_DEFINITIONS` costs nothing when no hook is registered — the runtime checks `has_hooks()` before doing any work (including the deep copy of `tool_definitions`) on both sync (`chat`) and async (`achat`) paths. Adding this hook is safe on the tool-calling hot path; the deep-copy and hook execution only run when you actually opt in.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookEvent, BeforeToolDefinitionsInput
+
+def read_file(path: str) -> str:
+    """Read a file."""
+    return f"contents of {path}"
+
+def delete_file(path: str) -> str:
+    """Delete a file."""
+    return f"deleted {path}"
+
+# No BEFORE_TOOL_DEFINITIONS hook registered → the runtime skips the deep-copy
+# and hook plumbing entirely. Same cost as an agent that never had hooks wired up.
+agent = Agent(name="Fast", instructions="Be helpful.", tools=[read_file, delete_file])
+agent.start("Read notes.txt")
+
+# Only pay the cost when you actually opt in:
+def drop_delete(data: BeforeToolDefinitionsInput) -> None:
+    data.tool_definitions[:] = [
+        t for t in data.tool_definitions
+        if t.get("function", {}).get("name") != "delete_file"
+    ]
+
+agent = Agent(
+    name="Safer",
+    instructions="Be helpful.",
+    tools=[read_file, delete_file],
+    hooks={HookEvent.BEFORE_TOOL_DEFINITIONS: drop_delete},
+)
+agent.start("Read notes.txt")   # Now the deep-copy + hook fire on every request.
+```
+</Accordion>
+
 <Accordion title="Use session_id to scope per-user tool access">
 The `session_id` field lets you load per-session permissions from a store and filter tools accordingly. This is the recommended pattern for multi-tenant bots where different users get different tool sets.
 </Accordion>
