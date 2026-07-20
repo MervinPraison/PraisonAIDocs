@@ -176,6 +176,64 @@ The `external_dir:` rows above only apply when `PermissionManager` is created wi
 
 ---
 
+## Shell expansion escalates to ASK
+
+Shell commands containing an expansion that cannot be statically resolved are escalated to `ASK` instead of being silently allowed by a broad rule.
+
+Before the tokenizer runs, the manager checks for `$IFS`, `${VAR}`, and bare `$VAR`. If any is present, an explicit `deny` still wins; otherwise the request is escalated to `ASK` with the reason *"Command contains shell expansion that cannot be statically verified; requires approval"*. Command substitution (`$(...)` and backticks) is excluded — it is already decomposed per-op, so its inner commands keep matching deny rules.
+
+| Pattern | Example | Resolution |
+|---|---|---|
+| `$IFS` word-splitting | `rm${IFS}-rf${IFS}/` | `ASK` (deny still wins) |
+| `${VAR}` expansion | `rm -rf ${TARGET_DIR}` | `ASK` (deny still wins) |
+| Bare `$VAR` | `rm -rf $HOME` | `ASK` (deny still wins) |
+| `$(...)` substitution | `echo $(rm -rf x)` | Decomposed per-op (existing behavior) |
+| Backtick substitution | `` echo `rm -rf x` `` | Decomposed per-op (existing behavior) |
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.approval.protocols import ApprovalConfig
+
+agent = Agent(
+    name="Safe Worker",
+    instructions="Run shell commands safely",
+    approval=ApprovalConfig(permissions={
+        "bash:rm *": "deny",
+        "bash:*": "allow",
+    }),
+)
+
+# All of these now trigger ASK (or hit the explicit deny), not silent allow:
+#   rm${IFS}-rf${IFS}/tmp/data      → ASK
+#   rm -rf ${TARGET}                → ASK
+#   rm -rf $HOME/downloads          → ASK
+#   rm -rf /tmp/foo                 → DENY (matches bash:rm *)
+agent.start("Clean up temp files")
+```
+
+Before this change, a broad `bash:*` allow could shadow a specific `bash:rm *` deny for anything containing `${IFS}` or `$HOME` — a real permission bypass.
+
+```mermaid
+graph LR
+    Cmd[📥 Shell command] --> HasExp{Has $IFS,<br/>${VAR}, or $VAR?}
+    HasExp -->|No| Normal[🔧 Tokenize & decompose]
+    HasExp -->|Yes| FlatCheck{Explicit deny<br/>matches?}
+    FlatCheck -->|Yes| Deny[🚫 DENY]
+    FlatCheck -->|No| Ask[❓ ASK user]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Cmd input
+    class HasExp,FlatCheck check
+    class Deny deny
+    class Normal,Ask ok
+```
+
+---
+
 ## Evasions Now Blocked
 
 A `deny: bash:rm *` rule now blocks **all** of these:
