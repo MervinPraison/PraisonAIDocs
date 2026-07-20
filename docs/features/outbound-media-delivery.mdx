@@ -24,7 +24,12 @@ Outbound media now honours threaded targets: when the delivery route names a thr
 </Note>
 
 <Note>
-Outbound media delivery uses the same `OutboundResilienceMixin` now applied to all six channels: Slack, Discord, WhatsApp, Email, Linear, AgentMail, and Telegram. See [Durable Delivery](/docs/features/durable-delivery) for retry and crash-safe persistence.
+Outbound media uploads share the same retry/backoff path as text replies —
+`DeliveryRouter.send_media` wraps the upload in `deliver_with_retry`, reusing
+the adapter's configured `BackoffPolicy` (or a sensible default). See
+[Retry & backoff on transient failures](#retry--backoff-on-transient-failures)
+below and [Outbound Resilience](/docs/features/outbound-resilience) for the
+underlying policy config.
 </Note>
 
 ```mermaid
@@ -226,6 +231,69 @@ router.send_media("telegram:-1001234567890:42", "/tmp/chart.png",
 | WhatsApp / Email / custom | — (no thread concept) | ✅ silently dropped |
 
 `DeliveryRouter.send_media` resolves the thread from the target and forwards it to `deliver_media_to_adapter`, which passes it through each transport's native keyword only when the primitive accepts it — so non-threaded adapters never raise.
+
+---
+
+## Retry & backoff on transient failures
+
+Media uploads go through the same `deliver_with_retry` wrapper as text
+replies. A transient transport failure — HTTP 5xx, rate limit, connection
+reset — is retried with bounded exponential backoff (honouring a
+server-mandated `Retry-After` hint) instead of silently dropping the
+attachment on the first blip.
+
+```mermaid
+sequenceDiagram
+    participant DR as DeliveryRouter
+    participant DMA as deliver_media_to_adapter
+    participant P as Platform API
+
+    DR->>DMA: send_media(path, thread_id?)
+    DMA->>P: upload (attempt 1)
+    P-->>DMA: 429 Too Many Requests (Retry-After: 2s)
+    Note over DMA: Honour Retry-After, wait 2s
+    DMA->>P: upload (attempt 2)
+    P-->>DMA: 503 Service Unavailable
+    Note over DMA: Exponential backoff
+    DMA->>P: upload (attempt 3)
+    P-->>DMA: 200 OK
+    DMA-->>DR: ✅ delivered
+```
+
+### Which backoff policy is used?
+
+`DeliveryRouter.send_media` reuses the adapter's already-configured
+`_outbound_backoff` `BackoffPolicy` if one is set (matching the text
+path). If the adapter exposes no policy, a sensible default is used:
+
+| Field | Default |
+|-------|---------|
+| `initial_ms` | `1000` |
+| `max_ms` | `10000` |
+| `factor` | `1.5` |
+| `max_attempts` | `3` |
+
+To customise, set `outbound_resilience` on the channel in `praisonai.yml`
+(the same block that tunes text retries — see
+[Outbound Resilience](/docs/features/outbound-resilience)). The media
+upload picks up the same values automatically.
+
+### Non-retryable outcomes are preserved
+
+| Outcome | Behaviour |
+|---------|-----------|
+| Adapter exposes no upload primitive | Returns `False` immediately — no retry. |
+| Missing optional `discord` package | Logged as "unavailable", returns `False` — no retry. |
+| Permanent transport error (e.g. 4xx that is not 429) | Surfaces as a failed send after policy exhaustion. |
+
+<Note>
+Prior to this fix the Discord native upload branch caught **every**
+exception locally and returned `False`, which bypassed the retry wrapper
+entirely — a transient blip on Discord silently dropped the file. That
+branch now only catches the missing optional `discord` dependency; every
+other transport error propagates so `deliver_with_retry` can apply the
+same backoff Slack and Telegram already got.
+</Note>
 
 ---
 
