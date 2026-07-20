@@ -313,24 +313,30 @@ Delivery reuses the existing `DeliveryRouter`, so scheduled sends inherit the ga
 | Guarantee | What it means |
 |-----------|---------------|
 | **Rate limiting** | Inherits the router's per-platform token-bucket limits |
-| **Idempotency dedup** | Each success carries a stable idempotency key; a re-fired job delivering the same result to the same target is deduplicated in-process |
+| **Idempotency dedup — lightweight `AgentScheduler`** | Router LRU (in-process). A re-fired job delivering the same result to the same target is deduplicated within one process. |
+| **Idempotency dedup — gateway-hosted scheduled/proactive delivery** | Durable — enqueued via SQLite `OutboundQueue` at `~/.praisonai/state/gateway_outbox.sqlite`. Survives a crash-and-restart: a re-fired job is a no-op INSERT that resolves to the already-`sent` row. Falls back to the router LRU only if the durable store cannot be built. |
 | **Dead-target self-heal** | The router retries and skips/marks dead targets |
 | **Graceful degradation** | When `praisonai-bot` is not installed, a single warning is logged and delivery no-ops — the scheduled run itself never fails |
 
+On the gateway-hosted scheduled path, delivery is enqueued into a durable SQLite outbox at `~/.praisonai/state/gateway_outbox.sqlite` before it reaches the router. Its `UNIQUE` idempotency key survives a process restart, so the exact crash window a scheduler must survive (fire → deliver → crash → restart → re-fire) is deduplicated without a double-post. A pre-crash send that never landed stays retryable and is delivered at-least-once on the next tick. If the outbox cannot be built (missing dependency or permission error) the path falls back to the router's in-process LRU exactly as before.
+
 ```mermaid
 graph LR
-    Result[✅ Result] --> Router[🔀 DeliveryRouter]
+    Result[✅ Result] --> Outbox[💾 gateway_outbox.sqlite\nUNIQUE idempotency key]
+    Outbox --> Router[🔀 DeliveryRouter]
     Router --> Rate[⏱️ Rate limit]
-    Router --> Dedup[🔁 Idempotency dedup]
+    Router --> Dedup[🔁 LRU dedup]
     Router --> Heal[🩹 Dead-target self-heal]
     Missing[📦 bot not installed] --> NoOp[⚠️ Warn + no-op]
 
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
     classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
 
     class Result ok
     class Router,Rate,Dedup,Heal proc
+    class Outbox store
     class Missing,NoOp warn
 ```
 
