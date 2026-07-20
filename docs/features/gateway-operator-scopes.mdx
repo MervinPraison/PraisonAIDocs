@@ -148,6 +148,10 @@ sequenceDiagram
 | Pairing | `pairing` | Approve or revoke device pairing |
 | Admin | `admin` | Channel pause/resume/reconnect — implies all scopes |
 
+<Note>
+`admin` implies every scope, but `approvals` and `pairing` do **not** imply each other — they are sibling capabilities. Only `admin` grants both. A method requiring both (via field escalation) therefore resolves to `admin`. See [Incomparable scopes escalate to `ADMIN`](#incomparable-scopes-escalate-to-admin).
+</Note>
+
 ```mermaid
 graph TB
     Admin[admin] --> Read[read]
@@ -239,6 +243,8 @@ print(config.resolve_scopes("${VIEWER_TOKEN}"))  # ['read']
 
 ## Scope-Gated Routes
 
+For programmatic (WebSocket / RPC) methods, see [Method → Scope Registry](#method-scope-registry) below.
+
 | Route | Method | Required scope |
 |---|---|---|
 | `/api/channels/{name}/pause` | POST | `admin` |
@@ -250,6 +256,144 @@ print(config.resolve_scopes("${VIEWER_TOKEN}"))  # ['read']
 | `/api/pairing/approve` | POST | `pairing` |
 | `/api/pairing/revoke` | POST | `pairing` |
 | WebSocket `message` | — | `write` |
+
+---
+
+## Method → Scope Registry
+
+Every gateway method declares its required scope in one place — a declarative registry — instead of scattered checks per endpoint. New methods are **closed until explicitly classified**; an unregistered method requires `admin`.
+
+```python
+from praisonaiagents.gateway import (
+    OperatorScope,
+    register_gateway_method,
+    resolve_required_scope,
+)
+
+# What scope does this call need?
+resolve_required_scope("agent.message")            # OperatorScope.WRITE
+resolve_required_scope("channels.pause")           # OperatorScope.ADMIN
+resolve_required_scope("totally.unknown.method")   # OperatorScope.ADMIN (default-deny)
+```
+
+```mermaid
+graph LR
+    subgraph "Method registry"
+        Plugin[📦 Plugin] --> Reg[📝 register_gateway_method]
+        Reg --> Store[(GATEWAY_METHODS)]
+        Call[📞 Gateway call] --> Resolve[🔎 resolve_required_scope]
+        Resolve --> Store
+        Resolve --> Scope[✅ Required scope]
+    end
+
+    classDef plugin fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef api fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Plugin,Call plugin
+    class Reg,Resolve api
+    class Store store
+    class Scope result
+```
+
+### Core method classification
+
+Core methods are classified at import in `praisonaiagents.gateway.protocols`:
+
+| Method | Required scope |
+|---|---|
+| `agent.message`, `message` | `write` |
+| `session.status`, `session.transcript` | `read` |
+| `approvals.resolve` | `approvals` |
+| `pairing.approve`, `pairing.revoke` | `pairing` |
+| `channels.control`, `channels.pause`, `channels.resume`, `channels.reconnect` | `admin` |
+
+### Registering a plugin method
+
+A plugin that adds a new gateway surface registers its scope at import time:
+
+```python
+from praisonaiagents.gateway import OperatorScope, register_gateway_method
+
+register_gateway_method(
+    "myplugin.notify",
+    scope=OperatorScope.WRITE,
+    owner="myplugin",
+    since="1.4.0",
+)
+```
+
+### Per-payload-field escalation (raise, never lower)
+
+A descriptor can raise the required scope when a specific field appears in the params — an otherwise `write` method that mutates configuration should require `admin` when the `config` field is present:
+
+```python
+from praisonaiagents.gateway import OperatorScope, register_gateway_method, resolve_required_scope
+
+register_gateway_method(
+    "myplugin.update",
+    scope=OperatorScope.WRITE,
+    escalate_fields={"config": OperatorScope.ADMIN},
+)
+
+resolve_required_scope("myplugin.update", {"text": "hi"})               # WRITE
+resolve_required_scope("myplugin.update", {"text": "hi", "config": {}}) # ADMIN
+```
+
+### Strict-fields mode (fail closed on unknown fields)
+
+For high-risk methods, enable `strict_fields=True` with an allowlist of known-safe fields. Any field not in `safe_fields` or `escalate_fields` escalates to `admin`:
+
+```python
+from praisonaiagents.gateway import OperatorScope, register_gateway_method, resolve_required_scope
+
+register_gateway_method(
+    "myplugin.execute",
+    scope=OperatorScope.WRITE,
+    strict_fields=True,
+    safe_fields={"text"},
+)
+
+resolve_required_scope("myplugin.execute", {"text": "hi"})              # WRITE
+resolve_required_scope("myplugin.execute", {"text": "hi", "mutate": 1}) # ADMIN
+```
+
+### Incomparable scopes escalate to `ADMIN`
+
+`approvals` and `pairing` are sibling capabilities — neither implies the other. When a method's baseline is one and a field escalates to the other, the combined requirement escalates to `admin` rather than silently picking one (a single-scope check cannot satisfy both):
+
+```python
+from praisonaiagents.gateway import OperatorScope, register_gateway_method, resolve_required_scope
+
+register_gateway_method(
+    "myplugin.combo",
+    scope=OperatorScope.APPROVALS,
+    escalate_fields={"pair": OperatorScope.PAIRING},
+)
+
+resolve_required_scope("myplugin.combo", {"other": 1})   # APPROVALS
+resolve_required_scope("myplugin.combo", {"pair": True}) # ADMIN — fail-closed
+```
+
+### API reference
+
+| Symbol | Meaning |
+|---|---|
+| `GatewayMethodDescriptor` | Frozen dataclass — `name`, `required_scope`, `owner`, `since`, `escalate_fields`, `strict_fields`, `safe_fields`, `escalate_unknown_scope` |
+| `GATEWAY_METHODS: dict[str, GatewayMethodDescriptor]` | The module-level registry |
+| `register_gateway_method(name, *, scope=ADMIN, owner="core", since=None, escalate_fields=None, strict_fields=False, safe_fields=None, escalate_unknown_scope=ADMIN, replace=False)` | Registers `name`. Raises `ValueError` on duplicate unless `replace=True` |
+| `resolve_required_scope(method, params=None)` | Resolves the effective required scope. Unknown method → `admin` |
+
+<Note>
+`register_gateway_method` is safe to call at plugin import time. The core-method classification runs at `praisonaiagents.gateway.protocols` import, so any plugin registration you do afterwards adds to the same registry.
+</Note>
+
+<Warning>
+Do not lower a scope by re-registering with `replace=True` unless you own the method. Downgrading the required scope of a core method is a security regression.
+</Warning>
+
+For the approval-flow context these scopes gate, see [Scoped Approvals](/docs/features/gateway-scoped-approvals).
 
 ---
 
@@ -309,6 +453,10 @@ Combine `approvals` scope with `/api/approval/allowlist` for defence-in-depth on
 
 <Accordion title="Use admin sparingly">
 Prefer explicit scope lists over `[admin]` unless the operator truly needs channel control.
+</Accordion>
+
+<Accordion title="Classify every new gateway method">
+An unregistered gateway method defaults to `admin` (fail closed). When a plugin adds new surface, always call `register_gateway_method(name, scope=...)` at import time so the requirement matches the intent — not just whatever the current default happens to be.
 </Accordion>
 </AccordionGroup>
 
