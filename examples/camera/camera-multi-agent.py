@@ -116,7 +116,7 @@ def analyze_with_multiple_agents():
         async_execution=True
     )
     
-    # Run multi-agent analysis
+    # Run multi-agent analysis (async_execution fans tasks out concurrently)
     agents = AgentTeam(
         agents=[security_agent, object_detector, scene_analyst],
         tasks=[security_task, object_task, scene_task],
