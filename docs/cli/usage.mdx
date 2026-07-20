@@ -5,7 +5,7 @@ description: "Zero-config local token and cost reporting across all your session
 icon: "chart-line"
 ---
 
-`praisonai usage` reports your total token and cost spend across every locally-saved session — one line, no configuration, no network.
+See what you've spent — no dashboard, no API key, no setup. `praisonai usage` reads the token and cost totals PraisonAI already saves per session and rolls them up by day, model, or project.
 
 ```mermaid
 graph LR
@@ -36,10 +36,10 @@ praisonai usage
 ```
 
 ```
-Usage
-┌────────────┬─────────┬─────────┐
-│ Day        │ Tokens  │ Cost    │
-├────────────┼─────────┼─────────┤
+              Usage
+┏━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┓
+┃ Day        ┃ Tokens  ┃ Cost    ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━┩
 │ 2026-07-19 │ 1,240   │ $0.0140 │
 │ 2026-07-20 │ 3,980   │ $0.0320 │
 │ Total      │ 5,220   │ $0.0460 │
@@ -116,32 +116,39 @@ graph TB
 
 ## How It Works
 
-The command reads already-persisted per-session `total_tokens` and `cost` values, then filters, groups, and sums them.
+`praisonai usage` reads the same session files that `praisonai session list` shows — nothing new is written, no external service is contacted.
 
 ```mermaid
 sequenceDiagram
     participant User
     participant CLI as praisonai usage
-    participant Store as ~/.praisonai/sessions
-    participant Out as stdout
+    participant Proj as Current-project store
+    participant Glob as Global default store
 
     User->>CLI: praisonai usage --by model --days 7
-    CLI->>Store: list_sessions() (current + global stores)
-    Store-->>CLI: session records (model, total_tokens, cost)
-    CLI->>CLI: filter --days, dedup by session_id
-    CLI->>CLI: group + sum
-    CLI->>Out: rich table (or JSON with --json)
-    Out-->>User: spend by model
+    CLI->>Proj: list_sessions()
+    Proj-->>CLI: sessions (total_tokens, cost, model, updated_at)
+    CLI->>Glob: list_sessions()
+    Glob-->>CLI: sessions
+    CLI->>CLI: filter by --days, de-dup, group by --by
+    CLI-->>User: table (or JSON if --json)
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef cli fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class User user
+    class CLI cli
+    class Proj,Glob store
 ```
 
-| Step | What happens |
-|------|--------------|
-| Read | Loads session records from `~/.praisonai/sessions/*.json`. |
-| Filter | Keeps sessions updated within `--days` and, if set, a single `--project`. |
-| Group | Buckets rows by day, model, or project and sums tokens and cost. |
-| Output | Prints a table, or JSON with `--json`. |
+| Source | What it contributes |
+|---|---|
+| Current-project session store | Sessions from the project you're in — labelled `current` under `--by project`. |
+| Global default session store | Sessions from the global store — labelled `global` under `--by project`. |
+| `--project <id>` | Restricts to exactly that project's store; its own ID becomes the sole `project` label. |
 
-Without `--project`, the command reads the current-project store **and** the global default store separately, de-duplicating shared session IDs so `--by project` shows both `current` and `global` buckets. With `--project X`, only that project's scoped store is read. Each store is scanned up to **100,000 records** to keep memory predictable without silently truncating realistic stores.
+When `--project` is omitted, both stores are scanned separately and session ids shared across them are de-duplicated (the current-project store wins). Each store is scanned up to 100,000 sessions to keep memory predictable — realistic stores are never truncated.
 
 | Behaviour | Detail |
 |-----------|--------|
@@ -164,9 +171,15 @@ Every option is optional — `praisonai usage` with no flags reports the last 30
 | `--project` | `-p` | `str` | `None` | Restrict to a specific project ID (reads only that project's scoped store). |
 | `--json` |  | `bool` | `False` | Emit machine-readable JSON (also auto-enabled by the CLI's global JSON output mode). |
 
+`--by day` sorts chronologically (ascending); `--by model` and `--by project` sort by tokens descending (highest spend first).
+
 ### JSON output shape
 
 `--json` emits a stable object you can pipe into dashboards or cron jobs.
+
+```bash
+praisonai usage --by day --days 30 --json
+```
 
 ```json
 {
@@ -174,15 +187,23 @@ Every option is optional — `praisonai usage` with no flags reports the last 30
   "days": 30,
   "project": null,
   "rows": [
-    {"key": "2026-07-19", "total_tokens": 12345, "cost": 0.014}
+    {"key": "2026-07-15", "total_tokens": 12340, "cost": 0.043},
+    {"key": "2026-07-18", "total_tokens": 5220, "cost": 0.014}
   ],
-  "total_tokens": 12345,
-  "cost": 0.014,
+  "total_tokens": 17560,
+  "cost": 0.057,
   "errors": []
 }
 ```
 
-Store-read failures land in the top-level `errors` array rather than being swallowed. In table mode the same failures print as `Usage may be incomplete: <reason>` warnings. Empty output with no error means "no usage recorded yet" — the two states are distinguishable.
+### Empty output
+
+- Table: `No usage recorded yet`
+- JSON: `{"rows": [], "total_tokens": 0, "cost": 0.0, ...}`
+
+### Store errors
+
+A missing or damaged store is non-fatal. Table mode prints `Usage may be incomplete: <reason>` as a warning; JSON mode exposes the reasons under `errors`. The command still exits `0` and returns whatever it could read — a broken store is never silently reported as empty. An invalid `--by` value exits `1` with `--by must be one of: day, model, project`.
 
 ---
 
@@ -199,29 +220,14 @@ praisonai usage --json | jq '.cost'
 
 # Full history by project (no time filter)
 praisonai usage --days 0 --by project
-```
 
-If a run prints `No usage recorded yet` with no warning, no sessions matched — try a wider `--days` window. If it prints `Usage may be incomplete: …`, a store could not be read; check the notes below.
+# Export 90 days to CSV
+praisonai usage --days 90 --by day --json | jq '.rows[] | [.key, .total_tokens, .cost] | @csv' -r > usage.csv
+```
 
 ---
 
 ## Grouping Modes
-
-Pick the grouping that answers your question.
-
-```mermaid
-graph TB
-    Start["What do you want to know?"] --> Q1{"?"}
-    Q1 -->|Trend over time| Day["--by day"]
-    Q1 -->|Which model costs most| Model["--by model"]
-    Q1 -->|Which workspace costs most| Project["--by project"]
-
-    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef a fill:#10B981,stroke:#7C90A0,color:#fff
-
-    class Start,Q1 q
-    class Day,Model,Project a
-```
 
 | Mode | Sorts by | Use it to |
 |------|----------|-----------|
