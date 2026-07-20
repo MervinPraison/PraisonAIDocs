@@ -447,6 +447,50 @@ Use `set_session_context` / `clear_session_context` for advanced custom adapters
 
 ---
 
+## Concurrent Turns Across Adapters
+
+With an identity resolver configured, near-simultaneous turns from different adapters that resolve to the same unified user run one at a time against that user's single transcript.
+
+Each adapter — Telegram, Discord, Slack — keeps its own session manager, and the identity resolver unifies them onto one persisted session per human. Before this fix, each adapter still guarded its turns separately, so two adapters could run turns for the same human at the same time and scramble the order of their shared transcript.
+
+```mermaid
+sequenceDiagram
+    participant Alice as 👤 Alice
+    participant TG as 📱 Telegram
+    participant DC as 💬 Discord
+    participant BotOS as 🤖 BotOS
+    participant Hist as 💾 One Session
+
+    par Two platforms, same instant
+        Alice->>TG: "What's my favourite colour?"
+        Alice->>DC: "And my favourite food?"
+    end
+    TG->>BotOS: chat(user=alice)
+    DC->>BotOS: chat(user=alice)
+    Note over BotOS: shared turn lock on resolved id
+    BotOS->>Hist: Turn 1 append + reply (Telegram)
+    BotOS-->>TG: "Octarine."
+    BotOS->>Hist: Turn 2 append + reply (Discord)
+    BotOS-->>DC: "Pizza."
+```
+
+| When | What happens |
+|---|---|
+| One adapter, one user | Turns already serialise per user — unchanged. |
+| Multiple adapters, **no** resolver | Each adapter keeps its own per-user history (`bot_{platform}_{user_id}`) — no unified transcript, no shared lock needed. Unchanged. |
+| Multiple adapters, **with** resolver | Turns from any adapter for the same unified user run serially against the one shared transcript. **This is the new behaviour.** |
+
+### When it matters
+
+- A cron or scheduled outbound delivery lands on platform A while the user replies on platform B — the mirror and the inbound reply serialise cleanly (see [Mirror for Outbound Deliveries](#mirror-for-outbound-deliveries)).
+- A user types on Telegram while their smartwatch fires a Slack message in the same second — the second turn waits for the first to commit before appending, so the transcript stays in strict `user → assistant → user` order.
+
+<Note>
+Nothing to configure. This is automatic whenever an identity resolver is wired via `BotOS(identity_resolver=…)`, the gateway's `identity:` YAML block, or `--identity-store`. Deployments without a resolver are unchanged.
+</Note>
+
+---
+
 ## Mirror for Outbound Deliveries
 
 Cron jobs, scheduled deliveries, and cross-platform replies need to **mirror** the assistant's outbound message into the user's history:
