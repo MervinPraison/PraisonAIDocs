@@ -257,6 +257,156 @@ For programmatic (WebSocket / RPC) methods, see [Method → Scope Registry](#met
 | `/api/pairing/revoke` | POST | `pairing` |
 | WebSocket `message` | — | `write` |
 
+The WebSocket `message` requirement comes from the [Method Scope Registry](#method-scope-registry) below — the dispatcher calls `resolve_required_scope("message")` (and `resolve_required_scope("agent.message")`) rather than hard-coding the check per route.
+
+---
+
+## Method Scope Registry
+
+New gateway methods are closed until classified — you cannot accidentally ship an unauthenticated control-plane call.
+
+```mermaid
+graph LR
+    M[📨 method + params] --> L[🔍 registry lookup]
+    L --> B[🧱 base scope]
+    B --> E[⬆️ apply escalations]
+    E --> S[🛡 effective scope]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class M input
+    class L,E process
+    class B config
+    class S output
+```
+
+Every method maps to a `GatewayMethodDescriptor` in the module-level `GATEWAY_METHODS` registry. `resolve_required_scope` looks up that descriptor and returns the effective scope for a call.
+
+<Warning>
+**Default-deny.** Unknown or unregistered methods require `admin`. Adding a new gateway method without calling `register_gateway_method` means any caller holding less than `admin` is denied — this is intentional (fail closed), so new control surface is never reachable by omission.
+</Warning>
+
+### Quick lookup
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import resolve_required_scope, OperatorScope
+
+agent = Agent(name="assistant", instructions="You are a helpful assistant.")
+
+print(resolve_required_scope("agent.message"))   # OperatorScope.WRITE
+print(resolve_required_scope("session.status"))  # OperatorScope.READ
+print(resolve_required_scope("myplugin.unknown"))  # OperatorScope.ADMIN (default-deny)
+```
+
+### Registering a plugin method
+
+Plugin authors adding a new dispatcher method register its required scope once, at import time.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import register_gateway_method, OperatorScope
+
+agent = Agent(name="assistant", instructions="You are a helpful assistant.")
+
+register_gateway_method(
+    "myplugin.reindex",
+    scope=OperatorScope.ADMIN,
+    owner="myplugin",
+)
+```
+
+`register_gateway_method` refuses duplicates — pass `replace=True` to override an existing entry.
+
+### Per-field escalation
+
+Escalation raises the required scope when a sensitive field is present; a plain call stays at the baseline.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import register_gateway_method, resolve_required_scope, OperatorScope
+
+agent = Agent(name="assistant", instructions="You are a helpful assistant.")
+
+register_gateway_method(
+    "myplugin.publish",
+    scope=OperatorScope.WRITE,
+    owner="myplugin",
+    escalate_fields={"config": OperatorScope.ADMIN},
+    replace=True,
+)
+
+print(resolve_required_scope("myplugin.publish", {"text": "hi"}))       # OperatorScope.WRITE
+print(resolve_required_scope("myplugin.publish", {"config": {...}}))    # OperatorScope.ADMIN
+```
+
+Escalation only ever raises the requirement — a field mapped to a weaker scope than the baseline is ignored.
+
+### Strict fields (fail-closed on unknown payload)
+
+`strict_fields=True` escalates any structural field not explicitly listed as safe, so unexpected payload keys fail closed.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import register_gateway_method, resolve_required_scope, OperatorScope
+
+agent = Agent(name="assistant", instructions="You are a helpful assistant.")
+
+register_gateway_method(
+    "myplugin.echo",
+    scope=OperatorScope.WRITE,
+    owner="myplugin",
+    strict_fields=True,
+    safe_fields={"text"},
+    replace=True,
+)
+
+print(resolve_required_scope("myplugin.echo", {"text": "hi"}))              # OperatorScope.WRITE
+print(resolve_required_scope("myplugin.echo", {"text": "hi", "raw": 1}))    # OperatorScope.ADMIN
+```
+
+<Note>
+`APPROVALS` and `PAIRING` are **sibling** scopes — neither implies the other. A method whose baseline is one but whose payload escalates to the other resolves to `admin`, its common upper bound, so a single-scope check can never be satisfied by holding only one of the two capabilities.
+</Note>
+
+### Core method classification
+
+Core methods are classified at import; anything unlisted defaults to `admin`.
+
+| Method | Required scope |
+|---|---|
+| `agent.message` | `write` |
+| `message` | `write` |
+| `session.status` | `read` |
+| `session.transcript` | `read` |
+| `approvals.resolve` | `approvals` |
+| `pairing.approve` | `pairing` |
+| `pairing.revoke` | `pairing` |
+| `channels.control` | `admin` |
+| `channels.pause` | `admin` |
+| `channels.resume` | `admin` |
+| `channels.reconnect` | `admin` |
+
+<AccordionGroup>
+<Accordion title="Descriptor fields">
+`GatewayMethodDescriptor` is a frozen dataclass; its `escalate_fields` and `safe_fields` collections are defensively copied at construction, so mutating the originals after registration cannot change resolution.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `name` | — | Method / route / message-type identifier |
+| `required_scope` | `admin` | Baseline scope required |
+| `owner` | `"core"` | Who declared it (informational) |
+| `since` | `None` | Version/date when classified |
+| `escalate_fields` | `{}` | Per-field escalations (raises, never lowers) |
+| `strict_fields` | `False` | Escalate unlisted fields to `escalate_unknown_scope` |
+| `safe_fields` | `set()` | Fields that never escalate under `strict_fields` |
+| `escalate_unknown_scope` | `admin` | Scope for unknown fields under `strict_fields` |
+</Accordion>
+</AccordionGroup>
+
 ---
 
 ## Method → Scope Registry
@@ -470,5 +620,8 @@ An unregistered gateway method defaults to `admin` (fail closed). When a plugin 
 </Card>
 <Card title="Gateway Overview" icon="broadcast-tower" href="/docs/features/gateway-overview">
   Multi-channel gateway architecture and setup
+</Card>
+<Card title="Scoped Approvals" icon="circle-check" href="/docs/features/gateway-scoped-approvals">
+  Resolve tool-execution approvals with the `approvals` scope
 </Card>
 </CardGroup>
