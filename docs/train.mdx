@@ -166,6 +166,59 @@ Push a fine-tuned model to Hugging Face and Ollama.
 export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN in your shell}"
 ```
 
+### Chat Template
+
+Leave `chat_template` unset for tokenizers that ship their own — the trainer uses the model's native template and only overrides it when you set the key.
+
+```mermaid
+graph TB
+    Q1{Model?}
+    Q1 -->|Gemma 2 / Gemma 3| G[Leave chat_template unset<br/>native Gemma template]
+    Q1 -->|Qwen 2.5 / Qwen3| Qw[Leave unset OR<br/>chat_template: qwen-2.5]
+    Q1 -->|Llama 3.x| L[Leave unset OR<br/>chat_template: llama-3.1]
+    Q1 -->|No built-in template| E[Must set chat_template<br/>or trainer raises ValueError]
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warning fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Q1 question
+    class G,Qw,L success
+    class E warning
+```
+
+If a model has no built-in template and you leave `chat_template` unset, the trainer fails fast with a clear error you can grep for:
+
+```text
+Tokenizer for model '<name>' has no chat template and none was provided via config 'chat_template'. Set 'chat_template' (e.g. 'gemma', 'qwen-2.5', 'llama-3.1') so conversations format correctly.
+```
+
+### Multi-Model Fine-tuning
+
+Gemma and Qwen now fine-tune out of the box with their native templates — no config needed.
+
+```bash
+praisonai-train llm dataset.json --model unsloth/gemma-2-2b-it-bnb-4bit
+praisonai-train llm dataset.json --model unsloth/Qwen2.5-0.5B-Instruct-bnb-4bit
+```
+
+Both commands are the two models the SDK actually tests (2× RTX A6000). Forcing `llama-3.1` on every model was the old default and silently corrupted Gemma/Qwen training.
+
+### Assistant-only Loss
+
+Compute loss only on assistant turns — off by default, enable it in the YAML.
+
+```yaml
+assistant_only_loss: true
+```
+
+This replaces the old Llama-only `train_on_responses_only` markers with TRL's model-agnostic `SFTConfig(assistant_only_loss=True)`.
+
+<Warning>
+`assistant_only_loss` needs a chat template that exposes assistant-turn masks (`{% generation %}` blocks). If the template lacks them, TRL can't produce the mask.
+</Warning>
+
 ## Initilise praisonai train
 
 ```bash
@@ -279,11 +332,11 @@ You no longer need to run `ollama serve` manually. The trainer starts the Ollama
 </Note>
 
 <Note>
-**Supported Ollama templates:** Llama, Qwen, Mistral, Phi, DeepSeek, LLaVA, and Gemma (new). Any other model falls back to a Llama-style template. Gemma folds the system prompt into the first user turn (per the Gemma chat template spec) and stops on `<end_of_turn>` / `<start_of_turn>`.
+Pushing a **Gemma** model to Ollama now uses the correct `<start_of_turn>` / `<end_of_turn>` template and stop tokens (was Llama-only before, which exported the wrong template). Existing Llama, Qwen, Mistral, Phi, DeepSeek, and LLaVA Modelfile behaviour is unchanged.
 </Note>
 
 <Note>
-Tested on Linux with 1–2 GPUs; the current dependency floor requires CUDA 12.4+ (see the conda env installer).
+PraisonAI Train is tested on Linux with pytorch-cuda 12.4 and Python 3.11 (2× RTX A6000). The `[llm]` extra pulls the modern Unsloth stack — minimum floors: `torch>=2.6.0`, `transformers>=4.51.3`, `unsloth>=2025.9.1`, `trl>=0.18.2`, `peft>=0.13.0`, `accelerate>=0.34.0`, `bitsandbytes>=0.45.0`. Newer combinations (unsloth 2026.7.4 / trl 0.24.0 / torch 2.10 / peft 0.19.1) are also verified.
 </Note>
 
 ---
@@ -291,6 +344,10 @@ Tested on Linux with 1–2 GPUs; the current dependency floor requires CUDA 12.4
 ## Config.yaml example
 
 Drive an LLM fine-tuning run from a config file instead of flags.
+
+<Note>
+All `lora_*` keys and the runtime keys (`dataset_num_proc`, `packing`, `dataset_text_field`) below are honored as of PraisonAI [#3274](https://github.com/MervinPraison/PraisonAI/pull/3274) — previously several were silently overridden. Every new key is optional with its prior default, so existing configs keep working unchanged.
+</Note>
 
 ```yaml
 ollama_save: "true"
@@ -326,6 +383,9 @@ dataset:
 dataset_text_field: "text"
 dataset_num_proc: 2
 packing: false
+
+chat_template: "gemma"  # or "qwen-2.5", "llama-3.1"; omit to use the model's own
+assistant_only_loss: false  # opt-in; requires template with {% generation %} blocks
 
 max_seq_length: 2048
 load_in_4bit: true
@@ -367,8 +427,29 @@ quantization_method:
 praisonai-train llm dataset.json
 ```
 
+### New / newly-honored fine-tuning config keys
+
+These keys map straight to the trainer in `praisonai_train/train/llm/trainer.py` — all optional, all backward-compatible.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `chat_template` | `str \| null` | `null` (use model's own) | Override the tokenizer's built-in chat template. Common values: `"gemma"`, `"qwen-2.5"`, `"llama-3.1"`. Trainer raises `ValueError` if the model has no template **and** this is unset. |
+| `assistant_only_loss` | `bool` | `false` | Compute loss only on assistant turns. Requires a chat template that emits `{% generation %}` blocks so TRL can derive the mask. |
+| `lora_r` | `int` | `16` | LoRA rank. **Now honored from config** (was hardcoded pre-#3274). |
+| `lora_alpha` | `int` | `16` | LoRA alpha. **Now honored from config**. |
+| `lora_target_modules` | `list[str]` | `["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]` | LoRA target modules. **Now honored from config**. |
+| `lora_dropout` | `float` | `0` | LoRA dropout. **Now honored from config**. |
+| `lora_bias` | `str` | `"none"` | LoRA bias mode. **Now honored from config**. |
+| `use_gradient_checkpointing` | `str \| bool` | `"unsloth"` | Gradient checkpointing mode. **Now honored from config**. |
+| `random_state` | `int` | `3407` | PEFT seed. **Now honored from config**. |
+| `use_rslora` | `bool` | `false` | Enable RS-LoRA. **Now honored from config**. |
+| `loftq_config` | `dict \| null` | `null` | LoftQ config. **Now honored from config**. |
+| `dataset_num_proc` | `int` | `1` | Dataset tokenization workers (goes on `SFTConfig`). |
+| `packing` | `bool` | `false` | Enable sequence packing (goes on `SFTConfig`). |
+| `num_train_epochs` | `int \| null` | `null` | If set **and** `max_steps` unset, train by epochs instead of steps. |
+
 <Note>
-All `lora_*` keys (`lora_r`, `lora_alpha`, `lora_target_modules`, `lora_dropout`, `lora_bias`, `use_gradient_checkpointing`, `random_state`, `use_rslora`, `loftq_config`) now flow through to the LoRA adapter — they were silently ignored before. Set them intentionally, or drop them to keep the defaults shown above.
+`max_seq_length` stays a user-facing key but maps internally to `max_length` on `SFTConfig` (TRL's rename). `max_steps` still defaults to `2800` when neither `num_train_epochs` nor `max_steps` is set.
 </Note>
 
 ---
@@ -441,6 +522,10 @@ Use a low `max_steps` and a small `num_samples` for a first run to confirm the p
 
 <Accordion title="Track runs with Weights & Biases">
 Set `PRAISON_WANDB=True` and the `WANDB_*` variables to log loss curves and checkpoints for each run.
+</Accordion>
+
+<Accordion title="Let the tokenizer's native template win">
+Only set `chat_template` for models without one, or to force a specific one. Forcing `llama-3.1` on Gemma/Qwen was the old default and silently corrupted training — now the trainer uses each model's own template by default.
 </Accordion>
 </AccordionGroup>
 
