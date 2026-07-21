@@ -306,6 +306,57 @@ sequenceDiagram
 
 ---
 
+## Intentional Silence
+
+A scheduled run whose entire output is exactly `NO_REPLY`, `[SILENT]`, or `SILENT` skips delivery — nothing is pushed to the chat target. The run is still recorded as `succeeded` in scheduler history and metrics.
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(
+    name="Watchdog",
+    instructions=(
+        "Every hour, check the log file for new ERROR lines. "
+        "If there are none, reply with exactly: NO_REPLY. "
+        "Otherwise summarise the errors."
+    ),
+)
+AgentScheduler(agent, task="Hourly check", deliver="telegram:123456").start("hourly")
+```
+
+The noisy `NO_REPLY` control token is never posted to the channel — the tick just doesn't produce any message.
+
+```mermaid
+sequenceDiagram
+    participant Sched as Scheduler
+    participant Agent
+    participant Delivery
+    participant Chat as Chat channel
+
+    Sched->>Agent: run(task)
+    Agent-->>Sched: "NO_REPLY"
+    Note over Sched: is_intentional_silence_response("NO_REPLY") → True
+    Sched--xDelivery: delivery suppressed
+    Sched->>Sched: record run as succeeded
+    Note over Chat: no message posted
+```
+
+| Agent output | Delivery |
+|---|---|
+| `NO_REPLY` (exact, case-insensitive, whitespace-trimmed) | Suppressed |
+| `[SILENT]` / `SILENT` | Suppressed |
+| `I think NO_REPLY is a good idea` (prose) | Delivered normally |
+| Any other text | Delivered normally |
+
+The marker check calls `is_intentional_silence_response` from `praisonaiagents.bots.silence` — the same primitive the chat-bot path uses. Both `AgentScheduler._deliver_result` (lightweight path) and the full-gateway `ScheduledAgentExecutor` honour it.
+
+<Note>
+Unlike the [chat-bot path](/docs/features/bot-intentional-silence) — where silence is opt-in via `allow_silence: true` — the scheduled delivery path honours silence markers **unconditionally**. An unattended monitor should never post the raw control token to a channel, so there is no `allow_silence` toggle for the scheduler.
+</Note>
+
+---
+
 ## Reliability Guarantees
 
 Delivery reuses the existing `DeliveryRouter`, so scheduled sends inherit the gateway's guarantees.
@@ -317,6 +368,7 @@ Delivery reuses the existing `DeliveryRouter`, so scheduled sends inherit the ga
 | **Idempotency dedup — gateway-hosted scheduled/proactive delivery** | Durable — enqueued via SQLite `OutboundQueue` at `~/.praisonai/state/gateway_outbox.sqlite`. Survives a crash-and-restart: a re-fired job is a no-op INSERT that resolves to the already-`sent` row. Falls back to the router LRU only if the durable store cannot be built. |
 | **Dead-target self-heal** | The router retries and skips/marks dead targets |
 | **Graceful degradation** | When `praisonai-bot` is not installed, a single warning is logged and delivery no-ops — the scheduled run itself never fails |
+| **Intentional silence** | An exact `NO_REPLY` / `[SILENT]` / `SILENT` output suppresses delivery; the run is still recorded as `succeeded` |
 
 On the gateway-hosted scheduled path, delivery is enqueued into a durable SQLite outbox at `~/.praisonai/state/gateway_outbox.sqlite` before it reaches the router. Its `UNIQUE` idempotency key survives a process restart, so the exact crash window a scheduler must survive (fire → deliver → crash → restart → re-fire) is deduplicated without a double-post. A pre-crash send that never landed stays retryable and is delivered at-least-once on the next tick. If the outbox cannot be built (missing dependency or permission error) the path falls back to the router's in-process LRU exactly as before.
 
