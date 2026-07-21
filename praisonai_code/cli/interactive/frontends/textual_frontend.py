@@ -110,17 +110,33 @@ class ApprovalDialog:
     def compose(self):
         """Compose the dialog widgets (for Textual)."""
         try:
-            from textual.containers import Vertical, Horizontal
+            from textual.containers import Vertical, Horizontal, VerticalScroll
             from textual.widgets import Static, Button
             
             narrow_pattern = self._narrow_pattern
             blanket_pattern = self._blanket_pattern
 
-            yield Vertical(
+            children = [
                 Static("[bold]Approval Required[/bold]", id="title"),
                 Static(f"\n{self.request.description}\n"),
                 Static(f"Tool: {self.request.tool_name}"),
                 Static(f"Action: {self.request.action_type}\n"),
+            ]
+            
+            # Show the concrete change (diff/content) so the user approves the
+            # actual mutation, not just a tool label.
+            preview = self.request.change_preview()
+            if preview:
+                from rich.markup import escape
+
+                children.append(
+                    VerticalScroll(
+                        Static(escape(preview), id="approval-preview"),
+                        id="approval-preview-scroll",
+                    )
+                )
+            
+            children.append(
                 Horizontal(
                     Button("Allow Once", id="once", variant="primary"),
                     Button(f"Always Allow This Command ({narrow_pattern})", id="always", variant="success"),
@@ -128,17 +144,25 @@ class ApprovalDialog:
                     Button(f"Always Allow All ({blanket_pattern})", id="always_tool", variant="warning"),
                     Button("Reject", id="reject", variant="error"),
                     id="buttons"
-                ),
-                id="approval-dialog"
+                )
             )
+            
+            yield Vertical(*children, id="approval-dialog")
         except ImportError:
             pass
     
-    def on_button_pressed(self, button_id: str) -> ApprovalResponse:
+    def on_button_pressed(self, button_id: str, reason: Optional[str] = None) -> ApprovalResponse:
         """Handle button press.
         
         Args:
             button_id: ID of the pressed button.
+            reason: Optional one-line denial reason to steer the agent when the
+                ``reject`` button is pressed. Empty or ``None`` preserves today's
+                plain-denial behaviour. Note: the live Textual TUI currently
+                approves/denies via the ``y``/``n`` key handler in
+                ``tui/widgets/tool_panel.py`` and does not yet collect a reason;
+                this parameter keeps the dialog contract consistent for when a
+                reason-capture widget is wired in.
         
         Returns:
             ApprovalResponse based on the button pressed.
@@ -174,5 +198,6 @@ class ApprovalDialog:
         else:  # reject
             return ApprovalResponse(
                 request_id=self.request.request_id,
-                decision=ApprovalDecision.REJECT
+                decision=ApprovalDecision.REJECT,
+                reason=(reason.strip() or None) if reason else None,
             )

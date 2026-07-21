@@ -843,6 +843,14 @@ class WebSocketGateway:
         # interactive BotOS path already uses, instead of a bare send.
         self._delivery_router: Optional[Any] = None
         self._dead_targets: Optional[Any] = None
+        # Issue #3231: durable dedup for the scheduled/proactive path. The
+        # router's LRU is per-process and empty after a restart, so a
+        # crash-and-refire re-posts a scheduled result. Route that path through
+        # the same durable ``OutboundQueue`` the reply path uses so its UNIQUE
+        # idempotency key — which survives restart — is the source of truth for
+        # "already sent". Lazily built (see ``scheduled_outbox``) so the SQLite
+        # cost is only paid when a scheduled/proactive delivery occurs.
+        self._scheduled_outbox: Optional[Any] = None
         self._routing_rules: Dict[str, Dict[str, str]] = {}  # channel_name -> {context -> agent_id}
         self._routing_bindings: Dict[str, List[Any]] = {}  # channel_name -> [RouteBinding] (Issue #2225)
         self._channel_tasks: Dict[str, asyncio.Task] = {}  # channel_name -> asyncio task
@@ -3597,6 +3605,42 @@ class WebSocketGateway:
         self._delivery_router = DeliveryRouter(botos, dead_targets=self._dead_targets)
         return self._delivery_router
 
+    @property
+    def scheduled_outbox(self) -> Optional[Any]:
+        """Durable outbound ledger for the scheduled/proactive delivery path.
+
+        Issue #3231: dedup on the scheduled path was previously provided only by
+        the router's bounded, per-process, in-memory LRU, which is empty after a
+        restart — so the one crash window a scheduler must survive (fire,
+        deliver, crash before the terminal state is recorded, restart, re-fire)
+        re-posts the same message. This wires the *same* durable
+        :class:`~praisonai_bot.bots.OutboundQueue` the reply path uses into the
+        scheduled path, so its ``UNIQUE`` idempotency key — which survives a
+        restart — becomes the source of truth for "already sent".
+
+        Built lazily so the SQLite cost is only paid when a scheduled/proactive
+        delivery actually occurs. Returns ``None`` (callers fall back to the
+        LRU-only router path) only if the queue cannot be constructed,
+        preserving delivery even without the durable store.
+        """
+        if self._scheduled_outbox is not None:
+            return self._scheduled_outbox
+        try:
+            from pathlib import Path
+            from praisonai_bot.bots import OutboundQueue
+
+            self._scheduled_outbox = OutboundQueue(
+                Path.home() / ".praisonai" / "state" / "gateway_outbox.sqlite"
+            )
+        except Exception as e:  # pragma: no cover - defensive import/build guard
+            logger.debug(
+                "OutboundQueue unavailable for scheduled delivery, falling back "
+                "to router LRU dedup: %s",
+                e,
+            )
+            return None
+        return self._scheduled_outbox
+
     async def _deliver_hook_reply(self, deliver_to: str, text: str) -> bool:
         """Deliver a hook reply to a ``channel:target`` via the router.
 
@@ -4185,9 +4229,23 @@ class WebSocketGateway:
                 route = f"{channel}:{channel_id}"
             else:
                 route = f"{channel}:{channel_id}:{thread_id}"
-            delivered = await router.deliver(
-                route, text, idempotency_key=idem,
-            )
+
+            # Issue #3231: durable dedup. The router's LRU is per-process and
+            # empty after a restart, so a crash-and-refire re-posts the result.
+            # Enqueue into the durable outbox first: its UNIQUE idempotency key
+            # survives restart, so a re-fired job is a no-op INSERT that resolves
+            # to the already-``sent`` row and is skipped on drain — no
+            # double-post. The router remains the sender (throttle + dead-target
+            # + LRU), so those guarantees are preserved on top of durability.
+            outbox = self.scheduled_outbox
+            if outbox is not None:
+                delivered = await self._deliver_via_outbox(
+                    outbox, router, route, text, idem,
+                )
+            else:
+                delivered = await router.deliver(
+                    route, text, idempotency_key=idem,
+                )
             if delivered:
                 logger.info(
                     "Delivered scheduled result to %s:%s", channel, channel_id,
@@ -4224,6 +4282,67 @@ class WebSocketGateway:
             logger.error(
                 "Failed to deliver to %s:%s: %s", channel, channel_id, e,
             )
+
+    async def _deliver_via_outbox(
+        self, outbox: Any, router: Any, route: str, text: str, idem: str,
+    ) -> bool:
+        """Deliver a scheduled result durably via the shared ``OutboundQueue``.
+
+        Issue #3231: enqueue under the stable idempotency key ``idem`` first. The
+        queue's ``UNIQUE`` constraint means a re-fired job (after a crash) is a
+        no-op INSERT that resolves to the existing row; if that row already
+        reached the terminal ``sent`` state the entry is skipped on drain, so the
+        user never receives a duplicate. When the prior attempt was in-flight at
+        crash time it is reconciled/re-sent per the outbox's at-least-once
+        contract. The router stays the sender so the token-bucket throttle,
+        dead-target suppression, and LRU still apply on top of durability.
+        """
+        try:
+            await outbox.enqueue(
+                idempotency_key=idem,
+                target=route,
+                payload={"text": text, "idempotency_key": idem},
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(
+                "Outbox enqueue failed for %s, falling back to router: %s",
+                route, e,
+            )
+            return await router.deliver(route, text, idempotency_key=idem)
+
+        # The ``scheduled_outbox`` is a single shared queue, so ``drain`` may
+        # process rows other than the one we just enqueued. The sender must use
+        # each *row's own* idempotency key (carried in its payload) rather than
+        # this call's ``idem`` — otherwise an older row would be sent under our
+        # key, poisoning the router's LRU so our real row is later suppressed as
+        # a duplicate and lost. Fall back to the row's ``target`` for any legacy
+        # payload written before this field existed.
+        async def _send(target: str, payload: Dict[str, Any]) -> bool:
+            return await router.deliver(
+                target,
+                payload.get("text", ""),
+                idempotency_key=payload.get("idempotency_key") or target,
+            )
+
+        try:
+            await outbox.drain(_send)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(
+                "Outbox drain failed for %s, falling back to router: %s",
+                route, e,
+            )
+            # The drain may have failed before reaching our row. Only report
+            # success if the durable ledger confirms our own key already reached
+            # the terminal ``sent`` state; otherwise the row stays non-terminal
+            # and is re-delivered at-least-once on the next drain — do not
+            # blind-re-send here, which would duplicate that pending row.
+            return outbox.status_for(idem) == "sent"
+        # Report the result of *this* delivery from the durable ledger, scoped to
+        # our own key — never the aggregate drain count, which conflates
+        # unrelated rows in the shared queue. ``"sent"`` covers both a fresh send
+        # and a re-fired job whose original already landed (suppressed duplicate,
+        # issue #3231); any other status is a genuine miss for this key.
+        return outbox.status_for(idem) == "sent"
 
     def _start_scheduler_tick(self, interval: float = 15.0) -> None:
         """Start a background task that polls the scheduler for due jobs.
@@ -4921,6 +5040,10 @@ class WebSocketGateway:
                 # so this channel keys sessions by canonical identity (unified
                 # user) instead of a per-platform key. No-op when unconfigured.
                 self._stamp_identity_resolver(bot)
+                # Issue #3232: share one per-turn LockMap so channels that unify
+                # to the same session serialise turns on the resolved id. No-op
+                # without an identity resolver (single-channel behaviour).
+                self._stamp_turn_lock_map(bot)
                 self._channel_bots[channel_name] = bot
                 logger.info(f"Channel '{channel_name}' ({channel_type}) initialized")
             except Exception as e:
@@ -5129,6 +5252,42 @@ class WebSocketGateway:
             sess._identity_resolver = resolver
         elif hasattr(bot, "_identity_resolver"):
             bot._identity_resolver = resolver
+
+    def _stamp_turn_lock_map(self, bot: Any) -> None:
+        """Share one per-turn ``LockMap`` with a channel bot (Issue #3232).
+
+        The identity resolver unifies distinct platform users onto one persisted
+        session, but each channel bot's ``BotSessionManager`` owns its own
+        ``LockMap`` keyed on the resolved id. Two channels resolving to the same
+        unified id therefore hold two distinct locks, so near-simultaneous turns
+        run concurrently against one transcript — interleaving read-modify-write
+        and breaking strict user/assistant alternation.
+
+        Stamping a single shared map onto every channel session makes those turns
+        serialise on the resolved id regardless of which channel a message
+        arrives on. Mirrors :meth:`_stamp_identity_resolver` /
+        :meth:`_stamp_admission_gate` and ``BotOS._wire_turn_locks``: wired only
+        when an identity resolver is configured (the sole case where distinct
+        channels unify to one session), so single-channel gateways keep their own
+        map and today's behaviour is preserved exactly. Called from both
+        ``start_channels`` and ``_start_single_channel`` (hot-reload) so a
+        restarted channel keeps sharing the same lock map.
+        """
+        if getattr(self, "_identity_resolver", None) is None:
+            return
+        lock_map = getattr(self, "_turn_lock_map", None)
+        if lock_map is None:
+            from .._lockmap import LockMap
+            lock_map = LockMap()
+            self._turn_lock_map = lock_map
+        sess = (
+            getattr(bot, "_session", None)
+            or getattr(bot, "_session_mgr", None)
+        )
+        if sess is not None and hasattr(sess, "_locks"):
+            sess._locks = lock_map
+        elif hasattr(bot, "_turn_lock_map"):
+            bot._turn_lock_map = lock_map
 
     def _create_bot(
         self,
@@ -5873,6 +6032,10 @@ class WebSocketGateway:
             # Issue #3020: stamp the identity resolver on the hot-reloaded
             # channel too, so a restarted channel keeps cross-platform continuity.
             self._stamp_identity_resolver(bot)
+            # Issue #3232: re-share the same per-turn LockMap on the hot-reloaded
+            # channel so a restarted channel keeps serialising turns on the
+            # resolved id alongside its still-running siblings.
+            self._stamp_turn_lock_map(bot)
             self._channel_bots[channel_name] = bot
             logger.info(f"Channel '{channel_name}' ({channel_type}) initialized")
         except Exception as e:

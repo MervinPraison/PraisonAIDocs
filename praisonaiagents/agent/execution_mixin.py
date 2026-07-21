@@ -742,7 +742,7 @@ Write the complete compiled report:"""
                 
                 # Show animated status during LLM call if verbose
                 if self.verbose and is_tty:
-                    from ..main import PRAISON_COLORS, sync_display_callbacks
+                    from ..main import PRAISON_COLORS, sync_display_callbacks, _callbacks_lock
                     import threading
                     import time as time_module
                     
@@ -763,9 +763,11 @@ Write the complete compiled report:"""
                             tools_called.append(tool_name)
                             current_status[0] = f"Calling tool: {tool_name}..."
                     
-                    # Store original callback and register ours
-                    original_tool_callback = sync_display_callbacks.get('tool_call')
-                    sync_display_callbacks['tool_call'] = status_tool_callback
+                    # Store original callback and register ours (use the module's
+                    # own lock so this doesn't race concurrent verbose agents)
+                    with _callbacks_lock:
+                        original_tool_callback = sync_display_callbacks.get('tool_call')
+                        sync_display_callbacks['tool_call'] = status_tool_callback
                     
                     # Animation state
                     result_holder = [None]
@@ -803,11 +805,16 @@ Write the complete compiled report:"""
                             error_holder[0] = e
                         finally:
                             self.verbose = original_verbose_chat
-                            # Restore original callback
-                            if original_tool_callback:
-                                sync_display_callbacks['tool_call'] = original_tool_callback
-                            elif 'tool_call' in sync_display_callbacks:
-                                del sync_display_callbacks['tool_call']
+                            # Restore original callback under the lock. The identity
+                            # check guards the entire restore, so we only mutate the
+                            # entry while it's still ours and never clobber a callback
+                            # a concurrent verbose agent has since installed.
+                            with _callbacks_lock:
+                                if sync_display_callbacks.get('tool_call') is status_tool_callback:
+                                    if original_tool_callback:
+                                        sync_display_callbacks['tool_call'] = original_tool_callback
+                                    else:
+                                        del sync_display_callbacks['tool_call']
                     
                     # Start chat in background thread
                     chat_thread = threading.Thread(target=run_chat)
@@ -1143,6 +1150,68 @@ Write the complete compiled report:"""
                 turn_tools = self._turn_tools_used
             turn_tools.append(function_name)
 
+        # Enforce BEFORE_TOOL/AFTER_TOOL security hooks for every async caller,
+        # mirroring the sync execute_tool path in tool_execution.py. Without
+        # this the primary async path (_execute_unified_achat_completion) would
+        # silently skip HookEvent.BEFORE_TOOL gating registered via
+        # Agent(hooks=HookRegistry(...)). Zero overhead when no hooks apply.
+        hook_runner = getattr(self, '_hook_runner', None)
+        if hook_runner is not None:
+            from ..hooks import HookEvent
+            if hook_runner.registry.has_hooks(HookEvent.BEFORE_TOOL):
+                from ..hooks import BeforeToolInput
+                before_tool_input = BeforeToolInput(
+                    session_id=getattr(self, '_session_id', 'default'),
+                    cwd=os.getcwd(),
+                    event_name=HookEvent.BEFORE_TOOL,
+                    timestamp=str(time.time()),
+                    agent_name=self.name,
+                    tool_name=function_name,
+                    tool_input=arguments,
+                )
+                before_results = await hook_runner.execute(
+                    HookEvent.BEFORE_TOOL, before_tool_input, target=function_name
+                )
+                if hook_runner.is_blocked(before_results):
+                    logging.warning(f"Tool {function_name} execution blocked by BEFORE_TOOL hook")
+                    return f"Execution of {function_name} was blocked by security policy."
+                for res in before_results:
+                    if res.output and res.output.modified_input:
+                        arguments.update(res.output.modified_input)
+
+            result = await self._execute_tool_async_dispatch(
+                function_name, arguments, tool_call_id, tools_override
+            )
+
+            if hook_runner.registry.has_hooks(HookEvent.AFTER_TOOL):
+                from ..hooks import AfterToolInput
+                after_tool_input = AfterToolInput(
+                    session_id=getattr(self, '_session_id', 'default'),
+                    cwd=os.getcwd(),
+                    event_name=HookEvent.AFTER_TOOL,
+                    timestamp=str(time.time()),
+                    agent_name=self.name,
+                    tool_name=function_name,
+                    tool_input=arguments,
+                    tool_output=result,
+                )
+                after_results = await hook_runner.execute(
+                    HookEvent.AFTER_TOOL, after_tool_input, target=function_name
+                )
+                extra_context = hook_runner.aggregate_context(after_results)
+                if extra_context:
+                    if isinstance(result, str):
+                        result = f"{result}\n\n{extra_context}"
+                    elif isinstance(result, dict):
+                        result.setdefault("_additional_context", extra_context)
+            return result
+
+        return await self._execute_tool_async_dispatch(
+            function_name, arguments, tool_call_id, tools_override
+        )
+
+    async def _execute_tool_async_dispatch(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
+        """Route an async tool call through the middleware chain (if any) then retry loop."""
         # Route async tool calls through the same tool middleware chain as the
         # sync path. The chain (before_tool/after_tool/wrap_tool_call) is
         # synchronous, so we run it in a worker thread and bridge its final

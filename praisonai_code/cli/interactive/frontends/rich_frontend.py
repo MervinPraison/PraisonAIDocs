@@ -168,8 +168,10 @@ class RichFrontend:
         # a command-scoped grant, not a blanket ``action_type:*`` whitelist.
         narrow_pattern = derive_permission_pattern(request, scope="command")
         blanket_pattern = derive_permission_pattern(request, scope="tool")
+        preview = request.change_preview()
         try:
             from rich.console import Console
+            from rich.markup import escape
             from rich.panel import Panel
             console = Console()
             
@@ -180,6 +182,15 @@ class RichFrontend:
                 title="[yellow]Approval Required[/yellow]",
                 border_style="yellow"
             ))
+            
+            # Show the concrete change so the user approves the actual diff/
+            # content, not just a tool label.
+            if preview:
+                console.print(Panel(
+                    escape(preview),
+                    title="[cyan]Change Preview[/cyan]",
+                    border_style="cyan",
+                ))
             
             console.print("[1] Allow once")
             console.print(f"[2] Always allow this command ({narrow_pattern})")
@@ -192,6 +203,10 @@ class RichFrontend:
             print(f"Description: {request.description}")
             print(f"Tool: {request.tool_name}")
             print(f"Action: {request.action_type}")
+            if preview:
+                print("\n--- Change Preview ---")
+                print(preview)
+                print("--- End Preview ---")
             print("[1] Allow once")
             print(f"[2] Always allow this command ({narrow_pattern})")
             print(f"[3] Always allow this command for this session ({narrow_pattern})")
@@ -228,7 +243,8 @@ class RichFrontend:
                 elif choice == "5":
                     return ApprovalResponse(
                         request_id=request.request_id,
-                        decision=ApprovalDecision.REJECT
+                        decision=ApprovalDecision.REJECT,
+                        reason=self._prompt_deny_reason(),
                     )
                 else:
                     print("Invalid choice. Please enter 1-5.")
@@ -237,6 +253,19 @@ class RichFrontend:
                     request_id=request.request_id,
                     decision=ApprovalDecision.REJECT
                 )
+
+    def _prompt_deny_reason(self) -> Optional[str]:
+        """Optionally capture a denial reason to steer the agent.
+
+        Returns the trimmed reason string, or ``None`` when the user provides
+        no feedback (blank input) or input is unavailable — preserving today's
+        plain-denial behaviour.
+        """
+        try:
+            reason = input("Reason for denial (optional, steers the agent): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        return reason or None
     
     async def run(self) -> None:
         """Run the interactive REPL loop."""

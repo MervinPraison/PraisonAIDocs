@@ -34,6 +34,36 @@ def _yaml_safe_load(stream):
     return yaml.safe_load(stream)
 
 
+def _strict_validation_enabled() -> bool:
+    """True when PRAISONAI_VALIDATE_STRICT is set to a truthy value."""
+    return os.getenv("PRAISONAI_VALIDATE_STRICT", "false").lower() == "true"
+
+
+def _list_to_dict(entries: list, prefix: str, kind: str) -> dict:
+    """Convert a list of named entries to a dict, preserving duplicates.
+
+    Duplicate ``name`` keys would otherwise silently clobber each other. Instead
+    we raise under ``PRAISONAI_VALIDATE_STRICT`` or warn loudly and keep both by
+    suffixing the colliding key, so a multi-agent YAML never quietly shrinks.
+    """
+    normalized: dict = {}
+    duplicates: list = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("name") or f"{prefix}_{i}"
+        if key in normalized:
+            duplicates.append(key)
+            key = f"{key}__dup_{i}"
+        normalized[key] = entry
+    if duplicates:
+        msg = f"Duplicate {kind} name(s) in YAML: {sorted(set(duplicates))}"
+        if _strict_validation_enabled():
+            raise ValueError(msg)
+        logger.warning("%s — kept both by suffixing keys; rename to silence.", msg)
+    return normalized
+
+
 def _normalize_yaml_config(config: dict) -> dict:
     """Normalise list-format agents/tasks YAML to dict format expected by merge/run."""
     if not isinstance(config, dict):
@@ -41,11 +71,7 @@ def _normalize_yaml_config(config: dict) -> dict:
 
     agents = config.get("agents")
     if isinstance(agents, list):
-        config["agents"] = {
-            (a.get("name") or f"agent_{i}"): a
-            for i, a in enumerate(agents)
-            if isinstance(a, dict)
-        }
+        config["agents"] = _list_to_dict(agents, "agent", "agent")
 
     for bucket_key in ("agents", "roles"):
         bucket = config.get(bucket_key)
@@ -56,11 +82,7 @@ def _normalize_yaml_config(config: dict) -> dict:
 
     roles = config.get("roles")
     if isinstance(roles, list):
-        config["roles"] = {
-            (r.get("name") or f"role_{i}"): r
-            for i, r in enumerate(roles)
-            if isinstance(r, dict)
-        }
+        config["roles"] = _list_to_dict(roles, "role", "role")
 
     tasks = config.get("tasks")
     if isinstance(tasks, list):
@@ -73,13 +95,25 @@ def _normalize_yaml_config(config: dict) -> dict:
                 continue
             agent_key = task.get("agent")
             if not agent_key or agent_key not in bucket or not isinstance(bucket[agent_key], dict):
-                logger.warning(
-                    "Task %r references unknown agent %r; skipping.",
-                    task.get("name", f"task_{i}"), agent_key,
+                msg = (
+                    f"Task {task.get('name', f'task_{i}')!r} references "
+                    f"unknown agent {agent_key!r}; skipping."
                 )
+                if _strict_validation_enabled():
+                    raise ValueError(msg)
+                logger.warning(msg)
                 continue
             entry = bucket[agent_key].setdefault("tasks", {})
-            entry[task.get("name", f"task_{i}")] = {
+            task_name = task.get("name", f"task_{i}")
+            if task_name in entry:
+                dup_msg = (
+                    f"Duplicate task name {task_name!r} for agent {agent_key!r} in YAML"
+                )
+                if _strict_validation_enabled():
+                    raise ValueError(dup_msg)
+                logger.warning("%s — kept both by suffixing keys; rename to silence.", dup_msg)
+                task_name = f"{task_name}__dup_{i}"
+            entry[task_name] = {
                 k: v for k, v in task.items() if k != "agent"
             }
         if not bucket_from_roles and bucket:
@@ -401,7 +435,7 @@ def _resolve_yaml_cli_backend(cli_backend_config, logger):
 
 
 class AgentsGenerator:
-    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None, adapter_registry=None, tool_timeout_executor=None, tool_resolver=None):
+    def __init__(self, agent_file, framework, config_list, log_level=None, agent_callback=None, task_callback=None, agent_yaml=None, tools=None, cli_config=None, adapter_registry=None, tool_timeout_executor=None, tool_resolver=None, adapter=None):
         """
         Initialize the AgentsGenerator object.
 
@@ -461,6 +495,12 @@ class AgentsGenerator:
         # DI-friendly: tests/multi-tenant runtimes pass their own registry;
         # CLI users get the process default.
         self._adapter_registry = adapter_registry or _get_default_adapter_registry()
+
+        # Optional pre-resolved adapter handed down from the entry point so the
+        # winning adapter from pick_default() is not constructed (and re-validated)
+        # a second time on the hot path. Reused only when the requested framework
+        # matches; otherwise we fall back to registry.create().
+        self._adapter = adapter
 
         # Instance-owned tool-timeout executor so multi-tenant runtimes can scope
         # it per session (no process-wide singleton). Created lazily on first use
@@ -556,6 +596,12 @@ class AgentsGenerator:
         Raises:
             ValueError: If framework is not supported
         """
+        # Reuse the pre-resolved adapter from the entry point when it matches the
+        # requested framework, avoiding a second construction + protocol
+        # re-validation on the hot path.
+        injected = getattr(self, "_adapter", None)
+        if injected is not None and getattr(injected, "name", None) == framework:
+            return injected
         return self._adapter_registry.create(framework)
 
     def _merge_cli_config(self, config, cli_config):
@@ -764,22 +810,40 @@ class AgentsGenerator:
     def _resolve_effective_tool_timeout(self, config):
         """Resolve the effective per-tool timeout in seconds.
 
-        Precedence: an explicit CLI ``tool_timeout`` wins; otherwise use the
-        largest ``tool_timeout`` declared on any role/agent (safest default for
-        a shared tool dict). Returns ``None`` when nothing declares a timeout.
+        Precedence: an explicit CLI ``tool_timeout`` wins; otherwise the tightest
+        (smallest) ``tool_timeout`` declared on any role/agent is applied to the
+        shared tool dict. The tightest value is the safe-by-default choice for a
+        multi-agent run: an agent that asked to bail out quickly is never forced
+        to wait for another agent's larger budget. Any agent whose declared value
+        is overridden is warned about so the collapse is never silent. Returns
+        ``None`` when nothing declares a timeout.
         """
         cli_timeout = (self.cli_config or {}).get("tool_timeout")
         if isinstance(cli_timeout, (int, float)) and not isinstance(cli_timeout, bool):
             return float(cli_timeout)
 
-        entities = {**config.get("roles", {}), **config.get("agents", {})}
-        timeouts = [
-            e.get("tool_timeout") for e in entities.values()
-            if isinstance(e, dict)
-            and isinstance(e.get("tool_timeout"), (int, float))
-            and not isinstance(e.get("tool_timeout"), bool)
-        ]
-        return float(max(timeouts)) if timeouts else None
+        entities = {**(config.get("roles") or {}), **(config.get("agents") or {})}
+
+        def _declared(entity):
+            v = entity.get("tool_timeout") if isinstance(entity, dict) else None
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return v
+            return None
+
+        timeouts = [v for v in (_declared(e) for e in entities.values()) if v is not None]
+        if not timeouts:
+            return None
+
+        tightest = float(min(timeouts))
+        for name, entity in entities.items():
+            v = _declared(entity)
+            if v is not None and float(v) != tightest:
+                self.logger.warning(
+                    "Agent %r declared tool_timeout=%s but a shared tool dict "
+                    "forces the tightest value %ss for the whole run.",
+                    name, v, tightest,
+                )
+        return tightest
     
     def _select_framework(self, framework: str, config: Dict[str, Any]) -> Any:
         """Select and resolve the appropriate framework adapter.
@@ -804,8 +868,8 @@ class AgentsGenerator:
         """Validate that cli_backend and runtime are only used with compatible frameworks."""
         # Check if any agent/role defines cli_backend or runtime
         all_entities = {
-            **config.get('roles', {}),
-            **config.get('agents', {}),
+            **(config.get('roles') or {}),
+            **(config.get('agents') or {}),
         }
         
         has_cli_backend = any(

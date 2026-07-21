@@ -42,7 +42,7 @@ def example_basic_persistence():
     response2 = agent.chat("What is my favorite color?")
     print(f"[Assistant]: {response2}")
     
-    print(f"\n✅ Session saved to: ~/.praisonai/sessions/{session_id}.json")
+    print(f"\n✅ Session saved to: ~/.praison/sessions/{session_id}.json")
     print(f"   Chat history length: {len(agent.chat_history)} messages")
 
 
@@ -157,8 +157,8 @@ def main():
     print("\n" + "=" * 60)
     print("ALL EXAMPLES COMPLETE")
     print("=" * 60)
-    print("\nSession files are stored in: ~/.praisonai/sessions/")
-    print("You can inspect them with: cat ~/.praisonai/sessions/<session_id>.json")
+    print("\nSession files are stored in: ~/.praison/sessions/")
+    print("You can inspect them with: cat ~/.praison/sessions/<session_id>.json")
 
 
 if __name__ == "__main__":
