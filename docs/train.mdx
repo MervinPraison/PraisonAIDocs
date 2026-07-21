@@ -114,6 +114,36 @@ Runs cleanly on Windows and other non-UTF-8 consoles — the summary automatical
 
 ---
 
+## Beginner-safe defaults
+
+A minimal config trains locally and never pushes to a hub unless you ask it to.
+
+A config with just `model_name`, `max_seq_length`, and `dataset:` trains locally and saves the LoRA to `lora_model/`. Publishing to Hugging Face or Ollama is opt-in — set the flag **and** the target name. Response-only masking auto-probes the tokenizer, so `assistant_only_loss: auto` is safe on any template.
+
+```mermaid
+graph TB
+    Q1{What do I want?}
+    Q1 -->|Just train locally| Local[No publish flags<br/>saves to lora_model/]
+    Q1 -->|Publish to Hugging Face| HF[huggingface_save: true<br/>+ hf_model_name]
+    Q1 -->|Publish to Ollama| Ol[ollama_save: true<br/>+ ollama_model]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q1 question
+    class Local success
+    class HF,Ol config
+```
+
+Three safety guarantees:
+
+- **Minimal config trains locally** — no push, no missing-repo crash.
+- **`assistant_only_loss: auto` never crashes** on a stock Gemma / Qwen / Llama template — it falls back to full-sequence SFT.
+- **Unknown / misnamed keys warn instead of crashing** — a typo logs `WARNING: ignoring unknown config key '...'` and training continues.
+
+---
+
 ## How It Works
 
 Point the trainer at a base model and dataset to fine-tune, or at a scenario to iteratively improve an agent.
@@ -207,16 +237,33 @@ Both commands are the two models the SDK actually tests (2× RTX A6000). Forcing
 
 ### Assistant-only Loss
 
-Compute loss only on assistant turns — off by default, enable it in the YAML.
+Response-only loss is on by default via `assistant_only_loss: auto` — the trainer probes the tokenizer and enables masking only when the template supports it.
 
 ```yaml
-assistant_only_loss: true
+assistant_only_loss: auto   # default — probe the template, mask if supported
 ```
 
-This replaces the old Llama-only `train_on_responses_only` markers with TRL's model-agnostic `SFTConfig(assistant_only_loss=True)`.
+The trainer calls the tokenizer's chat template with `return_assistant_tokens_mask=True`; if the template exposes `{% generation %}` markers, masking is enabled, otherwise the trainer trains on the full sequence with no error.
+
+| Value | Behaviour | When to use |
+|-------|-----------|-------------|
+| `auto` | Probe the template; mask if supported, else full-sequence SFT | **Recommended default** — safe on any template |
+| `true` | Force masking; fails fast at model-prep time if unsupported | You know your template emits `{% generation %}` markers |
+| `false` | Force off — train on the full sequence | You want full-sequence loss regardless |
+
+`train_on_responses_only` is accepted as an alias for `assistant_only_loss` if you're migrating from an older config. Both real YAML booleans (`assistant_only_loss: true`) and the string forms (`"true"` / `"false"` / `"yes"` / `"no"` / `"on"` / `"off"`) work.
 
 <Warning>
-`assistant_only_loss` needs a chat template that exposes assistant-turn masks (`{% generation %}` blocks). If the template lacks them, TRL can't produce the mask.
+`assistant_only_loss: true` on a template without `{% generation %}` markers raises `ValueError` at model-prep time:
+
+```
+ValueError: assistant_only_loss is enabled but the chat template for
+'<model_name>' has no assistant-turn markers ({% generation %}). Set
+assistant_only_loss: auto (recommended) or false, or use a chat_template
+that supports masking.
+```
+
+Use `auto` (recommended) or `false`, or set a `chat_template` that supports masking.
 </Warning>
 
 ## Initilise praisonai train
@@ -349,23 +396,62 @@ Drive an LLM fine-tuning run from a config file instead of flags.
 All `lora_*` keys and the runtime keys (`dataset_num_proc`, `packing`, `dataset_text_field`) below are honored as of PraisonAI [#3274](https://github.com/MervinPraison/PraisonAI/pull/3274) — previously several were silently overridden. Every new key is optional with its prior default, so existing configs keep working unchanged.
 </Note>
 
-```yaml
-ollama_save: "true"
-huggingface_save: "true"
-train: "true"
+<Tabs>
+<Tab title="Minimal — train locally">
 
+No publish flags — trains and saves the LoRA to `lora_model/`, pushing nowhere.
+
+```yaml
+model_name: "unsloth/gemma-2-2b-it-bnb-4bit"
+max_seq_length: 2048
+dataset:
+  - name: "yahma/alpaca-cleaned"
+    num_samples: 20        # subset for a fast smoke test (honored as of #3279)
+```
+
+</Tab>
+<Tab title="Publish to HF + Ollama">
+
+Publishing defaults **off** — set the flag **and** the matching target name. Real YAML booleans (not `"true"` strings).
+
+```yaml
 model_name: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
-hf_model_name: "mervinpraison/llama-3.1-instruct"
-ollama_model: "mervinpraison/llama3.1-instruct"
+max_seq_length: 2048
+dataset:
+  - name: "yahma/alpaca-cleaned"
+
+huggingface_save: true              # real YAML bool; "true" string also works
+hf_model_name: "yourname/llama-3.1-instruct-lora"
+
+ollama_save: true
+ollama_model: "yourname/llama3.1-instruct"
+
+assistant_only_loss: auto           # tri-state — auto probes the template (default)
+```
+
+</Tab>
+</Tabs>
+
+Both real YAML booleans (`train: true`) and the string forms (`train: "true"`) work — pick whichever reads better.
+
+The full-config reference below shows every optional key with its default.
+
+```yaml
+model_name: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
 model_parameters: "8b"
+
+# Publishing — all default OFF. Set the flag AND its target to push.
+huggingface_save: true
+hf_model_name: "yourname/llama-3.1-instruct"
+ollama_save: true
+ollama_model: "yourname/llama3.1-instruct"
 
 # Optional: force a specific Unsloth chat template (default: model's own).
 # Required when the base model's tokenizer has no built-in chat template.
 chat_template: "llama-3.1"   # or "gemma", "qwen-2.5"
 
-# Optional: compute loss only on assistant turns (model-agnostic).
-# Requires a chat template that emits {% generation %} blocks.
-assistant_only_loss: false
+# Response-only loss — tri-state, default "auto" (probe the template).
+assistant_only_loss: auto
 
 dataset:
   - name: "yahma/alpaca-cleaned"
@@ -378,14 +464,11 @@ dataset:
     filter_data: false
     filter_column_value: "id"
     filter_value: "alpaca"
-    num_samples: 20000
+    num_samples: 20000   # Now honored — trains on the first 20000 rows of the split (PraisonAI #3279).
 
 dataset_text_field: "text"
 dataset_num_proc: 2
 packing: false
-
-chat_template: "gemma"  # or "qwen-2.5", "llama-3.1"; omit to use the model's own
-assistant_only_loss: false  # opt-in; requires template with {% generation %} blocks
 
 max_seq_length: 2048
 load_in_4bit: true
@@ -433,8 +516,14 @@ These keys map straight to the trainer in `praisonai_train/train/llm/trainer.py`
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `model` | `str` | — | Alias for `model_name`. Accepted for parity with the `--model` CLI flag; if both are set, `model_name` wins. |
 | `chat_template` | `str \| null` | `null` (use model's own) | Override the tokenizer's built-in chat template. Common values: `"gemma"`, `"qwen-2.5"`, `"llama-3.1"`. Trainer raises `ValueError` if the model has no template **and** this is unset. |
-| `assistant_only_loss` | `bool` | `false` | Compute loss only on assistant turns. Requires a chat template that emits `{% generation %}` blocks so TRL can derive the mask. |
+| `assistant_only_loss` | `"auto" \| bool` | `"auto"` | Compute loss only on assistant turns. `"auto"` probes the tokenizer and enables masking iff the template supports it; `true` forces on (errors if unsupported); `false` forces off. `train_on_responses_only` is accepted as an alias. |
+| `train` | `bool` | `true` | Set `false` to skip training **and** publishing (validation still runs). |
+| `huggingface_save` | `bool` | `false` | Push merged LoRA to Hugging Face. Requires `hf_model_name`. |
+| `huggingface_save_gguf` | `bool` | `false` | Push GGUF quantizations to Hugging Face. Requires `hf_model_name`. |
+| `ollama_save` | `bool` | `false` | Push to Ollama. Requires `ollama_model`. |
+| `dataset[].num_samples` | `int` | — | Train on the first N rows of the split. Must be a positive integer — validated on load. **Now honored** as of #3279 (was silently ignored before). |
 | `lora_r` | `int` | `16` | LoRA rank. **Now honored from config** (was hardcoded pre-#3274). |
 | `lora_alpha` | `int` | `16` | LoRA alpha. **Now honored from config**. |
 | `lora_target_modules` | `list[str]` | `["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]` | LoRA target modules. **Now honored from config**. |
@@ -452,6 +541,83 @@ These keys map straight to the trainer in `praisonai_train/train/llm/trainer.py`
 `max_seq_length` stays a user-facing key but maps internally to `max_length` on `SFTConfig` (TRL's rename). `max_steps` still defaults to `2800` when neither `num_train_epochs` nor `max_steps` is set.
 </Note>
 
+<Tip>
+For a smoke test, set `dataset[].num_samples: 20` to finish in seconds. The `--model` CLI flag and the `model:` / `model_name:` YAML keys all point at the same value.
+</Tip>
+
+---
+
+## Config validation
+
+The trainer validates the config on load — before any download or training starts.
+
+Three keys are required: `model_name`, `max_seq_length`, and `dataset`. Missing any raises `ValueError` with a minimal example:
+
+```
+ValueError: Config is missing required keys: ['model_name', 'max_seq_length', 'dataset']. Minimal example:
+  model_name: unsloth/gemma-2-2b-it-bnb-4bit
+  max_seq_length: 2048
+  dataset:
+    - name: yahma/alpaca-cleaned
+```
+
+<Note>
+Unknown keys don't crash — they log `WARNING: ignoring unknown config key '<key>' (typo, or not supported).` If you see this warning, it's usually a typo (`num_sample` vs `num_samples`) or a key not yet supported.
+</Note>
+
+<Warning>
+Enabling a publish flag without its target fails fast on load:
+
+```
+ValueError: hf_model_name is required when huggingface_save or huggingface_save_gguf is enabled.
+ValueError: ollama_model is required when ollama_save is enabled.
+```
+
+`dataset[].num_samples` must be a positive integer — `0`, negatives, and booleans raise `dataset[].num_samples must be a positive integer, got <value>`.
+</Warning>
+
+---
+
+## Publishing
+
+Publishing to Hugging Face or Ollama is opt-in — set the flag **and** the matching target.
+
+```mermaid
+graph TB
+    Q1{Where to?}
+    Q1 -->|Just training locally| Local[No flags<br/>saves to lora_model/]
+    Q1 -->|Publish to HF| HF[huggingface_save: true<br/>+ hf_model_name]
+    Q1 -->|Publish to Ollama| Ol[ollama_save: true<br/>+ ollama_model]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q1 question
+    class Local success
+    class HF,Ol config
+```
+
+`train: false` is a valid config — the trainer skips training **and** publishing (previously it crashed with an `AttributeError` on a `None` model).
+
+---
+
+## Run summary
+
+Just before training starts, the trainer prints a one-block summary so you can confirm the config resolved as intended.
+
+```
+──────────── PraisonAI Train ────────────
+  Model:       unsloth/gemma-2-2b-it-bnb-4bit
+  Examples:    20
+  Loss mask:   full sequence
+  Steps:       10  ·  batch 2 × accum 2
+  Output:      lora_model/
+─────────────────────────────────────────
+```
+
+The `Loss mask:` line is the resolved `auto` / `true` / `false` decision — `assistant replies only` or `full sequence` — so you can verify masking without reading the DEBUG noise.
+
 ---
 
 ## Advanced
@@ -460,16 +626,18 @@ Fine-tune loss to assistant turns only, in a model-agnostic way.
 
 ### Model-agnostic response-only training
 
-Set `assistant_only_loss: true` to mask the loss to assistant turns instead of the whole prompt.
+Leave `assistant_only_loss: auto` to let the trainer mask the loss to assistant turns whenever the template supports it — falling back to full-sequence SFT otherwise. Force it with `true` only when you know your template emits `{% generation %}` blocks.
 
 ```yaml
 model_name: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
 chat_template: "llama-3.1"
-assistant_only_loss: true
+assistant_only_loss: true   # force on — errors fast if the template can't mask
 ```
 
+This uses TRL's model-agnostic `SFTConfig(assistant_only_loss=True)` instead of the old Llama-only `train_on_responses_only` markers.
+
 <Warning>
-`assistant_only_loss` requires a chat template that emits `{% generation %}` blocks — TRL derives the response mask from those markers. Templates without them cannot produce the mask.
+`assistant_only_loss: true` on a template without `{% generation %}` markers raises `ValueError` at model-prep time. Use `auto` (recommended) or `false`, or set a `chat_template` that supports masking (e.g. an Unsloth "llama-3.1-lite" style template extended with generation blocks).
 </Warning>
 
 ---
@@ -517,7 +685,15 @@ Export `HF_TOKEN` in your shell before fine-tuning so the trainer can push to Hu
 </Accordion>
 
 <Accordion title="Start small, then scale">
-Use a low `max_steps` and a small `num_samples` for a first run to confirm the pipeline before a full training job.
+Use a low `max_steps` and `num_samples: 20` for a first run — a full smoke test finishes in under a minute. Ramp up once the pipeline is green.
+</Accordion>
+
+<Accordion title="Leave assistant_only_loss: auto">
+The trainer enables masking whenever the tokenizer supports it and falls back cleanly otherwise. Only set `true` / `false` if you need to force a specific behaviour.
+</Accordion>
+
+<Accordion title="Publish flags are opt-in">
+For local experiments, delete the `huggingface_save` / `ollama_save` keys entirely — no target, no push, no crash. Set the flag **and** its target (`hf_model_name` / `ollama_model`) only when you want to publish.
 </Accordion>
 
 <Accordion title="Track runs with Weights & Biases">
