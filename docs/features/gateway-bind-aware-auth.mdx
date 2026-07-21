@@ -10,7 +10,7 @@ The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` 
 </Note>
 
 
-The gateway and chat UI change security behaviour based on the interface they bind to — permissive on loopback, strict on external.
+The gateway and chat UI change security behaviour based on the interface they bind to — permissive on loopback, strict on external. External binds also refuse a known-weak/placeholder `auth_token` — see [Weak / placeholder secret guard](#weak-placeholder-secret-guard).
 
 ```python
 from praisonaiagents import Agent
@@ -293,6 +293,112 @@ When the operator changes `auth_token` and reloads, every session authenticated 
 <Card title="Gateway Credential Rotation" icon="key" href="/docs/features/gateway-credential-rotation">
   Full rotation behaviour, the opt-out toggle, and client-side recovery
 </Card>
+
+---
+
+## Weak / placeholder secret guard
+
+A publicly-known placeholder like `change-me` is no protection at all — external binds refuse to start on a weak `auth_token`, and loopback prints a warning.
+
+```mermaid
+graph TB
+    Start[🔑 auth_token] --> Weak{Known-weak?}
+    Weak -->|No — strong secret| Ok[🟢 Start normally]
+    Weak -->|Yes| Bind{Bind host?}
+    Bind -->|External 0.0.0.0 / LAN / public| Fail[🛑 Fail closed<br/>WeakGatewaySecretError<br/>exit 78]
+    Bind -->|Loopback 127.0.0.1 / ::1| Warn[⚠️ Start + warn]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef strict fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Weak,Bind decision
+    class Ok success
+    class Warn warn
+    class Fail strict
+```
+
+### Behaviour matrix
+
+| Bind | `auth_token` weak? | Behaviour |
+|---|---|---|
+| External (`0.0.0.0`, LAN, public IP) | Yes | **Fail closed** — raise `WeakGatewaySecretError`; gateway does not start. Exits `EX_CONFIG` (78) — the supervisor should not restart. |
+| External | No | Start normally. |
+| Loopback (`127.0.0.1`, `localhost`, `::1`) | Yes | **Warn** — gateway starts (permissive-loopback posture) but logs a warning naming the field. |
+| Loopback | No | Start normally, no warning. |
+
+### The denylist
+
+`KNOWN_WEAK_SECRETS` is a frozenset of well-known placeholder values. The lookup is whitespace-stripped and case-insensitive, so `CHANGE-ME`, `  change-me  `, and `Change-Me` all match. Empty and `None` also count as weak.
+
+| Known-weak values |
+|---|
+| `change-me`, `changeme`, `change-me-now`, `changemenow` |
+| `your-token-here`, `your_token_here`, `your-secret-here` |
+| `secret`, `password`, `passwd`, `test`, `token`, `admin` |
+| `default`, `example`, `placeholder`, `none`, `null`, `todo` |
+| `$(openssl rand -hex 16)`, `$(openssl rand -hex 32)` |
+
+<Warning>
+The last two entries — `$(openssl rand -hex 16)` and `$(openssl rand -hex 32)` — are in the denylist because pasting the fix command as a **literal string** (into YAML or an env value) instead of running it in a shell is the most common footgun. The literal is rejected exactly so this mistake fails loudly.
+</Warning>
+
+### The refusal message
+
+On an external bind with a weak token, the gateway raises `WeakGatewaySecretError` with this exact message:
+
+```bash
+Refusing to start: gateway.auth_token is a known-weak/placeholder value.
+A publicly-known secret provides no real authentication.
+Fix:  praisonai onboard         (30 seconds, 3 prompts)
+Or:   export GATEWAY_AUTH_TOKEN="$(openssl rand -hex 16)"  (run in a shell so the command is expanded, not pasted literally)
+```
+
+### Fix a weak token
+
+<Steps>
+<Step title="Option A — run onboarding (recommended)">
+```bash
+praisonai onboard
+```
+</Step>
+
+<Step title="Option B — generate a strong token">
+```bash
+export GATEWAY_AUTH_TOKEN="$(openssl rand -hex 16)"
+praisonai gateway start --host 0.0.0.0
+```
+<Warning>
+Run this in a shell so `$(...)` is expanded to a random value. Do **not** paste the literal string `$(openssl rand -hex 16)` into `gateway.yaml` or an env value — that literal is itself in the denylist.
+</Warning>
+</Step>
+</Steps>
+
+### Programmatic use
+
+```python
+from praisonaiagents.gateway import (
+    is_weak_secret,
+    assert_gateway_secret_strong,
+    WeakGatewaySecretError,
+)
+
+assert not is_weak_secret("my-strong-token")
+
+try:
+    assert_gateway_secret_strong("change-me", field="gateway.auth_token")
+except WeakGatewaySecretError as e:
+    print(e)  # → the multi-line refusal message
+```
+
+`assert_gateway_secret_strong` is not bind-aware itself — it raises on any weak value. The bind-aware policy (fail-closed external / warn loopback) is applied at the wrapper call sites.
+
+<Note>
+`praisonai gateway doctor` surfaces the same verdict before start — see [Weak-secret check](/docs/features/gateway-cli#weak-secret-check).
+</Note>
 
 ---
 
