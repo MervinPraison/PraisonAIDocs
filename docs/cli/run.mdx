@@ -385,6 +385,190 @@ praisonai attach my-session
 
 ---
 
+## Isolated Runs
+
+Run an agent on a fresh git branch — your working tree is never touched.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Refactor helper",
+    instructions="Modernise the auth module.",
+)
+
+# Then, from the terminal:
+#   praisonai run agents.yaml --worktree
+# → agent edits happen on a fresh branch like praisonai/agents.yaml-a1b2c3d4
+# → your working tree stays clean; merge or discard the branch when you're ready
+```
+
+```mermaid
+graph LR
+    subgraph "Isolated Run"
+        Start[📋 praisonai run --worktree] --> Fork[🌱 git worktree<br/>praisonai/branch]
+        Fork --> Agent[🧠 Agent runs<br/>cwd=worktree]
+        Agent --> Result{Changes?}
+        Result -->|Yes| Commit[💾 auto-commit<br/>keep branch]
+        Result -->|No| Prune[🧹 remove branch + worktree]
+        Commit --> Merge[🔀 git merge branch]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef prune fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Fork,Agent process
+    class Commit,Merge result
+    class Prune prune
+```
+
+`--worktree` provisions a fresh git worktree on a new branch, `chdir`s into it, runs the agent, then prints the branch name and a `git status --short` summary. Every other flag (`--tools`, `--model`, `--session`, `--thinking`, `--memory`) applies unchanged.
+
+### How teardown protects your output
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as praisonai run
+    participant Git
+    participant Agent
+    participant Workspace as Original cwd
+
+    User->>CLI: praisonai run --worktree "prompt"
+    CLI->>Git: git worktree add (fresh branch)
+    Git-->>CLI: worktree ready
+    CLI->>Workspace: chdir(worktree)
+    CLI->>Agent: run(...)
+    Agent-->>CLI: done (files changed?)
+
+    alt changes present
+        CLI->>Git: git add -A && git commit --no-verify
+        CLI->>Git: git worktree remove (checkout only)
+        CLI-->>User: "Committed changes to branch 'praisonai/...'. Review/merge with: git merge praisonai/..."
+    else no changes
+        CLI->>Git: git worktree remove + delete branch
+        CLI-->>User: "No changes on 'praisonai/...'."
+    end
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef cli fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef git fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class User user
+    class CLI cli
+    class Git,Workspace git
+    class Agent agent
+```
+
+Changes are detected with `git status --porcelain`, so brand-new untracked files count. When the agent produced output, the CLI auto-commits everything to the branch (`praisonai run: <target>`, `--no-verify`) and retains the branch — only the worktree checkout is pruned. A run with no changes is torn down completely.
+
+If the auto-commit fails (for example no `user.email`/`user.name` is configured, or a hook rejects it), the worktree checkout is kept in place with a `Could not commit isolated changes; worktree kept at <path> (branch '<branch>') for manual review.` warning — your output is never lost.
+
+### When to use it
+
+```mermaid
+graph TB
+    Start([Should I use --worktree?])
+    Editing{Will the agent<br/>edit files?}
+    Multiple{Multiple agents<br/>in parallel?}
+    Review{Want to review<br/>before applying?}
+    Git{Inside a git repo?}
+
+    Start --> Editing
+    Editing -->|No| Skip[❌ Skip --worktree<br/>no isolation needed]
+    Editing -->|Yes| Git
+    Git -->|No| NoOp[⚠️ --worktree becomes a no-op<br/>runs in current cwd]
+    Git -->|Yes| Multiple
+    Multiple -->|Yes| Use[✅ --worktree<br/>one branch per run]
+    Multiple -->|No| Review
+    Review -->|Yes| Keep[✅ --worktree --keep<br/>inspect the worktree]
+    Review -->|No| Use
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef action fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef skip fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start,Editing,Multiple,Review,Git question
+    class Use,Keep action
+    class NoOp warn
+    class Skip skip
+```
+
+### Recipes
+
+```bash
+# Run an agent on a fresh branch, then merge if you like the result
+praisonai run agents.yaml --worktree
+# → prints:  Committed changes to branch 'praisonai/agents.yaml-a1b2c3d4'.
+#            Review/merge with: git merge praisonai/agents.yaml-a1b2c3d4
+git merge praisonai/agents.yaml-a1b2c3d4
+```
+
+```bash
+# Keep the worktree open for hands-on review
+praisonai run agents.yaml --worktree --keep
+# → prints:  Worktree kept at /path (branch 'praisonai/...').
+#            Review/merge then remove with: git worktree remove.
+```
+
+```bash
+# Run several agents in parallel on the same repo — each gets its own branch
+praisonai run "Add tests to lib/api" --worktree &
+praisonai run "Refactor lib/db"      --worktree &
+wait
+```
+
+A short `uuid4` token is appended to each run's branch name (e.g. `praisonai/agents.yaml-a1b2c3d4`), so concurrent runs of the same target never collide.
+
+### Compatibility
+
+The CLI rejects incompatible combinations at parse time.
+
+| Combined with | Behaviour |
+|---|---|
+| `--attach <id>` | ❌ `Error: --worktree cannot be combined with --attach` — isolated runs stay in-process, but `--attach` targets the warm runtime (a separate process). |
+| `--keep` without `--worktree` | ❌ `Error: --keep requires --worktree` — `--keep` is meaningless without isolation. |
+| `--agent <name>` | ❌ `Error: --worktree is only supported for direct prompt and YAML file runs` — the custom-agent flow has its own execution path. |
+| `--command <name>` | ❌ Same error — the custom-command flow has its own execution path. |
+| `--profile` / `--profile-deep` | ❌ Same error — the profiling flow has its own execution path. |
+| `--session <id>` / `--continue` | ✅ Works — session state is stored outside the worktree. |
+| `--tools`, `--toolset`, `--model`, `--thinking`, `--memory` | ✅ Works — orthogonal to isolation. |
+| Warm runtime (`praisonai daemon start`) | ⚠️ Bypassed — isolated runs always execute in-process, even when a warm runtime is available. |
+
+### Best practices
+
+<AccordionGroup>
+<Accordion title="Auto-commit means your output is never lost">
+On completion, any tracked or untracked change is committed to the branch and the branch is retained. Even if the auto-commit fails (missing `user.email`/`user.name`, hook rejection), the worktree checkout is kept in place — you never have to fight the CLI for your agent's output.
+</Accordion>
+
+<Accordion title="Use --keep for inspection, not for saving output">
+Auto-commit already preserves your work on a branch. `--keep` is for cases where you want to review files in place before merging — compare screenshots, or run a local dev server against the checkout.
+</Accordion>
+
+<Accordion title="Non-git directories still work">
+The flag is a transparent no-op outside git. Wire it into every project script without conditionals: `praisonai run --worktree "..."` runs in the current cwd if there's no repo, printing `Not a git repository; running without worktree isolation.`
+</Accordion>
+
+<Accordion title="Cleaning up abandoned worktrees">
+`--keep` never auto-removes. When you're done: `git worktree remove <path> && git branch -D praisonai/…`. To see leftovers from all runs: `git worktree list`.
+</Accordion>
+</AccordionGroup>
+
+<Note>
+Three ways to get worktree isolation, one shared primitive:
+- **CLI (this page)** — `praisonai run --worktree` for one-off human-driven runs.
+- **Kanban** — set `workspace_kind="worktree"` on a task so dispatched workers each get one ([Per-Task Worktree Isolation](/docs/features/kanban#per-task-worktree-isolation)).
+- **Library** — instantiate `GitWorktreeAdapter` yourself for programmatic isolation ([Workspace Isolation](/docs/features/workspace-isolation)).
+</Note>
+
+---
+
 ## Project context
 
 By default, `praisonai run` walks up from the current directory to your git root and prepends any `AGENTS.md` / `CLAUDE.md` / `agents.md` / `.agents/AGENTS.md` it finds to the agent's system prompt, layered on top of `~/.praisonai/AGENTS.md`. Pass `--no-context` (or set `PRAISON_NO_CONTEXT=true`) to disable. See [Context Files](/docs/features/context-files) for details.
@@ -787,3 +971,4 @@ See [Checkpoints](/docs/features/checkpoints) and [Checkpoint CLI](/docs/cli/che
 - [Workflow](/docs/cli/workflow) - Workflow execution
 - [Interactive TUI](/docs/cli/interactive-tui) - Interactive terminal interface
 - [Attach](/docs/cli/attach) - Stream live events from a warm-runtime session
+- [Workspace Isolation](/docs/features/workspace-isolation) - The `GitWorktreeAdapter` primitive behind `--worktree`
