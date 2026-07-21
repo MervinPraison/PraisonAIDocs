@@ -9,13 +9,13 @@ Workspace isolation gives every agent its own working directory on its own branc
 
 <Note>
 Three surfaces, one primitive:
-- **CLI** — `praisonai run --worktree` ([Isolated Runs](/docs/features/cli-worktree-isolation)) for one-off human-driven runs.
+- **CLI** — `praisonai run --worktree` ([Isolated Runs](/docs/cli/run#isolated-runs-worktree)) for one-off human-driven runs.
 - **Kanban tasks** — `workspace_kind="worktree"` ([Per-Task Worktree Isolation](/docs/features/kanban#per-task-worktree-isolation)) for dispatched workers.
 - **Library API** — `GitWorktreeAdapter` (this page) for programmatic isolation.
 </Note>
 
 <Note>
-This page covers the general-purpose `GitWorktreeAdapter` in `praisonaiagents.workspace`, which gives individual agents their own worktrees at the application layer. Kanban tasks have their **own** built-in worktree isolation — set `workspace_kind="worktree"` on the task instead. See [Kanban → Per-Task Worktree Isolation](/docs/features/kanban#per-task-worktree-isolation).
+This page covers the general-purpose `GitWorktreeAdapter` in `praisonaiagents.workspace` (used programmatically) **and the `praisonai run --worktree` CLI wrapper that provisions one per run.** Kanban tasks have their **own** built-in worktree isolation — set `workspace_kind="worktree"` on the task instead. See [Kanban → Per-Task Worktree Isolation](/docs/features/kanban#per-task-worktree-isolation).
 </Note>
 
 ## Using it from the CLI
@@ -55,6 +55,24 @@ graph LR
 ## Quick Start
 
 <Steps>
+<Step title="Isolate a run from the CLI">
+Add `--worktree` to any `run` invocation — the agent works on a fresh branch instead of your working tree.
+
+```bash
+praisonai run "refactor auth to use bcrypt" --worktree
+# > Isolated run on branch 'praisonai/refactor-auth-<uid>' (./.praisonai/worktrees/refactor-auth-<uid>)
+# ... agent runs ...
+# > Committed changes to branch 'praisonai/refactor-auth-<uid>'.
+# > Review/merge with: git merge praisonai/refactor-auth-<uid>
+```
+
+Keep the worktree in place for in-place review with `--keep`:
+
+```bash
+praisonai run agents.yaml --worktree --keep
+```
+</Step>
+
 <Step title="Default (No Isolation)">
 Every run shares the same directory — the behaviour you already have.
 
@@ -123,6 +141,58 @@ sequenceDiagram
 | `remove(name)` | Tear down the worktree and delete its branch. |
 
 When the directory is not a git repository, every method degrades gracefully — `create` and `path` return the original directory, and `reset` and `remove` do nothing.
+
+---
+
+## CLI Usage
+
+`praisonai run --worktree` wraps the adapter so a single command runs the agent on a fresh branch — no Python glue required.
+
+```bash
+praisonai run "refactor auth to use bcrypt" --worktree
+```
+
+```mermaid
+graph LR
+    subgraph "Isolated praisonai run"
+        Prompt[📝 praisonai run --worktree] --> Provision[🌿 New branch + worktree]
+        Provision --> Agent[🤖 Agent edits here]
+        Agent --> Commit{Changes?}
+        Commit -->|Yes| Keep[✅ Auto-commit branch, prune checkout]
+        Commit -->|No| Clean[🧹 Remove worktree + branch]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Prompt input
+    class Provision,Agent process
+    class Commit question
+    class Keep,Clean result
+```
+
+The run detects changes with `git status --porcelain`, so brand-new (untracked) files are never lost.
+
+| Situation | Worktree checkout | Branch | Reported |
+|-----------|-------------------|--------|----------|
+| No changes | Removed | Removed | `No changes on '<branch>'.` |
+| Any change (tracked **or** untracked) | Pruned | **Retained** with auto-commit | `Committed changes to branch '<branch>'. Review/merge with: git merge <branch>` |
+| `--keep` | **Retained** | **Retained** | `Worktree kept at <path> (branch '<branch>'). Review/merge then remove with: git worktree remove.` |
+| Cwd is not a git repo | n/a (no-op) | n/a | Warning: `Not a git repository; running without worktree isolation.` |
+
+<Warning>
+`--worktree` never destroys the agent's output. On any change the branch is committed and retained even without `--keep` — only the worktree checkout is pruned.
+</Warning>
+
+<Tip>
+A short random 8-char token is appended to every branch/worktree name, so two runs of the **same** target never collide — run `praisonai run "..." --worktree` twice in parallel and each gets its own branch and directory.
+</Tip>
+
+<Note>
+`--worktree` works with a direct prompt or a YAML file. It cannot be combined with `--attach`, `--agent`, `--command`, `--profile`, or `--profile-deep`, and `--keep` requires `--worktree`. See the [`run` CLI reference](/docs/cli/run#isolated-runs-worktree) for the full options table and compatibility matrix.
+</Note>
 
 ---
 
@@ -213,6 +283,18 @@ workspace.remove("alice")  # removes worktree and branch
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Reach for --worktree before the Python API">
+For a one-off isolated agent run there is nothing to install and no Python glue — just append `--worktree`. The programmatic `GitWorktreeAdapter` is only needed when you're orchestrating multiple agents from your own code.
+</Accordion>
+
+<Accordion title="Use --keep when you want to inspect in place">
+Without `--keep`, the worktree checkout is pruned after each run (the branch is preserved). With `--keep`, both the checkout and the branch stay so you can `cd` into the isolated directory and inspect changes in place.
+</Accordion>
+
+<Accordion title="Merge or squash the auto-commit">
+The isolated run auto-commits everything (tracked + untracked) with the message `praisonai run: <target>`, so merge or cherry-pick with a plain `git merge praisonai/<name>-<uid>`. To collapse into a single commit, use `git merge --squash`.
+</Accordion>
+
 <Accordion title="Use GitWorktreeAdapter unconditionally">
 It degrades gracefully outside git repos, so you can always reach for it. No need to detect git yourself — `available` reports the state and non-git directories simply fall back to shared behaviour.
 </Accordion>
@@ -235,6 +317,9 @@ Each worktree lives under `.praisonai/worktrees/`. Call `remove()` on completion
 ## Related
 
 <CardGroup cols={2}>
+<Card title="Run CLI" icon="play" href="/docs/cli/run#isolated-runs-worktree">
+`praisonai run --worktree` / `--keep` — the CLI wrapper and its full options table.
+</Card>
 <Card title="Multi-Agent Context Safety" icon="shield-check" href="/docs/features/multi-agent-context-safety">
 Isolate per-agent runtime and resolver state — the context half of concurrency.
 </Card>
