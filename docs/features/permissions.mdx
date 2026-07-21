@@ -15,17 +15,9 @@ For the CLI, see [`praisonai permissions`](/docs/cli/permissions) and [Interacti
 To also block reads, writes, and shell commands **outside** a project root, see [Workspace Boundary](/docs/features/workspace-boundary).
 </Note>
 
-## Built-in secret file gate (new default)
-
-Reading `.env`, private keys, and keystores defaults to **ask** — even under a broad `read:*` allow — so credentials never leak silently to the model provider.
-
-The gate lives in the core `PermissionManager`, so it protects every frontend by default. A broad `read:*` allow does **not** opt in; use a secret-specific rule to skip the prompt for a trusted workflow:
-
-```bash
-praisonai run "Compare prod.env and staging.env" --allow 'read:*.env'
-```
-
-See [Secret File Read Gate](/docs/features/secret-read-gate) for the full pattern list and override precedence.
+<Warning>
+**Reading secret files (`.env`, private keys, `*.pem`, `id_rsa`, etc.) now defaults to `ask` — even with a broad `"read:*": "allow"` rule.** A catch-all read allow no longer silently authorises credential files; you need a secret-specific rule (e.g. `"read:*.env": "allow"`) to opt in. See [Built-in Secret-File Read Gate](#built-in-secret-file-read-gate).
+</Warning>
 
 ```python
 from praisonaiagents import Agent
@@ -146,6 +138,168 @@ For YAML and CLI surfaces, see [Declarative Permissions](/docs/features/declarat
 
 </Step>
 </Steps>
+
+---
+
+## Built-in Secret-File Read Gate
+
+Reading a `.env` or private-key file and forwarding its contents to the model provider is a silent secret-leak path. The core permission manager closes it by defaulting reads of well-known credential-file names to **ask** — even when a broad `"read:*": "allow"` rule is in effect. Safe example/template files stay allowed, and explicit user rules always override.
+
+```mermaid
+graph LR
+    subgraph "Secret-File Read Gate"
+        Read[📖 read:file] --> Basename{🔍 Secret basename?}
+        Basename -->|No — main.py, data.txt| Normal[⚙️ Normal rule check]
+        Basename -->|Yes — .env, *.pem| Rule{Explicit rule?}
+        Rule -->|Approved / deny| Explicit[✅ Rule wins]
+        Rule -->|Secret-specific allow| Explicit
+        Rule -->|Broad read:* allow| Ask[❓ Ask user]
+        Rule -->|No rule| Ask
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef ask fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Read input
+    class Basename,Rule check
+    class Normal,Explicit result
+    class Ask ask
+```
+
+### Gated basenames
+
+Case-insensitive `fnmatch` against the file's basename (path prefix ignored — `config/.env` and `.env` both gate).
+
+| Category | Globs | Example paths |
+|----------|-------|---------------|
+| Environment files | `.env`, `*.env`, `.env.*`, `*.env.*` | `.env`, `prod.env`, `.env.local`, `config/.env` |
+| PEM / TLS keys | `*.pem`, `*.key` | `server.pem`, `certs/tls.key` |
+| SSH keys | `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519` | `~/.ssh/id_ed25519` |
+| Keystores | `*.pfx`, `*.p12` | `keystore.pfx`, `bundle.p12` |
+
+### Not gated (safe siblings)
+
+Documentation templates without real secrets fall through to normal rules — a broad `read:*` allow reads them without prompting:
+
+| Globs |
+|-------|
+| `*.env.example`, `.env.example` |
+| `*.env.sample`, `.env.sample` |
+| `*.env.template`, `.env.template` |
+| `*.example`, `*.sample`, `*.template` |
+
+### Override precedence
+
+```mermaid
+graph TB
+    Read[read:secret-file] --> Approve{Persistent approval?}
+    Approve -->|Yes — always/session| Allow[✅ Allow]
+    Approve -->|No| RuleCheck{Matching rule?}
+    RuleCheck -->|Explicit deny| Deny[❌ Deny]
+    RuleCheck -->|Secret-specific allow| Allow
+    RuleCheck -->|Broad allow — read:*| Fallthrough
+    RuleCheck -->|No| Fallthrough
+    Fallthrough[Fall through to gate] --> Ask[❓ Ask user]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#EF4444,stroke:#7C90A0,color:#fff
+    classDef ask fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Read input
+    class Approve,RuleCheck,Fallthrough check
+    class Allow good
+    class Deny bad
+    class Ask ask
+```
+
+| Priority | Override | Wins because |
+|----------|----------|-------------|
+| 1 | Persistent approval (`manager.approve("read:.env", approved=True, scope="always")`) | User has explicitly approved this exact target |
+| 2 | Secret-specific `deny` rule (`"read:*.env": "deny"`) | Hardening always beats a soft `ask` |
+| 3 | Secret-specific `allow` rule (`"read:*.env": "allow"`, `"read:id_rsa": "allow"`, `"read:*.pem": "allow"`) | Author was explicit about opting the secret in |
+| 4 | Regex rules (`is_regex=True`) | Conservatively treated as specific opt-ins |
+| — | Broad `"read:*": "allow"` catch-all | **Ignored for secrets** — falls through to the gate |
+| — | No rule | Falls through to the gate |
+
+### What counts as "secret-specific"?
+
+A rule is a secret-specific opt-in when its glob does **not** match ordinary files. A glob that also matches ordinary files (like `read:*`) is treated as broad and does **not** silently authorise secrets:
+
+| Rule | Treated as | Why |
+|------|-----------|-----|
+| `read:*.env` | Secret-specific ✅ | Doesn't match ordinary files like `main.py` |
+| `read:id_rsa` | Secret-specific ✅ | Doesn't match ordinary files |
+| `read:*.pem` | Secret-specific ✅ | Doesn't match ordinary files |
+| `read:*` | Broad ❌ | Matches `main.py` |
+| `read:./*` | Broad ❌ | Matches `./main.py` |
+| Regex rule (`is_regex=True`) | Secret-specific ✅ | Author was explicit |
+
+### Quick-start examples
+
+<Steps>
+<Step title="Default — reading .env prompts">
+
+Reading `.env` prompts for approval — no configuration required.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Coder", instructions="Help me refactor")
+agent.start("Read .env and tell me the DB host")
+# > Approve read:.env ? [y/N]:
+```
+
+</Step>
+
+<Step title="Opt in — secret-specific allow">
+
+Add a secret-specific allow rule — a broad `read:*` alone won't do.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="CI Runner",
+    instructions="Ship the release",
+    approval={
+        "permissions": {
+            "read:*": "allow",      # ordinary files auto-read
+            "read:*.env": "allow",  # explicit opt-in for .env
+        },
+    },
+)
+```
+
+</Step>
+
+<Step title="Harden — secret-specific deny">
+
+Add a secret-specific `deny` rule to reject even with user approval.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Sandboxed",
+    instructions="Never touch credentials",
+    approval={"permissions": {"read:*.env": "deny"}},
+)
+```
+
+</Step>
+</Steps>
+
+<Note>
+**Non-read targets are unaffected.** `write:.env`, `delete_file:.env`, and any non-`read`-prefixed target follow the ordinary rule flow — this gate only intercepts `read:` and `read_file:` prefixes.
+
+**Non-secret reads are unaffected.** A broad `"read:*": "allow"` still allows ordinary files like `main.py`, `README.md`, `data.txt` — only credential-file basenames trigger the gate.
+
+**No filesystem access.** The gate is purely pattern-based on the target string. It does not stat the file or read its contents.
+</Note>
 
 ---
 
@@ -456,6 +610,18 @@ Use `agent_name` on rules when a coder agent may write but a reviewer agent must
 </Accordion>
 <Accordion title="Watch for doom loops">
 `DoomLoopDetector` flags repeated identical tool calls — reset or change strategy when `is_loop` is true.
+</Accordion>
+<Accordion title="Opt in to .env reads explicitly in CI">
+The gate exists because a catch-all `read:*` allow is the exact pattern that lets an agent forward credentials to the model provider. If your CI genuinely needs to read `.env`, add `"read:*.env": "allow"` alongside `"read:*": "allow"` so the intent is auditable.
+</Accordion>
+<Accordion title="Keep templates as templates">
+Template files with placeholder values are safe by design — they match the allowlist and stay readable. Don't rename them to `.env` "for consistency"; renaming triggers the gate.
+</Accordion>
+<Accordion title="Bake a persistent approval instead of a rule">
+An interactive approval (`always` or `session` scope) on a specific `read:.env` target survives the gate. Use `praisonai permissions approve` to bake this into your project once instead of a rule.
+</Accordion>
+<Accordion title="Prefer named globs over regex for secrets">
+Rules created with `is_regex=True` are always treated as secret-specific opt-ins on the assumption the author was explicit. Prefer named globs over regex when writing rules for secrets so the intent is obvious to reviewers.
 </Accordion>
 </AccordionGroup>
 
