@@ -257,6 +257,8 @@ class Spanish(_AxisRecipe):
 
 Once imported anywhere, `--recipe spanish` (or `recipe: spanish` in YAML) works from the CLI.
 
+The built-in `tamil` recipe stamps a `task_type` label on translation rows (its `EN_TA_TASK` axis value), so the task-aware QC checks resolve direction from authoritative metadata rather than text detection.
+
 ---
 
 ## `validate`
@@ -282,6 +284,8 @@ Quality-check an instruction dataset — dedup, boilerplate/refusal, script puri
 | `script_range` | `[int, int]` | `[2944, 3071]` (Tamil block) | Unicode range that defines the target script |
 | `script_drop` | `float` | `0.5` | Drop rows whose output has less than this fraction of chars in `script_range` |
 | `script_flag` | `float` | `0.7` | Flag (but keep) rows between `script_drop` and this |
+| `task_aware_purity` | `bool` | `true` | When `true`, exempt resolved translation-into-English rows from `low_script_purity` / `script_review`. Set `false` to restore strict purity behaviour. |
+| `verify_translation_target` | `bool` | `true` | Enable the `wrong_target_script` flag (asked for English, output still in source script). Set `false` to disable that flag. |
 
 ### Checks
 
@@ -292,9 +296,10 @@ Drop checks remove a row; flag checks keep it but count it.
 | `exact_dup` | drop | Identical normalised instruction+input+output already seen |
 | `too_short` | drop | `len(output) < min_output_chars` |
 | `boilerplate_refusal` | drop | Output matches an "as an AI" / refusal pattern |
-| `low_script_purity` | drop | Script ratio below `script_drop` |
+| `low_script_purity` | drop | Script ratio below `script_drop`. When `task_aware_purity` is on, a resolved translation-into-English row is exempted (its correct output *is* English). |
 | `near_dup` | drop | 4-gram Jaccard above `near_dup_jaccard` |
-| `script_review` | flag | Script ratio between `script_drop` and `script_flag` |
+| `script_review` | flag | Script ratio between `script_drop` and `script_flag`. When `task_aware_purity` is on, a resolved translation-into-English row is exempted (its correct output *is* English). |
+| `wrong_target_script` | flag | Task asked for English output but the output is still mostly in the source script (a failed translation). Only fires when `task_aware_purity` and `verify_translation_target` are both on. Silent to a naive purity filter — net-new signal. |
 | `maybe_truncated` | flag | Output doesn't end in terminal punctuation / closing fence |
 | `restates_question` | flag | First sentence overlaps the instruction (Jaccard > 0.6) |
 
@@ -307,10 +312,12 @@ Drop checks remove a row; flag checks keep it but count it.
   in=500  kept=406 (81.2%)
   drops: {'exact_dup': 12, 'near_dup': 38, 'too_short': 21, 'boilerplate_refusal': 3, 'low_script_purity': 20}
   flags: {'restates_question': 47}
-  metrics: {'distinct_2': 0.87, 'length_cv': 0.62, 'top_prefix_share': 0.008}
+  metrics: {'distinct_2': 0.87, 'length_cv': 0.62, 'top_prefix_share': 0.008, 'translation': {'share': 0.12, 'by_direction': {'en_ta': 43, 'ta_en': 18, 'unknown': 0}, 'exempted': 15}}
   ✓ no diversity warnings
   wrote 406 filtered rows -> data/clean.jsonl
 ```
+
+`metrics.translation.share` is the fraction of kept rows that are translation tasks; `by_direction` counts them by direction (`en_ta`, `ta_en`, `unknown`); `exempted` is the number of English-target rows the task-aware exemption actually rescued from the `low_script_purity` drop. Because both the exemption and the metric use the same detector (`translation_intent`), the numbers always reconcile.
 
 Malformed JSONL lines are skipped with a `⚠ skipping malformed JSON on line N` warning — the run still succeeds on the remaining rows.
 
@@ -333,6 +340,57 @@ script_flag: 0.70
 praisonai-train validate --config validate.yaml
 ```
 
+### Task-aware script purity
+
+A naive script-purity filter deletes legitimate translation outputs written in the target script — a Tamil→English row's correct output *is* English, so a Tamil-purity check would wrongly drop it.
+
+Only a *resolved English target* exempts a row from the Tamil-purity drop. `en→ta`, ambiguous, and native rows keep the strict thresholds.
+
+```mermaid
+graph TB
+    Row[📝 Row] --> Intent{translation_intent}
+    Intent -->|metadata task_type| Meta[✅ Authoritative direction]
+    Intent -->|text keywords| Text[🔎 Fallback direction]
+    Meta --> Dir{expected_script?}
+    Text --> Dir
+    Dir -->|english| Exempt[✅ Exempt from low_script_purity<br/>Check wrong_target_script]
+    Dir -->|tamil / native| Strict[🛑 Strict purity thresholds]
+    Dir -->|None ambiguous| Strict
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef strict fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Row input
+    class Intent,Meta,Text process
+    class Dir decision
+    class Exempt safe
+    class Strict strict
+```
+
+The detector resolves intent in a fixed order: ground-truth `task_type` metadata is authoritative → instruction-text keyword fallback for external rows → an ambiguous direction yields *no* exemption (the safe default).
+
+<Note>
+`task_aware_purity: false` restores strict purity behaviour (English translation outputs are dropped again). `verify_translation_target: false` disables the `wrong_target_script` flag while leaving the exemption on.
+</Note>
+
+### Translation composition metric
+
+`metrics.translation` reports `{share, by_direction, exempted}` — the corpus-level view of how much of the kept dataset is translation.
+
+The metric uses the same `translation_intent()` detector as the per-row exemption, so the numbers can never disagree with the checks they describe.
+
+```python
+from praisonai_train.data import score
+
+rows = [{"instruction": "...", "input": "", "output": "..."}]
+
+result = score(rows, cfg={"near_dup": False})
+share = result["metrics"]["translation"]["share"]   # 0.0–1.0
+```
+
 ### Python API — `score()` / `filter_rows()`
 
 Run the same QC from Python.
@@ -349,6 +407,24 @@ clean_rows = filter_rows(rows, cfg={"min_output_chars": 20})   # just the kept l
 ```
 
 Diversity warnings fire when `distinct_2 < 0.5`, `length_cv < 0.4`, or `top_prefix_share > 0.01` — the "healthy dataset" bar.
+
+`translation_intent()` is the shared detector behind both task-aware purity and the translation metric — call it directly to inspect a single row's intent.
+
+```python
+from praisonai_train.data import translation_intent
+
+intent = translation_intent(
+    "Translate the following into English: வணக்கம்",
+    task_type=None,  # or the recipe's stamped label
+)
+# intent == {"is_translation": True, "direction": "ta_en", "expected_script": "english"}
+```
+
+| Key | Type | Values |
+|-----|------|--------|
+| `is_translation` | `bool` | `True` if the row is a translation task |
+| `direction` | `str \| None` | `"en_ta"`, `"ta_en"`, `"unknown"`, or `None` |
+| `expected_script` | `str \| None` | `"tamil"`, `"english"`, or `None` (unresolved → no exemption) |
 
 ### Custom row checks
 
@@ -419,6 +495,21 @@ touch ~/.praisonai_train_stop
 
 Point `recipe:` at an inline dict — no Python needed. See the Spanish example under [Recipes](#recipes).
 
+### Audit a translation corpus
+
+Read `metrics.translation` before fine-tuning to verify how much of the corpus is translation and in which direction.
+
+```python
+from praisonai_train.data import score
+
+result = score(rows, cfg={"near_dup": False})
+t = result["metrics"]["translation"]
+
+print(f"translation share: {t['share']:.0%}")
+print(f"by direction: {t['by_direction']}")   # {'en_ta': ..., 'ta_en': ..., 'unknown': ...}
+print(f"english outputs rescued: {t['exempted']}")
+```
+
 ---
 
 ## Best Practices
@@ -442,6 +533,14 @@ The callback runs on the hot path after every completed request. Throttle any pr
 
 <Accordion title="Match script_range to your language">
 The defaults target the Tamil block (`[2944, 3071]`). Set `script_range` to your language's Unicode block so `low_script_purity` and `script_review` measure the right script.
+</Accordion>
+
+<Accordion title="Prefer task_type metadata over text detection">
+When generating your own rows, stamp `task_type` so the detector resolves direction from authoritative metadata instead of the instruction-text fallback. The Tamil recipe already stamps its `EN_TA_TASK` label — do the same for custom translation recipes.
+</Accordion>
+
+<Accordion title="Keep verify_translation_target on for translation datasets">
+It surfaces `wrong_target_script` — failed translations whose output is still in the source script. A naive purity filter keeps these silently because the wrong-script output still passes a same-script purity check.
 </Accordion>
 </AccordionGroup>
 
