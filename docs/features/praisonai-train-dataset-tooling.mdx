@@ -5,14 +5,16 @@ description: "Generate and quality-check instruction datasets with praisonai-tra
 icon: "database"
 ---
 
-Generate an instruction dataset from a teacher LLM, then quality-check it before fine-tuning — two commands that compose into a clean training corpus.
+Generate an instruction dataset from a teacher LLM, merge parallel batches, then quality-check it before fine-tuning — three commands that compose into a clean training corpus.
 
 ```mermaid
 graph LR
     subgraph "Dataset Tooling"
         Recipe[📋 Recipe / axes] --> Teacher[🤖 Teacher LLM]
         Teacher --> Raw[💾 Raw JSONL]
+        Raw --> Merge[🔗 dedup<br/>multi-file merge]
         Raw --> QC[🧪 validate]
+        Merge --> QC
         QC --> Clean[✅ Clean JSONL]
         Clean --> Train[⚙️ praisonai-train llm]
     end
@@ -22,11 +24,11 @@ graph LR
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Recipe input
-    class Teacher,QC,Train process
+    class Teacher,Merge,QC,Train process
     class Raw,Clean result
 ```
 
-`generate` calls an OpenAI-compatible endpoint to synthesise `{instruction, input, output}` rows from a recipe; `validate` filters them with research-backed QC checks. Both are YAML-driven, like `praisonai-train llm`.
+`generate` calls an OpenAI-compatible endpoint to synthesise `{instruction, input, output}` rows from a recipe; `dedup` merges parallel batches across files with one shared index; `validate` filters them with research-backed QC checks. All three are YAML-driven, like `praisonai-train llm`.
 
 ## Quick Start
 
@@ -279,7 +281,12 @@ Quality-check an instruction dataset — dedup, boilerplate/refusal, script puri
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `near_dup` | `bool` | `true` | Enable near-duplicate detection |
+| `near_dup_method` | `str` | `"sliding"` | Engine — `"sliding"` (bounded window) or `"minhash"` (MinHash + LSH, no bounded look-back). See [Cross-file dedup](#cross-file-dedup) |
 | `near_dup_jaccard` | `float` | `0.7` | 4-gram Jaccard threshold (≈ Self-Instruct ROUGE-L 0.7) |
+| `near_dup_window` | `int` | `3000` | Sliding look-back size (`≤ 0` = unbounded); sliding only |
+| `minhash_perm` | `int` | `128` | MinHash signature length (minhash only; `≥ 1`) |
+| `ngram_n` | `int` | `4` | Character n-gram size (minhash only; `≥ 1`) |
+| `minhash_seed` | `int` | `1` | Deterministic permutation seed (minhash only) |
 | `min_output_chars` | `int` | `20` | Below this, output is dropped as `too_short` |
 | `script_range` | `[int, int]` | `[2944, 3071]` (Tamil block) | Unicode range that defines the target script |
 | `script_drop` | `float` | `0.5` | Drop rows whose output has less than this fraction of chars in `script_range` |
@@ -446,6 +453,180 @@ Once imported, it participates in the next `score()` / `validate` run automatica
 
 ---
 
+## Cross-file dedup
+
+Merge many JSONL batch files into one deduped file with a single shared MinHash+LSH index — the cross-file duplicates that per-file `validate` (whose dedup state resets each call) always misses.
+
+You generated N batches in parallel with disjoint `--start-offset` values. `cat`-ing them and re-running `validate` still leaves near-duplicates across files. `dedup` catches them because one index spans every file.
+
+```bash
+praisonai-train dedup batch_*.jsonl --out merged.jsonl
+```
+
+### CLI flags
+
+| Flag | Short | YAML key | Type | Required | Description |
+|------|-------|----------|------|----------|-------------|
+| `inputs` (positional, N ≥ 1) | — | `inputs` (list) or `input` (single) | paths | **yes** (via CLI or YAML) | JSONL files to dedup across |
+| `--config` | `-c` | — | path | no | YAML config file |
+| `--out` | `-o` | `output` | path | **yes** | JSONL destination for the merged, deduped rows |
+| `--method` | — | `near_dup_method` | `minhash` or `sliding` | no (default `minhash`) | Near-dup engine — `dedup` defaults to `minhash` because a shared index is the whole point |
+| `--threshold` | — | `near_dup_jaccard` | float 0–1 | no (default `0.7`) | Jaccard threshold |
+| `--exact-only` | — | `near_dup: false` | flag | no | Skip near-dup, keep exact-dedup only |
+
+### YAML-only keys
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `inputs` | `list` | — | JSONL paths to dedup across (or use `input` for a single path) |
+| `minhash_perm` | `int` | `128` | MinHash signature length (`≥ 1`) |
+| `ngram_n` | `int` | `4` | Character n-gram size (`≥ 1`) |
+| `minhash_seed` | `int` | `1` | Deterministic permutation seed |
+
+### Behaviour worth knowing
+
+- **Atomic write** — the command writes to a sibling temp file and does `os.replace()` on success, so an `--out` that aliases an input is never truncated before its rows are read, and a malformed line never leaves a partial file.
+- **Exact-dup key** = sha1 of the normalised `instruction + input + output`, removed first; near-dup runs on the survivors.
+- **Missing path** raises `FileNotFoundError: dedup source not found: PATH` — a clear error, not a cryptic `AttributeError`.
+- **Report** prints at the end:
+  ```text
+  ─── cross-file dedup: 3 file(s) ───
+    in=15000  kept=12873  removed=2127 (14.2% dup)
+    wrote 12873 unique rows -> merged.jsonl
+  ```
+
+### Which engine to pick
+
+`dedup` defaults to `minhash`; `validate`/`score` default to `sliding`. Pick by scale and intent.
+
+```mermaid
+graph TB
+    Start[📝 Near-dup pass] --> Q1{Merging<br/>many files?}
+    Q1 -->|yes| Minhash[⚡ minhash<br/>shared LSH index<br/>no look-back window]
+    Q1 -->|no| Q2{Corpus<br/>> 100k rows?}
+    Q2 -->|yes| Minhash
+    Q2 -->|no| Sliding[🪟 sliding<br/>last near_dup_window rows]
+    Start --> Q3{Want novelty<br/>filter at all?}
+    Q3 -->|exact only| Exact[🛑 --exact-only<br/>near_dup false]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef scale fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef exact fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Q1,Q2,Q3 decision
+    class Minhash,Sliding scale
+    class Exact exact
+```
+
+### Example config
+
+```yaml
+inputs:
+  - data/batch_a.jsonl
+  - data/batch_b.jsonl
+  - data/batch_c.jsonl
+output: data/merged.jsonl
+near_dup_method: minhash   # default for dedup; set to 'sliding' for classic window semantics
+near_dup_jaccard: 0.7
+near_dup: true             # set false for exact-only
+minhash_perm: 128
+ngram_n: 4
+minhash_seed: 1
+```
+
+```bash
+praisonai-train dedup --config dedup.yaml
+```
+
+### Python API — `global_dedup()`
+
+Deduplicate rows across many JSONL paths or in-memory row lists with one shared exact + LSH index — streaming unique rows in source order.
+
+```python
+from praisonai_train.data import global_dedup
+
+merged = list(global_dedup(
+    ["data/batch_a.jsonl", "data/batch_b.jsonl", "data/batch_c.jsonl"],
+    cfg={"near_dup_jaccard": 0.7},
+))
+print(f"{len(merged)} unique rows")
+```
+
+Full signature:
+
+```python
+def global_dedup(
+    sources: Iterable,       # JSONL paths (str) or in-memory row lists — mix freely
+    cfg: dict | None = None,
+) -> Iterator[dict]
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `sources` | `Iterable[str \| list[dict]]` | required | JSONL file paths **or** in-memory row lists — mix freely |
+| `cfg` | `dict \| None` | `None` | Same config keys as `near_dedup`; `near_dup_method` defaults to `"minhash"` here |
+
+Missing paths raise `FileNotFoundError: dedup source not found: PATH`.
+
+### Python API — `near_dedup()` and `MinHashLSH`
+
+Drop near-duplicate rows by instruction over either engine — this is what `validate`'s near-dup pass now delegates to.
+
+```python
+from praisonai_train.data import near_dedup
+
+rows = [{"instruction": "...", "input": "", "output": "..."}]
+
+kept, dropped = near_dedup(rows, cfg={"near_dup_method": "minhash"})
+```
+
+Full signature:
+
+```python
+def near_dedup(
+    rows: Iterable[dict],
+    cfg: dict | None = None,
+    index: "MinHashLSH | None" = None,
+) -> tuple[list[dict], int]
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `rows` | `Iterable[dict]` | required | Rows to dedup |
+| `cfg` | `dict \| None` | `None` → all defaults | Config keys — `near_dup_method`, `near_dup_jaccard`, `near_dup_window`, `minhash_perm`, `ngram_n`, `minhash_seed` |
+| `index` | `MinHashLSH \| None` | `None` → build fresh | Reuse a shared LSH across successive batches (minhash only) |
+
+Reuse the same index to dedup across a stream of batches — the whole corpus becomes the look-back.
+
+```python
+from praisonai_train.data import near_dedup, MinHashLSH
+
+shared = MinHashLSH(threshold=0.7, num_perm=128, seed=1)
+cfg = {"near_dup_method": "minhash"}
+
+for batch in stream_of_batches():
+    kept, dropped = near_dedup(batch, cfg, index=shared)
+    save(kept)
+    print(f"batch: kept={len(kept)} dropped={dropped}  index size={len(shared)}")
+```
+
+`MinHashLSH(threshold=0.7, num_perm=128, n=4, seed=1)` is the pure-stdlib index behind both (no `datasketch` / `numpy`).
+
+| Method | Signature | Returns |
+|--------|-----------|---------|
+| `add_if_new(text)` | `str -> bool` | `True` (and indexes it) if `text` is new; `False` if it's a near-dup |
+| `is_near_dup(text)` | `str -> bool` | `True` if `text` is a near-dup of anything indexed (does **not** insert) |
+| `query(text)` | `str -> tuple[signature, set[int]]` | Signature + candidate keys sharing ≥ 1 band |
+| `__len__()` | — | Rows currently indexed |
+
+<Note>
+`near_dup_method` defaults to `"sliding"` in `score`/`validate` but `"minhash"` in `global_dedup`/`dedup`. Existing `validate` configs are unchanged unless you opt in. An unknown method raises `ValueError("unknown near_dup_method 'X'; use 'sliding' or 'minhash'")`.
+</Note>
+
+---
+
 ## Common Patterns
 
 ### Disjoint parallel workers
@@ -465,6 +646,19 @@ praisonai-train generate -r tamil -d gpt-4o -n 5000 --start-offset 5000 -o data/
 dedup_from:
   - data/a.jsonl
   - data/b.jsonl
+```
+
+### Merge parallel batches
+
+Two shells generate disjoint slices, then one `dedup` command merges and cross-dedups them before `validate`.
+
+```bash
+# Two shells generate disjoint slices…
+praisonai-train generate -r tamil -d gpt-4o -n 5000 --start-offset 0 -o data/a.jsonl
+praisonai-train generate -r tamil -d gpt-4o -n 5000 --start-offset 5000 -o data/b.jsonl
+# …then one command merges + dedups them.
+praisonai-train dedup data/a.jsonl data/b.jsonl --out data/merged.jsonl
+praisonai-train validate data/merged.jsonl --out data/clean.jsonl
 ```
 
 ### Live progress in a notebook
@@ -523,8 +717,12 @@ List prior output files under `dedup_from`. Their normalised instructions load i
 `--snapshot-every 1000` copies the output to `snapshots/{stem}_{n}.jsonl` every N rows. A crash then costs at most N rows, not the whole run.
 </Accordion>
 
-<Accordion title="Use --no-near-dup on 100k+ datasets">
-The pairwise 4-gram Jaccard pass is O(n²). On very large datasets, skip it with `--no-near-dup` (or `near_dup: false`) and rely on the exact-dup + on-write dedup instead.
+<Accordion title="Use near_dup_method: minhash on 100k+ datasets">
+The default sliding pass is O(n·`near_dup_window`) and structurally blind to near-dups more than `near_dup_window` rows apart. The MinHash + LSH engine has no bounded look-back window and scales sub-linearly. `--no-near-dup` is still available for exact-dedup-only runs.
+</Accordion>
+
+<Accordion title="Merge parallel batches with dedup, not manual concatenation">
+Running `praisonai-train generate` with disjoint `--start-offset` values still produces near-duplicates across files. `praisonai-train dedup batch_*.jsonl --out merged.jsonl` removes both exact and near cross-file dups with a shared MinHash+LSH index; `cat`-ing the files then re-running `validate` cannot (its dedup state is rebuilt per call).
 </Accordion>
 
 <Accordion title="Keep progress_callback cheap">
