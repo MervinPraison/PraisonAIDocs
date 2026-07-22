@@ -172,11 +172,105 @@ Telegram registers a `PHOTO | Document.ALL` handler — both photos and any docu
 
 ---
 
+## Media Albums
+
+Coalesce a burst of updates sharing one `media_group_id` into a single multimodal turn — the agent sees the whole album at once instead of N separate turns.
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User
+    participant TG as 📱 Telegram
+    participant Bot as 🤖 TelegramBot
+    participant Coal as 🧺 AlbumCoalescer
+    participant A as 🧠 Agent
+
+    U->>TG: send 3-photo album<br/>(1 caption on first)
+    TG->>Bot: update #1 (media_group_id=X, photo A, caption)
+    TG->>Bot: update #2 (media_group_id=X, photo B)
+    TG->>Bot: update #3 (media_group_id=X, photo C)
+    Bot->>Coal: collect(X, [A], caption)
+    Bot->>Coal: collect(X, [B], "")
+    Bot->>Coal: collect(X, [C], "")
+    Note over Coal: buffer for window_ms of silence<br/>OR until max_items reached
+    Coal-->>Bot: MergedAlbum(attachments=[A,B,C], caption)
+    Bot->>A: chat(caption, attachments=[A,B,C])
+    A-->>U: single reply covering all 3
+```
+
+Opt in via `BotConfig.metadata` — disabled by default so existing deployments are unchanged.
+
+```python
+from praisonaiagents import Agent, BotConfig
+from praisonai.bots import TelegramBot
+
+agent = Agent(
+    name="album-assistant",
+    instructions="Compare and describe the photos the user sends.",
+    llm="gpt-4o",
+)
+
+bot = TelegramBot(
+    token="your-telegram-bot-token",
+    agent=agent,
+    config=BotConfig(
+        metadata={
+            "media_group_window_ms": 1200,   # silence window (0 = disabled)
+            "media_group_max": 10,           # cap per album (default: 10)
+        },
+    ),
+)
+
+import asyncio
+asyncio.run(bot.start())
+```
+
+Each inbound update flows through this decision path:
+
+```mermaid
+graph TB
+    Q{User sends media?}
+    Q -->|single photo/doc| Single[Standalone message<br/>→ returned immediately]
+    Q -->|album, media_group_id set| Album{window_ms > 0?}
+    Album -->|no| Legacy[Legacy: N separate turns<br/>backward compatible default]
+    Album -->|yes| Buffer[Buffer parts]
+    Buffer --> Full{Reached max_items?}
+    Full -->|yes| Flush[⚡ Flush immediately]
+    Full -->|no| Silence{window_ms of silence?}
+    Silence -->|yes| Flush
+    Silence -->|no| Buffer
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q,Album,Full,Silence decision
+    class Buffer process
+    class Single,Legacy,Flush result
+```
+
+### Behaviour
+
+| Behaviour | Detail |
+|-----------|--------|
+| **Disabled by default** | `media_group_window_ms=0` keeps every existing deployment byte-for-byte unchanged. |
+| **First non-empty caption wins** | The album's prompt is the caption on whichever part carried one first (Telegram typically puts it on part 1). |
+| **Sibling updates fold in** | Only one caller owns the merged turn; siblings' media folds into it and their `collect()` returns `None` internally. |
+| **Cancelled-owner cleanup** | If the owning update is cancelled mid-wait (e.g. during shutdown), buffered temp files are reclaimed via the shared `_remove_inbound_media` hook. |
+| **Shutdown flush** | `bot.stop()` calls `AlbumCoalescer.cancel_all()`, flushing pending buffers. |
+| **Telegram-only** | Slack and Discord adapters do not wire the coalescer — they don't have Telegram's split-update album model. |
+
+---
+
 ## Configuration
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `max_inbound_media_bytes` | `int` | `20971520` | Maximum file size in bytes. `0` = disable inbound media. |
+| `metadata["media_group_window_ms"]` | `int` (ms) | `0` (disabled) | Silence window before an album flushes as one turn. Set > 0 (e.g. `1200`) to enable coalescing; `0` keeps legacy per-update behaviour. |
+| `metadata["media_group_max"]` | `int` | `10` | Upper bound on attachments buffered per album — a full Telegram album is 10, so the default splits nothing. Lower it to bound memory/latency; reaching it forces an immediate flush. |
+
+Both album options live under `BotConfig.metadata` (there are no top-level `BotConfig` fields for them — `resolve_album_window_ms` / `resolve_album_max_items` read `metadata` first, then a direct attribute). Values that fail `int()` coercion silently fall back to the default.
 
 Set via `BotConfig`:
 
@@ -199,7 +293,10 @@ agent:
 platforms:
   telegram:
     token: ${TELEGRAM_BOT_TOKEN}
-    max_inbound_media_bytes: 10485760  # 10 MiB
+    max_inbound_media_bytes: 10485760       # 10 MiB
+    metadata:
+      media_group_window_ms: 1200           # coalesce albums (0 disables)
+      media_group_max: 10
 ```
 
 ---
@@ -271,6 +368,14 @@ WARNING: SSRF guard rejected URL: https://internal-cdn.example.com/...
 ```
 </Accordion>
 
+<Accordion title="Enable album coalescing on public Telegram bots">
+Set `metadata["media_group_window_ms"]` to `1000`–`1500` ms so a user sending "compare these 3 photos" reaches the agent as one multimodal turn instead of three. Leave `media_group_max` at `10` (a full Telegram album) unless you want to cap memory further.
+
+```python
+config = BotConfig(metadata={"media_group_window_ms": 1200})
+```
+</Accordion>
+
 <Accordion title="Use gpt-4o or claude-3 for vision">
 Not all models support vision. Pass a vision-capable model to see image attachments.
 
@@ -298,5 +403,8 @@ agent = Agent(llm="gemini/gemini-2.0-flash")      # Google vision
 </Card>
 <Card title="Bot Streaming Replies" icon="message-pen" href="/docs/features/bot-streaming-replies">
   Live streaming responses for Telegram, Slack, and Discord
+</Card>
+<Card title="Turn Completion Notes" icon="message-check" href="/docs/features/gateway-turn-completion">
+  Surface why a bot turn ended (max_steps, cancelled, error) as a user-safe note
 </Card>
 </CardGroup>
