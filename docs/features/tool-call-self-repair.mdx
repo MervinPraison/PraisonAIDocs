@@ -27,7 +27,12 @@ graph LR
         Match -->|Miss| Norm{🔧 Repairable?}
         Norm -->|Unique match| Run
         Norm -->|No match| Fix[📋 Corrective error + hint]
+        Run --> Boom{❌ Raised?}
+        Boom -->|Bind error| Hint[📋 Schema hint]
+        Boom -->|Value error| Raw[📩 Original message]
         Fix --> Retry[🔁 Model retries]
+        Hint --> Retry
+        Raw --> Retry
     end
 
     classDef call fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -36,9 +41,9 @@ graph LR
     classDef fix fill:#189AB4,stroke:#7C90A0,color:#fff
 
     class Call,Retry call
-    class Match,Norm check
+    class Match,Norm,Boom check
     class Run run
-    class Fix fix
+    class Fix,Hint,Raw fix
 ```
 
 ## Quick Start
@@ -73,7 +78,29 @@ except ToolExecutionError as e:
     print(str(e))
     # ... Expected parameters for 'web_search' — required: ['query'], optional: ['limit'].
 ```
-The model learns which arguments to send next.
+The model learns which arguments to send next. This hint fires only when the kwargs cannot bind — a genuine argument-binding error.
+</Step>
+
+<Step title="Value errors pass through unchanged">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.errors import ToolExecutionError
+
+def web_search(query: str) -> str:
+    """Search the web."""
+    if not query:
+        raise ValueError("query must not be empty")
+    return f"results for {query}"
+
+agent = Agent(name="Search", instructions="Search the web", tools=[web_search])
+
+try:
+    agent.execute_tool("web_search", {"query": ""})   # bound OK, tool raises
+except ToolExecutionError as e:
+    print(str(e))
+    # query must not be empty
+```
+The kwargs bound cleanly, so the model isn't told to change the parameter names — it's told to fix the value.
 </Step>
 </Steps>
 
@@ -100,7 +127,13 @@ sequenceDiagram
     alt Unique match
         Agent->>Registry: dispatch web_search
         Registry-->>Agent: result
-        Agent-->>LLM: tool result
+        alt Bind-time error
+            Agent-->>LLM: ToolExecutionError (... Expected parameters for 'web_search' — ...)
+        else Runtime error inside tool
+            Agent-->>LLM: ToolExecutionError (original message, no hint)
+        else Success
+            Agent-->>LLM: tool result
+        end
     else No match
         Agent-->>LLM: ToolExecutionError (Did you mean...? Available tools: [...])
         LLM->>Agent: execute_tool("web_search", {...})
@@ -111,7 +144,7 @@ Normalisation compares `str(name).lower().replace('_', '').replace('-', '').repl
 
 ---
 
-## Three failure modes, three responses
+## Four failure modes, four responses
 
 <Tabs>
 <Tab title="Case / separator drift">
@@ -136,7 +169,7 @@ The nearest name uses `difflib.get_close_matches(name, available, n=1, cutoff=0.
 </Tab>
 
 <Tab title="Bind failure">
-When the callable itself raises (e.g. a missing argument), the runtime introspects the signature and folds the parameters into the message:
+A genuine argument-binding error — `inspect.signature(...).bind(**kwargs)` raises `TypeError` before the tool body runs (missing, extra, or wrong-named kwargs). The runtime introspects the signature and folds the parameters into the message:
 
 ```python
 {
@@ -146,6 +179,22 @@ When the callable itself raises (e.g. a missing argument), the runtime introspec
 ```
 
 Introspection skips `self`, `*args`, and `**kwargs`. `BaseTool` subclasses are inspected via `.run` (classes fall back to `._run`).
+</Tab>
+
+<Tab title="Runtime error inside the tool">
+The kwargs bind cleanly and the tool body raises its own `TypeError` / `ValueError`. The runtime surfaces the original error and adds **no** parameter hint — the model needs to change the value, not the argument names:
+
+```python
+def web_search(query: str) -> str:
+    if not query:
+        raise ValueError("query must not be empty")
+    ...
+
+agent.execute_tool("web_search", {"query": ""})
+# {"error": "query must not be empty"}
+```
+
+No `expected_parameters` field and no `Expected parameters for '<tool>' — ...` suffix in the message.
 </Tab>
 </Tabs>
 
@@ -164,8 +213,12 @@ The `Did you mean '<nearest>'?` hint and the `Available tools: [...]` list live 
 The bind-failure branch appends `Expected parameters for '<tool>' — required: [...], optional: [...].` to the message string. The same names are also returned as a structured `expected_parameters` dict on the impl-level result.
 </Accordion>
 
+<Accordion title="Only true bind failures get the hint">
+A `TypeError` or `ValueError` raised *inside* a successfully-bound tool is a value problem, not a parameter problem. The runtime gates the schema hint on `inspect.signature(target).bind(**kwargs)` — the `required`/`optional` names only appear in the error message when the kwargs actually failed to bind. Otherwise the tool's own error string reaches the model unchanged, so the model fixes the value instead of renaming the parameters.
+</Accordion>
+
 <Accordion title="Backward compatible">
-No new public API, no new `Agent` parameters, and no new environment variables. The prior behavior on unknown tools was a bare `Tool 'X' is not callable` — not a stable contract, so no valid callers depended on it.
+No new public API, no new `Agent` parameters, and no new environment variables. The prior behavior on unknown tools was a bare `Tool 'X' is not callable` — not a stable contract, so no valid callers depended on it. When signature introspection itself is impossible (e.g. a C-implemented callable), the gate fails closed — it omits the hint rather than echo a misleading one.
 </Accordion>
 </AccordionGroup>
 
