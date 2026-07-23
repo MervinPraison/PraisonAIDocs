@@ -29,9 +29,11 @@ agent = Agent(name="dispatcher", instructions="Dispatch CLI commands to the righ
 agent.start("Run the deploy command with the staging environment.")
 ```
 
-The user types `praisonai …`; the dispatcher routes to Typer subcommands, version flags, or the legacy prompt path.
+Just type your prompt — `praisonai "…"` uses the same modern engine as `praisonai run "…"`.
 
-PraisonAI picks one of five paths based on what you type — and adding a new subcommand means it Just Works.
+The user types `praisonai …`; the dispatcher routes to Typer subcommands, version flags, bare prompts, or the legacy YAML/flag path.
+
+PraisonAI picks one of six paths based on what you type — and adding a new subcommand means it Just Works.
 
 ```mermaid
 graph LR
@@ -65,12 +67,9 @@ graph TB
     E -->|No| F[🔎 first non-flag positional]
     F --> K{🧠 in registered<br/>Typer commands?}
     K -->|Yes| Typer3[🧰 Typer subcommand]
-    K -->|No| Legacy[🤖 Legacy<br/>PraisonAI().main]
-    Legacy --> C{🔍 single-word<br/>bare positional?}
-    C -->|No / multi-word| Prompt[🤖 Direct prompt → LLM]
-    C -->|Yes| G{🛡 Reserved verb<br/>or close typo?}
-    G -->|No| Prompt
-    G -->|Yes| Guard[❌ Print hint stderr<br/>exit 2]
+    K -->|No| B{🔍 bare prompt?<br/>no flags &amp;<br/>not .yaml/.yml}
+    B -->|Yes| Run[🧰 Typer run<br/>run &lt;prompt&gt;]
+    B -->|No| Legacy[🤖 Legacy<br/>YAML / deprecated flags]
 
     classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
@@ -78,10 +77,10 @@ graph TB
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
 
     class Start input
-    class V,H,E,K,C,G check
+    class V,H,E,K,B check
     class F input
-    class Print,Typer1,Typer2,Typer3,Prompt route
-    class Legacy,Guard agent
+    class Print,Typer1,Typer2,Typer3,Run route
+    class Legacy agent
 ```
 
 ## Quick Start
@@ -118,10 +117,14 @@ praisonai chat "Build a weather agent"
 <Step title="Free-text Prompts">
 ```bash
 praisonai "Build a weather agent"
-# Routes to legacy for direct prompts
+# Identical to: praisonai run "Build a weather agent"
 ```
 </Step>
 </Steps>
+
+<Note>
+**Why route bare prompts to `run`?** A bare prompt inherits the full modern engine: **session continuity** (`--continue` / `--session` / `--fork`), **structured output** (`--output json`, `--output stream-json`), the **local-first credential gate**, and the **permission model + checkpoints**. `praisonai "…"` and `praisonai run "…"` are the same engine underneath.
+</Note>
 
 ---
 
@@ -135,7 +138,7 @@ sequenceDiagram
     participant Legacy
     
     User->>main(): praisonai command
-    main()->>main(): Check routing rules 1-5
+    main()->>main(): Check routing rules 1-6
     alt --version / -V
         main()->>User: Print version & exit
     else --help / -h
@@ -147,7 +150,10 @@ sequenceDiagram
     else Known command
         main()->>Typer: Execute subcommand
         Typer-->>User: Command result
-    else Unknown/prompt/YAML
+    else Bare free-text prompt
+        main()->>Typer: run "<prompt>"
+        Typer-->>User: Modern engine result
+    else YAML / deprecated flags
         main()->>Legacy: PraisonAI().main()
         Legacy-->>User: Legacy behavior
     end
@@ -155,28 +161,49 @@ sequenceDiagram
 
 | Component | Purpose | Route Decision |
 |-----------|---------|---------------|
-| `main()` | Entry router | Applies 5 rules in order |
+| `main()` | Entry router | Applies 6 rules in order |
 | `_find_first_command()` | Positional finder | Skips flags, finds command |
 | `_get_typer_commands()` | Auto-discovery | Cached command introspection |
-| Typer | Subcommand handler | Registered commands only |
-| Legacy | Fallback handler | Everything else |
+| `_looks_like_bare_prompt()` | Bare-prompt predicate | True when no flags and not `.yaml`/`.yml` |
+| Typer | Subcommand & `run` handler | Registered commands + bare prompts |
+| Legacy | Fallback handler | YAML files and deprecated flags |
 
 ---
 
 ## Routing Rules
 
-| # | What you type | Route | Notes |
-|---|---|---|---|
-| 1 | `praisonai --version` / `praisonai -V` | Version short-circuit | Prints version and returns. Does **not** import `praisonai.cli.*` — stays fast even with broken optional deps. Pinned by `TestVersionShortCircuit`. |
-| 2 | `praisonai --help` / `praisonai -h` | Typer | Typer's auto-generated help lists every registered subcommand (auto-discovered, no manual list). |
-| 3 | `praisonai` (no argv) | Typer | Drops into Typer's interactive TUI. |
-| 4 | `praisonai --verbose` / `praisonai -o json` (only flags) | Typer | `_find_first_command` returns `None` → Typer handles global-flag-only cases. |
-| 5 | `praisonai chat ...` (first positional ∈ registered commands) | Typer | Auto-discovered via Click introspection of `app`. Adding a new subcommand to `cli/app.py` makes it routable here with **zero dispatcher changes**. |
-| 6 | `praisonai "Build a weather agent"` (free-text — token contains a space) | Legacy → direct prompt | Multi-word prompts skip the guard and run as a one-shot prompt. |
-| 7 | `praisonai agents.yaml` (filename, not a registered command) | Legacy → direct prompt | Routing decision is by **command-set membership**, NOT by `os.path.isfile()`. A typo'd YAML path also routes to legacy and surfaces there. |
-| 8 | `praisonai hello` (single word, not a typo of any command) | Legacy → direct prompt | An unrecognised single word still runs as a prompt (backward-compatible). |
-| 9 | `praisonai show` (reserved verb) | Guard → stderr hint, exit 2 | `classify_unknown_command` catches reserved verbs and prints a suggestions list instead of a paid LLM call. |
-| 10 | `praisonai memoyr` (single-word typo of `memory`) | Guard → stderr hint, exit 2 | `difflib.get_close_matches(cutoff=0.8)` matches the typo and prints `Did you mean: memory?`. |
+`main()` applies six rules in order. The first match wins.
+
+| # | Rule | Route |
+|---|---|---|
+| 1 | `--version` / `-V` | Version short-circuit — prints version, no `cli.*` imports |
+| 2 | `--help` / `-h` | Typer help (auto-generated, lists every subcommand) |
+| 3 | No arguments | Typer interactive TUI |
+| 4 | First arg is a Typer command | Typer subcommand |
+| 5 | Bare free-text prompt | **Typer `run`** (modern engine) |
+| 6 | Everything else | Legacy (`.yaml`, deprecated flags) |
+
+Rule 5 fires only when `_looks_like_bare_prompt(argv, first_cmd)` returns `True` — that is, when **all three** hold: `first_cmd` is not empty, **no** `-`/`--` token appears anywhere in argv, and `first_cmd` does not end (case-insensitively) with `.yaml` or `.yml`.
+
+### Behaviour Matrix
+
+| You type | Route | Result |
+|---|---|---|
+| `praisonai "Create a weather app"` | **Typer `run`** | `target="Create a weather app"` |
+| `praisonai build a weather agent` (unquoted) | **Typer `run`** | tokens joined → `target="build a weather agent"` |
+| `praisonai hello` (single word, unknown) | **Typer `run`** | `target="hello"` |
+| `praisonai totally-unknown` | **Typer `run`** | `target="totally-unknown"` |
+| `praisonai show` (reserved verb, bare) | **Typer `run`** | `target="show"` — legacy guard bypassed |
+| `praisonai memoyr` (typo of `memory`, bare) | **Typer `run`** | `target="memoyr"` — legacy guard bypassed |
+| `praisonai agents.yaml` | **Legacy** | `.yaml`/`.yml` predicate returns False |
+| `praisonai "Create a weather app" --framework crewai` | **Legacy** | any flag keeps it on legacy |
+| `praisonai --verbose hello` | **Legacy** | leading flag → predicate returns False |
+| `praisonai chat "Hello"` | **Typer** | rule 4 fires before rule 5 |
+| `praisonai serve` / `call` / `realtime` / `debug` (flagless) | **Typer** | registered commands — rule 4 wins |
+
+<Tip>
+An unquoted prompt (`praisonai build a weather agent`) arrives as four argv tokens; the dispatcher joins them with spaces into a single `run` argument so the whole prompt reaches the modern engine intact.
+</Tip>
 
 ---
 
@@ -211,13 +238,13 @@ The auto-discovery cache (`_get_typer_commands()`) works by:
 ### Bare Prompt
 ```bash
 praisonai "Create a Python script that scrapes weather data"
-# Routes to legacy - spaces in token indicate free-text prompt
+# Routes to Typer run - no flags, not a .yaml/.yml file
 ```
 
 ### YAML File
 ```bash
 praisonai agents.yaml
-# Routes to legacy - filename not in registered command set
+# Routes to legacy - .yaml/.yml token keeps the multi-framework path
 ```
 
 ### Subcommand with Global Flags
@@ -229,16 +256,15 @@ praisonai --verbose chat "Hello world"
 
 ---
 
-## Unknown-command guard
+## Legacy-only guard
 
-The dispatcher intercepts single-word command-like tokens so a mistyped verb never becomes a paid LLM call.
+The reserved-verb / typo guard is a **legacy-path** behaviour. It fires only when an invocation already reached the legacy dispatcher for another reason — a flag or a `.yaml`/`.yml` file. A plain `praisonai show` now routes to Typer `run` (rule 5) and is sent to the model as the literal prompt `show`.
 
 ```mermaid
 graph TB
-    Token[🔎 bare positional] --> C{🔍 single-word?}
-    C -->|No / multi-word| Prompt[🤖 Direct prompt → LLM]
-    C -->|Yes| G{🛡 Reserved verb<br/>or close typo?}
-    G -->|No| Prompt
+    Bare[🔎 bare token, no flags] --> Run[🧰 Typer run<br/>prompt to model]
+    Flagged[🔎 legacy invocation<br/>flag or .yaml] --> G{🛡 Reserved verb<br/>or close typo?}
+    G -->|No| Prompt[🤖 Direct prompt → LLM]
     G -->|Yes| Guard[❌ Print hint stderr<br/>exit 2]
 
     classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -246,39 +272,26 @@ graph TB
     classDef route fill:#10B981,stroke:#7C90A0,color:#fff
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
 
-    class Token input
-    class C,G check
-    class Prompt route
+    class Bare,Flagged input
+    class G check
+    class Run,Prompt route
     class Guard agent
 ```
 
-`classify_unknown_command` in `praisonai/cli/legacy/dispatch/argparse_builder.py` returns a hint string only when a lone token looks like a mistyped or reserved command; otherwise it returns `None` and the token runs as a prompt.
-
-| Input token | Classification | Result |
-|---|---|---|
-| `""` / `None` | Not guarded | Runs as prompt |
-| `"write a poem"` (contains a space) | Not guarded | Runs as prompt |
-| `show` (reserved verb, case-insensitive) | Guarded | `Unknown command: 'show'` + suggestions |
-| `memoyr` (close typo of `memory`, cutoff `0.8`) | Guarded | `Unknown command: 'memoyr'` + `Did you mean: memory?` |
-| `hello` (single word, no match) | Not guarded | Runs as prompt |
+`classify_unknown_command` in `praisonai/cli/legacy/dispatch/argparse_builder.py` returns a hint string only when a lone token looks like a mistyped or reserved command; otherwise it returns `None` and the token runs as a prompt. This only runs on the legacy path.
 
 ### When it fires
 
 | You type | Guard fires? | What happens |
 |---|---|---|
-| `praisonai show` | ✅ reserved verb | stderr hint listing `paths` / `version show` / `memory show` / `config show`, exit 2 |
-| `praisonai memoyr` | ✅ close typo (cutoff 0.8) | stderr `Did you mean: memory?` + `praisonai run "<prompt>"` hint, exit 2 |
-| `praisonai hello` | ❌ single word, unmatched | routed as a direct prompt |
-| `praisonai "write a poem"` | ❌ multi-word | routed as a direct prompt |
-| `praisonai run "show"` | ❌ argument to `run`, not a top-level token | LLM sees `"show"` as a prompt |
+| `praisonai show` (bare) | ❌ | routes to Typer `run` as the prompt `show` |
+| `praisonai show --framework crewai` | ✅ | flag forces legacy; guard runs, stderr hint, exit 2 |
+| `praisonai memoyr` (bare) | ❌ | routes to Typer `run` as the prompt `memoyr` |
+| `praisonai memoyr --framework crewai` | ✅ | flag forces legacy; `Did you mean: memory?`, exit 2 |
 
 <Warning>
-The hint prints to **stderr** with **exit code 2**. Shell scripts must not swallow stderr if they need the diagnostic.
+On the legacy path the hint prints to **stderr** with **exit code 2**. Shell scripts must not swallow stderr if they need the diagnostic.
 </Warning>
-
-<Tip>
-To send a single word to the model, wrap it in `praisonai run "<word>"` — arguments to `run` bypass the guard by construction.
-</Tip>
 
 ---
 
@@ -293,8 +306,12 @@ The `--version` flag takes a fast path that prints version information without i
 To add a new subcommand, simply register it in `praisonai/cli/app.py` using `app.add_typer()`. The dispatcher automatically discovers it through Click introspection with no manual updates needed to routing logic. The command becomes available immediately after registration.
 </Accordion>
 
-<Accordion title="Free-text prompts vs. typo'd command names">
-Multi-word bare positionals (e.g. `praisonai "build a weather agent"`) still fall through to legacy and run as a direct prompt. Single-word tokens go through `classify_unknown_command` first: a reserved verb like `show` or a close typo like `memoyr` fails fast with a hint on **stderr** and exits with code **2**, while an unrecognised single word (e.g. `hello`) still runs as a prompt for backward compatibility. Use `praisonai run "hello"` to send a genuine single-word prompt.
+<Accordion title="Two ways to type it, one engine underneath">
+`praisonai "build a weather agent"` and `praisonai run "build a weather agent"` reach the same modern engine. Bare prompts — single word or multi word, quoted or unquoted — route to Typer `run` and inherit session continuity, `--output` modes, the credential gate, and permissions/checkpoints. A single word like `hello` or a reserved verb like `show` is sent to the model as a literal prompt, not blocked.
+</Accordion>
+
+<Accordion title="How to force the legacy path">
+Add any flag, or use a `.yaml`/`.yml` file. Any `-`/`--` token anywhere in argv keeps the invocation on the legacy dispatcher (which owns `--framework`, `--auto`, `--serve`, and friends). `.yaml`/`.yml` tokens stay on the legacy multi-framework path. The reserved-verb / typo guard only runs once you are already on legacy.
 </Accordion>
 
 <Accordion title="Failure visibility">
