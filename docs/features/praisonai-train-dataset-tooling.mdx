@@ -135,6 +135,8 @@ These have no CLI flag — set them in the config file.
 | `dedup_from` | `list` | `[]` | JSONL paths (or inline row lists) whose `instruction` values are excluded |
 | `stop_file` | `path` | `~/.praisonai_train_stop` | Touch this file to halt immediately |
 | `snapshot_dir` | `path` | `snapshots` | Directory for `--snapshot-every` snapshots |
+| `subscription_id` | `str` | env `AZ_SUBSCRIPTION` | Azure subscription id — when set (and no `should_continue` is passed), the built-in [Azure sponsorship guard](#continuation-guard) is wired in automatically |
+| `sponsor_check_rows` | `int` | `5000` | How often the continuation guard is re-checked (once every N completed requests). Coerced to a safe minimum of `1` — `0` and negative values are corrected; `None` keeps the `5000` default |
 
 ### Behaviour worth knowing
 
@@ -143,6 +145,7 @@ These have no CLI flag — set them in the config file.
 - **Dedup is on-write and cross-run** — the normaliser hashes `instruction`; rows whose normalised instruction is already seen (from `dedup_from` or earlier in the run) are silently skipped.
 - **Zero unique rows exits `1`** with `error: no rows generated — check endpoint/api_key/deployment and provider JSON-mode support`.
 - **Progress bar:** when `tqdm` is importable the CLI shows a live bar (`generating: 42/1000 [00:12<04:38] req kept=39`); otherwise it prints `  ...500/1000 requests (487 kept)` every 500 requests. `tqdm` stays optional — the import is guarded.
+- **Per-row provenance** — each emitted row carries `model` (the teacher deployment), plus `task_type` and `topic` when the recipe stamps them (built-in `tamil` and any `_AxisRecipe` subclass do). Downstream QC and category splits key off this metadata instead of brittle text detection. Backward compatible — keys are added only when values are available (see [Per-row provenance](#per-row-provenance)).
 
 ### Example config
 
@@ -191,6 +194,7 @@ def generate_dataset(
     config: dict,
     on_row: Callable[[dict], None] | None = None,
     progress_callback: Callable[[int, int, int], None] | None = None,
+    should_continue: Callable[[], bool] | None = None,
 ) -> Iterator[dict]
 ```
 
@@ -199,12 +203,140 @@ def generate_dataset(
 | `config` | `dict` | required | Same keys as the YAML config above |
 | `on_row` | `fn(row) -> None` | `None` | Called once per **kept** row, before it's yielded |
 | `progress_callback` | `fn(done, total, kept) -> None` | `None` | Fires once up-front with `(0, total, 0)` and again after each completed request. `done` = requests finished; `kept` = unique rows emitted so far |
+| `should_continue` | `fn() -> bool` | `None` | Continuation guard re-checked every `sponsor_check_rows` completed requests. Returns `False` to halt the run cleanly (see [Continuation guard](#continuation-guard)). When omitted, a `subscription_id` / `AZ_SUBSCRIPTION` auto-wires the built-in Azure guard |
 
-Returns an `Iterator[dict]` of `{"instruction", "input", "output"}` — the caller drives the run by iterating.
+Returns an `Iterator[dict]` of `{"instruction", "input", "output"}` — plus `model`, `task_type`, and `topic` when available (see [Per-row provenance](#per-row-provenance)). The caller drives the run by iterating.
 
 <Note>
 `progress_callback` guarantees (verified by the SDK tests): `done` is monotonic non-decreasing, `kept` is monotonic non-decreasing, `kept <= done` always, final `done == total`, and final `kept == len(rows)`. When duplicates collapse everything, `done` still reaches `total` but `kept` plateaus. Keep the callback cheap — it runs on the hot path. `progress_callback=None` preserves the original behaviour exactly.
 </Note>
+
+### Continuation guard
+
+Halt a run from inside the loop when a billing or quota check flips — a belt-and-suspenders companion to the external stop-file circuit-breaker.
+
+`should_continue` is a `fn() -> bool` re-checked every `sponsor_check_rows` completed requests. When it returns `False`, the run halts via the same clean shutdown as the [stop-file](#circuit-breaker): touch the stop-file → cancel pending futures → break.
+
+The guard is resolved in a fixed order.
+
+```mermaid
+graph TB
+    Start[📝 request completes] --> Emit[✅ yield row]
+    Emit --> Check{done % check_every == 0?}
+    Check -->|no| Next[continue]
+    Check -->|yes| Guard{should_continue?}
+    Guard -->|True| Next
+    Guard -->|False| Halt[🛑 touch stop-file<br/>cancel pending<br/>break]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef halt fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Emit,Next safe
+    class Check,Guard decision
+    class Halt halt
+```
+
+| Order | Source | Result |
+|-------|--------|--------|
+| 1 | Explicit `should_continue` callback | Wins if supplied |
+| 2 | `subscription_id` or env `AZ_SUBSCRIPTION` | Built-in Azure sponsorship guard |
+| 3 | Neither | No guard — unguarded (same as before) |
+
+Key behaviours:
+
+- **Fail-OPEN** — `azure_sponsorship_guard` returns `True` on any transient error (az CLI missing, network blip, unparseable output). It never halts a healthy run on a flaky check. Pair it with an external watchdog for hard budget enforcement.
+- **Trigger row is emitted, not dropped** — the just-completed row is yielded *before* the guard runs, so the paid, already-finished request that trips the check is never silently lost.
+- **`sponsor_check_rows` coercion** — `0` (divide-by-zero) and negative (never-poll) values are corrected to `1`; `None` keeps the `5000` default.
+
+Pass any billing or quota check as a custom callback.
+
+```python
+from praisonai_train.data import generate_dataset
+
+def under_budget() -> bool:
+    return my_billing_client.remaining_credit_usd() > 10
+
+rows = list(generate_dataset(
+    {"recipe": "tamil", "deployment": "gpt-4o", "num_examples": 100_000,
+     "sponsor_check_rows": 1000},
+    should_continue=under_budget,
+))
+```
+
+Auto-wire the built-in Azure sponsorship guard with just a subscription id — no callback needed.
+
+```yaml
+recipe: tamil
+deployment: gpt-4o
+num_examples: 100000
+subscription_id: 00000000-0000-0000-0000-000000000000   # or set AZ_SUBSCRIPTION
+sponsor_check_rows: 5000
+output: data/tamil.jsonl
+```
+
+```bash
+praisonai-train generate --config generate.yaml
+# The run halts automatically once the Azure subscription's quotaId flips
+# away from "Sponsored_2016-01-01" (i.e. sponsorship converts to pay-as-you-go).
+```
+
+Or build the guard directly and pass it as `should_continue`.
+
+```python
+from praisonai_train.data import azure_sponsorship_guard, generate_dataset
+
+guard = azure_sponsorship_guard("sub-123")   # default quota_id="Sponsored_2016-01-01"
+rows = list(generate_dataset(config, should_continue=guard))
+```
+
+`azure_sponsorship_guard(subscription_id, quota_id="Sponsored_2016-01-01")` returns a `fn() -> bool` that is `True` while the subscription still reads as sponsored, and fail-OPEN on any error.
+
+### Per-row provenance
+
+Emitted rows are self-describing: the generator stamps `model` (from `deployment`) and passes `task_type` / `topic` through from the recipe when present.
+
+| Key | Source | When it's added |
+|-----|--------|-----------------|
+| `model` | `deployment` | Whenever a deployment is set (always — it's required) |
+| `task_type` | recipe spec | Whenever the recipe stamps it |
+| `topic` | recipe spec | Whenever the recipe stamps it |
+
+Any [axis recipe](#recipes) (`tamil`, `CustomRecipe`, or any `_AxisRecipe` subclass) stamps `task_type` and `topic` automatically, so QC and category splits key off metadata instead of brittle text detection.
+
+```jsonc
+// Recipe that doesn't stamp (still valid):
+{"instruction": "...", "input": "", "output": "..."}
+
+// Built-in tamil / any _AxisRecipe subclass:
+{
+  "instruction": "...",
+  "input": "",
+  "output": "...",
+  "model": "gpt-4o",
+  "task_type": "படைப்பாக்க எழுத்து",
+  "topic": "தமிழ் இலக்கியம்"
+}
+```
+
+Rows describe themselves — no re-detection needed.
+
+```python
+from praisonai_train.data import generate_dataset
+
+rows = list(generate_dataset({
+    "recipe": "tamil",
+    "deployment": "gpt-4o",
+    "num_examples": 10,
+}))
+
+for r in rows:
+    print(r["model"], r["task_type"], r["topic"])
+    # gpt-4o  ஒரு விளக்கம்  அறிவியல்
+    # gpt-4o  படைப்பாக்க எழுத்து  தமிழ் இலக்கியம்
+```
 
 ### Recipes
 
@@ -259,7 +391,7 @@ class Spanish(_AxisRecipe):
 
 Once imported anywhere, `--recipe spanish` (or `recipe: spanish` in YAML) works from the CLI.
 
-The built-in `tamil` recipe stamps a `task_type` label on translation rows (its `EN_TA_TASK` axis value), so the task-aware QC checks resolve direction from authoritative metadata rather than text detection.
+Any `_AxisRecipe` recipe (including `tamil` and inline `CustomRecipe`) automatically stamps `task_type` (its first axis) and `topic` (its second axis) onto every emitted row — see [Per-row provenance](#per-row-provenance). That metadata is what makes the task-aware QC checks and the `metrics.translation` by-direction breakdown reliable: they resolve direction from authoritative labels rather than brittle text detection. For the Tamil recipe, the `EN_TA_TASK` axis value becomes the stamped `task_type` on translation rows.
 
 ---
 
@@ -377,7 +509,7 @@ graph TB
     class Strict strict
 ```
 
-The detector resolves intent in a fixed order: ground-truth `task_type` metadata is authoritative → instruction-text keyword fallback for external rows → an ambiguous direction yields *no* exemption (the safe default).
+The detector resolves intent in a fixed order: ground-truth `task_type` metadata is authoritative → instruction-text keyword fallback for external rows → an ambiguous direction yields *no* exemption (the safe default). That `task_type` metadata is now stamped automatically by any [axis recipe](#recipes) (not just the Tamil recipe's `EN_TA_TASK` task), so freshly-generated corpora resolve direction from authoritative labels out of the box.
 
 <Note>
 `task_aware_purity: false` restores strict purity behaviour (English translation outputs are dropped again). `verify_translation_target: false` disables the `wrong_target_script` flag while leaving the exemption on.
@@ -679,10 +811,23 @@ rows = list(generate_dataset(
 
 ### Circuit-breaker
 
-Halt a rogue run without losing kept rows — queued requests cancel, in-flight ones drain.
+Halt a rogue run without losing kept rows — queued requests cancel, in-flight ones drain. Two routes trip the same clean shutdown:
+
+- **External / manual** — touch the stop-file from another shell.
+- **In-loop / automatic** — a `should_continue` guard (or an auto-wired Azure subscription id) halts the run when a billing or quota check flips, without you touching anything. See [Continuation guard](#continuation-guard).
 
 ```bash
 touch ~/.praisonai_train_stop
+```
+
+```python
+from praisonai_train.data import generate_dataset
+
+rows = list(generate_dataset(
+    {"recipe": "tamil", "deployment": "gpt-4o", "num_examples": 100_000,
+     "subscription_id": "00000000-0000-0000-0000-000000000000"},
+))
+# Halts automatically once the Azure sponsorship converts to pay-as-you-go.
 ```
 
 ### Custom recipe for another language
@@ -734,7 +879,19 @@ The defaults target the Tamil block (`[2944, 3071]`). Set `script_range` to your
 </Accordion>
 
 <Accordion title="Prefer task_type metadata over text detection">
-When generating your own rows, stamp `task_type` so the detector resolves direction from authoritative metadata instead of the instruction-text fallback. The Tamil recipe already stamps its `EN_TA_TASK` label — do the same for custom translation recipes.
+Any `_AxisRecipe` recipe now stamps `task_type` automatically — not just Tamil translation rows — so the detector resolves direction from authoritative metadata instead of the instruction-text fallback. When you build a recipe outside the axis base class, stamp `task_type` yourself to keep this signal.
+</Accordion>
+
+<Accordion title="Set sponsor_check_rows low enough to catch sponsorship flips fast">
+The default is `5000`. On a fast teacher endpoint that can still be many minutes and dollars of overrun before the guard fires. Match the interval to your acceptable overrun — lower for expensive endpoints.
+</Accordion>
+
+<Accordion title="Treat the guard as belt-and-suspenders, not the hard billing stop">
+`azure_sponsorship_guard` fails OPEN on transient errors (missing az CLI, network blip), so it never halts a healthy run on a flaky check — but that also means it can miss a real flip during an outage. Run an external watchdog too for hard budget enforcement.
+</Accordion>
+
+<Accordion title="Split datasets by task_type / topic instead of re-detecting">
+Every axis-recipe row is stamped with `task_type` and `topic`, so downstream evaluation and category splits can group by these metadata fields directly — no text-heuristic classifier needed.
 </Accordion>
 
 <Accordion title="Keep verify_translation_target on for translation datasets">
