@@ -319,22 +319,23 @@ sequenceDiagram
 
 ## Reacting to Retries
 
-When the agent hits a rate limit or transient error, it emits a `RETRY` event **before** it waits, then retries. The signal fires on both the sync and async retry loops — and emission is guarded so there is zero overhead when nothing is listening.
+When the agent hits a rate limit or transient error, it emits a `RETRY` event **before** it waits, then retries. The signal fires on both the sync and async retry loops, and reaches both `add_callback(sync_fn)` and `add_async_callback(async_fn)` consumers. Emission is guarded so there is zero overhead when nothing is listening.
 
 ```mermaid
 sequenceDiagram
     participant Agent
     participant LLM
     participant Emitter as StreamEmitter
-    participant Consumer
+    participant Sync as sync callback<br/>(add_callback)
+    participant Async as async callback<br/>(add_async_callback)
 
-    Agent->>LLM: request
+    Agent->>LLM: async request
     LLM-->>Agent: 429 rate-limit
     Agent->>Agent: honour retry-after
-    Agent->>Emitter: emit RETRY (attempt, max_attempts, delay, reason)
-    Emitter-->>Consumer: RETRY event
+    Agent->>Emitter: emit_async RETRY (attempt, max_attempts, delay, reason)
+    Emitter-->>Sync: RETRY (via emit)
+    Emitter-->>Async: RETRY (via emit_async)
     Agent->>LLM: retry
-    LLM-->>Agent: 200 OK
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef llm fill:#189AB4,stroke:#7C90A0,color:#fff
@@ -344,7 +345,7 @@ sequenceDiagram
     class Agent agent
     class LLM llm
     class Emitter emit
-    class Consumer consumer
+    class Sync,Async consumer
 ```
 
 The `RETRY` event carries its details in `event.metadata`:
@@ -356,6 +357,8 @@ The `RETRY` event carries its details in `event.metadata`:
 | `delay` | `float` | Seconds the agent will wait before retrying |
 | `reason` | `str` | Why the retry fired (e.g. `rate_limit`) |
 
+<Tabs>
+<Tab title="Sync callback">
 ```python
 from praisonaiagents import Agent
 from praisonaiagents.streaming import StreamEvent, StreamEventType
@@ -372,6 +375,37 @@ agent = Agent(instructions="Answer concisely.")
 agent.stream_emitter.add_callback(on_event)
 agent.start("Summarise the news")
 ```
+</Tab>
+
+<Tab title="Async callback">
+The recommended shape for streaming UIs, TUIs, WebSocket bridges, and bot connectors.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonaiagents.streaming import StreamEvent, StreamEventType
+
+async def on_event(event: StreamEvent):
+    if event.type == StreamEventType.RETRY:
+        m = event.metadata or {}
+        await broadcast_status(
+            f"Retrying in {m['delay']:.1f}s "
+            f"(attempt {m['attempt']}/{m['max_attempts']}) — {m['reason']}"
+        )
+
+async def main():
+    agent = Agent(instructions="Answer concisely.")
+    agent.stream_emitter.add_async_callback(on_event)
+    await agent.astart("Summarise the news")
+
+asyncio.run(main())
+```
+</Tab>
+</Tabs>
+
+<Note>
+`RETRY` events reach every registered callback, sync or async. You can mix `add_callback(fn)` and `add_async_callback(afn)` on the same emitter — both fire for every retry. Requires PraisonAI 2026-07-23 or later ([PR #3325](https://github.com/MervinPraison/PraisonAI/pull/3325)); earlier versions dispatched async retries via the sync path only and skipped async-only consumers.
+</Note>
 
 <Note>
 Same signal, two consumers — the [`ON_RETRY` hook](/docs/features/agent-retry) is for programmatic control, while the `RETRY` stream event feeds live UIs and `stream-json` pipelines. The [`run.retry` NDJSON event](/docs/features/run-stream-events) is the CLI-facing form of this same event.
