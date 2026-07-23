@@ -18,13 +18,16 @@ graph LR
     Route -->|gateway| Queue[📥 GatewayApprovalBackend]
     Route -->|http| HTTP[🌐 HTTPApproval]
     Route -->|webhook| Webhook[🔗 WebhookApproval]
+    Route -->|nothing resolves| Deny[⛔ CallbackBackend<br/>deny shell commands]
 
     classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef backend fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
     class YAML input
     class Gate,Route gate
     class Auto,Platform,Queue,HTTP,Webhook backend
+    class Deny deny
 ```
 
 Before this feature, adding `execute_command` to an inbound bot meant building the agent, attaching an approval backend, and lifting the default deny — all in Python. Now the operator flips one flag and the gateway wires everything at bot construction.
@@ -129,8 +132,88 @@ approval_mode == "webhook" OR
 channel_type == "slack"    + resolved id  → SlackApproval(...)
 channel_type == "telegram" + resolved id  → TelegramApproval(...)
 channel_type == "discord"  + resolved id  → DiscordApproval(...)
-otherwise                                 → GatewayApprovalBackend()  (fallback)
+GatewayApprovalBackend importable         → GatewayApprovalBackend()  (fallback)
+otherwise                                 → CallbackBackend (deny shell tools)
+                                            + warning log
 ```
+
+---
+
+## Fail-closed behaviour
+
+When `auto_approve_shell: false` is set but no approval backend can be wired, shell commands are denied instead of silently auto-approved.
+
+```mermaid
+graph LR
+    Off[🔒 auto_approve_shell: false] --> Try{🧭 Any backend<br/>resolves?}
+    Try -->|Yes| Wired[✅ Platform / gateway / http / webhook]
+    Try -->|No| Stale{♻️ Stale AutoApproveBackend<br/>or None?}
+    Stale -->|Yes| Deny[⛔ CallbackBackend<br/>denies shell tools]
+    Deny --> Log[⚠️ warning log]
+
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
+    class Try,Stale gate
+    class Wired ok
+    class Deny,Log deny
+```
+
+`apply_bot_smart_defaults()` may install an `AutoApproveBackend` when `auto_approve_tools` is on. If the shell wiring then finds no `SlackApproval` / `TelegramApproval` / `DiscordApproval` / `GatewayApprovalBackend` / `HTTPApproval` / `WebhookApproval`, leaving that backend in place would auto-approve shell despite the explicit opt-out. The gateway now swaps in a deny-by-default `CallbackBackend`.
+
+| Situation | Outcome |
+|-----------|---------|
+| A backend resolves from the routing ladder | Shell approval routed to that backend. |
+| No backend resolves, existing `AutoApproveBackend` or `None` | Shell tools denied by a `CallbackBackend`; startup logs a warning. |
+| Non-shell tools | Still auto-approved — the deny fence is scoped to `execute_command`, `shell_command`, and `acp_execute_command`. |
+
+The warning line to watch for at startup:
+
+```
+allow_shell with auto_approve_shell=false needs approval_channel,
+approval_mode (gateway|http|webhook), or a custom approval backend on the agent
+— shell commands will be denied until one is configured
+```
+
+<Warning>
+This is a behavioural change. A bot that previously auto-approved shell under `auto_approve_shell: false` (because smart defaults auto-approved tools) now replies *"That command needs approval and was denied."* Add `approval_channel`, set `approval_mode`, or wire a custom backend to restore approvals.
+</Warning>
+
+---
+
+## With routing rules
+
+Routing rules on a shell-enabled channel keep `execute_command` — routed agents are shell-enabled too, not just the default channel clone.
+
+```mermaid
+sequenceDiagram
+    participant Msg as Inbound message
+    participant Bot
+    participant GW as Gateway
+    participant RA as Routed agent (from _agents)
+    participant Clone as Shell-enabled clone (cached)
+
+    Msg->>Bot: chat on channel with allow_shell + routing
+    Bot->>GW: _resolve_agent_for_routing(...)
+    GW-->>Bot: routed agent (raw, no shell)
+    Bot->>GW: _apply_channel_shell(channel, agent)
+    alt Cache miss
+        GW->>RA: clone_for_channel()
+        GW->>Clone: enable_shell_tools(...)
+        GW->>GW: cache in _shell_routed_agents[(ch, id(agent))]
+    else Cache hit
+        GW-->>Bot: cached shell-enabled clone
+    end
+    Bot->>Clone: run(...)
+```
+
+Previously a routing rule swapped in a raw agent that never saw `enable_shell_tools()`, so `execute_command` disappeared for any turn that hit a routing rule — even with `allow_shell: true`. The gateway now re-applies the channel's shell setup to routed agents.
+
+| Behaviour | Detail |
+|-----------|--------|
+| **Routed agents opt in too** | Every routed agent on a shell-enabled channel gains `execute_command`, closing the silent gap. Any routing rule on that channel inherits the shell capability. |
+| **Cloned per `(channel, agent)`** | The routed agent is cloned once per channel-agent pair and cached, so a shared agent used by other channels never gains `execute_command` on channels that did not opt in. |
+| **Reload drops the clones** | Hot-reloading a channel to remove `allow_shell: true` drops the cached shell-enabled clones — the next inbound message uses the non-shell agent. |
 
 ---
 
@@ -161,7 +244,7 @@ The four side effects, in order:
 | **1. Tool injection** | Adds `execute_command` to `agent.tools` if not already present. |
 | **2. Permission grant** | Appends `You can run shell commands on the bot server using the execute_command tool.` to `agent.instructions` (idempotent). |
 | **3. Deny-list lift** | Removes `execute_command`, `shell_command`, and `acp_execute_command` from `agent._perm_deny`. |
-| **4. Approval backend** | Sets `agent._approval_backend` — `AutoApproveBackend()` when auto-approve is on, otherwise the routed platform backend. |
+| **4. Approval backend** | Sets `agent._approval_backend` — `AutoApproveBackend()` when auto-approve is on, the routed platform backend when one resolves, otherwise a deny-by-default `CallbackBackend` that rejects shell tools (see [Fail-closed behaviour](#fail-closed-behaviour)). |
 
 ---
 
@@ -319,6 +402,14 @@ WhatsApp, email, and other channels have no in-channel approval UI. Route them t
 
 <Accordion title="Validate the YAML before starting">
 Run `praisonai gateway lint` — the fail-closed `approval_mode` validator rejects typos at load time, catching `chanel`/`webook` before they strand approvals.
+</Accordion>
+
+<Accordion title="Watch the startup log for '— shell commands will be denied'">
+When `auto_approve_shell: false` resolves no approval backend, the gateway logs a warning and denies shell tools. If your bot suddenly refuses commands with *"needs approval and was denied"*, that log line lists the missing knobs — add `approval_channel`, set `approval_mode`, or wire a custom backend.
+</Accordion>
+
+<Accordion title="Routing rules inherit shell on shell-enabled channels">
+Adding `allow_shell: true` to a channel with routing rules grants `execute_command` to every routed agent on that channel, not just the default one. Keep routing rules narrow on shell-enabled channels, and remove `allow_shell` on reload to drop the cached shell clones.
 </Accordion>
 </AccordionGroup>
 
