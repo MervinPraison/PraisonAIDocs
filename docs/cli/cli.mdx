@@ -25,18 +25,12 @@ graph TB
     Version -->|No| Auth{Credentials<br/>configured?}
     Auth -->|No, TTY| Wizard[🧙 Offer setup wizard]
     Auth -->|No, non-TTY| Err[❌ stderr + exit 1]
-    Auth -->|Yes| LegacyCheck{Bare prompt/YAML?}
+    Auth -->|Yes| RouteCheck{Flag or<br/>.yaml/.yml?}
     Wizard -->|User accepts| SetupRun[⚙️ praisonai setup]
     Wizard -->|User declines| Exit0[💡 Exit 0 with hint]
-    SetupRun --> LegacyCheck
-    LegacyCheck -->|Yes| Legacy[🔄 Legacy shim]
-    LegacyCheck -->|No| Typer[⚡ Typer dispatcher]
-    
-    Legacy --> PromptCheck{Contains spaces?}
-    PromptCheck -->|Yes| FreeText[💬 Free-text prompt]
-    PromptCheck -->|No| FileCheck{YAML file exists?}
-    FileCheck -->|Yes| YAMLFile[📄 YAML workflow]
-    FileCheck -->|No| Typer
+    SetupRun --> RouteCheck
+    RouteCheck -->|No — bare prompt| Typer[⚡ Typer run<br/>modern engine]
+    RouteCheck -->|Yes — YAML / flags| Legacy[🔄 Legacy shim]
     
     classDef version fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef auth fill:#F59E0B,stroke:#7C90A0,color:#fff
@@ -45,12 +39,14 @@ graph TB
     classDef typer fill:#10B981,stroke:#7C90A0,color:#fff
     
     class PrintVersion version
-    class Auth auth
+    class Auth,RouteCheck auth
     class Wizard,SetupRun,Exit0 auth
     class Err error
-    class Legacy,FreeText,YAMLFile legacy
+    class Legacy legacy
     class Typer typer
 ```
+
+A **bare prompt** (no flags, not a `.yaml`/`.yml` file) routes to Typer `run` — the same modern engine as `praisonai run "…"`. Only YAML files and flag-bearing invocations reach the legacy shim.
 
 When no credentials are configured, both `praisonai` (bare) and `praisonai run` check before doing any agent work. In a TTY, the user is offered the setup wizard. In CI or `--output json` mode, the command exits `1` with a clear error on `stderr`. See [First-run Onboarding](/docs/features/first-run-onboarding) for the full behaviour matrix.
 
@@ -58,18 +54,17 @@ When no credentials are configured, both `praisonai` (bare) and `praisonai run` 
 PraisonAI now fails loud on CLI registration errors. If you see a new ImportError after upgrading, a Typer subcommand or one of its dependencies failed to import — fix the import rather than ignoring the error.
 </Note>
 
-## Unknown Command Guard
+## Unknown Command Guard (legacy path)
 
-A bare single-word token that looks like a mistyped or reserved command fails fast with a hint on `stderr` and exit code `2`, instead of becoming a paid one-shot LLM prompt.
+The guard fires on the legacy dispatcher only; a plain `praisonai show` now reaches Typer `run` and is sent to the model as the literal prompt `show`. It only kicks in once an invocation is already on the legacy path — because it carries a flag or points at a `.yaml`/`.yml` file — and a lone token there looks like a mistyped or reserved command.
 
 ```mermaid
 graph LR
-    subgraph "Unknown Command Guard"
-        A[💻 praisonai TOKEN] --> C{🔍 Classify}
+    subgraph "Unknown Command Guard (legacy path)"
+        A[💻 legacy invocation<br/>flag or .yaml] --> C{🔍 Classify}
         C -->|Reserved verb| H[💡 Hint + exit 2]
         C -->|Fuzzy match| S[🧠 Did you mean?]
-        C -->|Multi-word| P[✅ LLM prompt]
-        C -->|Unrelated word| P
+        C -->|Unrelated word| P[✅ LLM prompt]
     end
 
     classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -85,21 +80,21 @@ graph LR
 
 ### What Triggers It
 
-The guard only fires on a **single-word** positional that is not a known command, a file path, or a `.yaml` / `.yml` file. Anything containing a space stays a natural-language prompt.
+The guard runs only when the invocation already reached legacy (a flag or a `.yaml`/`.yml` file) and the lone token looks like a mistyped or reserved command. A bare `praisonai show` skips legacy entirely and routes to Typer `run`.
 
-| Command | Before | After |
-|---------|--------|-------|
-| `praisonai show` | ~10s paid LLM call, exit 0 | `Unknown command: 'show'` hint + `exit 2`, $0, `&lt;100ms` |
-| `praisonai memoyr` | LLM prompt call | `Did you mean: memory?` + `exit 2` |
-| `praisonai "write a poem"` | LLM prompt | LLM prompt (unchanged) |
-| `praisonai hello` | LLM prompt | LLM prompt (unchanged) |
+| Command | Route | Result |
+|---------|-------|--------|
+| `praisonai show` (bare) | Typer `run` | prompt `show` sent to the model |
+| `praisonai show --framework crewai` | Legacy | `Unknown command: 'show'` hint + `exit 2` |
+| `praisonai memoyr --framework crewai` | Legacy | `Did you mean: memory?` + `exit 2` |
+| `praisonai "write a poem"` (bare) | Typer `run` | prompt sent to the model |
 
 ### The Two Hint Shapes
 
-A **reserved verb** prints its canonical replacements:
+On the legacy path, a **reserved verb** prints its canonical replacements:
 
 ```bash
-$ praisonai show
+$ praisonai show --framework crewai
 Unknown command: 'show'
 There is no top-level 'show' command. Did you mean one of:
   praisonai paths           # storage paths
@@ -113,7 +108,7 @@ $ echo $?
 A **typo** of a known command prints a `Did you mean:` suggestion via `difflib` (cutoff `0.8`):
 
 ```bash
-$ praisonai memoyr
+$ praisonai memoyr --framework crewai
 Unknown command: 'memoyr'
 Did you mean: memory?
 Run 'praisonai --help' to see available commands, or use 'praisonai run "<prompt>"' to send a prompt to the model.
@@ -122,24 +117,14 @@ $ echo $?
 ```
 
 <Note>
-The guard is **case-insensitive** — `praisonai SHOW` fires the same reserved-verb hint as `praisonai show`.
+On the legacy path the guard is **case-insensitive** — `praisonai SHOW --framework crewai` fires the same reserved-verb hint as its lowercase form.
 </Note>
-
-### The Escape Hatch
-
-For a genuine one-word prompt, use `run` explicitly:
-
-```bash
-praisonai run "hello"
-```
-
-Or add words so the token contains a space — `praisonai "write a poem"` still runs as a prompt.
 
 ### Exit Codes & Output Stream
 
 | Outcome | Exit code | Stream |
 |---------|:---------:|--------|
-| Guard hit (reserved verb or typo) | `2` | Hint on `stderr` |
+| Guard hit on legacy (reserved verb or typo) | `2` | Hint on `stderr` |
 | Normal prompt or command | `0` | Result on `stdout` |
 
 The hint goes to `stderr` so it can be redirected separately in scripts, and the check runs **before any LLM client is initialised** — cost is `$0`.
@@ -152,6 +137,8 @@ The hint goes to `stderr` so it can be redirected separately in scripts, and the
 # Basic usage - includes 5 built-in tools by default
 praisonai "hello world"
 ```
+
+A bare prompt is **identical to** `praisonai run "hello world"` — same modern engine, same features (session continuity, `--output` modes, credential gate, permissions/checkpoints).
 
 <Frame>
   <img src="./cli-direct-prompt-execution.gif" alt="Direct prompt execution" />
