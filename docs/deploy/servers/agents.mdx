@@ -56,9 +56,51 @@ Deploy single or multi-agent systems as HTTP REST API servers.
   </Step>
 </Steps>
 
+## Security
+
+`praisonai serve agents` drives YAML-defined tools (including `execute_command`), so binding it to a non-localhost interface without authentication is refused.
+
 <Warning>
-`praisonai serve agents` refuses to start on a non-localhost host (anything other than `127.0.0.1` / `localhost` / `::1`) unless an API key is set — because `POST /agents` can execute YAML-defined tools. Provide `PRAISONAI_SERVE_API_KEY` or `--api-key`. See [Serve Agents Authentication](/docs/features/serve-agents-auth).
+Binding to any host other than `127.0.0.1` / `localhost` **requires** an API key. The server exits immediately (`SystemExit`) if neither `--api-key` nor `PRAISONAI_SERVE_API_KEY` is set.
 </Warning>
+
+```bash
+# Localhost — no key required
+praisonai serve agents --port 8000
+
+# Remote — key required (via env var)
+export PRAISONAI_SERVE_API_KEY="your-secret"
+praisonai serve agents --port 8000 --host 0.0.0.0
+
+# Or via flag
+praisonai serve agents --port 8000 --host 0.0.0.0 --api-key "your-secret"
+```
+
+Clients then send the key in the `Authorization: Bearer …` header (mirrors `jobs/server.py`).
+
+```bash
+curl -X POST http://SERVER_IP:8000/agents \
+  -H "Authorization: Bearer your-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is AI?"}'
+```
+
+```mermaid
+graph TB
+    Start[praisonai serve agents] --> Host{Host is<br/>localhost?}
+    Host -->|Yes| Run[Start — no key needed]
+    Host -->|No| Key{--api-key or<br/>PRAISONAI_SERVE_API_KEY?}
+    Key -->|Set| Auth[Start — Bearer auth enforced]
+    Key -->|Missing| Exit[SystemExit — refuse to bind]
+
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Host,Key decision
+    class Run,Auth ok
+    class Exit stop
+```
 
 ## Python - Single Agent
 
@@ -141,8 +183,8 @@ praisonai serve agents --port 8000 --host 0.0.0.0
 # Start agents server (localhost default — no key needed)
 praisonai serve agents --port 8000
 
-# With custom host for remote access (requires an api key)
-export PRAISONAI_SERVE_API_KEY="$(openssl rand -hex 32)"
+# With custom host for remote access (key required — see Security)
+export PRAISONAI_SERVE_API_KEY="your-secret"
 praisonai serve agents --port 8000 --host 0.0.0.0
 
 # With agents file
@@ -175,11 +217,17 @@ praisonai serve agents --port 8000
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
+| `/agents` | POST | Send query to all agents — runs through the cached generator (ToolResolver, tool_timeout, approval, guardrails, retry) |
+| `/agents/{agent_name}` | POST | Call a specific agent through the **same** pipeline as `/agents`. Returns `404` for an unknown name |
 | `/{path}` | POST | Send query to agent(s) |
 | `/{path}/list` | GET | List available agents |
 | `/{path}/{agent_id}` | POST | Call specific agent |
 | `/health` | GET | Health check |
 | `/docs` | GET | Swagger UI |
+
+<Note>
+`/agents` and `/agents/{agent_name}` share one pipeline. The named-agent route previously used a hand-rolled agent that dropped every safety/reliability field; both routes now apply identical YAML lowering.
+</Note>
 
 ## Example Request/Response
 
@@ -199,29 +247,66 @@ curl -X POST http://localhost:8000/ask \
 
 ## Remote Access
 
-Use `host="0.0.0.0"` to allow remote connections. A non-localhost bind requires an API key ([details](/docs/features/serve-agents-auth)):
+Use `host="0.0.0.0"` to allow remote connections. For `praisonai serve agents`, a non-localhost bind **requires** an API key (see [Security](#security)):
+
+<Warning>
+`praisonai serve agents --host 0.0.0.0` without `--api-key` / `PRAISONAI_SERVE_API_KEY` exits immediately with `SystemExit`. Set a key before binding remotely.
+</Warning>
 
 ```bash
-# CLI — set a key first, or startup exits with SystemExit
-export PRAISONAI_SERVE_API_KEY="$(openssl rand -hex 32)"
+# CLI — key required for non-localhost
+export PRAISONAI_SERVE_API_KEY="your-secret"
 praisonai serve agents --port 8000 --host 0.0.0.0
 
-# Python
+# Python launch() — no key gate (mount your own auth if exposing publicly)
 agent.launch(path="/ask", port=8000, host="0.0.0.0")
 ```
 
-Connect from remote:
+Connect from remote (include the Bearer key when serving `agents`):
 ```bash
 curl -X POST http://SERVER_IP:8000/ask \
+  -H "Authorization: Bearer your-secret" \
   -H "Content-Type: application/json" \
   -d '{"query": "Hello"}'
 ```
+
+## How It Works
+
+The `agents` server builds one shared generator per app and routes every request through the same YAML pipeline.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant App as FastAPI (lifespan)
+    participant Gen as AgentsGenerator
+    participant Lock as asyncio.Lock
+
+    App->>Gen: build once at startup
+    Client->>App: POST /agents or /agents/{name}
+    App->>Lock: acquire (serialise cli_config)
+    Lock->>Gen: run through ToolResolver, tool_timeout, approval, guardrails, retry
+    Gen-->>Client: response
+    App->>Gen: close() at shutdown
+
+    classDef app fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef gen fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef lock fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class App app
+    class Gen gen
+    class Lock lock
+```
+
+- **Generator cached per app.** A FastAPI `lifespan` builds a single `AgentsGenerator` at startup and `close()`s it at shutdown — no per-request YAML re-parse, framework re-resolution, or fresh 32-worker tool-timeout pool on every call.
+- **Concurrency-safe.** Concurrent requests are serialised on the shared `cli_config` via a per-app `asyncio.Lock`.
+- **Graceful fallback.** If the cached generator can't be built, the server falls back to the per-request `praisonai.arun` path.
+- **Route convergence.** Both `/agents` and `/agents/{agent_name}` run through the cached generator, so both apply identical YAML lowering (`ToolResolver`, `tool_timeout`, `approval`, `guardrails`, retry policy). `POST /agents/{agent_name}` returns `404` for an unknown name.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PRAISONAI_SERVE_API_KEY` | - | API key for `praisonai serve agents`. Equivalent to `--api-key`. **Required for any non-localhost bind.** |
+| `PRAISONAI_SERVE_API_KEY` | - | API key required to bind `praisonai serve agents` on a non-localhost host. The server exits with `SystemExit` if this is unset and no `--api-key` is passed when `--host` is not localhost. Clients authenticate with `Authorization: Bearer <key>`. |
 | `PRAISONAI_SERVER_READY_TIMEOUT` | `5.0` | Seconds to wait for the FastAPI server to become ready after `.launch()` / `praisonai serve agents`. A warning is logged if exceeded; startup continues. |
 
 ## Troubleshooting
@@ -232,6 +317,7 @@ curl -X POST http://SERVER_IP:8000/ask \
 | Port in use | `lsof -i :8000` then kill process |
 | No agents.yaml | `praisonai --init "topic"` |
 | Missing API key | `export OPENAI_API_KEY="your-key"` |
+| Server exits immediately on `--host 0.0.0.0` | Non-localhost bind needs auth: `export PRAISONAI_SERVE_API_KEY="your-secret"` (or pass `--api-key`) |
 | Missing deps | `pip install "praisonaiagents[os]"` |
 | Connection refused | Use `host="0.0.0.0"` for remote |
 | Firewall blocking | Open port in firewall |
