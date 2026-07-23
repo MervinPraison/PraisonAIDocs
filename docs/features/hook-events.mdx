@@ -732,6 +732,118 @@ def on_persist(event_data):
     return HookResult.allow()
 ```
 
+### CLI Backend Events
+
+| Event | Trigger | Input Type | Use Case |
+|-------|---------|------------|----------|
+| `CLI_BACKEND_EXECUTE` | Agent delegates a turn to a CLI backend subprocess | `CliBackendExecuteInput` | Observability — confirm CLI delegation, log subprocess argv, capture errors |
+
+`CLI_BACKEND_EXECUTE` fires on **both success and failure**, so subprocess startup errors and timeouts stay traceable — the payload's `error` field carries the exception message on the failure path.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant CLI as CLI Backend
+    participant Hook as CLI_BACKEND_EXECUTE
+
+    User->>Agent: prompt
+    Agent->>CLI: subprocess (codex exec / grok -p / …)
+    alt success
+        CLI-->>Agent: text
+        Agent->>Hook: emit (backend, command redacted, content)
+    else failure
+        CLI-->>Agent: error / timeout
+        Agent->>Hook: emit (backend, command redacted, error=<msg>)
+    end
+    Hook-->>Agent: HookResult.allow()
+    Agent-->>User: reply
+```
+
+<Note>
+This hook is **observe-only** — it cannot gate the CLI backend call. Return `HookResult.allow()` (or return nothing). For a policy gate on tool use, register on `BEFORE_TOOL` instead.
+</Note>
+
+#### `CliBackendExecuteInput` Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `backend` | `str` | `""` | Human-readable backend id, e.g. `"claude"`, `"codex"`, `"grok"`, `"gemini"`. Comes from `config.command` when available, else the backend class name. |
+| `command` | `Optional[List[Any]]` | `None` | The full subprocess argv the CLI backend spawned. **Prompt/system values are redacted** (`"<redacted>"`) at serialisation, so log sinks never see the user prompt. |
+| `content` | `Optional[str]` | `None` | The backend's textual response. **Truncated to the first 500 characters** at serialisation. |
+| `error` | `Optional[str]` | `None` | Non-null on failure — carries the exception message from the CLI subprocess or timeout. |
+| `transport` | `str` | `"subprocess"` | Always `"subprocess"` today. Reserved for future transports. |
+| `praisonai_llm_http` | `bool` | `False` | Always `False` — the hook exists precisely because PraisonAI did **not** make an HTTP LLM call this turn. Useful for dashboards proving the LiteLLM path was skipped. |
+| `session_id`, `cwd`, `event_name`, `timestamp`, `agent_name` | — | — | Standard `HookInput` fields. |
+
+<Note>
+Two safety mechanisms apply at `to_dict()` time (the payload that reaches log sinks): prompt/system values that follow `-p`, `--prompt`, `-i`, `--input`, `-m`, `--message`, `--system` are replaced with `"<redacted>"`, and `content` is truncated to the first **500 characters**. The live in-memory `command` field is left untouched — only the serialised payload is redacted.
+</Note>
+
+#### Trace CLI delegation programmatically
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.CLI_BACKEND_EXECUTE)
+def trace_cli_backend(event_data):
+    if event_data.error:
+        print(f"[cli-backend] {event_data.backend} FAILED: {event_data.error}")
+    else:
+        argv = " ".join(str(a) for a in (event_data.command or []))
+        print(f"[cli-backend] {event_data.backend} ok → {argv}")
+    return HookResult.allow()
+
+agent = Agent(
+    name="assistant",
+    instructions="Be helpful.",
+    cli_backend="codex-cli",   # or claude-code, grok-cli, gemini-cli
+    hooks=registry,
+)
+
+agent.start("Refactor utils.py")
+```
+
+The prompt is redacted at the payload boundary:
+
+```
+[cli-backend] codex ok → codex exec --skip-git-repo-check -C /workspace <redacted>
+```
+
+#### Enable the built-in tracer plugin
+
+The `cli_backend_tracer` plugin from **praisonai-plugins** is the batteries-included consumer of this hook — it logs every delegation to the standard `praisonai` logger. Enable it with one env var and a plugin toggle:
+
+```bash
+pip install praisonai-plugins
+export PRAISONAI_CLI_BACKEND_DEBUG=1
+praisonai plugins enable cli_backend_tracer
+```
+
+Or use the standard Python knob:
+
+```bash
+export LOGLEVEL=DEBUG
+```
+
+With either set and the plugin enabled, every `codex exec` / `grok -p` / `gemini -p` / `claude` delegation appears in the log stream, with the prompt value already redacted.
+
+#### What gets masked
+
+`redact_command` masks the value **that follows** these flags, leaving the flag itself visible for verification:
+
+| Flag | Reason it's masked |
+|------|--------------------|
+| `-p`, `--prompt` | The user prompt |
+| `-i`, `--input` | Alternate prompt form (Grok) |
+| `-m`, `--message` | Chat message form |
+| `--system` | System instruction |
+
+Non-list `command` values (already-serialised strings, `None`) pass through unchanged.
+
 ### Kanban Events
 
 | Event | Input Type | Use Case |
@@ -826,6 +938,7 @@ def on_auto_promotion(event_data):
 | `SCHEDULE_TRIGGER` | Schedule | Scheduled job runs |
 | `JOB_COMPLETED` | Background | Background job reached terminal state (COMPLETED or FAILED) |
 | `TOOL_RESULT_PERSIST` | Storage | Before result storage |
+| `CLI_BACKEND_EXECUTE` | CLI Backend | Fires after an Agent delegates a turn to a CLI backend subprocess (success **and** failure). Observe-only. |
 | `KANBAN_TASK_CREATED` | Kanban | Task added to board |
 | `KANBAN_TASK_CLAIMED` | Kanban | Task assigned |
 | `KANBAN_TASK_MOVED` | Kanban | Task status changed (includes auto-promotion: dispatcher fires this with `to_status='ready'` for each dependent task whose parents are all terminal) |
@@ -844,7 +957,7 @@ Gateway and session hooks are emitted by `BotOS` and `BotSessionManager` — no 
 - In async contexts (e.g. inside `BotSessionManager.chat`), emission is fire-and-forget; in sync contexts it is blocking
 
 <Note>
-**`MESSAGE_RECEIVED` and `MESSAGE_SENDING` are policy gates, not passive observers.** `deny` drops the message; `modified_input["content"]` rewrites it. Gateway/session lifecycle events (`GATEWAY_START`, `GATEWAY_STOP`, `SESSION_START`, `SESSION_END`) remain best-effort observability points and do not gate startup or shutdown.
+**`MESSAGE_RECEIVED` and `MESSAGE_SENDING` are policy gates, not passive observers.** `deny` drops the message; `modified_input["content"]` rewrites it. Gateway/session lifecycle events (`GATEWAY_START`, `GATEWAY_STOP`, `SESSION_START`, `SESSION_END`) remain best-effort observability points and do not gate startup or shutdown. `CLI_BACKEND_EXECUTE` is also **observe-only** — it is orthogonal to the message gates and cannot stop the CLI delegation; it only reports that a subprocess turn happened.
 </Note>
 
 ---
