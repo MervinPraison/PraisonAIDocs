@@ -64,6 +64,10 @@ async def main():
 asyncio.run(main())
 ```
 
+<Note>
+Both `from praisonai.cli.features import create_agent_centric_tools` and `from praisonai.cli.features.agent_tools import create_agent_centric_tools` now resolve to the same implementation (canonical: `praisonai_code.cli.features.agent_tools`). Older PraisonAI releases briefly had these resolve to two separate copies — upgrade to the latest `praisonai` release for a single source of truth. See [PR #3361](https://github.com/MervinPraison/PraisonAI/pull/3361).
+</Note>
+
 ## Available Tools
 
 ### ACP-Powered File Tools
@@ -90,6 +94,69 @@ asyncio.run(main())
 |------|-------------|
 | `read_file` | Read file content |
 | `list_files` | List directory contents |
+
+## Timeouts & Cancellation
+
+Every agent-centric tool call is bounded by `PRAISONAI_RUN_SYNC_TIMEOUT` (default **300 seconds**) so a hung ACP/LSP tool can never block the agent indefinitely.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Tool as ACP / LSP Tool
+    participant Bridge as _run_sync
+
+    User->>Agent: "Edit hello.py"
+    Agent->>Tool: acp_edit_file(...)
+    Tool->>Bridge: submit coroutine
+    Note over Bridge: PRAISONAI_RUN_SYNC_TIMEOUT<br/>default 300 s
+    alt within budget
+        Bridge-->>Tool: result
+        Tool-->>Agent: patch applied
+        Agent-->>User: done
+    else timeout exceeded
+        Bridge-->>Tool: TimeoutError (returns promptly)
+        Tool-->>Agent: tool call failed
+        Agent-->>User: timed out
+    end
+```
+
+Override the default five-minute cap by setting the env var before creating the tools:
+
+```python
+import os
+from praisonai.cli.features import (
+    create_agent_centric_tools,
+    InteractiveRuntime,
+    RuntimeConfig,
+)
+from praisonaiagents import Agent
+
+os.environ["PRAISONAI_RUN_SYNC_TIMEOUT"] = "30"  # tighten to 30 s for fast-fail
+
+runtime = InteractiveRuntime(RuntimeConfig(workspace="./my_project", acp_enabled=True))
+# ... await runtime.start()
+tools = create_agent_centric_tools(runtime)
+
+agent = Agent(name="FileAgent", instructions="Edit files with ACP tools.", tools=tools)
+agent.start("Add a hello() function to hello.py")
+```
+
+**Configuration:**
+
+| Env var | Type | Default | Description |
+|---|---|---|---|
+| `PRAISONAI_RUN_SYNC_TIMEOUT` | `float` (seconds) | `300` | Maximum wall-clock time a single agent-centric tool call (`acp_*`, `lsp_*`, `edit_file`, etc.) is allowed before the underlying coroutine is cancelled and `TimeoutError` is raised. |
+
+**Behaviour on timeout:**
+
+- The coroutine is cancelled (`future.cancel()`) and `concurrent.futures.TimeoutError` propagates to the agent.
+- The worker pool is shut down with `wait=False`, so the tool call returns immediately — it does **not** block until the hung coroutine finishes.
+- Because Python threads cannot be force-killed, a hung sync tool may keep running in the background daemon thread; it is reclaimed on interpreter exit. Do not rely on the timeout as a hard security cutoff.
+
+<Warning>
+This env var is **shared** with the wrapper-level `praisonai._async_bridge.run_sync`. Setting it applies to **both** the wrapper bridge (used by gateway, a2u, mcp_server, scheduler) and the `praisonai-code` agent-tool bridge (used by the ACP/LSP tools created above). See [Async Bridge](/features/async-bridge) for the wrapper-level surface.
+</Warning>
 
 ## Tool Details
 
