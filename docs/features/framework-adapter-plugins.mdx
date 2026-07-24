@@ -290,19 +290,21 @@ Framework adapters must implement the `FrameworkAdapter` protocol:
 | `resolve_alias()` | ❌ | Return the concrete adapter name to dispatch to (string). Default returns `self.name`. Override when your adapter is a router that picks a sibling adapter at runtime by name. |
 | `setup(*, framework_tag)` | ❌ | Framework-specific pre-run hooks (default no-op) |
 | `run(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ✅ | Execute framework logic (all four trailing kwargs are validated at registration time — see Troubleshooting) |
-| `arun(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ❌ | Async execution path. When `SUPPORTS_ASYNC` is `False` (default), it offloads `run()` to this adapter's bounded thread pool and logs a one-line warning. Override with a native `async def` for a fully async path. |
+| `arun(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ❌ | Async execution path. Validated at registration time whenever it exists — same rules as `run()`. `arun` remains optional; adapters without it keep the sync-only offload behaviour. When `SUPPORTS_ASYNC` is `False` (default), it offloads `run()` to this adapter's bounded thread pool and logs a one-line warning. Override with a native `async def` for a fully async path. |
 | `cleanup()` | ❌ | Release resources after execution (default no-op; also shuts down the offload pool) |
 | `SUPPORTS_ASYNC` | ❌ | `bool`, default `False`. Set `True` when you override `arun()` with a native `async def`. When `False`, `arun()` offloads `run()` to the adapter's bounded thread pool and logs a one-line warning. |
 | `_THREAD_OFFLOAD_MAX_WORKERS` | ❌ | `int`, default `4`. Size of this adapter's private `ThreadPoolExecutor` used by `arun()`'s sync-offload path. Override on the class or instance for high-concurrency workloads. |
 
 ### Protocol Validation (PR #2083)
 
-Since PR #2083, `FrameworkAdapterRegistry.create()` validates every adapter at construction time. If the `run()` method does not accept the four keyword-only parameters `tools_dict`, `agent_callback`, `task_callback`, and `cli_config`, instantiation fails with:
+Since PR #2083, `FrameworkAdapterRegistry.create()` validates every adapter at construction time. If the `run()` method does not accept the four parameters `tools_dict`, `agent_callback`, `task_callback`, and `cli_config`, instantiation fails with a per-method `TypeError`:
 
 ```
-TypeError: FrameworkAdapter '<name>' does not implement the protocol:
-missing keyword-only parameters ['agent_callback', 'cli_config', 'task_callback', 'tools_dict']
+TypeError: FrameworkAdapter '<name>'.run does not implement the protocol:
+missing keyword parameters ['agent_callback', 'cli_config', 'task_callback', 'tools_dict']
 ```
+
+The error names the failing method (`.run` or `.arun`), so `arun()` is now validated with the same rules whenever it exists. A `run()` (or `arun()`) that declares a `**kwargs` catch-all satisfies the check without listing each protocol keyword explicitly.
 
 Adapters that fail validation also report `registry.is_available("<name>") == False` instead of raising — so a broken plugin will simply disappear from the available-framework list rather than crashing the CLI.
 
@@ -1174,9 +1176,14 @@ gen = AgentsGenerator(
 ## Troubleshooting
 
 <AccordionGroup>
-<Accordion title="TypeError: missing keyword-only parameters ['agent_callback', 'cli_config', 'task_callback', 'tools_dict']">
+<Accordion title="TypeError: <name>.run does not implement the protocol: missing keyword parameters [...]">
 
-Your adapter's `run()` method is missing the four keyword-only parameters required by the `FrameworkAdapter` protocol. As of [PR #2083](https://github.com/MervinPraison/PraisonAI/pull/2083), `FrameworkAdapterRegistry.create()` validates these at adapter construction time.
+Your adapter's `run()` (or `arun()`) method is missing the four parameters required by the `FrameworkAdapter` protocol. As of [PR #2083](https://github.com/MervinPraison/PraisonAI/pull/2083), `FrameworkAdapterRegistry.create()` validates these at adapter construction time. The error names the failing method:
+
+```
+TypeError: FrameworkAdapter '<name>'.run does not implement the protocol:
+missing keyword parameters ['agent_callback', 'cli_config', 'task_callback', 'tools_dict']
+```
 
 Update your `run()` signature to:
 
@@ -1197,11 +1204,22 @@ def run(
 
 Your code can still ignore the values — the signature just needs to accept them. The four parameters can be either `KEYWORD_ONLY` (after `*`) or `POSITIONAL_OR_KEYWORD`; either form passes validation.
 
+A `**kwargs` catch-all also passes — handy when your adapter forwards to a delegate:
+
+```python
+def run(self, config, llm_config, topic, **kwargs):  # ✅ now accepted
+    tools_dict = kwargs.get("tools_dict")
+    agent_callback = kwargs.get("agent_callback")
+    ...
+```
+
 </Accordion>
 
 <Accordion title="My adapter disappeared from the available frameworks list">
 
 If `praisonai --list-frameworks` (or `registry.list_names()`) no longer shows your adapter, run `registry.is_available("<your-adapter-name>")`. Since PR #2083, `is_available()` catches `TypeError` from the new protocol validator and returns `False` rather than raising — so a malformed plugin is silently filtered out of the available list. Since PR #2415, `is_available()` also catches `ImportError` raised during adapter construction (e.g., when the adapter's `__init__` touches an optional dependency). Check the application logs for the error message above and fix the `run()` signature or ensure your dependencies are properly guarded.
+
+A `**kwargs` adapter is no longer a cause of this — if your adapter still disappears, the culprit is a named-parameter signature that omits one of the four protocol kwargs, or an `ImportError` in `__init__`.
 
 </Accordion>
 
