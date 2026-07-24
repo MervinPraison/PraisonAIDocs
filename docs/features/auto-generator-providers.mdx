@@ -151,6 +151,10 @@ async def generate(topic: str):
 
 Prefer `await generator.agenerate()` when you are already in an async context — it avoids the thread-offload overhead. The sync `.generate()` form is provided as a safe fallback.
 
+<Note>
+Under the hood, the worker thread now dispatches to the shared background loop (or the caller's `scoped_bridge()` if one is active) instead of creating a new loop per call — LiteLLM/HTTPX connection pools are preserved across concurrent requests, and per-session loop isolation from `scoped_bridge()` is honoured.
+</Note>
+
 </Step>
 </Steps>
 
@@ -204,11 +208,16 @@ sequenceDiagram
         CLI-->>User: agents created & executed
     else LiteLLM raises exception
         LiteLLM-->>AutoGenerator: Exception (auth/timeout/unsupported)
-        AutoGenerator->>AutoGenerator: log warning + continue
+        AutoGenerator->>AutoGenerator: log warning + keep LiteLLM error
         AutoGenerator->>OpenAI: core OpenAIClient.parse_structured_output(...)
-        OpenAI-->>AutoGenerator: parsed Pydantic object
-        AutoGenerator-->>CLI: agents.yaml
-        CLI-->>User: agents created & executed
+        alt OpenAI fallback succeeds
+            OpenAI-->>AutoGenerator: parsed Pydantic object
+            AutoGenerator-->>CLI: agents.yaml
+            CLI-->>User: agents created & executed
+        else OpenAI fallback also fails
+            OpenAI-->>AutoGenerator: Exception
+            AutoGenerator-->>User: raise OpenAIError from LiteLLMError (both tracebacks shown)
+        end
     end
 ```
 
@@ -221,6 +230,7 @@ The OpenAI fallback runs through the core-owned `praisonaiagents.llm.openai_clie
 | **1. LiteLLM attempt** | Calls `litellm.completion(model=..., response_format=PydanticModel)` |
 | **2. Runtime fallback** | If LiteLLM raises (auth error, timeout, unsupported model), logs a warning and continues |
 | **3. OpenAI fallback** | Delegates to the core-owned `OpenAIClient.parse_structured_output(...)`, which calls `beta.chat.completions.parse` under the hood. Inherits `OPENAI_MAX_RETRIES` automatically. |
+| **3a. Both providers fail** | `OpenAIError` is raised with `__cause__ = LiteLLMError`. The traceback shows both provider failures via Python's `raise ... from` chaining, so users can debug the LiteLLM cause without inspecting log files. |
 | **4. No providers** | Raises `ImportError` with install instructions |
 
 <Note>
@@ -347,6 +357,8 @@ asyncio.run(run())
     - Is the provider having an outage?
 
     Investigate before relying on the fallback long-term.
+
+    If BOTH providers fail, you no longer need to read the log — the raised exception's `__cause__` now holds the original LiteLLM traceback.
   </Accordion>
 
   <Accordion title="Pin model names in config_list for concurrent generators">
