@@ -32,6 +32,10 @@ graph LR
 
 Before this feature, adding `execute_command` to an inbound bot meant building the agent, attaching an approval backend, and lifting the default deny — all in Python. Now the operator flips one flag and the gateway wires everything at bot construction.
 
+<Note>
+**Behaviour change (PraisonAI ≥ 2026-07-24).** Bots now honour `auto_approve_shell: true` for `execute_command` end-to-end. On older builds the tool could still prompt because the auto-approve backend was attached to the agent instance but not the global approval registry. Upgrade to fix — see [Auto-approve still prompting](#troubleshooting).
+</Note>
+
 ## Quick Start
 
 <Steps>
@@ -199,6 +203,7 @@ sequenceDiagram
     Bot->>GW: _apply_channel_shell(channel, agent)
     alt Cache miss
         GW->>RA: clone_for_channel()
+        GW->>Clone: apply_bot_smart_defaults(clone, config)
         GW->>Clone: enable_shell_tools(...)
         GW->>GW: cache in _shell_routed_agents[(ch, id(agent))]
     else Cache hit
@@ -207,10 +212,11 @@ sequenceDiagram
     Bot->>Clone: run(...)
 ```
 
-Previously a routing rule swapped in a raw agent that never saw `enable_shell_tools()`, so `execute_command` disappeared for any turn that hit a routing rule — even with `allow_shell: true`. The gateway now re-applies the channel's shell setup to routed agents.
+Previously a routing rule swapped in a raw agent that never saw `enable_shell_tools()`, so `execute_command` disappeared for any turn that hit a routing rule — even with `allow_shell: true`. The gateway now re-applies the channel's shell setup to routed agents, and runs the full smart-defaults pipeline first.
 
 | Behaviour | Detail |
 |-----------|--------|
+| **Smart defaults inherited** | `_apply_channel_shell` calls `apply_bot_smart_defaults(clone, config)` **before** `enable_shell_tools()`. Routed clones now get the same memory, tool wiring, and guardrails as top-level bots — not only the shell tool. |
 | **Routed agents opt in too** | Every routed agent on a shell-enabled channel gains `execute_command`, closing the silent gap. Any routing rule on that channel inherits the shell capability. |
 | **Cloned per `(channel, agent)`** | The routed agent is cloned once per channel-agent pair and cached, so a shared agent used by other channels never gains `execute_command` on channels that did not opt in. |
 | **Reload drops the clones** | Hot-reloading a channel to remove `allow_shell: true` drops the cached shell-enabled clones — the next inbound message uses the non-shell agent. |
@@ -235,9 +241,10 @@ sequenceDiagram
     Agent->>Agent: instructions += permission-grant line
     Agent->>Agent: _perm_deny -= {execute_command, shell_command, acp_execute_command}
     Agent->>Agent: _approval_backend = <chosen backend>
+    Agent->>Agent: approval registry.set_backend(backend, agent_name)
 ```
 
-The four side effects, in order:
+The five side effects, in order:
 
 | Step | Effect |
 |------|--------|
@@ -245,6 +252,11 @@ The four side effects, in order:
 | **2. Permission grant** | Appends `You can run shell commands on the bot server using the execute_command tool.` to `agent.instructions` (idempotent). |
 | **3. Deny-list lift** | Removes `execute_command`, `shell_command`, and `acp_execute_command` from `agent._perm_deny`. |
 | **4. Approval backend** | Sets `agent._approval_backend` — `AutoApproveBackend()` when auto-approve is on, the routed platform backend when one resolves, otherwise a deny-by-default `CallbackBackend` that rejects shell tools (see [Fail-closed behaviour](#fail-closed-behaviour)). |
+| **5. Approval registry sync** | Mirrors the chosen backend into the global approval registry keyed by `agent.name`, so `@require_approval` tools (`execute_command` is decorated) honour the same policy. |
+
+<Note>
+Step 5 closes the gap that made `auto_approve_shell: true` still prompt. `execute_command` is decorated with `@require_approval`, which consults the **global** approval registry — often with `agent_name=None`. Attaching a backend only to the agent instance was not enough. `enable_shell_tools()` now calls `set_backend(backend, agent_name=agent.name)` after installing the backend, so auto-approval takes effect end-to-end. The related core fix honours `mark_approved()` even for `critical`-risk tools like `execute_command`.
+</Note>
 
 ---
 
@@ -382,6 +394,16 @@ channels:
 ## User Flow
 
 A Slack workspace owner wants their support team to type `@bot run pytest -q` and see results in-thread, but only after they personally approve each command. They edit `gateway.yaml` on the server, add `allow_shell: true`, `auto_approve_shell: false`, and `approval_channel: "UOWNER"` to their `slack:` block, then restart the gateway. From that moment, every shell request from any Slack user triggers a Block Kit approval prompt in the owner's DMs — they tap **Approve** and the command runs; they tap **Deny** and the agent replies *"That command needs approval and was denied."* No Python was written.
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+<Accordion title="Bot still asks for approval with auto_approve_shell: true">
+Upgrade to a PraisonAI build with the approval-registry sync fix (≥ 2026-07-24). On older builds, `auto_approve_shell: true` attached `AutoApproveBackend` to the agent instance only, but `execute_command` is decorated with `@require_approval` and consults the **global** approval registry (often with `agent_name=None`) — so it kept prompting. The fix mirrors the backend into the registry keyed by `agent.name`, and honours `mark_approved()` even for `critical`-risk tools like `execute_command`.
+</Accordion>
+</AccordionGroup>
 
 ---
 
