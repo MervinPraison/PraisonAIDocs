@@ -796,9 +796,9 @@ praisonai gateway restart --host 127.0.0.1 --port 9000
 `gateway restart` is **daemon-aware**: if the gateway is installed as an OS service (`praisonai gateway install`), the platform service manager restarts it (`launchctl kickstart -k`, `systemctl --user restart praisonai-bot`, or `schtasks /End && /Run`) so the installed unit's launch flags are preserved. Otherwise the CLI drains the running PID and relaunches directly in the foreground.
 </Note>
 
-<Warning>
-The **direct** (non-service) fallback cannot recover CLI-only flags the original process was started with (e.g. `--openai-api`, `--mcp`, `--max-concurrent-runs`). For production, either install the daemon or put all settings in `gateway.yaml` so a restart preserves them.
-</Warning>
+<Note>
+The **direct** (non-service) fallback now replays the CLI-only flags the original process was started with (`--openai-api`, `--mcp`, `--reliability`, `--max-concurrent-runs`, `--queue-depth`, `--overflow-policy`, `--identity-store`, `--scale-to-zero`, `--idle-minutes`, `--drain-marker`, `--agents`, `--config`, `--drain-timeout`) from a persisted start-flags artefact — see [Persisted start-flags artefact](#persisted-start-flags-artefact). Flags passed explicitly to `restart` still win; anything else replays the value the running process was launched with.
+</Note>
 
 ### Options
 
@@ -808,7 +808,84 @@ The **direct** (non-service) fallback cannot recover CLI-only flags the original
 | `--port` | `int` | `GATEWAY_PORT` env, else `8765` | Gateway port |
 | `--config` | `str` | none | Path to `gateway.yaml` for direct-relaunch fallback |
 | `--agents` | `str` | none | Path to agent configuration file for direct-relaunch fallback |
-| `--drain-timeout` | `float` | `10.0` | Seconds to wait for in-flight agent turns before relaunch |
+| `--drain-timeout` | `Optional[float]` | _persisted start value, else `10.0`_ | Seconds to wait for in-flight agent turns before relaunch. Omit to replay the persisted start value; explicit value wins over the persisted one and applies to both the OLD-process drain and the relaunch. |
+
+### Persisted start-flags artefact
+
+`praisonai gateway start` persists the CLI-only runtime flags it was launched with to `~/.praisonai/gateway.start.<host>.<port>.json` so a later `praisonai gateway restart` (direct, non-service path) reproduces the exact posture instead of silently reverting to defaults.
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant Start as gateway start
+    participant Disk as gateway.start.host.port.json
+    participant Restart as gateway restart
+
+    Op->>Start: gateway start --openai-api --reliability production --max-concurrent-runs 8
+    Note over Start: validate config / agents / bind slot
+    Start->>Disk: write { openai_api, reliability, max_concurrent_runs }
+    Start-->>Op: bound on 127.0.0.1:8765
+
+    Op->>Restart: gateway restart
+    Restart->>Disk: load persisted flags
+    Restart->>Start: relaunch (persisted, drain = persisted OR 10.0)
+    Start-->>Op: same posture, no silent revert
+
+    classDef op fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef cli fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef disk fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Op op
+    class Start,Restart cli
+    class Disk disk
+```
+
+**Path:** `~/.praisonai/gateway.start.<safe_host>.<port>.json` (or `$PRAISONAI_HOME/gateway.start.<safe_host>.<port>.json` when set). `safe_host` replaces `:` with `_`, so IPv6 hosts work. The artefact is keyed by host:port — multiple gateways on one machine each keep their own posture.
+
+**Persisted keys** (only non-`None` values are stored — `None` means "fall back to YAML"):
+
+| Key | Corresponds to |
+|-----|----------------|
+| `agent_file` | `--agents` |
+| `config_file` | `--config` |
+| `drain_timeout` | `--drain-timeout` |
+| `max_concurrent_runs` | `--max-concurrent-runs` |
+| `queue_depth` | `--queue-depth` |
+| `overflow_policy` | `--overflow-policy` |
+| `reliability` | `--reliability` |
+| `openai_api` | `--openai-api` |
+| `mcp` | `--mcp` |
+| `identity_store` | `--identity-store` |
+| `scale_to_zero` | `--scale-to-zero` |
+| `idle_minutes` | `--idle-minutes` |
+| `drain_marker` | `--drain-marker` |
+
+**Write timing:** the artefact is written **only after** startup validation passes (config parse, agent-file parse, admission wiring), immediately before the gateway binds. A `start` attempt that fails validation on the same host:port never clobbers the running gateway's saved posture — otherwise the next `restart` would faithfully replay a rejected attempt.
+
+<Note>
+On restart, `gateway restart` prints `Replaying persisted start flags: <sorted keys>` before relaunching, so operators see exactly which flags were replayed.
+</Note>
+
+**Precedence on `restart`:**
+
+```mermaid
+graph TB
+    Start([praisonai gateway restart]) --> Explicit{Flag passed<br/>explicitly?}
+    Explicit -->|Yes| ExplicitWins[Explicit wins]
+    Explicit -->|No| Persisted{Persisted<br/>value present?}
+    Persisted -->|Yes| PersistedWins[Replay persisted]
+    Persisted -->|No| Default[Static default<br/>drain_timeout 10.0<br/>others fall back to YAML]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef info fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Explicit,Persisted q
+    class ExplicitWins,PersistedWins ok
+    class Default info
+```
+
+An **omitted** `--drain-timeout` on `restart` no longer forces a fixed 10s window; it replays the persisted value (and only falls back to `10.0` when nothing is persisted). An **explicit** `--drain-timeout` still wins over the persisted value for **both** the OLD-process drain and the relaunch, so a long configured drain is not silently cut off. Fixes [#3349](https://github.com/MervinPraison/PraisonAI/issues/3349).
 
 <Tip>
 On **Windows**, `gateway restart` aborts if `schtasks /End` fails — this prevents a duplicate / colliding gateway relaunch that the raw `/End && /Run` chain would silently produce.
@@ -980,6 +1057,14 @@ See [Secret References](/docs/features/gateway-secret-references) for the full `
   
   <Accordion title="Monitor daemon status regularly">
     Set up monitoring that runs `praisonai gateway status --daemon-only` to detect service failures quickly.
+  </Accordion>
+
+  <Accordion title="Set a runtime flag once — every restart replays it">
+    Stop, restart with the new flag once, and every subsequent `praisonai gateway restart` replays it automatically — `~/.praisonai/gateway.start.<host>.<port>.json` is your on-host record of what the process was launched with. To reset, delete the artefact.
+  </Accordion>
+
+  <Accordion title="Reset to YAML defaults by deleting the artefact">
+    `rm ~/.praisonai/gateway.start.<safe_host>.<port>.json` before the next restart to revert to the YAML defaults (or an empty CLI baseline). A corrupt or unreadable artefact is treated as absent — the restart falls back to explicit flags and defaults.
   </Accordion>
 </AccordionGroup>
 
