@@ -615,6 +615,80 @@ graph LR
     class Blocked blocked
 ```
 
+### Auto-upgrade for repo-linked tasks
+
+Link a task to a git repo and the dispatcher gives it a worktree automatically — no keyword needed.
+
+```python
+from praisonai_bot.kanban.sqlite_store import SQLiteKanbanStore
+
+store = SQLiteKanbanStore()
+
+# repo_path alone opts the task into isolation — workspace_kind is set for you
+task = store.create_task({
+    "title": "Refactor auth module",
+    "repo_path": "/repos/service-a",
+})
+
+assert task.workspace_kind == "worktree"
+assert task.branch == f"kanban/{task.id}"
+assert task.metadata["repo_path"] == "/repos/service-a"
+```
+
+<Note>
+The built-in `kanban_create` agent tool (`praisonai.tools.kanban_tools`) accepts a fixed argument list — `title`, `body`, `assignee`, `status`, `priority`, `board`, `max_retries`, `idempotency_key` — and does **not** forward `repo_path`, `auto_worktree`, or `workspace_kind`. To opt a task into worktree isolation by linkage, call `SQLiteKanbanStore().create_task({...})` directly as shown above.
+</Note>
+
+The upgrade is triggered by *linkage*, not by task content — the task body is never inspected.
+
+```mermaid
+graph TB
+    Start[📋 create_task called] --> Explicit{workspace_kind set<br/>by caller?}
+    Explicit -->|yes| Keep[Keep caller's kind<br/>e.g. default or worktree]
+    Explicit -->|no| AutoFlag{auto_worktree=false?}
+    AutoFlag -->|yes| Default[workspace_kind=default]
+    AutoFlag -->|no| RepoLinked{repo_path points<br/>inside a git repo?}
+    RepoLinked -->|yes| Upgrade[workspace_kind=worktree<br/>branch=kanban/id<br/>metadata.repo_path persisted]
+    RepoLinked -->|no| Default
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef keep fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef def fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef up fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start,Explicit,AutoFlag,RepoLinked q
+    class Keep keep
+    class Default def
+    class Upgrade up
+```
+
+| Task input | Effective `workspace_kind` | Effective `branch` | Notes |
+|---|---|---|---|
+| `repo_path="/repos/svc"` (git repo) | `worktree` | `kanban/<task_id>` | Auto-upgrade fires. `metadata["repo_path"]` is persisted so dispatch sees the same linkage. |
+| `metadata={"repo_path": "/repos/svc"}` | `worktree` | `kanban/<task_id>` | Same — `repo_path` can live inside `metadata` too. |
+| `repo_path="/repos/svc"` + `workspace_kind="default"` | `default` | *(unset)* | Explicit kind always wins. Deliberate opt-out. |
+| `repo_path="/repos/svc"` + `auto_worktree=False` | `default` | *(unset)* | Board- or task-level escape hatch. `metadata["auto_worktree"]=False` works too. |
+| `workspace_kind="worktree"` (no `repo_path`) | `worktree` | `kanban/<task_id>` | Branch is derived at **create** time, not dispatch. |
+| `repo_path="/not/a/repo"` | `default` | *(unset)* | Bad path → not a repo → no upgrade. Never fails the create. |
+| `repo_path="/repos/svc"` + `metadata={"repo_path": "/explicit/other"}` | `worktree` | `kanban/<task_id>` | Explicit `metadata.repo_path` is respected — top-level `repo_path` does not overwrite. |
+
+Disable the upgrade per task (or per board via `metadata`) with `auto_worktree=False`:
+
+```python
+from praisonai_bot.kanban.sqlite_store import SQLiteKanbanStore
+
+store = SQLiteKanbanStore()
+
+# repo-linked, but isolation explicitly disabled
+task = store.create_task({
+    "title": "Read-only audit",
+    "repo_path": "/repos/service-a",
+    "auto_worktree": False,
+})
+
+assert task.workspace_kind == "default"
+```
+
 ### How It Works
 
 The dispatcher forks a worktree from the base branch, runs the worker inside it, then merges the branch back on success.
@@ -671,7 +745,9 @@ graph TB
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `workspace_kind` | `str` | `"default"` | `"worktree"` opts the task into per-task git worktree isolation. Any other value keeps the shared-cwd behaviour. |
-| `branch` | `str \| None` | `None` | Populated by the dispatcher on worktree tasks — `kanban/<task_id>`. Read it via `kanban_show`. |
+| `repo_path` | `str \| None` | `None` | Filesystem path of the git repo this task is linked to. When set and the caller left `workspace_kind` unset, the store upgrades `workspace_kind` to `"worktree"` and persists the resolved path into `metadata["repo_path"]`. Non-git or unreadable paths are treated as unlinked (never fails the create). Also accepted inside `metadata`. |
+| `auto_worktree` | `bool` | `True` | Set to `False` to disable the repo-linked auto-upgrade for this task (or a whole board via `metadata["auto_worktree"]`). Explicit `workspace_kind` always wins over both this flag and `repo_path`. |
+| `branch` | `str \| None` | `None` | Populated at `create_task` time on worktree tasks (auto-upgraded **or** explicit `workspace_kind="worktree"`) — `kanban/<task_id>`. An explicit `branch` in `task_data` is respected. Read it via `kanban_show`. |
 | `worktree_path` | `str \| None` | `None` | Populated by the dispatcher — filesystem path of the worktree (`~/.praisonai/kanban/worktrees/<task_id>`). |
 
 <Note>
@@ -717,6 +793,76 @@ git worktree remove --force ~/.praisonai/kanban/worktrees/task_abc123
 Task IDs are validated (`^[A-Za-z0-9._-]+$`, no leading `.`, no path traversal) before use as a branch ref or path. An unsafe ID **fails closed** — the task refuses to spawn a worker rather than falling back to the shared cwd.
 </Note>
 
+### Lossless-only worktree teardown
+
+The dispatcher never destroys work a worker produced but failed to integrate — a worktree with uncommitted changes or unmerged commits is preserved on disk with a `worktree_preserved` comment on the task.
+
+```mermaid
+sequenceDiagram
+    participant Dispatcher
+    participant Guard as Lossless guard
+    participant Git
+    participant Store as Kanban Store
+
+    Dispatcher->>Git: git merge --no-ff kanban/<id>
+    Dispatcher->>Guard: _remove_worktree(path, branch)
+    Guard->>Git: git status --porcelain
+    Guard->>Git: git rev-list --count base..branch
+    alt Clean tree and 0 commits ahead
+        Guard->>Git: git worktree remove --force
+        alt remove succeeded
+            Git-->>Guard: ok
+            Guard-->>Dispatcher: None (removed)
+            Dispatcher->>Store: drop tracking entry
+        else remove failed (nonzero / exception)
+            Git-->>Guard: error
+            Guard-->>Dispatcher: "worktree removal failed: …"
+            Dispatcher->>Store: add_comment worktree_preserved at <path>: …
+            Note over Dispatcher: tracking entry kept — no orphan
+        end
+    else Dirty or ahead of base
+        Guard-->>Dispatcher: reason string
+        Dispatcher->>Store: add_comment worktree_preserved at <path>: <reason>
+        Note over Dispatcher: worktree left on disk; tracking entry kept
+    end
+```
+
+Every preserved worktree records its reason as a task comment, readable via `kanban_show(task_id)`:
+
+| Reason (recorded on the task) | Trigger | Recovery |
+|---|---|---|
+| `worktree has uncommitted changes` | Worktree still has files in `git status --porcelain` after integration | `cd` into the worktree, `git add -A && git commit`, then rerun cleanup — or discard with `git -C <path> reset --hard HEAD` then remove |
+| `branch has <N> commit(s) not in <base>` | `git rev-list --count <base>..<branch>` > 0 (worker committed something that never merged into base) | Merge or cherry-pick the branch into base by hand, then rerun cleanup, or force-remove if the commits are known-throwaway |
+| `could not read worktree status: <err>` / `could not compute ahead-count: <err>` | The `git status` / `git rev-list` command itself failed | Investigate the worktree state manually — the guard errs toward preservation, so no data is at risk |
+| `worktree removal failed: <detail>` | `git worktree remove --force` returned nonzero | Read the git error, resolve, then rerun cleanup or force-remove |
+| `worktree removal error: <exc>` | `git worktree remove` raised (permissions, missing binary, etc.) | Fix the underlying environment issue, then retry |
+
+To recover a preserved worktree, commit anything worth keeping first, then integrate or remove it from the base repo:
+
+```bash
+# Read the preserved worktree, losslessly commit anything worth keeping
+git -C ~/.praisonai/kanban/worktrees/task_abc123 status
+git -C ~/.praisonai/kanban/worktrees/task_abc123 add -A
+git -C ~/.praisonai/kanban/worktrees/task_abc123 commit -m "recover worker output"
+
+# Then either integrate the branch by hand...
+git merge kanban/task_abc123
+
+# ...or, if the edits are known throwaway, remove the worktree manually
+git worktree remove --force ~/.praisonai/kanban/worktrees/task_abc123
+```
+
+Inside a dispatcher-owned code path (e.g. a custom `KanbanDispatcher` subclass), the equivalent destructive teardown is an explicit `force=True`:
+
+```python
+# Explicitly opt into destructive teardown — bypasses the lossless guard
+dispatcher._remove_worktree(path, branch, force=True)
+```
+
+<Warning>
+`force=True` is destructive by design — use it only when the outstanding work in the worktree is known to be throwaway. In normal operation the dispatcher never sets it.
+</Warning>
+
 ### Best Practices
 
 <AccordionGroup>
@@ -733,7 +879,11 @@ The dispatcher rejects `..`, `/`, leading `.`, spaces, and other invalid chars. 
 </Accordion>
 
 <Accordion title="Sweep stuck worktrees under ~/.praisonai/kanban/worktrees/">
-Every `blocked`-on-conflict task leaves its worktree behind by design. Clean them up with `git worktree remove --force` once the conflict is resolved.
+Both `blocked`-on-conflict tasks and clean-merge tasks with a `worktree_preserved` comment leave their worktree on disk by design. Read the comment for the reason (`kanban_show <task_id>`), integrate any recoverable work by hand, then `git worktree remove --force ~/.praisonai/kanban/worktrees/<task_id>` once resolved.
+</Accordion>
+
+<Accordion title="Prefer repo_path over workspace_kind for repo-scoped work">
+Linking a task to its repo (`repo_path="/repos/foo"`) opts it into isolation *and* records the isolating repo in `metadata` so the dispatcher never loses the linkage. `workspace_kind="worktree"` still works for callers that already track the repo themselves.
 </Accordion>
 </AccordionGroup>
 
