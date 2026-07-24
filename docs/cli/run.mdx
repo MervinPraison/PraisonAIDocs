@@ -14,6 +14,10 @@ For a quick one-off prompt you can omit the `run` subcommand entirely: `praisona
 Single-word direct prompts that look like reserved commands or common typos now fail fast with a hint on `stderr` and exit code `2`. To send a genuine single word to the model, use `praisonai run "<word>"` explicitly. See [Unknown Command Guard](/docs/cli/cli#unknown-command-guard).
 </Note>
 
+<Info>
+`praisonai run` exits **`1`** whenever the agent fails to produce a result. Under `--output json` / `--output stream-json` the failure surfaces as `{"status": "failed", "code": "run_failed"}` with an actionable remediation. See [Exit Codes](#exit-codes) for the full table.
+</Info>
+
 <Note>
 `praisonai run "..."` with no cloud key and no `--model` picks a reachable local model automatically. If Ollama (or any OpenAI-compatible local server) is running, you'll see a one-line stderr notice and the run continues:
 
@@ -291,6 +295,99 @@ praisonai run --output verbose "What is the capital of France?"
 ```
 </Tab>
 </Tabs>
+
+---
+
+## Exit Codes
+
+`praisonai run` returns a non-zero exit code whenever the agent fails to produce a result, so CI pipelines and scripts can branch on the exit code instead of scraping stderr.
+
+```mermaid
+graph LR
+    subgraph "praisonai run outcome"
+        Start[📝 Agent.start/run result] --> Check{🔍 non-empty?}
+        Check -->|Yes: real answer| Ok[✅ exit 0<br/>Run completed]
+        Check -->|No: None or empty| Fail[❌ exit 1<br/>run_failed + remediation]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef failure fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Check gate
+    class Ok success
+    class Fail failure
+```
+
+| Exit | When | Emitted where |
+|------|------|---------------|
+| `0` | Agent returned a non-empty result | All modes |
+| `1` | Agent returned `None` or empty (swallowed LLM/auth error, guardrail block, tool failure, `max_iter` without completion) | All run modes (direct prompt, YAML file, `--agent`, `--attach`, `--profile`, `--profile-deep`) |
+| `1` | No API key configured in CI mode | Direct prompt |
+| `1` | Worktree flag combined with `--attach`, `--agent`, `--command`, or `--profile` | Direct prompt |
+| `1` | Warm-runtime major-version mismatch on `--attach` | `--attach <id>` |
+| `2` | Single-word direct prompt collides with a reserved command / typo guard | Direct prompt |
+
+### Failure payload (`--output json` / `--output stream-json`)
+
+When the agent produces no result, the CLI emits a machine-readable failure object **and** exits `1`:
+
+```json
+{"status": "failed", "result": null}
+```
+
+The paired error event carries the same status and an error code:
+
+```json
+{"code": "run_failed", "status": "failed", "message": "Run failed: the agent did not produce a result."}
+```
+
+The human-facing stderr line includes an actionable remediation:
+
+```
+Run failed: the agent did not produce a result.
+Re-run with --verbose to see the underlying error, or check credentials with: praisonai setup
+```
+
+<Note>
+The failure contract applies to **every** run path — direct prompt, YAML file, `--agent`, `--attach`, `--profile`, and `--profile-deep`. Profiled runs still print the profiling report before exiting non-zero, so you keep the profile even on failure.
+</Note>
+
+### CI usage
+
+Test the run in-process first — the CLI's exit-code contract mirrors this success test.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="Answer succinctly")
+result = agent.start("Summarise yesterday's PRs")
+
+if not (result and (not isinstance(result, str) or result.strip())):
+    raise SystemExit("Agent run failed")
+```
+
+The CLI does the same success test for you and returns exit `1` on failure:
+
+```bash
+# Fails the CI job when the agent swallows an error
+if ! praisonai run "Summarise yesterday's PRs"; then
+  echo "Agent run failed"
+  exit 1
+fi
+
+# Or branch on the JSON status
+result=$(praisonai run --output json "Summarise yesterday's PRs")
+status=$(echo "$result" | jq -r '.status')
+if [ "$status" = "failed" ]; then
+  echo "$result" | jq -r '.message'
+  exit 1
+fi
+```
+
+See [Agent Run Outcomes → CLI Mapping](/docs/features/agent-run-outcomes#cli-mapping-praisonai-run) for how the SDK-level statuses collapse into this single exit signal.
 
 ---
 
