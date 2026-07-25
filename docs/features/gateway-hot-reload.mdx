@@ -43,6 +43,7 @@ graph LR
     Event --> Debounce[⏱️ Debounce 1s]
     Poll --> Debounce
     Debounce --> Diff[🔍 Diff paths]
+    Diff -->|HOT_APPLIABLE_KEYS| Hot[⚡ Hot-apply in place]
     Diff -->|agents.*| Agents[🔄 Recreate agents]
     Diff -->|channels.name.*| Channel[🔄 Restart one channel]
     Diff -->|routes/scheduler| Full[🔄 Full channel restart]
@@ -50,10 +51,12 @@ graph LR
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Edit agent
     class Watcher,Debounce,Diff tool
     class Event,Poll,Agents,Channel,Full warn
+    class Hot good
 
 ```
 
@@ -172,10 +175,82 @@ gateway:
 
 ---
 
+## Hot-Apply (no restart)
+
+Some config paths are safe to apply *in place* — the gateway mutates the live subsystem without restarting agents or channels. When the diff only touches these paths, no drain runs, no client sees a blip.
+
+An operator raising `gateway.reload_drain_timeout` at 3am does **not** disconnect a live conversation:
+
+```python
+from praisonaiagents import Agent
+
+# The agent whose transport is served by the gateway
+agent = Agent(
+    name="ops-bot",
+    instructions="Answer ops questions. Stay connected — I'll be tuning drain timings live.",
+)
+
+agent.start("Under the hood: operators can now raise gateway.reload_drain_timeout "
+            "from 10s to 30s in gateway.yaml without dropping this connection.")
+```
+
+Editing the key in `gateway.yaml` triggers the hot-apply on the next SIGHUP / file save — no restart, no client disconnect, no drain:
+
+```yaml
+# gateway.yaml — before
+gateway:
+  reload_drain_timeout: 10
+
+# gateway.yaml — after (hot-applied on the next SIGHUP / file save)
+gateway:
+  reload_drain_timeout: 30
+```
+
+The health check confirms the change landed **without a restart** — the only changed path is hot-applied:
+
+```python
+payload = gateway.health()
+print(payload["reload"]["changed_paths"])
+# ('gateway.reload_drain_timeout',)  ← the only changed path, hot-applied
+```
+
+The full registry of hot-appliable paths:
+
+| Path | Live effect | What restarts |
+|---|---|---|
+| `gateway.logging.level` | Root/gateway logger level applied immediately | Nothing |
+| `gateway.drain_timeout` | New drain window used on the next graceful drain | Nothing |
+| `gateway.reload_drain_timeout` | New reload-drain window used on the next reload-triggered channel restart | Nothing |
+
+Anything **not** in this registry falls through to the existing restart-based plans — restart is always the safe default for unknown or structural changes. Invalid values (e.g. a non-numeric timeout) are ignored so one bad key never aborts an otherwise-good reload; the applied paths appear in the reload summary line as `hot[...]` and in `health().reload.changed_paths`.
+
+```mermaid
+graph TB
+    Change[✏️ Config change] --> Q{Path in HOT_APPLIABLE_KEYS?}
+    Q -->|Yes| Hot[⚡ Hot-apply in place]
+    Q -->|No, but agents.*| Agents[🔄 Recreate agents]
+    Q -->|No, channels.name.*| Channel[🔄 Restart one channel]
+    Q -->|No, structural| Full[🔄 Full channel restart]
+    Hot --> None[✅ Nothing restarts]
+
+    classDef change fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef restart fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Change change
+    class Q check
+    class Hot,None good
+    class Agents,Channel,Full restart
+```
+
+---
+
 ## Restart Scope
 
 | Changed section | Effect |
 |---|---|
+| `gateway.logging.level`, `gateway.drain_timeout`, `gateway.reload_drain_timeout` | **Hot-apply in place** — no channel restart, no agent recreate (see [Hot-Apply](#hot-apply-no-restart)) |
 | `agents.*` | Recreate agents only — channels keep running |
 | `channels.<name>.*` | Restart only that channel |
 | `channels.<name>.unknown_user_policy` | Re-read policy and rebuild `BotConfig` — re-fires the startup warning |
@@ -257,6 +332,25 @@ print(revision)   # e.g. 'a1b2c3d4e5f6'
 ```
 
 Identical logical configs produce identical revisions regardless of key order or whitespace; an empty or `None` config returns the sentinel `"000000000000"`.
+
+### Inspect the hot-apply registry
+
+`HOT_APPLIABLE_KEYS` and `is_hot_appliable` are public exports from `praisonaiagents.gateway`, so you can query which paths are zero-restart before an edit:
+
+```python
+from praisonaiagents.gateway import HOT_APPLIABLE_KEYS, is_hot_appliable
+
+# The whole registry (frozenset[str], safe to iterate)
+print(sorted(HOT_APPLIABLE_KEYS))
+# ['gateway.drain_timeout', 'gateway.logging.level', 'gateway.reload_drain_timeout']
+
+# Ask about a specific path — matches exact paths AND leaves under a registered key
+is_hot_appliable("gateway.logging.level")          # True
+is_hot_appliable("gateway.logging.level.extra")    # True  (leaf under a registered key)
+is_hot_appliable("agents.assistant.instructions")  # False → falls through to restart plan
+```
+
+The `SupportsHotReload` protocol is `runtime_checkable` — a gateway implementation opts in by defining an `apply_hot_reload(paths, new_config) -> None` method. Third-party gateway subclasses that want the wrapper's hot-apply behaviour implement this method; core owns the classification so every runtime reloads identically.
 
 ### Reload observability flow
 
@@ -342,12 +436,12 @@ The reload machinery is additive: `ReloadStatus` and `compute_config_revision` a
 |---|---|---|
 | Poll interval | `5.0`s | How often the mtime watcher checks the file |
 | Debounce | `1.0`s | Wait after last write before applying |
-| `gateway.reload_drain_timeout` | falls back to `gateway.drain_timeout` | Bounded drain window before a reload-triggered channel restart |
+| `gateway.reload_drain_timeout` | falls back to `gateway.drain_timeout` | Bounded drain window before a reload-triggered channel restart. **Hot-appliable** — edits take effect on the next reload-triggered drain without restarting anything (see [Hot-Apply](#hot-apply-no-restart)). |
 
 ---
 
 <Note>
-**Backward compatibility:** Leaving `reload_drain_timeout` unset preserves the prior immediate-restart behaviour. Not installing `watchdog` keeps polling as before. This is a fully additive change.
+**Backward compatibility:** Leaving `reload_drain_timeout` unset preserves the prior immediate-restart behaviour. Not installing `watchdog` keeps polling as before. This is a fully additive change. The `HOT_APPLIABLE_KEYS` set is a closed core registry; unknown or structural changes still trigger the existing restart plans, so upgrading is drop-in and cannot silently skip a needed restart.
 </Note>
 
 ---
