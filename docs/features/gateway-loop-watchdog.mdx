@@ -1,0 +1,317 @@
+---
+title: "Event-Loop Watchdog"
+sidebarTitle: "Loop Watchdog"
+description: "Detect and self-recover from a wedged asyncio loop in long-lived gateways"
+icon: "stethoscope"
+---
+
+`LoopWatchdog` detects a wedged asyncio loop and hands the process back to your supervisor before the gateway becomes a silent zombie.
+
+```mermaid
+graph LR
+    subgraph "Event-Loop Watchdog"
+        Thread[🧵 OS thread] -->|probe| Loop[🔁 asyncio loop]
+        Loop -->|ack| Thread
+        Thread --> Check{💓 alive?}
+        Check -->|yes| Wait[⏳ next probe]
+        Check -->|no × N| Wedge[🚨 dump + exit 75]
+        Wedge --> Sup[👷 supervisor restart]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef alarm fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Thread input
+    class Loop process
+    class Check,Wait check
+    class Wedge alarm
+    class Sup ok
+```
+
+<Note>
+**Looking for connection heartbeats?** [Gateway Liveness](/docs/features/gateway-liveness) reaps silent **client connections** with `PING`/`PONG` frames. This page covers the **event loop itself** — when the process is up but the loop stops running. The two solve orthogonal problems:
+
+| Concern | Gateway Liveness | Loop Watchdog |
+|---|---|---|
+| What is dead? | An individual **client connection** | The **event loop itself** (process is a zombie) |
+| Detected how? | `PING` / `PONG` frames on the wire | OS-thread probe via `loop.call_soon_threadsafe` |
+| Reaction | Close the connection (`LIVENESS_TIMEOUT`) | Dump stacks and `os._exit(75)` for restart |
+| Config surface | `LivenessConfig` in `gateway.yaml` | Python opt-in via `watchdog.arm(loop)` |
+| Runs on | Gateway reaper task (async) | Dedicated OS thread (survives loop hang) |
+</Note>
+
+## Quick Start
+
+<Steps>
+
+<Step title="Simple usage (defaults)">
+
+Build an agent, then arm the watchdog on the loop that serves it.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonaiagents.gateway import LoopWatchdog
+
+agent = Agent(name="Support", instructions="Reply to users.")
+
+async def serve():
+    # ... your long-lived gateway/serving loop here ...
+    await asyncio.sleep(3600)
+
+loop = asyncio.new_event_loop()
+watchdog = LoopWatchdog()          # probe every 5s, wedge after 3 misses (~15s)
+watchdog.arm(loop)
+try:
+    loop.run_until_complete(serve())
+finally:
+    watchdog.disarm()
+```
+
+</Step>
+
+<Step title="Tune the cadence">
+
+Pass a `LoopWatchdogPolicy` to change how fast a wedge is caught.
+
+```python
+from praisonaiagents.gateway import LoopWatchdog, LoopWatchdogPolicy
+
+watchdog = LoopWatchdog(LoopWatchdogPolicy(
+    probe_interval_s=2.0,               # probe every 2s
+    missed_probes_before_wedged=5,      # wedge only after ~10s of silence
+    dump_file="/var/log/praisonai/loop-wedge.log",
+))
+```
+
+</Step>
+
+<Step title="Observe without exiting (dev / staging)">
+
+Use `dump_only` to catch a hang without killing the process.
+
+```python
+from praisonaiagents.gateway import LoopWatchdog, LoopWatchdogPolicy
+
+watchdog = LoopWatchdog(LoopWatchdogPolicy(on_wedge="dump_only"))
+watchdog.arm(loop)
+# ... later ...
+if watchdog.wedged:
+    print("loop hung at least once; check the stack dump on stderr")
+```
+
+</Step>
+
+</Steps>
+
+---
+
+## How It Works
+
+A dedicated OS thread probes the loop, so it keeps working precisely when the loop does not.
+
+```mermaid
+sequenceDiagram
+    participant Sup as Supervisor
+    participant App as Embedder
+    participant WD as LoopWatchdog<br/>(OS thread)
+    participant Loop as asyncio loop
+
+    App->>WD: arm(loop)
+    loop every probe_interval_s
+        WD->>Loop: call_soon_threadsafe(_ack)
+        alt loop is healthy
+            Loop-->>WD: _ack() runs
+            Note over WD: missed = 0
+        else loop is wedged
+            Note over Loop: _ack never runs
+            Note over WD: missed += 1
+        end
+    end
+    Note over WD: missed >= threshold
+    WD->>WD: faulthandler.dump_traceback(all_threads)
+    WD->>Sup: os._exit(75)
+    Sup-->>App: restart process
+```
+
+| Piece | Owner | Role |
+|---|---|---|
+| `LoopWatchdogPolicy` | Core (pure) | Configuration: cadence, threshold, on-wedge action, exit code, dump file |
+| `LoopWatchdog.arm(loop)` | Embedder call | Spawns daemon OS thread `praisonai-loop-watchdog` |
+| Watchdog thread | Runs off-loop | Schedules `_ack` via `call_soon_threadsafe` every interval |
+| `faulthandler.dump_traceback(all_threads=True)` | Stdlib | All-thread stack dump on wedge |
+| `os._exit(75)` | Stdlib | Bypasses `Py_FinalizeEx` — supervisor sees `EX_TEMPFAIL` |
+| `GATEWAY_RESTART_EXIT_CODE` | Protocol | The `75` constant, shared with the restart-intent codes |
+
+The watchdog uses `os._exit`, not `sys.exit`, on a confirmed wedge. Normal interpreter shutdown runs `Py_FinalizeEx`, which would itself hang trying to join the wedged loop thread — so `os._exit` hands the process straight back to the supervisor, which restarts it cleanly.
+
+---
+
+## Configuration Options
+
+`LoopWatchdogPolicy` holds every knob.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `probe_interval_s` | `float` | `5.0` | Seconds between liveness probes scheduled onto the loop. Also the cadence at which the watchdog thread wakes. Must be finite and `> 0` (raises `ValueError` on `0`, negative, `NaN`, or `inf`). |
+| `missed_probes_before_wedged` | `int` | `3` | Number of **consecutive** probes that must fail to round-trip within their budget before the loop is declared wedged. Must be `>= 1`. |
+| `on_wedge` | `"dump_and_exit"` \| `"dump_only"` | `"dump_and_exit"` | What to do once a wedge is confirmed. `"dump_and_exit"` dumps all-thread stacks then calls `os._exit(exit_code)`; `"dump_only"` dumps stacks but leaves the process running. |
+| `exit_code` | `int` | `75` (`GATEWAY_RESTART_EXIT_CODE`) | Exit code used when `on_wedge == "dump_and_exit"`. Defaults to EX_TEMPFAIL so a supervisor restarts the process. |
+| `dump_file` | `Optional[str]` | `None` | Optional path to *also* write the stack dump to (appended, line-buffered). `None` writes to stderr only. |
+
+**Computed property:**
+
+| Property | Returns | Description |
+|---|---|---|
+| `wedge_after_s` | `float` | `probe_interval_s * missed_probes_before_wedged` — approximate stall before a wedge is declared (defaults: `~15s`). |
+
+`LoopWatchdog` exposes a small surface:
+
+| Method / property | Description |
+|---|---|
+| `LoopWatchdog(policy=None)` | Construct with an explicit `LoopWatchdogPolicy` or accept the defaults. |
+| `arm(loop)` | Start watching `loop` from a daemon OS thread named `praisonai-loop-watchdog`. Idempotent and fail-open. |
+| `disarm()` | Stop watching. Safe to call multiple times / when not armed. Joins the worker (best-effort) with a `probe_interval_s + 1.0s` timeout. |
+| `armed` | `True` iff the worker thread is alive. |
+| `wedged` | `True` once a wedge has been confirmed (mainly useful for `dump_only`). |
+
+---
+
+## Choosing a cadence
+
+Match the probe interval to how fast a wedge must be caught.
+
+```mermaid
+graph TB
+    Q[❓ How fast must a wedge be caught?] --> A{"Latency budget"}
+    A -->|"< 5s (realtime chat)"| Fast["probe_interval_s=1, missed=3<br/>wedge in ~3s"]
+    A -->|"~15s (default)"| Def["probe_interval_s=5, missed=3<br/>wedge in ~15s"]
+    A -->|"~60s (batch)"| Slow["probe_interval_s=10, missed=6<br/>wedge in ~60s"]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef opt fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q,A q
+    class Fast,Def,Slow opt
+```
+
+Shorter intervals bound recovery time but cost a scheduling roundtrip every N seconds; longer intervals reduce noise and false alerts under GC pauses.
+
+<Warning>
+A long stop-the-world GC or a big **synchronous** blocking call inside a coroutine looks like a wedge if it exceeds `wedge_after_s`. If you legitimately do 20-second sync work on the loop, either raise `wedge_after_s` above it or — better — push the work off the loop with `run_in_executor` / `asyncio.to_thread`.
+</Warning>
+
+<Info>
+`faulthandler` writes one per-thread traceback on a wedge. Read the **loop thread** first (typically `MainThread` or the asyncio worker) — that's where the actual hang is. Other threads may just be blocked waiting on that one.
+</Info>
+
+---
+
+## Fail-open guarantees
+
+A misbehaving watchdog must never kill a healthy gateway.
+
+- `arm()` while already armed is a no-op.
+- `disarm()` when not armed is safe.
+- Any exception inside probe scheduling, dumping, or exiting is swallowed.
+- A closed / stopped loop is **not** a wedge — scheduling onto it is a normal shutdown, so the missed counter resets and the watchdog keeps failing open.
+- A `disarm()` racing an in-flight wedge suppresses the destructive `os._exit` — a deliberate shutdown never triggers a supervisor restart.
+
+---
+
+## Common Patterns
+
+Three ways teams wire the watchdog.
+
+**Long-lived embedder (production):** keep the defaults and wire the process to your existing supervisor (systemd / Kubernetes / pm2). `EX_TEMPFAIL (75)` is the same exit code the rest of the restart-intent protocol uses, so any supervisor that already restarts the gateway handles this too.
+
+```python
+from praisonaiagents.gateway import LoopWatchdog
+
+watchdog = LoopWatchdog()          # defaults trip at ~15s
+watchdog.arm(loop)
+```
+
+**Diagnostic-only mode (staging):** catch a hang without killing the process, inspect the dump, then flip to `dump_and_exit` in production.
+
+```python
+from praisonaiagents.gateway import LoopWatchdog, LoopWatchdogPolicy
+
+watchdog = LoopWatchdog(LoopWatchdogPolicy(
+    on_wedge="dump_only",
+    dump_file="/var/log/praisonai/loop-wedge.log",
+))
+watchdog.arm(loop)
+```
+
+**Custom exit code for a bespoke supervisor:** override `exit_code` if you can't use `75`.
+
+```python
+from praisonaiagents.gateway import LoopWatchdog, LoopWatchdogPolicy
+
+watchdog = LoopWatchdog(LoopWatchdogPolicy(exit_code=42))
+watchdog.arm(loop)
+```
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+
+<Accordion title="Only arm in long-lived processes">
+Short-lived CLI runs don't need the watchdog — the process exits anyway. Arm it around gateways, bots, and other loops that must stay up for hours.
+</Accordion>
+
+<Accordion title="Always pair arm(loop) with disarm() in finally">
+The watchdog is a daemon thread and never blocks shutdown, but `disarm()` also joins it cleanly and prevents any race with a shutdown-time wedge.
+</Accordion>
+
+<Accordion title="Do not shorten the interval below your longest sync block">
+A 100ms interval false-positives under GC or big JSON serialisation. Keep `probe_interval_s` above your longest expected synchronous block on the loop.
+</Accordion>
+
+<Accordion title="Make sure your supervisor restarts on EX_TEMPFAIL">
+systemd (`Restart=on-failure`) restarts on `75`; a naive `nohup` does not. See [Exit Codes](/docs/features/gateway-exit-codes) for the full restart-intent contract.
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+
+<Card title="Gateway Liveness" icon="heart-pulse" href="/docs/features/gateway-liveness">
+Connection-level heartbeats that reap silent clients (disambiguation).
+</Card>
+
+<Card title="Exit Codes" icon="hashtag" href="/docs/features/gateway-exit-codes">
+The shared `EX_TEMPFAIL (75)` restart-intent protocol.
+</Card>
+
+<Card title="Forensics" icon="magnifying-glass" href="/docs/features/gateway-forensics">
+What to keep on unhealthy exits.
+</Card>
+
+<Card title="Crash-Loop Guard" icon="shield" href="/docs/features/gateway-crash-loop-guard">
+Guard against restart storms.
+</Card>
+
+<Card title="Restart Continuation" icon="rotate" href="/docs/features/gateway-restart-continuation">
+Re-drive interrupted turns after the restart.
+</Card>
+
+</CardGroup>
+
+{/* SDK verification — every claim above maps to a test in tests/unit/test_gateway_loop_watchdog.py:
+  test_policy_defaults, test_policy_validation, test_policy_rejects_non_finite_interval,
+  test_disarm_when_not_armed_is_safe, test_healthy_loop_not_tripped, test_wedged_loop_detected,
+  test_wedge_writes_dump_file, test_arm_is_idempotent, test_disarm_suppresses_in_flight_exit,
+  test_closed_loop_does_not_trip.
+  Source: praisonaiagents/gateway/liveness.py; re-exported from praisonaiagents/gateway/__init__.py;
+  GATEWAY_RESTART_EXIT_CODE = 75 in praisonaiagents/gateway/protocols.py. */}
