@@ -7,6 +7,10 @@ icon: "stethoscope"
 
 `LoopWatchdog` detects a wedged asyncio loop and hands the process back to your supervisor before the gateway becomes a silent zombie.
 
+<Info>
+**Running `praisonai gateway start`?** You don't need to write any Python — the gateway wires the watchdog for you. Add `gateway.watchdog: { enabled: true }` to `gateway.yaml`, or pass `--watchdog` on the CLI. See [Using it from the gateway](#using-it-from-the-gateway) below.
+</Info>
+
 ```mermaid
 graph LR
     subgraph "Event-Loop Watchdog"
@@ -43,7 +47,84 @@ graph LR
 | Runs on | Gateway reaper task (async) | Dedicated OS thread (survives loop hang) |
 </Note>
 
-## Quick Start
+## Using it from the gateway
+
+Most operators run `praisonai gateway start` — turn the watchdog on with YAML or a CLI flag, no Python required.
+
+<Tabs>
+
+<Tab title="YAML (recommended)">
+
+Add a `watchdog` block under `gateway` and start as usual.
+
+```yaml
+# gateway.yaml
+gateway:
+  watchdog:
+    enabled: true
+    liveness_interval: 5      # seconds between loop probes
+    liveness_strikes: 3       # hard-exit after N consecutive misses (wedge_after ≈ 15s)
+    dump_file: /var/log/praisonai/loop-wedge.log   # optional; stderr always gets the dump
+```
+
+```bash
+praisonai gateway start --config gateway.yaml
+```
+
+The gateway arms the watchdog right before `_server.serve()` and disarms it in `finally` and on `stop()`.
+
+</Tab>
+
+<Tab title="CLI flags">
+
+Pass `--watchdog` to enable it for a single run — the flags override the matching YAML fields.
+
+```bash
+# Enable with defaults (probe every 5s, wedge after ~15s)
+praisonai gateway start --config gateway.yaml --watchdog
+
+# Set a specific wedge budget (splits into 3 strikes → probe interval = budget / 3)
+praisonai gateway start --config gateway.yaml --watchdog --watchdog-timeout 15
+
+# Works without a YAML file too (no-config WebSocket-only mode)
+praisonai gateway start --watchdog
+```
+
+`restart` replays these flags automatically via the persisted start-flags — you do not re-pass them.
+
+</Tab>
+
+<Tab title="Python (custom runtime)">
+
+Embedding your own asyncio runtime? Arm the watchdog on the loop directly.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonaiagents.gateway import LoopWatchdog
+
+agent = Agent(name="Support", instructions="Reply to users.")
+
+async def serve():
+    # ... your long-lived gateway/serving loop here ...
+    await asyncio.sleep(3600)
+
+loop = asyncio.new_event_loop()
+watchdog = LoopWatchdog()          # probe every 5s, wedge after 3 misses (~15s)
+watchdog.arm(loop)
+try:
+    loop.run_until_complete(serve())
+finally:
+    watchdog.disarm()
+```
+
+</Tab>
+
+</Tabs>
+
+---
+
+## Quick Start (custom runtime)
 
 <Steps>
 
@@ -148,6 +229,18 @@ sequenceDiagram
 
 The watchdog uses `os._exit`, not `sys.exit`, on a confirmed wedge. Normal interpreter shutdown runs `Py_FinalizeEx`, which would itself hang trying to join the wedged loop thread — so `os._exit` hands the process straight back to the supervisor, which restarts it cleanly.
 
+### Health signal
+
+When the watchdog is configured, `GET /health` (or `gateway.health()` in-process) includes a `watchdog` block.
+
+| Field | Type | Description |
+|---|---|---|
+| `watchdog.enabled` | `bool` | Always `true` when the block is present (implied by the block existing at all). |
+| `watchdog.armed` | `bool` | `true` while `_server.serve()` is running; flips to `false` on graceful `stop()`. |
+| `watchdog.wedge_after_s` | `float` | `liveness_interval * liveness_strikes` — the effective wedge budget. |
+
+The block is omitted entirely from `health()` when the watchdog isn't configured — an always-on gateway sees no shape change.
+
 ---
 
 ## Configuration Options
@@ -177,6 +270,46 @@ The watchdog uses `os._exit`, not `sys.exit`, on a confirmed wedge. Normal inter
 | `disarm()` | Stop watching. Safe to call multiple times / when not armed. Joins the worker (best-effort) with a `probe_interval_s + 1.0s` timeout. |
 | `armed` | `True` iff the worker thread is alive. |
 | `wedged` | `True` once a wedge has been confirmed (mainly useful for `dump_only`). |
+
+### YAML config keys
+
+The `gateway.watchdog` block is a thin façade over `LoopWatchdogPolicy` for gateway operators.
+
+| YAML key (under `gateway.watchdog.*`) | Type | Default | Maps to | Description |
+|---|---|---|---|---|
+| `enabled` | `bool` \| `"true"`/`"yes"`/`"on"` | `false` | — | Master switch. Omit or set to `false` and the gateway does not create a watchdog at all — zero cost. |
+| `liveness_interval` | `float` | `5.0` | `LoopWatchdogPolicy.probe_interval_s` | Seconds between probes scheduled onto the loop. |
+| `liveness_strikes` | `int` | `3` | `LoopWatchdogPolicy.missed_probes_before_wedged` | Consecutive missed probes before a wedge is declared. |
+| `dump_file` | `str` \| `null` | `null` | `LoopWatchdogPolicy.dump_file` | Optional path to also write the stack dump to. `null` writes to stderr only. |
+
+An invalid value (for example `liveness_interval: 0`) fails closed: the gateway logs a warning and runs without a watchdog.
+
+### CLI flag reference
+
+- `--watchdog` — enable the watchdog for this run (sets/overrides `gateway.watchdog.enabled: true`).
+- `--watchdog-timeout <seconds>` — total wedge budget in seconds. Derives `liveness_interval = budget / liveness_strikes` (keeps the default 3 strikes unless YAML overrides). `--watchdog-timeout 15` → probe every 5s. `--watchdog-timeout 6` → probe every 2s.
+
+### Precedence
+
+Highest wins: `--watchdog[-timeout]` CLI flag → `gateway.watchdog.*` YAML block → off. Missing values fall back down the chain — an unset CLI flag does **not** clobber `enabled: true` in YAML.
+
+```mermaid
+graph TB
+    CLI["⚙️ --watchdog / --watchdog-timeout"] -->|set| Win[✅ Watchdog config]
+    CLI -->|unset| YAML["📄 gateway.watchdog.*"]
+    YAML -->|enabled: true| Win
+    YAML -->|absent / false| Off[⏹️ Off — zero cost]
+
+    classDef cli fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef yaml fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef win fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef off fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class CLI cli
+    class YAML yaml
+    class Win win
+    class Off off
+```
 
 ---
 
@@ -261,6 +394,14 @@ watchdog.arm(loop)
 ## Best Practices
 
 <AccordionGroup>
+
+<Accordion title="Turn it on wherever a supervisor can restart the process">
+systemd's `Restart=on-failure`, launchd's `KeepAlive`, Docker's `restart: unless-stopped`, and Kubernetes all handle exit code 75 correctly. If your supervisor doesn't, the watchdog will still dump stacks but the process won't come back — either fix the supervisor or use `on_wedge="dump_only"` for diagnostics.
+</Accordion>
+
+<Accordion title="Prefer YAML over CLI flags for permanent deployments">
+CLI flags survive `restart` via persisted start-flags, but a colleague reading `gateway.yaml` learns the watchdog is on. The YAML block is the discoverable configuration surface.
+</Accordion>
 
 <Accordion title="Only arm in long-lived processes">
 Short-lived CLI runs don't need the watchdog — the process exits anyway. Arm it around gateways, bots, and other loops that must stay up for hours.
