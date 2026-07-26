@@ -137,6 +137,11 @@ from .protocols import (
     is_weak_secret,
     assert_gateway_secret_strong,
 )
+from .liveness import (
+    # Event-loop liveness watchdog (Issue #3385)
+    LoopWatchdogPolicy,
+    LoopWatchdog,
+)
 from .hooks import (
     HookAction,
     HookConfig,
@@ -158,6 +163,10 @@ from .config import (
     DeliveryConfig,
     PollingConfig,
     LivenessConfig,
+    # Hot-reload registry (Issue #3378)
+    HOT_APPLIABLE_KEYS,
+    SupportsHotReload,
+    is_hot_appliable,
 )
 
 # Lazy loading cache
@@ -334,6 +343,9 @@ __all__ = [
     "WeakGatewaySecretError",
     "is_weak_secret",
     "assert_gateway_secret_strong",
+    # Event-loop liveness watchdog (Issue #3385)
+    "LoopWatchdogPolicy",
+    "LoopWatchdog",
     # Inbound trigger / webhook contract (Issue #2281)
     "HookAction",
     "HookConfig",
@@ -353,6 +365,10 @@ __all__ = [
     "DeliveryConfig",
     "PollingConfig",
     "LivenessConfig",
+    # Hot-reload registry (Issue #3378)
+    "HOT_APPLIABLE_KEYS",
+    "SupportsHotReload",
+    "is_hot_appliable",
     # Implementations (lazy loaded from praisonai wrapper)
     "WebSocketGateway",
     "GatewaySession",
