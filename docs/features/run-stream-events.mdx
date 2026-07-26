@@ -13,7 +13,7 @@ agent.start("Process this request and stream each step as it completes.")
 ```
 
 
-`praisonai run --output stream-json` emits a per-step NDJSON event stream for CI pipelines, scripts, and observability tools.
+`praisonai run --output stream-json` emits a per-step NDJSON event stream for CI pipelines, scripts, and observability tools. This works for single-agent runs **and** YAML / AgentTeam runs — team member events are fanned in on a single stream and tagged with the emitting agent's `agent_id`.
 
 ```bash
 praisonai run --output stream-json "Find the weather in London"
@@ -111,6 +111,127 @@ sequenceDiagram
 
 **Run-level lifecycle events** (`run.start`, `agent.message`, `run.result`, `run.error`) are driven directly by the CLI. **Per-step events** (`tool.*`, `text.delta`, `reasoning.delta`) come through the `StreamEventBridge` callback.
 
+On YAML / AgentTeam runs, the bridge attaches to `team.stream_emitter` — a lazy aggregate `StreamEventEmitter` that fans in every member agent's events and tags each with the emitting `agent_id`.
+
+---
+
+## YAML / Multi-Agent Runs
+
+YAML and AgentTeam runs emit the same NDJSON contract as single-agent runs, with an extra `agent_id` field on per-step events.
+
+```bash
+praisonai run agents.yaml --output stream-json
+```
+
+Every team member's events fan in on one stream, and each per-step event carries an `agent_id` so consumers can attribute activity to a specific member.
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+researcher = Agent(name="Researcher", instructions="Research the topic.")
+writer     = Agent(name="Writer",     instructions="Summarise the findings.")
+
+team = PraisonAIAgents(
+    agents=[researcher, writer],
+    tasks=[
+        Task(description="Find recent news on quantum computing", agent=researcher),
+        Task(description="Write a 3-sentence summary",           agent=writer),
+    ],
+)
+
+# The team's aggregate stream_emitter fans in per-agent events.
+# The CLI `--output stream-json` attaches to this automatically.
+team.start()
+```
+
+```mermaid
+graph LR
+    subgraph "AgentTeam Fan-In"
+        A1[🤖 Researcher] -->|events| TE[📡 team.stream_emitter]
+        A2[🤖 Writer]     -->|events| TE
+        TE --> Bridge[🔗 StreamEventBridge]
+        Bridge --> NDJSON[📜 NDJSON stdout]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef emit  fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef out   fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A1,A2 agent
+    class TE,Bridge emit
+    class NDJSON out
+```
+
+Each member agent forwards its per-step events onto `team.stream_emitter`, which the bridge turns into NDJSON on stdout.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as praisonai run agents.yaml
+    participant Bridge as StreamEventBridge
+    participant TE as team.stream_emitter
+    participant A1 as Researcher
+    participant A2 as Writer
+    participant Stdout as NDJSON stdout
+
+    User->>CLI: --output stream-json
+    CLI->>Bridge: _attach_stream_bridge(team)
+    Bridge->>Stdout: run.start (schema_version: 1)
+    CLI->>A1: astart()
+    A1-->>TE: tool_call_start (tagged agent_id=Researcher)
+    TE-->>Bridge: forward
+    Bridge->>Stdout: tool.start (agent_id: Researcher)
+    A1-->>TE: text.delta
+    TE-->>Bridge: forward
+    Bridge->>Stdout: text.delta (agent_id: Researcher)
+    CLI->>A2: astart()
+    A2-->>TE: text.delta
+    TE-->>Bridge: forward
+    Bridge->>Stdout: text.delta (agent_id: Writer)
+    CLI->>Bridge: _detach_stream_bridge
+    Bridge->>Stdout: run.result (ok: true)
+```
+
+### Example NDJSON for a team run
+
+```jsonl
+{"event":"run.start","data":{"schema_version":1,"target":"agents.yaml","model":"gpt-4o-mini","framework":"praisonai"}}
+{"event":"agent.message","data":{"schema_version":1,"agent":"Researcher"}}
+{"event":"tool.start","data":{"schema_version":1,"agent_id":"Researcher","tool":"web_search","args":{"query":"quantum computing news"}}}
+{"event":"tool.result","data":{"schema_version":1,"agent_id":"Researcher","tool":"web_search","result":"...","ok":true}}
+{"event":"text.delta","data":{"schema_version":1,"agent_id":"Writer","text":"Recent breakthroughs include "}}
+{"event":"text.delta","data":{"schema_version":1,"agent_id":"Writer","text":"error-corrected qubits..."}}
+{"event":"run.result","data":{"schema_version":1,"ok":true,"result":"Recent breakthroughs include error-corrected qubits..."}}
+```
+
+### Group events by agent
+
+Filter one member's events with `jq`:
+
+```bash
+praisonai run agents.yaml --output stream-json \
+  | jq -c 'select(.data.agent_id == "Researcher")'
+```
+
+Route deltas to per-agent buffers in Python:
+
+```python
+import json, subprocess, collections
+
+buffers = collections.defaultdict(list)
+proc = subprocess.Popen(
+    ["praisonai", "run", "agents.yaml", "--output", "stream-json"],
+    stdout=subprocess.PIPE, text=True,
+)
+for line in proc.stdout:
+    ev = json.loads(line)
+    if ev["event"] == "text.delta":
+        buffers[ev["data"].get("agent_id", "?")].append(ev["data"]["text"])
+for agent_id, chunks in buffers.items():
+    print(f"--- {agent_id} ---")
+    print("".join(chunks))
+```
+
 ---
 
 ## Event Schema (schema_version = 1)
@@ -129,6 +250,12 @@ Every NDJSON line is a JSON object with `event` and `data` keys. Every `data` ob
 | `run.retry` | Before a retry wait, on rate-limit / transient-error backoff | `schema_version`, `attempt`, `max_attempts`, `delay`, `reason` |
 | `run.result` | Successful run end | `schema_version`, `ok: true`, `result` |
 | `run.error` | Run or transport failure | `schema_version`, `ok: false`, `error` |
+
+### Optional fields
+
+| Field | Type | Present on | Description |
+|-------|------|------------|-------------|
+| `agent_id` | `str` \| `null` | `tool.*`, `text.delta`, `reasoning.delta`, `run.retry` | Emitting team member's `agent_id` (falls back to `display_name`). Present on YAML/team runs; absent (or `null`) on single-agent runs. |
 
 ### Example NDJSON output
 
@@ -277,6 +404,8 @@ Emitted when a run-level, streaming, or transport failure occurs. Also emitted f
   }
 }
 ```
+
+On YAML / AgentTeam runs, `run.error` is now emitted when `team.astart()` raises. This lets stream-json consumers distinguish a **failed** team run from an **incomplete / still-running** one. The original exception is always re-raised — the `run.error` emit is best-effort and does not mask it.
 </Accordion>
 
 </AccordionGroup>
@@ -305,6 +434,8 @@ for line in proc.stdout:
 <Note>
 Pin your consumer against `schema_version: 1`. Future backward-incompatible changes will increment this value so you can detect and handle them gracefully.
 </Note>
+
+The `agent_id` field on per-step events is a **new optional field** — a forward-compatible addition that does not change `schema_version`. Consumers can ignore it and keep working on both single-agent and team runs.
 
 ---
 
@@ -425,5 +556,11 @@ Concatenating `text.delta` chunks is useful for live display, but `run.result.da
   </Card>
   <Card title="CLI Backend Protocol" icon="plug" href="/docs/features/cli-backend-protocol">
     Backend protocol for custom CLI integrations
+  </Card>
+  <Card title="YAML / Team Session Continuity" icon="folder-tree" href="/docs/features/yaml-session-continuity">
+    Resume and continue YAML / AgentTeam runs across sessions
+  </Card>
+  <Card title="Multi-Agent Output" icon="layer-group" href="/docs/features/multi-agent-output">
+    How multi-agent runs structure and surface their output
   </Card>
 </CardGroup>
