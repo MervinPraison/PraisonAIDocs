@@ -260,6 +260,7 @@ The `praisonai-train` CLI groups subcommands into **data** (`generate`, `validat
 | `benchmark` | Compare deployments by throughput, latency, and success rate | [Speed Benchmark](/docs/features/praisonai-train-benchmark) |
 | `dedup` | Exact + MinHash/LSH near-dedup across many JSONL files | [Cross-file dedup](/docs/features/praisonai-train-dataset-tooling#cross-file-dedup) |
 | `llm` | Fine-tune a base LLM on a generated dataset | [Train CLI → llm](/docs/cli/train#praisonai-train-llm) |
+| `export` | Publish an already-trained model (HF / GGUF / Ollama) without re-training | [Train CLI → export](/docs/cli/train#praisonai-train-export) |
 | `agents` | Distil an agent workflow into a dataset for training | [Train CLI → agents](/docs/cli/train#praisonai-train-agents) |
 | `serve` | Serve a trained GGUF on an OpenAI-compatible endpoint (MTP for Gemma-4) | [Serve](#serve-a-trained-model) |
 | `export` | Publish / convert an already-trained model without re-training | [Export](#export-an-already-trained-model) |
@@ -1046,7 +1047,36 @@ graph TB
 
 ## Config validation
 
-Before any model download or GPU load, the trainer validates the config and fails fast with a single actionable line. Runs no longer die 20 minutes in on missing credentials or a wrong quantization name.
+The trainer runs a preflight pass on load — **before** any model, dataset, GPU, or download is touched — so a non-developer gets a clean, actionable error in seconds instead of a traceback after minutes.
+
+```mermaid
+graph TB
+    Start[📋 config.yaml] --> Req{Required keys?}
+    Req -->|missing| E1[❌ minimal example]
+    Req -->|ok| Tgt{Publish target set?}
+    Tgt -->|missing| E2[❌ hf_model_name / ollama_model required]
+    Tgt -->|ok| Gpu{train: true<br/>+ no GPU?}
+    Gpu -->|yes| E3[❌ No CUDA GPU]
+    Gpu -->|no| Cred{Publishing<br/>+ no HF creds?}
+    Cred -->|yes| E4[❌ Run huggingface-cli login]
+    Cred -->|no| Disk{< 10 GB free?}
+    Disk -->|yes| E5[❌ Low disk]
+    Disk -->|no| Quant{Bad --quant?}
+    Quant -->|yes| E6[❌ invalid quantization]
+    Quant -->|no| Ok[✅ Train / publish]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef error fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Req,Tgt,Gpu,Cred,Disk,Quant decision
+    class E1,E2,E3,E4,E5,E6 error
+    class Ok success
+```
+
+### Required keys
 
 ### Preflight checks
 
@@ -1070,18 +1100,49 @@ ValueError: Config is missing required keys: ['model_name', 'max_seq_length', 'd
     - name: yahma/alpaca-cleaned
 ```
 
-<Note>
-**`train: false` skips the CUDA check.** A publish/export-only config runs fine on CPU because there's nothing to fine-tune. A cached `huggingface-cli login` counts as HF credentials — you don't need `HF_TOKEN` set as well.
-</Note>
+### GPU check
+
+Enforced only when `train: true` (the default). A publish-only or export-only run (`train: false`) is valid on CPU — cross-link [Publishing](#publishing).
+
+```
+No CUDA GPU detected. Fine-tuning needs a GPU. On a rented box check the driver; on CPU it cannot run.
+```
+
+### Hugging Face credentials
+
+When publishing is enabled, **either** an `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` env var **or** a cached `huggingface-cli login` (read via `huggingface_hub.get_token()`) is accepted — you don't need both.
+
+```
+Publishing to Hugging Face is enabled but no credentials were found. Run `huggingface-cli login` or `export HF_TOKEN=hf_...`. To train without publishing, set huggingface_save: false.
+```
 
 <Tip>
-**Unknown-key suggestions.** If you set `num_sample: 100` (typo), the trainer collects all unknown keys and prints them in one block with the closest known key inline:
+Already ran `huggingface-cli login`? You do **not** also need to `export HF_TOKEN` — the cached login counts.
+</Tip>
+
+### Disk headroom
+
+The trainer needs at least **10 GB** free on the `output_dir` volume (or `.` when `output_dir` is unset).
+
+```
+Low disk: only 3.2 GB free on the training disk (need ~10 GB minimum). Free up space or set output_dir to a larger disk.
+```
+
+### Quantization method
+
+Enforced only when a GGUF or Ollama push is enabled. Valid values: `q4_k_m`, `q5_k_m`, `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q3_k_m`, `q6_k`, `f16`, `bf16`, `q2_k`. An unknown value lists all valid choices.
+
+### Unknown keys
+
+Unrecognized keys don't crash — the trainer collects **all** of them and prints one block with the closest known key suggested via `difflib`:
 
 ```
 WARNING: unrecognized config key(s) — these will be ignored:
   - num_sample  (did you mean 'num_samples'?)
+  - max_step    (did you mean 'max_steps'?)
 ```
-</Tip>
+
+Training continues after the warning.
 
 <Warning>
 **Clean errors, no tracebacks.** Preflight and known runtime failures print a single `ERROR: <msg>` line and exit with code `1`. Real bugs still show the full traceback. `Ctrl-C` exits with code `130` and a single `Interrupted.` line.
@@ -1114,6 +1175,18 @@ graph TB
 ```
 
 `train: false` is a valid config — the trainer skips training **and** publishing (previously it crashed with an `AttributeError` on a `None` model).
+
+### Publish without re-training
+
+Already trained a model? Publish it with [`praisonai train export`](/docs/cli/train#praisonai-train-export) — no dataset, no re-training.
+
+```bash
+praisonai-train export hf     --model-dir lora_model --hf     me/my-model
+praisonai-train export gguf   --model-dir lora_model --hf     me/my-model --quant q4_k_m
+praisonai-train export ollama --model-dir lora_model --ollama me/my-model --quant q4_k_m
+```
+
+`for_export()` skips the training-only validation — an export-only run needs no `dataset:` (or a config file at all). See [Export an already-trained model](/docs/features/praisonai-train-package#exporting-an-already-trained-model).
 
 ### Publishing failure modes
 
@@ -1148,6 +1221,14 @@ A rejected Hub push turns into a one-line fix, not a stack trace.
 **Chat-template fallback warns loudly.** When no known family (`llama`, `qwen`, `gemma`, `mistral`, `phi`, `deepseek`) matches your `model_name`, the trainer prints `WARNING: no known chat template matched...` and falls back to a generic Llama-style template. Verify the Ollama output, or set `model_name` to a recognized family. Empty stop tokens are skipped, so the Modelfile never emits a broken `PARAMETER stop` line.
 </Note>
 
+<Warning>
+Publish-auth failures translate to one clean, actionable line:
+
+- **HF 401** — `Hugging Face rejected the token (401). It is invalid or expired — run huggingface-cli login or export HF_TOKEN=hf_... with a valid write token.`
+- **HF 403** — `No write access to '<repo>' (403). The repo must be under your own username and the token must have write scope. Set hf_model_name to '<your-username>/<name>'.`
+- **Ollama 401/403** — `Ollama rejected the push (unauthorized). Register your public key at https://ollama.com/settings/keys ...` and prints your local `~/.ollama/id_ed25519.pub`. The model must be namespaced as `<username>/<name>`.
+</Warning>
+
 ---
 
 ## Run summary
@@ -1165,6 +1246,40 @@ Just before training starts, the trainer prints a one-block summary so you can c
 ```
 
 The `Loss mask:` line is the resolved `auto` / `true` / `false` decision — `assistant replies only` or `full sequence`. The block now also reports the GPU count (`× N GPUs` under `torchrun`), the held-out eval count (`+N eval`), the checkpoint strategy, and the final `final_model_dir` — so you can verify the whole run resolved as intended without reading the DEBUG noise.
+
+---
+
+## Non-developer errors
+
+The trainer translates the failures hit in practice into a single clean `ERROR:` line — never a traceback for these.
+
+| What went wrong | Error you see |
+|---|---|
+| No GPU on a training run | `ERROR: No CUDA GPU detected. Fine-tuning needs a GPU. On a rented box check the driver; on CPU it cannot run.` |
+| Publishing enabled, no HF login | `ERROR: Publishing to Hugging Face is enabled but no credentials were found. Run huggingface-cli login or export HF_TOKEN=hf_...` |
+| < 10 GB free disk | `ERROR: Low disk: only X.X GB free on the training disk (need ~10 GB minimum). Free up space or set output_dir to a larger disk.` |
+| Wrong `--quant` value | `ERROR: quantization_method 'q4km' is not valid. Choose one of: bf16, f16, q2_k, q3_k_m, q4_0, q4_1, q4_k_m, q5_0, q5_1, q5_k_m, q6_k, q8_0.` |
+| HF token rejected | `ERROR: Hugging Face rejected the token (401). It is invalid or expired — run huggingface-cli login or export HF_TOKEN=hf_... with a valid write token.` |
+| No write access to HF repo | `ERROR: No write access to '<repo>' (403). The repo must be under your own username and the token must have write scope. Set hf_model_name to '<your-username>/<name>'.` |
+| Ollama daemon didn't come up | `ERROR: ollama serve did not become ready in 15.0 seconds.` + the captured `ollama serve` stderr |
+| Ollama key not registered | `ERROR: Ollama rejected the push (unauthorized). Register your public key at https://ollama.com/settings/keys ...` + your local `~/.ollama/id_ed25519.pub` |
+| Not enough disk on the Ollama volume | `ERROR: Not enough disk for the Ollama model: X.X GB free on '<dir>', need ~Y GB. Point Ollama at a bigger disk, e.g. export OLLAMA_MODELS=/big/disk/ollama-models` |
+
+<Note>
+`ollama serve` readiness honours `OLLAMA_HOST` — the probe hits `GET /api/version` on the resolved endpoint (forms `host`, `host:port`, `http://host:port`, `[::1]:11434`), so a healthy remote daemon is used instead of being ignored.
+</Note>
+
+Everything else — a genuine bug — still shows its full traceback so it's not silently swallowed. `Ctrl-C` exits `130`.
+
+---
+
+## Silent-behaviour NOTES
+
+Three behaviours that used to surprise users now print an explicit `NOTE:` / `WARNING:` line.
+
+- **`num_samples` takes the first N rows before shuffle** — repeated runs with the same seed use the same deterministic subset.
+- **`split_type` of `validation` / `valid` / `test` / `eval` is ADDED to the training set** — no validation set is held out. Warned via `WARNING: dataset split_type '<x>' is ADDED to the training set`.
+- **Default `max_steps: 2800`** fires when neither `num_train_epochs` nor `max_steps` is set: `NOTE: neither num_train_epochs nor max_steps set; defaulting to max_steps: 2800. Set num_train_epochs: 1-3 (or max_steps) to be explicit.` When **both** are set, `max_steps` silently wins (logged at DEBUG).
 
 ---
 
