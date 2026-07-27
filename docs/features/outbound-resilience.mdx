@@ -1,11 +1,11 @@
 ---
 title: "Outbound Resilience"
 sidebarTitle: "Outbound Resilience"
-description: "Auto-retry agent replies on every bot channel with backoff, Retry-After honouring, and DLQ park on permanent failure"
+description: "Retry transient send failures on every bot channel and park permanently-failed replies in a per-platform durable DLQ — safe by default, no config needed."
 icon: "shield"
 ---
 
-Outbound Resilience makes sure your agent's reply actually reaches the user on every channel, retrying transient send errors and parking permanently-failed replies in a DLQ for later replay.
+Outbound Resilience makes sure your agent's reply actually reaches the user on every channel — retrying transient send errors with bounded backoff, and **parking permanently-failed replies in a durable per-platform DLQ by default** so they can be replayed instead of silently lost. No configuration is required.
 
 <Note>
 **Safe by default (as of PraisonAI #3447 / PR #3446).** The outbound reply is a durable delivery obligation by default — symmetric with the inbound journal. A permanent or exhausted send failure is **automatically parked** at `~/.praisonai/state/<platform>/outbound_dlq.sqlite` so it can be replayed, without any configuration. To disable durable parking entirely, set `outbound_resilience.enabled = false`.
@@ -32,7 +32,7 @@ graph LR
         Send -->|transient 429/503| Backoff[⏳ Backoff Retry]
         Backoff --> Send
         Send -->|success| Success[✅ Delivered]
-        Backoff -->|max attempts| DLQ[💾 DLQ Park]
+        Backoff -->|max attempts| DLQ["💾 DLQ Park\n(~/.praisonai/state/&lt;platform&gt;/)"]
         DLQ --> Replay[🔁 Replay Later]
     end
 
@@ -52,8 +52,8 @@ graph LR
 ## Quick Start
 
 <Steps>
-<Step title="Works out of the box">
-Resilience is on by default — no config needed. Every bot adapter already retries transient failures automatically.
+<Step title="Retry and durable parking are both on by default">
+Every bot adapter retries transient failures with backoff **and** parks a permanent / exhausted failure at a canonical per-platform DLQ so nothing is silently lost — with no config on your side.
 
 ```python
 from praisonaiagents import Agent
@@ -65,24 +65,39 @@ agent = Agent(
 )
 bot = SlackBot(token="xoxb-...", agent=agent)
 bot.start()
-# Transient Slack 5xx / rate-limit responses are now retried automatically.
+# Transient Slack 5xx / rate-limit responses are retried.
+# A permanently-failed reply (bad channel, revoked bot, etc.) is parked at
+#   ~/.praisonai/state/slack/outbound_dlq.sqlite
+# for later replay — with no config on your side.
 ```
 </Step>
 
-<Step title="Tune retries and park failures in a DLQ">
-Set `outbound_resilience` in `praisonai.yml` to customise backoff and persist exhausted failures for replay.
+<Step title="Override the defaults only when you need to">
+Set `outbound_resilience` in `praisonai.yml` only to override defaults — e.g. more attempts, a longer cap, or a custom DLQ path.
 
 ```yaml
 bots:
   slack:
     outbound_resilience:
-      enabled: true
       initial_ms: 1000
-      max_ms: 10000
-      factor: 1.5
+      max_ms: 30000
+      factor: 2.0
       max_attempts: 5
       jitter: 0.25
-      dlq_path: ~/.praisonai/state/slack-outbound-dlq.sqlite
+      # dlq_path: /var/lib/praisonai/slack-dlq.sqlite  # optional override
+```
+
+The default DLQ path is `~/.praisonai/state/<platform>/outbound_dlq.sqlite` — only set `dlq_path` if you need it elsewhere (e.g. a shared volume in Docker).
+</Step>
+
+<Step title="Opt out with a single flag">
+`enabled: false` disables **both** retry and durable parking on that channel — a permanently-failed reply on that channel is lost, matching the pre-safe-by-default behaviour.
+
+```yaml
+bots:
+  email:
+    outbound_resilience:
+      enabled: false
 ```
 </Step>
 </Steps>
@@ -121,37 +136,31 @@ When a send fails, the adapter classifies the error:
 |---|---|---|
 | **Success** | Platform returned 2xx | Done — no further action |
 | **Transient retry** | 429 / 503 / network error | Wait (honouring `Retry-After`) and retry |
-| **Exhausted → DLQ** | Max attempts reached on transient error | Parked in the DLQ (default path unless overridden); exception re-raised |
-| **Permanent error → DLQ** | 4xx (not 429) | Parked in the DLQ immediately; exception re-raised |
-
-### Transient storage recovery
-
-If the DLQ file can't be created on the first send (disk full, temporary permission error, container FS not yet mounted), the mixin logs the failure once and degrades **that send** to retry-only, but **does not** latch the resilience state as ready. The next `deliver_outbound()` re-attempts DLQ init, so the moment storage recovers the durable park is restored automatically — the operator does not have to restart the bot.
-
-```
-[slack] Failed to initialize outbound DLQ (will retry on next send): ...
-```
-
-This means: a permanently-failed reply *during* the outage is lost (best-effort documented behaviour); every reply after storage recovers is parked as normal.
+| **Exhausted → DLQ** | Max attempts reached on transient error | Parked in the default DLQ (`~/.praisonai/state/<platform>/outbound_dlq.sqlite`), or the custom `dlq_path`; exception re-raised |
+| **Permanent error → DLQ** | 4xx (not 429) | Parked immediately; exception re-raised |
+| **Storage transiently unavailable** | DLQ init failed on this send | Degrades to retry-only for **this** send; state does not latch — the next send re-attempts DLQ init and parks the reply once storage recovers |
+| **`enabled: false`** | Operator opted out | One attempt, no retry, no parking; original exception re-raised |
 
 ---
 
 ## Which Channels Does This Apply To?
 
-Resilience is on by default for every adapter. Every channel now parks permanent / exhausted failures in a per-platform DLQ **by default** — no `dlq_path` required.
+Both retry/backoff **and** durable DLQ parking are on by default for every adapter — no `dlq_path` opt-in required.
 
-| Channel | Default | DLQ on exhaust |
+| Channel | Retry/backoff | DLQ on exhaust |
 |---|---|---|
-| Telegram | ✅ on | ✅ default |
-| Slack | ✅ on | ✅ default |
-| Discord | ✅ on | ✅ default |
-| WhatsApp | ✅ on | ✅ default |
-| Email | ✅ on | ✅ default |
-| Linear | ✅ on | ✅ default |
-| AgentMail | ✅ on | ✅ default |
+| Telegram | ✅ default-on | ✅ default-on¹ |
+| Slack | ✅ default-on | ✅ default-on¹ |
+| Discord | ✅ default-on | ✅ default-on¹ |
+| WhatsApp | ✅ default-on | ✅ default-on¹ |
+| Email | ✅ default-on | ✅ default-on¹ |
+| Linear | ✅ default-on | ✅ default-on¹ |
+| AgentMail | ✅ default-on | ✅ default-on¹ |
+
+¹ Default DLQ location: `~/.praisonai/state/<platform>/outbound_dlq.sqlite`. Override with `outbound_resilience.dlq_path`; disable with `outbound_resilience.enabled = false`.
 
 <Note>
-Both the retry/backoff **and** the DLQ park are the "safe by default" posture — no operator-visible opt-in required. Before this feature shipped, retry/backoff only existed in the Telegram adapter; it is now the default for every adapter via the shared `OutboundResilienceMixin`, with no API change required.
+**Safe by default ([PR #3447](https://github.com/MervinPraison/PraisonAI/pull/3447)).** The outbound DLQ is now enabled on every adapter without any configuration — mirroring the inbound journal, which has been durable-by-default since PraisonAI #1915. A permanent send failure is parked at `~/.praisonai/state/<platform>/outbound_dlq.sqlite` for replay instead of silently dropped. The operator escape hatch is `outbound_resilience.enabled = false`.
 </Note>
 
 Both **text and media** now inherit the same policy:
@@ -189,15 +198,15 @@ All settings live under `outbound_resilience` in your channel config (in `praiso
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | `bool` | `True` | Set to `False` to opt this channel out — only one attempt, no DLQ park. |
+| `enabled` | `bool` | `True` | Set to `False` to opt this channel out entirely — one attempt, no retry, no DLQ. |
 | `initial_ms` | `int` | `1000` | First backoff delay in milliseconds. |
 | `max_ms` | `int` | `10000` | Maximum backoff delay (caps exponential growth). |
 | `factor` | `float` | `1.5` | Multiplicative growth factor per retry. |
 | `max_attempts` | `int` | `3` | Total attempts before parking (1 = no retry). |
 | `jitter` | `float` | `0.25` | Random jitter fraction (0.0–1.0) applied to each delay. |
-| `dlq_path` | `str \| None` | _(canonical per-platform path — see below)_ | Override the DLQ file location. When omitted, the DLQ defaults to `~/.praisonai/state/<platform>/outbound_dlq.sqlite` so permanent failures are always parked. Set this only if you need the DLQ on a different filesystem. |
+| `dlq_path` | `str \| None` | `~/.praisonai/state/<platform>/outbound_dlq.sqlite` | Where permanent / exhausted failures are parked. Defaults to the canonical per-platform store (mirrors the inbound journal). Set to override for a shared volume, a custom filesystem, or a distinct file per instance. |
 
-The canonical default path is resolved via `resolve_durable_store_dir(<platform>)` and mirrors the inbound journal. Set the `PRAISONAI_HOME` environment variable to relocate the whole `~/.praisonai/` root (useful in tests or containers).
+The canonical default path is resolved via `resolve_durable_store_dir(<platform>)`. Set the `PRAISONAI_HOME` environment variable to relocate the whole `~/.praisonai/` root (useful in tests or containers).
 
 <Note>
 Before PraisonAI #3447 you had to set `dlq_path` to opt into a DLQ park. On #3447+ that step is unnecessary — the default path is already applied. Existing configs that set `dlq_path` continue to work unchanged (an explicit path always wins over the default).
@@ -209,34 +218,70 @@ Full YAML example:
 bots:
   slack:
     outbound_resilience:
-      enabled: true
-      initial_ms: 1000
-      max_ms: 10000
-      factor: 1.5
+      # dlq_path is optional — defaults to ~/.praisonai/state/slack/outbound_dlq.sqlite
       max_attempts: 5
-      jitter: 0.25
-      dlq_path: ~/.praisonai/state/slack-outbound-dlq.sqlite
+      max_ms: 30000
+      factor: 2.0
   discord:
     outbound_resilience:
-      enabled: true
+      # Custom DLQ path for a shared volume
+      dlq_path: /var/lib/praisonai/state/discord/outbound_dlq.sqlite
       max_attempts: 3
-      dlq_path: ~/.praisonai/state/discord-outbound-dlq.sqlite
 ```
+
+---
+
+## Transient DLQ Init Recovery
+
+If the default DLQ path is briefly unwritable when the adapter tries to initialise it (SQLite lock, disk permission race, transient FS error), Outbound Resilience does **not** latch itself into a permanently-degraded state. The failed send this turn is retried at the transport level and the DLQ init is re-attempted on the **next** send — so a first-turn storage blip does not silently disable durable parking for the life of the process.
+
+```mermaid
+sequenceDiagram
+    participant Send as 📤 send #1
+    participant Init as 🔧 DLQ init
+    participant Storage as 💾 Storage
+    participant Send2 as 📤 send #2
+
+    Send->>Init: build OutboundDLQ(path)
+    Init->>Storage: open sqlite
+    Storage-->>Init: OSError (transient)
+    Note over Init: log warning<br/>degrade THIS send<br/>do NOT latch _ready
+    Init-->>Send: retry-only path (no park)
+    Send-->>Send: exception re-raised
+
+    Note over Storage: storage recovers
+
+    Send2->>Init: build OutboundDLQ(path) (retry)
+    Init->>Storage: open sqlite
+    Storage-->>Init: ok
+    Init-->>Send2: DLQ ready, park permanent failures
+```
+
+You will see a `Failed to initialize outbound DLQ (will retry on next send): <error>` warning in the log the first time this happens; a subsequent send will silently succeed if storage has recovered.
 
 ---
 
 ## Common Patterns
 
-**Opt one channel out:**
+**Opt one channel out entirely:**
 
 ```yaml
 bots:
   email:
     outbound_resilience:
-      enabled: false
+      enabled: false   # one attempt, no retry, no DLQ park
 ```
 
-**Aggressive retry for a flaky upstream:**
+**Use a shared DLQ path (e.g. a Docker volume):**
+
+```yaml
+bots:
+  slack:
+    outbound_resilience:
+      dlq_path: /var/lib/praisonai/state/slack/outbound_dlq.sqlite
+```
+
+**Aggressive retry for a flaky upstream (defaults handle 99% of cases):**
 
 ```yaml
 bots:
@@ -245,38 +290,48 @@ bots:
       max_attempts: 5
       max_ms: 30000
       factor: 2.0
-      dlq_path: ~/.praisonai/state/whatsapp-outbound-dlq.sqlite
 ```
 
-**DLQ replay** — failed messages parked in the SQLite DLQ can be replayed using the same tooling as the inbound DLQ. See [Inbound DLQ](/docs/features/inbound-dlq) for the analogous replay command pattern.
+**DLQ replay** — failed replies parked in the SQLite DLQ can be replayed with the same tooling as the inbound DLQ. See [Inbound DLQ](/docs/features/inbound-dlq) for the analogous replay command.
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Keep the default ~/.praisonai/state/ writable">
+  The default DLQ path is `~/.praisonai/state/<platform>/outbound_dlq.sqlite`. If your process runs as a user with no home directory, or `~/.praisonai/` is on a container tmpfs, parked failures are still logged but lost on restart — set `PRAISONAI_HOME` to a persistent path or override `dlq_path` explicitly.
+</Accordion>
+
 <Accordion title="Default values are sane — only tune when you see real DLQ growth">
   The defaults (`initial_ms=1000`, `max_ms=10000`, `max_attempts=3`) handle the vast majority of transient failures. Only adjust them after observing DLQ entries accumulating in your SQLite file — that signals the defaults are too aggressive or too conservative for your traffic.
 </Accordion>
 
-<Accordion title="Use a persistent dlq_path (not /tmp or a container tmpfs)">
-  Store the DLQ on a persistent, local filesystem path. If you use `/tmp` or an in-container tmpfs, parked failures are lost on restart — defeating the purpose of the DLQ.
+<Accordion title="Override dlq_path only for shared or per-instance filesystems">
+  The default `~/.praisonai/state/<platform>/outbound_dlq.sqlite` is already persistent on any conventional deployment. Set `dlq_path` when you need a shared filesystem (multi-replica) or a distinct file per instance.
 
   ```yaml
-  # ✅ Good: persistent path
-  dlq_path: ~/.praisonai/state/slack-outbound-dlq.sqlite
+  # ✅ Default — durable, per-platform, isolated
+  # (omit dlq_path)
 
-  # ❌ Bad: lost on restart
+  # ✅ Shared volume — multi-replica setup
+  dlq_path: /var/lib/praisonai/state/slack/outbound_dlq.sqlite
+
+  # ❌ Bad — lost on container restart
   dlq_path: /tmp/slack-dlq.sqlite
   ```
 </Accordion>
 
 <Accordion title="Don't disable resilience just because retries are slow — increase factor or max_ms instead">
-  Slow retries usually mean the platform backoff is long (e.g., `Retry-After: 60`). The mixin already honours `Retry-After` headers automatically. Increase `max_ms` to allow longer waits rather than disabling resilience entirely.
+  Slow retries usually mean the platform backoff is long (e.g., `Retry-After: 60`). The mixin already honours `Retry-After` headers automatically. Increase `max_ms` to allow longer waits rather than disabling resilience entirely — `enabled: false` also throws away durable parking, which is almost never what you want.
 </Accordion>
 
 <Accordion title="Durable park is the default — no separate mode to opt into">
   Outbound Resilience now parks permanent and exhausted failures automatically. You don't need to set `dlq_path` or opt in to a separate "durable delivery" mode — the mixin uses the same canonical `~/.praisonai/state/<platform>/outbound_dlq.sqlite` store as the inbound journal. Set `outbound_resilience.enabled = false` only if you genuinely want the pre-#3447 retry-without-park behaviour (fire-and-forget channels, ephemeral test bots).
+</Accordion>
+
+<Accordion title="Pair with Durable Delivery when you need crash-safety across process restarts">
+  Outbound Resilience retries within a single process lifetime and parks a permanent failure in the DLQ. If your process crashes mid-retry — before parking — the message is lost. For full crash-safe delivery with a SQLite outbox and startup drain, use [Durable Delivery](/docs/features/durable-delivery) alongside Outbound Resilience.
 </Accordion>
 </AccordionGroup>
 
