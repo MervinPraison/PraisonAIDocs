@@ -89,7 +89,105 @@ snapshot.restore(info.commit_hash)
 ```
 
 </Step>
+
+<Step title="Re-root After a Workspace">
+
+`Agent.__init__` roots change tracking at `os.getcwd()`. Attach a per-session directory later, then call `set_snapshot_root()` so `undo()` restores the right place:
+
+```python
+from praisonaiagents import Agent, AutonomyConfig
+
+agent = Agent(
+    name="Editor",
+    instructions="Edit files carefully.",
+    autonomy=AutonomyConfig(track_changes=True),
+)
+
+# Later — once you know the workspace the tools will actually write to
+agent.set_snapshot_root("/tmp/session-42/workspace")
+
+agent.start("Rename getUserName in src/user.js")
+agent.undo()  # restores /tmp/session-42/workspace, not process cwd
+```
+
+</Step>
 </Steps>
+
+---
+
+## Re-rooting Change Tracking
+
+`set_snapshot_root(project_path)` re-roots `undo`/`redo`/`diff` at a directory known only after construction — the moment a bot, gateway, or custom wrapper attaches a per-chat `Workspace`.
+
+```mermaid
+sequenceDiagram
+    participant Wrapper as Bot/Gateway wrapper
+    participant Agent
+    participant FS as FileSnapshot
+    participant Git as Shadow repo
+
+    Wrapper->>Agent: set_snapshot_root(workspace.root)
+    Agent->>FS: FileSnapshot(project_path=workspace.root)
+    Note over Agent: undo/redo stacks cleared
+    Agent->>FS: track(message)
+    FS->>Git: commit workspace state
+    Git-->>FS: commit_hash
+    Agent->>Agent: edits files via tools
+    Agent->>FS: undo()
+    FS->>Git: checkout files
+```
+
+```mermaid
+graph LR
+    W[🤖 Wrapper] --> A[🤖 Agent.set_snapshot_root]
+    A --> F[📸 new FileSnapshot]
+    F --> G[🌑 Shadow repo]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class W,A agent
+    class F process
+    class G store
+```
+
+| Behaviour | Detail |
+|-----------|--------|
+| **Path resolution** | `project_path` is normalised via `os.path.abspath()` — relative paths resolve against process cwd |
+| **No-op on same root** | Called with the current root → returns `True` immediately and keeps the existing manager |
+| **Re-root clears stacks** | Called with a *new* root → creates a fresh `FileSnapshot` and clears the undo/redo stacks |
+| **Preserves `snapshot_dir`** | Reuses `autonomy_config["snapshot_dir"]` if set, so a custom shadow-repo base survives re-rooting |
+| **Silent fallback** | If `FileSnapshot(...)` fails (git missing, permission error), returns `False` and logs at DEBUG — never raises |
+| **Thread-safe** | Uses the agent's snapshot lock when clearing the stacks |
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `project_path` | `str` | Directory to root change tracking at. Absolute-normalised; relative paths resolve against cwd. |
+
+Returns `bool` — `True` when a snapshot manager is rooted at the given path, `False` if construction failed (e.g. git unavailable).
+
+<Note>
+Re-rooting clears the undo/redo stacks — they belong to the previous root. The old shadow repo is orphaned (still on disk under `~/.praisonai/snapshots/`), and only *future* changes are tracked at the new root.
+</Note>
+
+---
+
+## Bot / Gateway Workspaces
+
+Bots and gateways call `Agent.set_snapshot_root(workspace.root)` from `apply_bot_smart_defaults()` immediately after attaching the per-chat `Workspace`. So `/undo` in a Slack, Discord, or Telegram chat reverts files in that chat's workspace — never the gateway's process cwd.
+
+Custom wrappers that attach a workspace after `Agent.__init__` should do the same:
+
+```python
+from praisonaiagents import Agent, AutonomyConfig
+
+agent = Agent(name="assistant", autonomy=AutonomyConfig(track_changes=True))
+# ... attach your workspace ...
+agent.set_snapshot_root(str(workspace.root))
+```
+
+See [Bot Gateway](/docs/features/bot-gateway) for how the gateway wires this automatically.
 
 ---
 
@@ -167,6 +265,10 @@ The shadow repo honours `.gitignore` patterns — build artefacts and secrets ig
 
 <Accordion title="Clean up when finished">
 Call `snapshot.cleanup()` to remove the shadow repository if you no longer need history for a project.
+</Accordion>
+
+<Accordion title="Re-root after attaching a workspace">
+`Agent.__init__` roots the snapshot at `os.getcwd()`. If you attach a `Workspace` (or any per-session root) later, call `agent.set_snapshot_root(str(workspace.root))` immediately — otherwise `agent.undo()` restores files in the wrong directory. Re-rooting clears the undo/redo stacks; rooting at the current directory is a no-op.
 </Accordion>
 </AccordionGroup>
 
