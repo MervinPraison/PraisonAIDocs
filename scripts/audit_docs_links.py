@@ -1,16 +1,26 @@
 #!/usr/bin/env python3
-"""Fast docs audit: live 404 checks + local internal link validation."""
+"""Fast docs audit: live 404 checks + local internal link validation.
+
+Cross-platform: live HTTP checks use ``curl`` when available (fast path)
+and fall back to the stdlib :mod:`urllib.request` otherwise, so the audit
+works identically on Windows, macOS, and Linux. A transport failure
+(no HTTP response) is reported with the sentinel status ``-1`` to keep it
+distinguishable from a genuine HTTP error code.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen, Request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +29,9 @@ DOCS = f"{BASE}/docs"
 WORKERS = 32
 TIMEOUT = 12
 OK_STATUSES = {200, 301, 302, 307, 308}
+TRANSPORT_FAILURE = -1
+USER_AGENT = "PraisonAIDocs-Audit/1.0"
+_CURL = shutil.which("curl")
 
 MDX_TAG_RE = re.compile(
     r"</?(Steps|Step|Card|CardGroup|Accordion|AccordionGroup|Tabs|Tab)\b[^>]*?/?>"
@@ -30,16 +43,52 @@ LINK_RE = re.compile(
 FENCE_RE = re.compile(r"^```.*$", re.MULTILINE)
 
 
-def curl_head(url: str) -> int:
+def _curl_head(url: str) -> int | None:
+    """Return an HTTP status via curl, or ``None`` if curl is unusable."""
+    if not _CURL:
+        return None
+    null_dev = "NUL" if os.name == "nt" else "/dev/null"
     try:
         out = subprocess.run(
-            ["/usr/bin/curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-             "--max-time", str(TIMEOUT), "-H", "Cache-Control: no-cache", url],
+            [_CURL, "-s", "-o", null_dev, "-w", "%{http_code}",
+             "--max-time", str(TIMEOUT), "-L",
+             "-H", "Cache-Control: no-cache", url],
             capture_output=True, text=True, check=False,
         )
-        return int(out.stdout.strip() or "0")
+        code = out.stdout.strip()
+        return int(code) if code.isdigit() else None
     except Exception:
-        return 0
+        return None
+
+
+def _urllib_head(url: str) -> int:
+    """Return an HTTP status via stdlib urllib, falling back to GET."""
+    headers = {"Cache-Control": "no-cache", "User-Agent": USER_AGENT}
+    for method in ("HEAD", "GET"):
+        try:
+            req = Request(url, method=method, headers=headers)
+            with urlopen(req, timeout=TIMEOUT) as resp:
+                return getattr(resp, "status", resp.getcode())
+        except HTTPError as exc:
+            if method == "HEAD" and exc.code in {405, 501}:
+                continue
+            return exc.code
+        except (URLError, OSError, ValueError):
+            return TRANSPORT_FAILURE
+    return TRANSPORT_FAILURE
+
+
+def http_head(url: str) -> int:
+    """Return the HTTP status for ``url`` in a cross-platform way.
+
+    Uses ``curl`` when available for speed, otherwise stdlib ``urllib``.
+    Returns :data:`TRANSPORT_FAILURE` (``-1``) when no HTTP response is
+    obtained, so transport errors are distinct from real HTTP codes.
+    """
+    status = _curl_head(url)
+    if status is not None:
+        return status
+    return _urllib_head(url)
 
 
 def page_to_url(page: str) -> str:
@@ -151,7 +200,7 @@ def mdx_component_issues() -> list[str]:
 def live_status(urls: list[str]) -> dict[str, int]:
     results: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futs = {pool.submit(curl_head, u): u for u in urls}
+        futs = {pool.submit(http_head, u): u for u in urls}
         for fut in as_completed(futs):
             results[futs[fut]] = fut.result()
     return results
@@ -161,16 +210,23 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, default=ROOT / "scripts" / "audit_report.md")
     parser.add_argument("--nav-only", action="store_true", help="Check nav URLs only (faster)")
+    parser.add_argument("--skip-live", action="store_true", help="Skip live URL checks (offline, local-only audit)")
     args = parser.parse_args()
 
     nav = nav_pages()
     nav_urls = [page_to_url(p) for p in nav]
-    sm = [] if args.nav_only else sitemap_urls()
-    all_urls = sorted(set(nav_urls) | set(sm))
 
-    print(f"checking {len(all_urls)} live URLs...")
-    statuses = live_status(all_urls)
-    live_broken = sorted([u for u, s in statuses.items() if s not in OK_STATUSES])
+    if args.skip_live:
+        all_urls = []
+        statuses = {}
+        live_broken = []
+        print("skipping live URL checks (--skip-live)")
+    else:
+        sm = [] if args.nav_only else sitemap_urls()
+        all_urls = sorted(set(nav_urls) | set(sm))
+        print(f"checking {len(all_urls)} live URLs...")
+        statuses = live_status(all_urls)
+        live_broken = sorted([u for u, s in statuses.items() if s not in OK_STATUSES])
 
     print("scanning local mdx links...")
     local_broken = local_links()
