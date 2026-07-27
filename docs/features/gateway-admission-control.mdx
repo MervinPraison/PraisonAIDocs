@@ -153,6 +153,7 @@ The three fields live on `GatewayConfig` (read from `praisonaiagents/gateway/con
 | `max_concurrent_runs` | `int` | `0` | Max concurrent inbound agent runs across all users. `0` disables the gate (legacy behaviour). |
 | `queue_depth` | `int` | `128` | Max number of inbound turns that can wait when at the ceiling. |
 | `overflow_policy` | `str` | `"reject"` | Behaviour when at the ceiling and the queue is full: `reject`, `queue`, or `shed_oldest`. |
+| `max_rss_mb` | `float` | `0.0` | Hard RSS ceiling in MiB for [memory-aware admission](#memory-aware-admission). `0` disables it (concurrency-only, legacy behaviour). |
 
 **Precedence:** CLI flags → YAML → Python defaults.
 
@@ -243,10 +244,164 @@ bot = BotOS(
 
 ```python
 print(bot.admission_stats)
-# {"in_flight": 12, "queued": 3, "rejected": 0}
+# {
+#   "max_concurrent_runs": 32, "queue_depth": 128,
+#   "in_flight": 12, "queued": 3,
+#   "admitted": 1247, "rejected": 0, "shed": 0,
+#   "max_rss_mb": 0.0,   # ← memory-aware ceiling (0.0 when disabled)
+# }
 ```
 
 Watch `rejected` alongside your LLM provider's 429 rate. When both rise together, raise `max_concurrent_runs`. When only `rejected` rises, deepen `queue_depth` or switch to `overflow_policy="queue"`.
+
+---
+
+## Memory-aware admission
+
+Set one number — `max_rss_mb` — and the gateway queues turns under soft RSS pressure and sheds them under hard pressure, **before the OOM killer fires**. Zero deps, no new subsystem — the same admission gate that enforces the concurrency ceiling folds a memory decision into every `admit()`.
+
+```mermaid
+graph LR
+    subgraph "Memory-aware admission"
+        Sample[📊 RSS sample] --> Decide{🚦 Pressure?}
+        Decide -->|rss below soft| Admit[✅ ADMIT]
+        Decide -->|soft ≤ rss below hard| Queue[⏳ QUEUE]
+        Decide -->|rss ≥ hard| Reject[⛔ REJECT<br/>busy ack]
+    end
+
+    classDef sample fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Sample sample
+    class Decide gate
+    class Admit ok
+    class Queue warn
+    class Reject bad
+```
+
+### Quick start
+
+<Tabs>
+<Tab title="Python (single knob)">
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import BotOS
+
+agent = Agent(name="Support", instructions="Help users")
+
+# 1 GiB hard ceiling; soft (queue) threshold auto-derived at 90% (~921 MiB).
+bot = BotOS(agent=agent, platforms=["telegram"], max_rss_mb=1024)
+
+print(bot.admission_stats["max_rss_mb"])
+# 1024.0
+```
+
+</Tab>
+<Tab title="YAML">
+
+```yaml
+# Top-level (canonical praisonai.yaml or gateway.yaml)
+max_rss_mb: 1024
+
+# Or nested under gateway:
+gateway:
+  max_rss_mb: 1024
+```
+
+</Tab>
+<Tab title="Explicit ladder">
+
+```python
+from praisonaiagents.gateway import MemoryPressurePolicy
+from praisonai_bot.bots._admission import build_admission_gate
+
+# Explicit two-threshold ladder instead of the single-knob 90% default.
+policy = MemoryPressurePolicy(soft_rss_mb=800, hard_rss_mb=1024)
+gate = build_admission_gate(
+    max_concurrent_runs=32,   # concurrency ceiling (optional)
+    resource_policy=policy,   # memory-aware layer
+)
+```
+
+</Tab>
+</Tabs>
+
+### The pressure ladder
+
+Given a sample's resident set size (`rss_mb`), the policy decides:
+
+| RSS | Decision | What the gateway does |
+|---|---|---|
+| `rss < soft_rss_mb` | **ADMIT** | Run the turn immediately. |
+| `soft_rss_mb ≤ rss < hard_rss_mb` | **QUEUE** | Apply backpressure via the existing bounded wait queue.<sup>*</sup> |
+| `rss ≥ hard_rss_mb` | **REJECT** | Shed with a polite busy ack (honours the existing `reject` / `shed_oldest` overflow policy). |
+| `rss is None` (platform can't report) | **ADMIT** | Never block on a missing signal — sampler self-disables with a single warning. |
+
+<sup>*</sup> **Memory-only mode caveat.** With no concurrency ceiling (`max_concurrent_runs=0`), there is no slot to wait on, so a soft-pressure QUEUE degrades to ADMIT — real wait-queue backpressure needs a concurrency ceiling *alongside* `max_rss_mb`. **The hard threshold always REJECTs regardless**, which is what prevents the OOM kill.
+
+### Memory-aware configuration
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `max_rss_mb` | `float` | `0.0` | Hard RSS ceiling in MiB. `0` disables memory-aware admission (concurrency-only, byte-for-byte legacy behaviour). |
+| `MemoryPressurePolicy.soft_rss_mb` | `float` | `0.0` | Soft (QUEUE) threshold in MiB. When you set only `max_rss_mb`, this is auto-derived as `0.9 × max_rss_mb`. |
+| `MemoryPressurePolicy.hard_rss_mb` | `float` | `0.0` | Hard (REJECT) threshold in MiB. |
+| `soft_ratio` (in `build_memory_pressure_policy`) | `float` | `0.9` | Fraction of the hard ceiling that becomes the soft threshold when a single-knob `max_rss_mb` is used. Clamped to `[0.0, 1.0]`. |
+
+<Warning>
+`MemoryPressurePolicy` fails fast at construction — a `ValueError` is raised if `soft_rss_mb` or `hard_rss_mb` is negative or non-numeric, or if `soft_rss_mb > hard_rss_mb` (which would queue turns that should be shed). No silent pressure-ladder inversion.
+</Warning>
+
+### Choosing values
+
+<AccordionGroup>
+  <Accordion title="Small always-on host (a $5 VPS)">
+    Set `max_rss_mb` at ~70–80% of the box's RAM ceiling minus other resident daemons. Example: on a 1 GiB VPS running only the gateway, `max_rss_mb: 700` gives a ~630 MiB soft threshold — bursts queue, sustained pressure sheds, and the OOM killer stays quiet.
+  </Accordion>
+  <Accordion title="Containerised deployment with a memory limit">
+    Set `max_rss_mb` to ~80% of the container's memory limit. The pressure ladder then queues *before* the kernel starts reclaiming pages aggressively, preserving observability and giving the graceful-drain window a chance to complete in-flight turns.
+  </Accordion>
+  <Accordion title="Large host combining concurrency + memory">
+    Combine `max_concurrent_runs` (concurrency ceiling) with `max_rss_mb` (memory ceiling). Concurrency handles CPU-scaled bursts; memory handles per-turn resident growth (large tool outputs, long transcripts). Either dimension can shed independently.
+  </Accordion>
+  <Accordion title="Development / test (off)">
+    Default `max_rss_mb=0` disables memory-aware admission entirely. `admit()` is bit-for-bit as before — the exact behaviour of every release prior to 2026-07-27.
+  </Accordion>
+</AccordionGroup>
+
+### Sampler behaviour
+
+The wrapper samples process RSS on a lightweight cadence:
+
+- **Preferred:** `psutil.Process().memory_info().rss` — a live, monotonic reading. Enabled automatically if `psutil` is installed.
+- **Fallback:** stdlib `resource.getrusage(RUSAGE_SELF).ru_maxrss` — a *peak* (not live) reading, good enough to catch a climbing leak. Kilobytes on Linux, bytes on macOS/BSD; the sampler normalises to MiB.
+- **Self-disable:** if the platform can report neither (Windows without `psutil`, exotic runtimes), the sampler emits a single `AdmissionGate: resource sampling unavailable on this platform; memory-pressure admission disabled.` warning and thereafter returns a `rss_mb=None` sample. The policy admits on `None` — the monitor never crashes the gateway it protects.
+
+<Warning>
+The `resource` stdlib module is **Unix-only**. On Windows without `psutil`, memory-aware admission is silently disabled — a single warning is logged at first sample. Install `psutil` in production Windows deployments if you rely on `max_rss_mb`.
+</Warning>
+
+### Memory observability
+
+`admission_stats` gains a `max_rss_mb` field so operators can confirm the ceiling is wired end-to-end:
+
+```python
+bot.admission_stats
+# {
+#   "max_concurrent_runs": 32, "queue_depth": 128,
+#   "in_flight": 4, "queued": 0,
+#   "admitted": 1247, "rejected": 3, "shed": 0,
+#   "max_rss_mb": 1024.0,     # ← the configured hard ceiling (0.0 when disabled)
+# }
+```
+
+<Note>
+`stats()` surfaces only the configured ceiling, not a rolling RSS window. For historical RSS for capacity planning, scrape `psutil.Process(<pid>).memory_info().rss` or your existing container / host metrics pipeline.
+</Note>
 
 ---
 
@@ -275,6 +430,9 @@ Watch `rejected` alongside your LLM provider's 429 rate. When both rise together
 ## Related
 
 <CardGroup cols={2}>
+  <Card title="Memory-aware admission" icon="memory" href="#memory-aware-admission">
+    Queue under soft RSS pressure, shed under hard pressure — before the OOM killer fires
+  </Card>
   <Card title="Gateway Reliability Presets" icon="shield-check" href="/docs/features/gateway-reliability">
     One switch that turns on admission + graceful drain with sensible defaults
   </Card>
