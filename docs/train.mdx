@@ -702,6 +702,22 @@ quantization_method:
 praisonai-train llm dataset.json
 ```
 
+### Silent-behaviour notes
+
+The trainer prints these at runtime — they change results without erroring, so know them up front.
+
+<Note>
+**`num_samples` takes the FIRST N rows *before* shuffle.** Without `shuffle: true` you always train on the head of the dataset (often sorted by source/topic and unrepresentative). Add `shuffle: true` to sample randomly.
+</Note>
+
+<Warning>
+**A validation split is concatenated into training, not held out.** A `split_type` of `validation`, `valid`, `test`, or `eval` is added to the training data. Use `val_split_ratio` for a true held-out eval set.
+</Warning>
+
+<Note>
+**No length set means 2800 steps.** With neither `num_train_epochs` nor `max_steps` set, the trainer silently defaults to `max_steps: 2800`. Set `num_train_epochs: 1-3` (or `max_steps`) explicitly to control training length. When both are set, `max_steps` wins.
+</Note>
+
 ### New / newly-honored fine-tuning config keys
 
 These keys map straight to the trainer in `praisonai_train/train/llm/trainer.py` — all optional, all backward-compatible.
@@ -910,9 +926,21 @@ graph TB
 
 ## Config validation
 
-The trainer validates the config on load — before any download or training starts.
+Before any model download or GPU load, the trainer validates the config and fails fast with a single actionable line. Runs no longer die 20 minutes in on missing credentials or a wrong quantization name.
 
-Three keys are required: `model_name`, `max_seq_length`, and `dataset`. Missing any raises `ValueError` with a minimal example:
+### Preflight checks
+
+| Check | Trigger | Failure message (paraphrased) |
+|---|---|---|
+| Required keys | `model_name`, `max_seq_length`, or `dataset` missing | `Config is missing required keys: [...]. Minimal example: ...` |
+| Publish target set | `huggingface_save` / `huggingface_save_gguf` true but `hf_model_name` missing | `hf_model_name is required when huggingface_save or huggingface_save_gguf is enabled.` |
+| Publish target set | `ollama_save: true` but `ollama_model` missing | `ollama_model is required when ollama_save is enabled.` |
+| CUDA available (only when `train: true`, default) | No CUDA GPU | `No CUDA GPU detected. Fine-tuning needs a GPU. On a rented box check the driver; on CPU it cannot run.` |
+| HF credentials | Any publish flag set but neither `HF_TOKEN` nor a cached `huggingface-cli login` | `Publishing to Hugging Face is enabled but no credentials were found. Run \`huggingface-cli login\` or \`export HF_TOKEN=hf_...\`. To train without publishing, set huggingface_save: false.` |
+| Free disk | `output_dir` (or `.`) has < 10 GB free | `Low disk: only X.X GB free on the training disk (need ~10 GB minimum). Free up space or set output_dir to a larger disk.` |
+| Quantization method | `huggingface_save_gguf` or `ollama_save` true and `quantization_method` outside the allowed set | `quantization_method '<val>' is not valid. Choose one of: bf16, f16, q2_k, q3_k_m, q4_0, q4_1, q4_k_m, q5_0, q5_1, q5_k_m, q6_k, q8_0.` |
+
+The required-keys message shows a copy-paste minimal config:
 
 ```
 ValueError: Config is missing required keys: ['model_name', 'max_seq_length', 'dataset']. Minimal example:
@@ -923,27 +951,25 @@ ValueError: Config is missing required keys: ['model_name', 'max_seq_length', 'd
 ```
 
 <Note>
-Unknown keys don't crash. The trainer collects **all** unknown keys, prints them once as a block at config load, and adds a `did you mean` suggestion for each key that fuzzy-matches a known one:
+**`train: false` skips the CUDA check.** A publish/export-only config runs fine on CPU because there's nothing to fine-tune. A cached `huggingface-cli login` counts as HF credentials — you don't need `HF_TOKEN` set as well.
+</Note>
+
+<Tip>
+**Unknown-key suggestions.** If you set `num_sample: 100` (typo), the trainer collects all unknown keys and prints them in one block with the closest known key inline:
 
 ```
 WARNING: unrecognized config key(s) — these will be ignored:
-  - learnign_rate  (did you mean 'learning_rate'?)
-  - max_step       (did you mean 'max_steps'?)
+  - num_sample  (did you mean 'num_samples'?)
 ```
-
-The run continues (this is a warning, not an error). Fix the flagged keys to make those settings take effect.
-</Note>
+</Tip>
 
 <Warning>
-Enabling a publish flag without its target fails fast on load:
-
-```
-ValueError: hf_model_name is required when huggingface_save or huggingface_save_gguf is enabled.
-ValueError: ollama_model is required when ollama_save is enabled.
-```
+**Clean errors, no tracebacks.** Preflight and known runtime failures print a single `ERROR: <msg>` line and exit with code `1`. Real bugs still show the full traceback. `Ctrl-C` exits with code `130` and a single `Interrupted.` line.
 
 `dataset[].num_samples` must be a positive integer — `0`, negatives, and booleans raise `dataset[].num_samples must be a positive integer, got <value>`.
 </Warning>
+
+See [Export a trained model](/docs/features/praisonai-train-export) to publish an already-trained model without re-running training.
 
 ---
 
@@ -969,21 +995,30 @@ graph TB
 
 `train: false` is a valid config — the trainer skips training **and** publishing (previously it crashed with an `AttributeError` on a `None` model).
 
-### Publishing failure messages
+### Publishing failure modes
 
-A rejected Hugging Face push translates to an actionable message instead of a raw HTTP error:
+Actionable messages replace raw HTTP tracebacks.
 
-| HTTP status | Message |
-|---|---|
-| `401` | `Hugging Face rejected the token (401). It is invalid or expired — run 'huggingface-cli login' or 'export HF_TOKEN=hf_...' with a valid write token.` |
-| `403` | `No write access to '<repo>' (403). The repo must be under your own username and the token must have write scope. Set hf_model_name to '<your-username>/<name>'.` |
-| other | `Hugging Face upload to '<repo>' failed: <exc>` |
+| Situation | Message you'll see | Fix |
+|---|---|---|
+| HF token invalid / expired | `Hugging Face rejected the token (401). It is invalid or expired — run \`huggingface-cli login\` or \`export HF_TOKEN=hf_...\` with a valid write token.` | New write-scoped token |
+| HF wrong repo owner or read-only token | `No write access to '<repo>' (403). The repo must be under your own username and the token must have write scope. Set hf_model_name to '<your-username>/<name>'.` | Namespace to your user; write token |
+| Ollama key not registered | `Ollama rejected the push (unauthorized). Register your public key at https://ollama.com/settings/keys and make sure the model is namespaced as '<username>/<name>'.` **plus** your key printed inline from `~/.ollama/id_ed25519.pub` | Paste the printed key at the URL |
+| Ollama disk full | `Not enough disk for the Ollama model: X GB free on '<path>', need ~Y GB. Point Ollama at a bigger disk, e.g. \`export OLLAMA_MODELS=/big/disk/ollama-models\`.` | Move `$OLLAMA_MODELS` |
+| Ollama daemon didn't start | `ollama serve did not become ready in 15 seconds. ollama serve output: <stderr>` | Fix the underlying stderr (port busy, bad `OLLAMA_HOST`) |
+| `ollama create` failed | Raised as a `RuntimeError` with the create-command stderr, not a raw `CalledProcessError` | Follow the printed guidance |
 
 <Note>
-Before an export the trainer removes a stale local output dir **only** when `hf_model_name` is a plain local name without `/`. A namespaced Hub repo id like `me/model` is never treated as a path to delete — so the common `hf_model_name: me/model` case can't lose data on a retry.
+**Namespaced repo IDs are never deleted as local paths.** Setting `hf_model_name: "user/model"` (a Hub repo id) is never treated as a local dir to remove. The trainer only cleans up a stale local dir when the value has no `/` **and** actually exists on disk.
 </Note>
 
-See [Ollama publishing failures](#push-failures--key-registration) for the matching Ollama 401/403 translation and key-registration hint.
+<Tip>
+**Ollama `--quantize` at create time.** The trainer passes `--quantize <method>` to `ollama create` so the model isn't stored as huge FP16 first. Set `quantization_method: q4_k_m` (or any value from the preflight list) to control the packed size.
+</Tip>
+
+<Note>
+**Chat-template fallback warns loudly.** When no known family (`llama`, `qwen`, `gemma`, `mistral`, `phi`, `deepseek`) matches your `model_name`, the trainer prints `WARNING: no known chat template matched...` and falls back to a generic Llama-style template. Verify the Ollama output, or set `model_name` to a recognized family. Empty stop tokens are skipped, so the Modelfile never emits a broken `PARAMETER stop` line.
+</Note>
 
 ---
 
