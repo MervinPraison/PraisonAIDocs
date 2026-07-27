@@ -7,6 +7,10 @@ icon: "paper-plane"
 
 Set `deliver=` on a scheduled agent and each result is pushed to a chat target — no gateway required.
 
+<Note>
+**New:** every delivered brief is now a *continuable* conversation by default — a user's reply in the same chat resumes the job's turn with the brief in context. Opt out per-job with `--no-continuable` for pure notifications. See [Continuable Delivery](#continuable-delivery).
+</Note>
+
 ```python
 from praisonaiagents import Agent
 from praisonai.scheduler import AgentScheduler
@@ -307,22 +311,24 @@ sequenceDiagram
 
 ## Continuable Delivery
 
-A delivered brief is a resumable conversation by default — reply in the same chat and the agent picks up where the job left off, no IDs, no configuration.
+A delivered brief is a **conversation opener**, not a dead-end. Reply in the same chat and the agent picks up where the brief left off — with the delivered text already in context. Zero configuration, on by default.
 
-```python
-from praisonaiagents import Agent
-from praisonaiagents.tools.schedule_tools import schedule_add
+```mermaid
+sequenceDiagram
+    participant Cron as ⏰ Scheduled Job
+    participant Router as 🔀 DeliveryRouter
+    participant Chat as 💬 Telegram / Slack / Discord
+    participant User
+    participant Session as 🧵 Bot Session
 
-agent = Agent(
-    name="Scheduler",
-    instructions="Schedule reminders on demand.",
-    tools=[schedule_add],
-)
-
-# Continuable by default — reply to the delivered brief resumes the job.
-agent.start("Send me a daily revenue brief at 9am to Slack")
-# schedule_add(name=..., schedule="cron:0 9 * * *", message=..., deliver="slack")
-# continuable=True is the default, no argument needed.
+    Cron->>Router: deliver(text)
+    Router->>Chat: send_message(brief)
+    Chat-->>Router: ok
+    Note over Router,Session: seed continuable session<br/>mirrors brief into session<br/>keyed by chat id
+    User->>Chat: "dig into item 3"
+    Chat->>Session: reply (same chat id)
+    Note over Session: session already carries<br/>the brief — reply resumes<br/>the conversation
+    Session-->>User: contextual answer
 ```
 
 **Before / after #3449:**
@@ -333,95 +339,108 @@ agent.start("Send me a daily revenue brief at 9am to Slack")
 | Config required | Manually pre-wire `session_id` on `DeliveryTarget`. | None — `continuable=True` is the default. |
 | Fire-and-forget notice (e.g. "backup finished") | Same as above. | Set `continuable=False` (or `--no-continuable`) to opt out. |
 
-**How a reply resumes the job:**
+### Quick start — nothing to do
 
-```mermaid
-sequenceDiagram
-    participant Scheduler
-    participant Agent
-    participant Gateway
-    participant Store as SessionStore
-    participant Channel
-    participant User
+Continuable delivery is default-on. Every scheduled job with a delivery target already resumes its conversation on reply:
 
-    Scheduler->>Agent: run(job.message)
-    Agent-->>Scheduler: brief text
-    Scheduler->>Gateway: _deliver_scheduled_result(target, brief)
-    Gateway->>Channel: send_message(brief)
-    Gateway->>Store: _seed_continuable_session(reply_key, [job.message, brief])
-    User->>Channel: "why did revenue dip on Tuesday?"
-    Channel->>Gateway: inbound reply (same reply_key)
-    Gateway->>Store: resume(reply_key) — brief in context
-    Gateway->>Agent: continue(...)
-```
-
-### Opt out for fire-and-forget notices
-
-Set `continuable=False` (Python/YAML) or `--no-continuable` (CLI) when a reply should start a fresh session — correct for one-shot notices like "backup finished" pings.
-
-<Tabs>
-<Tab title="Python">
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.scheduler.models import DeliveryTarget
 from praisonai.scheduler import AgentScheduler
 
-agent = Agent(name="Backup", instructions="Post the backup-complete notice")
-target = DeliveryTarget(channel="slack", channel_id="C0123456", continuable=False)
-AgentScheduler(agent, task="Notice", deliver=target).start("daily")
-```
-</Tab>
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+AgentScheduler(agent, task="Morning brief", deliver="telegram:123456").start("hourly")
 
-<Tab title="YAML">
-```yaml
-schedule:
-  every: "daily"
-  deliver:
-    channel: "slack"
-    channel_id: "C0123456"
-    continuable: false
+# User replies "expand on item 2" in chat 123456 → resumes the job's conversation
+# with the brief already in context. No wiring, no session id, no re-briefing.
 ```
-</Tab>
 
+### Opt out for fire-and-forget alerts
+
+Some deliveries are pure notifications ("build finished", "backup ok") — a reply should stay a fresh turn, not resume a maintenance job. Turn seeding off with a single flag:
+
+<Tabs>
 <Tab title="CLI">
 ```bash
-praisonai schedule add "backup-notice" \
-  -s daily \
-  -m "post the backup-complete notice" \
-  --deliver slack:C0123456 \
+praisonai schedule add "backup-alert" \
+  -s "cron:0 3 * * *" \
+  -m "Backup ok" \
+  --deliver "slack:C012345" \
   --no-continuable
+```
+</Tab>
+<Tab title="Tool">
+```python
+from praisonaiagents.tools import schedule_add
+
+schedule_add(
+    name="backup-alert",
+    schedule="cron:0 3 * * *",
+    message="Backup ok",
+    deliver="slack:C012345",
+    continuable=False,      # fire-and-forget notification
+)
+```
+</Tab>
+<Tab title="Python">
+```python
+from praisonaiagents.scheduler.models import DeliveryTarget, ScheduleJob, Schedule
+
+job = ScheduleJob(
+    name="backup-alert",
+    schedule=Schedule(kind="cron", cron_expr="0 3 * * *"),
+    message="Backup ok",
+    delivery=DeliveryTarget(
+        channel="slack",
+        channel_id="C012345",
+        continuable=False,   # opt out — reply lands as a fresh turn
+    ),
+)
 ```
 </Tab>
 </Tabs>
 
-### `continuable` at a glance
+### The seed contract
 
-| `continuable` | User reply behaviour |
+Given a successful delivery of `text` to `channel:channel_id`, the gateway seeds a resumable session:
+
+| Precondition | What the gateway does |
 |---|---|
-| `True` (default) | Reply in the same chat/thread resumes the job's session with the delivered brief in context. |
-| `False` | Reply starts a new, contextless session (pre-#3449 behaviour). Correct for one-shot notices. |
-
-### Which mode fits which scenario?
-
-```mermaid
-graph TB
-    Start{What happens when the user replies?} -->|Ask follow-up questions on this brief| Keep[Keep the default<br/>continuable=True]
-    Start -->|One-shot notice, reply should start fresh| Opt[continuable=False<br/>--no-continuable]
-
-    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef opt fill:#10B981,stroke:#7C90A0,color:#fff
-
-    class Start q
-    class Keep,Opt opt
-```
+| `continuable is True` (default) | Mirrors `text` into the destination bot's session under the delivery chat id. The user's next message in this chat resumes the conversation. |
+| `continuable is False` | Skips seeding entirely. Reply lands as a brand-new, contextless turn. |
+| Delivery **failed** (any path) | Does **not** seed. Nothing was delivered, so nothing is claimed to have been. |
+| Seeding raises (session missing, adapter oddity) | Logs a single `debug` line and returns. The delivery has already succeeded and remains committed — a seeding failure never breaks it. |
+| Intentional-silence run (`NO_REPLY` / `[SILENT]` / `SILENT`) | Delivery is skipped — no delivery, no seed. See [Intentional Silence](#intentional-silence). |
 
 <Note>
-Seeding is best-effort. A seed failure logs and never breaks the delivery itself — the brief still lands in the channel.
+The `continuable` field is a **declarable contract**. Core (`praisonaiagents/scheduler/models.py`) owns the field and its round-trip; the actual seeding runs in the `praisonai-bot` gateway. Deployments running the scheduler without the bot wrapper (direct scheduler → agent, no gateway) still round-trip the field and honour the opt-out, but there is no session to seed.
 </Note>
 
-<Tip>
-`continuable=False` is only persisted when set — existing `DeliveryTarget` records on disk remain byte-identical to pre-#3449, so upgrading is a no-op for stored schedules.
-</Tip>
+### Configuration options
+
+| Option | Where | Type | Default | Description |
+|---|---|---|---|---|
+| `continuable` | `DeliveryTarget(continuable=…)` | `bool` | `True` | When `True`, seed the destination bot's session with the delivered brief so a reply resumes the job's conversation. Set `False` for pure fire-and-forget notifications. |
+| `continuable` | `schedule_add(…, continuable=…)` | `bool` | `True` | Threaded through to the constructed `DeliveryTarget`. |
+| `--continuable / --no-continuable` | `praisonai schedule add` | flag | `--continuable` | Applied only when a delivery target is configured; a no-op on jobs with no delivery. |
+
+**Serialisation.** `DeliveryTarget.to_dict()` persists `continuable` **only when it is `False`** — the default is implied by absence, so existing on-disk schedule stores are byte-for-byte unchanged. `from_dict()` treats a missing field as `True`, so restored legacy jobs immediately gain the new behaviour on next fire.
+
+### When to opt out
+
+<AccordionGroup>
+  <Accordion title="Pure status alerts">
+    Backup finished, deploy succeeded, monitoring "ok" heartbeat. There is no conversation to have — the reply, if any, is an unrelated command. Use `--no-continuable` so the chat context stays fresh.
+  </Accordion>
+  <Accordion title="Fan-out to shared channels (deliver=&quot;all&quot;)">
+    A broadcast to every home channel implies the recipients aren't a single continuing conversation. Seeding runs once per destination `channel:channel_id`, so a shared/group chat resumes the *last* fire's context, not per-participant. If replies in the shared chat are noise, prefer `--no-continuable`.
+  </Accordion>
+  <Accordion title="Sub-minute ticks">
+    A tight loop that seeds on every fire would overwrite the session before the user can read it. Prefer `--no-continuable` (or a coarser schedule) for high-frequency jobs.
+  </Accordion>
+  <Accordion title="Recurring briefs and digests (leave it on)">
+    Recurring briefs, digests, standing reports, sensor summaries — the reader almost always wants to reply to the *thing they just read*. Leave continuable on.
+  </Accordion>
+</AccordionGroup>
 
 ---
 
@@ -448,9 +467,10 @@ sequenceDiagram
     end
     DeliveryRouter->>Channel: bot.send_message(...)
     Channel-->>DeliveryRouter: ok
+    Note over DeliveryRouter: gateway seeds a continuable session<br/>(skipped when continuable is False)
 ```
 
-`SchedulerDelivery` is built once per scheduler and reused across runs, so the router's idempotency cache and rate limiters persist between ticks.
+`SchedulerDelivery` is built once per scheduler and reused across runs, so the router's idempotency cache and rate limiters persist between ticks. After a successful delivery, a gateway-hosted job also seeds a resumable session so a reply resumes the conversation — see [Continuable Delivery](#continuable-delivery).
 
 ---
 
