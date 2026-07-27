@@ -112,7 +112,13 @@ def page_to_file(page: str) -> Path:
     page = page.strip("/")
     if page.startswith("docs/"):
         page = page[5:]
-    return ROOT / "docs" / f"{page}.mdx"
+    flat = ROOT / "docs" / f"{page}.mdx"
+    if flat.exists():
+        return flat
+    index = ROOT / "docs" / page / "index.mdx"
+    if index.exists():
+        return index
+    return flat
 
 
 def resolve_page_file(page: str) -> Path | None:

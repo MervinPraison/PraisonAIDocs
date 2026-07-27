@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for audit_docs_links: MDX component balance counting and portable HTTP client."""
+"""Unit tests for audit_docs_links: MDX component balance counting, portable HTTP client, and page_to_file index.mdx resolution."""
 
 from __future__ import annotations
 
@@ -215,6 +215,35 @@ class HttpHeadTests(unittest.TestCase):
 
     def test_backwards_compatible_alias(self):
         self.assertIs(audit.curl_head, audit.http_head)
+
+
+# ── page_to_file / index.mdx resolution tests ──────────────────────────────
+
+def test_flat_page_resolves():
+    p = audit.page_to_file("docs/index")
+    assert p == audit.ROOT / "docs" / "index.mdx"
+
+
+def test_directory_index_resolves():
+    target = "docs/deploy"
+    index = audit.ROOT / "docs" / "deploy" / "index.mdx"
+    if index.exists():
+        assert audit.page_to_file(target) == index
+
+
+def test_missing_page_returns_flat_path():
+    p = audit.page_to_file("docs/this/does/not/exist")
+    assert p == audit.ROOT / "docs" / "this/does/not/exist.mdx"
+    assert not p.exists()
+
+
+def test_no_local_broken_links():
+    assert audit.local_links() == []
+
+
+def test_no_nav_missing():
+    missing = [p for p in audit.nav_pages() if not audit.page_to_file(p).exists()]
+    assert missing == []
 
 
 if __name__ == "__main__":
