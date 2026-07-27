@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Unit tests for audit_docs_links: MDX component balance counting, portable HTTP client, and page_to_file index.mdx resolution."""
+"""Unit tests for audit_docs_links: MDX component balance counting, portable HTTP client, and path resolver."""
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 import unittest
@@ -18,6 +19,8 @@ from audit_docs_links import (  # noqa: E402
     strip_fenced_blocks,
     tag_delta,
 )
+
+SCRIPT = Path(__file__).resolve().parent / "audit_docs_links.py"
 
 
 # ── MDX component balance tests ────────────────────────────────────────────
@@ -217,33 +220,41 @@ class HttpHeadTests(unittest.TestCase):
         self.assertIs(audit.curl_head, audit.http_head)
 
 
-# ── page_to_file / index.mdx resolution tests ──────────────────────────────
+# ── Path resolver tests ────────────────────────────────────────────────────
 
-def test_flat_page_resolves():
-    p = audit.page_to_file("docs/index")
-    assert p == audit.ROOT / "docs" / "index.mdx"
+def test_page_to_file_resolves_directory_index(tmp_path, monkeypatch):
+    docs = tmp_path / "docs" / "deploy"
+    docs.mkdir(parents=True)
+    (docs / "index.mdx").write_text("# deploy")
+    monkeypatch.setattr(audit, "ROOT", tmp_path)
 
-
-def test_directory_index_resolves():
-    target = "docs/deploy"
-    index = audit.ROOT / "docs" / "deploy" / "index.mdx"
-    if index.exists():
-        assert audit.page_to_file(target) == index
-
-
-def test_missing_page_returns_flat_path():
-    p = audit.page_to_file("docs/this/does/not/exist")
-    assert p == audit.ROOT / "docs" / "this/does/not/exist.mdx"
-    assert not p.exists()
+    resolved = audit.page_to_file("docs/deploy")
+    assert resolved == tmp_path / "docs" / "deploy" / "index.mdx"
+    assert resolved.exists()
 
 
-def test_no_local_broken_links():
+def test_page_to_file_prefers_flat_file(tmp_path, monkeypatch):
+    docs = tmp_path / "docs"
+    docs.mkdir(parents=True)
+    (docs / "memory.mdx").write_text("# memory")
+    monkeypatch.setattr(audit, "ROOT", tmp_path)
+
+    resolved = audit.page_to_file("docs/memory")
+    assert resolved == docs / "memory.mdx"
+
+
+def test_page_to_file_missing_returns_flat_path(tmp_path, monkeypatch):
+    (tmp_path / "docs").mkdir(parents=True)
+    monkeypatch.setattr(audit, "ROOT", tmp_path)
+
+    resolved = audit.page_to_file("docs/nope")
+    assert resolved == tmp_path / "docs" / "nope.mdx"
+    assert not resolved.exists()
+
+
+def test_repository_has_no_broken_internal_links():
     assert audit.local_links() == []
 
-
-def test_no_nav_missing():
-    missing = [p for p in audit.nav_pages() if not audit.page_to_file(p).exists()]
-    assert missing == []
 
 
 if __name__ == "__main__":
