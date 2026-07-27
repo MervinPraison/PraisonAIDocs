@@ -305,6 +305,126 @@ sequenceDiagram
 
 ---
 
+## Continuable Delivery
+
+A delivered brief is a resumable conversation by default — reply in the same chat and the agent picks up where the job left off, no IDs, no configuration.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.tools.schedule_tools import schedule_add
+
+agent = Agent(
+    name="Scheduler",
+    instructions="Schedule reminders on demand.",
+    tools=[schedule_add],
+)
+
+# Continuable by default — reply to the delivered brief resumes the job.
+agent.start("Send me a daily revenue brief at 9am to Slack")
+# schedule_add(name=..., schedule="cron:0 9 * * *", message=..., deliver="slack")
+# continuable=True is the default, no argument needed.
+```
+
+**Before / after #3449:**
+
+| Scenario | Before #3449 | After #3449 (default) |
+|---|---|---|
+| User replies to a delivered daily-brief with "why did revenue dip on Tuesday?" | Reply lands as a new turn — agent has no idea which report this refers to. | Reply resumes the job's session — agent sees the brief it just delivered and answers in context. |
+| Config required | Manually pre-wire `session_id` on `DeliveryTarget`. | None — `continuable=True` is the default. |
+| Fire-and-forget notice (e.g. "backup finished") | Same as above. | Set `continuable=False` (or `--no-continuable`) to opt out. |
+
+**How a reply resumes the job:**
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant Agent
+    participant Gateway
+    participant Store as SessionStore
+    participant Channel
+    participant User
+
+    Scheduler->>Agent: run(job.message)
+    Agent-->>Scheduler: brief text
+    Scheduler->>Gateway: _deliver_scheduled_result(target, brief)
+    Gateway->>Channel: send_message(brief)
+    Gateway->>Store: _seed_continuable_session(reply_key, [job.message, brief])
+    User->>Channel: "why did revenue dip on Tuesday?"
+    Channel->>Gateway: inbound reply (same reply_key)
+    Gateway->>Store: resume(reply_key) — brief in context
+    Gateway->>Agent: continue(...)
+```
+
+### Opt out for fire-and-forget notices
+
+Set `continuable=False` (Python/YAML) or `--no-continuable` (CLI) when a reply should start a fresh session — correct for one-shot notices like "backup finished" pings.
+
+<Tabs>
+<Tab title="Python">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.scheduler.models import DeliveryTarget
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Backup", instructions="Post the backup-complete notice")
+target = DeliveryTarget(channel="slack", channel_id="C0123456", continuable=False)
+AgentScheduler(agent, task="Notice", deliver=target).start("daily")
+```
+</Tab>
+
+<Tab title="YAML">
+```yaml
+schedule:
+  every: "daily"
+  deliver:
+    channel: "slack"
+    channel_id: "C0123456"
+    continuable: false
+```
+</Tab>
+
+<Tab title="CLI">
+```bash
+praisonai schedule add "backup-notice" \
+  -s daily \
+  -m "post the backup-complete notice" \
+  --deliver slack:C0123456 \
+  --no-continuable
+```
+</Tab>
+</Tabs>
+
+### `continuable` at a glance
+
+| `continuable` | User reply behaviour |
+|---|---|
+| `True` (default) | Reply in the same chat/thread resumes the job's session with the delivered brief in context. |
+| `False` | Reply starts a new, contextless session (pre-#3449 behaviour). Correct for one-shot notices. |
+
+### Which mode fits which scenario?
+
+```mermaid
+graph TB
+    Start{What happens when the user replies?} -->|Ask follow-up questions on this brief| Keep[Keep the default<br/>continuable=True]
+    Start -->|One-shot notice, reply should start fresh| Opt[continuable=False<br/>--no-continuable]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start q
+    class Keep,Opt opt
+```
+
+<Note>
+Seeding is best-effort. A seed failure logs and never breaks the delivery itself — the brief still lands in the channel.
+</Note>
+
+<Tip>
+`continuable=False` is only persisted when set — existing `DeliveryTarget` records on disk remain byte-identical to pre-#3449, so upgrading is a no-op for stored schedules.
+</Tip>
+
+---
+
 ## How It Works
 
 The scheduler runs the agent, then hands the result to `SchedulerDelivery`, which resolves the token and sends through the shared `DeliveryRouter`.
@@ -403,6 +523,7 @@ Delivery reuses the existing `DeliveryRouter`, so scheduled sends inherit the ga
 | **Dead-target self-heal** | The router retries and skips/marks dead targets |
 | **Graceful degradation** | When `praisonai-bot` is not installed, a single warning is logged and delivery no-ops — the scheduled run itself never fails |
 | **Intentional silence** | An exact `NO_REPLY` / `[SILENT]` / `SILENT` output suppresses delivery; the run is still recorded as `succeeded` |
+| **Continuable delivery** | On successful delivery of a `continuable` target, the gateway seeds a resumable session keyed to the reply address. A seed failure logs and never breaks the delivery — the brief still lands. |
 
 On the gateway-hosted scheduled path, delivery is enqueued into a durable SQLite outbox at `~/.praisonai/state/gateway_outbox.sqlite` before it reaches the router. Its `UNIQUE` idempotency key survives a process restart, so the exact crash window a scheduler must survive (fire → deliver → crash → restart → re-fire) is deduplicated without a double-post. A pre-crash send that never landed stays retryable and is delivered at-least-once on the next tick. If the outbox cannot be built (missing dependency or permission error) the path falls back to the router's in-process LRU exactly as before.
 
@@ -456,6 +577,17 @@ AgentScheduler(agent, task="Standup", deliver="discord:555:thread-42").start("da
 ```
 
 Attachments produced by the job (media returned by the agent) now travel into the same thread — parity with text delivery is preserved on Slack, Telegram, and Discord. See [Outbound Media Delivery](/docs/features/outbound-media-delivery) for the thread grammar.
+
+### Fire-and-forget notice
+
+```bash
+praisonai schedule add "backup-notice" -s daily \
+  -m "post the backup-complete notice" \
+  --deliver slack:C0123456 \
+  --no-continuable
+```
+
+Use `--no-continuable` when a reply should not resume the job — the reply starts a fresh session, matching pre-#3449 behaviour.
 
 ---
 
