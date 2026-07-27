@@ -41,6 +41,7 @@ LINK_RE = re.compile(
     r'\[[^\]]+\]\((/docs[^)#?]+)\)'
 )
 FENCE_RE = re.compile(r"^```.*$", re.MULTILINE)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 
 
 def _curl_head(url: str, curl: str) -> int | None:
@@ -177,6 +178,7 @@ def local_links() -> list[tuple[str, str]]:
 
 
 def tag_delta(tag_text: str) -> int:
+    """Balance delta for an MDX tag: opening +1, closing -1, self-closing 0."""
     if tag_text.startswith("</"):
         return -1
     if tag_text.rstrip().endswith("/>"):
@@ -184,13 +186,18 @@ def tag_delta(tag_text: str) -> int:
     return 1
 
 
-def component_counts(text: str) -> dict[str, int]:
-    text = strip_fenced_blocks(text)
+def mdx_component_balance(text: str) -> dict[str, int]:
+    r"""Count net open/close balance per MDX component tag in ``text``.
+
+    Inline code spans (e.g. ``\`<Steps>\```) are stripped so component
+    references in prose are not mistaken for real unclosed tags.
+    """
+    text = INLINE_CODE_RE.sub("", text)
     counts: dict[str, int] = {}
     for m in MDX_TAG_RE.finditer(text):
         tag = m.group(1)
         counts[tag] = counts.get(tag, 0) + tag_delta(m.group(0))
-    return {t: n for t, n in counts.items() if n != 0}
+    return counts
 
 
 def mdx_component_issues() -> list[str]:
@@ -198,9 +205,9 @@ def mdx_component_issues() -> list[str]:
     for path in sorted((ROOT / "docs").rglob("*.mdx")):
         if "sdk/reference" in path.as_posix():
             continue
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        counts = component_counts(text)
-        bad = [f"{t}(+{n})" if n > 0 else f"{t}({n})" for t, n in counts.items()]
+        text = strip_fenced_blocks(path.read_text(encoding="utf-8", errors="ignore"))
+        counts = mdx_component_balance(text)
+        bad = [f"{t}(+{n})" if n > 0 else f"{t}({n})" for t, n in counts.items() if n != 0]
         if bad:
             issues.append(f"{path.relative_to(ROOT)}: {', '.join(bad)}")
     return issues
