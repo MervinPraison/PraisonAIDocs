@@ -20,7 +20,9 @@ WORKERS = 32
 TIMEOUT = 12
 OK_STATUSES = {200, 301, 302, 307, 308}
 
-MDX_TAG_RE = re.compile(r"</?(Steps|Step|Card|CardGroup|Accordion|AccordionGroup|Tabs|Tab)\b")
+MDX_TAG_RE = re.compile(
+    r"</?(Steps|Step|Card|CardGroup|Accordion|AccordionGroup|Tabs|Tab)\b[^>]*?/?>"
+)
 LINK_RE = re.compile(
     r'(?:href|to)=["\'](/docs[^"\'#?]+)["\']|'
     r'\[[^\]]+\]\((/docs[^)#?]+)\)'
@@ -116,18 +118,31 @@ def local_links() -> list[tuple[str, str]]:
     return broken
 
 
+def tag_delta(tag_text: str) -> int:
+    if tag_text.startswith("</"):
+        return -1
+    if tag_text.rstrip().endswith("/>"):
+        return 0
+    return 1
+
+
+def component_counts(text: str) -> dict[str, int]:
+    text = strip_fenced_blocks(text)
+    counts: dict[str, int] = {}
+    for m in MDX_TAG_RE.finditer(text):
+        tag = m.group(1)
+        counts[tag] = counts.get(tag, 0) + tag_delta(m.group(0))
+    return {t: n for t, n in counts.items() if n != 0}
+
+
 def mdx_component_issues() -> list[str]:
     issues: list[str] = []
     for path in sorted((ROOT / "docs").rglob("*.mdx")):
-        if "sdk/reference" in str(path):
+        if "sdk/reference" in path.as_posix():
             continue
-        text = strip_fenced_blocks(path.read_text(encoding="utf-8", errors="ignore"))
-        counts: dict[str, int] = {}
-        for m in MDX_TAG_RE.finditer(text):
-            tag = m.group(1)
-            closing = text[m.start() : m.start() + 2] == "</"
-            counts[tag] = counts.get(tag, 0) + (-1 if closing else 1)
-        bad = [f"{t}(+{n})" if n > 0 else f"{t}({n})" for t, n in counts.items() if n != 0]
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        counts = component_counts(text)
+        bad = [f"{t}(+{n})" if n > 0 else f"{t}({n})" for t, n in counts.items()]
         if bad:
             issues.append(f"{path.relative_to(ROOT)}: {', '.join(bad)}")
     return issues
