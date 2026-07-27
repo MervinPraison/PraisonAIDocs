@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Unit tests for MDX component balance counting in audit_docs_links."""
+"""Unit tests for audit_docs_links: MDX component balance counting and portable HTTP client."""
 
 from __future__ import annotations
 
 import sys
+import types
+import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import audit_docs_links as audit
 from audit_docs_links import component_counts, tag_delta
 
+
+# ── MDX component balance tests ────────────────────────────────────────────
 
 def test_self_closing_card_is_balanced():
     assert component_counts("<Card />") == {}
@@ -60,6 +66,87 @@ def test_tag_delta_close():
 
 def test_tag_delta_self_closing():
     assert tag_delta('<Card icon="x" />') == 0
+
+
+# ── HTTP client tests ───────────────────────────────────────────────────────
+
+class FakeResponse:
+    def __init__(self, status: int):
+        self.status = status
+
+    def getcode(self) -> int:
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class HttpHeadTests(unittest.TestCase):
+    def test_urllib_returns_200(self):
+        with mock.patch.object(audit.shutil, "which", return_value=None), \
+             mock.patch.object(audit, "urlopen", return_value=FakeResponse(200)):
+            self.assertEqual(audit.http_head("https://example.com"), 200)
+
+    def test_urllib_http_error_404(self):
+        err = audit.HTTPError("https://example.com", 404, "Not Found", {}, None)
+        with mock.patch.object(audit.shutil, "which", return_value=None), \
+             mock.patch.object(audit, "urlopen", side_effect=err):
+            self.assertEqual(audit.http_head("https://example.com"), 404)
+
+    def test_urllib_url_error_transport_sentinel(self):
+        err = audit.URLError("connection refused")
+        with mock.patch.object(audit.shutil, "which", return_value=None), \
+             mock.patch.object(audit, "urlopen", side_effect=err):
+            self.assertEqual(
+                audit.http_head("https://example.com"), audit.TRANSPORT_ERROR
+            )
+
+    def test_head_405_falls_back_to_get(self):
+        err = audit.HTTPError("https://example.com", 405, "Method Not Allowed", {}, None)
+        side_effects = [err, FakeResponse(200)]
+
+        def fake_urlopen(req, timeout=None):
+            result = side_effects.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with mock.patch.object(audit.shutil, "which", return_value=None), \
+             mock.patch.object(audit, "urlopen", side_effect=fake_urlopen):
+            self.assertEqual(audit.http_head("https://example.com"), 200)
+
+    def test_curl_fast_path_used_when_available(self):
+        completed = types.SimpleNamespace(stdout="301", returncode=0)
+        with mock.patch.object(audit.shutil, "which", return_value="/usr/bin/curl"), \
+             mock.patch.object(audit.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(audit.http_head("https://example.com"), 301)
+            run.assert_called_once()
+
+    def test_curl_failure_falls_back_to_urllib(self):
+        completed = types.SimpleNamespace(stdout="", returncode=1)
+        with mock.patch.object(audit.shutil, "which", return_value="/usr/bin/curl"), \
+             mock.patch.object(audit.subprocess, "run", return_value=completed), \
+             mock.patch.object(audit, "urlopen", return_value=FakeResponse(200)):
+            self.assertEqual(audit.http_head("https://example.com"), 200)
+
+    def test_curl_uses_nul_on_windows(self):
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return types.SimpleNamespace(stdout="200", returncode=0)
+
+        with mock.patch.object(audit.os, "name", "nt"), \
+             mock.patch.object(audit.subprocess, "run", side_effect=fake_run):
+            audit._curl_head("https://example.com", "curl")
+        self.assertIn("NUL", captured["cmd"])
+        self.assertNotIn("/dev/null", captured["cmd"])
+
+    def test_backwards_compatible_alias(self):
+        self.assertIs(audit.curl_head, audit.http_head)
 
 
 if __name__ == "__main__":

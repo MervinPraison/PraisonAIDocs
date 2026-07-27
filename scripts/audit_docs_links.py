@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Fast docs audit: live 404 checks + local internal link validation.
 
-Cross-platform: live HTTP checks use ``curl`` when available (fast path)
-and fall back to the stdlib :mod:`urllib.request` otherwise, so the audit
-works identically on Windows, macOS, and Linux. A transport failure
-(no HTTP response) is reported with the sentinel status ``-1`` to keep it
-distinguishable from a genuine HTTP error code.
+Cross-platform: live HTTP checks use ``curl`` when available on PATH
+(via ``shutil.which``) and fall back to the stdlib :mod:`urllib.request`
+otherwise, so the audit works identically on Windows, macOS, and Linux.
+A transport failure (no HTTP response) is reported with the sentinel
+status ``-1`` to keep it distinguishable from a genuine HTTP error code.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ DOCS = f"{BASE}/docs"
 WORKERS = 32
 TIMEOUT = 12
 OK_STATUSES = {200, 301, 302, 307, 308}
-TRANSPORT_FAILURE = -1
+TRANSPORT_ERROR = -1
 USER_AGENT = "PraisonAIDocs-Audit/1.0"
 _CURL = shutil.which("curl")
 
@@ -43,52 +43,61 @@ LINK_RE = re.compile(
 FENCE_RE = re.compile(r"^```.*$", re.MULTILINE)
 
 
-def _curl_head(url: str) -> int | None:
-    """Return an HTTP status via curl, or ``None`` if curl is unusable."""
-    if not _CURL:
-        return None
+def _curl_head(url: str, curl: str) -> int | None:
+    """Return HTTP status via curl, or None if curl produced no usable code."""
     null_dev = "NUL" if os.name == "nt" else "/dev/null"
     try:
         out = subprocess.run(
-            [_CURL, "-s", "-o", null_dev, "-w", "%{http_code}",
-             "--max-time", str(TIMEOUT), "-L",
-             "-H", "Cache-Control: no-cache", url],
+            [curl, "-s", "-L", "-o", null_dev, "-w", "%{http_code}",
+             "--max-time", str(TIMEOUT), "-H", "Cache-Control: no-cache", url],
             capture_output=True, text=True, check=False,
         )
         code = out.stdout.strip()
-        return int(code) if code.isdigit() else None
+        if code.isdigit():
+            return int(code)
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _urllib_head(url: str) -> int:
-    """Return an HTTP status via stdlib urllib, falling back to GET."""
-    headers = {"Cache-Control": "no-cache", "User-Agent": USER_AGENT}
+    """Return HTTP status via stdlib urllib, or TRANSPORT_ERROR on failure."""
+    headers = {
+        "Cache-Control": "no-cache",
+        "User-Agent": USER_AGENT,
+    }
     for method in ("HEAD", "GET"):
         try:
             req = Request(url, method=method, headers=headers)
             with urlopen(req, timeout=TIMEOUT) as resp:
-                return getattr(resp, "status", resp.getcode())
+                return getattr(resp, "status", None) or resp.getcode()
         except HTTPError as exc:
             if method == "HEAD" and exc.code in {405, 501}:
                 continue
             return exc.code
         except (URLError, OSError, ValueError):
-            return TRANSPORT_FAILURE
-    return TRANSPORT_FAILURE
+            return TRANSPORT_ERROR
+    return TRANSPORT_ERROR
 
 
 def http_head(url: str) -> int:
-    """Return the HTTP status for ``url`` in a cross-platform way.
+    """Return HTTP status for *url*, portable across all platforms.
 
-    Uses ``curl`` when available for speed, otherwise stdlib ``urllib``.
-    Returns :data:`TRANSPORT_FAILURE` (``-1``) when no HTTP response is
-    obtained, so transport errors are distinct from real HTTP codes.
+    Uses ``curl`` from PATH as a fast path when present; otherwise falls
+    back to the stdlib ``urllib`` client. Transport-level failures return
+    ``TRANSPORT_ERROR`` (-1) so they are distinguishable from real HTTP
+    error codes in reports.
     """
-    status = _curl_head(url)
-    if status is not None:
-        return status
+    curl = shutil.which("curl")
+    if curl:
+        code = _curl_head(url, curl)
+        if code is not None:
+            return code
     return _urllib_head(url)
+
+
+# Backwards-compatible alias.
+curl_head = http_head
 
 
 def page_to_url(page: str) -> str:
