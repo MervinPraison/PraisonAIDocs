@@ -12,60 +12,76 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import audit_docs_links as audit
-from audit_docs_links import component_counts, tag_delta
+from audit_docs_links import (  # noqa: E402
+    mdx_component_balance,
+    strip_fenced_blocks,
+    tag_delta,
+)
 
 
 # ── MDX component balance tests ────────────────────────────────────────────
 
+def balance(text: str, tag: str = "Card") -> int:
+    return mdx_component_balance(text).get(tag, 0)
+
+
 def test_self_closing_card_is_balanced():
-    assert component_counts("<Card />") == {}
+    assert balance("<Card />") == 0
 
 
 def test_self_closing_card_with_attrs_is_balanced():
-    assert component_counts('<Card icon="robot" href="/docs/x" />') == {}
+    assert balance('<Card icon="robot" href="/docs/x" />') == 0
 
 
 def test_paired_card_is_balanced():
-    assert component_counts("<Card>text</Card>") == {}
+    assert balance("<Card>text</Card>") == 0
 
 
-def test_unclosed_card_is_flagged():
-    assert component_counts("<Card>text") == {"Card": 1}
+def test_unclosed_card_is_positive():
+    assert balance("<Card>text") == 1
 
 
-def test_nested_self_closing_in_group_is_balanced():
-    assert component_counts("<CardGroup><Card /></CardGroup>") == {}
+def test_nested_self_closing_within_group():
+    assert balance("<CardGroup><Card /></CardGroup>", "Card") == 0
+    assert balance("<CardGroup><Card /></CardGroup>", "CardGroup") == 0
 
 
-def test_fenced_code_is_ignored():
-    text = "```mdx\n<Card>\n```\n"
-    assert component_counts(text) == {}
-
-
-def test_multiple_self_closing_cards_balanced():
+def test_related_section_multiple_self_closing():
     text = (
-        "<CardGroup cols={2}>\n"
-        '  <Card icon="robot" href="/a" />\n'
-        '  <Card icon="book-open" href="/b" />\n'
-        "</CardGroup>\n"
+        '<CardGroup cols={2}>\n'
+        '  <Card icon="robot" href="/docs/concepts/agents" />\n'
+        '  <Card icon="book-open" href="/docs/guides/single-agent" />\n'
+        '</CardGroup>'
     )
-    assert component_counts(text) == {}
+    assert balance(text, "Card") == 0
+    assert balance(text, "CardGroup") == 0
+
+
+def test_fenced_code_card_is_ignored():
+    text = "```mdx\n<Card>\n```\n"
+    assert balance(strip_fenced_blocks(text)) == 0
+
+
+def test_inline_code_reference_is_ignored():
+    text = "Every page must use `<Steps>` and `<CardGroup cols={2}>`."
+    assert balance(text, "Steps") == 0
+    assert balance(text, "CardGroup") == 0
+
+
+def test_inline_reference_does_not_offset_real_tags():
+    text = "Use `<Steps>` here.\n<Steps>\n<Step>x</Step>\n</Steps>"
+    assert balance(text, "Steps") == 0
+
+
+def test_tag_delta_values():
+    assert tag_delta("<Card>") == 1
+    assert tag_delta("</Card>") == -1
+    assert tag_delta("<Card />") == 0
+    assert tag_delta("<Card/>") == 0
 
 
 def test_extra_closing_tag_is_negative():
-    assert component_counts("<Card>x</Card></Card>") == {"Card": -1}
-
-
-def test_tag_delta_open():
-    assert tag_delta("<Card>") == 1
-
-
-def test_tag_delta_close():
-    assert tag_delta("</Card>") == -1
-
-
-def test_tag_delta_self_closing():
-    assert tag_delta('<Card icon="x" />') == 0
+    assert balance("<Card>x</Card></Card>") == -1
 
 
 # ── HTTP client tests ───────────────────────────────────────────────────────
