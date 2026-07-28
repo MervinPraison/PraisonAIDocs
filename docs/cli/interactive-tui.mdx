@@ -342,6 +342,77 @@ Messages are processed in FIFO order (First In, First Out). The agent automatica
   See the full Message Queue documentation for programmatic usage and API reference.
 </Card>
 
+## Interrupting a Turn
+
+Press `Ctrl-C` while the agent is thinking and the current turn stops at the next step boundary — the partial output is kept, the warm agent stays loaded, and the session is intact. Type the next prompt immediately.
+
+```mermaid
+graph LR
+    subgraph "Cooperative Cancellation"
+        Turn[⏳ Turn running] --> CtrlC[⌨️ Ctrl-C]
+        CtrlC --> Req[🛑 controller.request user]
+        Req --> Step{🚦 Next step<br/>boundary}
+        Step -->|checked| Stop[⏹ Stop + partial output]
+        Stop --> Warm[♻️ Warm agent + session kept]
+        Warm --> Next[▶️ Type next prompt]
+    end
+
+    classDef running fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Turn running
+    class CtrlC,Next input
+    class Req,Step,Stop stop
+    class Warm ok
+```
+
+### What happens
+
+Each turn runs in a worker thread wired to an `InterruptController` — the same cooperative-cancellation primitive the core chat loop already checks at every step boundary. `Ctrl-C` requests the interrupt on the main thread; the worker observes it at the next check and returns.
+
+```
+❯ summarise the whole repo
+  ⏳ Praison AI is thinking... (Ctrl-C to interrupt)
+^C
+  ⏹ Interrupting… (finishing current step)
+Turn interrupted by user.
+
+❯ ok, just the README instead
+```
+
+### One press vs. two
+
+| Press | State | Behaviour |
+|---|---|---|
+| `Ctrl-C` × 1 | Turn running | Cooperative cancel. Prints `⏹ Interrupting…`; the core loop stops at the next step boundary; partial output is kept; a `system` message `Turn interrupted by user.` is appended to the transcript. Warm agent and session survive. |
+| `Ctrl-C` × 2 | Turn still running (blocked in a slow tool call that hasn't checked yet) | The wrapper stops waiting on the worker thread. The cancellation request is still set — the daemon worker observes it whenever it next reaches a check-point. Control returns to the prompt immediately. |
+| `Ctrl-C` × 1 | Idle (no turn running, prompt-toolkit path) | Resets the current input line — unchanged from before. |
+
+### While a cancel is in flight
+
+If you press `Ctrl-C` twice and try to start a new turn before the previous one has observed the cancel, the CLI refuses cleanly rather than double-booking the shared controller:
+
+```
+❯ new question
+  ⏹ Previous turn is still cancelling; please wait a moment and try again.
+```
+
+This is deliberate — silently starting a new turn would either un-cancel the abandoned worker (and let it resume against the warm session) or race two turns against the same agent. Wait a moment and retry.
+
+<Note>
+Between turns, a stale `Ctrl-C` you pressed while nothing was running does **not** kill the next turn — the interrupt is cleared at the start of every fresh turn. You only cancel what is actually running.
+</Note>
+
+<Warning>
+Cooperative means the loop stops at the **next** boundary — it does not kill the current step. A single long-running blocking call (a slow HTTP request, a long shell command) finishes before the interrupt is observed. That is why a second `Ctrl-C` is available: it stops waiting on the wrapper side and returns you to the prompt.
+</Warning>
+
+<Tip>
+Cancelling a turn does **not** cost you the session. Re-run `praisonai chat` in the same directory, or use `praisonai session resume <id>`, and the transcript up to (and including) the partial output is restored.
+</Tip>
+
 ## Profiling
 
 Enable profiling to see timing breakdown:
@@ -561,7 +632,8 @@ display.print_success("Done!")
 | Shortcut | Action |
 |----------|--------|
 | `Tab` | Auto-complete |
-| `Ctrl+C` | Cancel current input |
+| `Ctrl+C` (turn running) | Cancel the running turn cooperatively — keeps partial output and warm agent. Press twice to stop waiting on a stuck step. [See details](#interrupting-a-turn). |
+| `Ctrl+C` (idle) | Clear the current input line. |
 | `Ctrl+D` | Exit (on empty line) |
 | `Ctrl+L` | Clear screen |
 
