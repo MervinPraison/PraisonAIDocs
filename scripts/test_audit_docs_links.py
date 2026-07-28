@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import audit_docs_links as audit
 from audit_docs_links import (  # noqa: E402
     mdx_component_balance,
+    resolve_page_file,
     strip_fenced_blocks,
     tag_delta,
 )
@@ -82,6 +83,57 @@ def test_tag_delta_values():
 
 def test_extra_closing_tag_is_negative():
     assert balance("<Card>x</Card></Card>") == -1
+
+
+# ── Page resolver tests ─────────────────────────────────────────────────────
+
+class ResolvePageFileTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "docs").mkdir()
+        self._orig_root = audit.ROOT
+        audit.ROOT = self.root
+
+    def tearDown(self):
+        audit.ROOT = self._orig_root
+        self._tmp.cleanup()
+
+    def _write(self, rel: str) -> None:
+        path = self.root / "docs" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+
+    def test_flat_mdx_resolves(self):
+        self._write("guides/quickstart.mdx")
+        self.assertIsNotNone(resolve_page_file("guides/quickstart"))
+
+    def test_directory_index_mdx_resolves(self):
+        self._write("mcp/index.mdx")
+        self.assertIsNotNone(resolve_page_file("mcp"))
+
+    def test_directory_index_preferred_when_flat_missing(self):
+        self._write("sdk/reference/index.mdx")
+        resolved = resolve_page_file("sdk/reference")
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.name, "index.mdx")
+
+    def test_docs_prefix_is_stripped(self):
+        self._write("cli/index.mdx")
+        self.assertIsNotNone(resolve_page_file("docs/cli"))
+
+    def test_leading_and_trailing_slashes_ignored(self):
+        self._write("features/memory.mdx")
+        self.assertIsNotNone(resolve_page_file("/features/memory/"))
+
+    def test_missing_page_returns_none(self):
+        self.assertIsNone(resolve_page_file("does/not/exist"))
+
+    def test_empty_page_returns_none(self):
+        self.assertIsNone(resolve_page_file(""))
+        self.assertIsNone(resolve_page_file("/"))
 
 
 # ── HTTP client tests ───────────────────────────────────────────────────────
