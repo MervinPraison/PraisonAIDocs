@@ -115,6 +115,26 @@ def page_to_file(page: str) -> Path:
     return ROOT / "docs" / f"{page}.mdx"
 
 
+def resolve_page_file(page: str) -> Path | None:
+    """Return the on-disk MDX file for a docs *page*, or ``None`` if missing.
+
+    Mintlify serves a docs route from either ``{page}.mdx`` or the
+    directory-index form ``{page}/index.mdx``. The audit must treat both as
+    valid so that links to section landing pages are not reported as broken.
+    """
+    page = page.strip("/")
+    if page.startswith("docs/"):
+        page = page[5:]
+    if not page:
+        return None
+    docs = ROOT / "docs"
+    candidates = (docs / f"{page}.mdx", docs / page / "index.mdx")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def strip_fenced_blocks(text: str) -> str:
     lines = text.splitlines()
     out: list[str] = []
@@ -172,7 +192,7 @@ def local_links() -> list[tuple[str, str]]:
             target = href.removeprefix("/docs/")
             if not target:
                 continue
-            if not page_to_file(f"docs/{target}").exists():
+            if resolve_page_file(target) is None:
                 broken.append((rel, href))
     return broken
 
@@ -227,6 +247,16 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=ROOT / "scripts" / "audit_report.md")
     parser.add_argument("--nav-only", action="store_true", help="Check nav URLs only (faster)")
     parser.add_argument("--skip-live", action="store_true", help="Skip live URL checks (offline, local-only audit)")
+    parser.add_argument(
+        "--max-broken",
+        type=int,
+        default=None,
+        help=(
+            "Optional CI gate: exit non-zero only when the local broken href "
+            "count exceeds this threshold. When set, live/nav/mdx findings do "
+            "not affect the exit code, enabling a soft link-rot budget in CI."
+        ),
+    )
     args = parser.parse_args()
 
     nav = nav_pages()
@@ -250,7 +280,7 @@ def main() -> int:
     print("scanning mdx components...")
     mdx_bad = mdx_component_issues()
 
-    nav_missing = [p for p in nav if not page_to_file(p).exists()]
+    nav_missing = [p for p in nav if resolve_page_file(p) is None]
 
     lines = [
         "# Docs audit report",
@@ -298,6 +328,19 @@ def main() -> int:
         f"live_broken={len(live_broken)} local_broken={len(local_broken)} "
         f"mdx_bad={len(mdx_bad)} nav_missing={len(nav_missing)}"
     )
+    if args.max_broken is not None:
+        over = len(local_broken) > args.max_broken
+        if over:
+            print(
+                f"FAIL: local_broken={len(local_broken)} exceeds "
+                f"threshold {args.max_broken}"
+            )
+        else:
+            print(
+                f"OK: local_broken={len(local_broken)} within "
+                f"threshold {args.max_broken}"
+            )
+        return 1 if over else 0
     return 1 if (live_broken or local_broken or mdx_bad or nav_missing) else 0
 
 
