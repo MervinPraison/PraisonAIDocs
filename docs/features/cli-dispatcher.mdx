@@ -67,7 +67,7 @@ graph TB
     E -->|No| F[🔎 first non-flag positional]
     F --> K{🧠 in registered<br/>Typer commands?}
     K -->|Yes| Typer3[🧰 Typer subcommand]
-    K -->|No| B{🔍 bare prompt?<br/>no flags &amp;<br/>not .yaml/.yml}
+    K -->|No| B{🔍 bare prompt?<br/>flags all run-supported &amp;<br/>not .yaml/.yml}
     B -->|Yes| Run[🧰 Typer run<br/>run &lt;prompt&gt;]
     B -->|No| Legacy[🤖 Legacy<br/>YAML / deprecated flags]
 
@@ -164,9 +164,12 @@ sequenceDiagram
 | `main()` | Entry router | Applies 6 rules in order |
 | `_find_first_command()` | Positional finder | Skips flags, finds command |
 | `_get_typer_commands()` | Auto-discovery | Cached command introspection |
-| `_looks_like_bare_prompt()` | Bare-prompt predicate | True when no flags and not `.yaml`/`.yml` |
+| `_looks_like_bare_prompt()` | Bare-prompt predicate | True when not `.yaml`/`.yml` **and** every flag (if any) is in `run`'s supported option set (derived via `_get_run_option_names()`) |
+| `_get_run_option_names()` | Auto-discovery of `run`'s flags | Introspects Typer `run`'s Click parameters at dispatch; cached under a lock; value-taking vs boolean discrimination |
+| `_flag_names()` | Value-aware flag extractor | Skips a value-taking option's following token so a dash-prefixed value isn't mis-classified as a flag |
+| `_build_run_argv()` | Argv rewriter | Joins positionals into one `target`; keeps value-taking options with their values |
 | Typer | Subcommand & `run` handler | Registered commands + bare prompts |
-| Legacy | Fallback handler | YAML files and deprecated flags |
+| Legacy | Fallback handler | YAML files and legacy-only flags |
 
 ---
 
@@ -180,10 +183,22 @@ sequenceDiagram
 | 2 | `--help` / `-h` | Typer help (auto-generated, lists every subcommand) |
 | 3 | No arguments | Typer interactive TUI |
 | 4 | First arg is a Typer command | Typer subcommand |
-| 5 | Bare free-text prompt | **Typer `run`** (modern engine) |
-| 6 | Everything else | Legacy (`.yaml`, deprecated flags) |
+| 5 | Bare free-text prompt (optionally with `run`-supported flags like `--model`, `--continue`, `--session`, `--output`, `--stream`) | **Typer `run`** (modern engine) |
+| 6 | Everything else | Legacy (`.yaml`, legacy-only flags) — a one-line stderr notice fires when a legacy-only flag is what forced the fallback |
 
-Rule 5 fires only when `_looks_like_bare_prompt(argv, first_cmd)` returns `True` — that is, when **all three** hold: `first_cmd` is not empty, **no** `-`/`--` token appears anywhere in argv, and `first_cmd` does not end (case-insensitively) with `.yaml` or `.yml`.
+Rule 5 fires when `_looks_like_bare_prompt(argv, first_cmd)` returns `True` — that is, when `first_cmd` is non-empty, doesn't end with `.yaml`/`.yml`, and **either** no dash-prefixed token appears anywhere in argv **or** every flag present is one that Typer `run` itself accepts (`--model`, `--continue`, `--session`, `--output`, `--stream`, …, derived at dispatch time by introspecting `run`'s Click parameters). A single genuinely legacy-only flag (`--auto`, `--serve`, `--framework`, …) still forces legacy. If `run`-option discovery fails, the predicate falls back to the original conservative any-flag→legacy rule.
+
+### Never-silent legacy fallback
+
+When a bare-prompt invocation reaches the legacy engine solely because it contains a flag that `run` doesn't accept, `praisonai` prints a one-line stderr notice pointing at the modern equivalent:
+
+```
+Note: 'summarise this' contains a flag not supported by the modern engine;
+using the legacy engine. For session continuity, --output modes and
+permissions, try: praisonai run "summarise this" ...
+```
+
+The notice fires only in the legacy-flag case: `.yaml`/`.yml` workflows do **not** produce it (they legitimately live on the legacy path).
 
 ### Behaviour Matrix
 
@@ -196,8 +211,15 @@ Rule 5 fires only when `_looks_like_bare_prompt(argv, first_cmd)` returns `True`
 | `praisonai show` (reserved verb, bare) | **Typer `run`** | `target="show"` — legacy guard bypassed |
 | `praisonai memoyr` (typo of `memory`, bare) | **Typer `run`** | `target="memoyr"` — legacy guard bypassed |
 | `praisonai agents.yaml` | **Legacy** | `.yaml`/`.yml` predicate returns False |
-| `praisonai "Create a weather app" --framework crewai` | **Legacy** | any flag keeps it on legacy |
-| `praisonai --verbose hello` | **Legacy** | leading flag → predicate returns False |
+| `praisonai "Create a weather app" --framework crewai` | **Legacy** | `--framework` is legacy-only; the stderr notice fires |
+| `praisonai --verbose hello` | **Typer `run`** | `--verbose` is run-supported; forwarded as `run "hello" --verbose` |
+| `praisonai "fix the auth bug" --model gpt-4o` | **Typer `run`** | forwarded as `run "fix the auth bug" --model gpt-4o` |
+| `praisonai "summarise this" --continue` | **Typer `run`** | forwarded as `run "summarise this" --continue` |
+| `praisonai "diagnose" --output json` | **Typer `run`** | forwarded as `run "diagnose" --output json` |
+| `praisonai build a weather agent -m gpt-4o` (unquoted) | **Typer `run`** | forwarded as `run "build a weather agent" -m gpt-4o` — value stays with its flag |
+| `praisonai "resume" --session -abc` (dash value) | **Typer `run`** | value's leading `-` is not mis-classified as a flag |
+| `praisonai "do it" --serve` | **Legacy** | `--serve` is legacy-only; stderr notice fires |
+| `praisonai "x" --model gpt-4o --serve` (mixed) | **Legacy** | one unrecognised flag → legacy; stderr notice fires |
 | `praisonai chat "Hello"` | **Typer** | rule 4 fires before rule 5 |
 | `praisonai serve` / `call` / `realtime` / `debug` (flagless) | **Typer** | registered commands — rule 4 wins |
 
@@ -252,6 +274,16 @@ praisonai agents.yaml
 praisonai --verbose chat "Hello world"
 # --verbose is skipped when finding first positional (chat)
 # Routes to Typer since 'chat' is a registered command
+```
+
+### Bare Prompt With `run` Flags
+```bash
+praisonai "fix the auth bug" --model gpt-4o
+praisonai "summarise this" --continue
+praisonai "diagnose" --output json
+
+# All three reach the modern engine — same as praisonai run "..." <flag>.
+# Session continuity, --output modes, credential gate, permissions are all in effect.
 ```
 
 ---
@@ -311,7 +343,7 @@ To add a new subcommand, simply register it in `praisonai/cli/app.py` using `app
 </Accordion>
 
 <Accordion title="How to force the legacy path">
-Add any flag, or use a `.yaml`/`.yml` file. Any `-`/`--` token anywhere in argv keeps the invocation on the legacy dispatcher (which owns `--framework`, `--auto`, `--serve`, and friends). `.yaml`/`.yml` tokens stay on the legacy multi-framework path. The reserved-verb / typo guard only runs once you are already on legacy.
+Add a **legacy-only** flag (e.g. `--framework`, `--auto`, `--serve`) or use a `.yaml`/`.yml` file. Flags accepted by the modern `run` command (`--model`, `--continue`, `--session`, `--output`, `--stream`, …) now stay on the modern engine instead of forcing legacy. When a legacy-only flag is what triggers the fallback, a one-line notice prints to stderr — the fallback is never silent, so you can spot un-migrated flags. The reserved-verb / typo guard only runs once you are already on legacy.
 </Accordion>
 
 <Accordion title="Failure visibility">
