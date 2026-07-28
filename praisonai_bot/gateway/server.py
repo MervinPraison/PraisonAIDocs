@@ -2285,6 +2285,14 @@ class WebSocketGateway:
         """
         self._last_inbound_ts = time.time()
 
+    def _record_channel_inbound(self, channel_name: str) -> None:
+        """Record inbound channel activity for metrics and idle tracking."""
+        self.notify_inbound()
+        self.record_metric(
+            "messages_inbound_total",
+            labels={"channel": channel_name},
+        )
+
     def _probe_idle_facts(self) -> Tuple[int, float, bool]:
         """Read live liveness facts from gateway sessions for the idle policy.
 
@@ -4225,28 +4233,70 @@ class WebSocketGateway:
 
     def health(self) -> Dict[str, Any]:
         """Get gateway health status including per-channel bot status and supervision state."""
+        from praisonaiagents.bots.protocols import HealthReason, HealthResult, evaluate_channel_health
+
         uptime = time.time() - self._started_at if self._started_at else 0
         channel_status = {}
         supervision_status = self._channel_supervisor.get_all_status()
+        stale_after = (
+            getattr(self._health_config, "stale_after", 120.0)
+            if self._health_config is not None
+            else 120.0
+        )
+        startup_grace = (
+            getattr(self._health_config, "startup_grace", 60.0)
+            if self._health_config is not None
+            else 60.0
+        )
         
         for name, bot in self._channel_bots.items():
             running = getattr(bot, "is_running", False)
             platform = getattr(bot, "platform", "unknown")
-            
+            last_activity = getattr(bot, "_last_inbound_activity", None)
+            if last_activity is None:
+                last_activity = getattr(bot, "_started_at", None)
+            active_runs = 0
+            counter = getattr(bot, "_active_run_count", None)
+            if callable(counter):
+                try:
+                    active_runs = int(counter() or 0)
+                except Exception:
+                    active_runs = 0
+
+            health_result = HealthResult(
+                ok=running,
+                platform=platform,
+                is_running=running,
+                last_activity=last_activity,
+                active_runs=int(active_runs or 0),
+            )
+            reason = evaluate_channel_health(
+                health_result,
+                startup_grace_seconds=startup_grace,
+                stale_after_seconds=stale_after,
+            )
+            cached_probe = getattr(bot, "_last_probe_result", None)
+            probe_ok = getattr(cached_probe, "ok", None) if cached_probe is not None else None
+
             # Get supervision state
             sup_status = supervision_status.get(name)
+            entry: Dict[str, Any] = {
+                "platform": platform,
+                "running": running,
+                "last_activity": last_activity,
+                "ok": reason == HealthReason.HEALTHY,
+                "reason": reason.value,
+            }
+            if probe_ok is not None:
+                entry["probe"] = {"ok": probe_ok}
             if sup_status:
-                entry = {
-                    "platform": platform,
-                    "running": running,
-                    "supervision": {
-                        "state": sup_status.state.value,
-                        "last_error": sup_status.last_error,
-                        "last_error_time": sup_status.last_error_time,
-                        "next_retry_at": sup_status.next_retry_at,
-                        "total_recoveries": sup_status.total_recoveries,
-                        "manual_pause": sup_status.manual_pause,
-                    }
+                entry["supervision"] = {
+                    "state": sup_status.state.value,
+                    "last_error": sup_status.last_error,
+                    "last_error_time": sup_status.last_error_time,
+                    "next_retry_at": sup_status.next_retry_at,
+                    "total_recoveries": sup_status.total_recoveries,
+                    "manual_pause": sup_status.manual_pause,
                 }
                 # Issue #3348: a channel whose credential was rejected at
                 # runtime (revoked/rotated/expired token) is surfaced as the
@@ -4257,12 +4307,7 @@ class WebSocketGateway:
                 if sup_status.state == ChannelState.CREDENTIAL_UNAVAILABLE:
                     entry["status"] = "degraded"
                     entry["reason"] = "credential unavailable"
-                channel_status[name] = entry
-            else:
-                channel_status[name] = {
-                    "platform": platform,
-                    "running": running,
-                }
+            channel_status[name] = entry
 
         # Issue #3159: surface channels that were configured but skipped at
         # startup because their credential was unavailable. Without this a
@@ -4285,6 +4330,7 @@ class WebSocketGateway:
             "sessions": len(self._sessions),
             "clients": len(self._clients),
             "channels": channel_status,
+            "last_inbound_at": self._last_inbound_ts,
         }
 
         # Issue #3021: surface opt-in lifecycle state so an operator can see
@@ -4486,6 +4532,9 @@ class WebSocketGateway:
                 logger.info(
                     "Delivered scheduled result to %s:%s", channel, channel_id,
                 )
+                # Seed a resumable session so the user's reply in this chat
+                # resumes the job's conversation with full context (#3444).
+                self._seed_continuable_session(delivery, text)
             else:
                 logger.error(
                     "Failed to deliver scheduled result to %s:%s", channel, channel_id,
@@ -4514,10 +4563,76 @@ class WebSocketGateway:
             logger.info(
                 "Delivered scheduled result to %s:%s", channel, channel_id,
             )
+            # Seed a resumable session so the user's reply resumes context (#3444).
+            self._seed_continuable_session(delivery, text)
         except Exception as e:
             logger.error(
                 "Failed to deliver to %s:%s: %s", channel, channel_id, e,
             )
+
+    def _seed_continuable_session(self, delivery: Any, text: str) -> None:
+        """Seed a resumable session so a reply to a delivered brief has context.
+
+        Issue #3444: a scheduled/automated delivery is one-way by default — the
+        gateway sends the text and stops, so when the user replies in the same
+        chat ("dig into item 3") the reply lands as a brand-new, contextless
+        turn. Here we mirror the just-delivered text into the destination
+        channel bot's session — keyed by the same chat id an inbound reply
+        reproduces — so the reply resumes the conversation with the brief in
+        context. Reuses the existing ``mirror_to_session`` outbound-mirror path
+        (the same mechanism ``send_message`` already uses), so this adds no new
+        session machinery. Opt-out via ``DeliveryTarget.continuable=False``.
+
+        Best-effort and side-effect-free on failure: seeding must never break
+        the delivery that already succeeded.
+        """
+        if not getattr(delivery, "continuable", True):
+            return
+        channel = getattr(delivery, "channel", "") or ""
+        channel_id = getattr(delivery, "channel_id", "") or ""
+        if not channel or not channel_id:
+            return
+        bot = self.get_channel_bot(channel)
+        if bot is None:
+            for name, b in self._channel_bots.items():
+                if name.lower() == channel.lower():
+                    bot = b
+                    break
+        if bot is None:
+            return
+        # Locate the bot's BotSessionManager across the adapter variants
+        # (adapters expose it as ``_session``/``_session_mgr``, sometimes behind
+        # an inner ``_adapter``) — same discovery the outbound-messenger wiring
+        # uses so seeding reaches every shipped transport.
+        session = None
+        for holder in (bot, getattr(bot, "_adapter", None)):
+            if holder is None:
+                continue
+            for attr in ("_session", "_session_mgr"):
+                candidate = getattr(holder, attr, None)
+                if candidate is not None:
+                    session = candidate
+                    break
+            if session is not None:
+                break
+        if session is None:
+            return
+        try:
+            from praisonai_bot.bots._mirror import mirror_to_session
+            # An inbound reply from this chat resolves its session by the chat
+            # id, so mirror under ``channel_id`` — byte-identical to the key the
+            # reply will mint — with the delivered brief as the assistant turn.
+            mirror_to_session(
+                session,
+                user_id=channel_id,
+                message_text=text,
+                source_label="cron",
+            )
+            logger.info(
+                "Seeded continuable session for %s:%s", channel, channel_id,
+            )
+        except Exception as e:  # pragma: no cover — defensive
+            logger.debug("continuable seed failed for %s:%s: %s", channel, channel_id, e)
 
     async def _deliver_via_outbox(
         self, outbox: Any, router: Any, route: str, text: str, idem: str,
@@ -5472,6 +5587,9 @@ class WebSocketGateway:
                 # to the same session serialise turns on the resolved id. No-op
                 # without an identity resolver (single-channel behaviour).
                 self._stamp_turn_lock_map(bot)
+                # Issue #3352: share the gateway's metrics registry so per-turn
+                # prompt-prefix drift increments ``prompt_cache_invalidations_total``.
+                self._stamp_metrics(bot)
                 self._channel_bots[channel_name] = bot
                 logger.info(f"Channel '{channel_name}' ({channel_type}) initialized")
             except Exception as e:
@@ -5717,6 +5835,29 @@ class WebSocketGateway:
         elif hasattr(bot, "_turn_lock_map"):
             bot._turn_lock_map = lock_map
 
+    def _stamp_metrics(self, bot: Any) -> None:
+        """Share the gateway's ``GatewayMetrics`` registry with a channel bot.
+
+        Issue #3352: the concrete adapters build their own ``BotSessionManager``
+        (exposed as ``_session`` / ``_session_mgr``), which increments
+        ``prompt_cache_invalidations_total`` on per-turn prompt-prefix drift only
+        when ``session._metrics`` is set. Without this splice that reference stays
+        ``None`` for gateway-managed sessions and the counter never moves despite
+        genuine invalidations. Mirrors ``_stamp_admission_gate`` /
+        ``_stamp_identity_resolver`` and is a no-op when no registry exists
+        (``--no-metrics``), preserving today's behaviour. Called from both
+        ``start_channels`` and ``_start_single_channel`` (hot-reload).
+        """
+        metrics = getattr(self, "_metrics", None)
+        if metrics is None:
+            return
+        sess = (
+            getattr(bot, "_session", None)
+            or getattr(bot, "_session_mgr", None)
+        )
+        if sess is not None and hasattr(sess, "_metrics"):
+            sess._metrics = metrics
+
     def _register_channel_shell_cfg(
         self, channel_name: str, config: Any, ch_cfg: Dict[str, Any]
     ) -> None:
@@ -5878,6 +6019,7 @@ class WebSocketGateway:
             # its own event loop which conflicts with our gateway loop.
             # Use the lower-level API instead.
             if self._is_telegram_bot(bot):
+                self._inject_routing_handler(name, bot)
                 await self._start_telegram_bot_polling(name, bot)
             elif type(bot).__name__ in ("WhatsAppBot", "LinearBot"):
                 # WhatsApp/Linear run their own aiohttp webhook servers
@@ -5935,6 +6077,7 @@ class WebSocketGateway:
         async def _routed_message_handler(message):
             if not message.sender:
                 return
+            gateway._record_channel_inbound(channel_name)
             # Determine routing context from channel type
             ch_type = message.channel.channel_type if message.channel else ""
             is_dm = ch_type in ("dm", "private")
@@ -6632,6 +6775,9 @@ class WebSocketGateway:
             # channel so a restarted channel keeps serialising turns on the
             # resolved id alongside its still-running siblings.
             self._stamp_turn_lock_map(bot)
+            # Issue #3352: re-share the metrics registry on the hot-reloaded
+            # channel so prompt-cache invalidation metering keeps working.
+            self._stamp_metrics(bot)
             self._channel_bots[channel_name] = bot
             logger.info(f"Channel '{channel_name}' ({channel_type}) initialized")
         except Exception as e:

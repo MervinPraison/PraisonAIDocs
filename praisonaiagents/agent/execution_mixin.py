@@ -1239,13 +1239,9 @@ Write the complete compiled report:"""
         # Record the tool name for this turn so the self-improve review policy
         # sees async tool usage too (issue #3037). Mirrors the sync path in
         # _execute_tool_with_context; skipped during a guarded review turn so
-        # the review's own calls are not tracked and cannot recurse.
-        if not getattr(self, "_in_skill_review", False):
-            turn_tools = getattr(self, "_turn_tools_used", None)
-            if turn_tools is None:
-                self._turn_tools_used = []
-                turn_tools = self._turn_tools_used
-            turn_tools.append(function_name)
+        # the review's own calls are not tracked and cannot recurse. Locked so
+        # concurrent turns on the same Agent don't corrupt the buffer (#3307).
+        self._record_turn_tool(function_name)
 
         # Enforce BEFORE_TOOL/AFTER_TOOL security hooks for every async caller,
         # mirroring the sync execute_tool path in tool_execution.py. Without
@@ -1462,11 +1458,22 @@ Write the complete compiled report:"""
                     return policy_result  # Error dict
                 _, arguments = policy_result
 
-            # Try to find the function in the override tools list first, then agent's tools list
+            # Try to find the function in the override tools list first, then agent's tools list.
+            # Resolve by BaseTool/FunctionTool ``.name`` (instances like BrowserBaseTool or
+            # aliased decorated tools), plain callable ``__name__``, or class name so async
+            # dispatch matches the robust sync resolution in _execute_tool_impl.
             func = None
             tools_to_search = tools_override if tools_override is not None else self.tools
+            from ..tools.base import BaseTool
             for tool in tools_to_search:
-                if (callable(tool) and getattr(tool, '__name__', '') == function_name):
+                if isinstance(tool, BaseTool) and getattr(tool, 'name', None) == function_name:
+                    func = tool
+                    break
+                if hasattr(tool, 'name') and getattr(tool, 'name', None) == function_name:
+                    func = tool
+                    break
+                if (callable(tool) and getattr(tool, '__name__', '') == function_name) or \
+                   (inspect.isclass(tool) and tool.__name__ == function_name):
                     func = tool
                     break
             
@@ -1475,15 +1482,18 @@ Write the complete compiled report:"""
                 return {"error": f"Function {function_name} not found in tools"}
 
             try:
-                if inspect.iscoroutinefunction(func):
+                # BaseTool instances (plugin system, e.g. BrowserBaseTool) are not
+                # directly callable — dispatch to their .run() method like the sync path.
+                call_target = func.run if isinstance(func, BaseTool) else func
+                if inspect.iscoroutinefunction(call_target):
                     logging.debug(f"Executing async function: {function_name}")
-                    result = await func(**arguments)
+                    result = await call_target(**arguments)
                 else:
                     logging.debug(f"Executing sync function in executor: {function_name}")
                     loop = asyncio.get_running_loop()
                     from ..trace.context_events import copy_context_to_callable
                     result = await loop.run_in_executor(
-                        None, copy_context_to_callable(lambda: func(**arguments))
+                        None, copy_context_to_callable(lambda: call_target(**arguments))
                     )
                 
                 # Ensure result is JSON serializable
@@ -1567,157 +1577,166 @@ Write the complete compiled report:"""
                 
         should_start = False
         with _server_lock:
-            # Initialize port-specific collections if needed
+            # Initialize port-specific collections if needed (once per port)
             if port not in _registered_agents:
                 _registered_agents[port] = {}
 
-                # Initialize shared FastAPI app if not already created for this port
-                if _shared_apps.get(port) is None:
-                    _shared_apps[port] = FastAPI(
-                        title=f"PraisonAI Agents API (Port {port})",
-                        description="API for interacting with PraisonAI Agents"
+            # Initialize shared FastAPI app if not already created for this port
+            if _shared_apps.get(port) is None:
+                _shared_apps[port] = FastAPI(
+                    title=f"PraisonAI Agents API (Port {port})",
+                    description="API for interacting with PraisonAI Agents"
+                )
+
+                # Add a root endpoint with a welcome message
+                @_shared_apps[port].get("/")
+                async def root():
+                    return {
+                        "message": f"Welcome to PraisonAI Agents API on port {port}. See /docs for usage.",
+                        "endpoints": list(_registered_agents[port].keys())
+                    }
+
+                # Add healthcheck endpoint
+                @_shared_apps[port].get("/health")
+                async def healthcheck():
+                    return {
+                        "status": "ok",
+                        "endpoints": list(_registered_agents[port].keys())
+                    }
+
+            # The path registration below must run on EVERY call, not just when the
+            # port is new, so multiple agents can share a single port.
+
+            # Normalize path to ensure it starts with /
+            if not path.startswith('/'):
+                path = f'/{path}'
+
+            # Check if path is already registered for this port
+            if path in _registered_agents[port]:
+                logging.warning(f"Path '{path}' is already registered on port {port}. Please use a different path.")
+                print(f"⚠️ Warning: Path '{path}' is already registered on port {port}.")
+                # Use a modified path to avoid conflicts
+                original_path = path
+                path = f"{path}_{self.agent_id[:6]}"
+                logging.warning(f"Using '{path}' instead of '{original_path}'")
+                print(f"🔄 Using '{path}' instead")
+
+            # Register the agent to this path
+            _registered_agents[port][path] = self.agent_id
+
+            # Define the endpoint handler
+            @_shared_apps[port].post(path)
+            async def handle_agent_query(request: Request, query_data: Optional[AgentQuery] = None):
+                # Handle both direct JSON with query field and form data
+                if query_data is None:
+                    try:
+                        request_data = await request.json()
+                        if "query" not in request_data:
+                            raise HTTPException(status_code=400, detail="Missing 'query' field in request")
+                        query = request_data["query"]
+                    except Exception:
+                        # Fallback to form data or query params
+                        form_data = await request.form()
+                        if "query" in form_data:
+                            query = form_data["query"]
+                        else:
+                            raise HTTPException(status_code=400, detail="Missing 'query' field in request")
+                else:
+                    query = query_data.query
+
+                try:
+                    # Use async version if available, otherwise use sync version
+                    if asyncio.iscoroutinefunction(self.chat):
+                        response = await self.achat(query, task_name=None, task_description=None, task_id=None)
+                    else:
+                        # Run sync function in a thread to avoid blocking
+                        loop = asyncio.get_running_loop()
+                        response = await loop.run_in_executor(None, lambda p=query: self.chat(p))
+
+                    return {"response": response}
+                except Exception as e:
+                    logging.error(f"Error processing query: {str(e)}", exc_info=True)
+                    return JSONResponse(
+                        status_code=500,
+                        content={"error": f"Error processing query: {str(e)}"}
                     )
 
-                    # Add a root endpoint with a welcome message
-                    @_shared_apps[port].get("/")
-                    async def root():
-                        return {
-                            "message": f"Welcome to PraisonAI Agents API on port {port}. See /docs for usage.",
-                            "endpoints": list(_registered_agents[port].keys())
-                        }
+            # Invalidate the cached OpenAPI schema so routes registered by later
+            # shared-port launch() calls still show up in /openapi.json and /docs.
+            # FastAPI caches app.openapi_schema on first access and does not
+            # regenerate it when new routes are added afterwards.
+            _shared_apps[port].openapi_schema = None
 
-                    # Add healthcheck endpoint
-                    @_shared_apps[port].get("/health")
-                    async def healthcheck():
-                        return {
-                            "status": "ok",
-                            "endpoints": list(_registered_agents[port].keys())
-                        }
+            print(f"🚀 Agent '{self.name}' available at http://{host}:{port}")
 
-                # Normalize path to ensure it starts with /
-                if not path.startswith('/'):
-                    path = f'/{path}'
-
-                # Check if path is already registered for this port
-                if path in _registered_agents[port]:
-                    logging.warning(f"Path '{path}' is already registered on port {port}. Please use a different path.")
-                    print(f"⚠️ Warning: Path '{path}' is already registered on port {port}.")
-                    # Use a modified path to avoid conflicts
-                    original_path = path
-                    path = f"{path}_{self.agent_id[:6]}"
-                    logging.warning(f"Using '{path}' instead of '{original_path}'")
-                    print(f"🔄 Using '{path}' instead")
-
-                # Register the agent to this path
-                _registered_agents[port][path] = self.agent_id
-
-                # Define the endpoint handler
-                @_shared_apps[port].post(path)
-                async def handle_agent_query(request: Request, query_data: Optional[AgentQuery] = None):
-                    # Handle both direct JSON with query field and form data
-                    if query_data is None:
-                        try:
-                            request_data = await request.json()
-                            if "query" not in request_data:
-                                raise HTTPException(status_code=400, detail="Missing 'query' field in request")
-                            query = request_data["query"]
-                        except Exception:
-                            # Fallback to form data or query params
-                            form_data = await request.form()
-                            if "query" in form_data:
-                                query = form_data["query"]
-                            else:
-                                raise HTTPException(status_code=400, detail="Missing 'query' field in request")
-                    else:
-                        query = query_data.query
-
-                    try:
-                        # Use async version if available, otherwise use sync version
-                        if asyncio.iscoroutinefunction(self.chat):
-                            response = await self.achat(query, task_name=None, task_description=None, task_id=None)
-                        else:
-                            # Run sync function in a thread to avoid blocking
-                            loop = asyncio.get_running_loop()
-                            response = await loop.run_in_executor(None, lambda p=query: self.chat(p))
-
-                        return {"response": response}
-                    except Exception as e:
-                        logging.error(f"Error processing query: {str(e)}", exc_info=True)
-                        return JSONResponse(
-                            status_code=500,
-                            content={"error": f"Error processing query: {str(e)}"}
-                        )
-
-                print(f"🚀 Agent '{self.name}' available at http://{host}:{port}")
-
-                # Check and mark server as started atomically to prevent race conditions
-                should_start = not _server_started.get(port, False)
-                if should_start:
-                    _server_started[port] = True
-
-            # Server start/wait outside the lock to avoid holding it during sleep  
+            # Check and mark server as started atomically to prevent race conditions
+            should_start = not _server_started.get(port, False)
             if should_start:
-                # Start the server in a separate thread
-                def run_server():
-                    try:
-                        print(f"✅ FastAPI server started at http://{host}:{port}")
-                        print(f"📚 API documentation available at http://{host}:{port}/docs")
-                        print(f"🔌 Available endpoints: {', '.join(list(_registered_agents[port].keys()))}")
-                        uvicorn.run(_shared_apps[port], host=host, port=port, log_level="debug" if debug else "info")
-                    except Exception as e:
-                        logging.error(f"Error starting server: {str(e)}", exc_info=True)
-                        print(f"❌ Error starting server: {str(e)}")
+                _server_started[port] = True
 
-                # Run server in a background thread
-                server_thread = threading.Thread(target=run_server, daemon=True)
-                server_thread.start()
-
-                # Wait for a moment to allow the server to start and register endpoints
-                self._safe_sleep(0.5)
-            else:
-                # If server is already running, wait a moment to make sure the endpoint is registered
-                self._safe_sleep(0.1)
-                print(f"🔌 Available endpoints on port {port}: {', '.join(list(_registered_agents[port].keys()))}")
-            
-            # Get the stack frame to check if this is the last launch() call in the script
-            import inspect
-            stack = inspect.stack()
-            
-            # If this is called from a Python script (not interactive), try to detect if it's the last launch call
-            if len(stack) > 1 and stack[1].filename.endswith('.py'):
-                caller_frame = stack[1]
-                caller_line = caller_frame.lineno
-                
+        # Server start/wait outside the lock to avoid holding it during sleep
+        if should_start:
+            # Start the server in a separate thread
+            def run_server():
                 try:
-                    # Read the file to check if there are more launch calls after this one
-                    with open(caller_frame.filename, 'r') as f:
-                        lines = f.readlines()
-                    
-                    # Check if there are more launch() calls after the current line
-                    has_more_launches = False
-                    for line_content in lines[caller_line:]: # renamed line to line_content
-                        if '.launch(' in line_content and not line_content.strip().startswith('#'):
-                            has_more_launches = True
-                            break
-                    
-                    # If this is the last launch call, block the main thread
-                    if not has_more_launches:
-                        try:
-                            print("\nAll agents registered for HTTP mode. Press Ctrl+C to stop the servers.")
-                            while True:
-                                self._safe_sleep(1)
-                        except KeyboardInterrupt:
-                            print("\nServers stopped")
+                    print(f"✅ FastAPI server started at http://{host}:{port}")
+                    print(f"📚 API documentation available at http://{host}:{port}/docs")
+                    print(f"🔌 Available endpoints: {', '.join(list(_registered_agents[port].keys()))}")
+                    uvicorn.run(_shared_apps[port], host=host, port=port, log_level="debug" if debug else "info")
                 except Exception as e:
-                    # If something goes wrong with detection, block anyway to be safe
-                    logging.error(f"Error in launch detection: {e}")
+                    logging.error(f"Error starting server: {str(e)}", exc_info=True)
+                    print(f"❌ Error starting server: {str(e)}")
+
+            # Run server in a background thread
+            server_thread = threading.Thread(target=run_server, daemon=True)
+            server_thread.start()
+
+            # Wait for a moment to allow the server to start and register endpoints
+            self._safe_sleep(0.5)
+        else:
+            # If server is already running, wait a moment to make sure the endpoint is registered
+            self._safe_sleep(0.1)
+            print(f"🔌 Available endpoints on port {port}: {', '.join(list(_registered_agents[port].keys()))}")
+
+        # Get the stack frame to check if this is the last launch() call in the script
+        import inspect
+        stack = inspect.stack()
+
+        # If this is called from a Python script (not interactive), try to detect if it's the last launch call
+        if len(stack) > 1 and stack[1].filename.endswith('.py'):
+            caller_frame = stack[1]
+            caller_line = caller_frame.lineno
+
+            try:
+                # Read the file to check if there are more launch calls after this one
+                with open(caller_frame.filename, 'r') as f:
+                    lines = f.readlines()
+
+                # Check if there are more launch() calls after the current line
+                has_more_launches = False
+                for line_content in lines[caller_line:]: # renamed line to line_content
+                    if '.launch(' in line_content and not line_content.strip().startswith('#'):
+                        has_more_launches = True
+                        break
+
+                # If this is the last launch call, block the main thread
+                if not has_more_launches:
                     try:
-                        print("\nKeeping HTTP servers alive. Press Ctrl+C to stop.")
+                        print("\nAll agents registered for HTTP mode. Press Ctrl+C to stop the servers.")
                         while True:
                             self._safe_sleep(1)
                     except KeyboardInterrupt:
                         print("\nServers stopped")
-            return None
+            except Exception as e:
+                # If something goes wrong with detection, block anyway to be safe
+                logging.error(f"Error in launch detection: {e}")
+                try:
+                    print("\nKeeping HTTP servers alive. Press Ctrl+C to stop.")
+                    while True:
+                        self._safe_sleep(1)
+                except KeyboardInterrupt:
+                    print("\nServers stopped")
+        return None
 
     def _launch_mcp_server(self, path: str, port: int, host: str, debug: bool):
         """
@@ -1764,7 +1783,7 @@ Write the complete compiled report:"""
             base_path = (path or "/mcp").rstrip("/") or "/mcp"
             transport = SseServerTransport(f"{base_path}/sse")
             starlette_app = Starlette(
-                routes=[Mount(base_path, mcp.create_app())]
+                routes=[Mount(base_path, mcp.sse_app())]
             )
 
             def run_mcp_server():
