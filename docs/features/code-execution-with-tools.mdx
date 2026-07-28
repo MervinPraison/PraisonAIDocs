@@ -192,16 +192,16 @@ graph TB
     Q1 -->|Yes| CM[✅ Use Code Mode]
     Q1 -->|No| Q2{Few calls or model needs<br/>to reason between calls?}
     Q2 -->|Yes| PT[✅ Use Plain Tool Calling]
-    Q2 -->|No| Q3{Tools too dangerous to<br/>expose to model-generated code?}
-    Q3 -->|Yes| PT2[✅ Plain Tool Calling<br/>or restrict allow-list]
+    Q2 -->|No| Q3{Untrusted input or<br/>host must stay untouched?}
+    Q3 -->|Yes| BR[✅ Isolated + Tools<br/>bridge= with same allow-list]
     Q3 -->|No| CM2[✅ Use Code Mode]
 
     classDef yes fill:#10B981,stroke:#7C90A0,color:#fff
     classDef no fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
 
-    class CM,CM2 yes
-    class PT,PT2 no
+    class CM,CM2,BR yes
+    class PT no
     class Q1,Q2,Q3 q
 ```
 
@@ -247,7 +247,9 @@ Code mode is **opt-in** and requires an explicit allow-list. Tools not on the al
 - **Unregistered tool → `NameError`** — calling a name that isn't registered raises `NameError`.
 - **Reserved name `"tools"` → `ValueError`** — you cannot add `"tools"` to the allow-list; it is always the namespace object.
 - **Imports and dangerous builtins remain blocked** — AST + blocklist checks from `execute_code` still apply in code mode.
-- **In-process execution** — the subprocess sandbox cannot see the tool registry, so code mode deliberately runs in-process. The `ToolProxy` stores its registry and allow-list in a closure that sandboxed code cannot reach.
+- **Two execution paths** — code mode runs either in-process or isolated:
+  - **In-process (default)** — no `bridge=`, same as today. The `ToolProxy` stores its registry and allow-list in a closure that in-process code cannot reach.
+  - **Isolated + tool-capable (opt-in)** — supply a `CodeToolBridge`; the script runs under isolation and tool calls are serviced in the parent via `serve_tool_call`, gated by the **same** allow-list and approval gate. The parent never trusts the child — the allow-list, registry, timeout, and max output size are all forwarded to the bridge, so the transport is gated by the caller's policy, not its own defaults.
 
 ```python
 # PermissionError: tool not on allow-list
@@ -262,6 +264,91 @@ execute_code_with_tools(
     allowed_tools=["tools"],   # raises ValueError
 )
 ```
+
+---
+
+## Isolated Code with Tools (Bridge)
+
+Run code mode inside a sandbox while still calling registered tools — same allow-list, same approval gate, no in-process execution.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant LLM
+    participant Child as Sandboxed Child
+    participant Bridge
+    participant Parent as serve_tool_call (Parent)
+    participant Tool
+
+    User->>Agent: Request
+    Agent->>LLM: Prompt with tool signatures
+    LLM-->>Agent: Python script
+    Agent->>Bridge: execute_code_with_tools(script, bridge=...)
+    Bridge->>Child: run script in isolation
+    Child->>Bridge: tool call (e.g. fetch(url))
+    Bridge->>Parent: serve_tool_call(name, args, allowed, registry)
+    Parent->>Parent: allow-list + approval gate
+    Parent->>Tool: call real tool
+    Tool-->>Parent: result
+    Parent-->>Bridge: value
+    Bridge-->>Child: value
+    Child-->>Bridge: final value
+    Bridge-->>Agent: {"result", "stdout", "stderr", "success"}
+    Agent-->>User: Response
+```
+
+Supply a `bridge=` object that implements `run_code`. The transport calls `serve_tool_call` in the parent for every tool request marshalled from the isolated child — never a weaker path than the in-process proxy.
+
+```python
+from praisonaiagents.tools import (
+    execute_code_with_tools, CodeToolBridge, serve_tool_call,
+)
+
+class MySubprocessBridge:
+    """Minimal bridge that runs code in a subprocess and services tool calls
+    in the parent via serve_tool_call."""
+    def run_code(self, code, *, allowed_tools=(), registry=None,
+                 timeout=30, max_output_size=10000):
+        # (transport-specific: send code to child, receive tool-call requests,
+        #  answer each one via serve_tool_call in the parent)
+        value = serve_tool_call(
+            "fetch", ["https://example.com"], {},
+            allowed=allowed_tools, registry=registry,
+        )
+        return {"result": value, "stdout": str(value), "stderr": "", "success": True}
+
+result = execute_code_with_tools(
+    code="print(fetch('https://example.com'))",
+    allowed_tools=["fetch"],
+    bridge=MySubprocessBridge(),
+)
+```
+
+Concrete transports (subprocess/Docker/etc.) live in the sandbox layer as follow-ups; the contract above is all a bridge needs to satisfy.
+
+### Bridge Contract
+
+The `run_code` method receives the caller's policy as keyword-only params and returns a result dict.
+
+| `run_code` param | Type | Default | Description |
+|------------------|------|---------|-------------|
+| `code` | `str` | — | Script to run in the isolated child. |
+| `allowed_tools` | `Iterable[str]` | `()` | Forwarded allow-list — the only tools the child may call. |
+| `registry` | `Optional[ToolRegistry]` | `None` | Registry to resolve tools against; defaults to the global registry. |
+| `timeout` | `int` | `30` | Maximum execution time in seconds. |
+| `max_output_size` | `int` | `10000` | Maximum output size in characters. |
+
+| Returned key | Type | Description |
+|--------------|------|-------------|
+| `result` | `Any` | Final value of the script. |
+| `stdout` | `str` | Captured standard output. |
+| `stderr` | `str` | Captured standard error. |
+| `success` | `bool` | Whether the run completed without error. |
+
+<Note>
+`bridge=None` (the default) is fully backward-compatible — omit it to keep today's in-process behaviour. Bridged calls pass through the **same** allow-list and `require_approval` gate, so isolation is never a weaker path. Disallowed tools raise `PermissionError`, unregistered tools raise `NameError`, and a denied approval raises `PermissionError` — exactly as in-process.
+</Note>
 
 ---
 
@@ -395,7 +482,7 @@ agent = Agent(..., tools=[parse_json], ...)
 
 <CardGroup cols={2}>
   <Card title="Sandbox" icon="shield-halved" href="/docs/features/sandbox">
-    Secure isolated environments for code execution — note that subprocess sandboxes cannot see the tool registry.
+    Secure isolated environments for code execution — pair with a `CodeToolBridge` to service tool calls from an isolated run.
   </Card>
   <Card title="Approval" icon="check-circle" href="/docs/features/approval">
     Configure tool approval gates that apply on every call in code mode.
