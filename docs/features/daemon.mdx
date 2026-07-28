@@ -111,7 +111,12 @@ sequenceDiagram
     run->>run: pid alive?
     run->>daemon: POST /healthz (Bearer token)
     daemon-->>run: {ok: true}
-    run->>daemon: POST /run {prompt}
+    run->>daemon: POST /run {prompt, session_id?, event_id?}
+    alt session_id present
+        daemon->>daemon: _get_session_agent(session_id, model)<br/>rehydrate once, retain history
+    else anonymous
+        daemon->>daemon: _get_agent(model)<br/>per-model stateless, cleared post-call
+    end
     daemon->>agent: agent.start(prompt)
     agent-->>daemon: result
     daemon-->>run: {ok: true, result}
@@ -123,7 +128,7 @@ sequenceDiagram
 | Component | Role |
 |-----------|------|
 | **Lockfile** (`runtime.json`) | Stores `{host, port, token, pid}` at `<project_data_dir>/runtime/runtime.json`. Mode `0600` — token is never world-readable. |
-| **WarmRuntime** | Holds one warm `Agent` per model. Reuses it across calls. Evicts the agent on failure to prevent state bleed. |
+| **WarmRuntime** | Holds two agent caches: (1) one **stateless** warm `Agent` per model for anonymous (no-session) calls — history cleared after each call; (2) one **stateful** warm `Agent` per session id for `--continue`/`--session` runs — history rehydrated once and **retained** across turns, persisted per-turn through the project session store. Both caches evict on turn failure to prevent state bleed. |
 | **RuntimeClient** | Thin stdlib (`urllib`) HTTP client. Raises `RuntimeUnavailable` on any error — `run` then falls back in-process. |
 | **Idle watcher** | Background thread shuts down the server after `--idle-timeout` seconds of inactivity (default 30 min). |
 
@@ -193,6 +198,16 @@ graph TB
 
 ---
 
+## When `--continue` / `--session` Attach Warm
+
+<Note>
+As of PraisonAI 4.x ([PR #3465](https://github.com/MervinPraison/PraisonAI/pull/3465)), `praisonai run --continue` and `praisonai run --session <id>` **now attach to a warm, per-session, stateful agent** on the daemon — when one is running and no per-invocation tool/memory/approval overrides, no `--thinking`, and no `--worktree` are set. The agent is built once, its history is rehydrated once from the project session store, and it is **retained across turns** — so an iterative loop no longer pays cold-start each turn. Per-turn deltas are still persisted through the same session store the in-process path uses, so a crash or idle eviction resumes deterministically.
+
+After upgrading, `--continue` just gets faster. Nothing else changes.
+</Note>
+
+---
+
 ## When `run` Stays In-Process
 
 `praisonai run` skips the daemon and runs locally whenever you pass any of these flags:
@@ -203,7 +218,8 @@ graph TB
 | `--approval`, `--approve-all-tools` | Approval flow requires interactive in-process handling. |
 | `--memory` | Memory store is managed in-process. |
 | `--permissions` overrides | Security policy must be enforced locally. |
-| `--continue`, `--session`, `--fork` | Session continuity and forking run in-process; the daemon carries no session state. |
+| `--fork` | The forked session id is minted in-process; subsequent turns against the forked id attach warm. |
+| `--thinking`, `--worktree` | Reasoning-effort and isolated git-worktree runs need in-process state. |
 | `--output actions`, `json`, `stream`, `stream-json` | Structured output modes need richer in-process event bridging. |
 
 In all these cases, `praisonai run` behaves exactly as it did before the daemon feature. No flags are needed to opt out — it happens automatically.
