@@ -220,6 +220,20 @@ User → /blueprint morning-brief hour=8 weekdays=mon-fri focus=tech
 Bot  → "✅ Automation scheduled from 'morning-brief'. Added job 'morning-brief' (schedule cron:0 8 * * mon,tue,wed,thu,fri)"
 ```
 
+**Flow C — Two users, one bot, no cross-talk (multi-tenant):**
+
+```
+Alice → DMs the bot: "remind me to file expenses every Friday at 5pm"
+Bot   → add(Suggestion(principal="tg:alice", name="weekly-expenses", ...))
+Bob   → DMs the same bot: "remind me to file expenses every Friday at 5pm"   (identical text)
+Bot   → add(Suggestion(principal="tg:bob", ...))  # admitted — dedup is per-principal
+Alice → /automations   → sees only her own pending suggestion
+Alice → accepts        → job created with principal="tg:alice"
+Bob   → accepts        → his own job created; no name collision, both coexist
+```
+
+Before per-principal scoping, Bob's identical proposal was silently blocked by Alice's dedup entry, and either user could accept or dismiss the other's suggestion.
+
 ---
 
 ## Multi-tenant isolation
@@ -239,22 +253,38 @@ graph TB
     class S1,S2,SG store
 ```
 
-Pass the resolved identity on every read or mutation. One user's pending queue is then invisible and non-mutable to another's:
+`principal` is any stable, opaque string that names the caller — a user id, an email hash, a tenant id. The store never parses or validates it; it only compares it. Leave it unset (`None`) for the global, single-tenant behaviour used by the CLI and single-user deployments.
+
+A gateway handler that already knows who's calling threads that identity through as `principal`:
 
 ```python
-from praisonaiagents.scheduler.suggestion_store import SuggestionStore
+from praisonaiagents.scheduler import Suggestion, SuggestionStore
 
-store = SuggestionStore()
+store = SuggestionStore()  # ~/.praisonai/suggestions.json
 
-# Only this user's pending suggestions
-mine = store.list_pending(principal="telegram:12345")
+# In a gateway handler that already knows who's calling:
+def handle_user_message(user_id: str) -> None:
+    store.add(Suggestion(
+        id=f"sug_{user_id}_standup",
+        blueprint_name="morning-brief",
+        slots={"hour": 9, "weekdays": "mon-fri"},
+        reason="Detected daily standup request",
+        principal=user_id,          # isolate to this caller
+    ))                              # pending cap + dedup window scoped per user_id
 
-# Cross-owner accept / dismiss are refused (returns False)
-store.accept("sug_abc123", principal="telegram:12345")
-store.dismiss("sug_abc123", principal="telegram:12345")
+# Later, when the same user pulls their pending list:
+def list_for(user_id: str) -> list[Suggestion]:
+    return store.list_pending(principal=user_id)
 ```
 
-The `principal` string is a canonical identity (e.g. `telegram:12345`, `slack:U01ABC`) chosen by the caller — core does not invent a schema.
+Cross-owner access is rejected, not silently merged:
+
+- `list_pending(principal="alice")` never returns Bob's suggestions.
+- `accept(sug_id, principal="alice")` returns `False` if the suggestion is Bob's.
+- `dismiss(sug_id, principal="alice")` returns `False` if the suggestion is Bob's.
+- The pending cap (`MAX_PENDING_CAP`, 20) and 24-hour dedup window are measured **per principal**, so one tenant can neither exhaust another's slots nor block their identical proposal.
+
+There is no admin bypass — a call passing `principal="bob"` cannot see Alice's items even when the process runs as root. Scoping is enforced only by the `principal` the caller passes.
 
 ```mermaid
 sequenceDiagram
@@ -273,7 +303,7 @@ sequenceDiagram
 
     Bob->>Bot: /automations
     Bot->>Store: list_pending(principal="telegram:bob")
-    Store-->>Bob: [sug_2]
+    Store-->>Bot: [sug_2]
     Bot-->>Bob: "1 pending: sug_2"
 
     Alice->>Bot: accept sug_2 (guessing Bob's id)
@@ -347,6 +377,9 @@ The commands also degrade gracefully: if the scheduler extra isn't installed, th
   </Card>
   <Card title="Schedule CLI" icon="clock" href="/docs/cli/schedule">
     Blueprint and suggestion subcommands with every flag.
+  </Card>
+  <Card title="Async Scheduler" icon="clock" href="/docs/features/async-scheduler">
+    Recurring jobs with the same per-owner `principal` isolation.
   </Card>
   <Card title="Proactive Delivery" icon="paper-plane" href="/docs/features/proactive-delivery">
     Home channels and delivery tokens for scheduled jobs.
