@@ -226,11 +226,11 @@ Anything **not** in this registry falls through to the existing restart-based pl
 
 ```mermaid
 graph TB
-    Change[✏️ Config change] --> Q{Path in HOT_APPLIABLE_KEYS?}
-    Q -->|Yes| Hot[⚡ Hot-apply in place]
-    Q -->|No, but agents.*| Agents[🔄 Recreate agents]
-    Q -->|No, channels.name.*| Channel[🔄 Restart one channel]
-    Q -->|No, structural| Full[🔄 Full channel restart]
+    Change[✏️ Config change] --> Q{classify_reload#40;path#41;?}
+    Q -->|HOT| Hot[⚡ Hot-apply in place]
+    Q -->|AGENTS| Agents[🔄 Recreate agents only]
+    Q -->|CHANNEL| Channel[🔄 Restart one channel]
+    Q -->|FULL| Full[🔄 Full channel restart]
     Hot --> None[✅ Nothing restarts]
 
     classDef change fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -248,17 +248,19 @@ graph TB
 
 ## Restart Scope
 
+Each *Effect* is prefixed with the canonical [`ReloadScope`](#programmatic-reload-scope-classification) value that `classify_reload(path)` returns for that section.
+
 | Changed section | Effect |
 |---|---|
-| `gateway.logging.level`, `gateway.drain_timeout`, `gateway.reload_drain_timeout` | **Hot-apply in place** — no channel restart, no agent recreate (see [Hot-Apply](#hot-apply-no-restart)) |
-| `agents.*` | Recreate agents only — channels keep running |
-| `channels.<name>.*` | Restart only that channel |
-| `channels.<name>.unknown_user_policy` | Re-read policy and rebuild `BotConfig` — re-fires the startup warning |
-| `channels.<name>.owner_user_id` | Re-read owner and rebuild `BotConfig` |
-| `provider.*`, `guardrails.*` | Recreate agents |
-| `scheduler.*`, `routes.*`, `routing.*` | Full channel restart |
+| `gateway.logging.level`, `gateway.drain_timeout`, `gateway.reload_drain_timeout` | **HOT** — hot-apply in place, no channel restart, no agent recreate (see [Hot-Apply](#hot-apply-no-restart)) |
+| `agents.*` | **AGENTS** — recreate agents only; channels keep running |
+| `provider.*`, `guardrails.*` | **AGENTS** — recreate agents |
+| `channels.<name>.*` | **CHANNEL** — restart only that channel |
+| `channels.<name>.unknown_user_policy` | **CHANNEL** — re-read policy and rebuild `BotConfig` — re-fires the startup warning |
+| `channels.<name>.owner_user_id` | **CHANNEL** — re-read owner and rebuild `BotConfig` |
+| `scheduler.*`, `routes.*`, `routing.*` | **FULL** — full channel restart |
 | `lifecycle.*` | Rebuild scale-to-zero / drain-marker policies; cancel or relaunch only the loops whose enablement changed (`_reconcile_lifecycle`) — no channel or process restart |
-| Entire `channels` section | Full channel restart |
+| Entire `channels` section (bare) | **FULL** — full channel restart |
 | Invalid YAML on save | Keep last-known-good config |
 
 Full restart stops and starts all channels but **does not** restart the WebSocket server — connected clients stay connected.
@@ -351,6 +353,52 @@ is_hot_appliable("agents.assistant.instructions")  # False → falls through to 
 ```
 
 The `SupportsHotReload` protocol is `runtime_checkable` — a gateway implementation opts in by defining an `apply_hot_reload(paths, new_config) -> None` method. Third-party gateway subclasses that want the wrapper's hot-apply behaviour implement this method; core owns the classification so every runtime reloads identically.
+
+### Programmatic reload-scope classification
+
+`ReloadScope` and `classify_reload` are public exports from `praisonaiagents.gateway` that tell you exactly what an edit to `gateway.yaml` will do — before you save it.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import classify_reload, ReloadScope
+
+agent = Agent(
+    name="ops-bot",
+    instructions="Answer ops questions about safe gateway reloads.",
+)
+
+# Before saving gateway.yaml, ask what the edit will actually do:
+scope = classify_reload("gateway.logging.level")
+if scope == ReloadScope.HOT:
+    agent.start("The change is hot-apply — no channel restart, no client disconnect.")
+elif scope == ReloadScope.CHANNEL:
+    agent.start("Only the affected channel will restart. Other channels stay connected.")
+elif scope == ReloadScope.AGENTS:
+    agent.start("Agents recreate in place. Channels keep running.")
+else:  # ReloadScope.FULL
+    agent.start("Full channel restart — expect a brief drain across all channels.")
+```
+
+The four canonical scopes are plain strings, so wrapper and runtime code can compare against them without importing the class:
+
+```python
+from praisonaiagents.gateway import ReloadScope, classify_reload
+
+ReloadScope.HOT       # "hot"     — apply in place, no restart
+ReloadScope.CHANNEL   # "channel" — restart only channels.<name>
+ReloadScope.AGENTS    # "agents"  — recreate agents only, channels keep running
+ReloadScope.FULL      # "full"    — full restart (fail-safe default)
+
+# Ask what a specific path would do before saving:
+classify_reload("gateway.logging.level")            # 'hot'
+classify_reload("channels.telegram.token")          # 'channel'
+classify_reload("agents.assistant.instructions")    # 'agents'
+classify_reload("guardrails.jailbreak.enabled")     # 'agents'
+classify_reload("routes.discord")                   # 'full' — structural fallback
+classify_reload("channels")                         # 'full' — bare section, fail-safe
+```
+
+`classify_reload` is canonical and side-effect-free — every runtime (core, wrapper, third-party gateway subclasses) uses the same classifier, so a pre-flight check reflects exactly what happens at reload time. Anything not explicitly recognised falls through to `ReloadScope.FULL`, keeping full restart the fail-safe default.
 
 ### Reload observability flow
 
