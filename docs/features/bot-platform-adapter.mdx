@@ -128,7 +128,7 @@ sequenceDiagram
     Caller->>Adapter: deliver(chat_id, content)
     Note over Adapter: dict content skips format + chunk
     Adapter->>Adapter: send_typing() if supports_typing
-    Adapter->>Adapter: format_message(text)
+    Adapter->>Adapter: format_message(text) → format_for_dialect(markdown_dialect)
     Adapter->>Adapter: chunk(text) → [c1, c2, c3]
     loop each chunk (reply_to on chunk #1 only)
         Adapter->>Send: send(chat_id, chunk)
@@ -315,6 +315,70 @@ Register the adapter at runtime via the platform registry — see [Bot Platform 
 
 ---
 
+## Formatting: the `markdown_dialect` seam
+
+`format_message` is no longer identity — it auto-calls `format_for_dialect(text, caps.markdown_dialect)`, so a custom adapter usually does **not** need to override it. Declare `markdown_dialect` on `PlatformCapabilities` and the base class renders each reply in the right flavour.
+
+<Tabs>
+<Tab title="Declarative (base class handles it)">
+
+Set `markdown_dialect` and inherit `format_message()` — replies render correctly with no extra code.
+
+```python
+from praisonaiagents import BasePlatformAdapter, SendResult
+from praisonaiagents.bots import PlatformCapabilities
+
+
+class AcmeBot(BasePlatformAdapter):
+    capabilities = PlatformCapabilities(markdown_dialect="telegram_markdown_v2")
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        ...
+
+    async def send(self, chat_id, content, *, reply_to=None, metadata=None) -> SendResult:
+        # deliver() already ran format_message() → MarkdownV2-safe text.
+        message_id = await acme_api.send(chat_id, content, reply_to=reply_to)
+        return SendResult(ok=True, message_id=message_id, chat_id=chat_id)
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+```
+
+</Tab>
+<Tab title="Direct (forward parse_mode)">
+
+Transports that need the transport `parse_mode` (Telegram requires it) call `format_for_dialect` in `send()` and forward the second return value.
+
+```python
+from praisonaiagents.bots import format_for_dialect
+
+
+async def send(self, chat_id, content, *, reply_to=None, metadata=None):
+    text, parse_mode = format_for_dialect(
+        content, self._cap("markdown_dialect", "markdown")
+    )
+    message_id = await self._bot.send_message(
+        chat_id, text, parse_mode=parse_mode, reply_to_message_id=reply_to
+    )
+    return SendResult(ok=True, message_id=message_id, chat_id=chat_id)
+```
+
+</Tab>
+</Tabs>
+
+`format_for_dialect(text, dialect)` returns `(rendered_text, parse_mode)`. See [How `markdown_dialect` is consumed](/docs/features/bot-platform-capabilities#how-markdown-dialect-is-consumed) for the full dialect table.
+
+Override `format_message` only when rendering can't be expressed as a dialect string — embed builders, non-text payloads, or ML-driven templating.
+
+<Note>
+**Plain-text fallback preserves identifiers.** The default `"markdown"` dialect returns a safe plain-text reduction. As of PraisonAI #3506, `strip_markdown` unwraps only *paired* emphasis/code spans, so identifiers (`svc_1`), globs (`*.py`), and arithmetic (`a*b`) are preserved in the fallback rendering rather than mangled.
+</Note>
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
@@ -332,10 +396,6 @@ A truthful `PlatformCapabilities` gives the shared code the best information for
 
 <Accordion title="Don't override edit_message unless supports_edit=True">
 Callers rely on the built-in `edit_not_supported` fallback to decide whether to re-send. Setting `supports_edit=True` without an override raises `NotImplementedError`.
-</Accordion>
-
-<Accordion title="Advanced: override format_message for markup">
-Slack `mrkdwn`, Telegram MarkdownV2, and Discord embeds each have quirks. `format_message` is the single method to apply platform-specific markup.
 </Accordion>
 </AccordionGroup>
 
