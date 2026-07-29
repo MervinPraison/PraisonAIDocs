@@ -441,6 +441,113 @@ See also: [Approval Protocol](/docs/features/approval-protocol) and [Gateway](/d
 
 ---
 
+## `run_sync_or_offload` — safe from any calling context
+
+Use `run_sync_or_offload()` when your code path can be reached from either a normal script or from inside a running event loop (FastAPI, Jupyter, async tests) — one helper, no `RuntimeError`.
+
+```mermaid
+graph LR
+    subgraph "run_sync_or_offload"
+        A{🔍 Running loop?} -->|No| B[🚀 run_sync]
+        B --> C[🌉 Shared bridge]
+        A -->|Yes| D[🧵 Offload thread]
+        D --> E[🌉 Same bridge]
+        C --> F[✅ Result]
+        E --> F
+    end
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A decision
+    class B,C,D,E process
+    class F result
+```
+
+<Steps>
+<Step title="Import and call">
+```python
+from praisonai._async_bridge import run_sync_or_offload
+
+async def fetch(): return 42
+
+value = run_sync_or_offload(fetch())
+```
+</Step>
+
+<Step title="Inside a FastAPI handler">
+Same helper, no code change — it just works:
+
+```python
+@app.post("/run")
+def run(prompt: str):
+    return {"answer": run_sync_or_offload(agent.astart(prompt))}
+```
+</Step>
+</Steps>
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `coro` | `Awaitable[T]` | — | The coroutine to await. |
+| `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300s) | Same env var as `run_sync`. |
+| `thread_name` | `str` | `"praisonai-sync-offload"` | Name of the offload worker thread (shows up in stack traces). |
+
+Called from a plain sync caller, it dispatches to the active `AsyncBridge` via `run_sync`, sharing its background loop and connection pools. Called from inside a running loop, it copies the caller's ContextVars onto a worker thread that hands the coroutine to the **same** bridge — never a fresh `asyncio.new_event_loop()` — so a caller-installed `scoped_bridge()` binding still wins and LiteLLM/HTTPX per-loop connection pools are preserved. Exceptions re-raise on the caller thread.
+
+### How it differs from `run_sync`
+
+| Helper | Plain sync caller | Inside a running loop |
+|--------|-------------------|-----------------------|
+| `run_sync` | ✅ works | ❌ `RuntimeError` |
+| `run_sync_or_offload` | ✅ works | ✅ offloads onto a worker thread that reuses the **same** bridge |
+
+### Best Practices
+
+<AccordionGroup>
+<Accordion title="Prefer run_sync_or_offload for any 3-way surface (CLI + YAML + Python)">
+The caller's context isn't knowable at write time — the same code path can be reached from a plain script, a YAML run, or a Python call inside a running loop. `run_sync_or_offload` handles all three without a `RuntimeError`, while still reusing the shared bridge and its connection pools.
+
+```python
+from praisonai._async_bridge import run_sync_or_offload
+
+def surface_entry(prompt: str) -> str:
+    return run_sync_or_offload(agent.astart(prompt))
+```
+</Accordion>
+
+<Accordion title="Keep run_sync for sync-only paths">
+`run_sync` fails loudly inside a loop, which is what you want for a code path that must never be called from one — the `RuntimeError` surfaces an architectural bug instead of silently offloading.
+
+```python
+from praisonai._async_bridge import run_sync
+
+def cli_only(prompt: str) -> str:
+    return run_sync(agent.astart(prompt))
+```
+</Accordion>
+</AccordionGroup>
+
+This helper landed in [PraisonAI #3492](https://github.com/MervinPraison/PraisonAI/pull/3492); its callers (`praisonai.auto`, `persistence.orchestrator`, `api.agent_invoke`) are migrated onto it.
+
+### Related
+
+<CardGroup cols={2}>
+<Card title="run_sync" icon="arrows-left-right" href="/docs/features/async-bridge#wrapper-bridge-praisonai-_async_bridge">
+Module-level runner for sync-only paths.
+</Card>
+<Card title="scoped_bridge" icon="lock" href="/docs/features/async-bridge#per-session-scoped-bridge">
+Per-session bridge that `run_sync_or_offload` preserves across the offload hop.
+</Card>
+<Card title="Agent-Centric Tools" icon="wrench" href="/cli/agent-tools#timeouts-cancellation">
+The Tier-2 `_run_sync` (PR #3361) mirrors the same design.
+</Card>
+</CardGroup>
+
+---
+
 ## Per-Session Scoped Bridge
 
 Servers and gateways that handle multiple concurrent sessions need each session to run on its own loop+thread binding. `current_bridge()` and `scoped_bridge()` provide `ContextVar`-backed per-session isolation so sessions never share a bridge accidentally.
