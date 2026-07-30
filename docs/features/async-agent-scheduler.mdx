@@ -210,11 +210,48 @@ The scheduler's async primitives (`_stop_event`, `_cancel_event`, `_stats_lock`)
 | `"*/1h"` | 3600s | Every 1 hour |
 | `"*/5s"` | 5s | Every 5 seconds |
 | `"60"` | 60s | Custom seconds (plain digits) |
-| `"cron:0 7 * * *"` | best-effort | Best-effort integer collapse for the polling loop |
+| `"cron:0 9 * * *"` | wall-clock | Fires at the real time-of-day. Requires the optional `croniter` package. |
 | `"at:2026-03-01T09:00:00"` | one-shot | ISO 8601 timestamp |
 
+### Wall-clock cron
+
+`cron:` schedules honour the real time-of-day, not the interval since process start.
+
+- **Time-of-day accuracy** — `cron:0 9 * * *` fires at 09:00 wall-clock every day. A restart at 09:30 does *not* re-phase the schedule to 09:30.
+- **Downtime catch-up (exactly once)** — if the process was down when a slot was due (e.g. a scale-to-zero window), the schedule catches up **once** on resume, then re-anchors to the next future occurrence. Never double-fires the same slot.
+- **State file** — the daemon persists `last_run_at` to `~/.praisonai/schedulers/<name>.json` so restarts pick up the schedule exactly where they left off.
+- **Optional dependency** — install `croniter` to enable wall-clock cron:
+
+  ```bash
+  pip install croniter
+  ```
+
+  Without `croniter`, a `cron:` schedule falls back to the pre-#3526 process-relative interval and the wrapper logs a one-time warning at startup.
+
+Plain interval expressions (`hourly`, `*/30m`, raw seconds) are **unchanged** — they keep the fixed-interval sleep behaviour.
+
+```mermaid
+sequenceDiagram
+    participant Daemon
+    participant Ticker as ScheduleTicker
+    participant State as ~/.praisonai/schedulers/*.json
+    participant Agent
+
+    Daemon->>State: Load last_run_at
+    Daemon->>Ticker: ScheduleTicker("cron:0 9 * * *", last_run_at)
+    loop Each slot
+        Ticker-->>Daemon: seconds_until_next() → sleep until 09:00
+        Daemon->>Agent: execute()
+        Agent-->>Daemon: result
+        Daemon->>State: Persist last_run_at (current slot)
+    end
+    Note over Daemon,State: Restart at 09:30 → next fire = tomorrow 09:00, not 09:30 + 24h
+```
+
+Introduced in [PraisonAI PR #3527](https://github.com/MervinPraison/PraisonAI/pull/3527).
+
 <Note>
-Since [PraisonAI PR #2916](https://github.com/MervinPraison/PraisonAI/pull/2916), the wrapper delegates the shared grammar (`hourly` / `daily` / `weekly` / `*/N{m,h,s}` / raw seconds) to `praisonaiagents.scheduler.parser.parse_schedule`, so `weekly` is now accepted by every wrapper scheduler (`AgentScheduler`, `AsyncAgentScheduler`, `DeploymentScheduler`, and the `praisonai schedule` CLI). The wrapper-specific `cron:` collapse and the bare `*/N` (unit-less) fast-path stay local to the wrapper.
+Since [PraisonAI PR #2916](https://github.com/MervinPraison/PraisonAI/pull/2916), the wrapper delegates the shared grammar (`hourly` / `daily` / `weekly` / `*/N{m,h,s}` / raw seconds) to `praisonaiagents.scheduler.parser.parse_schedule`, so `weekly` is now accepted by every wrapper scheduler (`AgentScheduler`, `AsyncAgentScheduler`, `DeploymentScheduler`, and the `praisonai schedule` CLI). The bare `*/N` (unit-less) fast-path stays local to the wrapper.
 </Note>
 
 ---
@@ -566,6 +603,18 @@ scheduler = AsyncAgentScheduler(
 ```
 
 `timeout=None` (the default) imposes no limit.
+</Accordion>
+
+<Accordion title="Install croniter for wall-clock cron schedules">
+`cron:` schedules honour wall-clock time only when the optional `croniter` package is installed (`pip install croniter`). Without it, the scheduler logs a one-time warning and falls back to a coarse interval anchored to process start — the same behaviour as before PR #3527.
+
+```python
+from praisonai.scheduler import AsyncAgentScheduler
+
+# Requires croniter — fires at 09:00 wall-clock every day
+scheduler = AsyncAgentScheduler(agent, task="Morning brief")
+await scheduler.start("cron:0 9 * * *")
+```
 </Accordion>
 </AccordionGroup>
 
