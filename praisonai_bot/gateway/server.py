@@ -692,6 +692,9 @@ class WebSocketGateway:
             max_connections=int(gateway_config.get("max_connections", 1000)),
             heartbeat_interval=int(gateway_config.get("heartbeat_interval", 30)),
             reconnect_timeout=int(gateway_config.get("reconnect_timeout", 60)),
+            per_turn_timeout=float(
+                gateway_config.get("per_turn_timeout", 0.0) or 0.0
+            ),
             ssl_cert=_substitute(gateway_config.get("ssl_cert")),
             ssl_key=_substitute(gateway_config.get("ssl_key")),
             max_buffered_bytes=int(
@@ -848,6 +851,11 @@ class WebSocketGateway:
         self._client_conns: Dict[str, _ClientConn] = {}  # client_id -> bounded outbound conn
         self._client_sessions: Dict[str, str] = {}  # client_id -> session_id
         self._client_scopes: Dict[str, List[str]] = {}  # client_id -> operator scopes
+        # Issue #3467: in-flight turn registry so a running turn can be aborted
+        # (by a WS ``abort`` frame or a portable ``/stop`` chat command) and so
+        # a per-turn timeout can cancel a runaway turn. Maps session_id ->
+        # (driving asyncio.Task, InterruptController).
+        self._active_turns: Dict[str, Tuple[Any, Any]] = {}
         # Issue #2661: fingerprint of the shared secret each authenticated
         # client connected under, so rotating ``auth_token`` can force-close
         # every session stamped with a stale secret (instant credential
@@ -2738,10 +2746,13 @@ class WebSocketGateway:
             
             # Build features list - only advertise implemented features
             features = {
-                "methods": ["message", "leave"],  # abort not implemented
+                # Issue #3467: an in-flight turn can now be aborted via the
+                # ``abort`` method (or the ``message_abort`` event alias).
+                "methods": ["message", "leave", "abort"],
                 "events": [
                     EventType.MESSAGE.value,
                     EventType.ERROR.value,
+                    EventType.MESSAGE_ABORT.value,
                 ],
             }
             
@@ -2750,6 +2761,9 @@ class WebSocketGateway:
                 features["events"].extend([
                     EventType.TOKEN_STREAM.value,
                     EventType.TOOL_CALL_STREAM.value,
+                    EventType.REASONING_STREAM.value,
+                    EventType.TOOL_PROGRESS_STREAM.value,
+                    EventType.STREAM_ERROR.value,
                     EventType.STREAM_END.value,
                 ])
             
@@ -2961,17 +2975,45 @@ class WebSocketGateway:
                 session = self._sessions.get(session_id)
                 if session:
                     content = data.get("content", "")
+                    # Issue #3467: portable stop command. A chat/operator client
+                    # can abort the in-flight turn by sending "/stop" (or "stop")
+                    # instead of a dedicated abort frame.
+                    if isinstance(content, str) and content.strip().lower() in ("/stop", "stop"):
+                        aborted = self._abort_active_turn(session_id, reason="user")
+                        await self._send_to_client(client_id, {
+                            "type": "aborted" if aborted else "no_active_turn",
+                            "session_id": session_id,
+                        })
+                        return True
                     message = GatewayMessage(
                         content=content,
                         sender_id=client_id,
                         session_id=session_id,
                     )
                     session.add_message(message)
-                    
+
+                    # A missing agent never enqueues a turn, so it must resolve
+                    # terminally here — otherwise an "accepted" ack would leave
+                    # the client waiting forever for a "final" that never comes.
+                    if self._agents.get(session.agent_id) is None:
+                        await self._send_to_client(client_id, {
+                            "type": "response",
+                            "status": "final",
+                            "content": "Agent not available",
+                            "outcome": {"status": "error"},
+                            "session_id": session_id,
+                        })
+                        return True
+
                     response = await self._process_agent_message(session, message)
-                    
+
+                    # Provisional acknowledgement: the turn was accepted/enqueued
+                    # but is not yet resolved. A distinct status lets clients tell
+                    # "accepted" from the "final" answer (sent later by
+                    # _run_session_queue) instead of string-sniffing the content.
                     await self._send_to_client(client_id, {
                         "type": "response",
+                        "status": "accepted",
                         "content": response,
                         "session_id": session_id,
                     })
@@ -2981,6 +3023,31 @@ class WebSocketGateway:
                     "message": "Not joined to any session",
                 })
         
+        elif msg_type in ("abort", EventType.MESSAGE_ABORT.value):
+            # Issue #3467: cancel the in-flight turn for this client's session.
+            # Requires the WRITE scope (same as sending a message as the agent).
+            if not self._client_has_scope(client_id, OperatorScope.WRITE):
+                await self._send_to_client(client_id, {
+                    "type": "error",
+                    "code": "insufficient_scope",
+                    "message": "insufficient scope",
+                    "required_scope": OperatorScope.WRITE.value,
+                })
+                return True
+            session_id = self._client_sessions.get(client_id)
+            if not session_id:
+                await self._send_to_client(client_id, {
+                    "type": "error",
+                    "message": "Not joined to any session",
+                })
+                return True
+            reason = data.get("reason") or "user"
+            aborted = self._abort_active_turn(session_id, reason=str(reason))
+            await self._send_to_client(client_id, {
+                "type": "aborted" if aborted else "no_active_turn",
+                "session_id": session_id,
+            })
+
         elif msg_type == "leave":
             session_id = self._client_sessions.pop(client_id, None)
             if session_id:
@@ -2999,8 +3066,9 @@ class WebSocketGateway:
         """Process a message through the agent.
         
         If the agent has a stream_emitter, registers a callback that relays
-        token deltas to the connected WebSocket client in real-time via
-        TOKEN_STREAM / TOOL_CALL_STREAM / STREAM_END events.
+        live progress to the connected WebSocket client in real-time via
+        TOKEN_STREAM / TOOL_CALL_STREAM / REASONING_STREAM /
+        TOOL_PROGRESS_STREAM / STREAM_ERROR / STREAM_END events.
         """
         agent = self._agents.get(session.agent_id)
         if not agent:
@@ -3031,7 +3099,9 @@ class WebSocketGateway:
         return "Started processing."
 
     @staticmethod
-    async def _dispatch_agent_turn(agent: Any, content: str) -> Any:
+    async def _dispatch_agent_turn(
+        agent: Any, content: str, interrupt: Any = None
+    ) -> Any:
         """Execute a single agent turn.
 
         Prefers the agent's native async entry point (``arun``/``achat``) so
@@ -3039,13 +3109,181 @@ class WebSocketGateway:
         cleaner cancellation/timeout and true async streaming. Falls back to
         offloading the synchronous ``chat`` onto the default thread pool only
         when no async entry point is available (sync-only agents).
+
+        Issue #3467: when ``interrupt`` is supplied it is passed *per turn* as
+        the entry point's ``cancel_token`` (which the agent's run loop already
+        checks at each checkpoint) so the agent stops cooperatively. This keeps
+        the controller local to a single turn instead of mutating the shared
+        ``agent.interrupt_controller`` — critical because one ``Agent`` instance
+        can serve overlapping turns for several sessions, where a shared
+        controller would let one session's abort/timeout interrupt another. A
+        legacy fallback stamps ``agent.interrupt_controller`` only for agents
+        whose entry point does not accept ``cancel_token``.
         """
+        _kw = {"cancel_token": interrupt} if interrupt is not None else {}
+
+        async def _call_async(fn: Any) -> Any:
+            try:
+                return await fn(content, **_kw)
+            except TypeError:
+                if not _kw:
+                    raise
+                # Entry point predates cancel_token: fall back to the shared
+                # attribute for this turn (best-effort, non-isolated).
+                if hasattr(agent, "interrupt_controller"):
+                    agent.interrupt_controller = interrupt
+                return await fn(content)
+
         for _name in ("arun", "achat"):
             _fn = getattr(agent, _name, None)
             if _fn is not None and asyncio.iscoroutinefunction(_fn):
-                return await _fn(content)
+                return await _call_async(_fn)
+
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, agent.chat, content)
+
+        def _call_sync() -> Any:
+            try:
+                return agent.chat(content, **_kw)
+            except TypeError:
+                if not _kw:
+                    raise
+                if hasattr(agent, "interrupt_controller"):
+                    agent.interrupt_controller = interrupt
+                return agent.chat(content)
+
+        return await loop.run_in_executor(None, _call_sync)
+
+    def _abort_active_turn(self, session_id: str, reason: str = "user") -> bool:
+        """Signal (and, if needed, cancel) the in-flight turn for ``session_id``.
+
+        Cooperative-first: requests interruption via the turn's
+        ``InterruptController`` (checked at each agent checkpoint / as the
+        turn's ``cancel_token``) so the agent stops at a safe point and
+        preserves partial output. A hard ``task.cancel()`` is scheduled only as
+        a fallback for a turn that does not yield within ``_ABORT_GRACE_SECONDS``,
+        so a genuinely stuck turn is still torn down. Returns ``True`` when a
+        turn was active and an abort was signalled.
+        """
+        entry = self._active_turns.get(session_id)
+        if entry is None:
+            return False
+        task, controller = entry
+        try:
+            if controller is not None:
+                controller.request(reason)
+        except Exception:
+            pass
+
+        async def _cancel_if_stuck() -> None:
+            try:
+                await asyncio.sleep(self._ABORT_GRACE_SECONDS)
+                if task is not None and not task.done():
+                    task.cancel()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        try:
+            if task is not None and not task.done():
+                asyncio.ensure_future(_cancel_if_stuck())
+        except Exception:
+            # No running loop / scheduling failure: fall back to immediate hard
+            # cancel so an abort is never a silent no-op.
+            try:
+                if task is not None and not task.done():
+                    task.cancel()
+            except Exception:
+                pass
+        return True
+
+    async def _drive_turn(
+        self,
+        session: GatewaySession,
+        agent: Any,
+        content: str,
+        controller: Any,
+        timeout: float,
+    ) -> Any:
+        """Run one agent turn cancellably and under an optional per-turn timeout.
+
+        Registers the driving task in ``_active_turns`` so ``_abort_active_turn``
+        can interrupt it, then awaits it with ``asyncio.wait_for`` when a
+        positive ``timeout`` is configured. A cancelled or timed-out turn is
+        normalised to a terminal string rather than left hanging or surfaced as
+        a raw traceback.
+
+        Cancellation is *cooperative first*: the turn's ``cancel_token``
+        (checked at each agent checkpoint) is requested before the driving
+        task is cancelled, so async and sync-only agents alike unwind at a safe
+        point. Because a synchronous ``agent.chat`` runs in a worker thread that
+        cannot be force-killed, we then give the turn a bounded grace window to
+        actually finish before advancing the serial session queue — otherwise a
+        timed-out sync turn could keep mutating shared agent state concurrently
+        with the next turn.
+        """
+        sid = session.session_id
+        task = asyncio.ensure_future(
+            self._dispatch_agent_turn(agent, content, interrupt=controller)
+        )
+        self._active_turns[sid] = (task, controller)
+        try:
+            if timeout and timeout > 0:
+                try:
+                    return await asyncio.wait_for(task, timeout=timeout)
+                except asyncio.TimeoutError:
+                    await self._settle_cancelled_turn(task, controller, "timeout")
+                    return self._finalise_aborted_turn(controller, "timeout")
+            return await task
+        except asyncio.CancelledError:
+            reason = controller.reason or "user"
+            await self._settle_cancelled_turn(task, controller, reason)
+            return self._finalise_aborted_turn(controller, reason)
+        finally:
+            existing = self._active_turns.get(sid)
+            if existing is not None and existing[0] is task:
+                self._active_turns.pop(sid, None)
+
+    # Bounded window to let a cooperatively-interrupted turn actually unwind
+    # (esp. a sync turn in a worker thread that cannot be force-killed) before
+    # the serial session queue advances to the next turn.
+    _ABORT_GRACE_SECONDS: float = 5.0
+
+    async def _settle_cancelled_turn(
+        self, task: "asyncio.Future", controller: Any, reason: str
+    ) -> None:
+        """Cooperatively stop ``task`` and wait (bounded) for it to unwind.
+
+        Requests interruption via the turn's controller first so the agent
+        stops at its next checkpoint, then—up to ``_ABORT_GRACE_SECONDS``—waits
+        for the task to settle. Only if it does not settle in time do we hard
+        ``cancel()`` the asyncio task (which cannot reclaim a blocked worker
+        thread, but at least frees the event-loop waiter).
+        """
+        try:
+            if controller is not None:
+                controller.request(reason)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=self._ABORT_GRACE_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        except (asyncio.CancelledError, Exception):
+            return
+        try:
+            if not task.done():
+                task.cancel()
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _finalise_aborted_turn(self, controller: Any, reason: str) -> str:
+        """Return a typed terminal message for an interrupted/timed-out turn."""
+        if reason == "timeout":
+            return "Turn cancelled: exceeded per-turn timeout."
+        return f"Turn cancelled: {reason}."
 
     async def _run_session_queue(self, session: GatewaySession, agent: Any, client_id: str) -> None:
         """Background task loop that constantly pulls from `_inbox` and executes the agent task."""
@@ -3055,13 +3293,27 @@ class WebSocketGateway:
                 if not content:
                     break  # Queue is empty, exit loop
                 
-                # Wire streaming relay if agent has a stream_emitter
+                # Wire streaming relay if agent has a stream_emitter.
+                # ``relay_futures`` collects the cross-thread sends the relay
+                # schedules so we can drain them before the final frame,
+                # guaranteeing "final" never overtakes trailing stream events.
                 relay_callback = None
+                relay_futures: List[Any] = []
                 emitter = getattr(agent, 'stream_emitter', None)
                 if emitter is not None and client_id:
-                    relay_callback = self._make_stream_relay(client_id, session)
+                    relay_callback = self._make_stream_relay(
+                        client_id, session, relay_futures
+                    )
                     emitter.add_callback(relay_callback)
                 
+                # Issue #3467: run the turn under a cancel scope so it can be
+                # aborted (WS ``abort`` / ``/stop``) and time-bounded. The
+                # controller is checked by the agent's run loop; cancelling the
+                # task tears down a turn that does not yield promptly.
+                from praisonaiagents.agent.interrupt import InterruptController
+                controller = InterruptController()
+                timeout = getattr(self.config, "per_turn_timeout", 0.0) or 0.0
+                outcome_status = "ok"
                 try:
                     gate = getattr(self, "_admission_gate", None)
                     if gate is not None and getattr(gate, "enabled", False):
@@ -3071,16 +3323,20 @@ class WebSocketGateway:
                         from ..bots._admission import AdmissionRejected
                         try:
                             async with gate.admit(session_id=session.session_id):
-                                response = await self._dispatch_agent_turn(
-                                    agent, content
+                                response = await self._drive_turn(
+                                    session, agent, content, controller, timeout
                                 )
                         except AdmissionRejected as rej:
                             response = rej.message
+                            outcome_status = "rejected"
                     else:
-                        response = await self._dispatch_agent_turn(agent, content)
+                        response = await self._drive_turn(
+                            session, agent, content, controller, timeout
+                        )
                 except Exception as e:
                     logger.error(f"Agent error in queue processor: {e}")
                     response = f"Error: {str(e)}"
+                    outcome_status = "error"
                 finally:
                     # Always clean up the relay callback
                     if relay_callback and emitter is not None:
@@ -3089,6 +3345,15 @@ class WebSocketGateway:
                         except (ValueError, AttributeError):
                             pass
                 
+                # Drain any stream sends the relay scheduled cross-thread so the
+                # final frame is enqueued strictly after every trailing stream
+                # event (token/reasoning/tool-progress/STREAM_END).
+                if relay_futures:
+                    await asyncio.gather(
+                        *[asyncio.wrap_future(f) for f in relay_futures],
+                        return_exceptions=True,
+                    )
+
                 response_message = GatewayMessage(
                     content=response,
                     sender_id=session.agent_id,
@@ -3096,18 +3361,31 @@ class WebSocketGateway:
                 )
                 session.add_message(response_message)
                 
+                # Final frame: distinct "final" status resolves the pending turn
+                # that the "accepted" ack opened, and carries a structured
+                # terminal outcome alongside the text (not just a bare string).
                 await self._send_to_client(client_id, {
                     "type": "response",
+                    "status": "final",
                     "content": response,
+                    "outcome": {"status": outcome_status},
                     "session_id": session.session_id,
                 })
         finally:
             session.mark_executing(False)
 
     def _make_stream_relay(
-        self, client_id: str, session: "GatewaySession"
+        self,
+        client_id: str,
+        session: "GatewaySession",
+        pending: Optional[List[Any]] = None,
     ) -> Callable:
-        """Create a StreamCallback that relays events to a WS client."""
+        """Create a StreamCallback that relays events to a WS client.
+
+        When ``pending`` is provided, every cross-thread send future is
+        appended to it so the caller can await them before emitting a
+        terminal frame (ordering guarantee: final never precedes stream).
+        """
         gateway = self
         # Capture the running loop while we are still on it.
         loop = asyncio.get_running_loop()
@@ -3115,30 +3393,52 @@ class WebSocketGateway:
         def _relay(event) -> None:
             try:
                 from praisonaiagents.streaming.events import StreamEventType
-                
+
                 event_type = getattr(event, 'type', None)
                 if event_type is None:
                     return
-                
-                # Map StreamEventType -> gateway EventType
+
+                sid = session.session_id
+                # Map a *closed* set of StreamEventTypes -> gateway EventType so a
+                # WS UI can render live progress (thinking, tool progress) and
+                # streamed failures without sniffing message text. Unmapped
+                # events are dropped.
                 if event_type == StreamEventType.DELTA_TEXT:
-                    gw_type = EventType.TOKEN_STREAM
+                    # A reasoning/thinking delta is surfaced under its own event
+                    # so clients can show "thinking…" separately from the answer.
+                    if getattr(event, 'is_reasoning', False):
+                        gw_type = EventType.REASONING_STREAM
+                    else:
+                        gw_type = EventType.TOKEN_STREAM
                     data = {
                         "content": getattr(event, 'content', ''),
-                        "session_id": session.session_id,
+                        "session_id": sid,
                     }
                 elif event_type == StreamEventType.DELTA_TOOL_CALL:
                     gw_type = EventType.TOOL_CALL_STREAM
                     data = {
                         "tool_call": getattr(event, 'tool_call', {}),
-                        "session_id": session.session_id,
+                        "session_id": sid,
+                    }
+                elif event_type == StreamEventType.TOOL_PROGRESS:
+                    gw_type = EventType.TOOL_PROGRESS_STREAM
+                    data = {
+                        "content": getattr(event, 'content', ''),
+                        "metadata": getattr(event, 'metadata', None),
+                        "session_id": sid,
+                    }
+                elif event_type == StreamEventType.ERROR:
+                    gw_type = EventType.STREAM_ERROR
+                    data = {
+                        "error": getattr(event, 'error', None),
+                        "session_id": sid,
                     }
                 elif event_type == StreamEventType.STREAM_END:
                     gw_type = EventType.STREAM_END
-                    data = {"session_id": session.session_id}
+                    data = {"session_id": sid}
                 else:
-                    return  # Skip non-essential events
-                
+                    return  # Skip non-forwarded events
+
                 gw_event = GatewayEvent(
                     type=gw_type,
                     data=data,
@@ -3147,10 +3447,12 @@ class WebSocketGateway:
                 )
                 
                 # No get_event_loop() in the threaded callback.
-                asyncio.run_coroutine_threadsafe(
+                fut = asyncio.run_coroutine_threadsafe(
                     gateway._send_to_client(client_id, gw_event.to_dict()),
                     loop,
                 )
+                if pending is not None:
+                    pending.append(fut)
             except Exception:
                 logger.warning("Stream relay error (non-fatal)", exc_info=True)
 
@@ -3294,6 +3596,9 @@ class WebSocketGateway:
                     "error",
                     "token_stream",
                     "tool_call_stream",
+                    "reasoning_stream",
+                    "tool_progress_stream",
+                    "stream_error",
                 ]:
                     session_id = self._client_sessions.get(client_id)
                     if session_id:
@@ -6445,59 +6750,57 @@ class WebSocketGateway:
         Returns:
             ReloadPlan with actions to take
         """
-        from praisonaiagents.gateway.config import is_hot_appliable
+        try:
+            from praisonaiagents.gateway.config import ReloadScope, classify_reload
+        except ImportError:
+            # Issue #3440: the canonical classifier was added in a later core
+            # release than the bot's minimum ``praisonaiagents`` pin. On an
+            # older-but-supported core it is simply unavailable, so degrade to
+            # the fail-safe full restart rather than crashing the live reload.
+            logger.warning(
+                "praisonaiagents is too old to expose classify_reload; "
+                "falling back to full restart for this config change"
+            )
+            plan = ReloadPlan()
+            plan.requires_full_restart()
+            return plan
 
         plan = ReloadPlan()
-        
+
         for path in changed_paths:
             parts = path.split(".")
-            
-            if not parts:
+
+            if not parts or not parts[0]:
                 continue
 
-            # Issue #3378: a closed set of paths (core registry) is safe to
-            # apply in place without restarting channels or agents. Everything
-            # else keeps falling through to the restart plans below, so restart
-            # stays the fail-safe default for unknown/structural changes.
-            if is_hot_appliable(path):
+            # Issue #3440: the *rules* for hot vs channel-scoped vs full live
+            # canonically in core (``classify_reload``) so every runtime builds
+            # an identical plan. The wrapper only implements the effects here;
+            # anything core cannot classify falls through to ``FULL`` (the
+            # fail-safe default for unknown/structural changes).
+            scope = classify_reload(path)
+
+            if scope == ReloadScope.HOT:
+                # Issue #3378: apply in place without restarting anything.
                 plan.hot_reload_paths.add(path)
-                continue
 
-            # Top-level section changes
-            if parts[0] == "agents":
-                if len(parts) == 1:
-                    # Entire agents section changed
-                    plan.reload_agents = True
-                elif len(parts) >= 2:
-                    # Specific agent or agent property changed
-                    plan.reload_agents = True
-                    
-            elif parts[0] == "channels":
-                if len(parts) == 1:
-                    # Entire channels section changed - need full restart
-                    plan.requires_full_restart()
-                elif len(parts) >= 2:
-                    # Specific channel changed
-                    channel_name = parts[1]
-                    plan.add_channel_restart(channel_name)
-                    
-            elif parts[0] == "provider":
-                # Provider changes affect agents if they use default model
+            elif scope == ReloadScope.CHANNEL:
+                # Restart only the affected channel; others keep their
+                # connections and in-flight turns.
+                plan.add_channel_restart(parts[1])
+
+            elif scope == ReloadScope.AGENTS:
+                # Recreate agents only, without bouncing channels.
                 plan.reload_agents = True
-                
-            elif parts[0] == "guardrails":
-                # Guardrails changes affect agents
-                plan.reload_agents = True
-                
-            elif parts[0] in ["scheduler", "routes", "routing"]:
-                # These are structural changes requiring full restart
+
+            else:  # ReloadScope.FULL
+                if parts[0] not in ("channels", "scheduler", "routes", "routing"):
+                    logger.warning(
+                        "Unknown config section changed: %s - triggering full restart",
+                        parts[0],
+                    )
                 plan.requires_full_restart()
-                
-            else:
-                # Unknown section - be safe and do full restart
-                logger.warning(f"Unknown config section changed: {parts[0]} - triggering full restart")
-                plan.requires_full_restart()
-        
+
         return plan
 
     def apply_hot_reload(
@@ -7387,6 +7690,22 @@ class WebSocketGateway:
             self.config.max_buffered_bytes = int(gw_cfg["max_buffered_bytes"])
         if "max_queued_frames" in gw_cfg:
             self.config.max_queued_frames = int(gw_cfg["max_queued_frames"])
+        # Issue #3467: per-turn wall-clock ceiling. ``self.config`` is built in
+        # ``__init__`` with defaults, so stamp the validated ``gateway:`` value
+        # here (as the other per-key overrides above do) or the documented
+        # timeout silently stays disabled. Invalid values fall back to OFF.
+        if "per_turn_timeout" in gw_cfg:
+            try:
+                _ptt = float(gw_cfg["per_turn_timeout"] or 0.0)
+                if _ptt < 0:
+                    raise ValueError
+                self.config.per_turn_timeout = _ptt
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid gateway.per_turn_timeout %r; disabling per-turn "
+                    "timeout",
+                    gw_cfg.get("per_turn_timeout"),
+                )
         # Issue #3297: close-the-loop opt-in. Core ``GatewayConfig`` deliberately
         # does not carry these knobs (kept lightweight); the delivery router
         # reads them off ``self.config`` via ``getattr``. Stamp them from the

@@ -39,6 +39,65 @@ def is_hot_appliable(path: str) -> bool:
     return any(path.startswith(key + ".") for key in HOT_APPLIABLE_KEYS)
 
 
+# ---------------------------------------------------------------------------
+# Reload scope classification (Issue #3440)
+# ---------------------------------------------------------------------------
+#
+# The wrapper/bot gateway builds a concrete reload plan (which channels to
+# bounce, whether to recreate agents, whether to full-restart). The *rules*
+# for that plan — hot-appliable vs channel-scoped vs full — must stay
+# canonical in core so every runtime reloads identically, rather than being
+# duplicated ad-hoc per runtime. This is a pure string classification with no
+# heavy imports; the wrapper consumes it and only implements the effects.
+class ReloadScope:
+    """Canonical classification of a changed config ``path``'s reload scope.
+
+    Values are plain strings so wrapper/runtime code can compare without
+    importing this class. ``FULL`` is the fail-safe default for unknown or
+    structural changes.
+
+    - ``HOT``: apply in place, no restart (see :func:`is_hot_appliable`).
+    - ``CHANNEL``: a change under ``channels.<name>`` — restart only that one
+      channel; other channels keep their connections and in-flight turns.
+    - ``AGENTS``: an agent/provider/guardrails change — recreate agents only,
+      without bouncing channels.
+    - ``FULL``: unknown or structural change — full restart (fail-safe).
+    """
+
+    HOT = "hot"
+    CHANNEL = "channel"
+    AGENTS = "agents"
+    FULL = "full"
+
+
+def classify_reload(path: str) -> str:
+    """Classify a changed dotted config ``path`` into a :class:`ReloadScope`.
+
+    Canonical, side-effect-free classification shared by every runtime so a
+    hot-reload plan is built identically regardless of who loads the config.
+    Anything not explicitly recognised falls through to ``ReloadScope.FULL``,
+    keeping full restart the fail-safe default for structural changes.
+    """
+    if is_hot_appliable(path):
+        return ReloadScope.HOT
+
+    parts = path.split(".")
+    head = parts[0] if parts else ""
+
+    # A change scoped to a single channel (``channels.<name>...``) only needs
+    # that channel restarted. The bare ``channels`` section (no name) — and a
+    # malformed empty name like ``channels.`` — is a structural change and
+    # stays a full restart (fail-safe).
+    if head == "channels" and len(parts) >= 2 and parts[1]:
+        return ReloadScope.CHANNEL
+
+    # Agent-affecting changes recreate agents without bouncing channels.
+    if head in ("agents", "provider", "guardrails"):
+        return ReloadScope.AGENTS
+
+    return ReloadScope.FULL
+
+
 @runtime_checkable
 class SupportsHotReload(Protocol):
     """Protocol a gateway implements to apply hot-reloadable config in place.
@@ -189,7 +248,11 @@ class DeliveryConfig:
         max_retries: Maximum retry attempts
         retry_backoff: Exponential backoff multiplier
         message_ttl: How long to retain unacknowledged messages (seconds)
-        store_backend: Message store backend ("memory" or "redis")
+        store_backend: Message store backend — ``"sqlite"`` (default,
+            zero-dependency durable store so the at-least-once guarantee
+            survives a gateway restart/redeploy), ``"redis"`` (durable +
+            multi-process horizontal fan-out) or ``"memory"`` (explicit,
+            ephemeral opt-out for testing/single-process throwaway use).
     """
     
     enabled: bool = True
@@ -197,7 +260,15 @@ class DeliveryConfig:
     max_retries: int = 3
     retry_backoff: float = 2.0
     message_ttl: int = 86400
-    store_backend: str = "memory"
+    store_backend: str = "sqlite"
+    
+    def __post_init__(self) -> None:
+        """Validate configuration values."""
+        if self.store_backend not in ("sqlite", "redis", "memory"):
+            raise ValueError(
+                f"Invalid delivery store_backend {self.store_backend!r}; "
+                "expected 'sqlite', 'redis' or 'memory'"
+            )
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -419,6 +490,12 @@ class GatewayConfig:
     session_config: SessionConfig = field(default_factory=SessionConfig)
     heartbeat_interval: int = 30
     reconnect_timeout: int = 60
+    # Issue #3467: per-turn wall-clock ceiling. When > 0, a single agent turn
+    # that runs longer than this many seconds is cancelled (cooperatively via
+    # the agent's interrupt controller and by cancelling the driving task) so a
+    # runaway turn cannot wedge the serial per-session queue. 0 = no timeout
+    # (today's behaviour: a turn runs to completion).
+    per_turn_timeout: float = 0.0
     ssl_cert: Optional[str] = None
     ssl_key: Optional[str] = None
     max_buffered_bytes: int = 1024 * 1024  # 1MB default
@@ -464,6 +541,10 @@ class GatewayConfig:
             raise ValueError("heartbeat_interval must be >= 0")
         if self.reconnect_timeout < 0:
             raise ValueError("reconnect_timeout must be >= 0")
+        if self.per_turn_timeout < 0:
+            raise ValueError(
+                "per_turn_timeout must be >= 0 (use 0 to disable the per-turn timeout)"
+            )
         if self.max_concurrent_runs < 0:
             raise ValueError(
                 "max_concurrent_runs must be >= 0 (use 0 to disable admission control)"
@@ -549,6 +630,7 @@ class GatewayConfig:
             "session_config": self.session_config.to_dict(),
             "heartbeat_interval": self.heartbeat_interval,
             "reconnect_timeout": self.reconnect_timeout,
+            "per_turn_timeout": self.per_turn_timeout,
             "ssl_enabled": bool(self.ssl_cert and self.ssl_key),
             "max_buffered_bytes": self.max_buffered_bytes,
             "max_queued_frames": self.max_queued_frames,
@@ -734,6 +816,7 @@ class MultiChannelGatewayConfig:
             session_config=session_config,
             heartbeat_interval=gw_data.get("heartbeat_interval", 30),
             reconnect_timeout=gw_data.get("reconnect_timeout", 60),
+            per_turn_timeout=float(gw_data.get("per_turn_timeout", 0.0) or 0.0),
             ssl_cert=gw_data.get("ssl_cert"),
             ssl_key=gw_data.get("ssl_key"),
             max_buffered_bytes=int(gw_data.get("max_buffered_bytes", 1024 * 1024)),

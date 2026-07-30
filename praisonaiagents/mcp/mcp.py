@@ -78,12 +78,14 @@ class MCPToolRunner(threading.Thread):
                                 response_queue, kind, name, arguments = item
                                 try:
                                     if kind == "resource":
-                                        result = await session.read_resource(name)
+                                        result = await asyncio.wait_for(session.read_resource(name), timeout=self.timeout)
                                     elif kind == "prompt":
-                                        result = await session.get_prompt(name, arguments or None)
+                                        result = await asyncio.wait_for(session.get_prompt(name, arguments or None), timeout=self.timeout)
                                     else:
-                                        result = await session.call_tool(name, arguments)
+                                        result = await asyncio.wait_for(session.call_tool(name, arguments), timeout=self.timeout)
                                     response_queue.put((True, result))
+                                except asyncio.TimeoutError:
+                                    response_queue.put((False, f"MCP {kind} call timed out after {self.timeout} seconds (server side)"))
                                 except Exception as e:
                                     response_queue.put((False, str(e)))
                             except queue.Empty:
@@ -385,8 +387,11 @@ class MCP:
         
         # Check if this is an HTTP URL
         if isinstance(command_or_string, str) and re.match(r'^https?://', command_or_string):
-            # Determine transport type based on URL or kwargs
-            if command_or_string.endswith('/sse') and 'transport_type' not in kwargs:
+            # Determine transport type based on URL or kwargs. Delegate the
+            # URL->transport classification to the shared helper so there is a
+            # single source of truth (see mcp_transport.get_transport_type).
+            from .mcp_transport import get_transport_type
+            if get_transport_type(command_or_string) == "sse" and 'transport_type' not in kwargs:
                 # Legacy SSE URL - use SSE transport for backward compatibility
                 from .mcp_sse import SSEMCPClient
                 self.sse_client = SSEMCPClient(command_or_string, debug=debug, timeout=timeout)
