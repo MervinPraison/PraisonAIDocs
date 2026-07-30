@@ -159,6 +159,68 @@ status = 'sending'  (crash)  ──►  status = 'recovered'  (on restart)
 Status-update writes (`mark_sent`, `mark_failed`, `_claim_entry`) now call `conn.commit()`. Without this, a terminal status could be lost on a crash, causing an already-delivered message to be redelivered. This is a reliability fix — no API change is required.
 </Note>
 
+### Age-gated dead-lettering (attempts + wall-clock)
+
+`permanent_failure` is now a two-condition decision, so a brief channel outage no longer silently drops deliverable messages.
+
+An entry moves to `permanent_failure` when **either**:
+
+- The error class is **known-permanent** (`"credential"` or `"permanent_target"`) — short-circuits immediately regardless of age.
+- **Both** `attempts >= max_attempts` **and** the entry has been in the queue for `>= dead_letter_min_age` (default 6h).
+
+Otherwise the entry stays retryable and the next `drain()` reschedules it under the normal capped backoff.
+
+The default 6-hour floor is far longer than any realistic channel incident and well under the 7-day retention TTL, so most operators need no config change — transient outages simply keep retrying until the channel recovers.
+
+```mermaid
+graph TB
+    Start([drain sees exhausted entry]) --> ErrCheck{Known-permanent<br/>error class?}
+    ErrCheck -->|credential / permanent_target| DL[💀 permanent_failure]
+    ErrCheck -->|recoverable| AgeCheck{Age ≥ dead_letter_min_age?}
+    AgeCheck -->|Yes| DL
+    AgeCheck -->|No| Retry[🔁 Reschedule under backoff]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef terminal fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef retry fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class ErrCheck,AgeCheck check
+    class DL terminal
+    class Retry retry
+```
+
+**Restoring legacy behaviour** — pass `dead_letter_min_age=0` if you rely on attempt-count-only quarantine (e.g. poison-message unit tests):
+
+```python
+from praisonai.bots import OutboundQueue
+
+# Attempt-only dead-lettering (pre-#3521 behaviour)
+outbox = OutboundQueue(
+    path="~/.praisonai/state/outbox.sqlite",
+    max_attempts=5,
+    dead_letter_min_age=0,
+)
+```
+
+**Custom policy** — inject any `DeadLetterPolicyProtocol` implementation for one-off decisions:
+
+```python
+from praisonaiagents.gateway import AttemptAndAgeDeadLetterPolicy
+from praisonai.bots import OutboundQueue
+
+outbox = OutboundQueue(
+    path="~/.praisonai/state/outbox.sqlite",
+    dead_letter_policy=AttemptAndAgeDeadLetterPolicy(
+        max_attempts=10,
+        min_age_seconds=24 * 3600,  # allow a full day of retries
+    ),
+)
+```
+
+Introduced in [PraisonAI PR #3521](https://github.com/MervinPraison/PraisonAI/pull/3521).
+
 ---
 
 ## Effectively-Once Delivery
@@ -280,7 +342,9 @@ SQLite-backed outbox. All parameters after `path` are keyword-only.
 | `path` | `str \| Path` | _(required)_ | SQLite file path. Parent dirs are created automatically. |
 | `max_size` | `int` | `50_000` | Max entries kept. Oldest sent entries are evicted when exceeded. |
 | `ttl_seconds` | `int` | `604800` (7 days) | Sent entries older than this are evicted. |
-| `max_attempts` | `int` | `5` | Max delivery attempts before marking permanent failure. |
+| `max_attempts` | `int` | `5` | Max delivery attempts before a message is eligible for permanent failure. Since [PR #3521](https://github.com/MervinPraison/PraisonAI/pull/3521), exhausting attempts alone is no longer enough to dead-letter a *transient* failure — the entry must also satisfy `dead_letter_min_age`. A known-permanent error (credentials, permanently-invalid target) still short-circuits immediately. |
+| `dead_letter_min_age` | `float` (seconds) | `21600` (6h) | Minimum wall-clock age since first receipt before an attempt-exhausted transient failure is marked `permanent_failure`. Set to `0` to restore the pre-#3521 attempt-only behaviour. |
+| `dead_letter_policy` | `DeadLetterPolicyProtocol \| None` | `None` | Optional custom `praisonaiagents.gateway.DeadLetterPolicyProtocol` implementation. When supplied, overrides `max_attempts` + `dead_letter_min_age`. |
 | `backoff` | `BackoffPolicy` | `BackoffPolicy()` | Retry backoff configuration. |
 | `ordering` | `"strict" \| "best_effort"` | `"best_effort"` | Per-conversation FIFO gate. `strict` holds later same-lane messages until the head reaches `sent` or `permanent_failure`. See [Outbound Ordering](/docs/features/outbound-ordering). |
 
@@ -584,6 +648,14 @@ async def on_start():
 asyncio.create_task(delivery.drain_pending())
 asyncio.create_task(delivery.drain_pending())
 ```
+</Accordion>
+
+<Accordion title="Only lower dead_letter_min_age with a specific reason">
+The 6-hour default is calibrated so a routine channel outage (Telegram 429 storm, Discord Cloudflare hiccup, WhatsApp API blip) never permanently loses a deliverable message, while a genuinely poisoned payload still dead-letters within the day. Only lower it when you have a specific need — e.g. `dead_letter_min_age=0` inside a test suite where you want the pre-#3521 attempt-only behaviour, or `dead_letter_min_age=60` in a synthetic burn-in that can't wait 6 hours to observe the terminal state.
+</Accordion>
+
+<Accordion title="Import AttemptAndAgeDeadLetterPolicy from praisonaiagents.gateway">
+The `praisonai-bot` package's dependency floor (`praisonaiagents>=1.6.152`) admits core releases that predate the shared `AttemptAndAgeDeadLetterPolicy` (first shipped 1.6.161). On those installs the queues fall back to a bundled `LocalDeadLetterPolicy` with identical semantics, so the age gate holds regardless of which core version is installed. If you customise the policy, prefer importing `AttemptAndAgeDeadLetterPolicy` from `praisonaiagents.gateway` — the import will succeed on any core ≥ 1.6.161.
 </Accordion>
 </AccordionGroup>
 
