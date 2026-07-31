@@ -194,6 +194,11 @@ Options:
   --preflight / --no-preflight    Validate channel credentials before
                                   starting (fail fast on bad tokens)
                                   [default: --preflight]
+  --strict-tools / --no-strict-tools
+                                  Fail fast if any tool named in the config
+                                  cannot be resolved. Use --no-strict-tools to
+                                  skip unresolved tools and start anyway (#3553)
+                                  [default: --strict-tools]
   --identity-store TEXT           Path to the cross-platform identity link-map
                                   JSON (default ~/.praisonai/identity.json).
                                   Enables one continuous session + memory per
@@ -214,6 +219,7 @@ Examples:
   praisonai gateway start --config gateway.yaml
   praisonai gateway start --agents agents.yaml --port 9000
   praisonai gateway start --config gateway.yaml --no-preflight
+  praisonai gateway start --config gateway.yaml --no-strict-tools
   praisonai gateway start --config gateway.yaml --reliability production
   GATEWAY_PORT=9000 praisonai gateway start
 
@@ -726,6 +732,123 @@ for platform, r in results.items():
 
 ---
 
+## Pre-flight tool check
+
+`praisonai gateway start` validates every tool named in your config **before** the gateway binds, so a typo or an uninstalled optional package fails fast with a per-name reason instead of silently starting a quietly under-powered bot.
+
+<Warning>
+**Default changed 2026-07-31.** Before PR #3555 an unresolved tool was silently skipped with only a log warning. The default is now `--strict-tools`, which aborts start with exit `78` and a per-name fix hint. Configs with typo'd or unavailable tools that previously started will now fail — pass `--no-strict-tools` or set `strict_tools: false` in `gateway.yaml` to restore the old warn-and-continue behaviour.
+</Warning>
+
+This gate runs one layer above the core resolver's `PRAISONAI_STRICT_TOOLS` / `ToolResolutionError` mechanism — it fires at start-time, before `GatewayHandler.start()` builds any agent. See [Tool Resolution](/docs/features/tool-resolution) for the complementary core-resolver behaviour.
+
+```mermaid
+graph LR
+    subgraph "Tool pre-flight"
+        Cfg[📄 gateway.yaml] --> Probe[🔍 validate_yaml_tools]
+        Probe --> All{All resolve?}
+        All -->|Yes| Start[🚀 gateway start]
+        All -->|No| Reasons[📋 Per-name reason<br/>+ 'did you mean?']
+        Reasons --> Mode{strict_tools?}
+        Mode -->|strict default| Fail[❌ exit 78]
+        Mode -->|--no-strict-tools<br/>or YAML: false| Warn[⚠️ Warn + continue]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Cfg input
+    class Probe,Reasons,All,Mode process
+    class Start,Warn ok
+    class Fail bad
+```
+
+### Strict mode (default) — fail fast
+
+```bash
+$ praisonai gateway start --config gateway.yaml
+✗ Tool pre-flight failed:
+    - 'duckduckgo_serch' not found. Did you mean 'duckduckgo'?
+  Fix the names in your config, or start with --no-strict-tools to run without them.
+$ echo $?
+78
+```
+
+### Non-strict — warn and continue
+
+Two equivalent ways:
+
+<Tabs>
+<Tab title="CLI flag">
+```bash
+praisonai gateway start --config gateway.yaml --no-strict-tools
+```
+</Tab>
+
+<Tab title="YAML key">
+```yaml
+# gateway.yaml
+strict_tools: false
+agents:
+  assistant:
+    instructions: "..."
+    tools: [duckduckgo_serch]        # unresolved but tolerated
+```
+</Tab>
+</Tabs>
+
+Either produces:
+
+```
+⚠ Tool pre-flight (non-strict) — starting without:
+    - 'duckduckgo_serch' not found. Did you mean 'duckduckgo'?
+```
+
+### "Did you mean?" mechanics
+
+Suggestions use stdlib `difflib.get_close_matches` (cutoff `0.7`, one suggestion per unknown). A tool that is registered but currently unloadable (e.g. an optional package not installed) is excluded from its own candidates, so it yields an install hint rather than suggesting the same name back:
+
+```
+'firecrawl' not found in any source. Check the spelling, install the package
+that provides it, or set PRAISONAI_ALLOW_LOCAL_TOOLS=true for a local tools.py.
+```
+
+A project `tools.py` that exists but is gated by the local-tools env var is flagged explicitly:
+
+```
+'my_local' not found. A local tools.py exists but local tools are disabled;
+set PRAISONAI_ALLOW_LOCAL_TOOLS=true to enable it.
+```
+
+An unknown toolset name is reported the same way:
+
+```
+    - toolset:research not found (unknown toolset)
+```
+
+### Precedence
+
+| Setting | Result |
+|---------|--------|
+| YAML `strict_tools: false` | Gate disabled (regardless of CLI flag) |
+| CLI `--no-strict-tools` | Gate disabled for this invocation |
+| CLI `--strict-tools` (default) with no YAML override | Gate strict → fail fast on any unresolved tool |
+| No unresolved tools | Pre-flight is silent, start proceeds |
+
+YAML `strict_tools: false` opts a bot out permanently; `--no-strict-tools` is per-invocation. A strict CLI default does **not** override a YAML `strict_tools: false`.
+
+### Env loading
+
+The gate loads `~/.praisonai/.env` before resolving, so `PRAISONAI_ALLOW_LOCAL_TOOLS=true` stored there by `praisonai onboard` is honoured and a gated local `tools.py` is not falsely reported as unresolved. The load is idempotent and existing process env wins — `GatewayHandler.start()` re-loads the same file moments later.
+
+### Exit code
+
+Strict failure exits with `78` (`EX_CONFIG`), which the OS units generated by `praisonai gateway install` treat as **do-not-restart** — an unresolvable tool in the config would loop the daemon otherwise. See [Gateway Exit Codes](/docs/features/gateway-exit-codes).
+
+---
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -1020,6 +1143,10 @@ identity:
   enabled: true                       # one session per paired user across channels (#3020)
   store: ~/.praisonai/identity.json   # optional; ~ expanded, `path:` accepted as alias
 
+# Opt into the pre-2026-07-31 warn-and-continue behaviour permanently.
+# Omit (or set true) to fail fast on any unresolved tool at start (#3553).
+strict_tools: false
+
 agents:
   support:
     instructions: "You are a support agent"
@@ -1099,5 +1226,11 @@ See [Secret References](/docs/features/gateway-secret-references) for the full `
   </Card>
   <Card title="Route Bindings" icon="route" href="/docs/features/gateway-route-bindings#fail-fast-validation">
     Fail-fast validation — route/binding typos caught at config load
+  </Card>
+  <Card title="Exit Codes" icon="circle-exclamation" href="/docs/features/gateway-exit-codes">
+    Exit `78` from the strict tool pre-flight — do-not-restart contract
+  </Card>
+  <Card title="Tool Resolution" icon="screwdriver-wrench" href="/docs/features/tool-resolution">
+    Core-resolver `PRAISONAI_STRICT_TOOLS` — complementary to this start-time gate
   </Card>
 </CardGroup>
