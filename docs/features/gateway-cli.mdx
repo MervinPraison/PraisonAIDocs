@@ -123,7 +123,7 @@ curl http://127.0.0.1:8765/health
 | `praisonai gateway start` | Start the gateway server (foreground) | `praisonai gateway start --port 9000` |
 | `praisonai gateway stop` | Stop a running gateway instance | `praisonai gateway stop --force` |
 | `praisonai gateway status` | Check gateway and daemon status | `praisonai gateway status --daemon-only` |
-| `praisonai gateway doctor` | Validate channel credentials **and route/binding targets** before start (pre-flight) | `praisonai gateway doctor --config gateway.yaml` |
+| `praisonai gateway doctor` | Validate channel credentials **and route/binding targets** before start, and optionally auto-repair weak auth tokens (`--fix`) | `praisonai gateway doctor --config gateway.yaml --fix` |
 | `praisonai gateway test` | One-shot readiness (probes + shell wiring + optional turn) | `praisonai gateway test --config gateway.yaml` |
 | `praisonai gateway channels` | List configured channels (add `--probe` to check creds) | `praisonai gateway channels --probe` |
 
@@ -292,9 +292,14 @@ Options:
   --channel TEXT      Channel a --turn probe uses (default: first configured)
   --turn TEXT         Run one offline inbound agent turn via
                       BotSessionManager.chat (requires LLM API key)
+  --fix               Repair safe findings (mint a strong gateway auth token
+                      when weak/missing), then re-validate
+  --dry-run           With --fix, preview repairs without writing anything
 
 Examples:
   praisonai gateway doctor
+  praisonai gateway doctor --fix
+  praisonai gateway doctor --fix --dry-run
   praisonai gateway doctor --config my-gateway.yaml --json
   praisonai gateway doctor --config gateway.yaml --channel slack --turn "Say OK"
   praisonai gateway doctor --config gateway.yaml --json --channel slack --turn "Say OK"
@@ -545,13 +550,14 @@ $ praisonai gateway doctor --config gateway.yaml
 
 A strong token prints nothing extra — silence is a pass, consistent with the credential-availability table.
 
-The `--json` output gains a top-level `gateway_auth_token` key (present only when the verdict is weak), alongside `probes` and `secrets`:
+The `--json` output gains a top-level `gateway_auth_token` key (present only when the verdict is weak), alongside `probes` and `secrets`. When `--fix` is passed, an optional `fix` key carries the repair report:
 
 ```json
 {
   "probes":  { "telegram": {"ok": true} },
   "secrets": { "telegram": {"token": "available"} },
-  "gateway_auth_token": "weak"
+  "gateway_auth_token": "weak",
+  "fix": "gateway_auth_token: weak → generated a strong token… done\nre-validated: gateway_auth_token now strong"
 }
 ```
 
@@ -564,6 +570,59 @@ The `--json` output gains a top-level `gateway_auth_token` key (present only whe
 <Card title="Weak Secret Guard" icon="shield-exclamation" href="/docs/features/gateway-bind-aware-auth#weak-placeholder-secret-guard">
   Full denylist, bind-aware behaviour matrix, and how to fix a weak `change-me`-style token
 </Card>
+
+### Auto-repair with `--fix`
+
+`--fix` repairs safe findings, then re-validates that each finding cleared.
+
+```mermaid
+graph LR
+    subgraph "detect → repair → re-validate"
+        Detect[🔍 Detect weak/missing auth_token] --> Mint[🔑 Mint token_hex 16]
+        Mint --> Env[💾 Write ~/.praisonai/.env]
+        Env --> Yaml[📄 Rewrite explicit weak YAML]
+        Yaml --> Revalidate[🔁 Re-run strength check]
+        Revalidate --> OK[✅ now strong — exit 0]
+        Revalidate --> Bad[❌ still weak — exit 1]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Detect input
+    class Mint,Env,Yaml,Revalidate process
+    class OK ok
+    class Bad bad
+```
+
+Repair a weak token, then confirm it cleared:
+
+```bash
+$ praisonai gateway doctor --config gateway.yaml --fix
+gateway_auth_token: weak → generated a strong token… done
+re-validated: gateway_auth_token now strong
+```
+
+Preview the repair without writing anything:
+
+```bash
+$ praisonai gateway doctor --config gateway.yaml --fix --dry-run
+gateway_auth_token: weak → would mint a strong token (--dry-run)
+```
+
+| Finding | `--fix` action | Persistence |
+|---|---|---|
+| `gateway.auth_token` weak/missing | Mint `secrets.token_hex(16)`, export to env, persist to `~/.praisonai/.env` | Survives daemon restart |
+| `gateway.auth_token` explicit weak in YAML | Also rewrites `gateway.yaml` in place (preserves `${ENV}` references) | Config file updated |
+| Any other finding | Not repaired yet (no dead-end: still surfaced with its own `retry_hint`) | — |
+
+`--dry-run` **still exits `1`** when a repairable finding is present, so CI catches un-fixed states before anything is written.
+
+<Warning>
+`--fix` writes to `~/.praisonai/.env` **and** may rewrite an explicit weak `auth_token` in `gateway.yaml` in place. Run `--fix --dry-run` first in production to preview the change. `${ENV}` references in YAML are left untouched — they resolve from the env store the env-var repair already fixed.
+</Warning>
 
 ### Pre-flight gate on start
 
