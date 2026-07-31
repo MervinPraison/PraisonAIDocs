@@ -18,12 +18,45 @@ def search_web(query: str) -> str:
     return f"Search results for: {query}"
 
 agent = Agent(name="Researcher", tools=[search_web])
-agent.start("Research quantum computing")  # tool hidden if key missing
+agent.start("Research quantum computing")
+# Tool hidden if the key is missing. Once the key is set, a subsequent transient
+# probe failure within 30 s keeps the tool available (last-good).
 ```
 
 
 
 The user requests work that needs a gated tool; unavailable tools are hidden from the schema so the model cannot call them.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Registry
+    participant Probe
+
+    Agent->>Registry: build schema
+    Registry->>Probe: check_availability()
+    Probe-->>Registry: True
+    Registry->>Registry: cache True (30 s) + stamp last_success
+    Registry-->>Agent: tool in schema
+
+    Note over Registry: within 30 s
+    Agent->>Registry: build schema again
+    Registry-->>Agent: tool in schema (cached, no probe)
+
+    Note over Probe: daemon momentarily busy
+    Agent->>Registry: build schema (cache TTL expired)
+    Registry->>Probe: check_availability()
+    Probe-->>Registry: raises Exception
+    Registry->>Registry: last_success < 30 s ago → serve last-good
+    Registry-->>Agent: tool STILL in schema (DEBUG log)
+
+    Note over Probe: sustained outage (>30 s later)
+    Agent->>Registry: build schema
+    Registry->>Probe: check_availability()
+    Probe-->>Registry: raises Exception
+    Registry->>Registry: grace expired → hide + cache False + WARNING
+    Registry-->>Agent: tool hidden
+```
 
 ```mermaid
 graph LR
@@ -134,7 +167,7 @@ sequenceDiagram
 | Phase | Behavior | Performance |
 |-------|----------|-------------|
 | **Schema Build** | Availability checks run once | Zero runtime cost |
-| **Tool Execution** | Only available tools included | No availability overhead |
+| **Tool Execution** | Only available tools included | Probes cached 30 s; no per-call overhead |
 | **LLM Interaction** | Only sees usable tools | Prevents hallucination |
 
 ---
@@ -225,42 +258,70 @@ if hasattr(web_tool, 'check_availability'):
 
 ```mermaid
 graph TD
-    A[Tool Registration] --> B{Has check_availability?}
-    B -->|No| C[Always Available]
-    B -->|Yes| D[Run Check]
-    D --> E{Check Result?}
-    E -->|True| F[Include in Schema]
-    E -->|False| G[Hide from LLM]
-    E -->|Exception| H[Log Warning + Hide]
-    
+    A[Schema Build] --> B{Cached < 30 s?}
+    B -->|Yes| C[Use cached result]
+    B -->|No| D{Has check_availability?}
+    D -->|No| E[Always Available]
+    D -->|Yes| F[Run Check]
+    F --> G{Result?}
+    G -->|True| H[Include in Schema<br/>stamp last_success]
+    G -->|False| I[Hide from LLM<br/>cache False for 30 s]
+    G -->|Exception + last_success < 30 s ago| J[Serve last-good<br/>debug log only]
+    G -->|Exception + no recent success| K[Hide from LLM<br/>cache False + warning log]
+
     classDef default fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef available fill:#10B981,stroke:#7C90A0,color:#fff
     classDef unavailable fill:#8B0000,stroke:#7C90A0,color:#fff
-    
-    class A,B,D default
-    class C,F available  
-    class G,H unavailable
+    classDef amber fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class A,B,D,F,G default
+    class C,E,H,J available
+    class I,K unavailable
 ```
 
 1. **No Check Method**: Tool is always considered available
-2. **Check Returns True**: Tool included in LLM schema
-3. **Check Returns False**: Tool hidden from LLM
-4. **Check Throws Exception**: Tool hidden + warning logged
+2. **Check Returns True**: Tool included in LLM schema; last-success timestamp stamped
+3. **Check Returns False**: Tool hidden from LLM; cached `False` for 30 s
+4. **Check Throws Exception**: Flaky — served last-good within the grace window, otherwise hidden (see below)
+
+The full behaviour, before and after the last-good grace window landed:
+
+| Scenario | Before | After |
+|---|---|---|
+| Probe returns `True` | tool available, cached `True` for 30 s | unchanged; `last_success` also stamped |
+| Probe returns `False` | tool hidden, cached `False` for 30 s | unchanged |
+| Probe **raises** (no prior success **ever**) | tool hidden, cached `False`, `WARNING` logged | unchanged (hidden, `WARNING`) |
+| Probe **raises** within 30 s of a recent success | tool hidden, cached `False`, `WARNING` logged | tool stays available (last-good), no negative cached, `DEBUG` logged |
+| Probe **raises** more than 30 s after last success | tool hidden, cached `False`, `WARNING` logged | unchanged (hidden, `WARNING`) |
+| `register(tool_v2, name="x", overwrite=True)` when `x` was recently healthy | replacement inherits cache + last-success — a broken v2 can look available for up to 30 s | cache + last-success evicted; the new tool starts clean |
+| `unregister("x")` / `clear()` | cache entry lingered | evicted; no stale growth |
 
 ### Exception Handling
 
+A raised probe is treated as flaky, not final:
+
+- If the tool succeeded **within the last 30 seconds**, the last-good result is served and a `DEBUG` line is logged. The failure is **not** cached, so the next probe can recover immediately.
+- Otherwise (no prior success, or the last success is older than 30 s), the tool is hidden, cached as unavailable for 30 s, and a `WARNING` is logged.
+
 ```python
-# If check_availability() raises an exception:
-def broken_availability_check():
+# Result depends on when the last successful probe was:
+def flaky_availability_check():
     raise ValueError("Network unreachable")
 
-@tool(availability=broken_availability_check)
+@tool(availability=flaky_availability_check)
 def network_tool(host: str) -> str:
     return f"Ping {host}"
 
-# Result: Tool is hidden, log shows:
-# WARNING: Tool 'network_tool' unavailable: Availability check failed: Network unreachable
+# Never succeeded / >30 s since last success:
+# WARNING: Availability check failed for tool 'network_tool': Network unreachable
+# → hidden from the LLM for 30 s
+
+# Recent success then transient failure (within 30 s):
+# DEBUG:   Availability check failed for tool 'network_tool' but serving last-good within grace window: Network unreachable
+# → tool stays in the schema; no negative cached
 ```
+
+This makes long-lived agents and gateways stable across brief daemon hiccups, import glitches, and network blips.
 
 ### Plain Function Registry
 
@@ -273,6 +334,30 @@ def simple_function(text: str) -> str:
 # Plain functions are always available (no protocol support yet)
 register_tool(simple_function)
 ```
+
+---
+
+## Availability Caching
+
+Availability checks are cached per-tool for **30 seconds** so probes aren't re-run on every schema build.
+
+| State | TTL | Behaviour |
+|---|---|---|
+| Cached `True` | 30 s | Reused on every subsequent schema build; probe skipped |
+| Cached `False` | 30 s | Reused; tool stays hidden without re-probing |
+| Last successful probe timestamp | 30 s | Enables the grace window (see [Exception Handling](#exception-handling)) |
+
+The TTL and grace window are internal defaults (both 30 s) on `ToolRegistry` and are not user-tunable.
+
+**When cache entries are cleared:**
+
+- `registry.unregister(name)` — evicts the tool's cache and last-success timestamp.
+- `registry.register(new_tool, name=..., overwrite=True)` — when the replacement is a **different instance**, prior availability state is evicted so a broken replacement can't inherit the previous tool's "healthy" status.
+- `registry.clear()` — wipes everything.
+
+<Tip>
+Expensive probes (network calls, subprocess spawns) don't need `@lru_cache` — the registry already caches results for 30 s. Add `@lru_cache` only if you need longer caching.
+</Tip>
 
 ---
 
@@ -375,26 +460,8 @@ def slow_check():
 ```
 </Accordion>
 
-<Accordion title="Cache Results When Possible" icon="database">
-For checks that might be expensive, consider caching results.
-
-```python
-import time
-from functools import lru_cache
-
-@lru_cache(maxsize=1)
-def cached_docker_check():
-    """Cache Docker availability for 5 minutes."""
-    try:
-        import docker
-        docker.from_env().ping()
-        return True, ""
-    except Exception as e:
-        return False, str(e)
-
-# Refresh cache periodically
-cached_docker_check.cache_clear()
-```
+<Accordion title="Let the Registry Cache Your Probes" icon="database">
+The registry already caches every probe result for 30 s — see [Availability Caching](#availability-caching). Don't wrap probes in `@lru_cache` unless you need caching longer than 30 s.
 </Accordion>
 
 <Accordion title="Fail Fast on Missing Dependencies" icon="shield-check">
