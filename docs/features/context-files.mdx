@@ -158,7 +158,9 @@ graph LR
 When your host wires the attacher into the CLI auto-loader, on-demand attachment runs for you — drop a `packages/foo/AGENTS.md` and it appears the first time the agent edits a file inside `packages/foo/`. If your host has not wired it in yet, reach for the stateless helper or the session class below.
 
 <Note>
-As of PraisonAI PR #2922 the AFTER_TOOL hook's `additional_context` is now actually appended to the tool result. Earlier releases wired the hook but discarded its output, so subtree rules never reached the model — if you tried this recipe before and saw no effect, update to `praisonaiagents 1.6.147` (PraisonAI release `v4.6.144`) and it will work as documented.
+As of PraisonAI PR **#3552**, both `praisonai chat` and `praisonai run` (including `praisonai run --agent …` and `praisonai run --profile …`) automatically register the subtree instruction hook — drop a `packages/foo/AGENTS.md` and it is attached the first time the agent reads or edits a file inside `packages/foo/`. If you're on an older release the hook fires only under `chat`; upgrade to pick up parity under `run`.
+
+(Historical: PR #2922 fixed the `AFTER_TOOL` hook's `additional_context` being dropped. If you tried this recipe before **`praisonaiagents 1.6.147` / PraisonAI `v4.6.144`** and saw no effect on either surface, upgrade first.)
 </Note>
 
 </Step>
@@ -297,7 +299,9 @@ Register `build_subtree_context_hook()` on a **dedicated per-session `HookRegist
 
 ```mermaid
 graph TB
-    Q1{"Are all instruction files inside cwd or above it?"}
+    Q0{"On a CLI<br/>(chat / run / code / tui)?"}
+    Q0 -->|Yes| CLI["✅ Nothing to wire<br/>the CLI registers the hook for you<br/>unless --no-rules / PRAISON_NO_RULES"]
+    Q0 -->|No — Python API| Q1{"Are all instruction files inside cwd or above it?"}
     Q1 -->|Yes| UPFRONT["✅ Up-front load_context_files is enough<br/>(no attacher)"]
     Q1 -->|No| Q2{"How does the session touch files?"}
     Q2 -->|"One known path"| ONESHOT["🎯 load_context_files_for_path(path)<br/>(stateless helper)"]
@@ -307,8 +311,8 @@ graph TB
     classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class Q1,Q2 q
-    class UPFRONT,ONESHOT,CLASS,HOOK pick
+    class Q0,Q1,Q2 q
+    class CLI,UPFRONT,ONESHOT,CLASS,HOOK pick
 ```
 
 <Note>
@@ -319,31 +323,38 @@ graph TB
 
 ## CLI Auto-loading
 
-As of PraisonAI PR #2358, `praisonai chat`, `praisonai run`, `praisonai code`, and `praisonai tui` automatically discover and inject AGENTS.md-style project context into the system prompt — no flag required.
+As of PraisonAI PR #2358, `praisonai chat`, `praisonai run`, `praisonai code`, and `praisonai tui` automatically discover and inject AGENTS.md-style project context — no flag required. Each command wires **two** things: the up-front `load_context_files()` merge that prepends the walk-up context to the system prompt, **and** the on-demand `build_subtree_context_hook` attach that fires the first time the agent touches a file under a nested `AGENTS.md`. Parity for `run` (including `run --agent …` and `run --profile …`) landed in PR **#3552** — before that, only `chat` registered the subtree hook.
 
 ```mermaid
 sequenceDiagram
     participant User
     participant CLI as praisonai CLI
     participant Loader as load_context_files
+    participant Hook as build_subtree_context_hook
     participant Agent as Agent backstory
 
     User->>CLI: praisonai chat / run / code / tui
     CLI->>Loader: walk_up=True, cwd=workspace
     Loader-->>CLI: merged context (≤8000 chars)
     CLI->>Agent: prepend "# Project Context\n{context}"
+    CLI->>Hook: register AFTER_TOOL hook (unless --no-rules)
+    Note over Hook: fires on first touch under a nested AGENTS.md
     Agent-->>User: response with project awareness
 
     classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef cli fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef loader fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef hook fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef agent fill:#10B981,stroke:#7C90A0,color:#fff
 
     class User user
     class CLI cli
     class Loader loader
+    class Hook hook
     class Agent agent
 ```
+
+Zero-config in a monorepo: from the repo root, `praisonai run "refactor packages/foo/bar.py"` picks up `packages/foo/AGENTS.md` the moment it opens a file there — the same behaviour `chat` has always had.
 
 ### Opt-out
 
@@ -398,12 +409,14 @@ configure_host(agent_kwargs={"no_context": True})
 
 ### Opt-out matrix
 
-| Surface | Opt-out |
-|---------|---------|
-| CLI flag | `--no-context` |
-| Env var | `PRAISON_NO_CONTEXT=true` |
-| `InteractiveConfig` field | `no_context=True` |
-| `configure_host()` param | `no_context=True` (or `agent_kwargs={"no_context": True}`) |
+Two independent switches gate the two mechanisms: `--no-context` / `PRAISON_NO_CONTEXT` skips the up-front `load_context_files()` merge, while `--no-rules` / `PRAISON_NO_RULES` skips the on-demand `build_subtree_context_hook` attach.
+
+| Surface | Opt-out for up-front load (`load_context_files`) | Opt-out for subtree hook (`build_subtree_context_hook`) |
+|---------|--------------------------------------------------|---------------------------------------------------------|
+| CLI flag | `--no-context` | `--no-rules` |
+| Env var | `PRAISON_NO_CONTEXT=true` | `PRAISON_NO_RULES=true` (accepts `1` / `true` / `yes`, case-insensitive) |
+| `InteractiveConfig` field | `no_context=True` | `no_rules=True` |
+| `configure_host()` param | `no_context=True` (or via `agent_kwargs`) | `no_rules=True` (or via `agent_kwargs`) |
 
 ### Token budget and truncation
 
@@ -411,6 +424,12 @@ The default budget is **8000 characters**. When discovered context exceeds the b
 
 - `InteractiveConfig(context_token_budget=16000)` for interactive sessions
 - `configure_host(context_token_budget=16000)` for host integrations
+
+`PRAISON_CONTEXT_BUDGET` — integer character budget for the **subtree hook** (`build_subtree_context_hook(max_chars=…)`). Applies to both interactive (`chat`) and non-interactive (`run`) CLI. `PRAISON_CONTEXT_BUDGET=0` — or a missing / non-integer value — disables the cap on the CLI subtree hook. Set a positive integer to bound the total subtree text emitted across the session.
+
+<Note>
+`PRAISON_CONTEXT_BUDGET` is **distinct** from `InteractiveConfig(context_token_budget=…)` / `configure_host(context_token_budget=…)`. The env var caps the on-demand subtree hook; the config field caps the up-front `load_context_files()` merge (default `8000`). When you call `build_subtree_context_hook()` yourself in Python, its own `max_chars` default is `8000` — the CLI wiring passes `PRAISON_CONTEXT_BUDGET` (defaulting to `0` = uncapped) instead.
+</Note>
 
 <Note>
 Discovery runs once per session and the result is cached. Editing `AGENTS.md` mid-session requires restarting the CLI to pick up changes.
