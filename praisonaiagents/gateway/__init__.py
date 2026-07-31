@@ -79,6 +79,11 @@ from .protocols import (
     RateLimitPolicyProtocol,
     RateLimitPolicy,  # backward-compat alias
     SlidingWindowRateLimitPolicy,
+    # Durable-queue dead-letter decision (Issue #3519)
+    PERMANENT_ERROR_CLASSES,
+    DeadLetterDecision,
+    DeadLetterPolicyProtocol,
+    AttemptAndAgeDeadLetterPolicy,
     # Port-less, restart-safe external drain trigger (Issue #2390)
     current_epoch,
     DrainMarkerPolicy,
@@ -145,6 +150,14 @@ from .liveness import (
     # Event-loop liveness watchdog (Issue #3385)
     LoopWatchdogPolicy,
     LoopWatchdog,
+)
+from .degraded_state import (
+    # Unified degraded-capability registry (Issue #3518)
+    DegradedOwner,
+    DegradedCapabilityProtocol,
+    DegradedCapabilityRegistry,
+    OWNER_KINDS,
+    DEGRADED_STATES,
 )
 from .hooks import (
     HookAction,
@@ -293,6 +306,11 @@ __all__ = [
     "RateLimitPolicyProtocol",
     "RateLimitPolicy",
     "SlidingWindowRateLimitPolicy",
+    # Durable-queue dead-letter decision (Issue #3519)
+    "PERMANENT_ERROR_CLASSES",
+    "DeadLetterDecision",
+    "DeadLetterPolicyProtocol",
+    "AttemptAndAgeDeadLetterPolicy",
     # Port-less, restart-safe external drain trigger (Issue #2390)
     "current_epoch",
     "DrainMarkerPolicy",
@@ -357,6 +375,12 @@ __all__ = [
     # Event-loop liveness watchdog (Issue #3385)
     "LoopWatchdogPolicy",
     "LoopWatchdog",
+    # Unified degraded-capability registry (Issue #3518)
+    "DegradedOwner",
+    "DegradedCapabilityProtocol",
+    "DegradedCapabilityRegistry",
+    "OWNER_KINDS",
+    "DEGRADED_STATES",
     # Inbound trigger / webhook contract (Issue #2281)
     "HookAction",
     "HookConfig",
