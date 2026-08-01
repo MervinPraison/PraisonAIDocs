@@ -577,8 +577,108 @@ When `--output` is set, the CLI writes the file and prints:
 |------|---------|-------------|
 | `--format` / `-f` | `md` | Export format — `md` or `json` |
 | `--output` / `-o` | _(stdout)_ | Write to a file instead of printing |
+| `--sanitise` / `--sanitize` | _(off)_ | Redact secrets, absolute paths, the cwd, and embedded file contents with stable `[redacted:<category>:<n>]` placeholders. Opt-in; default export unchanged. |
+| `--redact-level` | `standard` | Redaction level when `--sanitise` is set: `standard` or `strict`. An unknown value is rejected with an actionable error. |
 
-Legacy-only sessions fall back to the `SessionManager` exporter automatically.
+Legacy-only sessions fall back to the `SessionManager` exporter automatically — and legacy sessions **also** honour `--sanitise` now, so a raw transcript is never leaked through the fallback (see [Sanitise before sharing](#sanitise-before-sharing)).
+
+#### Sanitise before sharing
+
+`praisonai session export <id> --sanitise` (alias `--sanitize`) redacts secrets, absolute file paths, the working directory, and file contents embedded in tool I/O — replacing them with stable `[redacted:<category>:<n>]` placeholders — so a session is safe to paste into a bug report, share with a teammate, or attach to an audit trail. The default export (no flag) is **byte-for-byte unchanged**; sanitisation is strictly opt-in.
+
+```mermaid
+graph LR
+    subgraph "Sanitised Export"
+        Raw[📝 Raw transcript] --> Redact[🛡️ redact_transcript<br/>standard · strict]
+        Redact --> Secrets["[redacted:secret:n]"]
+        Redact --> Paths["[redacted:path:n]"]
+        Secrets --> Safe[✅ Safe to share]
+        Paths --> Safe
+    end
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Raw input
+    class Redact process
+    class Secrets,Paths store
+    class Safe output
+```
+
+```bash
+# Default — raw transcript, unchanged (may leak secrets)
+praisonai session export my-project --format json
+
+# Opt-in — secrets, paths, and cwd replaced with stable placeholders
+praisonai session export my-project --format json --sanitise
+
+# Same, US spelling
+praisonai session export my-project --format md --sanitize
+
+# Broader net (bearer tokens + PEM private-key blocks)
+praisonai session export my-project --sanitise --redact-level strict
+```
+
+Every masked span becomes `[redacted:<category>:<n>]`, where the same source value maps to the **same** placeholder within one export — so the reader still follows which value recurs where, without ever seeing it.
+
+```
+Before:   read /home/alice/project/config.yaml — api_key=sk-ABCDEF0123456789ABCDEF
+After:    read [redacted:path:1] — api_key=[redacted:secret:1]
+```
+
+The same path appearing three times becomes `[redacted:path:1]` three times, not `:1`, `:2`, `:3`.
+
+**Redaction levels.**
+
+| Level | Also masks | When to use |
+|-------|------------|-------------|
+| `standard` (default) | Process-registered secrets, OpenAI / Slack / GitHub / AWS / Google / JWT token shapes, `api_key=…` / `secret=…` / `token=…` / `password=…` pairs, absolute POSIX / Windows / UNC paths, and the current working directory | Almost every case — a safe default that keeps the transcript readable. |
+| `strict` | Everything `standard` masks, **plus** `Authorization: Bearer …` credentials and PEM `-----BEGIN … PRIVATE KEY-----` blocks | Wide sharing (public gist, open bug report, external audit) where over-redacting beats leaking. |
+
+An unknown value is rejected up front (exit 1):
+
+```
+$ praisonai session export my-project --sanitise --redact-level loose
+❌ Invalid --redact-level 'loose'. Choose one of: standard, strict.
+```
+
+<Note>
+The redactor is a small, self-contained helper (`praisonai_code/cli/state/redact.py`, stdlib only — no new dependencies). It reuses `praisonaiagents.secrets` when available, so any value registered via the process-wide secret registry is masked first, even if it does not match a built-in token shape.
+</Note>
+
+<Warning>
+`--sanitise` is a **best-effort safety net**, not a compliance guarantee. It masks the shapes above deterministically, but a novel secret shape that matches no built-in pattern and was never registered can still slip through. Before publishing a redacted transcript widely, skim the output for anything that looks like a credential and consider `--redact-level strict`.
+</Warning>
+
+<Note>
+Legacy `SessionManager` sessions (created before 2026-07-17) also honour `--sanitise` — they used to return a raw verbatim transcript ignoring the flag, a secret-leak gap closed by [praisonai/PraisonAI#3434](https://github.com/MervinPraison/PraisonAI/pull/3434).
+</Note>
+
+**Python API.** The same redaction is available on the resolver helper — handy when scripting an export from a notebook or CI job:
+
+```python
+from praisonai_code.cli.state.session_resolver import export_session
+
+# Default — raw
+raw = export_session("my-project", format="json")
+
+# Opt-in — sanitised
+safe = export_session("my-project", format="json", redact=True, redact_level="standard")
+```
+
+And directly against a resolved payload (dict → dict, input never mutated):
+
+```python
+from praisonai_code.cli.state.redact import redact_transcript, REDACT_LEVELS
+
+safe_payload = redact_transcript(
+    payload,                          # dict from resolved.to_dict()
+    level="standard",                 # or "strict"; must be in REDACT_LEVELS
+    extra_secrets=["HUNTER2SECRET"],  # extra literal values to mask
+)
+```
 
 ### Import a Session
 
@@ -613,7 +713,8 @@ Session Commands:
                                 --transcript  - Show transcript only (legacy view)
   praisonai session show <name>     - Show session details
   praisonai session delete <name>   - Delete a session
-  praisonai session export <name> [--format md|json] [--output FILE]  - Export a session
+  praisonai session export <name> [--format md|json] [--output FILE]
+                                  [--sanitise|--sanitize] [--redact-level standard|strict]  - Export a session
   praisonai session import <file>                                     - Import a session (JSON)
   praisonai session help            - Show this help
 
