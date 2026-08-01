@@ -152,7 +152,7 @@ def strip_fenced_blocks(text: str) -> str:
 
 
 def nav_pages() -> list[str]:
-    data = json.loads((ROOT / "docs.json").read_text())
+    data = json.loads((ROOT / "docs" / "docs.json").read_text())
     pages: list[str] = []
 
     def walk(node):
