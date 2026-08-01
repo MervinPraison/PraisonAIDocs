@@ -151,7 +151,8 @@ Both groups are scanned by `BotPlatformRegistry` on startup. A connector that wo
 ### Discovery via entry points (`praisonai.channels`)
 
 <Note>
-Plugin channels are accepted on both `praisonai bot serve` and `praisonai gateway start` (from PR #3019 / PraisonAI 2026-07-14). Older gateway builds only accepted the built-in six platforms at runtime and silently warned on plugin platforms.
+**Plugin channels on `praisonai gateway start`** (from [PR #3579](https://github.com/MervinPraison/PraisonAI/pull/3579), merged 2026-08-01):
+the gateway's `_create_bot` path now delegates to the same `resolve_adapter()` seam that `Bot()` and `probe_channels` use, so **channels registered via `register_platform()` or a `praisonai.channels` entry point are launched by the gateway exactly like a built-in**. Older gateway builds hardcoded seven built-in platforms and silently skipped everything else with a single `WARNING` — plugin channels never actually started under the gateway even though `Bot()` could construct them. Update to the post-#3579 wrapper if you rely on plugin channels in `gateway.yaml`.
 </Note>
 
 The `praisonai.channels` entry-point group is the idiomatic way to distribute a bot connector as a pip-installable package. Once installed, the platform is available with no extra Python code:
@@ -186,6 +187,8 @@ from praisonai.bots._registry import list_platforms
 print(sorted(list_platforms()))
 ```
 
+`list_platforms()` also returns anything registered by `register_platform()` in the current process. The entry-point group is loaded lazily on first registry access, so a plugin that is installed but never imported still appears after the first `resolve_adapter()` call.
+
 <Note>
 `praisonai.channels` is preferred over `praisonai.bots` for new packages. Both entry-point groups continue to work.
 </Note>
@@ -218,9 +221,94 @@ channels:
 
 ```bash
 python -c "import my_plugin" && praisonai gateway start --config gateway.yaml
-# Before PR #3019: WARNING 'mattermost' not a known platform, gateway starts, channel dead.
-# After PR #3019:  gateway starts, mattermost channel runs.
+# Before PR #3579: gateway silently skipped 'mattermost' with a single WARNING; channel never started.
+# After PR #3579:  resolve_adapter('mattermost') succeeds, adapter is constructed, channel runs;
+#                  an unresolvable name is recorded as a degraded channel instead of dropped.
 ```
+
+The gateway walks the same path a built-in channel does:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Gateway as WebSocketGateway
+    participant Registry as resolve_adapter
+    participant Adapter as PluginBot
+
+    User->>Gateway: praisonai gateway start --config gateway.yaml
+    Gateway->>Gateway: _create_bot(channel_type, ...)
+    Gateway->>Gateway: _build_channel_adapter(...)
+    Gateway->>Registry: resolve_adapter("mattermost")
+    Registry-->>Gateway: PluginBot class (register_platform or entry point)
+    Gateway->>Gateway: seed kwargs + _EXTRA_ENV_MAP backfill + ch_cfg pass-through
+    Gateway->>Adapter: PluginBot(**init_kwargs)
+    Adapter-->>Gateway: instance
+    Gateway->>Adapter: await bot.start()
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class User,Adapter agent
+    class Gateway,Registry process
+```
+
+When resolution fails, the gateway calls `self._mark_degraded_owner("channel", "mattermost", reason="unresolved_platform")` instead of raising — the channel is skipped but stays visible in `health` / `doctor`.
+
+### How the gateway constructs a plugin channel
+
+The gateway builds every channel adapter through one resolution seam and a three-step kwarg assembly.
+
+**Adapter resolution.** `resolve_adapter(channel_type)` is the single lookup — built-in, `register_platform`-registered, and `praisonai.channels` entry-point adapters are indistinguishable at this point.
+
+**Kwarg assembly.** The gateway layers three sources in order; later sources override earlier ones:
+
+| Order | Source | Contents |
+|-------|--------|----------|
+| 1 | Seed | `{"token": <token>, "agent": <Agent>, "config": <config>}` |
+| 2 | `_EXTRA_ENV_MAP[channel_type]` | For each `param → env_key`, if `os.environ.get(env_key)` is non-empty, set `init_kwargs[param] = env_val` (e.g. Slack's `SLACK_APP_TOKEN` → `app_token`) |
+| 3 | `ch_cfg` (from `channels:` YAML) | Every key except `"platform"` and `"token"` copied verbatim; **overrides** step 2 |
+
+The gateway then calls `adapter_cls(**init_kwargs)`. `ch_cfg` wins over env backfill, and `platform` / `token` are stripped so they never double up. This mirrors `probe_channels` and `Bot._build_adapter`.
+
+**Token env-var fallback.** When the `token` from `channels:` YAML is falsy, the gateway consults `_TOKEN_FALLBACK_ENV` — the first non-empty value wins:
+
+| `channel_type` | Env vars tried in order |
+|----------------|-------------------------|
+| `linear` | `LINEAR_OAUTH_TOKEN`, `LINEAR_API_KEY` |
+| `email` | `EMAIL_APP_PASSWORD` |
+| `agentmail` | `AGENTMAIL_API_KEY` |
+
+Other platforms have no token fallback here — Slack's app-token env still comes from step 2 (`_EXTRA_ENV_MAP`), not this map.
+
+Where a plugin author sets each value:
+
+```mermaid
+graph TB
+    Y[channels: YAML — highest wins] --> B[_EXTRA_ENV_MAP env var backfill]
+    B --> D[constructor default in the adapter class — lowest]
+
+    classDef yaml fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef env fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef default fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Y yaml
+    class B env
+    class D default
+```
+
+### Degraded channels: what happens when a plugin fails
+
+A channel that cannot resolve or construct is recorded as degraded, not silently dropped.
+
+Two exact `reason` strings surface via `_mark_degraded_owner("channel", <channel_type>, reason=...)`:
+
+| `reason` | Trigger | Log line |
+|----------|---------|----------|
+| `unresolved_platform` | `resolve_adapter(channel_type)` raised `ValueError` — no built-in, `register_platform`, or entry-point adapter matches | `Unknown channel type %r — no built-in, registered, or entry-point adapter resolves it; channel not started.` |
+| `adapter_construction_failed` | `adapter_cls(**init_kwargs)` raised any `Exception` (e.g. wrong kwargs, connection error) | `Failed to construct channel %r adapter: %s` |
+
+Both paths return `None` from `_create_bot`, so the two call sites (`start_channels` and hot-reload) keep their existing `None` contract. The failure is queryable via the degraded-owner surface (`health` / `doctor`) — see [Gateway Degraded Channels](/features/gateway-degraded-channels) — instead of vanishing into logs.
 
 ---
 
@@ -384,6 +472,9 @@ class RobustBot:
 <CardGroup cols={2}>
 <Card title="Bot Platform Capabilities" icon="sliders" href="/features/bot-platform-capabilities">
   Declare streaming, chunking, and rate-limit behaviour
+</Card>
+<Card title="Gateway Degraded Channels" icon="heart-pulse" href="/features/gateway-degraded-channels">
+  See where `unresolved_platform` and `adapter_construction_failed` surface in health/doctor
 </Card>
 <Card title="Framework Adapter Plugins" icon="puzzle-piece" href="/features/framework-adapter-plugins">
   Learn about extending PraisonAI with custom execution frameworks
