@@ -87,6 +87,13 @@ assert('ci-only label not exempt mixed changes', mg.sensitivePathReasons(
   [mg.WORKFLOW_ONLY_LABEL]
 ).length === 1);
 assert('secret in patch', mg.secretScanReasons([{ filename: 'x.py', patch: '+key = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"' }]).length === 1);
+assert('secret scan skips docs mdx', mg.secretScanReasons([
+  { filename: 'docs/cli/session.mdx', patch: '+example token sk-abcdefghijklmnopqrstuvwxyz123456' },
+]).length === 0);
+assert('scan comment is not a verdict', !mg.isMergeGateVerdictComment(
+  '**Merge gate scan** — eligible for assessment. Claude merge gate will assess and may auto-merge if `MERGE_GATE_VERDICT: APPROVE`.'
+));
+assert('real verdict comment detected', mg.isMergeGateVerdictComment('MERGE_GATE_VERDICT: APPROVE\n\nAll checks passed.'));
 
 // Nav-only docs.json exempt from manual-review sensitive path
 const navOnlyPatch = [

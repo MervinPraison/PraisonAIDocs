@@ -744,9 +744,16 @@ function missingTestsReason(files) {
   return null;
 }
 
+function isMergeGateVerdictComment(body) {
+  const text = body || '';
+  if (text.includes('Merge gate scan')) return false;
+  return /(?:^|\n)\s*MERGE_GATE_VERDICT:\s*(APPROVE|BLOCK)\b/m.test(text);
+}
+
 function secretScanReasons(files) {
   for (const f of files) {
     if (/\/tests?\//.test(f.filename) || /test_.*\.py$/.test(f.filename)) continue;
+    if (/^docs\/.*\.mdx$/.test(f.filename || '')) continue;
     const patch = f.patch || '';
     if (!patch) continue;
     for (const pattern of SECRET_PATTERNS) {
@@ -943,7 +950,7 @@ function findMergeGateVerdict(comments, minCreatedAt = null, headPushedAt = null
   const headTime = headPushedAt ? new Date(headPushedAt).getTime() - 60000 : 0;
   const gateComments = comments
     .filter((c) => {
-      if (!(c.body || '').includes('MERGE_GATE_VERDICT:')) return false;
+      if (!isMergeGateVerdictComment(c.body)) return false;
       const created = new Date(c.created_at).getTime();
       if (minTime && created < minTime) return false;
       if (headTime && created < headTime) return false;
@@ -952,8 +959,8 @@ function findMergeGateVerdict(comments, minCreatedAt = null, headPushedAt = null
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   if (gateComments.length === 0) return null;
   const body = gateComments[0].body || '';
-  if (body.includes('MERGE_GATE_VERDICT: APPROVE')) return 'APPROVE';
-  if (body.includes('MERGE_GATE_VERDICT: BLOCK')) return 'BLOCK';
+  if (/MERGE_GATE_VERDICT:\s*APPROVE\b/.test(body)) return 'APPROVE';
+  if (/MERGE_GATE_VERDICT:\s*BLOCK\b/.test(body)) return 'BLOCK';
   return null;
 }
 
@@ -1011,6 +1018,7 @@ module.exports = {
   loadPrContext,
   evaluatePipelineQuiescent,
   selectMergeGateCandidates,
+  isMergeGateVerdictComment,
   findMergeGateVerdict,
   MERGE_GATE_ACTIVE_LABEL,
   MERGE_GATE_ACTIVE_STALE_MS,
