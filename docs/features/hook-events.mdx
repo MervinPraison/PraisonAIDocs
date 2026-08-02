@@ -291,6 +291,7 @@ def after_llm(event_data):
 |-------|---------|------------|----------|
 | `SESSION_START` | When session starts | `SessionStartInput` | Session initialization |
 | `SESSION_END` | When session ends | `SessionEndInput` | Session cleanup |
+| `SESSION_PERSIST_FAILED` | A durable session write failed (disk-full / SQLite corruption / permission / `OSError`) | `SessionPersistFailedInput` | **Observe-only** — alert/metric on silent data-loss; the turn is salvaged to a spill file and re-ingested on next load |
 
 <Tip>
 Plugin authors: subclass `Plugin` and override `session_start` / `session_end` — see [Plugins → How the Bridge Works](/docs/features/plugins#how-the-bridge-works).
@@ -313,6 +314,46 @@ def session_end(event_data):
     print(f"Session ended: {event_data.session_id}")
     print(f"Reason: {event_data.reason}")
     return HookResult.allow()
+```
+
+#### `SESSION_PERSIST_FAILED` — a durable write failed
+
+Fires when the session store cannot persist a turn (`add_message` / `set_chat_history` hits disk-full, SQLite/FTS corruption, or a permission / `OSError`). Before this hook, a failed durable write silently collapsed to `False` and the already-produced turn lived only in memory — lost on the next shutdown. Now the store salvages the turn to a spill file and fires this event so the failure is observable.
+
+<Note>
+**Observe-only.** This is an observability signal, not a policy gate — it never re-runs the write and never raises on the caller's hot path. Return `HookResult.allow()` (or nothing). It mirrors the outbound-side `MESSAGE_UNDELIVERED` posture. Skipped entirely when no such hook is registered (zero overhead). See [Write-failure salvage](/features/session-persistence#write-failure-salvage) for the spill + re-ingest flow.
+</Note>
+
+##### `SessionPersistFailedInput` Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `role` | `str` | `""` | Role of the message that failed to persist (`user` / `assistant`) |
+| `content` | `str` | `""` | Message content (truncated to 500 chars in `to_dict`) |
+| `error` | `str` | `""` | Stringified error from the failing write (e.g. `"atomic write failed"` or the OSError text) |
+| `spilled` | `bool` | `False` | Whether the last-resort fallback write itself succeeded |
+| `spill_path` | `Optional[str]` | `None` | The file the turn was salvaged to (when `spilled=True`) |
+| `session_id`, `cwd`, `event_name`, `timestamp`, `agent_name` | — | — | Standard `HookInput` fields |
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks.registry import get_default_registry
+from praisonaiagents.hooks.types import HookEvent, HookResult
+
+registry = get_default_registry()
+
+@registry.on(HookEvent.SESSION_PERSIST_FAILED)
+def on_persist_failed(event_data):
+    # Mirror to metrics/alerting so a silent data-loss failure is observable.
+    print(
+        f"[persist-failed] session={event_data.session_id} "
+        f"role={event_data.role} spilled={event_data.spilled} "
+        f"path={event_data.spill_path} error={event_data.error}"
+    )
+    return HookResult.allow()
+
+agent = Agent(name="MyAgent", instructions="Be helpful.")
+agent.start("Do something that would append a turn.")
 ```
 
 ### Error Events
@@ -923,6 +964,7 @@ def on_auto_promotion(event_data):
 | `AFTER_LLM` | LLM | After LLM response |
 | `SESSION_START` | Session | Session starts |
 | `SESSION_END` | Session | Session ends |
+| `SESSION_PERSIST_FAILED` | Session | A durable session write failed — observe-only; turn is salvaged to a spill file and re-ingested on next load (see [Write-failure salvage](/features/session-persistence#write-failure-salvage)) |
 | `ON_ERROR` | Error | Error occurs |
 | `ON_RETRY` | Error | Before retry |
 | `USER_PROMPT_SUBMIT` | User | User submits prompt |
