@@ -7,12 +7,12 @@ icon: "clock-rotate-left"
 
 The `session` command manages conversation sessions, allowing you to save, resume, and organize multi-turn interactions.
 
-Every sub-command (`list`, `resume`, `show`, `delete`, `export`) and every `--continue` / `--session <id>` flag resolves the same session by the same id through a single resolver.
+Every sub-command (`list`, `resume`, `show`, `delete`, `export`, `share`, `unshare`) and every `--continue` / `--session <id>` flag resolves the same session by the same id through a single resolver.
 
 ```mermaid
 graph TB
     Start[🆔 You have a session id] --> Listed{📋 Listed by<br/>session list?}
-    Listed -->|Yes| Unified[✅ Use any sub-command<br/>show / delete / export / resume]
+    Listed -->|Yes| Unified[✅ Use any sub-command<br/>show / delete / export / resume<br/>share / unshare]
     Listed -->|No| Legacy{🕰️ Legacy id<br/>pre-2026-07-17?}
     Legacy -->|Yes| Fallback[♻️ Best-effort<br/>SessionManager fallback]
     Legacy -->|No| NotFound[🚫 not-found]
@@ -656,6 +656,10 @@ The redactor is a small, self-contained helper (`praisonai_code/cli/state/redact
 Legacy `SessionManager` sessions (created before 2026-07-17) also honour `--sanitise` — they used to return a raw verbatim transcript ignoring the flag, a secret-leak gap closed by [praisonai/PraisonAI#3434](https://github.com/MervinPraison/PraisonAI/pull/3434).
 </Note>
 
+<Note>
+To hand a redacted transcript straight to someone, use [`session share`](#share-a-session) instead — it runs this same redactor, wraps the result in a self-contained HTML file, and returns a `file://` link, so there's no manual `export --sanitise > out.md` plus attach step.
+</Note>
+
 **Python API.** The same redaction is available on the resolver helper — handy when scripting an export from a notebook or CI job:
 
 ```python
@@ -679,6 +683,149 @@ safe_payload = redact_transcript(
     extra_secrets=["HUNTER2SECRET"],  # extra literal values to mask
 )
 ```
+
+### Share a Session
+
+`session share` publishes a redacted, read-only HTML transcript to `~/.praisonai/shares/` and returns a `file://` link — no external service or dependency.
+
+```mermaid
+graph LR
+    subgraph "Share Flow"
+        Session[💾 Session] --> Resolve[🔎 session_resolver]
+        Resolve --> Export[📝 export_session<br/>format=md, redact=True]
+        Export --> Redact[🛡️ redact_transcript<br/>standard · strict]
+        Redact --> HTML[📄 Self-contained HTML<br/>~/.praisonai/shares/&lt;hash&gt;.html]
+        HTML --> Link[🔗 file:// link]
+    end
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef guard fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Session input
+    class Resolve,Export process
+    class Redact guard
+    class HTML,Link output
+```
+
+```bash
+# Publish a redacted, self-contained HTML transcript
+praisonai session share sess-abc123
+
+# → ✅ Shared session: sess-abc123
+# → ℹ Link: file:///Users/alice/.praisonai/shares/1a2b3c4d5e6f7a8b.html
+
+# Broader redaction net for wide sharing (adds Bearer creds + PEM key blocks)
+praisonai session share sess-abc123 --redact-level strict
+
+# Revoke — deletes the shared HTML file
+praisonai session unshare sess-abc123
+
+# → ✅ Unshared session: sess-abc123
+```
+
+`share` resolves `session_id` through the same shared resolver as `list` / `resume` / `show` / `export` (project store first, then global default store, then a best-effort legacy `SessionManager` fallback for pre-2026-07-17 ids), then calls `export_session(session_id, format="md", redact=True, redact_level=<level>)`. Sharing is **always** redacted — there is intentionally no `--no-redact` escape hatch. The redacted Markdown is wrapped in a single self-contained HTML file (inline CSS, no external assets), with the transcript inserted via `html.escape` inside a `<pre>` block so no session text can be interpreted as markup.
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `session_id` | `str` | Yes | Session ID to publish. Same id space as `session list` / `resume` / `export`. |
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--redact-level` | `str` (`standard` / `strict`) | `standard` | Redaction level applied before publish — same meaning as [`session export --sanitise`](#sanitise-before-sharing). An unknown value is rejected up front with exit 1. |
+
+**Expected Output:**
+```
+✅ Shared session: sess-abc123
+ℹ Link: file:///Users/alice/.praisonai/shares/1a2b3c4d5e6f7a8b.html
+```
+
+**JSON output** — pass `--json` for a machine-readable link and on-disk path:
+
+```json
+{
+  "session_id": "sess-abc123",
+  "shared": true,
+  "url": "file:///Users/alice/.praisonai/shares/1a2b3c4d5e6f7a8b.html",
+  "path": "/Users/alice/.praisonai/shares/1a2b3c4d5e6f7a8b.html"
+}
+```
+
+An id that resolves nowhere exits 1 with the same remediation text as the other session commands:
+
+```
+❌ Session not found: sess-abc123
+Use 'praisonai session list' to see available sessions
+```
+
+The `.html` file lands under the canonical data home alongside `sessions/`, so shares never split across a second home root:
+
+```
+~/.praisonai/
+└── shares/                        # NEW — created on first share
+    └── <sha256(id)[:16]>.html
+```
+
+The filename is `sha256(id)[:16]` — a **stable per-session path**. Re-sharing the same id overwrites the same file, and the write is **atomic**: the HTML is written to a sibling temp file, then `os.replace()` swaps it in, so a failed or interrupted write never truncates a previously published transcript. On an `OSError` the temp file is cleaned up and the command exits non-zero.
+
+<Warning>
+Redaction is a **best-effort safety net**, not a compliance guarantee — the same caveat as [`export --sanitise`](#sanitise-before-sharing). A novel secret shape that matches no built-in pattern and was never registered via `praisonaiagents.secrets` can still slip through. Skim the published HTML before sharing widely; use `--redact-level strict` for anything public.
+</Warning>
+
+<Note>
+The shared file is a plain **`file://`** link on the local filesystem. It is not uploaded to any server — only people who can read `~/.praisonai/shares/` (or receive the file itself) can open it. To share externally, attach or upload the file separately.
+</Note>
+
+<Note>
+The `.html` filename is `sha256(id)[:16]`, not the session id — so ids containing `/`, `..`, or shell metacharacters are safe on every filesystem.
+</Note>
+
+<Tip>
+`share` is idempotent: re-running it overwrites the same file atomically, so an updated transcript never coexists with a stale copy at a second URL.
+</Tip>
+
+### Unshare a Session
+
+`session unshare` revokes a previously published transcript by deleting the shared HTML file.
+
+```bash
+praisonai session unshare sess-abc123
+```
+
+`unshare` resolves the shared path deterministically via the same `sha256(id)[:16]` mapping — no session lookup — so it works even if the underlying session has since been deleted. A missing file is a clean **no-op**, not an error, so the command is idempotent and safe to script. A real `OSError` (permission denied, disk error) exits 1 with an actionable message.
+
+| Argument | Type | Required | Description |
+|----------|------|----------|-------------|
+| `session_id` | `str` | Yes | Same id passed to `share`. |
+
+**Expected Output (a file was removed):**
+```
+✅ Unshared session: sess-abc123
+```
+
+**Expected Output (nothing was published):**
+```
+ℹ No shared transcript found for: sess-abc123
+```
+
+**JSON output:**
+
+```json
+{"session_id": "sess-abc123", "revoked": true}
+```
+
+`revoked: false` means nothing was there to revoke — not that the operation failed.
+
+<Note>
+`unshare` on a session that was never shared is a clean no-op, not an error. Safe to script.
+</Note>
+
+#### Related
+
+- [Sanitise before sharing](#sanitise-before-sharing) — the underlying redactor is shared; `share` = `export --sanitise` + HTML wrap + atomic publish. Same `standard` vs `strict` table.
+- [List sessions](#list-sessions) — how to find the id to share.
+- Upstream: PraisonAI issue [#3590](https://github.com/MervinPraison/PraisonAI/issues/3590), commits `9c27592` + `cdd41eb`.
 
 ### Import a Session
 
@@ -715,6 +862,8 @@ Session Commands:
   praisonai session delete <name>   - Delete a session
   praisonai session export <name> [--format md|json] [--output FILE]
                                   [--sanitise|--sanitize] [--redact-level standard|strict]  - Export a session
+  praisonai session share <id> [--redact-level standard|strict]       - Publish a redacted HTML transcript (file:// link)
+  praisonai session unshare <id>                                      - Revoke a shared transcript
   praisonai session import <file>                                     - Import a session (JSON)
   praisonai session help            - Show this help
 
@@ -1161,6 +1310,7 @@ sequenceDiagram
 |-------------|-----------|
 | `list` / `resume` / `--continue` | project-scoped + global `DefaultSessionStore` |
 | `show` / `delete` / `export` | **same** project-scoped + global `DefaultSessionStore` (via `session_resolver`) |
+| `share` / `unshare` | **same** resolver + `export_session` path as `export --sanitise` (`share`); `unshare` deletes `~/.praisonai/shares/<sha256(id)[:16]>.html` with no lookup |
 | any of the above, pre-2026-07-17 legacy id | best-effort `SessionManager` fallback (deprecation window) |
 
 <Note>
