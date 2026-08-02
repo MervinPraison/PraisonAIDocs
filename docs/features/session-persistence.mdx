@@ -320,6 +320,81 @@ Multiple processes (a gateway worker and a bot worker, several uvicorn workers, 
 `store.invalidate_cache(session_id)` still exists for backwards compatibility, but since reads always reload from disk it is effectively a no-op on the read path. You no longer need to call it before `get_chat_history` / `get_session`.
 </Note>
 
+## Write-failure salvage
+
+When a durable session write fails, the turn is salvaged to a spill file and re-folded on the next load — nothing is silently lost.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Store as SessionStore
+    participant Disk as Session file
+    participant Spill as ~/.praisonai/state/session_spill/
+    participant Hook as SESSION_PERSIST_FAILED
+
+    Agent->>Store: add_message(...)
+    Store->>Disk: atomic write
+    alt Write OK
+        Disk-->>Store: True
+        Store-->>Agent: True
+    else Write fails (disk-full / OSError / corruption)
+        Disk-->>Store: False
+        Store->>Spill: atomic spill (0600, unique filename)
+        Store->>Hook: fire (role, content, error, spilled, spill_path)
+        Store-->>Agent: False
+    end
+
+    Note over Store,Spill: On next load: re-ingest spills,<br/>dedup on (role, content, timestamp),<br/>run retention window, then delete files.
+```
+
+On a durable-write failure the store spills **just that turn** to an atomic fallback file under `~/.praisonai/state/session_spill/`, then fires the observe-only [`SESSION_PERSIST_FAILED`](/features/hook-events#session-persist-failed-a-durable-write-failed) hook so operators can alert on the failure. On the next session **load** the store scans the spill directory for this session's files and re-ingests any un-persisted turns.
+
+| Aspect | Value |
+|--------|-------|
+| Spill directory | `~/.praisonai/state/session_spill/` |
+| Filename shape | `<safe_session_id>.<ms>.<pid>.<random4hex>.json` |
+| File permissions | `0o600` (owner read/write only) |
+| Payload | `{session_id, spilled_at, messages: [SessionMessage.to_dict(), …]}` |
+| Recovery | On next `load`, re-ingested, deduped on `(role, content, timestamp)`, retention re-enforced |
+| Cleanup | Spill file deleted only after a successful re-insert |
+| Malformed spill | Skipped; does not block recovery of other spills |
+| Happy path | Nothing is written to the spill directory |
+
+Key guarantees, all from `store.py`:
+
+- **Atomic, private writes** — temp file + `os.replace` + best-effort dir `fsync`, and the final file is chmod'd to `0o600`.
+- **No lost turns on rapid failure** — the random 4-hex suffix means consecutive same-ms/PID failures never overwrite each other.
+- **No duplicates on recovery** — re-ingest is de-duplicated on `(role, content, timestamp)`, so an already-persisted turn is never doubled.
+- **Retention still applies** — recovered turns run through `_enforce_window` before write-back, so recovery respects `max_messages` / `active_window` / `retention` like any ordinary write.
+- **One bad file can't block the rest** — malformed spills (non-object root / non-list `messages` / non-object message) are skipped, not fatal.
+- **Retry-safe** — spill files are deleted only after a successful re-insert; if the re-ingest write itself fails, spills stay in place for the next load to retry.
+
+No new `Agent` params, no new dependencies, and no behaviour change on the happy path — subscribe to the hook to observe the failure:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks.registry import get_default_registry
+from praisonaiagents.hooks.types import HookEvent, HookResult
+
+registry = get_default_registry()
+
+@registry.on(HookEvent.SESSION_PERSIST_FAILED)
+def on_persist_failed(event_data):
+    print(
+        f"[persist-failed] session={event_data.session_id} "
+        f"role={event_data.role} spilled={event_data.spilled} "
+        f"path={event_data.spill_path} error={event_data.error}"
+    )
+    return HookResult.allow()
+
+agent = Agent(
+    name="Reviewer",
+    instructions="Review the codebase and answer follow-ups",
+    memory={"session_id": "review-2026-06-25"},
+)
+agent.start("Summarise the auth module")
+```
+
 ## Direct Session Store Access
 
 For advanced use cases, you can access the session store directly:
@@ -783,5 +858,8 @@ When you use `SqliteSessionStore` instead of the default JSON store, `get_by_gat
 </Card>
 <Card title="Bot Session Compaction" icon="compress" href="/features/bot-session-compaction">
   Summarise older bot turns instead of dropping them
+</Card>
+<Card title="Hook Events" icon="webhook" href="/features/hook-events#session-persist-failed-a-durable-write-failed">
+  Subscribe to `SESSION_PERSIST_FAILED` to alert on write failures
 </Card>
 </CardGroup>
