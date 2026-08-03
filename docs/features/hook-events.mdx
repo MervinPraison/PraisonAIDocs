@@ -337,24 +337,68 @@ Fires when the session store cannot persist a turn (`add_message` / `set_chat_hi
 
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.hooks.registry import get_default_registry
-from praisonaiagents.hooks.types import HookEvent, HookResult
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
 
-registry = get_default_registry()
+registry = HookRegistry()
 
 @registry.on(HookEvent.SESSION_PERSIST_FAILED)
-def on_persist_failed(event_data):
-    # Mirror to metrics/alerting so a silent data-loss failure is observable.
-    print(
-        f"[persist-failed] session={event_data.session_id} "
-        f"role={event_data.role} spilled={event_data.spilled} "
-        f"path={event_data.spill_path} error={event_data.error}"
-    )
+def on_persist_failed(data):
+    # Alert / metric — do NOT retry the write here; the store has already spilled.
+    print(f"[persist-fail] role={data.role} spilled={data.spilled} path={data.spill_path}")
+    print(f"[persist-fail] error={data.error}")
     return HookResult.allow()
 
-agent = Agent(name="MyAgent", instructions="Be helpful.")
-agent.start("Do something that would append a turn.")
+agent = Agent(name="assistant", instructions="Help the user.", hooks=registry)
+agent.start("Hello")
 ```
+
+##### Spill & recovery flow
+
+A failed durable write salvages the turn to a spill file, fires this hook, then re-ingests the spill on the next session load.
+
+```mermaid
+graph TB
+    W[💬 add_message / set_chat_history] --> D{💾 Durable write}
+    D -->|✅ ok| Done[✅ Done]
+    D -->|❌ disk-full / corruption / OSError| S[📄 Spill to session_spill/*.json]
+    S --> H[🪝 Fire SESSION_PERSIST_FAILED]
+    H --> R[♻️ Re-ingest on next load]
+    R --> E[📏 Enforce window → persist → delete spill]
+
+    classDef write fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef spill fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef hook fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class W write
+    class D decision
+    class S,H spill
+    class R hook
+    class Done,E ok
+```
+
+Spill files land under `~/.praisonai/state/session_spill/` (written `0600`, atomic temp-file + `os.replace`).
+
+<AccordionGroup>
+
+<Accordion title="Observe-only — never retry">
+The hook is a notification. Do not retry the write from it — the store has already spilled the turn and re-ingests it on the next load.
+</Accordion>
+
+<Accordion title="Collision-safe filenames">
+Spill filenames carry a random token, so consecutive same-millisecond/PID failures never overwrite each other — no lost turns.
+</Accordion>
+
+<Accordion title="Recovery respects retention">
+`_reingest_spill` runs `_enforce_window` before persisting, so recovered turns obey the retention policy like any ordinary write.
+</Accordion>
+
+<Accordion title="Malformed spills are skipped">
+A non-object root, non-list `messages`, or non-object message is skipped — a bad spill never blocks recovery.
+</Accordion>
+
+</AccordionGroup>
 
 ### Error Events
 
