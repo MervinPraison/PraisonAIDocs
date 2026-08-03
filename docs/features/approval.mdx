@@ -550,6 +550,91 @@ agent.start("Write 'world' to /tmp/b.txt")
 This is a behavior change from previous versions where approving a tool name once would auto-approve **all** subsequent calls to that tool in the same context, regardless of arguments. Now only calls with **identical arguments** skip the prompt.
 </Note>
 
+### How approval decisions are keyed
+
+`mark_approved()` and `is_already_approved()` now take the effective **arguments** alongside the tool name. The `@require_approval` decorator binds the call's arguments via `inspect.signature`, merges any `modified_args` the approval callback returns, and derives the cache key from that effective call — not from the tool name alone.
+
+```python
+mark_approved(tool_name: str, arguments: dict | None = None) -> None
+is_already_approved(tool_name: str, arguments: dict | None = None) -> bool
+```
+
+| Item | Old behaviour (≤ PR#3614) | New behaviour (≥ PR#3614) |
+|------|---------------------------|---------------------------|
+| Approval cache key | `tool_name` only | `(tool_name, effective_arguments)` |
+| `mark_approved("write_file")` | Unlocks **any** future `write_file(...)` call | Only unlocks `write_file()` with **no args** |
+| `mark_approved("write_file", arguments={"path": "/tmp/a"})` | Not supported | Unlocks only that exact call |
+| `modified_args` from the callback | Ignored for the cache key | Rolled into the cache key, so the effective (sanitised) call is what's remembered |
+
+For C-callables with no bindable signature, the key falls back to a positional `__args__` tuple.
+
+```mermaid
+graph LR
+    Call[🔧 Tool call] --> Bind[🔗 Bind args via inspect.signature]
+    Bind --> Merge{✏️ modified_args?}
+    Merge -->|yes| Eff[Effective args = merged]
+    Merge -->|no| Eff2[Effective args = bound]
+    Eff --> Key[🔑 key = tool_name + args]
+    Eff2 --> Key
+    Key --> Cache{Already approved?}
+    Cache -->|hit| Skip[✅ Run without prompt]
+    Cache -->|miss| Ask[🛡️ Prompt for approval]
+
+    classDef call fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Call call
+    class Bind,Eff,Eff2 proc
+    class Merge,Key,Cache,Ask gate
+    class Skip ok
+```
+
+Because approvals are keyed on the real arguments, approving one call no longer collapses to a per-tool flag:
+
+```text
+approved /tmp/notes.txt: True
+approved /etc/cron.d/evil: False   # was True before the fix
+```
+
+```python
+from praisonaiagents import Agent, require_approval
+
+@require_approval(risk_level="high")
+def write_file(path: str, content: str) -> str:
+    """Write a file — a human must approve before each write."""
+    with open(path, "w") as f:
+        f.write(content)
+    return f"wrote {path}"
+
+agent = Agent(
+    name="File Writer",
+    instructions="Write user files on request.",
+    tools=[write_file],
+)
+agent.start("Save 'hello' to notes.txt")
+# → prompts, then writes notes.txt.
+# A later write_file('/etc/passwd', ...) re-prompts — the earlier
+# approval only covered notes.txt, not every write_file call.
+```
+
+<AccordionGroup>
+<Accordion title="Always pass arguments when you mark_approved() in tests">
+`mark_approved("write_file")` now only matches an argument-less call. In tests that pre-approve a specific call, pass the same dict the tool will receive: `mark_approved("write_file", arguments={"path": "/tmp/a", "content": "hi"})`.
+</Accordion>
+<Accordion title="Use modified_args to lock the caller to the sanitised value">
+When your approval callback returns `modified_args`, the cache key follows the modified args — so the approved (sanitised) call is exactly what runs and what is remembered.
+</Accordion>
+<Accordion title="Custom callbacks: prefer per-argument bucketing">
+Prompt once per unique high-risk argument (for example, one prompt per file path) rather than once per tool name. This keeps a single approval from unlocking an unrelated target.
+</Accordion>
+</AccordionGroup>
+
+### Path-scoped shell approvals
+
+Shell tool approvals are keyed on the **actual path being touched** — particularly out-of-workspace paths — not on the shell tool name alone. This is the same argument-scoping idea applied to shell targets: approving `rm /tmp/build-cache` no longer unlocks `rm /etc/hosts`; the second path re-prompts.
+
 ### Durable, Per-Agent Scoping
 
 On the gateway, "allow always" grants persist across restart and default to being scoped to the approving agent — one agent's approval no longer authorises every other agent. Grants live in a SQLite store at `~/.praisonai/state/gateway/approvals.sqlite` and expire after 90 days by default.
