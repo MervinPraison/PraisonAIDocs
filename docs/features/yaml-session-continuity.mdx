@@ -15,6 +15,10 @@ praisonai run agents.yaml
 praisonai run agents.yaml --continue
 ```
 
+<Note>
+**Upgrade note (PraisonAI PR #3637).** Team `--continue` is now memory-independent and deterministic — it uses the same durable `SessionStore` as single-agent `--continue`. Sessions saved by earlier releases still resume via a one-time legacy fallback through `shared_memory`. No YAML changes, no new flags, no new params — behaviour just gets more reliable.
+</Note>
+
 ```mermaid
 graph LR
     subgraph "YAML Session Continuity"
@@ -69,16 +73,16 @@ sequenceDiagram
     participant User
     participant Adapter
     participant Team as AgentTeam
-    participant Store as Session store
+    participant Store as SessionStore (durable, project-scoped)
 
     User->>Adapter: praisonai run agents.yaml --continue
-    Adapter->>Store: resolve session id
+    Adapter->>Store: resolve session id (SessionStore keyed lookup)
     Adapter->>Team: restore_session_state(id)
     Team->>Team: rehydrate per-agent chat_history (deduped)
     Adapter->>Team: astart()
     Team-->>Adapter: result
     Adapter->>Team: capture chat_history into state
-    Adapter->>Store: save_session_state(id)
+    Adapter->>Store: save_session_state → update_session_metadata(team_session_state=...)
     Adapter-->>User: response
 
     classDef actor fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -95,10 +99,43 @@ YAML/team runs go through the same core APIs as single-agent runs — `AgentTeam
 | Behavior | Detail |
 |---|---|
 | Chat history rides along with state | Per-agent history is stashed under the reserved state key `_cli_session_chat_history` so the existing save/restore machinery persists conversation with no new core APIs |
-| Shared memory auto-enabled | The team is built with `memory=True` whenever a session is active, so `save_session_state` / `restore_session_state` have the backend they need |
+| Memory-independent resume | Team state persists to the durable, project-scoped `SessionStore` (`update_session_metadata` / `get_session`), keyed by `session_id`. Resume works even when the team runs with `memory=False`; `shared_memory` is now optional enrichment, not a requirement |
+| Deterministic keyed lookup | Restore reads by exact `session_id` from `SessionStore.get_session(...).metadata`. The pre-#3637 `search_short_term(limit=10)` fuzzy scan is gone (kept only as a legacy fallback for pre-#3635 sessions) |
 | Rehydrate is deduplicated | Restore skips messages already present on an agent (matched on `(role, content)`), so a resume or fork never doubles prior turns |
 | Save never fails a completed run | If save raises after kickoff, it is logged as a warning and the successful result is still returned |
 | Opt-in via project sessions | Flags take effect only when the CLI has opted into project sessions — set automatically by `run` / `chat` / `code` when a session flag is present |
+
+---
+
+## Durable State Guarantees
+
+Team state rides the same crash-safe write path as single-agent `--continue`.
+
+```mermaid
+graph LR
+    subgraph "Durable Write Path"
+        W[💾 save_session_state] --> L[🔒 FileLock]
+        L --> A[📝 atomic replace]
+        A --> M[✅ SessionStore metadata]
+    end
+
+    classDef save fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef lock fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class W save
+    class L lock
+    class A process
+    class M result
+```
+
+| Guarantee | Detail |
+|---|---|
+| Crash-safe writes | Team state is written under `FileLock` + atomic file replace via `SessionStore` — a crashed process cannot leave a half-written session |
+| Compaction-aware | Same store as single-agent `--continue`, so compaction checkpoints apply — see [Session Store → Compaction Checkpoints](/features/session-store#compaction-checkpoints) |
+| Honest about failure | `AgentTeam.save_session_state` propagates the `SessionStore` `bool` result, so a silent `False` no longer reports success |
+| Clean unknown-session signal | Restoring an unknown `session_id` returns `False` — no fuzzy fallback that might match the wrong session |
 
 ---
 
@@ -124,13 +161,13 @@ YAML/team runs go through the same core APIs as single-agent runs — `AgentTeam
 
 ## What Gets Persisted
 
-Team state, per-agent chat history, and shared memory all survive a resume.
+Team state and per-agent chat history survive a resume via the durable `SessionStore`; shared memory is optional enrichment.
 
 | Layer | Persisted | Restored |
 |---|---|---|
-| `team._state` (task outputs, workflow bookkeeping) | ✅ | ✅ |
+| `team._state` (task outputs, workflow bookkeeping) | ✅ (via `SessionStore.update_session_metadata`) | ✅ (via `SessionStore.get_session(...).metadata`) |
 | Per-agent `chat_history` (LLM-visible turns) | ✅ (stashed under `_cli_session_chat_history`) | ✅ (deduplicated on `(role, content)`) |
-| `shared_memory` (short/long-term memory backend) | ✅ (auto-enabled) | ✅ |
+| `shared_memory` (short/long-term backend) | ✅ **when enabled** — optional enrichment only | ✅ **when enabled** — legacy fallback for pre-#3635 sessions |
 
 What does **not** persist: running tool subprocesses, in-flight streaming state, InteractiveRuntime (ACP/LSP) sessions, and ephemeral in-memory tool caches.
 
@@ -196,7 +233,7 @@ Nothing hits disk after kickoff, so PII-sensitive or throwaway prompts leave no 
 </Accordion>
 
 <Accordion title="Skip memory: true in agents.yaml">
-Session continuity opts the team into shared memory automatically — you do not need to add `memory: true` for resume to work.
+**Session resume no longer needs `memory: true`.** Team `--continue` writes and reads team state through the durable `SessionStore`, so a team declared with `memory: false` (or no `memory:` at all) resumes just as reliably as one with shared memory enabled. Add `memory: true` when your agents genuinely need cross-turn semantic recall — not for resume itself.
 </Accordion>
 </AccordionGroup>
 
@@ -213,5 +250,8 @@ Session continuity opts the team into shared memory automatically — you do not
 </Card>
 <Card title="Run Stream Events" icon="rss" href="/features/run-stream-events">
   Stream YAML / team runs as per-agent NDJSON with `--output stream-json`
+</Card>
+<Card icon="database" href="/features/session-store">
+  The durable, project-scoped store that now backs team resume too
 </Card>
 </CardGroup>
