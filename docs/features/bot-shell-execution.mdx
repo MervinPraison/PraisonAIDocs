@@ -40,15 +40,18 @@ Before this feature, adding `execute_command` to an inbound bot meant building t
 
 <Steps>
 <Step title="Turn it on">
-Add `allow_shell: true` to any channel. In a dev or trusted workspace, auto-approve every command:
+Add `allow_shell: true` to any channel. On a **loopback-bound gateway with a single-operator DM**, auto-approve every command:
 
 ```yaml
+gateway:
+  bind_host: "127.0.0.1"
+
 channels:
   slack:
     token: "${SLACK_BOT_TOKEN}"
     app_token: "${SLACK_APP_TOKEN}"
     allow_shell: true
-    auto_approve_shell: true
+    auto_approve_shell: true   # kept: loopback bind + no group_policy
 ```
 
 Start the gateway:
@@ -58,6 +61,10 @@ praisonai gateway start
 ```
 
 Now `@your-bot run ls` executes on the server.
+
+<Warning>
+On an **externally-bound gateway** (`0.0.0.0` or a real interface) or **any channel with a `group_policy`**, `auto_approve_shell: true` is automatically downgraded to require approval. Add `auto_approve_shell_acknowledge_exposed: true` to keep blanket auto-approval — see [Exposure-aware auto-approval](#exposure-aware-auto-approval).
+</Warning>
 </Step>
 
 <Step title="Require approval for real workloads">
@@ -78,14 +85,123 @@ channels:
 
 ---
 
+## Exposure-aware auto-approval
+
+`auto_approve_shell: true` runs every shell call immediately **only** when the gateway is loopback-bound *and* the channel is a single-operator DM. On any exposed or multi-user surface it is silently downgraded to an approval backend — the exact wiring `auto_approve_shell: false` produces.
+
+```mermaid
+graph TB
+    Start[🛡️ auto_approve_shell: true] --> BindQ{🌐 Gateway bound<br/>to loopback?}
+    BindQ -->|No| AckQ{🔐 acknowledge_exposed<br/>= true?}
+    BindQ -->|Yes| GroupQ{👥 group_policy<br/>set?}
+    GroupQ -->|Yes| AckQ
+    GroupQ -->|No| Auto[✅ AutoApproveBackend]
+    AckQ -->|Yes| Auto
+    AckQ -->|No| Downgrade[⚠️ Downgrade →<br/>Approval backend<br/>WARN logged]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class BindQ,GroupQ,AckQ decision
+    class Auto safe
+    class Downgrade warn
+```
+
+This mirrors the gateway auth token's "calibrated by exposure" posture (`assert_external_bind_safe`): blanket auto-approve is only trusted where a single operator reaches the bot over loopback.
+
+### Behaviour matrix
+
+| Gateway bind | Channel `group_policy` | `auto_approve_shell_acknowledge_exposed` | Effective backend |
+|---|---|---|---|
+| loopback (`127.0.0.1` / `::1`) | unset (DM / non-group) | — | Blanket auto-approve (`AutoApproveBackend`) — unchanged behaviour |
+| externally-bound (`0.0.0.0` or a real interface) | any | `false` (default) | **Downgraded to approval backend** (Slack / Telegram / Discord / HTTP / gateway approval — same routing as `auto_approve_shell: false`) |
+| loopback | any group policy (`mention_only`, `command_only`, `all`, …) | `false` (default) | **Downgraded to approval backend** |
+| externally-bound **or** group channel | any | `true` | Blanket auto-approve (explicit opt-in — WARN not emitted) |
+| bind host unknown / unresolvable | — | — | **Fail closed** — treat as exposed, downgrade to approval |
+
+<Note>
+`command_only` counts as multi-user: a group member's `/cmd` still reaches `execute_command`, so it downgrades too. The gateway passes its resolved bind host to `enable_shell_tools()` — the per-channel config does **not** carry a `bind_host:`; set it under the top-level `gateway:` block.
+</Note>
+
+The downgrade routes through the **same** approval-backend precedence documented under [Choosing an approval_mode](#choosing-an-approval-mode) (Slack / Telegram / Discord / HTTP / gateway → fail-closed `CallbackBackend`). No new backend, no new precedence — only the trigger changes. Watch for this WARN line in gateway logs:
+
+```
+Channel 'slack' enables shell on an exposed/multi-user surface;
+downgrading auto_approve_shell to require approval. Set
+auto_approve_shell_acknowledge_exposed: true to keep blanket auto-approval.
+```
+
+### Configurations
+
+<Tabs>
+<Tab title="Safe default (loopback DM)">
+Unchanged behaviour — loopback bind, no group policy, blanket auto-approve kept.
+
+```yaml
+gateway:
+  bind_host: "127.0.0.1"
+
+channels:
+  slack:
+    token: "${SLACK_BOT_TOKEN}"
+    app_token: "${SLACK_APP_TOKEN}"
+    allow_shell: true
+    auto_approve_shell: true   # kept: loopback bind + no group_policy
+```
+</Tab>
+
+<Tab title="Exposed — downgraded automatically">
+Externally-bound gateway on a group channel — `auto_approve_shell: true` silently becomes "approval required".
+
+```yaml
+gateway:
+  bind_host: "0.0.0.0"
+
+channels:
+  slack:
+    token: "${SLACK_BOT_TOKEN}"
+    app_token: "${SLACK_APP_TOKEN}"
+    allow_shell: true
+    auto_approve_shell: true   # silently becomes "approval required"
+    # WARN in gateway log:
+    #   Channel 'slack' enables shell on an exposed/multi-user surface;
+    #   downgrading auto_approve_shell to require approval. Set
+    #   auto_approve_shell_acknowledge_exposed: true to keep blanket auto-approval.
+```
+</Tab>
+
+<Tab title="Exposed — acknowledged">
+Explicit acknowledgement keeps blanket auto-approve on an exposed surface. No WARN is emitted.
+
+```yaml
+gateway:
+  bind_host: "0.0.0.0"
+
+channels:
+  slack:
+    token: "${SLACK_BOT_TOKEN}"
+    app_token: "${SLACK_APP_TOKEN}"
+    allow_shell: true
+    auto_approve_shell: true
+    auto_approve_shell_acknowledge_exposed: true   # I accept the RCE surface
+```
+</Tab>
+</Tabs>
+
+---
+
 ## Configuration Options
 
-Eight new per-channel fields control shell execution and approval routing.
+Nine per-channel fields control shell execution and approval routing.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `allow_shell` | `bool` | `False` | Opt in shell execution for this channel. Adds `execute_command` to the agent's tools, injects a permission-grant sentence into instructions, and lifts the deny-list entry. |
-| `auto_approve_shell` | `bool` | `True` | If `True`, uses `AutoApproveBackend` — every shell call runs immediately. If `False`, wires a human-in-the-loop backend via the routing ladder below. |
+| `auto_approve_shell` | `bool` | `True` | Runs every shell call immediately (`AutoApproveBackend`) **only on a loopback-bound gateway + non-group channel**. On externally-bound gateways or any channel with a `group_policy`, the gateway downgrades this to the approval backend (see [Exposure-aware auto-approval](#exposure-aware-auto-approval) and `auto_approve_shell_acknowledge_exposed`). If `False`, always wires a human-in-the-loop backend via the routing ladder below. |
+| `auto_approve_shell_acknowledge_exposed` | `bool` | `False` | Explicit acknowledgement that blanket auto-approval is safe on this externally-exposed or multi-user channel. Set to `true` (with `auto_approve_shell: true`) to keep blanket auto-approve on `0.0.0.0` binds or group channels. Off by default — the gateway fails closed to approval. |
 | `approval_channel` | `str` | `None` | Where the approval prompt is delivered. Slack: user/channel ID. Telegram: chat ID. Discord: channel ID (falls back to `home_channel`). |
 | `approval_users` | `str \| list[str]` | `None` | Approver allowlist. Comma-separated string or list. Falls back to `SLACK_APPROVERS` / `TELEGRAM_APPROVERS` / `DISCORD_APPROVERS` env var. |
 | `approval_mode` | `str` | `None` (= `"channel"`) | Backend selector: `"channel"` (default per-platform), `"gateway"`, `"http"`, `"webhook"`. **Validated at load time — typos throw `ValueError`.** |
@@ -164,6 +280,8 @@ graph LR
 ```
 
 `apply_bot_smart_defaults()` may install an `AutoApproveBackend` when `auto_approve_tools` is on. If the shell wiring then finds no `SlackApproval` / `TelegramApproval` / `DiscordApproval` / `GatewayApprovalBackend` / `HTTPApproval` / `WebhookApproval`, leaving that backend in place would auto-approve shell despite the explicit opt-out. The gateway now swaps in a deny-by-default `CallbackBackend`.
+
+If the gateway cannot determine its bind interface (host unresolvable), the [exposure check](#exposure-aware-auto-approval) also fails closed and blanket auto-approve is downgraded to require approval.
 
 | Situation | Outcome |
 |-----------|---------|
@@ -301,9 +419,12 @@ Copy-paste-ready configurations for common setups.
 
 <Tabs>
 <Tab title="Slack auto-approve (dev)">
-Fastest to demo — every shell call runs immediately in a trusted workspace.
+Fastest to demo — every shell call runs immediately on a loopback-bound gateway with a DM channel.
 
 ```yaml
+gateway:
+  bind_host: "127.0.0.1"
+
 channels:
   slack:
     token: "${SLACK_BOT_TOKEN}"
@@ -311,6 +432,8 @@ channels:
     allow_shell: true
     auto_approve_shell: true
 ```
+
+On `0.0.0.0` or a channel with a `group_policy`, add `auto_approve_shell_acknowledge_exposed: true` — otherwise this downgrades to approval. See [Exposure-aware auto-approval](#exposure-aware-auto-approval).
 </Tab>
 
 <Tab title="Slack owner-DM approval">
@@ -344,12 +467,15 @@ channels:
 Different channels, different policies — all in one gateway.
 
 ```yaml
+gateway:
+  bind_host: "127.0.0.1"           # loopback: Slack blanket auto-approve stays
+
 channels:
   slack:
     token: "${SLACK_BOT_TOKEN}"
     app_token: "${SLACK_APP_TOKEN}"
     allow_shell: true
-    auto_approve_shell: true          # trusted workspace
+    auto_approve_shell: true          # kept only on loopback + non-group DM
 
   telegram:
     token: "${TELEGRAM_BOT_TOKEN}"
@@ -369,6 +495,8 @@ channels:
     approval_mode: webhook
     approval_webhook_url: "https://hooks.example.com/approve"
 ```
+
+On a `0.0.0.0` bind — or if the Slack channel carries a `group_policy` — the Slack line downgrades to approval unless you add `auto_approve_shell_acknowledge_exposed: true`. See [Exposure-aware auto-approval](#exposure-aware-auto-approval).
 </Tab>
 </Tabs>
 
@@ -411,7 +539,7 @@ Upgrade to a PraisonAI build with the approval-registry sync fix (≥ 2026-07-24
 
 <AccordionGroup>
 <Accordion title="Never auto-approve on a public channel">
-Set `auto_approve_shell: true` only in trusted workspaces. On any channel that untrusted users can reach, keep it `false` and route approvals to an owner.
+Set `auto_approve_shell: true` only on a loopback-bound gateway with a single-operator DM. On externally-bound gateways or group channels the gateway downgrades it to approval automatically; overriding with `auto_approve_shell_acknowledge_exposed: true` re-opens a remote-code-execution surface — only do so on a channel you fully trust. See [Exposure-aware auto-approval](#exposure-aware-auto-approval).
 </Accordion>
 
 <Accordion title="Set approval_users explicitly">
