@@ -1,0 +1,301 @@
+---
+title: "Hierarchical Process"
+sidebarTitle: "Hierarchical Process"
+description: "A manager agent picks which agent runs which task, one delegation turn at a time — OpenAI strict-schema native"
+icon: "sitemap"
+---
+
+A manager agent decides which task runs next and which agent takes it, one delegation turn at a time.
+
+```mermaid
+graph LR
+    subgraph "Hierarchical Process (PraisonAIAgents)"
+        U[👤 User Goal] --> M[👔 Manager Agent<br/>manager_llm]
+        M -->|task_id, agent_name, action| D{🔀 Delegate}
+        D -->|action=execute| A[🤖 Worker Agent<br/>runs task]
+        A --> M
+        D -->|action=stop| R[✅ Result]
+    end
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef manager fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class U user
+    class M manager
+    class D gate
+    class A agent
+    class R done
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Delegate two tasks to two agents">
+The manager on `manager_llm` picks the next task and agent each turn.
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+researcher = Agent(name="researcher", role="Research topics")
+writer = Agent(name="writer", role="Write content")
+
+tasks = [
+    Task(name="research", description="Research AI trends", agent=researcher),
+    Task(name="write", description="Write article about AI trends", agent=writer),
+]
+
+team = PraisonAIAgents(
+    agents=[researcher, writer],
+    tasks=tasks,
+    process="hierarchical",
+    manager_llm="gpt-4o-mini",
+)
+team.start()
+```
+</Step>
+
+<Step title="See each delegation turn">
+Add `verbose=True` to watch the manager emit `{task_id, agent_name, action}` on every turn.
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+researcher = Agent(name="researcher", role="Research topics")
+writer = Agent(name="writer", role="Write content")
+
+tasks = [
+    Task(name="research", description="Research AI trends", agent=researcher),
+    Task(name="write", description="Write article about AI trends", agent=writer),
+]
+
+team = PraisonAIAgents(
+    agents=[researcher, writer],
+    tasks=tasks,
+    process="hierarchical",
+    manager_llm="gpt-4o-mini",
+    verbose=True,
+)
+team.start()
+```
+</Step>
+</Steps>
+
+---
+
+## Which hierarchical?
+
+Two flows share the `hierarchical` keyword — pick the one that matches your setup.
+
+```mermaid
+graph TB
+    Q{Do you have a<br/>list of agents<br/>and tasks?}
+    Q -->|Yes, PraisonAIAgents<br/>agents=[...], tasks=[...]| PC[Hierarchical Process<br/>THIS PAGE<br/>manager delegates by name]
+    Q -->|Yes, but a step-by-step<br/>AgentFlow steps=[...]| WF[Hierarchical Workflow<br/>manager validates each step<br/>see workflow-hierarchical]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef here fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef other fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class PC here
+    class WF other
+```
+
+---
+
+## How It Works
+
+The manager loops: it picks a task and agent, the worker runs it, and the loop repeats until the manager returns `action="stop"`.
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 User
+    participant T as PraisonAIAgents
+    participant M as 👔 Manager (manager_llm)
+    participant A as 🤖 Worker Agent
+
+    U->>T: team.start("Research and write about AI")
+    loop until action="stop"
+        T->>M: pick next task
+        M-->>T: {task_id: 1, agent_name: "researcher", action: "execute"}
+        T->>A: run task 1 as researcher
+        A-->>T: task 1 output
+    end
+    T->>M: pick next task
+    M-->>T: {task_id: 0, agent_name: "-", action: "stop"}
+    T-->>U: final aggregated result
+```
+
+Each turn the manager reads the goal and remaining tasks, returns a single `{task_id, agent_name, action}` object, and the framework runs the named agent on that task. When no work remains, the manager returns `action="stop"` and the team aggregates the results.
+
+---
+
+## The Manager's Schema
+
+The manager returns a fixed three-field object every delegation turn.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `task_id` | `int` | ✅ | 1-based index of the task to run next |
+| `agent_name` | `str` | ✅ | Name of the agent assigned to the task |
+| `action` | `str` | ✅ | `"execute"` to run the task or `"stop"` to end the workflow |
+
+---
+
+## OpenAI Strict-Mode Compatibility
+
+Hierarchical process uses OpenAI's strict structured-output API natively — no JSON fallback, no per-turn retry.
+
+Under the hood, every manager delegation turn asks the LLM for a fixed 3-field object:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `task_id` | `int` | 1-based index of the task to run next |
+| `agent_name` | `str` | Name of the agent assigned to the task |
+| `action` | `str` | `"execute"` to run the task, `"stop"` to end the workflow |
+
+The model (`ManagerInstructions` in `praisonaiagents/process/manager_schema.py`) sets `extra="forbid"`, so its generated JSON schema includes `additionalProperties: false` — the exact shape OpenAI's strict structured-output validator requires.
+
+<Note>
+Before PraisonAI 2026-08-04, hierarchical runs on OpenAI models silently fell back to JSON-mode on every delegation turn, making runs 5–13× slower. If you added a local workaround (patching `response_format`, or forcing `manager_llm="anthropic/..."` to sidestep the issue), you can remove it — `process="hierarchical"` is now strict-native by default on any OpenAI model.
+</Note>
+
+---
+
+## Manager LLM Choice
+
+`manager_llm` is optional and defaults to the team's LLM. A cheaper model is a good default for the manager, because it only picks the next task and agent — it does not do the work.
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+researcher = Agent(name="researcher", role="Research topics")
+writer = Agent(name="writer", role="Write content")
+
+team = PraisonAIAgents(
+    agents=[researcher, writer],
+    tasks=[
+        Task(name="research", description="Research AI trends", agent=researcher),
+        Task(name="write", description="Write article about AI trends", agent=writer),
+    ],
+    process="hierarchical",
+    manager_llm="gpt-4o-mini",
+)
+team.start()
+```
+
+---
+
+## Common Patterns
+
+Three realistic setups where a manager delegates by name.
+
+<Tabs>
+<Tab title="Research → Write → Review">
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+researcher = Agent(name="researcher", role="Research topics")
+writer = Agent(name="writer", role="Write content")
+reviewer = Agent(name="reviewer", role="Review and improve content")
+
+team = PraisonAIAgents(
+    agents=[researcher, writer, reviewer],
+    tasks=[
+        Task(name="research", description="Research AI trends", agent=researcher),
+        Task(name="write", description="Write an article on the research", agent=writer),
+        Task(name="review", description="Review and polish the article", agent=reviewer),
+    ],
+    process="hierarchical",
+    manager_llm="gpt-4o-mini",
+)
+team.start()
+```
+</Tab>
+
+<Tab title="Collect → Analyse → Report">
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+collector = Agent(name="collector", role="Collect raw data")
+analyst = Agent(name="analyst", role="Analyse the data")
+reporter = Agent(name="reporter", role="Write the report")
+
+team = PraisonAIAgents(
+    agents=[collector, analyst, reporter],
+    tasks=[
+        Task(name="collect", description="Collect sales figures", agent=collector),
+        Task(name="analyse", description="Analyse trends in the figures", agent=analyst),
+        Task(name="report", description="Write a summary report", agent=reporter),
+    ],
+    process="hierarchical",
+    manager_llm="gpt-4o-mini",
+)
+team.start()
+```
+</Tab>
+
+<Tab title="Triage → Respond">
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+triager = Agent(name="triager", role="Classify incoming requests")
+responder = Agent(name="responder", role="Draft a response")
+
+team = PraisonAIAgents(
+    agents=[triager, responder],
+    tasks=[
+        Task(name="triage", description="Classify the support ticket", agent=triager),
+        Task(name="respond", description="Draft a reply to the ticket", agent=responder),
+    ],
+    process="hierarchical",
+    manager_llm="gpt-4o-mini",
+)
+team.start()
+```
+</Tab>
+</Tabs>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Use a cheaper manager_llm">
+The manager only picks the next `(task_id, agent_name, action)` — it does not do the actual work. `gpt-4o-mini` (or an equivalently cheap model on another provider) is a good default.
+</Accordion>
+
+<Accordion title="Give tasks descriptive names">
+The manager delegates by `agent_name` and picks tasks by `task_id`. A clear task `description` helps the manager reason about ordering.
+</Accordion>
+
+<Accordion title="Do not set response_format on manager_llm">
+The framework already asks for the strict `ManagerInstructions` schema and OpenAI accepts it natively. Overriding `response_format` re-introduces the JSON fallback.
+</Accordion>
+
+<Accordion title="verbose=True shows delegation turns">
+When debugging why the manager stops early, run with `verbose=True` and read the `{task_id, agent_name, action}` payloads emitted on each turn.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Hierarchical Workflows" icon="sitemap" href="/features/workflow-hierarchical">
+The `AgentFlow` variant, where a manager validates each step.
+</Card>
+<Card title="Agents" icon="user" href="/features/agents">
+The underlying `Agent` class.
+</Card>
+<Card title="Tasks" icon="list-check" href="/concepts/tasks">
+The `Task` class the manager delegates.
+</Card>
+<Card title="Process" icon="diagram-project" href="/concepts/process">
+The process-mode concept page.
+</Card>
+</CardGroup>
