@@ -127,6 +127,10 @@ from .protocols import (
     LivenessDecision,
     LivenessPolicyProtocol,
     LivenessPolicy,
+    # Cluster-wide per-turn serialisation (Issue #3643)
+    TurnLeaseToken,
+    TurnLockProtocol,
+    LocalTurnLock,
     # Schema-validated inbound frame codec (Issue #2831)
     HelloParams,
     HelloResult,
@@ -158,6 +162,10 @@ from .degraded_state import (
     DegradedCapabilityRegistry,
     OWNER_KINDS,
     DEGRADED_STATES,
+    # Fail-closed read of the degraded-owner contract (Issue #3640)
+    DegradedCapabilityLookupProtocol,
+    OwnerUnavailable,
+    assert_owner_available,
 )
 from .hooks import (
     HookAction,
@@ -180,6 +188,7 @@ from .config import (
     DeliveryConfig,
     PollingConfig,
     LivenessConfig,
+    TurnLockConfig,
     # Hot-reload registry (Issue #3378)
     HOT_APPLIABLE_KEYS,
     SupportsHotReload,
@@ -354,6 +363,10 @@ __all__ = [
     "LivenessDecision",
     "LivenessPolicyProtocol",
     "LivenessPolicy",
+    # Cluster-wide per-turn serialisation (Issue #3643)
+    "TurnLeaseToken",
+    "TurnLockProtocol",
+    "LocalTurnLock",
     # Schema-validated inbound frame codec (Issue #2831)
     "HelloParams",
     "HelloResult",
@@ -381,6 +394,10 @@ __all__ = [
     "DegradedCapabilityRegistry",
     "OWNER_KINDS",
     "DEGRADED_STATES",
+    # Fail-closed read of the degraded-owner contract (Issue #3640)
+    "DegradedCapabilityLookupProtocol",
+    "OwnerUnavailable",
+    "assert_owner_available",
     # Inbound trigger / webhook contract (Issue #2281)
     "HookAction",
     "HookConfig",
@@ -400,6 +417,7 @@ __all__ = [
     "DeliveryConfig",
     "PollingConfig",
     "LivenessConfig",
+    "TurnLockConfig",
     # Hot-reload registry (Issue #3378)
     "HOT_APPLIABLE_KEYS",
     "SupportsHotReload",
