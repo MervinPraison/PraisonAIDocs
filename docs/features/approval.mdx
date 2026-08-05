@@ -604,19 +604,21 @@ This is a behavior change from previous versions where approving a tool name onc
 
 ### How approval decisions are keyed
 
-`mark_approved()` and `is_already_approved()` now take the effective **arguments** alongside the tool name. The `@require_approval` decorator binds the call's arguments via `inspect.signature`, merges any `modified_args` the approval callback returns, and derives the cache key from that effective call — not from the tool name alone.
+`mark_approved()` and `is_already_approved()` take the effective **arguments** and the requesting **agent** alongside the tool name. The `@require_approval` decorator binds the call's arguments via `inspect.signature`, merges any `modified_args` the approval callback returns, and derives the cache key from that effective call — not from the tool name alone.
 
 ```python
-mark_approved(tool_name: str, arguments: dict | None = None) -> None
-is_already_approved(tool_name: str, arguments: dict | None = None) -> bool
+mark_approved(tool_name: str, arguments: dict | None = None, agent_name: str | None = None) -> None
+is_already_approved(tool_name: str, arguments: dict | None = None, agent_name: str | None = None) -> bool
 ```
 
-| Item | Old behaviour (≤ PR#3614) | New behaviour (≥ PR#3614) |
-|------|---------------------------|---------------------------|
-| Approval cache key | `tool_name` only | `(tool_name, effective_arguments)` |
-| `mark_approved("write_file")` | Unlocks **any** future `write_file(...)` call | Only unlocks `write_file()` with **no args** |
-| `mark_approved("write_file", arguments={"path": "/tmp/a"})` | Not supported | Unlocks only that exact call |
-| `modified_args` from the callback | Ignored for the cache key | Rolled into the cache key, so the effective (sanitised) call is what's remembered |
+| Item | Post PR#3678 behaviour |
+|------|------------------------|
+| Approval cache key | `(agent_name or "*", tool_name, effective_arguments)` |
+| `mark_approved("write_file", args, agent_name="A")` | Only unlocks the same call **when Agent A requests it**; Agent B still re-prompts |
+| `mark_approved("write_file", args)` (no agent) | Uses `*` sentinel; only satisfies calls made outside any agent |
+| `mark_approved("write_file")` | Only unlocks `write_file()` with **no args**, under the `*` sentinel |
+| `modified_args` from the callback | Rolled into the cache key, so the effective (sanitised) call is what's remembered |
+| Automatic `agent_name` capture | `Agent._check_tool_approval_sync/_async` pass `getattr(self, "name", None)` into `mark_approved`; user code rarely needs to pass it explicitly |
 
 For C-callables with no bindable signature, the key falls back to a positional `__args__` tuple.
 
@@ -626,7 +628,7 @@ graph LR
     Bind --> Merge{✏️ modified_args?}
     Merge -->|yes| Eff[Effective args = merged]
     Merge -->|no| Eff2[Effective args = bound]
-    Eff --> Key[🔑 key = tool_name + args]
+    Eff --> Key[🔑 key = agent_name + tool_name + args]
     Eff2 --> Key
     Key --> Cache{Already approved?}
     Cache -->|hit| Skip[✅ Run without prompt]
@@ -674,6 +676,8 @@ agent.start("Save 'hello' to notes.txt")
 <AccordionGroup>
 <Accordion title="Always pass arguments when you mark_approved() in tests">
 `mark_approved("write_file")` now only matches an argument-less call. In tests that pre-approve a specific call, pass the same dict the tool will receive: `mark_approved("write_file", arguments={"path": "/tmp/a", "content": "hi"})`.
+
+If your test exercises an `Agent`, also pass `agent_name=` so the pre-approval matches the agent the SDK will look up for. Without it, the registry stores against `*` and the agent path will re-prompt.
 </Accordion>
 <Accordion title="Use modified_args to lock the caller to the sanitised value">
 When your approval callback returns `modified_args`, the cache key follows the modified args — so the approved (sanitised) call is exactly what runs and what is remembered.
@@ -683,6 +687,19 @@ Prompt once per unique high-risk argument (for example, one prompt per file path
 </Accordion>
 </AccordionGroup>
 
+### Per-agent approval scoping
+
+Approvals granted inside a multi-agent run are scoped to the agent that received them. If a permissive agent and a stricter agent share the same run and both call the same tool with the same arguments, the stricter agent still re-prompts — the permissive agent's approval does not carry over. Calls made outside any agent (e.g. bare `@require_approval` module functions in tests) use a `*` sentinel and never satisfy an agent-scoped lookup.
+
+```python
+from praisonaiagents.approval.registry import ApprovalRegistry
+
+reg = ApprovalRegistry()
+reg.mark_approved("write_file", {}, agent_name="permissive")
+reg.is_already_approved("write_file", {}, agent_name="permissive")  # True
+reg.is_already_approved("write_file", {}, agent_name="strict")      # False
+```
+
 ### Path-scoped shell approvals
 
 Shell tool approvals are keyed on the **actual path being touched** — particularly out-of-workspace paths — not on the shell tool name alone. This is the same argument-scoping idea applied to shell targets: approving `rm /tmp/build-cache` no longer unlocks `rm /etc/hosts`; the second path re-prompts.
@@ -690,6 +707,8 @@ Shell tool approvals are keyed on the **actual path being touched** — particul
 ### Durable, Per-Agent Scoping
 
 On the gateway, "allow always" grants persist across restart and default to being scoped to the approving agent — one agent's approval no longer authorises every other agent. Grants live in a SQLite store at `~/.praisonai/state/gateway/approvals.sqlite` and expire after 90 days by default.
+
+The in-process approval registry is now agent-scoped too: an in-context approval for one agent never pre-authorises an identical call from another agent in the same run. See [Per-agent approval scoping](#per-agent-approval-scoping).
 
 <Card title="Gateway Scoped Approvals" icon="user-lock" href="/features/gateway-scoped-approvals">
   Durable, agent-scoped allow-always grants, the `scope_to_agent` / `scope_to_args` resolver options, and the `/api/approval/allow-list` endpoint
