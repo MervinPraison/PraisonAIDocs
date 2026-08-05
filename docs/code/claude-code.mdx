@@ -73,6 +73,21 @@ agent.start("Hello")
 | `use_sdk` | bool | False | Use SDK instead of subprocess |
 | `model` | str | None | Model to use (e.g., "sonnet", "opus") |
 
+**Runtime-only kwargs** (passed to `execute()`, not to the constructor):
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `on_event` (alias `on_progress`) | `Callable[[dict], Any]` \| `Awaitable` | `None` | Called with every event (`system`, `stream_event`, `result`) as the run streams. Sync or async. Exceptions are swallowed so a broken sink can't fail the run. |
+| `continue_session` | `bool` | `False` | Continue the previous session. |
+
+The callback receives one event dict at a time:
+
+| `event["type"]` | Meaning | Useful fields |
+|-----------------|---------|---------------|
+| `system` (subtype `init`) | Session started | `session_id`, `model` |
+| `stream_event` | Partial content — token/tool-use deltas | `event.content_block.type == "tool_use"`, or `event.delta.type == "text_delta"` with `event.delta.text` |
+| `result` (subtype `success`) | Terminal event with final answer | `result` (final text), `total_cost_usd` |
+
 ## Examples
 
 ### Basic Execution
@@ -142,20 +157,111 @@ print(f"SDK available: {claude.sdk_available}")
 result = await claude.execute("Complex refactoring task")
 ```
 
+### Live Progress with `on_event`
+
+Pass an `on_event` callback to `execute()` to see live progress while the run is still in flight — `execute()` still returns the final text.
+
+```mermaid
+graph LR
+    subgraph "Claude Code Live Progress"
+        User[👤 Caller] -->|execute prompt<br/>on_event=cb| Claude[🤖 Claude Code CLI]
+        Claude -->|system: init| CB[📡 on_event callback]
+        Claude -->|stream_event: tool_use| CB
+        Claude -->|stream_event: text_delta| CB
+        Claude -->|result| CB
+        Claude -->|final text| User
+    end
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class User user
+    class Claude,CB process
+```
+
+An Agent using the Claude Code tool surfaces progress with the same `on_event` kwarg — nothing extra on the Agent side.
+
+```python
+from praisonaiagents import Agent
+from praisonai.integrations import ClaudeCodeIntegration
+
+progress_log = []
+claude = ClaudeCodeIntegration(workspace=".")
+
+# The agent hands its progress sink to the tool at call time via on_event.
+tool = claude.as_tool()
+
+agent = Agent(
+    name="Coder",
+    instructions="Refactor code and keep the user informed as you go.",
+    tools=[tool],
+)
+agent.start("Refactor the payment module")
+```
+
+The raw one-liner most callers reach for first:
+
+```python
+from praisonai.integrations import ClaudeCodeIntegration
+
+claude = ClaudeCodeIntegration(workspace="/project")
+
+def show_progress(event):
+    t = event.get("type")
+    if t == "system":
+        print(f"[started on {event.get('model')}]")
+    elif t == "stream_event":
+        block = (event.get("event") or {}).get("content_block", {})
+        if block.get("type") == "tool_use":
+            print(f"→ {block.get('name')}")
+
+# execute() still returns the final text — you just also see progress.
+final = await claude.execute(
+    "Refactor the auth module and add tests",
+    on_event=show_progress,
+)
+print(final)
+```
+
+`on_event` may be sync or async — awaitable results are awaited:
+
+```python
+async def stream_to_ui(event):
+    await websocket.send_json(event)
+
+final = await claude.execute("Big refactor", on_event=stream_to_ui)
+```
+
+<Note>
+`on_event` may be sync or async — awaitable results are awaited. A failing callback never breaks the underlying run, so you can plug in any UI without crashing the agent. Use either `on_event` or its alias `on_progress`.
+</Note>
+
+<Note>
+**`use_sdk=True` + `on_event`:** When you pass a progress callback, the integration silently reroutes through the subprocess path — even if `use_sdk=True` — because the SDK path yields no partial events. If you rely on the SDK for a specific reason (e.g. `claude-agent-sdk` custom tools), don't pass `on_event`. Any `output_format` you set is also ignored, since streaming forces `stream-json`.
+</Note>
+
 ### Streaming Output
+
+Iterate `stream()` directly for full control over each event.
 
 ```python
 claude = ClaudeCodeIntegration(workspace="/project")
 
 async for event in claude.stream("Add comprehensive tests"):
-    event_type = event.get("type")
-    
-    if event_type == "assistant":
-        print(f"Assistant: {event.get('content')}")
-    elif event_type == "tool_use":
-        print(f"Using tool: {event.get('name')}")
-    elif event_type == "result":
-        print(f"Result: {event.get('content')}")
+    if event.get("type") == "system":
+        print(f"[session {event.get('session_id')} started on {event.get('model')}]")
+    elif event.get("type") == "stream_event":
+        inner = event.get("event", {})
+        # Tool-use start
+        block = inner.get("content_block", {})
+        if block.get("type") == "tool_use":
+            print(f"→ using tool: {block.get('name')}")
+        # Streaming text
+        delta = inner.get("delta", {})
+        if delta.get("type") == "text_delta":
+            print(delta.get("text", ""), end="", flush=True)
+    elif event.get("type") == "result":
+        print(f"\n✅ done. cost=${event.get('total_cost_usd', 0):.4f}")
 ```
 
 ### As Agent Tool
@@ -209,6 +315,8 @@ The integration uses the following Claude Code CLI flags:
 | `--allowedTools` | Restrict available tools |
 | `--disallowedTools` | Disable specific tools |
 | `--model` | Select model (sonnet, opus) |
+| `--verbose` | Forced automatically when `output_format="stream-json"` (the CLI rejects `stream-json` in print mode without it). |
+| `--include-partial-messages` | Forced automatically when `output_format="stream-json"` — emits the token/tool-use deltas that make live progress visible. |
 
 ## Error Handling
 
