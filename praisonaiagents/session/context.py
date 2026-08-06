@@ -37,7 +37,12 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Any
 
 if TYPE_CHECKING:
-    from ..gateway.protocols import OutboundMessengerProtocol, SendPolicyProtocol
+    from ..gateway.protocols import (
+        ConversationRequestProtocol,
+        OutboundMessengerProtocol,
+        SendPolicyProtocol,
+        GatewayStatusProtocol,
+    )
 
 
 def neutralize_untrusted_text(value: object, *, max_chars: int = 240) -> str:
@@ -235,6 +240,40 @@ def clear_outbound_messenger(token: Token) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cross-conversation request/reply requester (Issue #3689)
+#
+# The running gateway/bot registers a concrete ConversationRequestProtocol impl
+# into this task-local slot so the built-in ``ask_conversation`` tool can ask
+# another conversation something and await the correlated reply mid-turn. When
+# unbound the tool reports that no gateway is available (gating, not a hang).
+# ---------------------------------------------------------------------------
+
+_CONVERSATION_REQUESTER: ContextVar[Optional["ConversationRequestProtocol"]] = ContextVar(
+    "praisonai_conversation_requester", default=None
+)
+
+
+def register_conversation_requester(
+    requester: Optional["ConversationRequestProtocol"],
+) -> Token:
+    """Register the active conversation requester for this task. Returns a token."""
+    return _CONVERSATION_REQUESTER.set(requester)
+
+
+def get_conversation_requester() -> Optional["ConversationRequestProtocol"]:
+    """Return the active conversation requester, or ``None`` if no gateway is running."""
+    return _CONVERSATION_REQUESTER.get()
+
+
+def clear_conversation_requester(token: Token) -> None:
+    """Restore the previous conversation requester using the token from register."""
+    try:
+        _CONVERSATION_REQUESTER.reset(token)
+    except (LookupError, ValueError):
+        _CONVERSATION_REQUESTER.set(None)
+
+
+# ---------------------------------------------------------------------------
 # Outbound send-policy guard (Issue #2226)
 #
 # An optional task-local policy authorising where an agent may proactively
@@ -266,6 +305,41 @@ def clear_send_policy(token: Token) -> None:
         _SEND_POLICY.reset(token)
     except (LookupError, ValueError):
         _SEND_POLICY.set(None)
+
+
+# ---------------------------------------------------------------------------
+# Gateway live status/health source (Issue #3688)
+#
+# The running gateway/bot registers a concrete GatewayStatusProtocol impl into
+# this task-local slot so the built-in ``gateway_status`` tool can report the
+# gateway's live self-state (run status, active sessions, delivery/DLQ backlog,
+# degraded owners). When nothing is registered (CLI / one-shot runs), the tool
+# is simply not offered — a clean gate, never a dead-end failure.
+# ---------------------------------------------------------------------------
+
+_GATEWAY_STATUS: ContextVar[Optional["GatewayStatusProtocol"]] = ContextVar(
+    "praisonai_gateway_status", default=None
+)
+
+
+def register_gateway_status(
+    source: Optional["GatewayStatusProtocol"],
+) -> Token:
+    """Register the active gateway status source for this task. Returns a token."""
+    return _GATEWAY_STATUS.set(source)
+
+
+def get_gateway_status() -> Optional["GatewayStatusProtocol"]:
+    """Return the active gateway status source, or ``None`` if no gateway is running."""
+    return _GATEWAY_STATUS.get()
+
+
+def clear_gateway_status(token: Token) -> None:
+    """Restore the previous gateway status source using the token from register."""
+    try:
+        _GATEWAY_STATUS.reset(token)
+    except (LookupError, ValueError):
+        _GATEWAY_STATUS.set(None)
 
 
 # ---------------------------------------------------------------------------
@@ -309,9 +383,15 @@ __all__ = [
     "register_outbound_messenger",
     "get_outbound_messenger",
     "clear_outbound_messenger",
+    "register_conversation_requester",
+    "get_conversation_requester",
+    "clear_conversation_requester",
     "register_send_policy",
     "get_send_policy",
     "clear_send_policy",
+    "register_gateway_status",
+    "get_gateway_status",
+    "clear_gateway_status",
     "register_gateway_loop",
     "get_gateway_loop",
     "clear_gateway_loop",

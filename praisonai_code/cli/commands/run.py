@@ -184,6 +184,31 @@ def _parse_permissions(allow: Optional[List[str]], deny: Optional[List[str]], pe
     return config if config else None
 
 
+def _plan_permission_conflicts(
+    approval: Optional[str],
+    allow: Optional[List[str]],
+    deny: Optional[List[str]],
+    permission_default: Optional[str],
+) -> List[str]:
+    """Return the permission flags that contradict ``--plan``.
+
+    ``--plan`` is a self-contained read-only preset (``PermissionMode.PLAN``);
+    combining it with an explicit approval backend or bespoke allow/deny rules
+    is unenforceable, so the caller fails closed. Returns the human-readable
+    flag names that were set, or an empty list when ``--plan`` may proceed.
+    """
+    return [
+        name
+        for name, value in (
+            ("--approval", approval),
+            ("--allow", allow),
+            ("--deny", deny),
+            ("--permission-default", permission_default),
+        )
+        if value
+    ]
+
+
 def _mcp_server_to_command(server: dict) -> Optional[tuple]:
     """Convert a resolved MCP server config entry to a (command, env) pair.
 
@@ -910,6 +935,7 @@ def run_main(
     deny: Optional[List[str]] = typer.Option(None, "--deny", help="Permission pattern to deny (e.g., 'bash:rm *'). Can be repeated."),
     permissions: Optional[str] = typer.Option(None, "--permissions", help="Permission file path (YAML or JSON) with allow/deny rules"),
     permission_default: Optional[str] = typer.Option(None, "--permission-default", help="Default action for unmatched patterns: allow, deny, ask (default: ask)"),
+    plan: bool = typer.Option(False, "--plan", help="Read-only planning mode: the agent may explore/read/search but every mutating tool is denied (maps to --approval plan)"),
     # Session continuity options
     continue_session: bool = typer.Option(False, "--continue", "-c", help="Continue the most recent session for this project"),
     session: Optional[str] = typer.Option(None, "--session", "-s", help="Resume a specific session ID"),
@@ -981,9 +1007,76 @@ def run_main(
         output.print_error(str(exc))
         raise typer.Exit(1)
 
+    # --plan is a discoverable alias for the existing read-only planning mode
+    # (--approval plan → PermissionMode.PLAN). It maps onto the same permission
+    # plumbing rather than a bespoke deny-set, so the agent may explore/read but
+    # every mutating tool is denied. Guard against contradictory permission
+    # flags so an unenforceable combination fails closed rather than silently
+    # dropping one intent.
+    if plan:
+        _conflicts = _plan_permission_conflicts(
+            approval, allow, deny, permission_default
+        )
+        if _conflicts:
+            output.print_error(
+                "--plan cannot be combined with "
+                + ", ".join(_conflicts)
+                + " (it already selects the read-only planning mode)"
+            )
+            raise typer.Exit(1)
+        approval = "plan"
+
     _require_wrapper_for_default_run(
         target, agent=agent, command=command, output_mode=output_mode
     )
+
+    # Validate session options before any model/credential resolution so an
+    # invalid combination fails closed and session-model restoration below sees
+    # a well-formed request.
+    if fork and not session:
+        output.print_error("--fork requires --session to specify which session to fork from")
+        raise typer.Exit(1)
+
+    if continue_session and session:
+        output.print_error("Cannot use both --continue and --session together")
+        raise typer.Exit(1)
+
+    # Resolve the effective model BEFORE the credential/local-endpoint gate so a
+    # resumed session (or config) model is honoured rather than being shadowed
+    # by the keyless local-first fallback (Issue #3685). Precedence:
+    #   explicit --model  >  config model  >  recorded session model  >  default
+    if model is None:
+        try:
+            config = resolve_config()
+            if config.agent.model:
+                model = config.agent.model
+                if verbose:
+                    output.print_info(f"Using model from config: {model}")
+        except (ValueError, OSError) as e:
+            # Continue if config resolution fails, but log in verbose mode
+            if verbose:
+                output.print_info(f"Skipping config-based model fallback: {e}")
+
+    # Restore the resumed session's model when none was explicitly chosen
+    # (Issue #3685). Without this, resume re-resolves the *current* default, so
+    # a change to the user's default between runs silently switches the model
+    # mid-conversation. An explicit --model (or config model above) still wins
+    # and updates the session's recorded model for subsequent turns. Placing it
+    # before the credential gate ensures a reachable local endpoint no longer
+    # silently shadows the recorded model on resume.
+    if model is None and (continue_session or session):
+        try:
+            from ..state.project_sessions import find_last_session, find_session_model
+
+            resumed_id = session or find_last_session()
+            if resumed_id:
+                recorded = find_session_model(resumed_id)
+                if recorded:
+                    model = recorded
+                    output.print_info(f"Restored session model: {model}")
+        except Exception:
+            # Model restore is best-effort; fall back to default resolution.
+            pass
 
     # Early credential check before any processing
     if target:  # Only check if we actually have something to run
@@ -1053,28 +1146,6 @@ def run_main(
                         "  - Or set environment variables like OPENAI_API_KEY"
                     )
                     raise typer.Exit(0)
-    
-    # Resolve configuration if model not explicitly provided
-    if model is None:
-        try:
-            config = resolve_config()
-            if config.agent.model:
-                model = config.agent.model
-                if verbose:
-                    output.print_info(f"Using model from config: {model}")
-        except (ValueError, OSError) as e:
-            # Continue if config resolution fails, but log in verbose mode
-            if verbose:
-                output.print_info(f"Skipping config-based model fallback: {e}")
-    
-    # Validate session options
-    if fork and not session:
-        output.print_error("--fork requires --session to specify which session to fork from")
-        raise typer.Exit(1)
-    
-    if continue_session and session:
-        output.print_error("Cannot use both --continue and --session together")
-        raise typer.Exit(1)
 
     # Worktree isolation runs the agent in a chdir'd worktree in-process; the
     # warm runtime is a separate process whose cwd we can't redirect, so reject
@@ -1271,6 +1342,9 @@ def run_main(
                 session=session,
                 fork=fork,
                 no_save=no_save,
+                approval=approval,
+                approve_all_tools=approve_all_tools,
+                approval_timeout=approval_timeout,
             )
         else:
             # Profiling for direct prompt
@@ -1285,6 +1359,9 @@ def run_main(
                 no_save=no_save,
                 no_rules=no_rules,
                 instructions=merged_instructions,
+                approval=approval,
+                approve_all_tools=approve_all_tools,
+                approval_timeout=approval_timeout,
             )
         return
     
@@ -1860,6 +1937,9 @@ def _run_from_file_profiled(
     session: Optional[str] = None,
     fork: bool = False,
     no_save: bool = False,
+    approval: Optional[str] = None,
+    approve_all_tools: bool = False,
+    approval_timeout: Optional[str] = None,
 ):
     """Run agents from a YAML file with profiling enabled."""
     from praisonai_code.cli.features.cli_profiler import (
@@ -1922,7 +2002,12 @@ def _run_from_file_profiled(
     if not no_save:
         import uuid
         auto_save_name = session_id or "session-" + str(uuid.uuid4())[:8]
-    if session_id or auto_save_name:
+
+    # Thread the approval backend (e.g. --plan -> PermissionMode.PLAN) through
+    # the same ``args`` the legacy YAML path reads, so a profiled YAML run is
+    # permission-gated identically to the non-profiled path instead of silently
+    # dropping the deny policy.
+    if session_id or auto_save_name or approval or approve_all_tools:
         class Args:
             pass
         
@@ -1930,6 +2015,12 @@ def _run_from_file_profiled(
         args.auto_save = auto_save_name
         args.resume_session = session_id
         args.cli_project_sessions = bool(session_id or auto_save_name)
+        if approval:
+            args.approval = approval
+        if approve_all_tools:
+            args.approve_all_tools = approve_all_tools
+        if approval_timeout is not None:
+            args.approval_timeout = approval_timeout
         
         praison.args = args
     
@@ -2299,6 +2390,9 @@ def _run_prompt_profiled(
     no_save: bool = False,
     no_rules: bool = False,
     instructions: Optional[List[str]] = None,
+    approval: Optional[str] = None,
+    approve_all_tools: bool = False,
+    approval_timeout: Optional[str] = None,
 ):
     """Run a direct prompt with profiling enabled."""
     from praisonai_code.cli.features.cli_profiler import (
@@ -2333,7 +2427,16 @@ def _run_prompt_profiled(
     }
     if model:
         agent_config["llm"] = model
-    
+
+    # Thread the approval backend (e.g. --plan -> PermissionMode.PLAN) into the
+    # profiled agent so a read-only planning run stays read-only under
+    # --profile instead of silently dropping the deny policy.
+    if approval:
+        from praisonai_code.cli.features._approval_bridge import resolve_approval_config
+        agent_config["approval"] = resolve_approval_config(
+            approval, all_tools=approve_all_tools, timeout=approval_timeout,
+        )
+
     # Apply session continuity if requested
     session_id = None
     auto_save_name = None

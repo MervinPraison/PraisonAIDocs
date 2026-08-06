@@ -2396,6 +2396,192 @@ class OutboundMessengerProtocol(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Agent-callable cross-conversation request/reply (Issue #3689)
+#
+# ``send_message`` is fire-and-deliver: it returns a delivery receipt, not the
+# target's answer. This adds the missing *ask another conversation and await
+# the reply* capability — an agent can route a question to a symbolic target
+# and get the next correlated inbound reply back into its own turn, bounded by
+# a timeout. It reuses ``send_message``'s target resolution and the outbound
+# send-policy guard; the only new surface is a one-shot reply correlation.
+#
+# Core owns only the *shape*: the typed outcome (:class:`ConversationReply`),
+# the protocol seam (:class:`ConversationRequestProtocol`), the context-var
+# registration slot (in ``session.context``), and the built-in
+# ``ask_conversation`` tool. The correlation-aware reply source is bound by the
+# running gateway/bot exactly as ``register_outbound_messenger`` binds the
+# outbound side — no heavy import lives in core. Every path ends in a recorded
+# outcome (reply | timeout | undelivered | no_route) — never a silent hang.
+# ---------------------------------------------------------------------------
+
+ConversationReplyStatus = Literal["reply", "timeout", "undelivered", "no_route"]
+"""Closed set of outcomes for an :func:`ask_conversation` request.
+
+* ``reply`` — the target replied within the timeout; ``text`` carries it.
+* ``timeout`` — the prompt was delivered but no reply arrived in time.
+* ``undelivered`` — the prompt could not be delivered to the target.
+* ``no_route`` — the target could not be resolved to a reachable channel.
+"""
+
+
+@dataclass
+class ConversationReply:
+    """Outcome of an agent-initiated cross-conversation request (Issue #3689).
+
+    Every request resolves to exactly one of the :data:`ConversationReplyStatus`
+    outcomes, so the agent always gets a typed answer back into its turn rather
+    than a silent hang.
+
+    Attributes:
+        status: The outcome (``reply`` / ``timeout`` / ``undelivered`` /
+            ``no_route``).
+        target: The resolved target the prompt was routed to.
+        text: The reply text, populated only when ``status == "reply"``.
+        detail: Optional extra information (error text, message id, etc.).
+    """
+
+    status: ConversationReplyStatus
+    target: str = ""
+    text: str = ""
+    detail: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Convert to a serializable dictionary for the tool return value."""
+        data: Dict[str, Any] = {"status": self.status}
+        if self.target:
+            data["from"] = self.target
+        if self.status == "reply":
+            data["text"] = self.text
+        if self.detail:
+            data["detail"] = self.detail
+        return data
+
+
+@runtime_checkable
+class ConversationRequestProtocol(Protocol):
+    """Protocol for agent-facing cross-conversation request/reply.
+
+    A concrete implementation is provided by the running gateway/bot (in the
+    praisonai wrapper) and registered into the per-turn context so the built-in
+    ``ask_conversation`` tool can resolve it. It sends the prompt via the same
+    delivery stack ``send_message`` uses, then correlates the *next inbound
+    reply* from that target (via the existing ``correlation_id``) with a bounded
+    timeout, returning a typed :class:`ConversationReply`.
+
+    Example usage (implementation in praisonai_bot.gateway)::
+
+        requester = BotConversationRequester(router, origin=origin)
+        token = register_conversation_requester(requester)
+        try:
+            ...  # agent runs; ask_conversation tool resolves the requester
+        finally:
+            clear_conversation_requester(token)
+    """
+
+    async def ask(
+        self,
+        target: str,
+        text: str,
+        *,
+        timeout_s: float = 120.0,
+    ) -> "ConversationReply":
+        """Send ``text`` to ``target`` and await the next correlated reply.
+
+        Args:
+            target: Symbolic target token ("origin", "<platform>",
+                "<platform>:<chat_id>[:<thread_id>]", or a friendly alias).
+            text: The prompt to send.
+            timeout_s: Maximum seconds to wait for a reply before returning a
+                ``timeout`` outcome.
+
+        Returns:
+            A :class:`ConversationReply` describing the outcome.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Agent-callable live status/health (Issue #3688)
+#
+# The gateway already computes rich live state (per-turn run status, active
+# sessions, delivery/DLQ backlog, degraded owners) but only humans/CLI/HTTP can
+# read it. This read-only protocol lets the running gateway bind a live source
+# into the per-turn context so the built-in ``gateway_status`` tool can report
+# it — mirroring how ``OutboundMessengerProtocol`` backs ``send_message``. Core
+# ships only the protocol + snapshot shape; the concrete binding (reading
+# ``health()`` / ``metrics_snapshot()`` / the session registry) lives in the
+# praisonai-bot wrapper. It is strictly read-only, redaction-aware and
+# visibility-scoped (no secrets, no cross-tenant leakage).
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GatewayStatus:
+    """Read-only snapshot of the gateway's live self-state (Issue #3688).
+
+    A neutral, serializable shape the agent can reason about and report. All
+    fields default to empty so a partial/minimal binding is valid and the tool
+    never dead-ends. The concrete binding populates only the visibility-scoped
+    facts it can safely expose.
+
+    Attributes:
+        run: Current turn/run status (e.g. "idle", "busy", "queued").
+        queued: Number of turns queued behind the current one.
+        active_sessions: Count of active sessions (visibility-scoped).
+        sessions_by_channel: Active-session counts keyed by channel/platform.
+        delivery: Delivery-health facts (e.g. outbox_depth, dlq, dead_targets).
+        degraded: Degraded owners as ``{"owner": ..., "reason": ...}`` entries
+            (channels/capabilities/routes flagged configured-unavailable).
+        detail: Optional free-form extra context for the model.
+    """
+
+    run: str = "idle"
+    queued: int = 0
+    active_sessions: int = 0
+    sessions_by_channel: Dict[str, int] = field(default_factory=dict)
+    delivery: Dict[str, Any] = field(default_factory=dict)
+    degraded: List[Dict[str, Any]] = field(default_factory=list)
+    detail: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        """Convert to a serializable dictionary."""
+        return {
+            "run": self.run,
+            "queued": self.queued,
+            "active_sessions": self.active_sessions,
+            "sessions_by_channel": dict(self.sessions_by_channel),
+            "delivery": dict(self.delivery),
+            "degraded": list(self.degraded),
+            "detail": self.detail,
+        }
+
+
+@runtime_checkable
+class GatewayStatusProtocol(Protocol):
+    """Protocol for agent-facing, read-only live status/health reporting.
+
+    A concrete implementation is provided by the running gateway/bot (in the
+    praisonai wrapper) and registered into the per-turn context so the built-in
+    ``gateway_status`` tool can resolve it. It reads the same live objects the
+    HTTP endpoints already serve (``health()`` / ``metrics_snapshot()`` / the
+    session registry) and returns a redaction-aware, visibility-scoped
+    :class:`GatewayStatus`.
+
+    Example usage (implementation in praisonai_bot.gateway)::
+
+        status = BotGatewayStatus(gateway)
+        token = register_gateway_status(status)
+        try:
+            ...  # agent runs; gateway_status tool resolves the source
+        finally:
+            clear_gateway_status(token)
+    """
+
+    def snapshot(self) -> "GatewayStatus":
+        """Return a read-only snapshot of the gateway's live self-state."""
+        ...
+
+
+# ---------------------------------------------------------------------------
 # Outbound send-policy guard (Issue #2226)
 #
 # ``send_message`` lets the model choose where to deliver. Because the target

@@ -203,7 +203,12 @@ TOOL_MAPPINGS = {
 
     # Proactive messaging (agent-facing gateway delivery)
     'send_message': ('.messaging_tools', None),
+    'ask_conversation': ('.messaging_tools', None),
     'messaging_tools': ('.messaging_tools', None),
+
+    # Live gateway status/health (agent-facing read-only introspection - Issue #3688)
+    'gateway_status': ('.gateway_status_tools', None),
+    'gateway_status_tools': ('.gateway_status_tools', None),
     
     # Search Tools (fast, capped content grep + file glob)
     'grep': ('.search_tools', None),
