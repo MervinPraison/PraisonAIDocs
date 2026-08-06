@@ -5,7 +5,7 @@ description: "Return type-safe, validated outputs from agents using Pydantic mod
 icon: "cube"
 ---
 
-Structured outputs give agents predictable, validated data — ideal for APIs, dashboards, and downstream automation.
+Structured outputs give agents predictable, validated data. When a Task sets `output_pydantic` or `output_json`, PraisonAI **fails the task** if the model can't produce a value matching the schema — no silent `None`.
 
 ```python
 from praisonaiagents import Agent
@@ -115,16 +115,18 @@ sequenceDiagram
     participant User
     participant Agent
     participant Schema as Pydantic Schema
+    participant Task
 
     User->>Agent: Request + output_pydantic=Model
     Agent->>Agent: Generate response
-    Agent->>Schema: Validate against fields
+    Agent->>Schema: json.loads + model_validate
     alt Valid
-        Schema-->>Agent: Typed object
-        Agent-->>User: model.field values
+        Schema-->>Task: TaskResult(success=True, pydantic=instance)
+        Task-->>User: model.field values
     else Invalid
-        Schema-->>Agent: Validation error
-        Agent->>Agent: Regenerate to match schema
+        Schema-->>Task: TaskResult(success=False, error="... (schema + validation err)")
+        Task->>Agent: Retry (up to max_retries)
+        Note over Task: After retries exhausted, task.status = "failed"
     end
 ```
 
@@ -132,8 +134,71 @@ sequenceDiagram
 |---|---|
 | 1. Request | You pass a Pydantic model to `output_pydantic` |
 | 2. Generate | The agent produces a response |
-| 3. Validate | The response is checked against your schema |
-| 4. Return | A typed object flows back to your code |
+| 3. Validate | The response is parsed and checked against your schema |
+| 4. Return | On success a typed object flows back; on failure the task retries then fails |
+
+---
+
+## Failure Handling
+
+Structured tasks fail-closed — `success` is `False` and `error` carries the schema name plus the parse error when the model can't match your schema.
+
+```python
+from praisonaiagents import Agent, Task, AgentTeam
+from pydantic import BaseModel
+
+class Fact(BaseModel):
+    title: str
+    detail: str
+
+agent = Agent(name="F", llm="gpt-4o-mini")
+
+task = Task(
+    description="Give one fact about the ocean",
+    agent=agent,
+    output_pydantic=Fact,
+    max_retries=2,     # optional — see Task Retry Policy
+)
+
+team = AgentTeam(agents=[agent], tasks=[task])
+team.start()
+
+# Success — pydantic is guaranteed populated
+if task.result.success:
+    print(task.result.pydantic.title)
+else:
+    print("Failed:", task.result.error)   # includes schema name + validation error
+    print("Raw text was:", task.result.raw)   # kept for debugging
+```
+
+| Case | `success` | `pydantic` / `json_dict` | `error` | `raw` |
+|------|-----------|--------------------------|---------|-------|
+| Model returns valid JSON matching schema | `True` | populated instance | `None` | JSON text |
+| Model returns invalid / freeform prose | `False` | `None` | Schema name + parse error | Preserved for debugging |
+| Model returns valid falsey JSON (`{}`, `[]`, `false`, `0`) with `output_json` | `True` | the falsey value | `None` | JSON text |
+| No structured output requested + non-empty prose | `True` | n/a | `None` | prose |
+
+<Note>
+When structured output was requested but the model returned prose, the completion checker marks the task incomplete and the existing `max_retries` loop retries the task. See [Task Retry Policy](/features/task-retry-policy).
+</Note>
+
+Pick the option that matches what your downstream code needs:
+
+```mermaid
+graph TB
+    Q{Does downstream code need typed fields?} -->|Yes — parse errors matter| S[Set output_pydantic=Model<br/>fail-closed on parse error]
+    Q -->|Only need dict-shaped JSON| J[Set output_json=True<br/>same fail-closed policy]
+    Q -->|Free prose is fine| R[Leave both unset<br/>non-empty text = success]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef s fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef j fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef r fill:#6366F1,stroke:#7C90A0,color:#fff
+    class Q q
+    class S s
+    class J j
+    class R r
+```
 
 ---
 
@@ -162,7 +227,7 @@ agent = Agent(name="TopicAgent", llm="gpt-4o-mini", native_structured_output=Fal
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `output_pydantic` | `BaseModel` | `None` | Return a validated Pydantic object |
-| `output_json` | `BaseModel` | `None` | Return structured JSON (same schema) |
+| `output_json` | `bool` / `BaseModel` | `None` | Return structured JSON; task fails if not parseable |
 | `native_structured_output` | `bool` | auto | Force native `response_format` on/off |
 
 ---
@@ -208,8 +273,12 @@ Use `output_pydantic` when you want a typed object; use `output_json` when you o
 Leave `native_structured_output` unset unless you know your model needs forcing — the SDK picks the cleanest path.
 </Accordion>
 
-<Accordion title="Validate failures in verbose mode">
-Enable verbose output while tuning schemas so validation errors show which field failed.
+<Accordion title="Check task.result.success for structured tasks">
+`pydantic` is guaranteed populated on success. On failure, read `task.result.error` for the schema name plus validation error, and `task.result.raw` for the model text that failed.
+</Accordion>
+
+<Accordion title="Use max_retries for flaky models">
+Soft models may need a couple of retries to hit the schema. Combine `output_pydantic` with `Task(max_retries=2)` from [Task Retry Policy](/features/task-retry-policy).
 </Accordion>
 </AccordionGroup>
 
@@ -229,5 +298,8 @@ Enable verbose output while tuning schemas so validation errors show which field
   </Card>
   <Card title="Tasks" icon="list-check" href="/features/agent-create">
     Task configuration and output options
+  </Card>
+  <Card title="Task Retry Policy" icon="rotate-ccw" href="/features/task-retry-policy">
+    Retry a task with exponential backoff on structured-output failure
   </Card>
 </CardGroup>
