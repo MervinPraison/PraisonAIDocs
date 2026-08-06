@@ -200,6 +200,87 @@ graph TB
 
 ---
 
+## Security: Project-Plugin Trust Gate
+
+A single-file plugin is the most privileged extension surface there is — it can hook every lifecycle event and intercept every tool call. So a plugin dropped into a **project's** `./.praisonai/plugins/*.py` (for example, one that arrived with a cloned repository) does **not** run until you opt in. This mirrors `PRAISONAI_ALLOW_LOCAL_TOOLS` for tools: a cloned repo carrying a malicious `.praisonai/plugins/exfil.py` stays inert by default.
+
+```mermaid
+graph TB
+    Q{Where does the plugin live?}
+    Q -->|./.praisonai/plugins/*.py| Gate{Gate open?}
+    Q -->|~/.praisonai/plugins/*.py| Trust[✅ Loaded]
+    Q -->|pip package / entry point| Trust
+    Gate -->|PRAISONAI_ALLOW_PROJECT_PLUGINS=true| Trust
+    Gate -->|plugins.allow_project_plugins: true| Trust
+    Gate -->|default| Deny[🛑 Refused with warning]
+
+    classDef decision fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef trust fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Q,Gate decision
+    class Trust trust
+    class Deny deny
+```
+
+Open the gate with an environment variable (accepts `true`/`1`/`yes`/`on`):
+
+```bash
+export PRAISONAI_ALLOW_PROJECT_PLUGINS=true
+```
+
+Or in `.praisonai/config.yaml`:
+
+```yaml
+plugins:
+  allow_project_plugins: true
+```
+
+| Behaviour | Rule |
+|-----------|------|
+| **Default** | Gate closed — project-local `.py` plugins are refused with a warning |
+| **User-global** | `~/.praisonai/plugins/` plugins remain trusted (you placed them there) |
+| **pip / entry point** | Installed entry-point plugins remain trusted |
+| **Env precedence** | `PRAISONAI_ALLOW_PROJECT_PLUGINS` wins over config |
+| **Explicit off** | `PRAISONAI_ALLOW_PROJECT_PLUGINS=false` overrides a `true` in config |
+
+<Warning>
+The gate judges a plugin by **where its file is located**, not where a symlink points. A repository-controlled symlink at `.praisonai/plugins/evil.py -> /tmp/evil.py` still counts as project-local and stays gated — it cannot slip past by resolving elsewhere.
+</Warning>
+
+---
+
+## Inspect the Plugin Registry
+
+`get_plugin_registry()` returns a truthful, unified view of every discoverable plugin from three real sources — no hardcoded entries. It reads without a running agent, so a CLI or health check can render it directly.
+
+```python
+from praisonaiagents.plugins import get_plugin_registry
+
+for p in get_plugin_registry():
+    print(p["name"], p["source"], p["enabled"], p["hooks"])
+```
+
+Each entry is a dict: `{name, version, description, source, enabled, hooks}` (single-file entries also include `path`). The `source` field records provenance:
+
+| `source` | Origin |
+|----------|--------|
+| `entry_point:<distribution-name>` | A pip package registering in the `praisonai.plugins` group |
+| `registered` | A `Plugin` instance held by the `PluginManager` |
+| `single_file` | A `.py` file discovered on disk in `.praisonai/plugins/` or `~/.praisonai/plugins/` (metadata only — never executed) |
+
+<Note>
+`enabled` reflects **both** the live manager state and the persisted config allow-list, so it renders correctly even before any agent starts.
+</Note>
+
+---
+
+## Reload Plugins at Runtime
+
+Edited a plugin, or dropped a new one in, and want it live in the current process? Run `praisonai plugins reload` — it forces rediscovery and rewires hooks so newly-added or edited plugins take effect without a restart. See the [Plugins CLI](/cli/plugins#reload-plugins).
+
+---
+
 ## Hook Plugin Example
 
 Create `~/.praisonai/plugins/my_logger.py`:
@@ -726,7 +807,7 @@ PyYAML is an *optional* dependency. Without it, `.yaml` configs return empty (de
 
 | `enabled` value | Meaning | Example |
 |-----------------|---------|---------|
-| `true` | Enable every discovered plugin | `enabled: true` |
+| `true` | Enable every discovered plugin — **preserved** across the loader/CLI round-trip | `enabled: true` |
 | `false` | Disable every plugin — **wins over per-plugin blocks** | `enabled: false` |
 | `[names]` (non-empty list) | Enable exactly these plugins | `enabled: [pii_guardrail, metrics]` |
 | `"name"` (bare string, TOML) | Enable exactly this one plugin | `enabled = "pii_guardrail"` |
@@ -736,12 +817,18 @@ PyYAML is an *optional* dependency. Without it, `.yaml` configs return empty (de
 The JSON config schema advertises `boolean` and `array` for `enabled`; the loader also accepts a bare string at runtime for TOML users who prefer `enabled = "pii_guardrail"`.
 </Info>
 
+<Note>
+A bare `enabled: true` is now **preserved** — enabling a plugin while it is set is a no-op (leaving "all enabled" intact). You **cannot** run `praisonai plugins disable X` while `enabled: true`: the CLI refuses with a clear error, since collapsing "all" to an allow-list would silently disable every other plugin. Set `plugins.enabled` to an explicit list of names first, then disable individual plugins.
+</Note>
+
 ### Per-plugin option blocks
 
-Reserved keys (`enabled`, `auto_discover`, `directories`) configure the plugin *system*; **any other key whose value is a mapping is treated as a per-plugin option map** delivered to that plugin's `on_config` hook.
+Reserved keys (`enabled`, `auto_discover`, `directories`, `allow_project_plugins`) configure the plugin *system*; **any other key whose value is a mapping is treated as a per-plugin option map** delivered to that plugin's `on_config` hook.
 
 ```yaml
 plugins:
+  enabled: true
+  allow_project_plugins: true   # authorise ./.praisonai/plugins/*.py
   pii_guardrail:
     redact: [email, phone]
     enabled: true
@@ -749,6 +836,10 @@ plugins:
     interval: 30
     enabled: false     # disable just this one; pii_guardrail still runs
 ```
+
+<Note>
+`allow_project_plugins: true` opens the [project-plugin trust gate](#security-project-plugin-trust-gate) so single-file plugins under `./.praisonai/plugins/` load. The `PRAISONAI_ALLOW_PROJECT_PLUGINS` env var takes precedence over this config key.
+</Note>
 
 <Note>
 An explicit top-level `enabled: false` wins over any per-plugin block. Omit `enabled` at the top level and per-plugin blocks decide.
@@ -855,9 +946,28 @@ graph TB
 ### Edge cases
 
 - **PyYAML missing** — YAML configs silently return empty (debug log only); install `pyyaml` to enable.
-- **Unknown reserved key** — the wrapper resolver's typo-suggestion validator only checks against `{enabled, auto_discover, directories}`; per-plugin blocks (dicts) are always accepted.
+- **Unknown reserved key** — the wrapper resolver's typo-suggestion validator only checks against `{enabled, auto_discover, directories, allow_project_plugins}`; per-plugin blocks (dicts) are always accepted.
 - **Removed plugin block on reload** — the manager stores options with `replace=True` by default, so a block dropped from a later config no longer delivers stale options.
 - **Plugin `on_config` raises** — logged as a warning; delivery to other plugins is not aborted.
+
+### Config-write single source of truth
+
+`praisonai plugins enable`/`disable` write to the **same file the runtime reads** — no separate JSON. The write target is resolved in this order:
+
+```
+1. .praisonai/config.toml   → .praisonai/config.yaml     (project-local)
+2. praisonai.toml           → praisonai.yaml             (project root)
+3. ~/.praisonai/config.toml → ~/.praisonai/config.yaml   (user global)
+4. (none found)             → .praisonai/config.yaml     (default)
+```
+
+<Warning>
+Writing a `.toml` config requires `tomli_w`. Without it the CLI **fails fast** with a remediation hint (`Install tomli-w (pip install tomli-w), or convert the config to .praisonai/config.yaml.`) rather than silently writing a `.yaml` sidecar the runtime would ignore.
+</Warning>
+
+<Note>
+`praisonai plugins disable <name>` unloads a single-file plugin's **tools** as well as its hooks — `unload_plugin(module_name)` removes the functions that module contributed (tracked via a pre-exec registry snapshot), so `disable` truly removes the plugin's functionality for the rest of the run without touching tools owned by another plugin or the core.
+</Note>
 
 ---
 
@@ -1155,15 +1265,16 @@ Once installed, verify the plugin registered with `praisonai plugins add <packag
 ## CLI Commands
 
 ```bash
-praisonai plugins init my_plugin
 praisonai plugins list
-praisonai plugins scan --verbose
+praisonai plugins enable pii_guardrail
+praisonai plugins disable pii_guardrail
+praisonai plugins reload
+praisonai plugins doctor
 praisonai plugins add praisonai-my-plugin
-praisonai plugins add praisonai-my-plugin --upgrade
 praisonai plugins add praisonai-my-plugin --dry-run
 ```
 
-`praisonai plugins list` and `praisonai plugins scan --verbose` surface the [capability manifest](#static-capability-manifest) fields (`Channels`, `Provides`, `Config`, `Auto Enable When Configured`) whenever a plugin declares them.
+`praisonai plugins list` shows every plugin with its `source` (`entry_point:<dist>`, `registered`, or `single_file`). `enable`/`disable` persist to the config the runtime reads, `reload` picks up edits without a restart, and `doctor` diagnoses issues. See the full reference on the [Plugins CLI](/cli/plugins) page.
 
 ---
 
@@ -1219,6 +1330,9 @@ Tools and guardrails work without `plugins.enable()`. But lifecycle-method plugi
 </Card>
 <Card title="Toolsets" icon="wrench" href="/features/toolsets">
   Create and register custom agent tools
+</Card>
+<Card title="Plugins CLI" icon="plug" href="/cli/plugins">
+  List, enable, disable, reload, and diagnose plugins
 </Card>
 <Card title="Config File" icon="file-code" href="/features/config-file">
   Turn plugins on from `[plugins]` in `config.toml`
