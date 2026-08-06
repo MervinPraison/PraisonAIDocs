@@ -395,6 +395,90 @@ agent = Agent(
 agent.start("Summarise the auth module")
 ```
 
+## Corruption-quarantine on load
+
+If a session `.json` is unreadable at load time (malformed JSON or invalid UTF-8), the store moves it aside to `<file>.json.corrupt-<epoch_ms>` before starting a fresh session — the raw bytes stay recoverable instead of being silently overwritten by the next write.
+
+Before this fix, the next write clobbered the corrupt file with an empty session and the user's entire conversation history was gone with only a log line. Now nothing is destroyed: a corrupt copy is always preserved, and the event is observable — not just logged.
+
+```mermaid
+graph LR
+    L[💾 Load session] --> D{🔍 JSON / UTF-8 decode ok?}
+    D -->|Yes| OK[✅ Return session]
+    D -->|No| Q[📦 Quarantine to .json.corrupt-&lt;ts&gt;]
+    Q --> H[🪝 Fire SESSION_PERSIST_FAILED]
+    H --> F[🟢 Return fresh SessionData]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef quarantine fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class L input
+    class D,H process
+    class Q quarantine
+    class OK,F result
+```
+
+### What triggers it
+
+A `json.JSONDecodeError` or a `UnicodeDecodeError` on the on-disk session file quarantines the bytes and starts fresh. The same contract applies to both `DefaultSessionStore` and the `HierarchicalSessionStore` (`ExtendedSessionData`) override — a corrupt binary file is quarantined in either store rather than propagating.
+
+<Note>
+A transient `OSError` on read (permission errors, NFS/network blips, antivirus locks, disk-full-during-read) is **re-raised**, not quarantined. The caller aborts the pending write, so a healthy on-disk copy is never destroyed by a flaky read. `json.JSONDecodeError` is a subclass of `ValueError`, not `OSError`, so genuine corruption never falls into this branch.
+</Note>
+
+### Where the quarantine lands
+
+The quarantined file sits next to the original in the same session directory (whatever store is configured — default `~/.praisonai/sessions/…`).
+
+| Aspect | Value |
+|--------|-------|
+| Filename shape | `<original>.json.corrupt-<epoch_ms>` |
+| Collision suffix | `-1`, `-2`, … appended when two corruptions land in the same millisecond, so every copy is preserved distinctly |
+| Rename | `os.replace(filepath, quarantine_path)` under the session `FileLock` — writes cannot race the quarantine |
+| Best-effort | If the rename itself fails, the quarantine path is `None` and the hook still fires |
+| Triggers | `json.JSONDecodeError` **or** `UnicodeDecodeError` |
+| Does not trigger | `OSError` on read — re-raised so the caller aborts the write |
+
+### How to observe it
+
+Subscribe to `SESSION_PERSIST_FAILED`; the corruption branch reuses the existing payload with distinguishing semantics.
+
+| Field | On corruption |
+|-------|---------------|
+| `session_id` | The affected session id |
+| `error` | Begins with `"corrupt session file: "` followed by the decoder error text |
+| `spilled` | Repurposed to carry the **quarantine path** (or `None` if the rename failed) |
+| `role`, `content` | Empty strings — there is no in-flight turn to attach |
+| `event_name`, `timestamp`, `cwd` | As usual |
+
+The `"corrupt session file:"` prefix on `error` distinguishes a corrupt read from the older write-failure branch, which uses different `error` text and carries a spill path in `spilled`.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import add_hook, HookEvent
+
+# Alert on corrupt session files so a silent history-loss event
+# becomes an actionable notification (no code changes needed
+# for the quarantine itself — it is on by default).
+@add_hook(HookEvent.SESSION_PERSIST_FAILED)
+def on_session_corruption(inp):
+    if inp.error.startswith("corrupt session file:"):
+        print(f"Session {inp.session_id} was corrupt; quarantined to {inp.spilled}")
+
+agent = Agent(name="Assistant", instructions="Answer the user.")
+agent.start("Hi")
+```
+
+### How to recover manually
+
+Inspect the `.json.corrupt-<ts>` file with any JSON tool, hex editor, or `jq`, hand-repair the malformed segment (or extract salvageable turns), then either drop the repaired content back into place at `<file>.json` or import it via the existing session-import path.
+
+<Tip>
+Corruption-quarantine and [Write-failure salvage](#write-failure-salvage) are two branches of the same "no silent data loss" contract: a bad *write* spills the turn and re-ingests it later; a bad *read* quarantines the file and preserves it for recovery. Both fire `SESSION_PERSIST_FAILED` so operators can alert on either.
+</Tip>
+
 ## Direct Session Store Access
 
 For advanced use cases, you can access the session store directly:
@@ -860,6 +944,6 @@ When you use `SqliteSessionStore` instead of the default JSON store, `get_by_gat
   Summarise older bot turns instead of dropping them
 </Card>
 <Card title="Hook Events" icon="webhook" href="/features/hook-events#session-persist-failed-a-durable-write-failed">
-  Subscribe to `SESSION_PERSIST_FAILED` to alert on write failures
+  Subscribe to `SESSION_PERSIST_FAILED` to alert on write failures and corrupt reads
 </Card>
 </CardGroup>
