@@ -74,6 +74,8 @@ def render_video(script: str) -> DeferredToolResult:
 agent = Agent(name="Studio", instructions="Render videos.", tools=[render_video])
 agent.start("Render the intro sequence")
 ```
+
+Later, call `resolve_deferred(job_id, video_url)` from the render-complete callback to deliver the result — see [Resolving a Deferred Result](#resolving-a-deferred-result).
 </Step>
 </Steps>
 
@@ -166,6 +168,94 @@ The enriched `ToolResult` carries these extra fields alongside `result`.
 | `is_deferred` | `bool` | `True` iff `deferred is not None`. |
 | `structured_error` | `Optional[Dict]` | `{"error": True, "type": ..., "message": ..., "tool": ...}` on failure, else `None`. |
 
+The `praisonaiagents.tools` public deferred-resolver API delivers a background result back into the conversation once the work finishes.
+
+| Symbol | Signature / kind | Description |
+|--------|------------------|-------------|
+| `register_deferred(handle_id, on_resolved, session_id=None)` | function | Register a callback for a handle on the process-default resolver. Overwrites any existing callback. The callback fires as `on_resolved(handle_id, value, session_id)`. |
+| `resolve_deferred(handle_id, value)` | function | Fire the callback with `value` and drop the registration. Buffers the value when no callback is registered yet, then delivers it on the next register. Returns `True` if a callback fired now. |
+| `get_deferred_resolver()` | function | Return the process-default `DeferredResolver` the run loops use. |
+| `DeferredResolver` | class | The registry (a lock + dict) with `register` / `register_if_absent` / `resolve` / `is_pending` / `cancel`. |
+
+---
+
+## Resolving a Deferred Result
+
+Call `resolve_deferred(handle_id, value)` when the background job finishes — the value is re-injected into the same conversation as a tool response.
+
+```mermaid
+graph LR
+    subgraph "Deferred Resolution"
+        Tool["🕒 Tool returns defer(...)"] --> Note["💬 Note surfaces now"]
+        Note --> Continue["🤖 Agent continues"]
+        BG["⚙️ Background finishes"] --> Resolve["📨 resolve_deferred(id, value)"]
+        Resolve --> Inject["✅ Re-injected into chat_history"]
+    end
+
+    classDef defer fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Tool,Note defer
+    class Continue,BG,Resolve process
+    class Inject result
+```
+
+A tool returns `defer(...)` immediately; a background thread calls `resolve_deferred(...)` with the same `handle_id` when it is done.
+
+```python
+import threading
+from praisonaiagents import Agent
+from praisonaiagents.tools import defer, DeferredToolResult, resolve_deferred
+
+def _run_render(job_id: str) -> None:
+    video_url = f"https://cdn.example.com/{job_id}.mp4"
+    resolve_deferred(job_id, video_url)
+
+def render_video(script: str) -> DeferredToolResult:
+    job_id = "job-123"
+    threading.Thread(target=_run_render, args=(job_id,)).start()
+    return defer(note=f"Rendering {job_id}; I'll post the link when it's ready.", handle_id=job_id)
+
+agent = Agent(name="Studio", instructions="Render videos.", tools=[render_video])
+agent.start("Render the intro sequence")
+```
+
+The run loop registers the handle automatically, so tool authors only call `resolve_deferred(...)` from the completion callback — no `LLM` wiring needed.
+
+<Note>
+Resolving a value **before** the run loop registers is safe — the value is buffered and delivered on the next `register()` call. Nothing is silently dropped. See the regression test `test_early_resolution_buffering` for provenance.
+</Note>
+
+### When does the resolver fire?
+
+The resolver handles the job finishing after registration, before registration (buffered), or being cancelled.
+
+```mermaid
+sequenceDiagram
+    participant Tool
+    participant Runloop as LLM run loop
+    participant Resolver as DeferredResolver
+    participant BG as Background job
+
+    Note over Runloop,Resolver: Case A — background finishes AFTER register
+    Tool->>Runloop: return defer(note, handle_id)
+    Runloop->>Resolver: register_if_absent(handle_id, cb)
+    BG-->>Resolver: resolve_deferred(handle_id, value)
+    Resolver->>Runloop: cb(value) — re-injected into chat_history
+
+    Note over Runloop,Resolver: Case B — background finishes BEFORE register (buffered)
+    BG-->>Resolver: resolve_deferred(handle_id, value)
+    Tool->>Runloop: return defer(note, handle_id)
+    Runloop->>Resolver: register_if_absent(handle_id, cb)
+    Resolver->>Runloop: cb(value) — buffered value delivered now
+
+    Note over Runloop,Resolver: Case C — cancelled
+    Tool->>Runloop: return defer(note, handle_id)
+    Runloop->>Resolver: cancel(handle_id)
+    BG-->>Resolver: resolve_deferred(handle_id, value) — dropped
+```
+
 ---
 
 ## Common Patterns
@@ -197,7 +287,7 @@ Return `defer(...)` now, then resolve the job later by its `handle_id`.
 
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.tools import defer, DeferredToolResult
+from praisonaiagents.tools import defer, DeferredToolResult, resolve_deferred
 
 jobs = {}
 
@@ -206,8 +296,9 @@ def enqueue_report(topic: str) -> DeferredToolResult:
     jobs[handle.handle_id] = {"topic": topic, "status": "running"}
     return handle
 
-def resolve_report(handle_id: str, content: str) -> None:
-    jobs[handle_id] = {"status": "done", "content": content}
+def on_report_done(handle_id: str, content: str) -> None:
+    # Re-injects `content` into the same conversation as a tool response.
+    resolve_deferred(handle_id, content)
 
 agent = Agent(name="Analyst", instructions="Build reports.", tools=[enqueue_report])
 agent.start("Build a market report on EVs")
