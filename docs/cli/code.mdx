@@ -37,7 +37,10 @@ praisonai code [OPTIONS] [PROMPT]
 | `--dangerously-skip-approval` | | Skip all tool approval prompts and export `PRAISONAI_TOOL_SAFETY=off` for the subprocess tree | `false` |
 | `--plan` | | Read-only planning mode — the agent may explore/read/search but every mutating tool is denied. Discoverable alias for the read-only planning permission mode. Cannot be combined with `--no-safe` or `--dangerously-skip-approval` (exits 1). | `false` |
 | `--session` | `-s` | Session ID to resume | |
+| `--resume` | | Resume a session by id in headless `-p` mode (alias of `--session` for scripted multi-turn). `--session` still wins when both are set. | |
 | `--continue` | `-c` | Continue last session | `false` |
+| `--print` | `-p` | Headless one-shot: emit a clean machine-readable result and exit with a status-reflecting code. Requires a prompt. | `false` |
+| `--output` | `-o` | Output format for `-p`: `json` (default) or `text`. Requires `-p`. | `json` when `-p` set |
 | `--no-context` | | Disable AGENTS.md/CLAUDE.md auto-loading into system prompt | `false` |
 | `--agent` | `-a` | Named custom agent profile from `.praisonai/agents/` (tools + permission scope) | |
 | `--thinking` | | Reasoning effort for this invocation: `off`, `minimal`, `low`, `medium`, `high` | |
@@ -57,6 +60,112 @@ cat data.json | praisonai code "Write a parser for this shape"
 ```
 
 Prompt argument is merged **first**, piped body second (joined with `\n`). See [Piped Input](/features/cli-piped-stdin).
+
+## Headless / scripting mode
+
+`-p/--print` runs one task and prints a clean, machine-readable result — no `Chat mode:` banners, no profiling block — then exits with a code that reflects success or failure. This is the scripting parity `code` shares with `run --output json` and `chat --json`.
+
+```bash
+praisonai code -p "Write a Python function to sort a list" --output json
+```
+
+```mermaid
+graph LR
+    Prompt[📝 code -p task] --> Agent[🤖 Minimal code agent]
+    Agent --> Env[📦 JSON / text on stdout]
+    Env --> Exit{status}
+    Exit -->|ok| Zero[✅ exit 0]
+    Exit -->|failed / error| One[⛔ exit non-zero]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef out fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Prompt input
+    class Agent proc
+    class Env,Exit out
+    class Zero ok
+    class One bad
+```
+
+### JSON envelope
+
+`--output json` (the default under `-p`) prints a single-line JSON object on stdout:
+
+```json
+{"result": "def sort_list(items): return sorted(items)", "session_id": null, "usage": {"in": 128, "out": 42, "cost": 0.0}, "status": "ok"}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `result` | The agent's answer as a string, or `null` when nothing was produced. |
+| `session_id` | The resolved session id when `--resume`/`--session`/`--continue` was used, else `null`. |
+| `usage.in` | Input tokens for this run. |
+| `usage.out` | Output tokens for this run. |
+| `usage.cost` | Estimated cost from the token collector + pricing table. |
+| `status` | `ok` on success, `failed` on an empty result, `error` when the agent raised. |
+| `error` | Present only when `status` is `error` — the exception message. |
+
+### Text mode
+
+`--output text` prints just the result on stdout — nothing else — so it pipes cleanly:
+
+```bash
+praisonai code -p "What is 2+2?" --output text
+# 4
+```
+
+Errors go to stderr; status is carried by the exit code.
+
+### Exit-code contract
+
+The exit code lets CI, benchmarks, and shell scripts branch on success without parsing stdout.
+
+| `status` | When | Exit code |
+|----------|------|-----------|
+| `ok` | Non-empty result | `0` |
+| `failed` | Empty / `None` result | `1` |
+| `error` | The agent raised an exception | `1` |
+
+```bash
+if praisonai code -p "Generate the release notes" --output text > notes.md; then
+  echo "wrote notes.md"
+else
+  echo "generation failed" >&2
+fi
+```
+
+### Scripted multi-turn with `--resume`
+
+`--resume <id>` composes with `-p` so a script can carry a session across calls. The id flows back out in the envelope's `session_id`:
+
+```bash
+praisonai code --resume my-feature -p "Draft the auth refactor" --output json
+praisonai code --resume my-feature -p "Now add tests"          --output json
+```
+
+### Fail-closed options
+
+Headless mode runs a minimal code agent, so options that need the full interactive wiring are **rejected up front** (exit 1) rather than silently dropped:
+
+| Rejected under `-p` | Why |
+|---------------------|-----|
+| `--tools` | Tool wiring lives in the interactive path. |
+| `--agent` | Named-profile permission scope is interactive-only. |
+| `--plan` | Read-only planning mode is interactive-only. |
+| `--no-acp` | ACP tool toggles are interactive-only. |
+| `--no-lsp` | LSP tool toggles are interactive-only. |
+| `--profile` / `--profile-deep` | Prints a human report and always exits 0 — it would break the machine-readable contract. |
+
+Two more guards keep the contract explicit: `--output` without `-p` errors, and `-p` without a prompt errors.
+
+**Honored under `-p`:** `--model`, `--thinking`, `--verbose`, `--workspace`, and `--resume` / `--session` / `--continue`.
+
+<Note>
+The envelope reuses the same token collector and cost tracker as `run --output json`, so `usage.in/out/cost` reflect real figures without any extra flags.
+</Note>
 
 ## Sessions
 
@@ -136,6 +245,15 @@ praisonai code --no-safe "Refactor main.py"
 ```bash
 praisonai code --dangerously-skip-approval "Clean up old logs"
 ```
+
+### Headless one-shot for scripts
+
+```bash
+# Machine-readable JSON envelope on stdout, status-reflecting exit code
+praisonai code -p "Write a Python function to sort a list" --output json
+```
+
+See [Headless / scripting mode](#headless-scripting-mode) for the envelope shape and exit-code contract.
 
 ### Read-only planning session
 
@@ -313,7 +431,8 @@ See [Checkpoints](/features/checkpoints) for the full checkpoint feature referen
 
 ## See Also
 
-- [Chat](/cli/chat) - General chat mode
+- [Chat](/cli/chat) - General chat mode (`--json` headless output)
+- [Piped Input](/features/cli-piped-stdin) - Compose `code -p` in Unix pipelines and CI
 - [LSP Code Intelligence](/cli/lsp-code-intelligence) - Language server integration
 - [Approval](/features/approval) - Tool approval and safety defaults
 - [Checkpoints](/features/checkpoints) - Workspace checkpointing and undo
