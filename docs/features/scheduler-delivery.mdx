@@ -39,7 +39,7 @@ graph LR
 "Run this agent every hour and text me the result on Telegram." That used to mean wiring up the scheduler **and** the full BotOS gateway. Now it's one parameter — the scheduler talks to the shared `DeliveryRouter` directly.
 
 <Note>
-If `praisonai-bot` isn't installed, delivery logs a single warning and no-ops. The scheduled run itself never fails because delivery failed.
+If `praisonai-bot` isn't installed, delivery logs a single warning and no-ops. The scheduled run itself never fails because delivery failed. **When it *is* installed but no live gateway is running** (a plain `praisonai schedule tick` from OS cron / CI / serverless), delivery falls back to a stateless, token-authenticated standalone sender per platform — see [Out-of-process delivery](#out-of-process-delivery).
 </Note>
 
 ## Quick Start
@@ -309,6 +309,109 @@ sequenceDiagram
 
 ---
 
+## Out-of-process delivery
+
+Run `praisonai schedule tick` as a cron entry / CI job / serverless function and each job's `deliver:` target is delivered via a stateless HTTP call — no gateway process required.
+
+```mermaid
+graph LR
+    subgraph "Out-of-process scheduled delivery"
+        Cron[⏰ OS cron / CI] --> Tick[praisonai schedule tick]
+        Tick --> Exec[ScheduledAgentExecutor]
+        Exec --> Live{live delivery_handler?}
+        Live -- yes --> LiveOK[gateway send_message]
+        Live -- no --> Standalone[🌐 standalone sender<br/>Telegram · Slack · Discord]
+        Standalone --> Chat[✅ chat]
+    end
+
+    classDef trigger fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef branch  fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef out     fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Cron,Tick trigger
+    class Exec,Standalone process
+    class Live branch
+    class LiveOK,Chat out
+```
+
+<Steps>
+<Step title="Set the platform token">
+```bash
+# Same env the live gateway uses — read at send time, not import.
+export TELEGRAM_BOT_TOKEN=123456:AAE...
+```
+</Step>
+
+<Step title="Run one tick from cron / CI / serverless">
+```bash
+# One-shot from a plain OS-cron entry — no gateway, no bots running.
+praisonai schedule tick
+# → each due job runs, and any deliver: telegram target is POSTed to
+#   sendMessage using the token above.
+```
+</Step>
+</Steps>
+
+The HTTP call uses the standard-library `urllib.request`, so there is nothing to install beyond `praisonai-bot`. Each send has a 30-second timeout, and a long result is auto-chunked into multiple messages so it is never rejected by the platform's size limit.
+
+### Environment variables
+
+| Env var | Platform | Purpose |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | Telegram | Bot token — required for Telegram delivery |
+| `SLACK_BOT_TOKEN` | Slack | Bot token — required for Slack delivery |
+| `DISCORD_BOT_TOKEN` | Discord | Bot token — required for Discord delivery |
+| `TELEGRAM_HOME_CHANNEL` | Telegram | Default chat id when `deliver: telegram` has no `:channel_id` |
+| `SLACK_HOME_CHANNEL` | Slack | Default channel id for bare `deliver: slack` |
+| `DISCORD_HOME_CHANNEL` | Discord | Default channel id for bare `deliver: discord` |
+
+### Chat-id resolution order
+
+A bare `deliver: telegram` target (no `:channel_id`) resolves its destination in this order:
+
+| Order | Source | Notes |
+|---|---|---|
+| 1 | `deliver: telegram:123456` explicit `channel_id` | Highest precedence |
+| 2 | `TELEGRAM_HOME_CHANNEL` env var | Deployment override |
+| 3 | `~/.praisonai/state/home_channels.json` | Populated by `/sethome` on a live gateway; reused out-of-process with no extra config |
+
+### Failure modes
+
+Nothing is hidden — a target that cannot be delivered is recorded as `delivery_error` on the run instead of being silently dropped.
+
+| Scenario | Result |
+|---|---|
+| Token env unset | Run succeeds; `delivery_error` recorded (never silently dropped) |
+| Bare-platform target and no `{PLATFORM}_HOME_CHANNEL` + no registry entry | Run succeeds; `delivery_error` recorded |
+| Unsupported platform (WhatsApp / custom / etc.) | Run succeeds; `delivery_error` recorded |
+| Slack `{"ok": false}` body | Run succeeds; `delivery_error` records the Slack error name |
+| Payload > platform limit | Auto-chunked into multiple messages (see per-platform table below) |
+| Live `delivery_handler` present | Live path wins; standalone sender is never invoked |
+
+### Per-platform detail
+
+| Platform | Token env | Home-channel env | Chunk limit | Thread mapping |
+|---|---|---|---:|---|
+| Telegram | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_HOME_CHANNEL` | 4096 chars | `thread_id` → `message_thread_id` (forum topic) |
+| Slack | `SLACK_BOT_TOKEN` | `SLACK_HOME_CHANNEL` | 39000 chars | `thread_id` → `thread_ts` (parent message ts) |
+| Discord | `DISCORD_BOT_TOKEN` | `DISCORD_HOME_CHANNEL` | 2000 chars | `thread_id` → `message_reference` reply |
+| WhatsApp / others | — | — | — | **Not supported** — delivery raises → `delivery_error` |
+
+#### Telegram
+Set `TELEGRAM_BOT_TOKEN` and either use an explicit `deliver: telegram:<chat_id>` target or set `TELEGRAM_HOME_CHANNEL`. `thread_id` on the target maps to `message_thread_id` (forum topic).
+
+#### Slack
+Set `SLACK_BOT_TOKEN` and either use `deliver: slack:<channel_id>` or set `SLACK_HOME_CHANNEL`. `thread_id` maps to `thread_ts`. Slack returns HTTP 200 even for logical failures like a bad channel — those surface as `delivery_error` in the run record.
+
+#### Discord
+Set `DISCORD_BOT_TOKEN` and either use `deliver: discord:<channel_id>` or set `DISCORD_HOME_CHANNEL`. `thread_id` becomes a `message_reference` reply to preserve conversation context; if the referenced message is gone, delivery degrades gracefully to a normal message instead of dropping.
+
+#### WhatsApp / other platforms
+Not supported by the standalone sender. Continue to use a live gateway for those.
+
+---
+
 ## Continuable Delivery
 
 A delivered brief is a **conversation opener**, not a dead-end. Reply in the same chat and the agent picks up where the brief left off — with the delivered text already in context. Zero configuration, on by default.
@@ -474,6 +577,29 @@ sequenceDiagram
     Note over DeliveryRouter: gateway seeds a continuable session<br/>(skipped when continuable is False)
 ```
 
+Under the full gateway a live `delivery_handler` is wired. Run `praisonai schedule tick` out of process (cron / CI / serverless) and there is no live handler — the executor falls back to a per-platform standalone sender instead. See [Out-of-process delivery](#out-of-process-delivery).
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant Agent
+    participant Exec as ScheduledAgentExecutor
+    participant Standalone as Standalone sender
+    participant Router as DeliveryRouter (gateway)
+    participant Channel
+
+    Scheduler->>Agent: run task
+    Agent-->>Exec: result
+    alt live delivery_handler wired
+        Exec->>Router: deliver(target, text)
+        Router->>Channel: bot.send_message(...)
+    else no live handler
+        Exec->>Standalone: resolve_standalone_sender(target.channel)
+        Standalone->>Channel: token-authed HTTPS POST
+    end
+    Channel-->>Exec: ok (or delivery_error on failure)
+```
+
 `SchedulerDelivery` is built once per scheduler and reused across runs, so the router's idempotency cache and rate limiters persist between ticks. After a successful delivery, a gateway-hosted job also seeds a resumable session so a reply resumes the conversation — see [Continuable Delivery](#continuable-delivery).
 
 ---
@@ -548,6 +674,8 @@ Delivery reuses the existing `DeliveryRouter`, so scheduled sends inherit the ga
 | **Graceful degradation** | When `praisonai-bot` is not installed, a single warning is logged and delivery no-ops — the scheduled run itself never fails |
 | **Intentional silence** | An exact `NO_REPLY` / `[SILENT]` / `SILENT` output suppresses delivery; the run is still recorded as `succeeded` |
 | **Continuable delivery** | On successful delivery of a `continuable` target, the gateway seeds a resumable session keyed to the reply address. A seed failure logs and never breaks the delivery — the brief still lands. |
+| **Out-of-process delivery (new — #3726)** | When `praisonai schedule tick` runs with no live gateway, a per-platform standalone sender (Telegram / Slack / Discord) posts via a token-authenticated HTTPS call. Zero new dependencies. |
+| **No silent drops** | A configured delivery target that cannot be delivered (missing token, unsupported platform, Slack logical error, etc.) is recorded as `delivery_error` on the run — never silently dropped. |
 
 On the gateway-hosted scheduled path, delivery is enqueued into a durable SQLite outbox at `~/.praisonai/state/gateway_outbox.sqlite` before it reaches the router. Its `UNIQUE` idempotency key survives a process restart, so the exact crash window a scheduler must survive (fire → deliver → crash → restart → re-fire) is deduplicated without a double-post. A pre-crash send that never landed stays retryable and is delivered at-least-once on the next tick. If the outbox cannot be built (missing dependency or permission error) the path falls back to the router's in-process LRU exactly as before.
 
@@ -613,6 +741,29 @@ praisonai schedule add "backup-notice" -s daily \
 
 Use `--no-continuable` when a reply should not resume the job — the reply starts a fresh session, matching pre-#3449 behaviour.
 
+### Out-of-process cron entry
+
+Deliver a morning brief without keeping a gateway process alive — set the token env vars in the crontab and call `praisonai schedule tick`.
+
+```bash
+# crontab -e
+# Deliver a morning brief without keeping a gateway process alive.
+TELEGRAM_BOT_TOKEN=123456:AAE...
+TELEGRAM_HOME_CHANNEL=-100555
+0 8 * * * cd /srv/praisonai && praisonai schedule tick
+```
+
+```yaml
+# .praisonai/schedules/morning-brief.yaml (or the same YAML you'd use elsewhere)
+name: morning-brief
+schedule:
+  cron: "0 8 * * *"
+message: "Summarise overnight alerts"
+deliver: "telegram"          # → resolved to TELEGRAM_HOME_CHANNEL out-of-process
+```
+
+See [Out-of-process delivery](#out-of-process-delivery) for the full contract.
+
 ---
 
 ## Best Practices
@@ -625,7 +776,7 @@ Use `--no-continuable` when a reply should not resume the job — the reply star
 </Accordion>
 
 <Accordion title="Install the bot extra to enable delivery">
-Delivery needs the `praisonai-bot` package. Without it, the scheduled run still executes — only the push is skipped, with one warning. Install the bot extra to turn delivery on.
+Delivery needs the `praisonai-bot` package. Without it, the scheduled run still executes — only the push is skipped, with one warning. With the package installed you get two delivery paths automatically: the **live gateway path** when a `delivery_handler` is wired, and the **standalone sender** for Telegram / Slack / Discord when running unattended (cron / CI / serverless). Both paths honour the same `{PLATFORM}_BOT_TOKEN` env vars. See [Out-of-process delivery](#out-of-process-delivery).
 </Accordion>
 
 <Accordion title="Reuse one scheduler instance per job">
