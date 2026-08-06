@@ -1,7 +1,7 @@
 ---
 title: "Bot Chat Commands"
 sidebarTitle: "Chat Commands"
-description: "Built-in chat commands — status, model switching, usage, context compression, queuing — plus custom commands for Telegram, Discord, Slack, and WhatsApp bots."
+description: "Built-in chat commands — status, model switching, usage, context compression, queuing — plus Python-registered, file-based, and entry-point custom commands for Telegram, Discord, Slack, and WhatsApp bots."
 icon: "terminal"
 ---
 
@@ -75,6 +75,7 @@ graph TB
     Q --> J[Toggle reasoning visibility]
     Q --> K[Accept a suggested automation]
     Q --> L[Create from a template]
+    Q --> M[Run a project command file]
     A --> A1[/stop]
     B --> B1[/compress]
     M --> M1[/recap]
@@ -88,13 +89,18 @@ graph TB
     J --> J1[/reasoning]
     K --> K1[/automations]
     L --> L1[/blueprint]
+    M --> M1[".praisonai/commands/*.md → /name"]
 
     classDef agent fill:#8B0000,color:#fff
     classDef tool fill:#189AB4,color:#fff
+    classDef source fill:#6366F1,color:#fff
 
     class Q agent
-    class A,B,C,D,E,F,G,H,I,J,K,L,M,A1,B1,C1,D1,E1,F1,G1,H1,I1,J1,K1,L1,M1 tool
+    class A,B,C,D,E,F,G,H,I,J,K,L,A1,B1,C1,D1,E1,F1,G1,H1,I1,J1,K1,L1 tool
+    class M,M1 source
 ```
+
+File-based (`.praisonai/commands/*.md`) and entry-point commands surface alongside built-ins — see [File-based & Entry-point Commands](#file-based-and-entry-point-commands-in-bot-chats).
 
 Every PraisonAI bot comes with built-in chat commands. Just type a command in your chat — no setup required.
 
@@ -786,6 +792,200 @@ telegram_commands = bot.list_commands(platform="telegram")
 
 ---
 
+## File-based and Entry-point Commands in Bot Chats
+
+One `.praisonai/commands/{name}.md` file authored once runs in `praisonai code` **and** in every bot chat — no duplication, no per-platform wiring.
+
+### Quick Start — one file, every chat
+
+Author a single command file:
+
+```markdown
+---
+description: Summarise the current channel
+argument-hint: <topic?>
+---
+Summarise recent messages about $ARGUMENTS.
+```
+
+Start the bot — nothing new to wire. The resolver discovers the file automatically once bot commands are enabled in config:
+
+```python
+from praisonai.bots import TelegramBot
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", instructions="Be helpful.")
+bot = TelegramBot(token="YOUR_TOKEN", agent=agent)
+
+import asyncio
+asyncio.run(bot.start())
+# /summary is now available in Telegram — same file also works in `praisonai code`.
+```
+
+The user runs it in chat:
+
+```
+User:  /summary Q3 revenue
+Bot:   [agent replies with a Q3 revenue summary]
+```
+
+### One command source, every surface
+
+```mermaid
+graph LR
+    File[📄 .praisonai/commands/*.md] --> Resolver[🔀 CustomCommandResolver]
+    EP[📦 praisonai.bot_commands entry-points] --> Resolver
+    Resolver --> Code[💻 praisonai code REPL/TUI]
+    Resolver --> Bot[💬 Telegram / Slack / Discord]
+
+    classDef source fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef surface fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class File,EP source
+    class Resolver proc
+    class Code,Bot surface
+```
+
+The same `.praisonai/commands/*.md` files already documented for [Custom Agents & Commands](/features/custom-agents-commands) now reach bot chats too — the resolver reuses that loader through the sanctioned `_code_bridge` seam instead of reimplementing it.
+
+### Configuration — `BotCommandsConfigSchema`
+
+Enable and tune the bridge with a `commands` block on each channel.
+
+<Tabs>
+<Tab title="YAML">
+```yaml
+# bots.yaml
+channels:
+  telegram:
+    token: env:TELEGRAM_BOT_TOKEN
+    commands:
+      allow_shell: false          # default; opt-in per deployment (see safety)
+      expose: [summary, deploy]   # optional allow-list; omit → all project commands
+      include_user_scope: false   # default; user ~/.praisonai commands excluded
+```
+</Tab>
+
+<Tab title="Python">
+```python
+from praisonai_bot.bots._config_schema import (
+    ChannelConfigSchema,
+    BotCommandsConfigSchema,
+)
+
+channel = ChannelConfigSchema(
+    platform="telegram",
+    token="${TELEGRAM_BOT_TOKEN}",
+    commands=BotCommandsConfigSchema(
+        allow_shell=False,
+        expose=["summary", "deploy"],
+        include_user_scope=False,
+    ),
+)
+```
+</Tab>
+
+<Tab title="Env">
+```bash
+export TELEGRAM_BOT_TOKEN=your_token_here
+# Author .praisonai/commands/summary.md, then start the bot with a config
+# whose channel enables commands. With an empty `expose`, every project
+# command is surfaced automatically.
+praisonai bot serve --config bots.yaml
+```
+</Tab>
+</Tabs>
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `allow_shell` | `bool` | `false` | Enables live `` !`cmd` `` substitution in bot chats. **Also requires the command's own `allow_shell: true` frontmatter** — a deployment can never *upgrade* a command that declared shell off. |
+| `expose` | `list[str]` | `[]` | Optional allow-list of command names surfaced in chat. Empty → every project-scope command is exposed. |
+| `include_user_scope` | `bool` | `false` | When `true`, also loads commands from `~/.praisonai/commands/`. Off by default — bots serve the project, not the operator's home dir. |
+
+### Safety posture: double opt-in for shell
+
+Shell substitution needs **both** the deployment and the command to say yes.
+
+```mermaid
+graph TB
+    Cmd["Command with !`cmd` in template"] --> D{Deployment: allow_shell?}
+    D -->|false<br/>default| Inert[Render segment inert<br/>rest of command still runs]
+    D -->|true| F{Command frontmatter:<br/>allow_shell?}
+    F -->|false| Inert
+    F -->|true| Exec[Execute shell substitution]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef exec fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class D,F q
+    class Inert safe
+    class Exec exec
+```
+
+When either is false, the resolver drops the `!` marker so the segment becomes plain backticks — the safe `$ARGUMENTS` and `@file` parts still interpolate normally instead of the whole command failing.
+
+<Warning>
+A shell-carrying command whose deployment forbids shell renders that segment **inert** rather than erroring. This safe-by-default degradation keeps the rest of the command working. See [Bot Shell Execution](/features/bot-shell-execution) for the wider shell-approval model.
+</Warning>
+
+### Precedence & collision rules
+
+When two sources define the same command name, one wins.
+
+| Source | Precedence | Notes |
+|--------|-----------|-------|
+| Built-in commands (`/status`, `/help`, ...) | **highest** — always wins | Live commands (`/automations`, `/blueprint`) step aside if you register a same-name handler. |
+| `register_command(...)` (Python) | high | Existing path, unchanged. |
+| File-based `.praisonai/commands/{name}.md` | medium | Wins over entry-point on collision. Project scope by default; user scope opt-in. |
+| Entry-point `praisonai.bot_commands` | lowest | Installed packages ship bot commands; file/project commands override. |
+
+`/help` and the native `/` menu are populated through the shared `ChatCommandMixin`, so file and entry-point commands appear in both automatically — no per-adapter wiring.
+
+### Packaged commands via entry-point
+
+Installed packages add bot commands through the `praisonai.bot_commands` entry-point group — no forking.
+
+```toml
+# pyproject.toml
+[project.entry-points."praisonai.bot_commands"]
+mypkg = "mypkg.bot_commands:commands"
+```
+
+```python
+# mypkg/bot_commands.py
+commands = {
+    "greet": {
+        "description": "Say hi",
+        "template": "Say hello to $ARGUMENTS.",
+        "allow_shell": False,   # optional; safe default
+    },
+}
+# Or expose a zero-argument callable that returns the same dict.
+```
+
+The loader accepts three `spec` shapes per command:
+
+| Spec shape | Example | Meaning |
+|------------|---------|---------|
+| Bare string | `"greet": "Say hello to $ARGUMENTS."` | Template only; no description, `allow_shell` off. |
+| Dict | `{"template": ..., "description": ..., "allow_shell": ...}` | Full record. |
+| Object | any object with `.template` / `.description` / `.allow_shell` attributes | Full record from a class instance. |
+
+### User interaction flow
+
+1. A teammate authors `.praisonai/commands/deploy.md` with `description: "Run the deploy checklist"` and opens a PR.
+2. After merge, everyone using `praisonai code` gets `/deploy` — no restart of code.
+3. On the next bot restart, `/deploy` also appears in Telegram's native `/` menu with the same description, and running it in chat replies with the interpolated template through the normal `session.chat` path.
+4. Same file. Two surfaces. No duplication.
+
+<Note>
+File and entry-point commands pass through the same [Command Access Control](/features/bot-command-access-control) policy as built-in and Python-registered commands — `admin_users` and `user_allowed_commands` gate them identically, and restricted commands stay hidden from the `/` menu for users who cannot run them.
+</Note>
+
+---
+
 ## Security & Allowlists
 
 Built-in commands (`/status`, `/new`, `/help`) and custom commands registered via `register_command()` go through the same security pipeline as regular text messages. If `allowed_users` is set and the sender is not in it, the command is silently dropped with no reply. If `unknown_user_policy="pair"`, unknown senders get the pairing flow before the command runs. If `group_policy="mention_only"`, commands in groups still need a mention. `observe` behaves like `mention_only` for command dispatch — slash-commands in groups still need a mention; only free-form messages are passively recorded.
@@ -989,6 +1189,12 @@ Out-of-range names are skipped; over-length descriptions are truncated.
   <Accordion title="Document custom commands in /help">
     Always pass a `description` to `register_command()`. Users discover extensions through `/help`, which filters to commands they are allowed to run.
   </Accordion>
+  <Accordion title="Share one command file across code and bots">
+    Author `.praisonai/commands/{name}.md` once and commit it. It runs in `praisonai code` and — once a channel's `commands` block is enabled — in every bot chat, with no per-platform duplication. See [File-based & Entry-point Commands](#file-based-and-entry-point-commands-in-bot-chats).
+  </Accordion>
+  <Accordion title="Keep shell double-opted-in">
+    Live `` !`cmd` `` substitution runs only when both the deployment (`commands.allow_shell: true`) and the command's own `allow_shell: true` frontmatter agree. Leave both off unless a specific command genuinely needs shell — the segment degrades to inert backticks otherwise, so the rest of the command still works.
+  </Accordion>
   <Accordion title="Isolate /automations and /blueprint per user">
     The scheduler's suggestion store supports per-user isolation via a `principal` owner key (see [Automation Suggestions → Multi-tenant isolation](/docs/features/automation-suggestions#multi-tenant-isolation) and [Per-User Scheduler Isolation](/features/scheduler-multi-tenant)). When your bot passes the resolved chat identity to the store, each user sees and can accept/dismiss only their own suggestions, and one tenant cannot exhaust another's pending cap or dedup window.
 
@@ -1017,5 +1223,11 @@ Bot tokens should never be hardcoded. Use environment variables or a `.env` file
   </Card>
   <Card icon="microphone" href="/features/gateway-voice-notes">
     Transcribe inbound voice messages on Telegram, Slack, and WhatsApp.
+  </Card>
+  <Card title="Custom Agents & Commands" icon="folder-tree" href="/features/custom-agents-commands">
+    Author `.praisonai/commands/*.md` files once — they run in `praisonai code` and bot chats.
+  </Card>
+  <Card title="Bot Shell Execution" icon="terminal" href="/features/bot-shell-execution">
+    The double-opt-in shell rule and the wider shell-approval model.
   </Card>
 </CardGroup>
