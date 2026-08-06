@@ -324,6 +324,10 @@ This error used to leak from SDK internals before the async bridge was implement
 
 **Test reference:** `praisonai/tests/unit/test_async_bridge.py::TestBridgeIntegration::test_timeout_cancels_coroutine_and_runs_finally` — quote this in the page so users can verify the behaviour locally.
 
+### TimeoutError: run_sync_or_offload() worker did not complete within {N}s
+
+The offloaded coroutine did not finish inside `timeout + 1s`. Check for blocking I/O or a missing `await`, or raise `PRAISONAI_RUN_SYNC_TIMEOUT` if the work is legitimately long-running.
+
 ### PermissionError in approval system
 
 The approval system now fails fast in async contexts. Configure a non-console backend:
@@ -502,7 +506,12 @@ Called from a plain sync caller, it dispatches to the active `AsyncBridge` via `
 | Helper | Plain sync caller | Inside a running loop |
 |--------|-------------------|-----------------------|
 | `run_sync` | ✅ works | ❌ `RuntimeError` |
-| `run_sync_or_offload` | ✅ works | ✅ offloads onto a worker thread that reuses the **same** bridge |
+| `run_sync_or_offload` | ✅ works | ✅ offloads onto a worker thread (blocks the caller) |
+| `arun_sync_or_offload` | — (must be awaited) | ✅ **non-blocking** await; the loop stays responsive |
+
+<Note>
+`run_sync_or_offload()` now bounds `thread.join()` at `timeout + 1.0s`. If the worker is still alive it raises `TimeoutError("run_sync_or_offload() worker did not complete within {timeout}s")`. The extra second covers thread hand-off/teardown so the join does not spuriously time out before the worker records its own error.
+</Note>
 
 ### Best Practices
 
@@ -543,6 +552,103 @@ Per-session bridge that `run_sync_or_offload` preserves across the offload hop.
 </Card>
 <Card title="Agent-Centric Tools" icon="wrench" href="/cli/agent-tools#timeouts-cancellation">
 The Tier-2 `_run_sync` (PR #3361) mirrors the same design.
+</Card>
+</CardGroup>
+
+---
+
+## `arun_sync_or_offload` — await from an async context
+
+Use `arun_sync_or_offload()` from async callers (FastAPI/Starlette handlers, Jupyter cells, async tests) — `await` it instead of parking the loop thread with the sync helper.
+
+```mermaid
+graph LR
+    subgraph "arun_sync_or_offload"
+        A[⚡ Async caller] --> B[🌉 Shared bridge]
+        B --> C[🔁 Background loop]
+        C --> D[✅ await result]
+    end
+
+    classDef caller fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A caller
+    class B,C process
+    class D result
+```
+
+<Steps>
+<Step title="Import and await">
+```python
+from praisonai._async_bridge import arun_sync_or_offload
+
+async def fetch(): return 42
+
+async def handler():
+    value = await arun_sync_or_offload(fetch())
+    return value
+```
+</Step>
+
+<Step title="Inside a FastAPI handler">
+`await`, don't park — the loop stays responsive while the agent runs:
+
+```python
+from fastapi import FastAPI
+from praisonaiagents import Agent
+from praisonai._async_bridge import arun_sync_or_offload
+
+app = FastAPI()
+agent = Agent(name="Analyst", instructions="Answer briefly")
+
+@app.post("/ask")
+async def ask(q: str):
+    answer = await arun_sync_or_offload(agent.astart(q))
+    return {"answer": answer}
+```
+</Step>
+</Steps>
+
+The user calls an async endpoint; the agent's coroutine runs on the shared background bridge while the request loop stays free to serve other traffic.
+
+### Configuration Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `coro` | `Awaitable[T]` | — | The coroutine to await. |
+| `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s) | Same env var as `run_sync`. On expiry the in-flight future is cancelled (`fut.cancel()`) and `asyncio.TimeoutError` re-raises. |
+
+Unlike `run_sync_or_offload`, this variant does **not** park the running loop thread. It submits `coro` to the active `AsyncBridge` and awaits the result, so the loop keeps serving other work. The coroutine runs on the shared background bridge loop — never a fresh `asyncio.new_event_loop()` — so a caller-installed `scoped_bridge()` binding still wins and per-loop LiteLLM/HTTPX connection pools are preserved. On timeout or cancellation, the in-flight future is cancelled before the exception re-raises.
+
+### Best Practices
+
+<AccordionGroup>
+<Accordion title="Await it from async handlers, not run_sync_or_offload">
+Inside a running loop, `run_sync_or_offload` offloads onto a worker thread and blocks the caller until the coroutine finishes. `arun_sync_or_offload` awaits instead, so the loop keeps serving other requests.
+
+```python
+# Good — loop stays responsive
+answer = await arun_sync_or_offload(agent.astart(q))
+
+# Blocks the caller until done
+answer = run_sync_or_offload(agent.astart(q))
+```
+</Accordion>
+
+<Accordion title="Keep the sync helper for sync-only paths">
+Plain scripts and CLI entry points can't `await`. Use `run_sync_or_offload` (or `run_sync`) there and reserve `arun_sync_or_offload` for code already inside a coroutine.
+</Accordion>
+</AccordionGroup>
+
+### Related
+
+<CardGroup cols={2}>
+<Card title="run_sync_or_offload" icon="arrows-left-right" href="/features/async-bridge#run-sync-or-offload-safe-from-any-calling-context">
+Sync sibling for non-async callers.
+</Card>
+<Card title="scoped_bridge" icon="lock" href="/features/async-bridge#per-session-scoped-bridge">
+Per-session bridge preserved across the await.
 </Card>
 </CardGroup>
 
