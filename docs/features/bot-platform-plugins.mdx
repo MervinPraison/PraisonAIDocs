@@ -335,6 +335,86 @@ register_platform(
 
 Capabilities let PraisonAI's shared delivery layer chunk, stream, and rate-limit messages correctly for your platform — see [Bot Platform Capabilities](/features/bot-platform-capabilities) for the full field list.
 
+### Use the Canonical Admission Primitive
+
+Reuse `resolve_ingress_admission()` in your adapter's message handler so your custom channel inherits the same allowlist / blocklist / group-policy semantics as every built-in — and drops become inspectable (`reason_code`) instead of silent `logger.debug` lines.
+
+```python
+from praisonaiagents.bots import resolve_ingress_admission
+
+class MyBot:
+    async def on_message(self, msg):
+        decision = resolve_ingress_admission(
+            chat_type=msg.chat_type,            # "dm" / "private" / "group" / "channel" / ...
+            sender_id=msg.sender_id,
+            is_mention=msg.mentions_bot,
+            is_command=msg.text.startswith("/"),
+            allowlist=self.config.allowed_users,
+            blocklist=self.config.blocked_users,
+            group_policy=self.config.group_policy,
+            paired=self.pairing.is_paired(msg.sender_id),
+        )
+
+        if not decision.admit:
+            # Record the reason so operators can answer "why didn't the bot reply?"
+            logger.info(
+                "message dropped: gate=%s reason=%s sender=%s",
+                decision.gate, decision.reason_code, msg.sender_id,
+            )
+            if decision.observe:
+                # `observe` group policy: passively record but do not run the agent
+                await self.session.record_passive(msg)
+            return
+
+        await self.agent.run(msg.text)
+```
+
+The ladder (first matching gate wins): **block-list → allow-list → pairing → direct-chat bypass → group policy**. An unset `group_policy` defaults to `mention_only` — the live `BotConfig` default — so a forwarded unset policy fails safe rather than replying to everything in a group.
+
+```mermaid
+graph TB
+    Start[📨 Inbound message] --> Block{Block-listed?}
+    Block -->|Yes| Drop1["🛑 blocked"]
+    Block -->|No| Allow{Allow-list<br/>configured & missing?}
+    Allow -->|Yes| Drop2["🛑 not_in_allowlist"]
+    Allow -->|No| Pair{Paired?}
+    Pair -->|No| Drop3["🛑 pairing_required"]
+    Pair -->|Yes| Direct{Direct chat?}
+    Direct -->|Yes| OK1["✅ allowed (direct)"]
+    Direct -->|No| Policy{group_policy}
+    Policy -->|respond_all| OK2["✅ allowed"]
+    Policy -->|mention_only<br/>+ !mention/cmd| Drop4["🛑 group_mention_only"]
+    Policy -->|command_only<br/>+ !cmd| Drop5["🛑 command_only"]
+    Policy -->|observe<br/>+ !mention/cmd| Obs["👁 observe (passive)"]
+
+    classDef msg fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef drop fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef obs fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start msg
+    class Block,Allow,Pair,Direct,Policy gate
+    class Drop1,Drop2,Drop3,Drop4,Drop5 drop
+    class OK1,OK2 ok
+    class Obs obs
+```
+
+**Reason codes** an operator can grep for: `allowed`, `blocked`, `not_in_allowlist`, `pairing_required`, `group_mention_only`, `command_only`, `observe`.
+
+**IngressDecision fields:**
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `admit` | `bool` | Whether the adapter should run the agent on this message. |
+| `reason_code` | `str` | Machine-readable reason (one of the seven above). |
+| `gate` | `str` | Which stage decided: `blocklist`, `allowlist`, `pairing`, `direct`, `group_policy`. |
+| `observe` | `bool` | When `True`, do not admit but *do* record the message as passive session context (`observe` group policy). |
+
+<Note>
+The primitive is **pure and dependency-free** — same inputs, same verdict. That means built-in and plugin channels cannot drift, and adopting it does not couple your adapter to any transport, config-loading, or session module.
+</Note>
+
 ### Override a Built-in Platform
 
 Registry uses last-write-wins with lower-cased keys:
@@ -473,6 +553,9 @@ class RobustBot:
 <CardGroup cols={2}>
 <Card title="Bot Platform Capabilities" icon="sliders" href="/features/bot-platform-capabilities">
   Declare streaming, chunking, and rate-limit behaviour
+</Card>
+<Card title="Bot Gateway" icon="tower-broadcast" href="/features/bot-gateway">
+  See how `group_policy`, `allowed_users`, and pairing are configured in YAML
 </Card>
 <Card title="Gateway Degraded Channels" icon="heart-pulse" href="/features/gateway-degraded-channels">
   See where `unresolved_platform` and `adapter_construction_failed` surface in health/doctor
