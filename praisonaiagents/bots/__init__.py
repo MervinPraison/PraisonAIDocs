@@ -27,6 +27,7 @@ from .protocols import (
     EmailProtocol,
     EmailInbox,
     SupportsPresentation,
+    PresentationRendererProtocol,
     PlatformCapabilities,
     ChannelField,
     ChannelDescriptor,
@@ -54,6 +55,8 @@ from .presentation import (
     adapt_presentation,
     table_to_markdown,
     chart_to_text,
+    register_presentation_renderer,
+    get_presentation_renderer,
 )
 from .interactive import (
     InteractiveContext,
@@ -95,6 +98,10 @@ from .silence import (
     BotLoopPolicy,
     BotLoopGuard,
 )
+from .admission import (
+    IngressDecision,
+    resolve_ingress_admission,
+)
 from .run_status import (
     RunPhase,
     RunStatusController,
@@ -135,6 +142,9 @@ __all__ = [
     "adapt_presentation",
     "table_to_markdown",
     "chart_to_text",
+    "PresentationRendererProtocol",
+    "register_presentation_renderer",
+    "get_presentation_renderer",
     "PlatformCapabilities",
     "ChannelField",
     "ChannelDescriptor",
@@ -175,6 +185,8 @@ __all__ = [
     "classify_final",
     "BotLoopPolicy",
     "BotLoopGuard",
+    "IngressDecision",
+    "resolve_ingress_admission",
     "RunPhase",
     "RunStatusController",
     "StallState",
