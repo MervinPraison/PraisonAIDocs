@@ -426,6 +426,7 @@ Nothing is hidden — a target that cannot be delivered is recorded as `delivery
 
 | Scenario | Result |
 |---|---|
+| **Unroutable token at schedule creation** (missing/malformed `channel_id`, unknown platform, empty target) | `SchedulerDelivery` logs an actionable warning with `reason` + `hint`; construction still returns so callers that only want a preview aren't blocked. A caller that wants hard-fail behaviour can raise `ScheduleTargetError` explicitly. See [Creation-time validation and preview](#creation-time-validation-and-preview). |
 | Token env unset | Run succeeds; `delivery_error` recorded (`"{TOKEN} not set for standalone delivery"`). |
 | Bare-platform target and no `{PLATFORM}_HOME_CHANNEL` + no registry entry | Run succeeds; `delivery_error` recorded. |
 | Unsupported platform (WhatsApp / custom / etc.) | Run succeeds; `delivery_error` recorded. |
@@ -730,12 +731,162 @@ Unlike the [chat-bot path](/features/bot-intentional-silence) — where silence 
 
 ---
 
+## Creation-time validation and preview
+
+A scheduled job now pre-flights its delivery target at creation, so "where will this go?" is answered before it ever fires — an unroutable token surfaces an actionable warning the moment you create the schedule, instead of being silently dropped at fire time.
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+AgentScheduler(agent, task="Morning brief", deliver="telegram:123456").start("hourly")
+# → logs: Scheduled -> telegram:123456
+```
+
+```mermaid
+graph LR
+    Create[📝 Create schedule<br/>deliver='telegram:123456'] --> Validate[🔀 SchedulerDelivery.validate]
+    Validate --> Routable{Routable?}
+    Routable -->|Yes| Log[✅ log 'Scheduled -> telegram:123456']
+    Routable -->|No| Warn[🟥 log WARN + reason + hint]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef failure fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Create input
+    class Validate,Routable process
+    class Log success
+    class Warn failure
+```
+
+The pre-flight runs the moment `AgentScheduler` (or the `SchedulerDelivery` wrapper) is constructed — before the first tick.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Sched as CLI / Python
+    participant Delivery as SchedulerDelivery
+    participant Router as DeliveryRouter
+    participant Channel
+
+    User->>Sched: create schedule (deliver="telegram:xxx")
+    Sched->>Delivery: construct(target)
+    Delivery->>Delivery: validate()
+    alt routable
+        Delivery->>Sched: log "Scheduled -> telegram:xxx"
+    else unroutable
+        Delivery->>Sched: log WARN "not routable: <reason> <hint>"
+    end
+    Note over Delivery: (later, at fire time)
+    Delivery->>Router: deliver(target, payload)
+    Router->>Channel: send_message
+```
+
+### Which primitive do I reach for?
+
+```mermaid
+graph TB
+    Q{What do you need?} -->|See where a target will go| Preview[DeliveryTarget.preview]
+    Q -->|Check if a target is reachable| Validate[create AgentScheduler<br/>→ logs DeliveryValidation]
+    Q -->|Fail hard on a bad target| Error[raise / catch ScheduleTargetError]
+    Q -->|Writing a custom resolver| Resolver[implement optional<br/>validate_target / preview_target]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class Preview,Validate,Error,Resolver opt
+```
+
+### Preview grammar
+
+`DeliveryTarget.preview()` is pure and dependency-free — nothing is fetched, so it is safe to call before the gateway is up. It renders the resolved destination as one of:
+
+| Rendering | When |
+|---|---|
+| `platform:channel_id` | Explicit channel (e.g. `telegram:@alice`) |
+| `platform:channel_id:thread_id` | Explicit channel + thread (e.g. `telegram:123:789`) |
+| `origin` / `all` | Symbolic routing tokens, preserved verbatim |
+| `<unrouted>` | An empty/no-op target with no resolvable destination |
+
+Pass `session_target="main"` (or `"isolated"`) to append a ` (session <id>)` suffix when the caller knows the session hint.
+
+```python
+from praisonaiagents.scheduler import DeliveryTarget
+
+target = DeliveryTarget.parse("telegram:@alice")
+print(target.preview())                       # → telegram:@alice
+print(target.preview(session_target="main"))  # → telegram:@alice (session main)
+```
+
+### The validation result
+
+Creating an `AgentScheduler` with a `deliver=` token pre-flights it and logs the outcome. That outcome is a frozen `DeliveryValidation` — the structured answer to "will this route?" — with four fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ok` | `bool` | `True` when the target resolves to a reachable route |
+| `reason` | `str` | On failure, why it is unroutable (empty when `ok`) |
+| `hint` | `str` | On failure, the actionable next step (empty when `ok`) |
+| `preview` | `str` | Dry-run preview of the destination |
+
+A routable target logs `Scheduled -> <preview>` at info level; an unroutable one logs a warning carrying `reason` and `hint`.
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+
+# Routable → logs: Scheduled -> telegram:123456
+AgentScheduler(agent, task="Morning brief", deliver="telegram:123456").start("hourly")
+
+# Unroutable → logs a warning with the reason and an actionable hint
+AgentScheduler(agent, task="Morning brief", deliver="all").start("hourly")
+```
+
+### Fail-fast with `ScheduleTargetError`
+
+Creating a scheduler with an unroutable token **logs an actionable warning but does not raise** — so a caller that only wants a preview isn't blocked. When you want hard-fail behaviour, raise `ScheduleTargetError` yourself with the structured `reason` / `hint`:
+
+```python
+from praisonaiagents.gateway import ScheduleTargetError
+
+def require_routable(preview: str, reason: str = "", hint: str = "") -> None:
+    if reason:
+        raise ScheduleTargetError(reason, hint)
+
+try:
+    require_routable(
+        preview="all",
+        reason="symbolic target 'all' cannot be resolved by the lightweight path",
+        hint="Use a 'platform' or 'platform:channel_id' token.",
+    )
+except ScheduleTargetError as e:
+    # e.reason and e.hint are structured, actionable strings
+    print(f"cannot schedule: {e.reason} — {e.hint}")
+```
+
+<Note>
+`ScheduleTargetError` **subclasses `ValueError`**, so any existing `except ValueError` handler keeps catching it — you can adopt the structured `reason` / `hint` fields incrementally.
+</Note>
+
+### Custom resolvers
+
+A custom delivery resolver can opt into creation-time pre-flight by implementing the optional `validate_target()` and `preview_target()` methods from `DeliveryPreflightProtocol`. Both are backward-compatible — a resolver that implements only `resolve()` still satisfies `DeliveryResolverProtocol` and keeps working exactly as before; callers duck-type on the pre-flight methods and fall back to the structural `DeliveryTarget.preview()` check when they are absent. See the [scheduler SDK reference](/sdk/praisonai/scheduler) for the exact signatures.
+
+---
+
 ## Reliability Guarantees
 
 Delivery reuses the existing `DeliveryRouter`, so scheduled sends inherit the gateway's guarantees.
 
 | Guarantee | What it means |
 |-----------|---------------|
+| **Creation-time pre-flight** | Unroutable delivery tokens surface a warning the moment the schedule is created — no more silent drops on the first fire. Fire-time dead-target self-heal remains the second line of defence. See [Creation-time validation and preview](#creation-time-validation-and-preview). |
 | **Rate limiting** | Inherits the router's per-platform token-bucket limits |
 | **Idempotency dedup — lightweight `AgentScheduler`** | Router LRU (in-process). A re-fired job delivering the same result to the same target is deduplicated within one process. |
 | **Idempotency dedup — gateway-hosted scheduled/proactive delivery** | Durable — enqueued via SQLite `OutboundQueue` at `~/.praisonai/state/gateway_outbox.sqlite`. Survives a crash-and-restart: a re-fired job is a no-op INSERT that resolves to the already-`sent` row. Falls back to the router LRU only if the durable store cannot be built. |
@@ -873,5 +1024,8 @@ Use Python inside an app, YAML for a config-file deploy, and the CLI for one-off
 </Card>
 <Card title="Gateway Inbound Hooks" icon="webhook" href="/features/gateway-inbound-hooks">
   Shares the same delivery target format
+</Card>
+<Card title="DeliveryTarget SDK reference" icon="code" href="/sdk/praisonai/scheduler">
+  Field-level detail for `DeliveryTarget`, `preview()`, and `DeliveryValidation`
 </Card>
 </CardGroup>
