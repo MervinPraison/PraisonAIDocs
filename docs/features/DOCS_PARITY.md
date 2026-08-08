@@ -18,22 +18,22 @@ This report compares **Python SDK feature categories** against **Python document
 | Category | Features | Docs | Lines |
 |----------|----------|------|-------|
 | ✅ AGUI | 1 | 2 | 420 |
-| ✅ Agent | 22 | 49 | 15427 |
+| ✅ Agent | 22 | 49 | 15432 |
 | ✅ Agent-to-Agent (A2A) | 1 | 7 | 2965 |
 | ✅ Agent-to-User (A2U) | 1 | 3 | 684 |
 | ✅ Approval | 1 | 5 | 2500 |
 | ✅ Audio | 2 | 12 | 1000 |
 | ✅ Auto Generation | 5 | 10 | 3005 |
 | ✅ Autonomy | 3 | 7 | 2736 |
-| ✅ Bots | 7 | 31 | 13154 |
+| ✅ Bots | 7 | 31 | 13253 |
 | ✅ Budget | 1 | 1 | 287 |
-| ✅ CLI | 5 | 121 | 35632 |
+| ✅ CLI | 5 | 121 | 35638 |
 | ✅ Chunking | 2 | 2 | 385 |
 | ✅ Citations | 2 | 1 | 202 |
-| ✅ Code Execution | 2 | 14 | 4543 |
+| ✅ Code Execution | 2 | 14 | 4548 |
 | ✅ Conditions | 1 | 3 | 1179 |
-| ✅ Configuration | 3 | 8 | 3045 |
-| ✅ Context Management | 16 | 34 | 13335 |
+| ✅ Configuration | 3 | 8 | 3047 |
+| ✅ Context Management | 16 | 34 | 13388 |
 | ✅ Deep Research | 8 | 2 | 587 |
 | ✅ Display | 6 | 3 | 741 |
 | ✅ Embeddings | 6 | 23 | 2049 |
@@ -42,7 +42,7 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Execution | 3 | 4 | 1560 |
 | ✅ Failover | 2 | 1 | 432 |
 | ✅ Files | 2 | 7 | 2273 |
-| ✅ Flow | 1 | 3 | 777 |
+| ✅ Flow | 1 | 3 | 788 |
 | ✅ Gateway | 7 | 65 | 23919 |
 | ✅ Guardrails | 4 | 4 | 1833 |
 | ✅ Handoffs | 11 | 6 | 2563 |
@@ -69,7 +69,7 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Retrieval | 2 | 5 | 1044 |
 | ✅ Routing | 1 | 2 | 430 |
 | ✅ Sandbox | 5 | 6 | 2806 |
-| ✅ Security | 1 | 3 | 2991 |
+| ✅ Security | 1 | 3 | 3025 |
 | ✅ Sessions | 4 | 17 | 6960 |
 | ✅ Skills | 6 | 15 | 5638 |
 | ✅ Tasks | 2 | 6 | 2819 |
