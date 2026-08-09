@@ -16,7 +16,7 @@ agent = Agent(
     instructions="You are a helpful assistant",
     llm=LLMConfig(
         model="gpt-4o",
-        fallbacks=["anthropic/claude-3-5-sonnet", "gpt-4o-mini"],
+        fallback_models=["anthropic/claude-3-5-sonnet", "gpt-4o-mini"],
     ),
 )
 agent.start("Answer even when the primary model is overloaded")
@@ -82,13 +82,40 @@ agent = Agent(
 )
 ```
 </Step>
+
+<Step title="Notice the switch">
+Subscribe to `HookEvent.MODEL_FALLBACK` to react the moment the primary model is swapped out:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.config import LLMConfig
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.MODEL_FALLBACK)
+def notice(evt):
+    print(f"[fallback] {evt.from_model} → {evt.to_model} ({evt.reason_category})")
+    return HookResult.allow()
+
+agent = Agent(
+    instructions="You are a helpful assistant",
+    llm=LLMConfig(
+        model="gpt-4o",
+        fallback_models=["claude-3-5-sonnet", "gpt-4o-mini"],
+    ),
+    hooks=registry,
+)
+agent.start("Answer even during a provider outage")
+```
+</Step>
 </Steps>
 
 ## How It Works
 
 On transient errors (503, timeout, model overloaded), the agent retries the **same turn** against the next model in `fallback_models`. Successful calls stay on the primary model.
 
-Failover fires on retryable errors classified by the LLM error classifier and covers **every** turn shape — non-streaming, streaming, tool-iteration turns, reflection turns, and their async equivalents. A 503 on a streaming chunk pushes the same turn to the next model in `fallbacks`; the user sees continuous output, not a failure.
+Failover fires on retryable errors classified by the LLM error classifier and covers **every** turn shape — non-streaming, streaming, tool-iteration turns, reflection turns, and their async equivalents. A 503 on a streaming chunk pushes the same turn to the next model in `fallback_models`; the user sees continuous output, not a failure.
 
 ```mermaid
 sequenceDiagram
@@ -106,10 +133,123 @@ sequenceDiagram
     Agent-->>User: reply
 ```
 
+## Observing the Switch
+
+Subscribe to `HookEvent.MODEL_FALLBACK` (or the `MODEL_FALLBACK` stream event) to react the moment the primary model is swapped out — for alerts, metrics, a UI notice, or a per-user notification.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Primary as Primary (gpt-4o)
+    participant Fallback as Fallback (claude-3-5-sonnet)
+
+    User->>Agent: prompt
+    Agent->>Primary: chat completion
+    Primary-->>Agent: 503 unavailable
+    Note over Agent: emit MODEL_FALLBACK<br/>(from_model, to_model, reason_category, fallback_index)
+    Agent->>Fallback: retry same turn
+    Fallback-->>Agent: response
+    Agent-->>User: reply
+```
+
+### `ModelFallbackInput` fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `from_model` | `str` | `""` | Model id the turn was using when the failure hit (e.g. `"gpt-4o"`). |
+| `to_model` | `str` | `""` | Next entry in the `fallback_models` chain that the turn continues on. |
+| `reason_category` | `str` | `""` | Failure classification from the LLM error classifier (e.g. `"rate_limit"`, `"provider_down"`, `"timeout"`). Provider internals stay redacted. |
+| `fallback_index` | `int` | `0` | 0-based index into `fallback_models` of the entry now in use. |
+| `session_id`, `cwd`, `event_name`, `timestamp`, `agent_name` | — | — | Standard `HookInput` fields. |
+
+<Note>
+Notification only — the turn already continued on `to_model`. Provider internals are redacted; only the failure class reaches your hook. Zero overhead when unsubscribed. Errors inside the hook never break the fallback path.
+</Note>
+
+### Hook subscription
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.config import LLMConfig
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.MODEL_FALLBACK)
+def on_fallback(evt):
+    print(f"[fallback] {evt.from_model} → {evt.to_model}")
+    print(f"           reason={evt.reason_category} index={evt.fallback_index}")
+    return HookResult.allow()
+
+agent = Agent(
+    instructions="You are a helpful assistant",
+    llm=LLMConfig(
+        model="gpt-4o",
+        fallback_models=["claude-3-5-sonnet", "gpt-4o-mini"],
+    ),
+    hooks=registry,
+)
+agent.start("Answer even during a provider outage")
+```
+
+### Stream event
+
+When a stream callback is active, the same swap emits a `StreamEventType.MODEL_FALLBACK` event carrying the four fields in `metadata`, plus `agent_id`, `session_id`, and `run_id`.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.config import LLMConfig
+from praisonaiagents.streaming import StreamEvent, StreamEventType
+
+agent = Agent(
+    instructions="You are a helpful assistant",
+    llm=LLMConfig(
+        model="gpt-4o",
+        fallback_models=["claude-3-5-sonnet", "gpt-4o-mini"],
+    ),
+    stream=True,
+)
+
+def on_event(event: StreamEvent):
+    if event.type == StreamEventType.MODEL_FALLBACK:
+        m = event.metadata
+        print(f"[stream] switched {m['from_model']} → {m['to_model']} ({m['reason_category']})")
+
+agent.stream_emitter.add_callback(on_event)
+agent.start("Answer even during a provider outage")
+```
+
+### Sync and async paths
+
+Both call sites emit — the sync `_chat_completion` path and the async `_handle_async_llm_error` path — so the hook fires whether you run `agent.start(...)` or `await agent.astart(...)`.
+
+<Tabs>
+<Tab title="Sync path">
+```python
+@registry.on(HookEvent.MODEL_FALLBACK)
+def on_fallback(evt):
+    print(f"[fallback] {evt.from_model} → {evt.to_model}")
+    return HookResult.allow()
+
+agent.start("Answer even during a provider outage")
+```
+</Tab>
+<Tab title="Async path">
+```python
+@registry.on(HookEvent.MODEL_FALLBACK)
+async def on_fallback(evt):
+    print(f"[fallback] {evt.from_model} → {evt.to_model}")
+    return HookResult.allow()
+
+await agent.astart("Answer even during a provider outage")
+```
+</Tab>
+</Tabs>
+
 ## Configuration Options
 
-| Option | Type | Default | Description |
-|---Model Fallback keeps your agent answering by automatically retrying on alternate models when the primary model is overloaded or unavailable.
+Model Fallback is configured through `LLMConfig` — set `model` for the primary and `fallback_models` for the ordered backup chain.
 
 ```python
 from praisonaiagents import Agent
@@ -117,12 +257,20 @@ from praisonaiagents.config import LLMConfig
 
 agent = Agent(
     instructions="You are a helpful assistant",
-    llm=LLMConfig(model="gpt-4o", fallbacks=["claude-3-5-sonnet", "gpt-4o-mini"]),
+    llm=LLMConfig(
+        model="gpt-4o",
+        fallback_models=["claude-3-5-sonnet", "gpt-4o-mini"],
+    ),
 )
 agent.start("Hello!")
 ```
 
-The user sends a message; if the primary model fails, the agent retries on configured fallbacks.
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `model` | `str` | — | Primary model the turn starts on. |
+| `fallback_models` | `Optional[List[str]]` | `None` | Ordered backup chain; the runtime advances to the next entry on a retryable failure. |
+
+The decision diagram below shows which chain shape fits which scenario.
 
 ```mermaid
 graph TB
@@ -140,8 +288,12 @@ graph TB
 ```
 
 <Note>
-Streaming, tool-iteration and reflection turns route through the same failover engine as plain single-shot calls (unified in [PraisonAI PR #2665](https://github.com/MervinPraison/PraisonAI/pull/2665)). You don't need a separate `fallbacks=` setting for streaming paths.
+Streaming, tool-iteration and reflection turns route through the same failover engine as plain single-shot calls (unified in [PraisonAI PR #2665](https://github.com/MervinPraison/PraisonAI/pull/2665)). You don't need a separate `fallback_models=` setting for streaming paths.
 </Note>
+
+<Card title="LLMConfig API Reference" icon="code" href="/features/hook-events">
+  Full `LLMConfig` surface is covered by the auto-generated SDK reference — see [Hook Events](/features/hook-events) for the paired `MODEL_FALLBACK` hook.
+</Card>
 
 ## Best Practices
 
