@@ -308,35 +308,40 @@ curl -X POST http://SERVER_IP:8000/ask \
 
 ## How It Works
 
-The `agents` server builds one shared generator per app and routes every request through the same YAML pipeline.
+The `agents` server builds one shared generator per app at startup, then builds a lightweight per-request generator for each call that borrows the cached generator's warm pieces.
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant App as FastAPI (lifespan)
-    participant Gen as AgentsGenerator
-    participant Lock as asyncio.Lock
+    participant Cached as Cached Generator
+    participant PerReq as Per-request Generator
 
-    App->>Gen: build once at startup
+    App->>Cached: build once at startup<br/>(warm adapter, config_list,<br/>tool_resolver, tool-timeout pool)
     Client->>App: POST /agents or /agents/{name}
-    App->>Lock: acquire (serialise cli_config)
-    Lock->>Gen: run through ToolResolver, tool_timeout, approval, guardrails, retry
-    Gen-->>Client: response
-    App->>Gen: close() at shutdown
+    App->>PerReq: build per-request<br/>(own cli_config, borrows cached pieces)
+    PerReq->>PerReq: run through ToolResolver, tool_timeout,<br/>approval, guardrails, retry
+    PerReq-->>Client: response
+    App->>Cached: close() at shutdown<br/>(owns tool-timeout pool)
 
     classDef app fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef gen fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef lock fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef cached fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef perreq fill:#F59E0B,stroke:#7C90A0,color:#fff
 
     class App app
-    class Gen gen
-    class Lock lock
+    class Cached cached
+    class PerReq perreq
 ```
 
 - **Generator cached per app.** A FastAPI `lifespan` builds a single `AgentsGenerator` at startup and `close()`s it at shutdown — no per-request YAML re-parse, framework re-resolution, or fresh 32-worker tool-timeout pool on every call.
-- **Concurrency-safe.** Concurrent requests are serialised on the shared `cli_config` via a per-app `asyncio.Lock`.
+- **Truly concurrent.** Each request builds a lightweight per-request `AgentsGenerator` that carries its own `cli_config` and borrows the cached generator's warm, immutable pieces (adapter, `config_list`, `tool_resolver`, tool-timeout thread pool). Concurrent requests never share mutable state and are **not** serialised — throughput now scales with the event loop.
+- **Cached pool ownership.** The cached generator still owns and shuts down the tool-timeout thread pool at app shutdown; per-request generators treat it as borrowed and delegate leak accounting / recycling back to the owner (`_get_tool_timeout_executor`, `_note_leaked_worker`, `_timeout_owner_key`).
 - **Graceful fallback.** If the cached generator can't be built, the server falls back to the per-request `praisonai.arun` path.
-- **Route convergence.** Both `/agents` and `/agents/{agent_name}` run through the cached generator, so both apply identical YAML lowering (`ToolResolver`, `tool_timeout`, `approval`, `guardrails`, retry policy). `POST /agents/{agent_name}` returns `404` for an unknown name.
+- **Route convergence.** Both `/agents` and `/agents/{agent_name}` run through the same YAML lowering (`ToolResolver`, `tool_timeout`, `approval`, `guardrails`, retry policy). `POST /agents/{agent_name}` returns `404` for an unknown name.
+
+<Note>
+**What changed in PR [#3812](https://github.com/MervinPraison/PraisonAI/pull/3812).** The per-app `asyncio.Lock` that used to serialise every request on the shared `cli_config` is gone. Each request now runs on its own per-request `AgentsGenerator` that borrows the cached generator's warm pieces, so concurrent requests are no longer serialised. Behaviour is otherwise unchanged — same routes, same YAML pipeline.
+</Note>
 
 ## Environment Variables
 
