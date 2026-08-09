@@ -11,6 +11,7 @@ The ``praisonai`` wrapper provides backward-compatible shims.
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from contextlib import (
@@ -31,6 +32,7 @@ from typing import (
     Literal,
     Optional,
     Protocol,
+    Sequence,
     Set,
     Tuple,
     TypedDict,
@@ -2263,6 +2265,51 @@ class HomeChannelRegistryProtocol(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class DeliveryValidation:
+    """Result of a creation-time delivery-target pre-flight (Issue #3800).
+
+    A scheduled job or agent-initiated proactive message carries a
+    ``DeliveryTarget`` whose reachability is otherwise only discovered when the
+    job *fires* — potentially hours later, where an unroutable target is
+    silently dropped or dead-target self-healed. This closed shape lets a
+    resolver answer "will this route?" the moment the send is created, so the
+    creator gets an immediate, actionable error instead of a late invisible
+    drop.
+
+    Attributes:
+        ok: Whether the target resolves to a reachable channel/route.
+        reason: On failure, a human-readable explanation of why it is
+            unroutable (empty when ``ok``).
+        hint: On failure, an actionable next step (e.g. the configured
+            channels, or a command to list them); empty when ``ok``.
+        preview: A dry-run preview of the destination (e.g.
+            ``"telegram:@alice (session main)"``) suitable for surfacing to the
+            creator before commit.
+    """
+
+    ok: bool
+    reason: str = ""
+    hint: str = ""
+    preview: str = ""
+
+
+class ScheduleTargetError(ValueError):
+    """Raised when a scheduled/agent-initiated send has an unroutable target.
+
+    Carries the structured :class:`DeliveryValidation` reason/hint so the
+    scheduler/CLI can fail fast at *creation* time with an actionable message
+    (``channel 'telegramm' is not configured. Configured: telegram, slack.``)
+    rather than accepting a target that is only discovered dead at fire time.
+    """
+
+    def __init__(self, reason: str, hint: str = ""):
+        self.reason = reason
+        self.hint = hint
+        message = f"{reason} {hint}".strip() if hint else reason
+        super().__init__(message)
+
+
 @runtime_checkable
 class DeliveryResolverProtocol(Protocol):
     """Protocol for resolving delivery routing tokens.
@@ -2291,6 +2338,46 @@ class DeliveryResolverProtocol(Protocol):
             
         Returns:
             List of concrete delivery targets
+        """
+        ...
+
+
+@runtime_checkable
+class DeliveryPreflightProtocol(Protocol):
+    """Optional creation-time pre-flight extension for delivery resolvers.
+
+    Kept separate from :class:`DeliveryResolverProtocol` so the base contract
+    stays ``resolve()``-only: an existing resolver that implements just
+    ``resolve`` still satisfies ``DeliveryResolverProtocol`` under
+    ``isinstance``/``runtime_checkable``. A resolver that can additionally
+    pre-flight or preview a target against its live registry advertises that by
+    also satisfying this protocol; callers duck-type on it and fall back to a
+    structural, registry-free check (:meth:`DeliveryTarget.preview`) otherwise.
+    """
+
+    def validate_target(
+        self, target: "DeliveryTarget"
+    ) -> "DeliveryValidation":
+        """Pre-flight ``target`` against the live channel/route registry.
+
+        Called at *creation* time (when a scheduled/agent-initiated send is
+        registered) so an unroutable target is rejected or warned on with an
+        actionable message, instead of being silently dropped when the job
+        fires.
+
+        Returns:
+            A :class:`DeliveryValidation` (``ok`` / ``reason`` / ``hint`` /
+            ``preview``).
+        """
+        ...
+
+    def preview_target(
+        self, target: "DeliveryTarget"
+    ) -> str:
+        """Return a dry-run preview of where ``target`` will deliver.
+
+        A short, display-only string (e.g. ``"telegram:@alice (session
+        main)"``) so the creator sees the destination before commit.
         """
         ...
 
@@ -3249,6 +3336,136 @@ class MemoryPressurePolicy:
         if self.soft_rss_mb and rss >= self.soft_rss_mb:
             return AdmissionDecision.QUEUE
         return AdmissionDecision.ADMIT
+
+
+# ---------------------------------------------------------------------------
+# Gateway memory-pressure cache eviction (Issue #3804)
+#
+# ``MemoryPressurePolicy`` above sheds *new* inbound turns under RSS pressure,
+# but it never reclaims the memory already held by *idle* warm per-session
+# agent caches. On a memory-limited host (a "$5 VPS", a Fly machine, a k8s pod
+# with a cgroup limit) a busy gateway accumulates dozens of warm caches and,
+# absent eviction, keeps climbing until the kernel OOM-kills the whole process
+# — dropping *every* live session at once. This adds a pure, import-free
+# planner that, given a memory *budget* and the LRU order of warm sessions,
+# names the coldest rebuildable caches to soft-evict *before* the OOM killer
+# fires. Each victim is transparently rebuilt from the persisted session store
+# on its next turn, so eviction is cheap and lossless — as long as we never
+# evict a session with an unflushed transcript or an in-flight turn.
+#
+# The *decision* lives here (provable in isolation, no event loop, no heavy
+# imports), mirroring :class:`MemoryPressurePolicy`; the *mechanism* — the warm
+# registry, the LRU order and the flushed/in-flight signals, plus reading the
+# cgroup limit and anon RSS — lives in the running gateway (the wrapper).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WarmSession:
+    """A warm per-session agent cache eligible for memory-pressure eviction.
+
+    A pure, import-free fact carried from the running gateway to
+    :func:`plan_pressure_evictions`. Attributes:
+
+    * ``session_id``: the cache key to soft-evict.
+    * ``last_activity``: monotonic/epoch seconds of the session's last turn;
+      the planner evicts the coldest (smallest ``last_activity``) first.
+    * ``in_flight``: ``True`` while a turn is executing — never evicted (would
+      abort live work).
+    * ``flushed``: ``True`` when the transcript is durably persisted — only a
+      flushed cache is rebuildable, so an unflushed one is never evicted
+      (would lose data).
+    """
+
+    session_id: str
+    last_activity: float = 0.0
+    in_flight: bool = False
+    flushed: bool = True
+
+
+@runtime_checkable
+class MemoryPressureProtocol(Protocol):
+    """Protocol for reading the memory budget and pressure of a gateway host.
+
+    Pure contract the gateway implements over its own process: report the
+    container's memory limit (from the cgroup v1/v2 memory limit) and the
+    current anonymous (non-reclaimable) RSS, so the eviction budget tracks the
+    *real* container ceiling rather than a hard-coded number. Both return
+    ``None``/``0`` gracefully when the platform can't report them, so the
+    planner degrades to a no-op instead of crashing the gateway it protects.
+    """
+
+    def cgroup_limit_mb(self) -> Optional[float]:
+        """Return the container memory limit in MiB, or ``None`` if unknown."""
+        ...
+
+    def anon_rss_mb(self) -> float:
+        """Return current anonymous (non-reclaimable) RSS in MiB."""
+        ...
+
+
+def plan_pressure_evictions(
+    budget_mb: Optional[float],
+    rss_mb: float,
+    warm_sessions: Sequence[WarmSession],
+    *,
+    headroom_ratio: float = 0.9,
+) -> List[str]:
+    """Return the ``session_id``s to soft-evict, coldest (LRU) first.
+
+    A pure planner: it takes the container memory *budget* (typically the
+    cgroup limit), the current anonymous ``rss_mb`` and the warm-cache
+    registry, and names the coldest rebuildable caches to shed until RSS is
+    back within ``headroom_ratio`` of the budget. It never touches the event
+    loop or the caches themselves — the gateway enacts the returned plan.
+
+    Guards (a victim is *skipped*, never evicted, when):
+
+    * ``in_flight`` is ``True`` — an executing turn must not be aborted, or
+    * ``flushed`` is ``False`` — an unflushed transcript is not yet rebuildable
+      from the store, so evicting it would lose data.
+
+    Returns an empty list when RSS is within budget, the budget is unknown
+    (``None``/``<= 0``), or nothing evictable remains — so a host that can't
+    report a cgroup limit simply never soft-evicts (legacy behaviour).
+    """
+    if budget_mb is None:
+        return []
+    try:
+        budget = float(budget_mb)
+        rss = float(rss_mb)
+    except (TypeError, ValueError):
+        return []
+    # Reject non-finite measurements (NaN/inf): a NaN budget or rss would slip
+    # past the ``rss <= target`` check (every comparison with NaN is False) and
+    # spuriously evict *every* warm cache — the opposite of protecting them.
+    if not math.isfinite(budget) or not math.isfinite(rss) or budget <= 0:
+        return []
+    try:
+        ratio = float(headroom_ratio)
+    except (TypeError, ValueError):
+        ratio = 0.9
+    if not (math.isfinite(ratio) and 0.0 < ratio <= 1.0):
+        ratio = 0.9
+    target = budget * ratio
+    if rss <= target:
+        return []
+
+    # Name the coldest evictable caches, LRU-first. We deliberately do not
+    # track per-cache bytes (guessing sizes would be scope creep) so we cannot
+    # remeasure RSS mid-plan; instead the planner returns every evictable cache
+    # coldest-first and the gateway evicts down that ordered list, re-sampling
+    # its own RSS as it goes and stopping as soon as it is back within target.
+    # Over-shedding is thus avoided by the enactor and under-shedding is caught
+    # on the next pass — keeping this decision pure and byte-agnostic.
+    evictable = [
+        s for s in warm_sessions
+        if not s.in_flight and s.flushed
+    ]
+    if not evictable:
+        return []
+    evictable.sort(key=lambda s: (s.last_activity, s.session_id))
+    return [s.session_id for s in evictable]
 
 
 # ---------------------------------------------------------------------------

@@ -92,6 +92,12 @@ class AgentScheduler(_BaseAgentScheduler):
         # ``from_blueprint`` / YAML) so a target set there is honoured too.
         self.deliver = deliver or (self.config.get("deliver", "") if self.config else "")
         self._delivery = None
+        # Creation-time pre-flight (Issue #3800): build the delivery wrapper now,
+        # not lazily at fire time, so "where will this go?" is answered — and an
+        # unroutable token warned on — the moment the scheduler is created,
+        # instead of only after the first scheduled run completes.
+        if self.deliver:
+            self._build_delivery()
         
         self.is_running = False
         self._stop_event = threading.Event()
@@ -417,44 +423,6 @@ class AgentScheduler(_BaseAgentScheduler):
             logger.error(f"One-time execution failed: {e}")
             raise
 
-    def _deliver_result(self, result: Any) -> None:
-        """Route a successful result to the configured chat target.
-
-        No-op when no ``deliver`` target is set. The delivery target is
-        resolved and sent through the shared ``DeliveryRouter`` (rate limiting,
-        idempotency dedup, dead-target self-heal), reusing the same machinery
-        the gateway uses — without requiring the full gateway. Never raises: a
-        delivery problem must not tear down the scheduler.
-        """
-        if not self.deliver:
-            return
-        text = str(result)
-        # Honour the core intentional-silence contract on the unattended path:
-        # a run whose whole output is an exact silence marker (NO_REPLY /
-        # [SILENT] / SILENT) means "nothing worth sending — stay quiet". The
-        # run still completes and is recorded in history; only delivery is
-        # suppressed. Prose that merely mentions the token is unaffected
-        # (is_intentional_silence_response is exact-match).
-        if self._should_suppress_delivery(text):
-            logger.info(
-                "Scheduled run chose intentional silence; delivery suppressed"
-            )
-            return
-        try:
-            if self._delivery is None:
-                from praisonai.scheduler._delivery import SchedulerDelivery
-                job_id = self.config.get("agent_id", "") if self.config else ""
-                # Pass the persisted origin (if any) so a ``deliver="origin"``
-                # target resolves to the concrete channel the job was created
-                # in — without the full gateway.
-                origin = SchedulerDelivery.origin_from_config(self.config)
-                self._delivery = SchedulerDelivery(
-                    self.deliver, job_id=job_id, origin=origin
-                )
-            self._delivery.deliver(text)
-        except Exception as e:
-            logger.error(f"Scheduler delivery error: {e}")
-    
     @classmethod
     def from_yaml(
         cls,

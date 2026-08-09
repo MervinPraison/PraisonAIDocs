@@ -141,6 +141,11 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
         self.max_cost = max_cost
         self.deliver = deliver or (self.config.get("deliver", "") if self.config else "")
         self._delivery = None
+        # Creation-time pre-flight (Issue #3800): build the delivery wrapper now,
+        # not lazily at fire time, so an unroutable token is surfaced the moment
+        # the scheduler is created rather than after the first run completes.
+        if self.deliver:
+            self._build_delivery()
         self._total_cost = 0.0
         
         self.is_running = False
@@ -156,39 +161,6 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
         self._stop_event: Optional[asyncio.Event] = None
         self._stats_lock: Optional[asyncio.Lock] = None
         self._bound_loop: Optional[asyncio.AbstractEventLoop] = None
-
-    def _deliver_result(self, result: Any) -> None:
-        """Route a successful result to the configured chat target.
-
-        No-op when no ``deliver`` target is set. Reuses the shared
-        ``DeliveryRouter`` (rate limiting, idempotency dedup, dead-target
-        self-heal) without the full gateway. Never raises.
-        """
-        if not self.deliver:
-            return
-        text = str(result)
-        # Honour the core intentional-silence contract on the unattended path:
-        # a run whose whole output is an exact silence marker means "nothing
-        # worth sending — stay quiet". Mirrors the sync scheduler.
-        if self._should_suppress_delivery(text):
-            logger.info(
-                "Scheduled run chose intentional silence; delivery suppressed"
-            )
-            return
-        try:
-            if self._delivery is None:
-                from praisonai.scheduler._delivery import SchedulerDelivery
-                job_id = self.config.get("agent_id", "") if self.config else ""
-                # Pass the persisted origin (if any) so a ``deliver="origin"``
-                # target resolves to the concrete channel the job was created
-                # in — without the full gateway.
-                origin = SchedulerDelivery.origin_from_config(self.config)
-                self._delivery = SchedulerDelivery(
-                    self.deliver, job_id=job_id, origin=origin
-                )
-            self._delivery.deliver(text)
-        except Exception as e:
-            logger.error(f"Scheduler delivery error: {e}")
 
     def _ensure_async_primitives(self) -> None:
         """Create async primitives if they don't exist yet.

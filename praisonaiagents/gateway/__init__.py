@@ -39,6 +39,10 @@ from .protocols import (
     # Home channel and delivery protocols
     HomeChannelRegistryProtocol,
     DeliveryResolverProtocol,
+    # Creation-time delivery-target pre-flight (Issue #3800)
+    DeliveryPreflightProtocol,
+    DeliveryValidation,
+    ScheduleTargetError,
     # Agent-facing outbound messaging
     OutboundMessengerProtocol,
     DeliveryResult,
@@ -81,6 +85,10 @@ from .protocols import (
     ResourceSample,
     ResourcePressurePolicyProtocol,
     MemoryPressurePolicy,
+    # Gateway memory-pressure cache eviction (Issue #3804)
+    WarmSession,
+    MemoryPressureProtocol,
+    plan_pressure_evictions,
     # Gateway rate-limit admission (Issue #2532)
     RateLimitDecision,
     RateLimitPolicyProtocol,
@@ -283,6 +291,9 @@ __all__ = [
     # Home channel and delivery protocols
     "HomeChannelRegistryProtocol",
     "DeliveryResolverProtocol",
+    "DeliveryPreflightProtocol",
+    "DeliveryValidation",
+    "ScheduleTargetError",
     # Agent-facing outbound messaging
     "OutboundMessengerProtocol",
     "DeliveryResult",
@@ -324,6 +335,10 @@ __all__ = [
     "ResourceSample",
     "ResourcePressurePolicyProtocol",
     "MemoryPressurePolicy",
+    # Gateway memory-pressure cache eviction (Issue #3804)
+    "WarmSession",
+    "MemoryPressureProtocol",
+    "plan_pressure_evictions",
     # Gateway rate-limit admission (Issue #2532)
     "RateLimitDecision",
     "RateLimitPolicyProtocol",
