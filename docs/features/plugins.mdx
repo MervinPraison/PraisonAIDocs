@@ -669,6 +669,134 @@ def create_plugin():
     return TokenInjector()
 ```
 
+## Message-Lifecycle Plugins
+
+Override `before_message`, `after_message`, `message_sent`, or `message_undelivered` to react to every hop of a message's lifecycle — per-user policy, per-channel redaction, delivery telemetry, or dead-letter escalation.
+
+### Choosing a message hook
+
+```mermaid
+graph TB
+    Q[What do you want to react to?] --> A[Inbound message before agent sees it]
+    Q --> B[Outbound reply before delivery]
+    Q --> C[Successful delivery]
+    Q --> D[Permanent delivery failure]
+    A --> R1[before_message → MESSAGE_RECEIVED - can block/rewrite]
+    B --> R2[after_message → MESSAGE_SENDING - can rewrite]
+    C --> R3[message_sent → MESSAGE_SENT - observe-only]
+    D --> R4[message_undelivered → MESSAGE_UNDELIVERED - observe-only, +error/notice_delivered]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef option fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q decision
+    class A,B,C,D option
+    class R1,R2,R3,R4 result
+```
+
+### Enriched payload keys
+
+Every message-lifecycle method receives (at most) these keys:
+
+| Key | Type | Present on | Description |
+|-----|------|------------|-------------|
+| `content` | `str` | All four events | Always emitted (empty string when the input has none). |
+| `platform` | `str` | All four events (when set) | Adapter/channel identifier (e.g. `"telegram"`, `"slack"`, `"cli"`). |
+| `sender_id` | `str` | Inbound (when set) | Stable identifier for the user/agent that sent the message. |
+| `channel_id` | `str` | Inbound + outbound (when set) | Stable identifier for the channel/thread/DM. |
+| `channel_type` | `str` | Inbound (when set) | e.g. `"dm"`, `"group"`, `"channel"`, `"broadcast"`. |
+| `message_id` | `str` | Inbound + `message_sent` (when set) | Provider-native message id for correlation. |
+| `session_id` | `str` | All four events (when set) | PraisonAI session id — pair with `session_start` / `session_end`. |
+| `error` | `str` | **`message_undelivered` only** | Failure classification / message from the delivery pipeline. |
+| `notice_delivered` | `bool` | **`message_undelivered` only** | `True` when a user-visible "your message wasn't delivered" notice was sent. |
+
+<Note>
+Absent fields are **skipped** — the bridge does not fabricate empty strings for keys the concrete input doesn't carry. Read fields with `.get(key)`, not subscripting, so a plugin written against inbound input degrades cleanly on outbound events.
+</Note>
+
+### React per user, per channel, and per delivery
+
+Lead with the outcome: rate-limit a noisy sender, count deliveries per channel, or escalate a dead letter.
+
+<CodeGroup>
+
+```python ~/.praisonai/plugins/per_user_rate_limit.py
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, PluginDecision
+
+class PerUserRateLimit(Plugin):
+    def __init__(self):
+        self._counts = {}
+
+    @property
+    def info(self):
+        return PluginInfo(name="per_user_rate_limit",
+                          hooks=[PluginHook.MESSAGE_RECEIVED])
+
+    def before_message(self, message):
+        sender = message.get("sender_id")
+        if sender is None:
+            return message              # outbound/unknown — no scope to enforce
+        self._counts[sender] = self._counts.get(sender, 0) + 1
+        if self._counts[sender] > 20:
+            return PluginDecision.deny(f"Rate limit exceeded for {sender}")
+        return message
+
+def create_plugin():
+    return PerUserRateLimit()
+```
+
+```python ~/.praisonai/plugins/delivery_counter.py
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class DeliveryCounter(Plugin):
+    def __init__(self):
+        self._sent = {}
+
+    @property
+    def info(self):
+        return PluginInfo(name="delivery_counter",
+                          hooks=[PluginHook.MESSAGE_SENT])
+
+    def message_sent(self, message):
+        key = (message.get("platform"), message.get("channel_id"))
+        self._sent[key] = self._sent.get(key, 0) + 1
+
+def create_plugin():
+    return DeliveryCounter()
+```
+
+```python ~/.praisonai/plugins/dead_letter.py
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class DeadLetter(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="dead_letter",
+                          hooks=[PluginHook.MESSAGE_UNDELIVERED])
+
+    def message_undelivered(self, message):
+        # Payload adds error + notice_delivered on this hook only
+        print(f"[dead-letter] {message.get('platform')} "
+              f"channel={message.get('channel_id')} "
+              f"error={message.get('error')} "
+              f"notice_delivered={message.get('notice_delivered')}")
+
+def create_plugin():
+    return DeadLetter()
+```
+
+</CodeGroup>
+
+<Warning>
+- Absent fields are **skipped**, not emitted as `""` — always `.get(key)` and handle `None`.
+- `message_sent` and `message_undelivered` are **observe-only**; return values are ignored (no rewrite, no block).
+- The new hooks only fire when a plugin **overrides them** (`_overrides` guard) — plain plugins still incur zero cost on the two new events.
+</Warning>
+
+<Note>
+`message_undelivered` is the counterpart to the plain `MESSAGE_UNDELIVERED` hook already covered in [Undelivered Messages](/features/undelivered-messages) and [Gateway → Undelivered Notice](/features/gateway-undelivered-notice) — this hook exposes the same signal at the plugin surface, so `Plugin` subclass authors don't need to reach for the raw `HookRegistry`.
+</Note>
+
 ---
 
 ## Auto-Enable from Env or Config
@@ -1013,8 +1141,10 @@ The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `befor
 | `before_tool(name, args)` | `BEFORE_TOOL` | Return a `dict` → replaces `data.tool_input` |
 | `after_tool(name, result)` | `AFTER_TOOL` | Observational (no mutation) |
 | `before_tool_definitions(defs)` | `BEFORE_TOOL_DEFINITIONS` | Return a `list` → replaces `data.tool_definitions` |
-| `before_message(msg)` | `MESSAGE_RECEIVED` | Return `{"content": "..."}` → rewrites `data.content` |
-| `after_message(msg)` | `MESSAGE_SENDING` | Return `{"content": "..."}` → rewrites `data.content` |
+| `before_message(msg)` | `MESSAGE_RECEIVED` | Payload carries `content` + identity (`platform`, `sender_id`, `channel_id`, `channel_type`, `message_id`, `session_id` when set). Return `{"content": "..."}` → rewrites `data.content`. Return `PluginDecision.deny(reason)` → drops the inbound message. |
+| `after_message(msg)` | `MESSAGE_SENDING` | Same enriched payload. Return `{"content": "..."}` → rewrites `data.content`. |
+| `message_sent(msg)` | `MESSAGE_SENT` | Observational (successful delivery). Payload carries the same enriched fields; return value is ignored. |
+| `message_undelivered(msg)` | `MESSAGE_UNDELIVERED` | Observational (permanent delivery failure). Payload adds `error` and `notice_delivered` to the enriched fields; return value is ignored. |
 | `on_permission_ask(target, reason)` | `ON_PERMISSION_ASK` | `True`/`False`/`None` → allow/deny/allow |
 | `on_config(config)` | `ON_CONFIG` | Return a `dict` → rewrites `data.config` |
 | `on_auth(auth_type, credentials)` | `ON_AUTH` | Return a `dict` → rewrites `data.credentials` (works when starting as `None`) |
