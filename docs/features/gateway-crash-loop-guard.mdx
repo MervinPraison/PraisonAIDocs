@@ -180,12 +180,13 @@ from praisonaiagents.gateway import RestartLoopGuard
 
 The crash-loop guard is a **rapid-fire** breaker (seconds window) that runs *around* the supervisor loop. It is orthogonal to the [Channel Supervision](/features/gateway-channel-supervision) health-monitor machinery:
 
-| Layer | Where it runs | Window | Purpose |
-|-------|---------------|--------|---------|
-| **Crash-Loop Guard** | Around the supervisor loop | Seconds (`window_seconds`) | Break a tight crash-on-resume loop fast. |
-| **`max_restarts_per_hour`** | Inside the health-monitor sweep | Per hour | Slower cap on total restarts. |
+| Layer | Where it runs | Window | Scope | Purpose |
+|-------|---------------|--------|-------|---------|
+| **Crash-Loop Guard** (`RestartLoopGuard`) | Around the supervisor loop | Seconds (`window_seconds`) | Per channel | Break a tight crash-on-resume loop fast. |
+| **`max_restarts_per_hour`** | Inside the health-monitor sweep | Per hour | Per channel | Slower cap on total restarts. |
+| **Fleet breaker** (`FleetSupervisionPolicy`) | Above the whole fleet | Per hour | Aggregate | Trip once on a fleet-wide storm instead of every channel silently burning its own budget. |
 
-Tune both for a two-tier defence: the guard catches immediate crash storms; `max_restarts_per_hour` catches slow, persistent flapping.
+Tune all three for a layered defence: the guard catches immediate crash storms per channel; `max_restarts_per_hour` catches slow, persistent flapping per channel; the [fleet breaker](#fleet-level-breaker) catches a systemic fault that restarts every channel at once.
 
 ### Log signal
 
@@ -194,6 +195,129 @@ When the guard trips, the gateway emits:
 ```
 ERROR: Channel 'telegram' crash-loop breaker tripped (>= 3 restarts in 60s); halting auto-resume: <original exception>
 ```
+
+---
+
+## Fleet-level breaker
+
+The per-channel guards above catch one bad channel. A systemic fault — a bad shared provider, a network partition, an org-wide expired token — restarts **every** channel at once, and each one silently burns its own `max_restarts_per_hour` budget in a fleet-wide reconnect storm. `FleetSupervisionPolicy` sits on top of the per-channel budgets and trips **one** operator-visible breaker instead.
+
+```mermaid
+graph TB
+    Crash[💥 Channel restart] --> L1[🧮 RestartLoopGuard<br/>seconds, per channel]
+    L1 --> L2[⏳ max_restarts_per_hour<br/>hour, per channel]
+    L2 --> L3{🛰️ FleetSupervisionPolicy<br/>hour, aggregate}
+    L3 -->|rate or failing-fraction exceeded| Trip[🛑 Fleet breaker TRIPPED<br/>hold all restarts + degraded owner]
+    L3 -->|under threshold| Serve[✅ keep serving]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef l1 fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef l2 fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Crash input
+    class L1 l1
+    class L2 l2
+    class L3 gate
+    class Trip input
+    class Serve good
+```
+
+### `FleetSupervisionPolicy` — a pure aggregate breaker
+
+`FleetSupervisionPolicy` is a pure, dependency-free, side-effect-free breaker — the aggregate sibling of `RestartLoopGuard`. Import it from `praisonaiagents.gateway`:
+
+```python
+import time
+from praisonaiagents.gateway import FleetSupervisionPolicy
+
+policy = FleetSupervisionPolicy(
+    fleet_restarts_per_hour=40,
+    failing_channel_fraction=0.5,
+    breaker_cooldown_s=120.0,
+)
+
+now = time.monotonic()
+
+# Record a fleet restart — True once the aggregate breaker trips.
+if policy.note_restart(now):
+    ...  # hold channel restarts; a systemic storm is underway
+
+# Or trip on failing fraction: half the fleet failing/parked.
+if policy.note_fleet_state(failing=2, total=3, now=now):
+    ...
+
+# Non-recording check (re-arms cleanly once cooldown elapses).
+policy.tripped(now)
+
+# Clear all recorded history + any active trip.
+policy.reset()
+```
+
+| Parameter | Type | Default | Constraint | Purpose |
+|-----------|------|---------|------------|---------|
+| `fleet_restarts_per_hour` | `int` | `40` | `>= 1` | Aggregate restart-rate window (rolling hour). |
+| `failing_channel_fraction` | `float` | `0.5` | `0.0 < x <= 1.0` | Trip when this fraction of the fleet is failing/parked. |
+| `breaker_cooldown_s` | `float` | `120.0` | `>= 0` | Hold restarts this long once tripped, then re-arm. |
+
+| Method | Returns | Semantics |
+|--------|---------|-----------|
+| `note_restart(now)` | `bool` | Record a fleet restart. True if tripped now or still within cooldown. While tripped it does **not** record new events — held (non-)restarts must not renew the window. |
+| `note_fleet_state(failing, total, now)` | `bool` | Trip when `failing/total >= failing_channel_fraction`. True if tripped now or still cooling down. |
+| `tripped(now)` | `bool` | Non-recording check. When cooldown elapses the breaker re-arms cleanly — the event window is cleared so pre-trip events cannot immediately re-trip. |
+| `reset()` | `None` | Clear all recorded history + any active trip. |
+
+<Warning>
+**Validation.** Out-of-range constructor values raise `ValueError` — `fleet_restarts_per_hour < 1`, `failing_channel_fraction` outside `(0.0, 1.0]`, or `breaker_cooldown_s < 0`.
+</Warning>
+
+### Recovery
+
+The breaker re-arms cleanly after `breaker_cooldown_s` — once cooldown elapses, `tripped()` clears the event window so pre-trip events cannot immediately re-trip it. When wired into the gateway, the degraded-owner fact (see below) clears on the next monitor sweep **without** an external `get_status()` poll: wait one `breaker_cooldown_s` after the underlying cause is fixed and the entry disappears on its own.
+
+### Observability
+
+When wired into the gateway, `get_status()` / `gateway status` / `/health` gain a `fleet` block:
+
+```json
+{
+  "enabled": true,
+  "running": true,
+  "interval": 300,
+  "channels": { "...": { "restart_count": 4, "can_restart": false } },
+  "fleet": {
+    "breaker_tripped": true,
+    "fleet_restarts_per_hour": 40,
+    "failing_channels": 2,
+    "total_channels": 3
+  }
+}
+```
+
+When the fleet breaker trips, the monitor records exactly **one** entry on the shared [Degraded-Capability Registry](/features/gateway-degraded-capabilities):
+
+| Field | Value |
+|-------|-------|
+| `owner_kind` | `"gateway"` |
+| `owner_id` | `"fleet"` |
+| `state` | `"stale"` |
+| `reason` | `"channel crash-loop: <N>/<M> channels failing"` (or `"channel crash-loop"` when `total == 0`) |
+| `retry_hint` | `"praisonai gateway doctor"` |
+
+The log line on trip:
+
+```
+ERROR: Fleet crash-loop breaker TRIPPED: holding channel restarts (2/3 channels failing, reason=...). Backing off for 120s; run 'praisonai gateway doctor' to diagnose.
+```
+
+<Note>
+The `fleet` block and the degraded owner flow through `health()` / `gateway status` / `gateway doctor` automatically — `WebSocketGateway` constructs the supervisor with the shared `degraded_registry`, so there is nothing to wire. A `None` registry keeps supervision fully functional (the breaker still holds restarts); it is only silent on the aggregate degraded surface. The standalone single-channel `Bot` path is unaffected — a 1-channel fleet never false-trips.
+</Note>
+
+<Info>
+`FleetSupervisionPolicy` is YAML-only + direct-Python configuration. It is not an `Agent` constructor parameter, and you never construct `ChannelHealthMonitor` yourself — the public Python surface is `FleetSupervisionPolicy` plus the `gateway.health.*` YAML keys. Tune the three keys on [Channel Supervision › Restart guard-rails](/features/gateway-channel-supervision#restart-guard-rails).
+</Info>
 
 ---
 
@@ -211,6 +335,14 @@ The guard is a fast breaker; `max_restarts_per_hour` on [Channel Supervision](/d
 
 <Accordion title="After a trip, fix the cause then reconnect">
 A trip means the channel stopped auto-resurrecting. Once the underlying crash is fixed, run `praisonai gateway reconnect <channel>` (see [Channel Supervision → Reconnect](/docs/features/gateway-channel-supervision#reconnect-channel)) to reset error state and bring the channel back.
+</Accordion>
+
+<Accordion title="Tune failing_channel_fraction for the fleet breaker">
+`_count_failing_channels` treats a channel as failing when its per-channel restart budget is exhausted (`not can_restart`). With `max_restarts_per_hour = 0` (disabled), idle channels with no recorded restarts are **not** counted as failing — so a quiet fleet never false-trips the aggregate breaker. Lower `failing_channel_fraction` only when you want the breaker to fire before half the fleet is down.
+</Accordion>
+
+<Accordion title="Wait one cooldown after fixing a fleet-wide fault">
+Once you fix the systemic cause (rotate the shared token, heal the partition), the fleet breaker holds restarts for `breaker_cooldown_s` then re-arms on its own. The `gateway/fleet` degraded owner clears on the next monitor sweep — no external `gateway status` poll required.
 </Accordion>
 
 </AccordionGroup>
