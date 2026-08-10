@@ -205,7 +205,11 @@ gateway:
     startup_grace: 60        # grace window after start (default 60)
     stale_after: 120         # no inbound activity (idle) → stale-socket (default 120)
     stuck_after: 900         # busy with no progress (inbound OR in-run) → stuck (default 900)
-    max_restarts_per_hour: 10
+    max_restarts_per_hour: 10        # per channel
+    # Fleet-level crash-loop breaker (aggregate across channels):
+    fleet_restarts_per_hour: 40      # int >= 1 (default 40)
+    failing_channel_fraction: 0.5    # float in (0.0, 1.0] (default 0.5)
+    breaker_cooldown_s: 120          # float >= 0 (default 120)
     enabled: true            # default true
 ```
 
@@ -228,7 +232,14 @@ supervisor = ChannelSupervisor(health_config=health_config)
 | `stale_after` | `float` | `120.0` | Seconds without **inbound** transport activity (while idle) → `stale-socket` |
 | `stuck_after` | `float` | `900.0` | Seconds a **busy** channel can go without **any progress signal** (inbound transport activity OR in-run progress — tool calls, streamed tokens, emitter events) → `stuck` |
 | `max_restarts_per_hour` | `int` | `10` | Hard cap on restart attempts per channel per hour |
+| `fleet_restarts_per_hour` | `int` | `40` | Aggregate restart-rate window across the whole fleet (`>= 1`) — see [Fleet-level breaker](/features/gateway-crash-loop-guard#fleet-level-breaker) |
+| `failing_channel_fraction` | `float` | `0.5` | Trip the fleet breaker when this fraction of channels is failing/parked (`0.0 < x <= 1.0`) |
+| `breaker_cooldown_s` | `float` | `120.0` | Hold channel restarts this long once the fleet breaker trips, then re-arm (`>= 0`) |
 | `enabled` | `bool` | `True` | Whether monitoring is enabled |
+
+<Note>
+`HealthMonitorConfig.from_dict` **defensively parses** the three fleet keys — a bad value clamps or falls back to the default instead of raising, matching the other numeric keys.
+</Note>
 
 ### HealthReason values
 
@@ -288,10 +299,32 @@ Before praisonaiagents 1.6.82, only inbound transport activity counted toward pr
 - **5-minute cooldown** — implicit cooldown after every restart (logged as `restart cooldown active`)
 - **`max_restarts_per_hour`** — when the cap is hit, a warning is logged and the restart is skipped
 - **[Crash-Loop Guard](/features/gateway-crash-loop-guard)** — a *rapid-fire* breaker (seconds window) that runs around the supervisor loop and halts auto-resume after a burst of crash-on-resume restarts, complementing the per-hour cap
+- **[Fleet-level breaker](/features/gateway-crash-loop-guard#fleet-level-breaker)** — an *aggregate* breaker (`fleet_restarts_per_hour`, `failing_channel_fraction`, `breaker_cooldown_s`) that trips **once** when a systemic fault restarts every channel at the same time, instead of each channel silently burning its own budget
 
 ```
 WARNING: channel telegram: max restarts per hour (10) reached, skipping restart
 ```
+
+### Fleet breaker status
+
+`get_status()` (surfaced by `gateway status` and `/health`) includes a `fleet` block so operators can see the aggregate breaker at a glance:
+
+```json
+{
+  "enabled": true,
+  "running": true,
+  "interval": 300,
+  "channels": { "telegram": { "restart_count": 4, "can_restart": false } },
+  "fleet": {
+    "breaker_tripped": true,
+    "fleet_restarts_per_hour": 40,
+    "failing_channels": 2,
+    "total_channels": 3
+  }
+}
+```
+
+`breaker_tripped: true` means restarts are being held fleet-wide; the same event records one `gateway`/`fleet` entry on the [Degraded-Capability Registry](/features/gateway-degraded-capabilities). See [Fleet-level breaker](/features/gateway-crash-loop-guard#fleet-level-breaker) for the full model.
 
 ### Suspend / resume monitoring
 

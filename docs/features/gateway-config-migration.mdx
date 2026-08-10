@@ -174,6 +174,175 @@ channels:
 
 ---
 
+## Config version stamp
+
+Gateway config now carries a canonical, integer `config_version` stamp. The **runtime** story is unchanged — the load-time shim still auto-migrates legacy shapes on every load — but the **upgrade** story is new: `praisonai gateway doctor --fix` applies a declarative rule set once, moves an out-of-date config forward, and stamps the new version.
+
+<Info>
+Runtime load auto-migrates legacy shapes but does **not** write the stamp. Only `praisonai gateway doctor --fix` persists `config_version` to disk.
+</Info>
+
+Import the public surface from `praisonaiagents.gateway`:
+
+```python
+from praisonaiagents.gateway import (
+    GATEWAY_CONFIG_VERSION,
+    ConfigVersionError,
+    is_config_current,
+    migrate_config_with_doctor,
+)
+```
+
+| Symbol | Kind | What it is |
+|--------|------|------------|
+| `GATEWAY_CONFIG_VERSION` | `int` constant | Current canonical version (starts at `1`). |
+| `ConfigVersionError` | `ValueError` subclass | Raised when the stamp is a version **newer** than this build supports, or is malformed (`bool` / `str` / `float`). |
+| `LegacyConfigRule` | dataclass | `detect`, `fix`, `reason` — one declarative migration step. |
+| `GATEWAY_CONFIG_RULES` | `List[LegacyConfigRule]` | Ordered rule list applied by `doctor --fix`. |
+| `is_config_current(raw)` | `bool` | True iff `raw["config_version"] == GATEWAY_CONFIG_VERSION`. Raises `ConfigVersionError` on malformed stamps. |
+| `migrate_config_with_doctor(raw)` | `Tuple[Dict, List[str]]` | Returns `(migrated_copy, applied_reasons)`. Copies input, applies rules, stamps `config_version`. Idempotent. Raises `ConfigVersionError` on newer/malformed stamps. |
+
+### Rules currently in scope
+
+`GATEWAY_CONFIG_RULES` holds two ordered migration steps.
+
+| Rule name | Before → After | Note |
+|-----------|----------------|------|
+| `allowed_users_csv_to_list` | `allowed_users: "alice,bob"` → `["alice", "bob"]` (per channel) | Empty string → `[]`. |
+| `group_policy_default` | channel missing `group_policy` → `group_policy: "mention_only"` | Sets the secure default. |
+
+<Warning>
+**Version safety.** `doctor` refuses to downgrade a config written by a newer build — it never migrates a config whose stamp is newer than this build supports. A malformed stamp (`true`, `"1"`, `1.0`) is **rejected** as `ConfigVersionError`, not silently coerced.
+</Warning>
+
+---
+
+## Doctor-driven migration
+
+`praisonai gateway doctor` inspects `gateway.yaml` and reports version drift; `--fix` applies the rules and stamps the file atomically.
+
+```mermaid
+graph TB
+    Load[📄 Load gateway.yaml] --> Check{is_config_current?}
+    Check -->|current| OK[✅ nothing to do]
+    Check -->|out of date| Fix[🔧 doctor --fix]
+    Check -->|newer / malformed| Refuse[🛑 ConfigVersionError<br/>refuse — never downgrade]
+    Fix --> Apply[apply GATEWAY_CONFIG_RULES]
+    Apply --> Stamp[stamp config_version]
+    Stamp --> Write[atomic rewrite<br/>tmpfile + fsync + os.replace]
+
+    classDef load fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef act fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Load load
+    class Check gate
+    class OK good
+    class Refuse stop
+    class Fix,Apply,Stamp,Write act
+```
+
+### Detection (no flag)
+
+When the stamp is missing / stale, or any rule's `detect` fires, `doctor` prints:
+
+```
+config: out of date (config_version unstamped -> 1); run 'gateway doctor --fix'
+```
+
+A newer or malformed stamp prints the error instead — doctor does **not** attempt to migrate:
+
+```
+config: config_version 2 is newer than supported (1)
+```
+
+### `--fix`
+
+`--fix` loads `gateway.yaml`, calls `migrate_config_with_doctor`, and rewrites the file **atomically** (tmpfile in the same dir + `fsync` + `os.replace`), so an interrupted `--fix` can never leave the file truncated. It prints one `config: <reason>` line per applied rule plus the version bump:
+
+```bash
+praisonai gateway doctor --config gateway.yaml --fix
+```
+
+```
+config: migrating allowed_users (string) -> list [rule: allowed_users_csv_to_list]
+config: setting group_policy secure default 'mention_only' [rule: group_policy_default]
+config: config_version unstamped -> 1
+```
+
+### `--fix --dry-run`
+
+Preview without writing — every line is prefixed with `would`:
+
+```bash
+praisonai gateway doctor --config gateway.yaml --fix --dry-run
+```
+
+```
+config: would migrate allowed_users (string) -> list [rule: allowed_users_csv_to_list]
+config: would stamp config_version unstamped -> 1 (--dry-run)
+```
+
+### JSON keys
+
+`--json` adds these keys (alongside any existing ones):
+
+```json
+{
+  "probes": {},
+  "config_version": "out-of-date",
+  "config_version_error": "config_version 2 is newer than supported (1)",
+  "config_fix": "config: migrating allowed_users (string) -> list [rule: allowed_users_csv_to_list]\nconfig: setting group_policy secure default 'mention_only' [rule: group_policy_default]\nconfig: config_version unstamped -> 1"
+}
+```
+
+| Key | Values | Present when |
+|-----|--------|--------------|
+| `config_version` | `"out-of-date"` \| `"unsupported"` | Stamp is stale, or newer/malformed. |
+| `config_version_error` | error message | Stamp is newer/malformed (`unsupported`). |
+| `config_fix` | multi-line report | `--fix` applied one or more rules. |
+
+<Note>
+If your installed `praisonaiagents` predates the migration API, `doctor` is a no-op for this check — the wrapper guards the import and logs no error. Upgrade `praisonaiagents` to get the config-version stamp.
+</Note>
+
+---
+
+## Programmatic migration
+
+Call `migrate_config_with_doctor` directly to migrate a config in memory — it copies the input (no mutation), applies the rules, and stamps the version. A second call returns `applied == []` because it is idempotent.
+
+```python
+from praisonaiagents.gateway import (
+    GATEWAY_CONFIG_VERSION,
+    ConfigVersionError,
+    is_config_current,
+    migrate_config_with_doctor,
+)
+
+raw = {
+    "channels": {
+        "telegram": {"token": "...", "allowed_users": "alice,bob"},
+    },
+}
+
+if not is_config_current(raw):
+    migrated, applied = migrate_config_with_doctor(raw)
+    # migrated["channels"]["telegram"]["allowed_users"] == ["alice", "bob"]
+    # migrated["channels"]["telegram"]["group_policy"] == "mention_only"
+    # migrated["config_version"] == GATEWAY_CONFIG_VERSION
+    for reason in applied:
+        print("applied:", reason)
+```
+
+<Note>
+`is_config_current` and `migrate_config_with_doctor` raise `ConfigVersionError` on a newer or malformed stamp — an older binary must never downgrade a config a newer build wrote. Catch it to surface a clear "upgrade this host" message.
+</Note>
+
+---
+
 ## Behaviour Notes
 
 - Migration runs on both `praisonai bot serve` and `praisonai gateway start` — before PR #3019, only `bot serve` migrated.
@@ -182,6 +351,8 @@ channels:
 - `observe` is a newly-accepted `group_policy` value (PR #3381). Configs never migrate **to** `observe` automatically — set it explicitly. See [`observe`: passive group context](/docs/features/bot-gateway#observe-passive-group-context).
 - Comma-separated `allowed_users` strings are auto-converted to lists at load time.
 - All three YAML shapes (`platform`+`token`, `agents`+`channels`, `platforms:`) validate against one schema — see [Gateway](/features/gateway).
+- `MultiChannelGatewayConfig` and `ChannelRouteConfig` remain public exports — neither is deprecated. The `config_version` stamp does not retire them.
+- The `--fix` auto-repair also mints a strong `gateway.auth_token` when weak/missing, then re-validates — see [Gateway CLI › Auto-repair](/docs/features/gateway-cli#auto-repair-with-fix) and [Pre-flight credential check](/docs/features/gateway-cli#pre-flight-credential-check).
 
 ---
 
