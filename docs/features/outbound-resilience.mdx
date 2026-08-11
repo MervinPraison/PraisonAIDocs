@@ -21,9 +21,18 @@ agent = Agent(
 )
 bot = SlackBot(token="xoxb-...", agent=agent)
 bot.start()
+
+# If the gateway crashes mid-send, the reply is parked in the outbound DLQ.
+# On the next boot, it is automatically redelivered with a marker:
+#
+#   ♻️ Recovered after restart — this reply may be a duplicate.
+#
+#   <original reply text>
+#
+# No operator step, no code change — symmetric with the inbound journal.
 ```
 
-The user sends a message on Slack; transient send failures retry with backoff until the reply is delivered or parked in the DLQ.
+The user sends a message on Slack; transient send failures retry with backoff until the reply is delivered or parked in the DLQ — and a parked reply is automatically redelivered on the next gateway boot.
 
 ```mermaid
 graph LR
@@ -140,6 +149,58 @@ When a send fails, the adapter classifies the error:
 | **Permanent error → DLQ** | 4xx (not 429) | Parked immediately; exception re-raised |
 | **Storage transiently unavailable** | DLQ init failed on this send | Degrades to retry-only for **this** send; state does not latch — the next send re-attempts DLQ init and parks the reply once storage recovers |
 | **`enabled: false`** | Operator opted out | One attempt, no retry, no parking; original exception re-raised |
+
+---
+
+## Automatic crash-recovery on start
+
+Every gateway-managed channel redelivers any reply parked by a crash on a previous run — no operator step, symmetric with the inbound journal's `replay()` sweep.
+
+The gateway schedules `WebSocketGateway._replay_outbound_dlq(bot)` about 5 seconds after each channel task starts (a grace period for the transport to connect), then calls `OutboundDLQ.redeliver(send)` — draining parked replies oldest-first through the adapter's own `send_message`, so the platform's normal retry/backoff still applies. A redelivery that fails again is kept for the next boot, bounded by the DLQ's existing TTL / `max_size` / `attempts` invariants. Failure never blocks channel start — the behaviour degrades to today's "parked until manual replay".
+
+Users receive redelivered replies with a **visible duplicate marker** so an ambiguous redelivery is never silent:
+
+> ♻️ Recovered after restart — this reply may be a duplicate.
+>
+> &lt;original reply text&gt;
+
+The marker is prepended idempotently — a parked reply that already starts with it is not double-marked. When something is recovered you'll see this line in the gateway log:
+
+```
+Outbound crash-recovery: redelivered N parked repl(y/ies) on start (marked as possible duplicates)
+```
+
+```mermaid
+sequenceDiagram
+    participant Boot as 🛠️ Gateway boot
+    participant Bot as 📡 Adapter
+    participant DLQ as 💾 OutboundDLQ
+    participant Platform as 📱 Platform API
+    participant User as 👤 User
+
+    Boot->>Bot: start_channels()
+    Note over Boot,Bot: 5s grace for transport connect
+    Boot->>DLQ: _replay_outbound_dlq(bot)
+    DLQ->>DLQ: redeliver(send) — oldest first
+    loop each parked reply
+        DLQ->>Bot: send_message(♻️ marker + text)
+        Bot->>Platform: send
+        alt success
+            Platform-->>Bot: 200 OK
+            Bot-->>User: recovered reply
+            DLQ->>DLQ: delete entry
+        else re-fails
+            Platform-->>Bot: transient error
+            DLQ->>DLQ: keep entry, attempts++
+        end
+    end
+```
+
+<Note>
+Only the exact reply the drainer is currently redelivering is suppressed from re-parking. A genuinely-new reply that fails **concurrently** during the boot drain is still parked — the durable-outbound contract holds even mid-recovery.
+</Note>
+
+Automatic crash-recovery introduced in [PraisonAI #3862](https://github.com/MervinPraison/PraisonAI/issues/3862).
 
 ---
 
@@ -330,8 +391,8 @@ bots:
   Outbound Resilience now parks permanent and exhausted failures automatically. You don't need to set `dlq_path` or opt in to a separate "durable delivery" mode — the mixin uses the same canonical `~/.praisonai/state/<platform>/outbound_dlq.sqlite` store as the inbound journal. Set `outbound_resilience.enabled = false` only if you genuinely want the pre-#3447 retry-without-park behaviour (fire-and-forget channels, ephemeral test bots).
 </Accordion>
 
-<Accordion title="Pair with Durable Delivery when you need crash-safety across process restarts">
-  Outbound Resilience retries within a single process lifetime and parks a permanent failure in the DLQ. If your process crashes mid-retry — before parking — the message is lost. For full crash-safe delivery with a SQLite outbox and startup drain, use [Durable Delivery](/features/durable-delivery) alongside Outbound Resilience.
+<Accordion title="A parked reply now survives a restart on its own — Durable Delivery is only needed for the mid-retry gap">
+  Once a permanent / exhausted failure is parked in the DLQ, the gateway automatically redelivers it on the next boot (labelled `♻️ Recovered after restart — this reply may be a duplicate.`). See [Automatic crash-recovery on start](#automatic-crash-recovery-on-start). The only remaining loss window is a crash that hits **after** the send failed but **before** the entry was persisted — the same narrow window covered by Durable Delivery's SQLite outbox. Reach for [Durable Delivery](/features/durable-delivery) when you need that pre-park guarantee; for the typical exhausted-retry case, Outbound Resilience alone is now crash-safe.
 </Accordion>
 </AccordionGroup>
 
