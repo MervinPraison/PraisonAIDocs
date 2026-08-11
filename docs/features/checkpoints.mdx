@@ -158,7 +158,47 @@ A checkpoint is not guaranteed to map 1:1 with an agent turn — manual saves an
 
 ## In-session `/undo` and `/revert`
 
-When `praisonai code --checkpoints` is active, the coding REPL gains turn-aware undo and revert commands.
+`/undo` and `/revert [n]` are first-class commands on the **interactive surfaces** — the modern REPL used by `praisonai code` and the default async TUI used by bare `praisonai`. They roll back **files + conversation together**, and checkpointing is **on by default** on these surfaces. Programmatic callers of `SessionCheckpointManager.from_config` stay opt-in, so the zero-overhead contract is preserved.
+
+```bash
+# Start an interactive session — checkpointing is on by default
+praisonai code "Refactor the auth module"
+
+# ... the agent edits several files ...
+# Something went wrong — undo the last turn (files + conversation)
+> /undo
+
+# Or roll back the last three turns
+> /revert 3
+```
+
+No config, no flags.
+
+**Precedence (highest last):** `default` → `checkpoints.auto` (config) → `PRAISONAI_CHECKPOINTS` (env)
+
+Interactive surfaces pass `default=True`, so `/undo` and `/revert` work out of the box. Opt out with `checkpoints.auto: false` in config or `PRAISONAI_CHECKPOINTS=off`.
+
+```mermaid
+graph TB
+    Q{Where does checkpointing<br/>get its default from?} -->|Interactive surface| D1[default = True<br/>on by default]
+    Q -->|Programmatic caller| D2[default = False<br/>opt in required]
+    D1 --> C{checkpoints.auto in config?}
+    D2 --> C
+    C -->|not set| Keep[keep the default]
+    C -->|true / false| Cfg[config wins over default]
+    Keep --> E{PRAISONAI_CHECKPOINTS env?}
+    Cfg --> E
+    E -->|unset| Final[final decision]
+    E -->|on / off| EnvWins[env wins over config]
+    EnvWins --> Final
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q,C,E q
+    class D1,D2,Keep,Cfg,EnvWins opt
+    class Final ok
+```
 
 ```mermaid
 sequenceDiagram
@@ -197,7 +237,11 @@ sequenceDiagram
 |------|------------------|
 | Checkpointing **off** (default) | Removes the last assistant + user message pair from history only. Workspace files are untouched. |
 | Checkpointing **on**, session store **not wired** | Restores workspace files to the previous turn's snapshot. Conversation history is left intact. (Legacy / file-only fallback.) |
-| Checkpointing **on**, session store **wired** (default in `praisonai code`) | Restores workspace files **and** rewinds `chat_history` to the message count captured at `checkpoint_turn()`, so the agent's memory matches the workspace. Diff preview shown first. |
+| Checkpointing **on**, session store **wired** (default in `praisonai code` and bare `praisonai`) | Restores workspace files **and** rewinds `chat_history` to the message count captured at `checkpoint_turn()`, so the agent's memory matches the workspace. Diff preview shown first. |
+
+<Note>
+The interactive surfaces reuse a single warm `Agent` across turns, so its `chat_history` grows independently of the visible transcript. `/undo` rewinds both — the visible history **and** the reused agent's own `chat_history` — matched by user-message count so interleaved system/tool messages don't skew the boundary.
+</Note>
 
 <Note>
 Revert is best-effort. A file restore failure skips the conversation rewind. A conversation-revert failure leaves the already-restored files intact — you can retry from a clean workspace state.
@@ -212,7 +256,42 @@ print(preview.dropped_message_count)   # 3 → messages that would be truncated
 
 **`/revert [n]`** rolls back `n` turns (default 1). After revert, the timeline drops the restored turns so the next `/undo` walks further back.
 
-**Now active in the async TUI too.** The same wiring runs in `praisonai tui`. Previously the TUI's `/undo` was a stub that printed "use git diff" — it now shares the coding REPL's engine, so `Undo: Workspace restored to `<short_id>` (<label>).` is reported on success.
+**Now active in the async TUI too.** The same wiring runs in `praisonai tui`. Previously the TUI's `/undo` was a stub that printed "use git diff" — it now shares the coding REPL's engine, so `Undo: Workspace restored to `<short_id>` (<label>).` is reported on success. The TUI also gets `/revert [n]` (not just `/undo`), and read-only review turns (`--plan`) are skipped so the revert timeline stays meaningful.
+
+### `/revert` on the async TUI
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant TUI as Async TUI / REPL
+    participant CP as SessionCheckpointManager
+    participant View as Visible history
+    participant Agent as Warm Agent (chat_history)
+
+    User->>TUI: prompt (turn N)
+    TUI->>CP: checkpoint_turn(label)
+    TUI->>Agent: run turn N (edits files, appends messages)
+    Agent-->>View: user + assistant messages
+    User->>TUI: /revert 2
+    TUI->>CP: preview(2) — diff shown
+    TUI->>CP: revert(2)
+    CP-->>View: rewind by 2 user turns
+    CP-->>Agent: rewind chat_history to same boundary (user-count matched)
+    CP-->>User: "Reverted 2 turn(s) — files + conversation restored"
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ui fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef cp fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef store fill:#6366F1,stroke:#7C90A0,color:#fff
+    class User user
+    class TUI ui
+    class CP cp
+    class View,Agent store
+```
+
+### One-shot rewind from `praisonai run`
+
+`praisonai run --revert[=last|N]` reverts files **and** the named `--session`'s conversation together, showing the diff first. Distinct from the file-only `--restore`. See [Run — Checkpoint & Rewind](/cli/run#coherent-rewind---revert).
 
 **Project config:**
 
@@ -225,7 +304,7 @@ checkpoints:
 
 **Env override:** `PRAISONAI_CHECKPOINTS=on` (or `off`).
 
-**Precedence:** `PRAISONAI_CHECKPOINTS` (env) > `checkpoints.auto` (config) > default (off).
+**Precedence:** `PRAISONAI_CHECKPOINTS` (env) > `checkpoints.auto` (config) > `default`. Interactive surfaces pass `default=True` (on by default); programmatic callers default to off.
 
 ---
 
