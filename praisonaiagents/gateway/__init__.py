@@ -116,6 +116,8 @@ from .protocols import (
     FatalConfigError,
     classify_exit_reason,
     RestartLoopGuard,
+    # Fleet-level crash-loop breaker for channel supervision (Issue #3840)
+    FleetSupervisionPolicy,
     # Protocol version negotiation
     PROTOCOL_VERSION,
     MIN_PROTOCOL_VERSION,
@@ -196,6 +198,13 @@ from .config import (
     ApiConfig,
     ChannelRouteConfig,
     MultiChannelGatewayConfig,
+    # Config version stamp + doctor-driven migration (Issue #3841)
+    GATEWAY_CONFIG_VERSION,
+    ConfigVersionError,
+    LegacyConfigRule,
+    GATEWAY_CONFIG_RULES,
+    is_config_current,
+    migrate_config_with_doctor,
     # Push config
     PushConfig,
     RedisConfig,
@@ -366,6 +375,8 @@ __all__ = [
     "FatalConfigError",
     "classify_exit_reason",
     "RestartLoopGuard",
+    # Fleet-level crash-loop breaker for channel supervision (Issue #3840)
+    "FleetSupervisionPolicy",
     # Protocol version negotiation
     "PROTOCOL_VERSION",
     "MIN_PROTOCOL_VERSION",
@@ -440,6 +451,13 @@ __all__ = [
     "ApiConfig",
     "ChannelRouteConfig",
     "MultiChannelGatewayConfig",
+    # Config version stamp + doctor-driven migration (Issue #3841)
+    "GATEWAY_CONFIG_VERSION",
+    "ConfigVersionError",
+    "LegacyConfigRule",
+    "GATEWAY_CONFIG_RULES",
+    "is_config_current",
+    "migrate_config_with_doctor",
     "PushConfig",
     "RedisConfig",
     "PresenceConfig",
