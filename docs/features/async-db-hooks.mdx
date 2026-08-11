@@ -133,20 +133,38 @@ sequenceDiagram
 | `aon_tool_call` | Tool execution logging | Dispatches via isinstance(store, AsyncConversationStore) |
 | `aon_agent_end` | Agent session end | Dispatches via isinstance(store, AsyncConversationStore) |
 
+### Sync hook against an async-mode store
+
+Calling a sync hook against a store opened with `mode="async"` now fails clearly instead of crashing deep inside the store.
+
+<Warning>
+Calling the sync `on_agent_start` against a store opened with `mode="async"` **from inside a running event loop** now raises a clear `RuntimeError` telling you to use the async surface (previously it crashed with the opaque `TypeError: 'coroutine' object is not iterable`). Called outside a loop, sync now resolves the coroutine transparently.
+</Warning>
+
+### State-store lifecycle key
+
+The wrapper writes both start and end under `agent:{session_id}`, so the end transition updates the same record the start wrote instead of a disconnected one.
+
+Start previously used `agent:{session_id}:{agent_id or name}` and end wrote a separate record. Consumers who query the state store directly must update their key format to `agent:{session_id}`.
+
 ---
 
 ## Configuration Options
+
+<Warning>
+**Signature change in PR #3857**: `aon_agent_start(agent_name, session_id, user_id, metadata) -> List` and `aon_agent_end(session_id, metadata)`. `user_id` is now persisted (previously silently dropped) and `aon_agent_start` returns the resumed message list. Update any custom `AsyncDbAdapter` implementations to match.
+</Warning>
 
 All async hooks support these signatures from the DB adapter:
 
 ```python
 async def aon_agent_start(
-    self, 
-    session_id: str, 
-    name: str, 
-    agent_id: str = "", 
-    metadata: Optional[Dict[str, Any]] = None
-) -> None
+    self,
+    agent_name: str,
+    session_id: str,
+    user_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List   # previous messages for resume; empty list on new session
 
 async def aon_user_message(
     self, 
@@ -172,11 +190,9 @@ async def aon_tool_call(
 ) -> None
 
 async def aon_agent_end(
-    self, 
-    session_id: str, 
-    name: str, 
-    agent_id: str = "", 
-    metadata: Optional[Dict[str, Any]] = None
+    self,
+    session_id: str,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None
 
 async def aclose(self) -> None
@@ -193,11 +209,12 @@ async def agent_lifecycle():
     async with PraisonAIDB("sqlite:///lifecycle.db") as db:
         session_id = "session_789"
         
-        # Start agent session
-        await db.aon_agent_start(
-            session_id=session_id,
-            name="DataAgent", 
-            agent_id="agent_123"
+        # Start agent session — agent_name is first, user_id is persisted
+        messages = await db.aon_agent_start(
+            "DataAgent",           # agent_name (now first)
+            session_id,
+            user_id="user_456",    # new; previously silently dropped
+            metadata={"env": "prod"},
         )
         
         # User interaction
@@ -221,12 +238,8 @@ async def agent_lifecycle():
             content="Analysis complete: 1000 rows, 5 columns found."
         )
         
-        # End session
-        await db.aon_agent_end(
-            session_id=session_id,
-            name="DataAgent",
-            agent_id="agent_123"
-        )
+        # End session — no longer takes name / agent_id
+        await db.aon_agent_end(session_id, metadata={"outcome": "ok"})
 ```
 
 ### Sync Store Compatibility
