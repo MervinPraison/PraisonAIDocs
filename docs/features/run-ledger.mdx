@@ -105,13 +105,42 @@ sequenceDiagram
     Gateway-->>User: "Your last run was interrupted — retry?"
 ```
 
-### Automatic on gateway boot (new — PR #3885)
+### Behaviour on gateway restart
 
-If you run `praisonai gateway start`, `recover_orphans()` is now called for you and each `LOST`-marked run's origin channel / thread receives a durable "your run was interrupted" notice — see [Gateway Restart Continuation › Run-level recovery](/features/gateway-restart-continuation#run-level-recovery-new-pr-3885). The manual patterns below remain the way to wire recovery into a custom (non-gateway) process.
+The gateway wires this recovery **automatically** — you don't call `recover_orphans()` yourself. On boot, after resuming interrupted turns, it reconciles the ledger and notifies each lost run's origin.
 
-<Info>
-**Default-safe.** Boot recovery is a no-op when no ledger `.db` exists — gateways that never used the ledger are unaffected. The notice is routed durably through the SQLite `scheduled_outbox` under the stable dedup key `run-recovery:{run_id}`, so a boot-time send to a not-yet-ready channel drains on the next boot instead of being lost.
-</Info>
+```mermaid
+sequenceDiagram
+    participant Process as Gateway process
+    participant Ledger as SQLiteRunLedger
+    participant Outbox as scheduled_outbox
+    participant Channel as User channel/thread
+
+    Process->>Process: crash
+    Process->>Process: boot
+    Process->>Ledger: recover_orphans()
+    Ledger-->>Process: [RunRecord(status=LOST, channel, thread_id), ...]
+    loop each lost run
+        Process->>Outbox: enqueue restart notice (run-recovery:<run_id>)
+        Outbox-->>Channel: deliver exactly-once
+    end
+```
+
+1. `_recover_orphaned_runs()` runs on boot, right after `_resume_interrupted_turns()`.
+2. `recover_orphans()` terminalises every still-active run to `LOST`, preserving its `channel` and `thread_id`.
+3. Each `LOST` run's origin receives a durable restart notice, enqueued into the SQLite `scheduled_outbox` under a stable `run-recovery:<run_id>` key — **exactly-once even across a crash loop**. A boot-time miss (transport not ready yet) leaves a pending row that drains on the next boot.
+4. It's a **no-op** when core lacks the ledger or `ledger.db` doesn't exist yet — gateways that never used the ledger are unaffected, and no empty DB is ever created.
+
+The user-facing message the origin receives:
+
+```text
+A background run was interrupted by a restart and could not be recovered
+(<outcome>). Please resend your request.
+```
+
+<Note>
+This is the built-in gateway behaviour. The [manual patterns below](#wake-users-after-a-crash) still work if you build your own runtime on the ledger, but a standard `praisonai gateway start` already does this for you. See also [Gateway Restart Continuation › Run ledger recovery](/features/gateway-restart-continuation#run-ledger-recovery).
+</Note>
 
 ### Run statuses
 
@@ -244,8 +273,8 @@ for r in ledger.list_all(limit=50):
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Call recover_orphans() once at boot">
-Run reconciliation on gateway startup, before accepting new work. Active runs left by the previous process become `LOST`, and you get their origin routes back to notify users.
+<Accordion title="The gateway calls recover_orphans() for you at boot">
+A standard `praisonai gateway start` runs reconciliation automatically on boot, before accepting new work, and notifies each lost run's origin durably. Only call `recover_orphans()` yourself when you build a custom runtime on the ledger directly.
 </Accordion>
 
 <Accordion title="Always set channel and thread_id">
@@ -275,7 +304,7 @@ The process is killed or crashes before the run finishes. In-memory state is gon
 </Step>
 
 <Step title="The gateway wakes the user back">
-On boot, `recover_orphans()` marks the run `LOST` and returns it with the original `channel` and `thread_id`. The gateway posts back to the same Telegram thread: "Your last run was interrupted — retry?"
+On boot, the gateway automatically calls `recover_orphans()`, marks the run `LOST`, and posts a durable notice back to the same Telegram thread: "A background run was interrupted by a restart… Please resend your request." No user code required.
 </Step>
 </Steps>
 
@@ -289,5 +318,8 @@ On boot, `recover_orphans()` marks the run `LOST` and returns it with the origin
 </Card>
 <Card title="Background Subagents" icon="rocket" href="/features/background-subagents">
   Spawn subagents that return a job ID immediately — the general-purpose ledger backs their durable state.
+</Card>
+<Card title="Restart Continuation" icon="arrows-rotate" href="/features/gateway-restart-continuation">
+  The boot recovery that runs ledger reconciliation alongside interrupted-turn resumption.
 </Card>
 </CardGroup>
