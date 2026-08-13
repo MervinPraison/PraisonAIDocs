@@ -123,6 +123,52 @@ sequenceDiagram
 | `accept` / `dismiss` | Yes | Returns `False` (refused) |
 | `get(job_id)` / `remove(job_id)` | No | Direct-id access is capability-shaped |
 
+### Auto-scoping from the session context
+
+On a bot gateway (Telegram, Discord, Slack, or WhatsApp adapter) every turn installs a `SessionContext` carrying a `unified_user_id`. The agent tools and the gateway bridge read that value automatically, so isolation is on by default — you never thread identity by hand.
+
+These surfaces now default `principal` from `SessionContext.unified_user_id`:
+
+- `schedule_add`, `schedule_list`, `schedule_remove` — the agent-callable tools
+- `SuggestionEngine.propose` / `pending` / `accept` / `dismiss` — the wrapper engine
+- `_automations.py` inline-keyboard callbacks and `create_from_blueprint`
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Session as SessionContext
+    participant Engine as SuggestionEngine
+    participant Store as SuggestionStore
+
+    User->>Session: taps /automations
+    Note over Session: unified_user_id="tg:12345"
+    Session->>Engine: pending(principal="tg:12345")
+    Engine->>Store: list_pending(principal="tg:12345")
+    Store-->>Engine: only this user's suggestions
+    Engine-->>User: their own queue
+```
+
+<Warning>
+**Session identity cannot be impersonated.** On a multi-user gateway the authenticated per-turn `SessionContext.unified_user_id` is authoritative and always wins. A prompt-injected agent cannot pass `principal=<victim>` through an agent-callable tool to read or mutate another tenant's jobs — the explicit argument is a trusted default, never an override of a resolved session identity.
+
+Resolution order:
+1. Session identity, when present (authenticated caller — cannot be overridden by tool arguments).
+2. Otherwise the explicit `principal` value (trusted CLI / gateway-bridge path where no session context is installed).
+3. Otherwise `None` ⇒ global, single-tenant behaviour (CLI / single-user deployments are unchanged).
+
+```python
+# Alice's authenticated turn on the gateway
+# (SessionContext.unified_user_id="alice" is installed by the bot session manager)
+schedule_add("j", "daily", principal="carol")   # arg is IGNORED
+
+# The job is owned by Alice, not Carol.
+# store.get_by_name("j").principal == "alice"
+# schedule_list(principal="carol") returns "No schedules found" — the arg cannot re-scope reads.
+```
+
+On the CLI path no session is installed, so `principal="carol"` **is** honoured — that's the trusted path, where there is no ambient identity to protect.
+</Warning>
+
 ---
 
 ## Configuration Options
@@ -172,6 +218,20 @@ store.add(ScheduleJob(
 | `get_by_name` | `get_by_name(self, name: str, principal: Optional[str] = None) -> Optional[ScheduleJob]` | A job owned by a different identity is treated as not found (`None`). |
 | `remove_by_name` | `remove_by_name(self, name: str, principal: Optional[str] = None) -> bool` | A job owned by a different identity is skipped (returns `False`). |
 
+### Agent-tool signatures
+
+The agent-callable tools and the wrapper engine gained an optional `principal`. On a gateway it defaults from the session; passing it by hand only matters on the CLI / bridge path.
+
+| Tool | Signature (only the new field) | Behaviour |
+|------|-------------------------------|-----------|
+| `schedule_add` | `schedule_add(..., principal: str = "")` | Trusted default (session identity wins). Stamps `job.principal` and scopes the duplicate-name check. |
+| `schedule_list` | `schedule_list(principal: str = "")` | Filters to jobs owned by the caller. |
+| `schedule_remove` | `schedule_remove(name: str, principal: str = "")` | Only removes a job owned by the caller. |
+| `SuggestionEngine.propose` | `propose(..., principal: Optional[str] = None)` | Stamps `suggestion.principal`. |
+| `SuggestionEngine.pending` | `pending(principal: Optional[str] = None)` | Filters. |
+| `SuggestionEngine.accept` | `accept(suggestion_id, principal: Optional[str] = None)` | Refuses cross-owner. |
+| `SuggestionEngine.dismiss` | `dismiss(suggestion_id, principal: Optional[str] = None)` | Refuses cross-owner. |
+
 ---
 
 ## Semantics Reference
@@ -189,6 +249,10 @@ store.add(ScheduleJob(
 | Two identical `blueprint_name`+`slots` from the same principal within 24h | Deduped (2nd rejected). |
 | Two identical `blueprint_name`+`slots` from different principals within 24h | Both accepted — dedup window is per-principal. |
 | Serialising a job with `principal=None` | `principal` key is absent from `to_dict()` output. |
+| Agent-tool call with `SessionContext.unified_user_id` set, no explicit `principal=` | Argument defaults to the session identity — job is stamped and reads/mutations are scoped to it. |
+| Agent-tool call with `SessionContext.unified_user_id` set AND explicit `principal="other"` | Session identity **wins**; the argument is ignored (prevents impersonation via prompt-injected tool calls). |
+| Agent-tool call with no `SessionContext` and explicit `principal="carol"` | Explicit value is honoured — trusted CLI / gateway-bridge path. |
+| Agent-tool call with no `SessionContext` and no explicit `principal` | `None` → global pool. Single-tenant / CLI behaviour, unchanged. |
 
 ---
 
@@ -215,7 +279,18 @@ graph TB
 
 ## Common Patterns
 
-Thread the gateway-resolved identity down; the core carries the string and enforces the filter but never resolves identity itself.
+On a bot gateway the tools read the session for you — no `principal=` needed. Once the gateway installs a `SessionContext`, an agent turn gets per-user isolation for free.
+
+```python
+# Called from inside an agent turn on a bot gateway.
+# No `principal=` needed — the tool reads SessionContext.unified_user_id.
+from praisonaiagents.tools.schedule_tools import schedule_add, schedule_list
+
+schedule_add("morning-brief", "daily", message="Send my morning brief")
+schedule_list()   # → only this user's jobs
+```
+
+For advanced callers (custom stores, non-gateway wiring) thread the resolved identity down yourself; the core carries the string and enforces the filter but never resolves identity itself.
 
 ```python
 from praisonaiagents.scheduler import ScheduleJob, Schedule
@@ -234,6 +309,10 @@ def create_for_caller(principal: str, name: str, cron: str, message: str) -> Non
 def list_for_caller(principal: str):
     return store.list(principal=principal)
 ```
+
+<Note>
+**Cross-owner reads are refused too.** On the gateway bridge, `accept_suggestion` in `_automations.py` hides a suggestion whose `principal` doesn't match the caller — the accept path returns *"That suggestion was not found or has already been handled."* Details never leak by guessing an id.
+</Note>
 
 <Info>
 `get(job_id)` and `remove(job_id)` are intentionally NOT scoped. Direct-id access is capability-shaped — the id is an opaque 12-character hex (`uuid4().hex[:12]`). The guessable surface is the human-readable `name`, so scoping the name-based path (`get_by_name` / `remove_by_name`) is what closes the leak.
