@@ -98,6 +98,42 @@ sequenceDiagram
 
 ---
 
+## Three Outcomes
+
+Every tick records exactly one status.
+
+```mermaid
+graph TB
+    T[⏰ Tick] --> P[🔎 Probe source]
+    P --> D{Changed?}
+    D -->|First run / changed| OK[✅ succeeded]
+    D -->|Unchanged| NC[🔕 no_change]
+    P -->|Probe error| F[❌ failed]
+
+    classDef tick fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef silent fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class T tick
+    class P proc
+    class D decision
+    class OK ok
+    class NC silent
+    class F fail
+```
+
+| Status | Meaning |
+|--------|---------|
+| `succeeded` | The source changed (or first run) — the agent ran and delivered |
+| `no_change` | A watched source was unchanged — suppressed silently, no tokens, no delivery |
+| `failed` | The probe itself errored |
+
+`no_change` is distinct from `skipped` (a generic gate go/no-go) so you can tell "nothing changed" apart from "the gate said don't run".
+---
+
 ## How It Works
 
 Each tick probes the source, hashes the output, and compares it to the last-seen hash held in per-job state.
@@ -138,8 +174,23 @@ The wrapper's monitor gate returns a `GateResult` carrying the monitor-mode outc
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `no_change` | `bool` | `False` | `True` when the watched source was unchanged. Suppressed silently and recorded as `no_change`. **Implies `run=False`** (enforced in `__post_init__`) |
-| `state_updates` | `Optional[Dict[str, Any]]` | `None` | Bounded key/value to persist for the next tick (last-seen hash, watermark). `None` means "write nothing" |
+| `run` | `bool` | `True` | Whether to spend the model turn this tick |
+| `context` | `str \| None` | `None` | Text seeded into the job message when `run` is `True` |
+| `reason` | `str \| None` | `None` | Human-readable note recorded with the run |
+| `no_change` | `bool` | `False` | `True` when the watched source was unchanged — implies `run=False` (enforced in `__post_init__`) |
+| `state_updates` | `dict \| None` | `None` | Bounded key/value to persist for the next tick (last-seen hash, watermark). `None` means "write nothing" |
+
+Setting `no_change=True` always forces `run=False`, so a monitor can never fire a tick the contract defines as suppressed.
+
+```python
+from praisonaiagents.scheduler import GateResult
+
+# unchanged source → suppress silently
+GateResult(no_change=True, state_updates={"last_hash": "abc123"})
+
+# changed source → run with a diff seeded into the message
+GateResult(run=True, context="2 new releases", state_updates={"last_hash": "def456"})
+```
 
 ### `RunRecord.status`
 
@@ -178,6 +229,8 @@ graph TB
 
 <Note>
 On the scheduled delivery path, a `no_change` outcome is silently suppressed — no ping, no tokens. See [Scheduler Delivery](/features/scheduler-delivery) and [Bot Intentional Silence](/features/bot-intentional-silence) for how unattended-monitor silence is enforced unconditionally.
+
+The heavy `MonitorGate` (URL/shell probe + hashing + diffing + state persistence) is a wrapper-layer feature. This page documents the **core contract** — the declarable `monitor` spec, the `GateResult` outcomes, and the state-store protocol.
 </Note>
 
 ---
@@ -195,6 +248,45 @@ A monitor needs memory across wake-ups — the last-seen hash or a watermark. Th
 <Warning>
 All `JobStateStoreProtocol` methods are **optional**. Callers detect support with `hasattr()` and treat absence as "no per-job state" — today's stateless behaviour. Legacy stateless gates (`should_run(self, job)`) still satisfy the protocol under `runtime_checkable`, so callers must detect capability before passing `state=`.
 </Warning>
+
+---
+
+## CLI, YAML, and Python Parity
+
+The same `monitor` spec round-trips through every front-end.
+
+<Tabs>
+<Tab title="Python">
+
+```python
+from praisonaiagents.scheduler import ScheduleJob, Schedule
+
+job = ScheduleJob(
+    name="release-watch",
+    message="Summarise what changed.",
+    schedule=Schedule(kind="every", every_seconds=3600),
+    monitor={"url": "https://example.com/releases"},
+)
+```
+
+</Tab>
+<Tab title="YAML">
+
+```yaml
+jobs:
+  - name: release-watch
+    message: "Summarise what changed."
+    schedule:
+      kind: every
+      every_seconds: 3600
+    monitor:
+      url: "https://example.com/releases"
+```
+
+</Tab>
+</Tabs>
+
+`ScheduleJob.to_dict()` / `from_dict()` only persist `monitor` when it's configured, so stateless jobs stay byte-for-byte unchanged.
 
 ---
 
@@ -220,6 +312,18 @@ If the decision is a stateless go/no-go (an inbox check, a queue depth), use [`p
 <Accordion title="Let first-run seed the baseline">
 The first tick has no prior state, so it always runs and stores the baseline hash. Expect one delivery when a monitor job is created, then silence until the source moves.
 </Accordion>
+
+<Accordion title="Watch no_change separately from skipped">
+Filter run history on `no_change` to see "how often was the source unchanged" without conflating it with a generic gate skip.
+</Accordion>
+
+<Accordion title="Leave prior state on a probe error">
+Return `state_updates=None` on an error probe so prior state is untouched — a later recovery to the prior output still suppresses correctly.
+</Accordion>
+
+<Accordion title="Keep stored state bounded">
+State is a small scratchpad, not a database. Store cursors and hashes, not full payloads, so a runaway write can't grow unbounded.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -238,5 +342,11 @@ The first tick has no prior state, so it always runs and stores the baseline has
 </Card>
 <Card title="Bot Intentional Silence" icon="volume-xmark" href="/features/bot-intentional-silence">
   How unattended silence is enforced
+</Card>
+<Card title="Async Scheduler" icon="clock" href="/features/async-scheduler">
+  Schedule agents on intervals, cron, or one-shot timestamps
+</Card>
+<Card title="Scheduled Run Policy" icon="shield-check" href="/features/scheduled-run-policy">
+  Safety gates on what a scheduled run may do
 </Card>
 </CardGroup>
