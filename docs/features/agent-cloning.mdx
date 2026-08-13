@@ -17,6 +17,10 @@ clone.start("Hello from Telegram")
 
 The user deploys one base agent to several channels; each clone keeps the same instructions with isolated session state.
 
+<Note>
+**Fix reference:** [PraisonAI PR #3769](https://github.com/MervinPraison/PraisonAI/pull/3769) — `clone_for_channel()` now isolates memory per clone so one channel's history never leaks into another.
+</Note>
+
 ```mermaid
 graph LR
     subgraph "Agent Cloning"
@@ -100,12 +104,72 @@ Agent cloning creates a fresh instance with the same configuration but isolated 
 | `llm`, `base_url`, `api_key`, `auth` | Copied as-is |
 | `tools` | Shallow-copied (`list(self.tools)`) |
 | `handoffs` | Reset to `None` (channels should not share handoffs) |
-| All feature configs: `memory`, `knowledge`, `planning`, `reflection`, `guardrails`, `web`, `context`, `autonomy`, `output`, `execution`, `templates`, `caching`, `hooks`, `skills`, `approval`, `learn`, `sandbox` | Forwarded from the stored `_<name>_config` attributes |
+| `memory` (as `MemoryConfig` / `db()` / dict) | Forwarded as config — each clone re-resolves into its own fresh backend |
+| `memory` (as a live `Memory` / `FileMemory` **instance**) | Rebuilt per clone via `deepcopy`, or `type(mem)(mem.cfg)` if deepcopy fails on thread-locals / connections; **falls back with a warning** if isolation is impossible |
+| All other feature configs: `knowledge`, `planning`, `reflection`, `guardrails`, `web`, `context`, `autonomy`, `output`, `execution`, `templates`, `caching`, `hooks`, `skills`, `approval`, `learn`, `sandbox` | Forwarded from the stored `_<name>_config` attributes |
 | `tool_config` (which holds `timeout`, `retry_policy`, `parallel`), `runtime` / `_runtime_config` | Forwarded |
 | `cli_backend` | Forwarded (**deprecated** — use `runtime` instead) |
 | `interrupt_controller` | **Fresh instance** (no cross-channel interference) |
 | `__cache_lock` (`threading.RLock`) | **Fresh instance** |
 | `_cost_lock` (`threading.Lock`) | **Fresh instance** |
+
+---
+
+## Memory isolation
+
+Per-channel clones need per-channel memory — otherwise one user's chat history and long-term memory leaks into another. `clone_for_channel()` handles this automatically.
+
+```mermaid
+graph LR
+    subgraph "Isolated Memory per Clone"
+        Base[🤖 Base Agent] --> C1[📱 Telegram Clone]
+        Base --> C2[💬 Discord Clone]
+        C1 --> M1[🗄️ Own Memory Store]
+        C2 --> M2[🗄️ Own Memory Store]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef clone fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Base agent
+    class C1,C2 clone
+    class M1,M2 store
+```
+
+**Recommended (fully isolated):** pass memory as a config, not a live instance. Each clone re-resolves the config into its own fresh backend.
+
+```python
+from praisonaiagents import Agent, MemoryConfig
+
+base = Agent(
+    name="Support",
+    instructions="Help customers.",
+    memory=MemoryConfig(provider="mem0"),   # or a db() config, or a dict
+)
+
+telegram = base.clone_for_channel()  # its own mem0 backend
+discord  = base.clone_for_channel()  # its own mem0 backend, no cross-talk
+```
+
+**Live-instance memory** works too — the clone rebuilds a fresh backend of the same type per clone (via `deepcopy`, or `type(mem)(mem.cfg)` as a fallback). If isolation is genuinely impossible (a custom backend without a `cfg` attribute), the clone logs a warning and falls back to sharing so `clone_for_channel()` never hard-fails.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.memory import Memory
+
+base = Agent(
+    name="Support",
+    instructions="Help customers.",
+    memory=Memory(cfg=my_cfg),   # live instance
+)
+
+telegram = base.clone_for_channel()  # fresh Memory(cfg=my_cfg) per clone
+```
+
+<Warning>
+If you see the log line `clone_for_channel: could not isolate the live memory backend; clones will share it`, switch to a `MemoryConfig` / `db()` / dict config to guarantee isolation.
+</Warning>
 
 ---
 
