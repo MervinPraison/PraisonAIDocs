@@ -300,6 +300,16 @@ praisonai auth list
 |---|---|
 | `stored` | From `~/.praisonai/credentials.json` (unchanged behaviour) |
 | `env (VAR_NAME)` | Live credential coming from an environment variable; the var name is shown for unambiguity |
+| `env (in-memory)` | The whole store was loaded from `PRAISONAI_AUTH_CONTENT` — see [Zero-disk mode](#zero-disk-mode-praisonai_auth_content) |
+
+When `PRAISONAI_AUTH_CONTENT` is set, every stored-side entry reports `env (in-memory)` instead of `stored`:
+
+```bash
+praisonai auth list
+# Provider   Method   Source            Secret          Expires   Base URL   Model
+# openai     apikey   env (in-memory)   sk-1***efgh     (n/a)     (default)  (none)
+# github     oauth    env (in-memory)   gho_***xyz1     59m       (default)  (none)
+```
 
 If both a stored and an env credential exist for one provider, the env value wins at run time (this is unchanged) — the `Source` line appends `[live, overrides stored]` so it's visible:
 
@@ -339,10 +349,97 @@ Each stored provider credential contains the following fields:
 | Writes | Atomic via temp file + `os.replace` |
 | Display | Keys/tokens redacted as `at-9***xyz1` everywhere except the file |
 | OAuth internals | `refresh_token`, `token_url`, `client_id` are scrubbed before crossing into the LLM resolver — never sent to the provider |
+| Zero-disk mode | Set `PRAISONAI_AUTH_CONTENT` to a JSON store — nothing is read from or written to `credentials.json` for the process lifetime. See below |
 
 <Note>
 **Path change — auto-migrated.** Prior releases stored credentials at `~/.praison/credentials.json`. The canonical path is now `~/.praisonai/credentials.json`; the legacy path is still read if the canonical file doesn't exist yet, and any subsequent `auth login` or `setup` transparently migrates your old entries onto the canonical file. No re-login is required.
 </Note>
+
+### Zero-disk mode (`PRAISONAI_AUTH_CONTENT`)
+
+Set `PRAISONAI_AUTH_CONTENT` to a JSON credential store and PraisonAI runs entirely from memory — nothing is ever read from or written to `~/.praisonai/credentials.json`.
+
+Use it for ephemeral containers (Docker/Kubernetes), CI runners, and secret-hygiene-sensitive deployments where OAuth and refresh tokens must not touch disk. A single secret injects the whole store — including OAuth entries — with zero on-disk footprint.
+
+```mermaid
+graph TB
+    Start([Where should credentials live?]) --> Ephemeral{Ephemeral container /<br/>CI runner / no disk?}
+    Ephemeral -->|Yes| InMem[PRAISONAI_AUTH_CONTENT<br/>zero-disk, in-memory<br/>whole store as JSON]
+    Ephemeral -->|No| Multi{Multiple providers<br/>or OAuth tokens?}
+    Multi -->|No| Simple[Per-provider env var<br/>e.g. OPENAI_API_KEY]
+    Multi -->|Yes| Disk[praisonai auth login<br/>stored in ~/.praisonai/credentials.json]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Ephemeral,Multi decision
+    class InMem,Simple,Disk result
+```
+
+The value is a JSON **object** mapping provider name → credential object. Each credential object mirrors the on-disk `ProviderCredential` fields — `api_key` and `auth_method` for API keys, plus `access_token`, `refresh_token`, and `expires_at` for OAuth:
+
+```json
+{
+  "openai": {
+    "api_key": "sk-...",
+    "auth_method": "apikey"
+  },
+  "github": {
+    "api_key": "gho_...",
+    "auth_method": "oauth",
+    "access_token": "gho_...",
+    "refresh_token": "ghr_...",
+    "expires_at": 1723545600
+  }
+}
+```
+
+<Tabs>
+  <Tab title="Bash / CI">
+    ```bash
+    # Inject the store from a CI secret; nothing is written to disk
+    export PRAISONAI_AUTH_CONTENT='{"openai":{"api_key":"sk-...","auth_method":"apikey"}}'
+    praisonai run "What is 2+2?"
+    ```
+  </Tab>
+  <Tab title="Python">
+    ```python
+    import json, os
+    from praisonaiagents import Agent
+
+    os.environ["PRAISONAI_AUTH_CONTENT"] = json.dumps({
+        "openai": {"api_key": "sk-...", "auth_method": "apikey"},
+    })
+
+    agent = Agent(name="CI Agent", instructions="Answer briefly")
+    agent.start("What is 2+2?")
+    # No ~/.praisonai/credentials.json is created — everything stays in memory.
+    ```
+  </Tab>
+</Tabs>
+
+Invalid values fail fast rather than silently falling back to disk, protecting the zero-disk contract:
+
+| Value | Behaviour |
+|---|---|
+| Unset | Falls back to disk (unchanged behaviour) |
+| Empty / whitespace only | Raises `ValueError` — misconfiguration, no silent disk fallback |
+| Not valid JSON | Raises `ValueError` with the underlying decode error |
+| JSON scalar or array (not an object) | Raises `ValueError` — must map provider → credential |
+| A provider value that isn't a JSON object | Raises `ValueError` naming the offending provider(s) |
+| Valid object with OAuth tokens | Loaded in memory; OAuth refresh works and stays in memory |
+
+<Note>
+**Precedence:** the env blob always wins over any on-disk `credentials.json`. Per-provider API-key env vars (`OPENAI_API_KEY`, …) still win for that specific provider at run time — unchanged.
+</Note>
+
+<Warning>
+Treat `PRAISONAI_AUTH_CONTENT` as a secret. Inject it only from a secrets manager, never commit it, and prefer a CI runtime that scrubs env vars from build logs. OAuth tokens refreshed in this mode stay **in memory only** — nothing is written back to disk.
+</Warning>
+
+`auth list` and `auth status` report the `Source` column as `env (in-memory)` in this mode via the `CredentialStore.is_in_memory` property, so zero-disk runs are never silently invisible.
 
 ## Supported Providers
 
@@ -373,7 +470,7 @@ OAuth login requires the optional 'requests' package. Install it with: pip insta
 `praisonai run` resolves credentials in this order:
 
 1. Environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …)
-2. Stored credentials — **OAuth tokens refreshed transparently** (~60 s before expiry) before injection
+2. Stored credentials — **OAuth tokens refreshed transparently** (~60 s before expiry) before injection. When `PRAISONAI_AUTH_CONTENT` is set, this store is the [in-memory env blob](#zero-disk-mode-praisonai_auth_content) instead of `~/.praisonai/credentials.json`, and any OAuth refresh stays in memory only
 3. LLM endpoint resolution via `resolve_llm_endpoint_with_credentials`
 
 If an expired OAuth token cannot be refreshed (refresh token revoked, network error, etc.), `praisonai run` reports:
