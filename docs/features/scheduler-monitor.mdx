@@ -1,0 +1,242 @@
+---
+title: "Scheduler Monitor"
+sidebarTitle: "Scheduler Monitor"
+description: "Wake a scheduled agent only when a watched source changed — and tell you only what changed"
+icon: "eye"
+---
+
+Turn a scheduled agent into a monitor: probe a cheap source each tick, run the model only when it changed, and stay silent when it didn't.
+
+```mermaid
+graph LR
+    Tick[⏰ Tick due] --> Probe[🔎 Probe source]
+    Probe --> Hash{🔐 Changed?}
+    Hash -->|No| NoChange[🤫 no_change — silent]
+    Hash -->|Yes / first run| Seed[📝 Seed diff into message]
+    Seed --> Run[🤖 Run model once]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef silent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef run fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Tick input
+    class Probe process
+    class Hash gate
+    class NoChange silent
+    class Seed,Run run
+```
+
+<Note>
+The `monitor` field is a **declarable spec** the core round-trips through storage. The probe, hashing, bounded diff, state persistence, and the `no_change` record live in the `praisonai-bot` / wrapper layer — the core owns only the contract.
+</Note>
+
+## Quick Start
+
+<Steps>
+<Step title="Turn an agent into a monitor">
+Add `monitor` to a `ScheduleJob`. The agent runs only when the watched URL changes.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.scheduler import ScheduleJob, Schedule
+
+agent = Agent(name="News watcher", instructions="Summarise new items")
+
+job = ScheduleJob(
+    name="hn-frontpage",
+    schedule=Schedule(kind="every", every_seconds=900),
+    message="Summarise the changes.",
+    agent_id=agent.id,
+    monitor={"url": "https://news.ycombinator.com/"},
+)
+```
+</Step>
+
+<Step title="Watch a shell source instead">
+Use `command` inside `monitor` to watch any cheap shell output — a file, a database count, a health probe.
+
+```python
+from praisonaiagents.scheduler import ScheduleJob, Schedule
+
+job = ScheduleJob(
+    name="disk-watch",
+    schedule=Schedule(kind="every", every_seconds=300),
+    message="Explain the change in disk usage and flag anything urgent.",
+    monitor={"command": "df -h /"},
+)
+```
+</Step>
+</Steps>
+
+---
+
+## What The User Sees
+
+Silence is the feature — an unchanged source produces no ping and spends no tokens.
+
+```mermaid
+sequenceDiagram
+    participant Source
+    participant Monitor as Monitor gate
+    participant Agent
+    participant User
+
+    loop Unchanged tick
+        Monitor->>Source: probe (cheap)
+        Source-->>Monitor: same hash
+        Monitor-->>Monitor: no_change — silent (0 tokens)
+    end
+    Note over User: nothing delivered
+
+    Monitor->>Source: probe (cheap)
+    Source-->>Monitor: new hash + diff
+    Monitor->>Agent: run message + seeded diff
+    Agent-->>User: delivered summary of what changed
+```
+
+---
+
+## How It Works
+
+Each tick probes the source, hashes the output, and compares it to the last-seen hash held in per-job state.
+
+| Tick outcome | What happens | Recorded status |
+|--------------|--------------|-----------------|
+| Source unchanged | Model turn suppressed — no tokens, no delivery | `no_change` |
+| Source changed | Bounded diff seeded into `message`, model runs once | `succeeded` |
+| First run (no prior state) | Treated as changed — model runs, hash stored | `succeeded` |
+| Probe errored | Prior state left untouched so a later recovery still suppresses | `failed` |
+
+<Note>
+`no_change` is a **distinct** status from `skipped`. `skipped` means "a gate said don't run"; `no_change` means "a watched source was unchanged" — so operators can tell the two apart in run history.
+</Note>
+
+---
+
+## Configuration Options
+
+### `monitor` spec
+
+`monitor` is a small mapping naming one cheap source to probe each tick.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `command` | `str` | Shell command whose stdout is hashed and diffed each tick |
+| `url` | `str` | A bounded fetch whose response body is hashed and diffed each tick |
+
+### `ScheduleJob` field
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `monitor` | `Optional[Dict[str, Any]]` | `None` | Change-detection source spec. `None` keeps the existing stateless behaviour. Omitted from serialization when unset (fully backward-compatible) |
+
+### `GateResult` — monitor outcome
+
+The wrapper's monitor gate returns a `GateResult` carrying the monitor-mode outcome.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `no_change` | `bool` | `False` | `True` when the watched source was unchanged. Suppressed silently and recorded as `no_change`. **Implies `run=False`** (enforced in `__post_init__`) |
+| `state_updates` | `Optional[Dict[str, Any]]` | `None` | Bounded key/value to persist for the next tick (last-seen hash, watermark). `None` means "write nothing" |
+
+### `RunRecord.status`
+
+| Value | Meaning |
+|-------|---------|
+| `succeeded` | The model turn ran and completed |
+| `failed` | The run raised or the probe errored |
+| `skipped` | A stateless gate said don't run |
+| `no_change` | A watched source was unchanged (monitor mode) |
+
+---
+
+## Monitor vs Pre-Run vs Command
+
+Three scheduler features feel similar but solve different problems.
+
+```mermaid
+graph TB
+    Start{What do you want<br/>on each tick?} -->|Silence unless a<br/>watched source changed| Monitor[monitor — stateful]
+    Start -->|Skip when there's<br/>nothing to do| PreRun[pre_run — stateless gate]
+    Start -->|Run a command<br/>instead of the model| Command[command — model-free action]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef choice fill:#10B981,stroke:#7C90A0,color:#fff
+    class Start question
+    class Monitor,PreRun,Command choice
+```
+
+| Feature | Kind | Fires the model? | Silence when… |
+|---------|------|------------------|---------------|
+| `monitor` | Stateful (remembers last hash) | Only when the source changed | The source is unchanged (`no_change`) |
+| [`pre_run`](/features/scheduler-pre-run-gate) | Stateless go/no-go gate | Only when the gate says "go" | Nothing to do (`skipped`) |
+| [`command`](/features/scheduler-command-action) | Model-free delivery action | Never — delivers stdout verbatim | — |
+
+> From the SDK docstring: "monitor is distinct from `pre_run` (a stateless go/no-go gate) and `command` (a model-free delivery action)."
+
+<Note>
+On the scheduled delivery path, a `no_change` outcome is silently suppressed — no ping, no tokens. See [Scheduler Delivery](/features/scheduler-delivery) and [Bot Intentional Silence](/features/bot-intentional-silence) for how unattended-monitor silence is enforced unconditionally.
+</Note>
+
+---
+
+## Per-Job State
+
+A monitor needs memory across wake-ups — the last-seen hash or a watermark. The core defines the `JobStateStoreProtocol` contract; a concrete store lives in the wrapper alongside the heavy monitor gate.
+
+| Method | Description |
+|--------|-------------|
+| `get_state(job_id)` | Return the persisted state dict (`{}` if none) |
+| `set_state(job_id, state)` | Persist bounded state for the job |
+| `clear_state(job_id)` | Drop state when the job is removed |
+
+<Warning>
+All `JobStateStoreProtocol` methods are **optional**. Callers detect support with `hasattr()` and treat absence as "no per-job state" — today's stateless behaviour. Legacy stateless gates (`should_run(self, job)`) still satisfy the protocol under `runtime_checkable`, so callers must detect capability before passing `state=`.
+</Warning>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Bound your source so a large fetch can't stall the tick">
+The probe runs on every tick. Watch a small, cheap source — a status endpoint, a row count, a file's modification marker — not a multi-megabyte page. A bounded source keeps the ticker responsive.
+
+```python
+monitor={"command": "curl -sf --max-time 5 https://status.example.com/health"}
+```
+</Accordion>
+
+<Accordion title="Use monitor when you want silence-when-unchanged">
+Reach for `monitor` when the whole point is "only tell me when something changed" — a page, a feed, a metric. Unchanged ticks cost zero tokens and deliver nothing.
+</Accordion>
+
+<Accordion title="Use pre_run when you want silence-when-nothing-to-do">
+If the decision is a stateless go/no-go (an inbox check, a queue depth), use [`pre_run`](/features/scheduler-pre-run-gate) instead — it doesn't need to remember a prior hash.
+</Accordion>
+
+<Accordion title="Let first-run seed the baseline">
+The first tick has no prior state, so it always runs and stores the baseline hash. Expect one delivery when a monitor job is created, then silence until the source moves.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Pre-Run Gate" icon="filter" href="/features/scheduler-pre-run-gate">
+  Stateless go/no-go gate — skip when there's nothing to do
+</Card>
+<Card title="Command Action" icon="terminal" href="/features/scheduler-command-action">
+  Model-free action — deliver a command's stdout verbatim
+</Card>
+<Card title="Scheduler Delivery" icon="paper-plane" href="/features/scheduler-delivery">
+  Push scheduled results to Telegram/Discord/Slack/WhatsApp
+</Card>
+<Card title="Bot Intentional Silence" icon="volume-xmark" href="/features/bot-intentional-silence">
+  How unattended silence is enforced
+</Card>
+</CardGroup>
