@@ -116,6 +116,39 @@ The whole scan is wrapped in a `try / except` at the `start()` site — a failur
 
 ---
 
+## Run-level recovery (new — PR #3885)
+
+The turn-level restart continuation above covers sessions that were mid-conversation. For **background runs** (a long-running agent job kicked off from a channel), the gateway now also reconciles them on boot via the [Run Ledger](/features/run-ledger). `SQLiteRunLedger.recover_orphans()` marks each active run `LOST` and preserves its origin `channel` + `thread_id`, and the gateway posts a **durable, exactly-once** "your run was interrupted" notice back to that thread. The user never sits in silence after a restart, even if the channel wasn't ready to send yet at the moment recovery ran.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Ch as Telegram / Slack
+    participant Gw as Gateway (on boot)
+    participant Le as SQLiteRunLedger
+    participant Ob as scheduled_outbox
+
+    User->>Ch: Kicks off a long agent run
+    Ch->>Gw: forward
+    Gw->>Le: upsert(RunRecord status=RUNNING)
+    Note over Gw: PraisonAI crashes / restarts
+    Gw->>Le: recover_orphans() on boot
+    Le-->>Gw: [RunRecord status=LOST, channel, thread_id]
+    Gw->>Ob: enqueue run-recovery:{run_id} (durable)
+    Ob->>Ch: "your run was interrupted — retry?"
+    Ch-->>User: notice delivered
+```
+
+<Note>
+**Durable, exactly-once.** The recovery notice is written to the SQLite `scheduled_outbox` under the stable dedup key `run-recovery:{run_id}` **before** delivery. If the channel adapter is not yet ready when the notice is first sent, the pending row drains on the next boot — the notice is never lost, and never duplicated. Falls back to a best-effort restart-notice path when no durable outbox / router is available.
+</Note>
+
+<Info>
+**Default-safe.** If your gateway never used the run ledger, boot recovery is a no-op — nothing scans, nothing sends. `SQLiteRunLedger` at `~/.praisonai/runs/ledger.db` is created the first time a run is upserted; boot recovery activates from that point on.
+</Info>
+
+---
+
 ## What Triggers a Resume
 
 A persisted session is resumed when all of these hold:
