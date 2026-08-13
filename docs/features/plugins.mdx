@@ -799,6 +799,153 @@ def create_plugin():
 
 ---
 
+## Function-Based Plugins (`FunctionPlugin`)
+
+`FunctionPlugin` wraps plain functions into a plugin without subclassing — useful for one-off hooks or when the whole plugin is a single callable.
+
+### When to reach for it
+
+```mermaid
+graph TB
+    Q[How much do you need?] --> A[One or two hook callbacks]
+    Q --> B[State, config, multiple hooks, session lifecycle]
+    A --> R1[FunctionPlugin - wrap plain functions]
+    B --> R2[Subclass Plugin - full base class]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef option fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q decision
+    class A,B option
+    class R1,R2 result
+```
+
+### Quick Start
+
+Register a `FunctionPlugin` on the plugin manager, then start the agent — the callable runs before the agent sees the message.
+
+```python
+from praisonaiagents import Agent, FunctionPlugin, PluginHook
+from praisonaiagents.plugins import get_plugin_manager
+
+def redact_secrets(message):
+    text = message.get("content", "")
+    return {"content": text.replace("sk-", "sk-****")}
+
+get_plugin_manager().register(FunctionPlugin(
+    name="redact_secrets",
+    hooks={PluginHook.MESSAGE_RECEIVED: redact_secrets},
+))
+
+agent = Agent(name="Assistant", instructions="Help users.")
+agent.start("here is my key sk-live-abc")   # agent sees redacted content
+```
+
+### Constructor
+
+```python
+FunctionPlugin(
+    name: str,
+    hooks: Optional[Dict[PluginHook, Callable]] = None,
+    version: str = "1.0.0",
+    description: str = "",
+)
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `str` | — | Plugin name shown in the registry. |
+| `hooks` | `Dict[PluginHook, Callable]` | `None` | Maps each `PluginHook` enum value to the callable that handles it. |
+| `version` | `str` | `"1.0.0"` | Semantic version. |
+| `description` | `str` | `""` | What the plugin does. |
+
+### Hook dispatch table
+
+Each key in `hooks={}` is a `PluginHook` enum value; the callable's return value drives the effect below.
+
+| `PluginHook` key | Callable signature | Effect |
+|------------------|--------------------|--------|
+| `PluginHook.BEFORE_TOOL` | `fn(tool_name: str, args: dict) -> dict` | Rewrites tool args |
+| `PluginHook.AFTER_TOOL` | `fn(tool_name: str, result: Any) -> Any` | Rewrites tool result |
+| `PluginHook.BEFORE_AGENT` | `fn(prompt: str, context: dict) -> str` | Rewrites prompt |
+| `PluginHook.AFTER_AGENT` | `fn(response: str, context: dict) -> str` | Rewrites response |
+| `PluginHook.MESSAGE_RECEIVED` | `fn(message: dict) -> dict \| PluginDecision \| None` | Rewrites `content`, or `deny` drops the inbound message |
+| `PluginHook.MESSAGE_SENDING` | `fn(message: dict) -> dict` | Rewrites outbound `content` |
+| `PluginHook.MESSAGE_SENT` | `fn(message: dict) -> None` | Observe-only |
+| `PluginHook.MESSAGE_UNDELIVERED` | `fn(message: dict) -> None` | Observe-only (payload adds `error`, `notice_delivered`) |
+
+### Message-lifecycle examples
+
+Lead with the outcome: rate-limit a channel, log every delivery, or capture permanent failures.
+
+<CodeGroup>
+
+```python rate-limit a channel
+from praisonaiagents import FunctionPlugin, PluginHook, PluginDecision
+from praisonaiagents.plugins import get_plugin_manager
+
+counts = {}
+def gate(message):
+    ch = message.get("channel_id")
+    if ch is None:
+        return message
+    counts[ch] = counts.get(ch, 0) + 1
+    if counts[ch] > 20:
+        return PluginDecision.deny(f"rate limit exceeded for {ch}")
+    return message
+
+get_plugin_manager().register(FunctionPlugin(
+    name="channel_rate_limit",
+    hooks={PluginHook.MESSAGE_RECEIVED: gate},
+))
+```
+
+```python log every successful delivery
+from praisonaiagents import FunctionPlugin, PluginHook
+from praisonaiagents.plugins import get_plugin_manager
+
+def on_sent(message):
+    print(f"[sent] {message.get('platform')} channel={message.get('channel_id')}")
+
+get_plugin_manager().register(FunctionPlugin(
+    name="delivery_log",
+    hooks={PluginHook.MESSAGE_SENT: on_sent},
+))
+```
+
+```python capture permanent delivery failures
+from praisonaiagents import FunctionPlugin, PluginHook
+from praisonaiagents.plugins import get_plugin_manager
+
+def on_dead(message):
+    # error + notice_delivered are only added on the MESSAGE_UNDELIVERED bridge
+    print(f"[dead] {message.get('channel_id')} err={message.get('error')} "
+          f"notice_delivered={message.get('notice_delivered')}")
+
+get_plugin_manager().register(FunctionPlugin(
+    name="dead_letter_log",
+    hooks={PluginHook.MESSAGE_UNDELIVERED: on_dead},
+))
+```
+
+</CodeGroup>
+
+<Warning>
+- The `hooks` dict key must be a `PluginHook` enum value, not the string `"before_tool"` — a string key silently no-ops.
+- `FunctionPlugin` receives the **same enriched payload** as `Plugin` subclasses, so absent identity fields are **skipped**, not empty strings. Always use `.get(key)` and handle `None`.
+- `MESSAGE_SENT` / `MESSAGE_UNDELIVERED` callbacks are observe-only — return values are ignored (no rewrite, no block).
+</Warning>
+
+<Note>
+`FunctionPlugin`'s message-lifecycle dispatch (`MESSAGE_RECEIVED`, `MESSAGE_SENDING`, `MESSAGE_SENT`, `MESSAGE_UNDELIVERED`) is a recent addition ([commit `857ebbe`](https://github.com/MervinPraison/PraisonAI/commit/857ebbe344cc295a5f1c52d0167c039fae4c3332)) — earlier versions silently no-op'd these four keys, so users had to subclass `Plugin`.
+</Note>
+
+<Note>
+For the full payload contract (identity keys, per-event availability, `error` / `notice_delivered` special-cases), see [Message-Lifecycle Plugins](#message-lifecycle-plugins) — `FunctionPlugin` and `Plugin` subclasses share the exact same `_message_payload` bridge.
+</Note>
+
+---
+
 ## Auto-Enable from Env or Config
 
 Agent construction auto-enables plugins when the environment or config file requests it — no explicit `plugins.enable()` call needed.
