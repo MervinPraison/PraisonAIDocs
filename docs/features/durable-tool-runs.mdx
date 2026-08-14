@@ -5,14 +5,14 @@ description: "Survive a crash mid-tool-loop without re-running side-effecting to
 icon: "rotate"
 ---
 
-Durable tool runs journal every model and tool boundary so a crash mid-loop resumes from the exact step it left off — recorded tool results replay instead of re-executing.
+Turn on durability with one flag: the agent journals every model and tool boundary, so a crash mid-loop resumes from the exact step it left off — recorded tool results replay instead of re-executing.
 
 ```mermaid
 graph LR
     subgraph "Durable Tool Run"
-        Start[🚀 Run starts] --> T1[🔧 Tool 1 done]
+        Start[🚀 agent.start] --> T1[🔧 Tool 1 done]
         T1 --> Crash[💥 Crash]
-        Crash --> Resume[🔁 Same run resumes]
+        Crash --> Resume[🔁 resume_run_id]
         Resume --> Replay[📒 Tool 1 from journal]
         Replay --> T2[🔧 Tool 2 live]
         T2 --> Done[✅ Success]
@@ -32,39 +32,47 @@ graph LR
 ## Quick Start
 
 <Steps>
-<Step title="Record each boundary">
-Open a run under a stable id and append an event at every model decision and tool result.
+<Step title="Enable durable execution">
+Set `durable=True` on `ExecutionConfig`, then capture `agent.last_durable_run_id` after the run and persist it alongside your business record.
 
 ```python
-from praisonaiagents.runtime import RunJournal, JournalEvent
+from praisonaiagents import Agent, ExecutionConfig
 
-journal = RunJournal()  # ~/.praisonai/runs/journal.db
-journal.open_run("order-A-1042", agent="Order Processor", task="Process order #A-1042")
+def charge_card(amount: float, customer_id: str) -> dict:
+    return payment_gateway.charge(amount, customer_id)
 
-# Record boundaries as the tool loop runs
-journal.append(JournalEvent("order-A-1042", 0, "model_decision", {"text": "charge the card"}))
-journal.append(JournalEvent("order-A-1042", 0, "tool_result", {"receipt": "rcpt_88f21"}))
+agent = Agent(
+    name="Order Processor",
+    instructions="Charge the card and ship the order.",
+    tools=[charge_card, ship_order, notify_customer],
+    execution=ExecutionConfig(
+        durable=True,
+        journal_path="./journal.db",   # optional; defaults to ~/.praisonai/runs/journal.db
+    ),
+)
 
-journal.close_run("order-A-1042", "succeeded")
+result = agent.start("Process order #A-1042 for customer C-99")
+
+# Persist alongside your business record so a restart can find it
+run_id = agent.last_durable_run_id
 ```
 </Step>
 
 <Step title="Resume after a crash">
-Re-open the same run id, then replay recorded steps so side-effecting tools do not fire twice.
+Set `resume_run_id` to the saved id and call `start()` with the **same prompt**. Recorded tool results replay from the journal — side-effecting tools do not fire again.
 
 ```python
-from praisonaiagents.runtime import RunJournal
+# SAME agent, SAME prompt
+agent.execution.resume_run_id = run_id
+result = agent.start("Process order #A-1042 for customer C-99")
 
-journal = RunJournal()
-
-# Runs left "running" after a crash are the resume candidates
-for run_id in journal.interrupted_runs():
-    replay = journal.replay_index(run_id)          # {(seq, kind): payload}
-    receipt = replay.get((0, "tool_result"))       # cached — charge_card does NOT re-run
-    if receipt:
-        print(f"Resuming {run_id}, replaying receipt {receipt['receipt']}")
-    journal.close_run(run_id, "succeeded")
+# charge_card does NOT fire again — the recorded result replays from the journal.
+# resume_run_id auto-clears to None once the turn ends terminally.
 ```
+
+<Warning>
+The prompt must match on resume. A different prompt raises `ValueError("Resume prompt does not match ...")`, an unknown id raises `ValueError("Cannot resume unknown durable run ...")`, and a terminal run raises `ValueError("Cannot resume terminal durable run ... (status=...)")`.
+</Warning>
 </Step>
 </Steps>
 
@@ -72,7 +80,7 @@ for run_id in journal.interrupted_runs():
 
 ## How It Works
 
-The journal records one event per boundary keyed by `(run_id, seq, kind)`. On resume the loop is re-driven from the top; journalled steps return their recorded payload instantly, and only un-journalled steps do real work.
+The agent records one event per boundary. On resume the loop is re-driven from the top; journalled steps return their recorded payload instantly, and only un-journalled steps do real work.
 
 ```mermaid
 sequenceDiagram
@@ -81,62 +89,91 @@ sequenceDiagram
     participant Tool
     participant Journal
 
-    User->>Agent: start run
-    Agent->>Journal: open_run(run_id)
+    User->>Agent: agent.start(prompt)
+    Agent->>Journal: begin run (auto)
     Agent->>Tool: charge_card()
     Tool-->>Agent: receipt
-    Agent->>Journal: append(tool_result)
+    Agent->>Journal: record result (auto)
     Note over Agent,Journal: 💥 crash before finishing
-    User->>Agent: restart
-    Agent->>Journal: interrupted_runs() → [run_id]
-    Journal-->>Agent: replay_index (cached receipt)
+    User->>Agent: set resume_run_id, start(prompt)
+    Journal-->>Agent: replay recorded receipt
     Agent->>Tool: ship_order() (live — first time)
     Tool-->>Agent: shipment id
-    Agent->>Journal: close_run(succeeded)
+    Agent->>Journal: finalize succeeded (auto)
 ```
-
-A run moves through three states:
-
-| State | Meaning | Resumed on restart? |
-|-------|---------|---------------------|
-| `running` | Open, in progress — or a process died before closing it | Yes — surfaced by `interrupted_runs()` |
-| `succeeded` / `cancelled` | Closed with a terminal outcome | No |
-| `failed` | Closed after an unrecoverable error | No |
 
 ---
 
-## Event Kinds
+## Run Outcomes
 
-Each boundary is recorded under a `kind`. Recorded results replay on resume instead of re-executing.
+Each terminal outcome maps to an auto-finalize state and controls whether `resume_run_id` clears itself.
 
-| Kind (string) | Records | Replayed on resume? |
-|---------------|---------|---------------------|
-| `model_decision` | The LLM decision text | Yes — the model is not re-called or re-billed |
-| `tool_call` | `{name, args, idempotency_key}` | Marks the call |
-| `tool_result` | The tool's returned value | Yes — side-effecting tools do not re-run |
-| `approval` | A human/policy approval decision | Yes — pause-for-approval survives a restart |
-| `iteration` | `{index}` — the loop cursor | Yes — restores the cursor exactly |
+| Outcome | Auto-finalize | `resume_run_id` auto-clears |
+|---------|---------------|-----------------------------|
+| Success | `succeeded` | Yes |
+| `ToolExecutionError(is_retryable=False)` | `failed` | Yes |
+| `ToolExecutionError(is_retryable=True)` | *(none — stays `running`)* | No |
+| `InterruptedError` / `asyncio.CancelledError` | `cancelled` | Yes |
+| Streaming `GeneratorExit` | `cancelled` | Yes |
+
+A retryable failure leaves the run resumable. A non-retryable failure marks it `failed` and non-resumable.
 
 ---
 
 ## Configuration Options
 
-`RunJournal(db_path=None)` — the constructor is the whole surface.
+Three fields on `ExecutionConfig` control durability. `Agent.last_durable_run_id` is the read-side companion.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `db_path` | `str` | `None` → `~/.praisonai/runs/journal.db` | SQLite path for the journal. Use `":memory:"` in tests. |
+| `durable` | `bool` | `False` | Enable journal writes and resume. Zero overhead when `False` — the journal is not constructed. |
+| `journal_path` | `Optional[str]` | `None` → `~/.praisonai/runs/journal.db` | SQLite path for the run journal. Use `":memory:"` in tests, a mounted volume in containers. |
+| `resume_run_id` | `Optional[str]` | `None` | Set to a prior run's id to resume it. Auto-cleared to `None` after any terminal turn. |
 
-Key methods:
+---
 
-| Method | Purpose |
-|--------|---------|
-| `open_run(run_id, *, agent="", task="", checkpoint_id=None, metadata=None)` | Register a run as `running` (idempotent; re-opening on resume preserves the journal). |
-| `append(JournalEvent(...))` | Append a boundary event (idempotent on `(run_id, seq, kind)`). |
-| `replay_index(run_id)` | Return `{(seq, kind): payload}` for memoised replay. |
-| `last_iteration(run_id)` | Highest journalled iteration index, to restore the loop cursor. |
-| `interrupted_runs()` | Ids of runs still `running` — resume candidates after a restart. |
-| `close_run(run_id, outcome)` | Mark terminal (`succeeded` / `failed` / `cancelled`) so it is not resumed again. |
+## Idempotency Contract for Tools
+
+Any tool whose signature accepts `idempotency_key` (or `**kwargs`) automatically receives a stable per-call key on every invocation. Non-declaring tools work unchanged.
+
+```python
+def charge_card(amount: float, customer_id: str, idempotency_key: str = "") -> dict:
+    return payment_gateway.charge(amount, customer_id, idem_key=idempotency_key)
+```
+
+The key shape is `"{run_id}:{seq}:{function_name}"` — the same on resume, so a tool that dedups on it stays safe even before journal replay records its result.
+
+---
+
+## Discovering Resumable Runs
+
+When your process restarts and you don't have the `run_id` handy, ask the journal directly for runs still `running`.
+
+```python
+from praisonaiagents.runtime import RunJournal
+
+journal = RunJournal("./journal.db")
+
+for run_id in journal.interrupted_runs():
+    print(f"Resumable: {run_id}")
+    # Set agent.execution.resume_run_id = run_id and re-run the original prompt
+```
+
+---
+
+## Advanced
+
+Framework and tool authors integrating a custom executor can reach the durable context directly through `praisonaiagents.agent.durable`.
+
+```python
+from praisonaiagents.agent.durable import get_durable_idempotency_key
+
+def charge_card(amount: float, customer_id: str) -> dict:
+    key = get_durable_idempotency_key()   # stable per-call key, or None outside a durable run
+    return payment_gateway.charge(amount, customer_id, idem_key=key)
+```
+
+The module also exposes `begin_durable_run`, `abegin_durable_run`, `end_durable_run`, `get_durable_run`, and `DurableRunContext` for wiring the journal into a bespoke tool loop.
 
 ---
 
@@ -145,48 +182,65 @@ Key methods:
 Long-running scheduled job that survives a container restart:
 
 ```python
+from praisonaiagents import Agent, ExecutionConfig
 from praisonaiagents.runtime import RunJournal
 
-journal = RunJournal("/data/praisonai/journal.db")  # persistent volume
+agent = Agent(
+    name="Nightly Reconciler",
+    instructions="Reconcile pending orders.",
+    tools=[reconcile_order],
+    execution=ExecutionConfig(durable=True, journal_path="/data/praisonai/journal.db"),
+)
 
-pending = journal.interrupted_runs()
-if pending:
-    for run_id in pending:
-        replay = journal.replay_index(run_id)
-        # feed replay into your tool loop; recorded steps return instantly
+# On startup, resume anything left running by a previous crash
+for run_id in RunJournal("/data/praisonai/journal.db").interrupted_runs():
+    agent.execution.resume_run_id = run_id
+    agent.start("Reconcile pending orders.")
 ```
 
-Batch of paid API calls that must never double-charge — replay the recorded receipt instead of re-calling:
+Batch of paid API calls that must never double-charge — the recorded receipt replays instead of re-calling:
 
 ```python
-replay = journal.replay_index("order-A-1042")
-receipt = replay.get((3, "tool_result"))     # step 3 = payment
-if receipt is None:
-    receipt = charge_card(order="A-1042")     # only if never recorded
-    journal.append(JournalEvent("order-A-1042", 3, "tool_result", receipt))
+agent = Agent(
+    name="Billing Runner",
+    instructions="Charge each pending invoice once.",
+    tools=[charge_card],
+    execution=ExecutionConfig(durable=True),
+)
+
+result = agent.start("Charge invoice #A-1042")
+invoice_run_id = agent.last_durable_run_id   # store next to the invoice row
+
+# After a crash: resume without re-charging
+agent.execution.resume_run_id = invoice_run_id
+agent.start("Charge invoice #A-1042")
 ```
 
-Pause-for-approval flows survive a restart because the `approval` decision is journalled — see [Durable Approvals](/features/durable-approvals).
+Pause-for-approval flows survive a restart because the approval decision is journalled — see [Durable Approvals](/features/durable-approvals).
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Use a stable run id per business transaction">
-Key the run on the order id, ticket id, or job id (`"order-A-1042"`) so a restart can find the right journal row with `interrupted_runs()` or `replay_index()`.
+<Accordion title="Persist last_durable_run_id with your business record">
+Capture `agent.last_durable_run_id` right after `start()`/`chat()` and store it next to the order id or ticket id. That's the value you set into `resume_run_id` later.
 </Accordion>
 
 <Accordion title="Point journal_path at a persistent volume in containers">
-The default `~/.praisonai/runs/journal.db` is lost when a container is recreated. Pass an explicit path on a mounted volume, e.g. `RunJournal("/data/praisonai/journal.db")`.
+The default `~/.praisonai/runs/journal.db` is lost when a container is recreated. Pass an explicit path on a mounted volume so the journal survives restarts.
 </Accordion>
 
 <Accordion title="Keep tools idempotent as belt-and-braces">
-The journal prevents re-execution of *recorded* completions. A tool that crashed *before* its `tool_result` was appended still needs an idempotency key at the tool layer.
+Opt into the auto-injected `idempotency_key` so a tool that crashes *before* recording its result still dedups on retry.
 </Accordion>
 
-<Accordion title="Do not reuse a run id across different tasks">
-The journal keys on `run_id` verbatim. Reusing an id for a different task replays the wrong recorded steps.
+<Accordion title="Distinguish retryable vs terminal failures">
+`ToolExecutionError(is_retryable=True)` leaves the run resumable; `is_retryable=False` marks it `failed` and non-resumable.
+</Accordion>
+
+<Accordion title="Close streams cleanly">
+Calling `stream.close()` finalizes the run as `cancelled`, so aborting a stream never leaves a ghost `running` row.
 </Accordion>
 </AccordionGroup>
 
@@ -199,7 +253,7 @@ The journal keys on `run_id` verbatim. Reusing an id for a different task replay
 The SQLite layer under durable runs.
 </Card>
 <Card title="Durable Approvals" icon="user-check" href="/features/durable-approvals">
-The `approval` event — pause-for-approval that survives a restart.
+Pause-for-approval that survives a restart.
 </Card>
 <Card title="Execution" icon="play" href="/features/execution">
 Agent execution limits and configuration.
