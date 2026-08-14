@@ -164,6 +164,103 @@ Under polling fallback, `PollingTransport.send({"type": "channel.publish", ...})
 
 ---
 
+## HA & cross-instance delivery
+
+With `PushConfig(redis=...)`, multiple gateway instances fan out channel messages through Redis pub/sub so a subscriber on any instance receives every publish.
+
+```mermaid
+graph LR
+    subgraph "HA fan-out"
+        P[📤 Publisher] --> GA[🛰️ Gateway A]
+        GA --> R[🔀 Redis pub/sub]
+        R --> GB[🛰️ Gateway B]
+        GB --> S[📥 Subscriber]
+    end
+
+    classDef pub fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef gw fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef redis fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef sub fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class P pub
+    class GA,GB gw
+    class R redis
+    class S sub
+```
+
+### Self-healing on Redis outage
+
+The fan-out adapter (`RedisPubSubAdapter`) survives a dropped Redis connection without operator intervention:
+
+- **Bounded exponential backoff** — reconnects starting at `1s`, doubling on each failed attempt, capped at `30s`. It never gives up unless the adapter is disconnected.
+- **Automatic re-subscription** — every channel is re-subscribed on the fresh pub/sub handle after reconnect, so operators do not re-subscribe.
+- **Degraded surfacing** — records itself as `route:redis-pubsub` in the degraded registry with a redacted reason and a `retry_hint`, so `gateway status` / `gateway doctor` / `health()["degraded_owners"]` show the outage.
+- **Dropped-write counting** — `publish`, `set_presence`, `remove_presence`, `store_message`, and `delete_message` calls made while disconnected are counted (previously silent no-ops) and exposed as `dropped_writes`.
+- **Clears on recovery** — the degraded record is removed and delivery resumes once Redis is reachable again.
+
+```mermaid
+sequenceDiagram
+    participant Listener
+    participant Redis
+    participant Registry as DegradedCapabilityRegistry
+
+    Listener->>Redis: get_message()
+    Redis--xListener: connection dropped
+    Listener->>Registry: mark(route:redis-pubsub, state=stale)
+    loop reconnect (1s → 30s cap)
+        Listener->>Redis: reconnect attempt
+    end
+    Redis-->>Listener: reconnected
+    Listener->>Redis: re-subscribe every channel
+    Listener->>Registry: clear(route, redis-pubsub)
+```
+
+### What operators see
+
+During an outage, `gateway status` reports the degraded transport under `push` and lists the owner in `degraded_owners`:
+
+```json
+{
+  "push": {
+    "redis_connected": false,
+    "redis_degraded": true,
+    "redis_dropped_writes": 3,
+    "online_clients": 12
+  },
+  "degraded_owners": [
+    {
+      "owner_kind": "route",
+      "owner_id": "redis-pubsub",
+      "state": "stale",
+      "reason": "redis pub/sub disconnected: Connection refused",
+      "retry_hint": "check Redis connectivity; see `praisonai gateway doctor`"
+    }
+  ]
+}
+```
+
+After recovery, the three `redis_*` fields return to healthy and the `route:redis-pubsub` entry is gone:
+
+```json
+{
+  "push": {
+    "redis_connected": true,
+    "redis_degraded": false,
+    "redis_dropped_writes": 3,
+    "online_clients": 12
+  },
+  "degraded_owners": []
+}
+```
+
+The reason only ever contains the exception message — the Redis connection URL and password are never surfaced. The log line to watch for on recovery is `Redis push adapter reconnected (server_id=<uuid>)`.
+
+<Warning>
+Messages published while `redis_degraded: true` are counted in `redis_dropped_writes` and are **not** replayed on reconnect. If you need durable cross-instance delivery, publish from a source of truth you can replay.
+</Warning>
+
+---
+
 ## Configuration Options
 
 ### PushConfig
@@ -201,6 +298,12 @@ Set `fallback_to_polling=True` on `PushClient` when WebSocket is blocked — the
 </Accordion>
 <Accordion title="Separate from A2A webhooks">
 Real-time channels differ from A2A task webhooks — use the right page for your pattern.
+</Accordion>
+<Accordion title="Watch redis_dropped_writes in HA deployments">
+A non-zero `push.redis_dropped_writes` after an outage tells you how many events fanned out one-sided. Alert on it if replay matters — those writes are gone from the cross-instance transport's perspective.
+</Accordion>
+<Accordion title="Alert on route:redis-pubsub degradation">
+The `degraded_owners` entry for `route:redis-pubsub` is the single place to hook a pager for cross-instance-transport outages. It appears for the duration of the outage and clears automatically on reconnect.
 </Accordion>
 </AccordionGroup>
 
