@@ -1087,6 +1087,7 @@ def run_main(
     # Per-run git-worktree isolation: run on a fresh branch/worktree.
     worktree: bool = typer.Option(False, "--worktree", help="Run on an isolated git worktree/branch (branch-per-task); no-op when not a git repo"),
     keep: bool = typer.Option(False, "--keep", help="With --worktree, keep the worktree/branch after the run for review instead of tearing it down"),
+    append_system_prompt: Optional[str] = typer.Option(None, "--append-system-prompt", help="Append text (or @file) to the system prompt for this invocation only. Env fallback: PRAISONAI_APPEND_SYSTEM_PROMPT"),
 ):
     """
     Run agents from a file or prompt.
@@ -1126,6 +1127,11 @@ def run_main(
     if revert is not None:
         _revert_checkpoint(revert, session=session)
         return
+
+    # Resolve --append-system-prompt (literal text or @file) and export it so
+    # every downstream agent-construction path appends it to the system prompt.
+    from ..utils.append_prompt import apply_append_system_prompt
+    resolved_append_prompt = apply_append_system_prompt(append_system_prompt)
 
     # Merge config-declared instruction sources (layered global→project) with
     # repeatable ``--instructions`` flags so both the prompt and profiled run
@@ -1402,6 +1408,7 @@ def run_main(
             thinking_budget=thinking_budget,
             allow_local_tools=allow_local_tools,
             instructions=merged_instructions,
+            append_system_prompt=resolved_append_prompt,
         )
         return
     
@@ -1490,6 +1497,7 @@ def run_main(
                 approval=approval,
                 approve_all_tools=approve_all_tools,
                 approval_timeout=approval_timeout,
+                output_mode=output_mode,
             )
         else:
             # Profiling for direct prompt
@@ -1585,6 +1593,7 @@ def run_main(
                 allow_local_tools=allow_local_tools,
                 isolated=worktree,
                 instructions=merged_instructions,
+                append_system_prompt=resolved_append_prompt,
             )
 
 
@@ -1680,7 +1689,13 @@ def _run_from_file(
         # approval / approve_all_tools / approval_timeout and session ids from
         # ``args``, so threading them here gives YAML the same permission gating
         # and continuity as `run "<prompt>"` — no new engine wiring needed.
-        if session_id or auto_save_name or effective_approval or approve_all_tools:
+        if (
+            session_id
+            or auto_save_name
+            or effective_approval
+            or approve_all_tools
+            or output_mode
+        ):
             class Args:
                 pass
             
@@ -1688,6 +1703,7 @@ def _run_from_file(
             args.auto_save = auto_save_name
             args.resume_session = session_id
             args.cli_project_sessions = bool(session_id or auto_save_name)
+            args.output = output_mode
             if effective_approval:
                 args.approval = effective_approval
             if approve_all_tools:
@@ -1751,6 +1767,7 @@ def _run_prompt(
     allow_local_tools: bool = False,
     isolated: bool = False,
     instructions: Optional[List[str]] = None,
+    append_system_prompt: Optional[str] = None,
 ):
     """Run a direct prompt."""
     output = get_output_controller()
@@ -1835,11 +1852,17 @@ def _run_prompt(
         # Isolated (--worktree) runs must stay in-process: the warm runtime is a
         # separate process whose cwd we can't redirect into the worktree, so
         # attaching would run the task outside the isolated branch.
+        # A per-invocation --append-system-prompt must also stay in-process: the
+        # warm runtime is a separate process that never received the CLI's
+        # PRAISONAI_APPEND_SYSTEM_PROMPT export, and it reuses a cached agent
+        # whose system prompt is already assembled — so attaching would silently
+        # drop the requested suffix. The in-process path applies it correctly.
         stateful_attach = bool(session_id) and not fork
         runtime_eligible = (
             (no_save or stateful_attach)
             and thinking_budget is None
             and not isolated
+            and not append_system_prompt
             and not any([
                 mcp, mcp_servers, tools, toolset, approval, approve_all_tools,
                 memory, permissions_config, fork, instructions,
@@ -2085,6 +2108,7 @@ def _run_from_file_profiled(
     approval: Optional[str] = None,
     approve_all_tools: bool = False,
     approval_timeout: Optional[str] = None,
+    output_mode: Optional[str] = None,
 ):
     """Run agents from a YAML file with profiling enabled."""
     from praisonai_code.cli.features.cli_profiler import (
@@ -2152,7 +2176,7 @@ def _run_from_file_profiled(
     # the same ``args`` the legacy YAML path reads, so a profiled YAML run is
     # permission-gated identically to the non-profiled path instead of silently
     # dropping the deny policy.
-    if session_id or auto_save_name or approval or approve_all_tools:
+    if session_id or auto_save_name or approval or approve_all_tools or output_mode:
         class Args:
             pass
         
@@ -2160,6 +2184,7 @@ def _run_from_file_profiled(
         args.auto_save = auto_save_name
         args.resume_session = session_id
         args.cli_project_sessions = bool(session_id or auto_save_name)
+        args.output = output_mode
         if approval:
             args.approval = approval
         if approve_all_tools:

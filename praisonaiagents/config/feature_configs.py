@@ -32,6 +32,7 @@ Usage:
 """
 
 from dataclasses import dataclass, field
+import math
 from typing import Dict, List, Any, Optional, Callable, Tuple, Union, FrozenSet
 from enum import Enum
 
@@ -238,6 +239,12 @@ class MemoryConfig:
     # History injection (auto-inject session history into context)
     history: bool = False
     history_limit: int = 10
+
+    # Turn-start long-term memory retrieval. Disabled by default so existing
+    # agents incur no backend query or prompt changes.
+    prefetch: bool = False
+    prefetch_limit: int = 5
+    prefetch_token_budget: int = 512
     
     # Auto-save session name (consolidated from standalone auto_save param)
     # When set, automatically saves session to memory with this name
@@ -264,6 +271,9 @@ class MemoryConfig:
             "learn": learn_dict,
             "history": self.history,
             "history_limit": self.history_limit,
+            "prefetch": self.prefetch,
+            "prefetch_limit": self.prefetch_limit,
+            "prefetch_token_budget": self.prefetch_token_budget,
             "auto_save": self.auto_save,
         }
 
@@ -504,10 +514,10 @@ class GuardrailConfig:
         
         # With string preset
         Agent(guardrails="strict")  # Uses strict preset
-        
-        # With policy strings
-        Agent(guardrails=["policy:strict", "pii:redact"])
-        
+
+        # For tool policy enforcement, use the dedicated `policy` param instead:
+        Agent(policy=PolicyEngine(...))  # policy strings on guardrails are NOT enforced
+
         # With config
         Agent(guardrails=GuardrailConfig(
             validator=my_validator_fn,
@@ -736,6 +746,44 @@ class ExecutionPreset(str, Enum):
 
 
 @dataclass
+class PreCompactionMemoryFlushConfig:
+    """Bounded policy for extracting durable memories before compaction.
+
+    The feature is enabled only when this config (or ``True``) is assigned to
+    ``ExecutionConfig.pre_compaction_memory_flush``. The nested config defaults
+    to enabled so ``PreCompactionMemoryFlushConfig(...)`` is ergonomic while
+    the containing execution feature remains default-off.
+    """
+
+    enabled: bool = True
+    timeout_seconds: float = 20.0
+    min_turns_to_flush: int = 2
+    max_flush_tokens: int = 8000
+    llm: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        try:
+            self.timeout_seconds = float(self.timeout_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("timeout_seconds must be finite and positive") from exc
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and positive")
+        if self.min_turns_to_flush < 1:
+            raise ValueError("min_turns_to_flush must be >= 1")
+        if self.max_flush_tokens < 1:
+            raise ValueError("max_flush_tokens must be >= 1")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "timeout_seconds": self.timeout_seconds,
+            "min_turns_to_flush": self.min_turns_to_flush,
+            "max_flush_tokens": self.max_flush_tokens,
+            "llm": self.llm,
+        }
+
+
+@dataclass
 class ExecutionConfig:
     """
     Configuration for agent execution limits.
@@ -822,6 +870,10 @@ class ExecutionConfig:
     # Or: Agent(execution=ExecutionConfig(context_compaction=my_policy))  # custom policy
     context_compaction: Union[bool, "ContextCompactionPolicy"] = False  # Keep False during deprecation period
 
+    # Optional best-effort memory extraction immediately before compaction.
+    # False preserves existing latency/cost and performs no extra LLM call.
+    pre_compaction_memory_flush: Union[bool, PreCompactionMemoryFlushConfig] = False
+
     # Token limit before compaction triggers. None = auto-detect from model metadata.
     max_context_tokens: Optional[int] = None
     
@@ -842,6 +894,12 @@ class ExecutionConfig:
     # Default False preserves existing behavior for backward compatibility
     parallel_tool_calls: bool = False
 
+    # Durable tool-loop replay. Default-off keeps the execution hot path free
+    # of journal construction and SQLite writes.
+    durable: bool = False
+    journal_path: Optional[str] = None
+    resume_run_id: Optional[str] = None
+
     def __post_init__(self) -> None:
         """Post-initialization processing with deprecation warnings and validation."""
         # Validate the unified step budget early (before any early returns below).
@@ -852,6 +910,10 @@ class ExecutionConfig:
             from ..context.policy import ContextCompactionPolicy
             self.context_compaction = ContextCompactionPolicy.from_dict(
                 self.context_compaction
+            )
+        if isinstance(self.pre_compaction_memory_flush, dict):
+            self.pre_compaction_memory_flush = PreCompactionMemoryFlushConfig(
+                **self.pre_compaction_memory_flush
             )
         
         # Emit deprecation warning once per process for default behavior change.
@@ -939,10 +1001,18 @@ class ExecutionConfig:
                 if hasattr(self.context_compaction, 'to_dict') 
                 else self.context_compaction
             ),
+            "pre_compaction_memory_flush": (
+                self.pre_compaction_memory_flush.to_dict()
+                if hasattr(self.pre_compaction_memory_flush, "to_dict")
+                else self.pre_compaction_memory_flush
+            ),
             "max_context_tokens": self.max_context_tokens,
             "compaction_strategy": self.compaction_strategy.value if self.compaction_strategy and hasattr(self.compaction_strategy, 'value') else (str(self.compaction_strategy) if self.compaction_strategy else None),
             "max_budget": self.max_budget,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "durable": self.durable,
+            "journal_path": self.journal_path,
+            "resume_run_id": self.resume_run_id,
         }
     
     @classmethod
@@ -979,10 +1049,16 @@ class ExecutionConfig:
             code_tools=data.get("code_tools", False),
             code_tools_allow=data.get("code_tools_allow", None),
             context_compaction=context_compaction,
+            pre_compaction_memory_flush=data.get(
+                "pre_compaction_memory_flush", False
+            ),
             max_context_tokens=data.get("max_context_tokens", None),
             compaction_strategy=compaction_strategy,
             max_budget=data.get("max_budget", None),
             parallel_tool_calls=data.get("parallel_tool_calls", False),
+            durable=data.get("durable", False),
+            journal_path=data.get("journal_path", None),
+            resume_run_id=data.get("resume_run_id", None),
         )
 
 

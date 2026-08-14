@@ -74,6 +74,7 @@ def chat_main(
     no_lsp: bool = typer.Option(False, "--no-lsp", help="Disable LSP tools"),
     safe_mode: bool = typer.Option(False, "--safe", help="Safe mode: require approval for file writes and commands"),
     autonomy: bool = typer.Option(True, "--autonomy/--no-autonomy", help="Enable agent autonomy for complex tasks"),
+    append_system_prompt: Optional[str] = typer.Option(None, "--append-system-prompt", help="Append text (or @file) to the system prompt for this invocation only. Env fallback: PRAISONAI_APPEND_SYSTEM_PROMPT"),
     # NEW: Agent-like consolidated params for ALL GREEN consistency
     knowledge: Optional[str] = typer.Option(
         None, "--knowledge", "-k",
@@ -173,6 +174,11 @@ def chat_main(
     # and always restores the prior value on return, so it never leaks into a
     # later in-process invocation. Persisted enable/disable state is untouched.
 
+    # Resolve --append-system-prompt (literal text or @file) and export it so
+    # every downstream agent-construction path appends it to the system prompt.
+    from praisonai_code.cli.utils.append_prompt import apply_append_system_prompt
+    apply_append_system_prompt(append_system_prompt)
+
     # Set workspace if provided
     if workspace:
         os.environ["PRAISONAI_WORKSPACE"] = workspace
@@ -219,17 +225,9 @@ def chat_main(
             typer.echo(f"Error: {e}", err=True)
             raise typer.Exit(1)
     
-    # Use the async TUI (non-blocking, scrollable output)
-    from praisonai_code._wrapper_bridge import wrapper_available
-
-    if not wrapper_available():
-        typer.echo(
-            "Error: chat requires the praisonai wrapper. "
-            "Install the full wrapper: pip install praisonai",
-            err=True,
-        )
-        raise typer.Exit(1)
-
+    # Use the resident async split-pane TUI (non-blocking, scrollable output).
+    # This lives in praisonai-code, so `pip install praisonai-code` alone yields
+    # a full interactive chat session with no `praisonai` wrapper required.
     from praisonai_code.cli.interactive.async_tui import AsyncTUI, AsyncTUIConfig
 
     # Resolve a provider-aware default when no model was given:

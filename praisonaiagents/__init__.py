@@ -143,9 +143,9 @@ _LAZY_IMPORTS = {
     'has_toolset': ('praisonaiagents.toolsets', 'has_toolset'),
 
     # Model-family-aware harness (base prompt + edit-format selection)
-    'HarnessProfile': ('praisonaiagents.model_harness', 'HarnessProfile'),
-    'resolve_harness': ('praisonaiagents.model_harness', 'resolve_harness'),
-    'register_profile': ('praisonaiagents.model_harness', 'register_profile'),
+    'HarnessProfile': ('praisonaiagents.model_harness.profiles', 'HarnessProfile'),
+    'resolve_harness': ('praisonaiagents.model_harness.profiles', 'resolve_harness'),
+    'register_profile': ('praisonaiagents.model_harness.profiles', 'register_profile'),
 
     # Run outcomes - typed validation and agent execution results
     'AgentRunOutcome': ('praisonaiagents.run_outcome', 'AgentRunOutcome'),
@@ -426,6 +426,7 @@ _LAZY_IMPORTS = {
     'WebConfig': ('praisonaiagents.config.feature_configs', 'WebConfig'),
     'OutputConfig': ('praisonaiagents.config.feature_configs', 'OutputConfig'),
     'ExecutionConfig': ('praisonaiagents.config.feature_configs', 'ExecutionConfig'),
+    'PreCompactionMemoryFlushConfig': ('praisonaiagents.config.feature_configs', 'PreCompactionMemoryFlushConfig'),
     'TemplateConfig': ('praisonaiagents.config.feature_configs', 'TemplateConfig'),
     'CachingConfig': ('praisonaiagents.config.feature_configs', 'CachingConfig'),
     'HooksConfig': ('praisonaiagents.config.feature_configs', 'HooksConfig'),

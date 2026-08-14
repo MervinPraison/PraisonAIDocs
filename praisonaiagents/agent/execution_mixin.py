@@ -437,7 +437,40 @@ class ExecutionMixin:
             self._auto_save_session()
         
         return result
-    
+
+    async def _adelegate_to_backend(self, prompt: str, **kwargs) -> Optional[str]:
+        """Async delegation to an external managed backend (async parity with
+        ``_delegate_to_backend``). Awaits the backend's async ``execute`` directly
+        instead of bridging through a worker thread, then records prompt/response
+        in chat_history so session management stays consistent.
+        """
+        from praisonaiagents.agent.protocols import ManagedBackendProtocol
+        if not (isinstance(self.backend, ManagedBackendProtocol) or hasattr(self.backend, 'execute')):
+            raise RuntimeError(f"Backend {type(self.backend).__name__} does not support execute() method")
+
+        result = await self.backend.execute(prompt, **kwargs)
+
+        if result is not None:
+            self._append_to_chat_history({"role": "user", "content": prompt})
+            self._append_to_chat_history({"role": "assistant", "content": str(result)})
+            if hasattr(self.backend, 'managed_session_id'):
+                msid = self.backend.managed_session_id
+                if msid and self._session_store is not None:
+                    try:
+                        sid = getattr(self, 'auto_save', None) or getattr(self, '_session_id', None)
+                        if sid and hasattr(self._session_store, 'set_gateway_info'):
+                            self._session_store.set_gateway_info(sid, gateway_session_id=msid)
+                    except Exception as e:
+                        logger.warning(
+                            "Session gateway linkage failed: %s",
+                            e,
+                            extra={"session_id": sid, "managed_session_id": msid},
+                            exc_info=True,
+                        )
+            self._auto_save_session()
+
+        return result
+
     def _execute_backend_sync(self, prompt: str, **kwargs) -> Optional[str]:
         """Execute backend in sync mode, handling async backends."""
         try:
@@ -1281,6 +1314,49 @@ Write the complete compiled report:"""
         # concurrent turns on the same Agent don't corrupt the buffer (#3307).
         self._record_turn_tool(function_name)
 
+        # Result-aware tool-loop detection (async parity with the sync path in
+        # tool_execution.py). Without this, an agent driven via achat()/astart()
+        # that repeatedly calls the same tool with the same args gets no
+        # stuck-loop detection, while the identical sync agent would be caught.
+        # Zero overhead when the detector is disabled.
+        _ld_enabled = False
+        if hasattr(self, '_ensure_loop_detector'):
+            from . import loop_detection as _loop_detection
+            _ld_history, _ld_config = self._ensure_loop_detector()
+            if _ld_config.enabled:
+                _ld_enabled = True
+                _loop_detection.record_tool_call(
+                    _ld_history, function_name, arguments, _ld_config
+                )
+                _verdict = _loop_detection.detect_tool_loop(
+                    _ld_history, function_name, arguments, _ld_config
+                )
+                if _verdict.get("stuck"):
+                    if _verdict.get("level") == "critical":
+                        return {
+                            "error": _verdict.get("message", "loop detected"),
+                            "loop_blocked": True,
+                        }
+                    elif not getattr(self, '_loop_warned_this_turn', False):
+                        self._loop_warned_this_turn = True
+                        self._pending_self_correction = (
+                            f"[System: repeated {_verdict.get('detector')} detected. "
+                            f"Try a different approach. {_verdict.get('message', '')}]"
+                        )
+
+        def _record_async_loop_outcome(_result):
+            # Back-fill the result hash so the result-aware detector can tell a
+            # genuine stall (identical output) from legitimate polling (changing
+            # output) on the async path too. Without this, records keep
+            # result_hash=None and no-progress detection never accumulates a
+            # streak, so async poll-loops go undetected. Mirrors the sync
+            # back-fill in tool_execution.py.
+            if _ld_enabled:
+                _loop_detection.record_tool_outcome(
+                    _ld_history, function_name, arguments, _result, _ld_config
+                )
+            return _result
+
         # Enforce BEFORE_TOOL/AFTER_TOOL security hooks for every async caller,
         # mirroring the sync execute_tool path in tool_execution.py. Without
         # this the primary async path (_execute_unified_achat_completion) would
@@ -1335,10 +1411,12 @@ Write the complete compiled report:"""
                         result = f"{result}\n\n{extra_context}"
                     elif isinstance(result, dict):
                         result.setdefault("_additional_context", extra_context)
-            return result
+            return _record_async_loop_outcome(result)
 
-        return await self._execute_tool_async_dispatch(
-            function_name, arguments, tool_call_id, tools_override
+        return _record_async_loop_outcome(
+            await self._execute_tool_async_dispatch(
+                function_name, arguments, tool_call_id, tools_override
+            )
         )
 
     async def _execute_tool_async_dispatch(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
@@ -1412,11 +1490,14 @@ Write the complete compiled report:"""
                 
                 # Check if result is an error that should be retried
                 if isinstance(result, dict) and result.get("error"):
-                    # Skip retry for non-retryable errors (approval, permission, etc.)
+                    # Skip retry for non-retryable errors (approval, permission, etc.).
+                    # `retryable is False` covers async tool timeouts, whose executor
+                    # work cannot be cancelled — retrying would duplicate side effects.
                     if (result.get("approval_denied") or 
                         result.get("permission_denied") or 
                         result.get("approval_error") or
-                        result.get("circuit_open")):
+                        result.get("circuit_open") or
+                        result.get("retryable") is False):
                         return result
                     
                     # Determine error type for retry policy
@@ -1539,20 +1620,65 @@ Write the complete compiled report:"""
                 # BaseTool instances (plugin system, e.g. BrowserBaseTool) are not
                 # directly callable — dispatch to their .run() method like the sync path.
                 call_target = func.run if isinstance(func, BaseTool) else func
-                if inspect.iscoroutinefunction(call_target):
-                    logging.debug(f"Executing async function: {function_name}")
-                    with tool_progress_channel(_progress_sink):
-                        result = await call_target(**arguments)
-                else:
+                try:
+                    from .durable import get_durable_idempotency_key
+
+                    durable_key = get_durable_idempotency_key()
+                except ImportError:
+                    durable_key = None
+                call_arguments = arguments
+                if durable_key:
+                    try:
+                        parameters = inspect.signature(call_target).parameters.values()
+                    except (TypeError, ValueError):
+                        parameters = ()
+                    if any(
+                        parameter.name == "idempotency_key"
+                        or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters
+                    ):
+                        call_arguments = dict(arguments)
+                        call_arguments["idempotency_key"] = durable_key
+
+                async def _invoke():
+                    # Set the tool-progress channel BEFORE dispatch so the sink
+                    # propagates into the executor thread via contextvars, mirroring
+                    # the sync execute_tool path.
+                    if inspect.iscoroutinefunction(call_target):
+                        logging.debug(f"Executing async function: {function_name}")
+                        with tool_progress_channel(_progress_sink):
+                            return await call_target(**call_arguments)
                     logging.debug(f"Executing sync function in executor: {function_name}")
                     loop = asyncio.get_running_loop()
                     from ..trace.context_events import copy_context_to_callable
-                    # Set the channel BEFORE copy_context_to_callable so the sink
-                    # propagates into the executor thread via contextvars.
                     with tool_progress_channel(_progress_sink):
-                        result = await loop.run_in_executor(
-                            None, copy_context_to_callable(lambda: call_target(**arguments))
+                        return await loop.run_in_executor(
+                            None, copy_context_to_callable(lambda: call_target(**call_arguments))
                         )
+
+                # Apply the per-agent tool timeout (ToolConfig.timeout) so the async
+                # path matches the sync path in tool_execution.py. asyncio.wait_for
+                # cannot kill a stuck sync tool running in the executor (same caveat
+                # the sync path has with future.cancel()), but it stops the awaiting
+                # coroutine from hanging forever, which is the actual defect.
+                tool_timeout = getattr(self, '_tool_timeout', None)
+                if tool_timeout and tool_timeout > 0:
+                    try:
+                        result = await asyncio.wait_for(_invoke(), timeout=tool_timeout)
+                    except asyncio.TimeoutError:
+                        logging.warning(f"Tool {function_name} timed out after {tool_timeout}s")
+                        # Mark as non-retryable: asyncio.wait_for cannot cancel a sync
+                        # tool already running in the executor, so retrying would launch
+                        # a duplicate invocation while the original keeps executing —
+                        # duplicating DB writes / API calls / file mutations. Surface the
+                        # timeout once instead of re-running an uncancellable side effect.
+                        return {
+                            "error": f"Tool timed out after {tool_timeout}s",
+                            "timeout": True,
+                            "retryable": False,
+                        }
+                else:
+                    result = await _invoke()
                 
                 # Ensure result is JSON serializable
                 logging.debug(f"Raw result from tool: {result}")
