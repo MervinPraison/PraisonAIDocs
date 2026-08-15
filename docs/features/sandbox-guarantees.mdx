@@ -1,0 +1,181 @@
+---
+title: "Sandbox Guarantees"
+sidebarTitle: "Sandbox Guarantees"
+description: "What each isolation surface actually guarantees — and what it does not"
+icon: "shield-halved"
+---
+
+Each isolation surface in PraisonAI guarantees something different — this page states exactly what, so you never mistake a restriction flag for a real boundary.
+
+```mermaid
+graph LR
+    subgraph "Choosing Isolation"
+        A[🤖 Agent] --> Q{🔍 What needs isolation?}
+        Q -->|Explicit execute_code calls| E[⚙️ Agent sandbox=]
+        Q -->|Model-driven execution| F[🐳 AgentFlow run_on=]
+        Q -->|One agent's tools| L[📦 LocalAgent compute=]
+        E --> R[✅ Isolated]
+        F --> R
+        L --> R
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef surface fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class Q question
+    class E,F,L surface
+    class R result
+```
+
+## Quick Start
+
+<Steps>
+
+<Step title="Isolate an explicit execute_code() call">
+`Agent(sandbox=…)` gives you the caller-invoked `execute_code()` API. It adds no tools and does not isolate `tools=` callables.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Coder", instructions="Run Python.", sandbox=True)
+result = agent.execute_code_sync("print(2 + 2)")
+print(result.stdout)
+```
+</Step>
+
+<Step title="Isolate everything the model runs">
+`AgentFlow(run_on="docker")` puts the whole workflow inside a real container boundary, so model-driven shell and file tools route through the shared sandbox.
+
+```python
+from praisonaiagents import Agent, AgentFlow
+
+flow = AgentFlow(
+    agents=[Agent(name="Builder", instructions="Build and run code.")],
+    run_on="docker",  # docker | e2b | modal | daytona | flyio | tenki | local
+)
+flow.start("Write a script that prints the first 10 primes, then run it")
+```
+</Step>
+
+</Steps>
+
+---
+
+## Guarantee Matrix
+
+Each surface below isolates a different thing — read the row before you rely on it.
+
+| Surface | Isolates model-visible tools? | Isolates `tools=` callables? | Real container boundary? | Enforces `SecurityPolicy`? |
+|---|---|---|---|---|
+| `Agent(sandbox=True)` (default subprocess backend) | No — no tools auto-added | No | No (subprocess only) | Partial — `run_command()` only, not `execute()` |
+| `Agent(sandbox=SandboxConfig(backend=...))` with real container backend | No — no tools auto-added | No | Yes (via configured backend) | Depends on backend |
+| `AgentFlow(run_on="docker" \| "e2b" \| ...)` | Yes — shell/file tools route through the shared sandbox | No (callables stay in-process) | Yes | Depends on provider |
+| `LocalAgent(compute="docker" \| "e2b" \| ...)` | Yes for that agent's shell/file tools | No | Yes | Depends on provider |
+| `SandboxedAgent(compute=...)` | Yes | No | Yes | Depends on provider |
+
+---
+
+## Why `sandbox=` is not a capability grant
+
+`Agent(sandbox=…)` is a **restriction flag**, not a way to hand the model an execution tool.
+
+<Warning>
+`Agent(sandbox=…)` does **not** add `execute_python_code` / `execute_shell_command` to `agent.tools` — that auto-injection was reverted in [PR #3976](https://github.com/MervinPraison/PraisonAI/pull/3976). Giving the model a sandboxed execution tool must be a deliberate act by the caller, the way `MCP()` is. No peer framework grants execution capability from a config flag.
+</Warning>
+
+<Warning>
+The default `subprocess` backend enforces **none** of its own `SecurityPolicy` on the `execute()` path:
+
+- `allow_network=False` does not block outbound HTTPS.
+- `blocked_paths=['~/.ssh', ...]` does not stop reading an SSH private key.
+- `blocked_imports=['subprocess', ...]` does not stop `import subprocess`.
+- A separate process is not a security boundary.
+
+For real containment, use a real container backend (`docker` / `e2b`) or `AgentFlow(run_on=…)`.
+</Warning>
+
+<Note>
+`praisonai-sandbox` must be installed to run any sandbox backend — `pip install praisonaiagents` alone is not enough. Install a backend, e.g. `pip install "praisonai-sandbox[docker]"`.
+</Note>
+
+---
+
+## Common Patterns
+
+<Tabs>
+<Tab title="Explicit code execution">
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Analyst", instructions="Analyze data.", sandbox=True)
+result = agent.execute_code_sync("import statistics; print(statistics.mean([1, 2, 3]))")
+print(result.stdout)
+```
+</Tab>
+
+<Tab title="Give the model a sandbox tool">
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Coder", instructions="Use run_code to answer.", sandbox=True)
+
+def run_code(code: str) -> str:
+    """Run Python in the agent's configured sandbox."""
+    result = agent.execute_code_sync(code)
+    return result.stdout or result.error or ""
+
+agent.tools = [run_code]  # explicit, the way MCP() is
+agent.start("Print the Python version")
+```
+</Tab>
+
+<Tab title="Whole-workflow container">
+```python
+from praisonaiagents import Agent, AgentFlow
+
+flow = AgentFlow(
+    agents=[Agent(name="Builder", instructions="Build and run code.")],
+    run_on="e2b",
+)
+flow.start("Create and run a script that lists installed packages")
+```
+</Tab>
+</Tabs>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Treat sandbox= as a restriction, not a grant">
+    `Agent(sandbox=…)` configures the explicit `execute_code()` API. It never hands the model a tool — add one yourself only when you intend the model to run code.
+  </Accordion>
+
+  <Accordion title="Use a real container for untrusted or model-driven code">
+    The default subprocess backend is for trusted development only. For untrusted or model-driven execution, use `AgentFlow(run_on="docker")`, `LocalAgent(compute="docker")`, or a `docker` / `e2b` sandbox backend.
+  </Accordion>
+
+  <Accordion title="Remember autonomy= injects a host tool">
+    With `autonomy=True`, the agent still carries the host `execute_command` tool. `sandbox=` does not protect that path — isolate the whole workflow with `AgentFlow(run_on=…)` instead.
+  </Accordion>
+
+  <Accordion title="Install a sandbox backend first">
+    `pip install praisonaiagents` cannot execute any sandbox. Install `praisonai-sandbox` with the backend you need before relying on isolation.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Sandbox" icon="shield-halved" href="/features/sandbox">
+    Configure the explicit `execute_code()` API and choose a backend
+  </Card>
+  <Card title="Shared Sandbox" icon="server" href="/features/shared-sandbox">
+    Share one container across every agent with `run_on=`
+  </Card>
+</CardGroup>
