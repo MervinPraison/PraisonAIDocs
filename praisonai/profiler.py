@@ -71,6 +71,16 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Callable, Any
 from contextlib import contextmanager, asynccontextmanager
 
+# Reuse the shared profiling primitives owned by the core SDK
+# (praisonaiagents.profiling) so there is a single source of truth for
+# TimingRecord / StreamingRecord / StreamingTracker. The wrapper extends them
+# below with its superset fields/behaviour instead of re-declaring them.
+from praisonaiagents.profiling import (
+    TimingRecord as _CoreTimingRecord,
+    StreamingRecord as _CoreStreamingRecord,
+    StreamingTracker as _CoreStreamingTracker,
+)
+
 
 # ============================================================================
 # Configuration
@@ -88,19 +98,58 @@ def _get_profiler_max() -> int:
 _PROFILER_MAX = _get_profiler_max()
 
 
+# tracemalloc is a process-wide singleton, so concurrent memory() scopes must
+# coordinate: reference-count how many scopes we started so only the *last*
+# one calls tracemalloc.stop(). Locking is required because is_tracing()+start()
+# is not atomic. Without this, one scope's stop() zeroes another's reading.
+_TRACEMALLOC_LOCK = threading.Lock()
+_TRACEMALLOC_STARTERS = 0
+
+
+def _tracemalloc_acquire() -> bool:
+    """Start tracing if needed and register this scope. Returns whether this
+    scope is responsible for eventually stopping tracing (i.e. we started it)."""
+    global _TRACEMALLOC_STARTERS
+    with _TRACEMALLOC_LOCK:
+        started_here = not tracemalloc.is_tracing()
+        if started_here:
+            tracemalloc.start()
+        # Only track scopes we own; if something *else* started tracing we must
+        # not stop it, so we leave the counter alone and return False.
+        if started_here or _TRACEMALLOC_STARTERS:
+            _TRACEMALLOC_STARTERS += 1
+            return True
+        return False
+
+
+def _tracemalloc_release(owned: bool) -> None:
+    """Deregister a scope; stop tracing only when the last owned scope exits."""
+    global _TRACEMALLOC_STARTERS
+    if not owned:
+        return
+    with _TRACEMALLOC_LOCK:
+        if _TRACEMALLOC_STARTERS > 0:
+            _TRACEMALLOC_STARTERS -= 1
+            if _TRACEMALLOC_STARTERS == 0:
+                tracemalloc.stop()
+
+
 # ============================================================================
 # Data Classes
 # ============================================================================
 
 @dataclass
-class TimingRecord:
-    """Record of a single timing measurement."""
-    name: str
-    duration_ms: float
+class TimingRecord(_CoreTimingRecord):
+    """Record of a single timing measurement.
+
+    Extends the core SDK's ``TimingRecord`` (single owner in
+    ``praisonaiagents.profiling``) with the wrapper-only ``file``/``line``
+    fields and a ``function`` default category. Defaults keep both existing
+    test suites and consumers green.
+    """
     category: str = "function"
     file: str = ""
     line: int = 0
-    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -116,14 +165,14 @@ class APICallRecord:
 
 
 @dataclass
-class StreamingRecord:
-    """Record of streaming operation (LLM responses)."""
-    name: str
-    ttft_ms: float  # Time to first token
-    total_ms: float
-    chunk_count: int = 0
+class StreamingRecord(_CoreStreamingRecord):
+    """Record of streaming operation (LLM responses).
+
+    Extends the core SDK's ``StreamingRecord`` with the wrapper-only
+    ``total_tokens`` field; the shared TTFT schema lives in
+    ``praisonaiagents.profiling``.
+    """
     total_tokens: int = 0
-    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -159,10 +208,14 @@ class FlowRecord:
 # Streaming Tracker
 # ============================================================================
 
-class StreamingTracker:
+class StreamingTracker(_CoreStreamingTracker):
     """
     Track streaming operations (LLM responses).
-    
+
+    Extends the core SDK's ``StreamingTracker`` (single owner of the TTFT
+    start/first_token/chunk/end logic) with wrapper-only ``total_tokens``
+    support and records to the wrapper's context-aware ``Profiler``.
+
     Usage:
         tracker = StreamingTracker("chat")
         tracker.start()
@@ -171,40 +224,32 @@ class StreamingTracker:
             tracker.chunk()
         tracker.end(total_tokens=100)
     """
-    
+
     def __init__(self, name: str):
-        self.name = name
-        self._start_time: Optional[float] = None
-        self._first_token_time: Optional[float] = None
-        self._end_time: Optional[float] = None
-        self._chunk_count: int = 0
+        super().__init__(name)
         self._total_tokens: int = 0
-    
-    def start(self) -> None:
-        """Start tracking."""
-        self._start_time = time.perf_counter()
-    
-    def first_token(self) -> None:
-        """Mark time to first token."""
-        if self._first_token_time is None:
-            self._first_token_time = time.perf_counter()
-    
-    def chunk(self) -> None:
-        """Record a chunk received."""
-        self._chunk_count += 1
-    
+        self._recorded: bool = False
+
     def end(self, total_tokens: int = 0) -> None:
-        """End tracking and record to Profiler."""
+        """End tracking and record to the wrapper Profiler.
+
+        Idempotent: safe to call explicitly inside a
+        ``with Profiler.streaming(...)`` block (whose ``finally`` also calls
+        ``end()``); only the first invocation records a StreamingRecord.
+        """
+        if self._recorded:
+            return
+        self._recorded = True
         self._end_time = time.perf_counter()
         self._total_tokens = total_tokens
-        
+
         if self._start_time is not None:
             ttft_ms = 0.0
             if self._first_token_time is not None:
                 ttft_ms = (self._first_token_time - self._start_time) * 1000
-            
+
             total_ms = (self._end_time - self._start_time) * 1000
-            
+
             Profiler.record_streaming(
                 name=self.name,
                 ttft_ms=ttft_ms,
@@ -212,21 +257,6 @@ class StreamingTracker:
                 chunk_count=self._chunk_count,
                 total_tokens=self._total_tokens
             )
-    
-    @property
-    def ttft_ms(self) -> float:
-        """Get time to first token in ms."""
-        if self._start_time and self._first_token_time:
-            return (self._first_token_time - self._start_time) * 1000
-        return 0.0
-    
-    @property
-    def elapsed_ms(self) -> float:
-        """Get elapsed time in ms."""
-        if self._start_time:
-            end = self._end_time or time.perf_counter()
-            return (end - self._start_time) * 1000
-        return 0.0
 
 
 # ============================================================================
@@ -572,17 +602,12 @@ class _ProfilerImpl:
     @contextmanager
     def memory(self, name: str):
         """Profile memory usage for a block when tracemalloc is available."""
-        import tracemalloc
-
-        was_tracing = tracemalloc.is_tracing()
-        if not was_tracing:
-            tracemalloc.start()
+        owned = _tracemalloc_acquire()
         try:
             yield
         finally:
             current, peak = tracemalloc.get_traced_memory()
-            if not was_tracing:
-                tracemalloc.stop()
+            _tracemalloc_release(owned)
             self.record_memory(
                 name=name,
                 current_kb=current / 1024.0,
@@ -591,16 +616,11 @@ class _ProfilerImpl:
 
     def memory_snapshot(self) -> Dict[str, float]:
         """Return current process memory snapshot in KB."""
-        import tracemalloc
-
-        was_tracing = tracemalloc.is_tracing()
-        if not was_tracing:
-            tracemalloc.start()
+        owned = _tracemalloc_acquire()
         try:
             current, peak = tracemalloc.get_traced_memory()
         finally:
-            if not was_tracing:
-                tracemalloc.stop()
+            _tracemalloc_release(owned)
         return {"current_kb": current / 1024.0, "peak_kb": peak / 1024.0}
 
     def export_json(self) -> str:

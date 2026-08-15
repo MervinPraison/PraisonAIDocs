@@ -1413,6 +1413,13 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                         'rerank': _knowledge_config.rerank,
                         'rerank_model': _knowledge_config.rerank_model,
                     }
+                # Forward embedder settings so they reach Knowledge (mem0).
+                # embedder is a provider shorthand (e.g. "gemini"); embedder_config
+                # is the full mem0 embedder dict. Only override when explicitly set.
+                if _knowledge_config.embedder and _knowledge_config.embedder != "openai":
+                    retrieval_config.setdefault('embedder_provider', _knowledge_config.embedder)
+                if _knowledge_config.embedder_config:
+                    retrieval_config.setdefault('embedder_config', _knowledge_config.embedder_config)
                 knowledge = _knowledge_config.sources if _knowledge_config.sources else None
             elif isinstance(_knowledge_config, list):
                 knowledge = _knowledge_config
@@ -2456,10 +2463,11 @@ Your Goal: {self.goal}
     def __deepcopy__(self, memo: dict) -> "Agent":
         """Custom deepcopy that creates fresh threading primitives.
 
-        threading.RLock (self.__cache_lock) and threading.Lock (self._cost_lock)
-        cannot be deep-copied on CPython < 3.13.  This hook deep-copies every
-        other attribute normally and replaces the locks with new instances so
-        that copy.deepcopy(agent) works in any Python version.
+        threading primitives cannot be deep-copied on all supported Python
+        versions, while copying an asyncio.Lock can preserve its locked/waiter
+        state. This hook replaces the Agent-owned locks directly, while
+        lock-bearing state wrappers provide their own deepcopy hooks, so the
+        clone receives independent state and fresh locks.
         """
         import copy
         cls = self.__class__
@@ -2470,6 +2478,8 @@ Your Goal: {self.goal}
                 object.__setattr__(result, k, threading.RLock())
             elif k == "_cost_lock":
                 object.__setattr__(result, k, threading.Lock())
+            elif k == "_approvals_lock":
+                object.__setattr__(result, k, asyncio.Lock())
             else:
                 object.__setattr__(result, k, copy.deepcopy(v, memo))
         return result
@@ -5783,6 +5793,15 @@ Answer:"""
                 except Exception:
                     pass
             self._guardrail_fn = LLMGuardrail(description=self.guardrail, llm=llm)
+            # A string guardrail is an output-quality validator. Although the
+            # resulting LLMGuardrail also exposes ``validate_input`` (via
+            # GuardrailProtocol), it must NOT be invoked as an input gate here:
+            # doing so would fire an extra, synchronous LLM call on every
+            # chat()/achat() (a hot-path regression, and blocking on the async
+            # event loop). Mark it so input validation skips it. Explicit
+            # GuardrailChain/GuardrailProtocol objects (passed as callables)
+            # remain the only deliberate input surface.
+            self._guardrail_fn._praison_output_only = True
         else:
             raise ValueError("Agent guardrail must be either a callable or a string description")
 
@@ -5843,6 +5862,33 @@ Answer:"""
                 result=None,
                 error=f"Agent guardrail validation error: {str(e)}"
             )
+
+    def _validate_input_with_guardrail(self, prompt):
+        """Validate the incoming prompt with the guardrail's input surface.
+
+        Only runs when the configured guardrail exposes a ``validate_input``
+        method (e.g. a ``GuardrailChain`` or an object implementing
+        ``GuardrailProtocol``). Plain callable guardrails and string (output-
+        quality) guardrails have no deliberate input surface and are skipped,
+        so behaviour is unchanged for them.
+
+        Returns (success, result, error). Fails closed on error.
+        """
+        fn = getattr(self, "_guardrail_fn", None)
+        if fn is None or not hasattr(fn, "validate_input"):
+            return True, prompt, None
+        # String guardrails are output-only validators; do not run them as an
+        # input gate (would add a synchronous LLM call to every chat/achat).
+        if getattr(fn, "_praison_output_only", False):
+            return True, prompt, None
+        try:
+            is_valid, result = fn.validate_input(prompt, agent_name=self.name)
+            if is_valid:
+                return True, (result if isinstance(result, str) else prompt), None
+            return False, None, (result if isinstance(result, str) else "Input blocked by guardrail")
+        except Exception as e:
+            logging.error(f"Agent {self.name}: Error in input guardrail validation: {e}")
+            return False, None, f"Input guardrail validation error: {str(e)}"
 
     def _validate_with_guardrail(self, response_text):
         """Validate response with guardrail. Returns (success, result, error)."""
