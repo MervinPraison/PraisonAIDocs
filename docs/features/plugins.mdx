@@ -866,7 +866,7 @@ Each key in `hooks={}` is a `PluginHook` enum value; the callable's return value
 | `PluginHook` key | Callable signature | Effect |
 |------------------|--------------------|--------|
 | `PluginHook.BEFORE_TOOL` | `fn(tool_name: str, args: dict) -> dict` | Rewrites tool args |
-| `PluginHook.AFTER_TOOL` | `fn(tool_name: str, result: Any) -> Any` | Rewrites tool result |
+| `PluginHook.AFTER_TOOL` | `fn(tool_name: str, result: Any) -> Any \| PluginDecision \| None` | Rewrites/redacts tool result, or `deny` blocks it before it reaches the model |
 | `PluginHook.BEFORE_AGENT` | `fn(prompt: str, context: dict) -> str` | Rewrites prompt |
 | `PluginHook.AFTER_AGENT` | `fn(response: str, context: dict) -> str` | Rewrites response |
 | `PluginHook.MESSAGE_RECEIVED` | `fn(message: dict) -> dict \| PluginDecision \| None` | Rewrites `content`, or `deny` drops the inbound message |
@@ -1276,7 +1276,7 @@ Writing a `.toml` config requires `tomli_w`. Without it the CLI **fails fast** w
 `plugins.enable()` auto-calls `wire_into_hook_registry()` — no manual step. Only lifecycle methods a plugin actually overrides (or declares in `PluginInfo.hooks`) are bridged, so a plugin with one guardrail never fires on every event. Return a new value and the bridge writes it back onto the payload in place. Errors in a lifecycle method are non-fatal, and `plugins.disable([...])` calls `unwire_from_hook_registry(name)` so the plugin truly stops firing.
 
 <Note>
-The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `before_tool_definitions`, `before_message`) also accept a deny/block decision instead of a rewrite — see [Blocking Plugins](#blocking-plugins-guardrails--policies).
+The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `before_tool_definitions`, `before_message`) also accept a deny/block decision instead of a rewrite — see [Blocking Plugins](#blocking-plugins-guardrails--policies). `after_tool` additionally accepts a rewrite **or** block — see [Redact / Block Tool Output](/features/redact-tool-output).
 </Note>
 
 | Plugin method | Hook event | In-place mutation |
@@ -1286,7 +1286,7 @@ The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `befor
 | `before_llm(messages, params)` | `BEFORE_LLM` | Return `(new_messages, ...)` → replaces `data.messages` |
 | `after_llm(response, usage)` | `AFTER_LLM` | Return a `str` → rewrites `data.response` |
 | `before_tool(name, args)` | `BEFORE_TOOL` | Return a `dict` → replaces `data.tool_input` |
-| `after_tool(name, result)` | `AFTER_TOOL` | Observational (no mutation) |
+| `after_tool(name, result)` | `AFTER_TOOL` | Return value → rewrites `data.tool_output` (redact/scrub). Return `PluginDecision.deny(reason)` / raise `GuardrailBlocked` → block; the model sees the block reason instead of the tool output. `None` → passthrough. Applies to sync `chat()` and async `achat()`. |
 | `before_tool_definitions(defs)` | `BEFORE_TOOL_DEFINITIONS` | Return a `list` → replaces `data.tool_definitions` |
 | `before_message(msg)` | `MESSAGE_RECEIVED` | Payload carries `content` + identity (`platform`, `sender_id`, `channel_id`, `channel_type`, `message_id`, `session_id` when set). Return `{"content": "..."}` → rewrites `data.content`. Return `PluginDecision.deny(reason)` → drops the inbound message. |
 | `after_message(msg)` | `MESSAGE_SENDING` | Same enriched payload. Return `{"content": "..."}` → rewrites `data.content`. |
@@ -1301,6 +1301,10 @@ The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `befor
 | `cli_backend_execute(context)` | `CLI_BACKEND_EXECUTE` | Observational (`backend`, `command` — redacted, `content`, `error`, `transport`, `praisonai_llm_http`, `session_id`) |
 
 `on_config` and `on_auth` write their returned dict back onto the payload even when the target attribute starts as `None` — so a plugin can inject credentials the first time they're requested, not only edit an existing dict.
+
+<Note>
+**`after_tool` is now a redaction / block seam, not an observer** (PraisonAI PRs [#3968](https://github.com/MervinPraison/PraisonAI/issues/3968) / [#3969](https://github.com/MervinPraison/PraisonAI/pull/3969)). A `Plugin.after_tool` return value is written back to the effective tool result before it reaches the model — mirroring `before_tool` (arg rewrite) and `after_llm` (response rewrite). Return a scrubbed value to redact, `PluginDecision.deny("reason")` to suppress, or raise `GuardrailBlocked("reason")` for the same effect via the exception form. See [Redact / Block Tool Output](/features/redact-tool-output).
+</Note>
 
 ---
 
@@ -1488,11 +1492,11 @@ class BlockDelete(Plugin):
 ```
 </CodeGroup>
 
-`PluginDecision.deny(reason)` and `PluginDecision.block(reason)` both stop the action (`is_denied()` is `True` for each); `allow(reason=None)` is an explicit no-op. `GuardrailBlocked(reason: str = "Blocked by guardrail plugin")` is caught by the bridge and converted to a block.
+`PluginDecision.deny(reason)` and `PluginDecision.block(reason)` both stop the action (`is_denied()` is `True` for each); `allow(reason=None)` is an explicit no-op. `GuardrailBlocked(reason: str = "Blocked by guardrail plugin")` is caught by the bridge and converted to a block. It may be raised from any `before_*` method **and from `after_tool`** — the tool has already run there, but the output is suppressed before it reaches the model (see [Redact / Block Tool Output](/features/redact-tool-output)).
 
 ### Where Blocks Fire
 
-Five `before_*` methods can block; `after_*` methods are observational and cannot.
+The five `before_*` methods and `after_tool` can block; the remaining `after_*` / observational methods cannot.
 
 | Plugin method | Can rewrite? | Can block? | Runtime effect of block |
 |---------------|:------------:|:----------:|-------------------------|
@@ -1501,7 +1505,8 @@ Five `before_*` methods can block; `after_*` methods are observational and canno
 | `before_tool_definitions` | ✅ | ✅ | Tool surface dropped for this turn (LLM sees no tools) |
 | `before_tool` | ✅ | ✅ | Tool call skipped; reason surfaced |
 | `before_message` | ✅ | ✅ | Inbound message dropped |
-| `after_*` | ✅ | ❌ | *(observational — no block path)* |
+| `after_tool` | ✅ | ✅ | Tool output rewritten/redacted, or suppressed — the model sees the block reason instead ([details](/features/redact-tool-output)) |
+| other `after_*` | ✅ | ❌ | *(observational — no block path)* |
 
 ### How a Block Flows
 
@@ -1644,5 +1649,8 @@ Tools and guardrails work without `plugins.enable()`. But lifecycle-method plugi
 </Card>
 <Card title="Guardrails" icon="shield-halved" href="/features/guardrails">
   Validate agent output — automatic retry on failure
+</Card>
+<Card title="Redact Tool Output" icon="shield-halved" href="/features/redact-tool-output">
+  Scrub secrets or block tool results before the model sees them
 </Card>
 </CardGroup>
