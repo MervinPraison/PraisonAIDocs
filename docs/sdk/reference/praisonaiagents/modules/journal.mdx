@@ -1,0 +1,94 @@
+---
+title: "journal • AI Agent SDK"
+sidebarTitle: "journal"
+description: "Durable run-state journal for resumable agent execution."
+icon: "file-code"
+---
+
+# journal
+
+<Badge color="blue">AI Agent</Badge>
+
+Durable run-state journal for resumable agent execution.
+
+The existing stores persist three *unlinked* things:
+
+* workspace **files** — ``checkpoints/`` (shadow-git), ``snapshot/``;
+* finished **conversation messages** — ``session/store.py``;
+
+but **nothing persists the execution cursor of a run** — the loop iteration
+index, the pending/in-flight tool calls, or the partial assistant turn. So if
+the process dies mid tool-loop, the run cannot resume where it left off and any
+in-flight tool work is lost (or, worse, re-run on a naive retry).
+
+This module adds the missing piece: a tiny append-only journal, keyed by a
+``run_id``, that records an event at every meaningful boundary (model decision,
+tool call, tool result, iteration index, approval decision). On resume, the loop
+is re-driven from the top and journalled steps return their **recorded** results
+instantly — no re-execution of side-effecting tools and no re-billing of LLM
+calls — while real work restarts at the first un-journalled step.
+
+Design notes
+------------
+* Reuses the zero-dependency stdlib ``sqlite3`` persistence pattern already used
+  by :mod:`praisonaiagents.runs.sqlite_ledger` and :mod:`praisonaiagents.session`
+  (WAL, ``busy_timeout``, a single re-entrant-lock-guarded shared connection).
+* **Default-off / zero-overhead:** nothing writes to the journal unless a run
+  opts in (e.g. ``Agent(..., durable=True)``). This module is lazy-imported from
+  :mod:`praisonaiagents.runtime`, so importing the package stays cheap.
+* Complements — does not replace — :mod:`praisonaiagents.runs`, which tracks run
+  *status* (queued/running/…); this tracks the per-event *cursor*.
+
+Usage::
+
+```python
+from praisonaiagents.runtime import RunJournal, JournalEvent
+
+j = RunJournal(":memory:")
+j.open_run("r1", agent="coder", task="migrate module")
+
+# ── record each boundary as it happens ──
+seq = 0
+j.append(JournalEvent("r1", seq, "model_decision", {"text": "call tool X"}))
+
+# ── on resume, memoise recorded steps ──
+replay = j.replay_index("r1")            # {(seq, kind): payload}
+if (rec := replay.get((seq, "model_decision"))) is not None:
+    resp = rec                            # cached — do NOT re-call the model
+
+j.close_run("r1", "succeeded")
+```
+
+## Import
+
+```python
+from praisonaiagents.runtime import journal
+```
+
+## Classes
+
+<CardGroup cols={2}>
+  <Card title="JournalEvent" icon="brackets-curly" href="../classes/JournalEvent">
+    A single append-only journal event.
+  </Card>
+  <Card title="RunMeta" icon="brackets-curly" href="../classes/RunMeta">
+    Durable metadata that binds the three stores under one ``run_id``.
+  </Card>
+  <Card title="RunJournal" icon="brackets-curly" href="../classes/RunJournal">
+    Append-only, restart-safe run-state journal backed by SQLite.
+  </Card>
+</CardGroup>
+
+### Constants
+
+| Name | Value |
+|------|-------|
+| `KIND_MODEL_DECISION` | `'model_decision'` |
+| `KIND_TOOL_CALL` | `'tool_call'` |
+| `KIND_TOOL_RESULT` | `'tool_result'` |
+| `KIND_APPROVAL` | `'approval'` |
+| `KIND_ITERATION` | `'iteration'` |
+| `VALID_KINDS` | `frozenset({KIND_MODEL_DECISION, KIND_TOOL_CALL, KIND_TOOL_RESULT, KIND_APPROVAL, KIND_ITERATION})` |
+| `_STATUS_RUNNING` | `'running'` |
+| `_TERMINAL_STATUSES` | `frozenset({'done', 'succeeded', 'failed', 'cancelled'})` |
+| `_SCHEMA` | `"\nCREATE TABLE IF NOT EXISTS runs (\n    run_id TEXT PRIMARY KEY,\n    agent TEXT NOT NULL DEFAULT '',\n    task TEXT NOT NULL DEFAULT '',\n    status TEXT NOT NULL DEFAULT 'running',\n    outcome TE...` |
