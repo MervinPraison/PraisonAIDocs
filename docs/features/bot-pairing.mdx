@@ -111,6 +111,7 @@ sequenceDiagram
     
     Note over Owner: Receives notification
     Owner->>PairingStore: praisonai pairing approve telegram ABCD1234
+    PairingStore->>PairingStore: verify_and_pair() — lockout check first, then consume code
     PairingStore->>PairingStore: Mark channel as paired
     
     User->>Bot: Next DM
@@ -421,10 +422,59 @@ bot = TelegramAdapter(config)
 
 ## Security Model
 
+### Store Hardening (PraisonAI #3974)
+
+[PraisonAI #3974](https://github.com/MervinPraison/PraisonAI/pull/3974) hardens the pairing store without changing its public API — legacy plaintext `pairing.json` stores still load, so there is nothing to migrate.
+
+#### At-rest hashing
+
+Since #3974, only a salted SHA-256 of each pending code is written to `pairing.json`. Reading the file never yields a usable code, and a rainbow table is useless without the per-install HMAC secret used as salt.
+
+```json
+{
+  "pending": [
+    {
+      "code_hash": "9f2c…64-hex-chars…a1",
+      "signature": "…",
+      "channel_type": "telegram",
+      "channel_id": "tg_42",
+      "created_at": 1755255600.0
+    }
+  ]
+}
+```
+
+On a fresh process, `praisonai pairing list` (or `PairingStore.list_pending()`) against a store whose code was created in another process returns entries with `code: None` and the `code_hash` — the pending request stays visible, the raw code does not.
+
+#### Store-level brute-force lockout
+
+`verify_and_pair()` counts failed verifications per `channel_type` and refuses further attempts once the ceiling trips — uniformly across every approval surface (HTTP route, in-chat Approve/Deny button, CLI `praisonai pairing approve`). Tune via constructor kwargs:
+
+| Constructor kwarg | Default | Meaning |
+|---|---|---|
+| `max_failures` | `5` | Consecutive failed verifications before lockout trips |
+| `lockout_window` | `60.0` s | Sliding window that counts failures |
+| `lockout_cooldown` | `300.0` s | How long a `channel_type` is refused once tripped |
+
+A success clears the counter; a valid HMAC presented against the **wrong `channel_id`** does not (otherwise a repeated wrong-binding guess would reset the budget). Once locked out, even a valid code for that `channel_type` is refused until the cooldown expires — the lockout is store-level, not surface-level.
+
+<Note>
+Log line to watch in operator dashboards: `Pairing verification locked out for channel_type=<type>` (level `WARNING`).
+</Note>
+
+#### Unambiguous alphabet
+
+Generated codes use `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` — 8 characters, dropping `0/O/1/I` so codes read aloud or retyped from another device are not mis-entered. Length is unchanged; entropy rises to `log2(32^8) = 40 bits`.
+
+<Note>
+`max_pending` now counts entries rehydrated from disk, so repeated restarts can no longer grow `pairing.json` past the configured bound.
+</Note>
+
 ### Code Generation
 
-- **8-character codes**: Hex format (e.g., `ABCD1234`)
+- **8-character codes**: Unambiguous alphabet `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (drops `0/O/1/I`, since #3974)
 - **HMAC signatures**: Codes are cryptographically signed
+- **Hashed at rest**: Only a salted SHA-256 of each code is persisted (since #3974)
 - **Per-install secret**: Auto-generated if `PRAISONAI_GATEWAY_SECRET` unset
 - **Channel binding**: Codes can be bound to specific channel IDs
 
