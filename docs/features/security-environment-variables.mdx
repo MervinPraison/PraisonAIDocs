@@ -310,6 +310,105 @@ agent.start("What is 2+2?")
 Precedence is env blob > disk file. Per-provider API-key env vars (`OPENAI_API_KEY`, …) still win for that specific provider. See [Auth → Zero-disk mode](/cli/auth#zero-disk-mode-praisonai_auth_content) for the full reference.
 </Note>
 
+### PRAISONAI_CONFIG_CONTENT
+
+Supplies the entire user-config layer as an inline JSON/YAML blob parsed in memory. When set, PraisonAI never reads `~/.praisonai/config.yaml` or a walk-up `praisonai.yaml` project file — the direct sibling of `PRAISONAI_AUTH_CONTENT` for a fully zero-disk run in ephemeral containers/CI.
+
+**Security value**: secret hygiene / stateless-run control — not an RCE gate. It keeps `config.yaml` (MCP server blocks, permissions arrays, model allowlists, hooks) off disk. Treat the env var itself as a secret: inject it from a secrets manager, never commit it, and only use it in CI runtimes that scrub env vars from build logs.
+
+```bash
+# Inline JSON — nothing on disk is read for the user-config layer
+export PRAISONAI_CONFIG_CONTENT='{"agent":{"model":"gpt-4o-mini"},"mcp":{"srv":{"url":"https://mcp.example.com"}}}'
+praisonai run "Summarise today's docs changes"
+# No ~/.praisonai/config.yaml or ./praisonai.yaml is read.
+```
+
+```bash
+# Inline YAML (multiline via $'...')
+export PRAISONAI_CONFIG_CONTENT=$'agent:\n  model: gpt-4o-mini\npermissions:\n  deny:\n    - "rm -rf /"\n'
+praisonai run "Answer briefly"
+```
+
+**Default**: unset → global + project file discovery (unchanged behaviour).
+
+**Value shape**: any valid YAML mapping — JSON works because JSON is a strict subset of YAML. Same schema as an on-disk `config.yaml`. The value must be a **mapping**, not a list or scalar.
+
+**Interpolation**: `${VAR}`, `{env:VAR}`, and `{file:...}` directives still resolve — the blob composes with the same conventions as an on-disk file.
+
+**Usage Example**:
+```python
+import json, os
+from praisonaiagents import Agent
+
+os.environ["PRAISONAI_CONFIG_CONTENT"] = json.dumps({
+    "agent": {"model": "gpt-4o-mini"},
+    "permissions": {"deny": ["rm -rf /"]},
+})
+
+agent = Agent(name="CI Agent", instructions="Answer briefly")
+agent.start("What is 2+2?")
+# No config.yaml read; no config.yaml written.
+```
+
+**Validation / error paths**:
+
+| Value | Behaviour |
+|-------|-----------|
+| Invalid JSON/YAML | Emits `UserWarning: "Ignoring PRAISONAI_CONFIG_CONTENT: value is not valid JSON/YAML."` and falls back to file discovery |
+| Valid non-mapping (list, scalar) | Emits `UserWarning: "Ignoring PRAISONAI_CONFIG_CONTENT: value must be a mapping."` and falls back to file discovery |
+| Empty valid mapping (`{}` or empty YAML doc) | Authoritative — treated as an empty user-config layer; disk files are still ignored |
+
+<Note>
+Higher-precedence layers still win: per-key env vars (`PRAISONAI_MODEL`, …) and CLI flags (`--model`) override any scalar the blob sets. Managed policy still layers below user config. See [`PRAISONAI_AUTH_CONTENT`](#praisonai_auth_content) for the credential sibling and [Env → Related Environment Variables](/cli/env#related-environment-variables).
+</Note>
+
+### PRAISONAI_CONFIG
+
+Names an explicit config file path to load as the user-config layer, replacing the discovered global + project files. Lower precedence than `PRAISONAI_CONFIG_CONTENT` (inline wins). Useful when the config is materialised via a mounted secret (Docker/Kubernetes secret volume) but you don't want it discoverable via file walk-up.
+
+```bash
+export PRAISONAI_CONFIG=/run/secrets/praisonai-config.yaml
+praisonai run "Answer briefly"
+# Discovered ~/.praisonai/config.yaml + project praisonai.yaml are ignored.
+```
+
+**Default**: unset → global + project file discovery (unchanged behaviour).
+
+**Value shape**: an absolute or tilde-expanded path to any file the resolver accepts (YAML/JSON). Discovered global + project files are ignored while this path is used.
+
+**Behaviour on missing / unreadable file**: does **not** hard-fail. Emits `UserWarning: "PRAISONAI_CONFIG points at '<path>', which could not be read as a config file; falling back to file discovery."` and falls back to discovery. A non-mapping file body is skipped the same way.
+
+<Note>
+When both `PRAISONAI_CONFIG_CONTENT` and `PRAISONAI_CONFIG` are set, the inline content wins and this path is ignored (no warning, by design).
+</Note>
+
+```mermaid
+graph TB
+    CLI[CLI flags<br/>e.g. --model] -->|highest| PerKey[Per-key env vars<br/>PRAISONAI_MODEL, …]
+    PerKey --> UserCfg{User-config layer}
+    UserCfg -->|inline wins| Inline[PRAISONAI_CONFIG_CONTENT<br/>in-memory JSON/YAML]
+    UserCfg -->|then path| Path[PRAISONAI_CONFIG<br/>explicit file path]
+    UserCfg -->|else discovery| Disk[~/.praisonai/config.yaml<br/>+ project praisonai.yaml walk-up]
+    Inline --> Managed[Managed policy<br/>PRAISONAI_MANAGED_CONFIG_URL / _DIR]
+    Path --> Managed
+    Disk --> Managed
+    Managed --> Defaults[Built-in defaults]
+
+    classDef top fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef env fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef base fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class CLI top
+    class PerKey,Inline,Path env
+    class UserCfg decision
+    class Disk,Managed result
+    class Defaults base
+```
+
+The provenance report (`praisonai config provenance`) reports a `layer` of `env-config` for keys supplied this way — `source` is `env:PRAISONAI_CONFIG_CONTENT` for inline content, or the absolute file path for explicit-path mode.
+
 ### PRAISONAI_ALLOW_PLUGIN_DISCOVERY
 
 Controls automatic discovery and loading of plugins from `.praisonai/plugins/` (project-level) and `~/.praisonai/plugins/` (user-level) directories.
