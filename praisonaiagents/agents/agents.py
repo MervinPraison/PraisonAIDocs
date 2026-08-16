@@ -660,13 +660,12 @@ class AgentTeam(SpawnAnnounceProtocol):
         reflection: Optional[Any] = None,  # Union[bool, ReflectionConfig] - self-reflection
         caching: Optional[Any] = None,  # Union[bool, CachingConfig] - caching
         learn: Optional[Any] = None,  # Union[bool, LearnConfig] - continuous learning
-        # Union[str, ComputeProviderProtocol] - run every agent's shell/file
-        # tools in ONE shared remote sandbox ("docker", "e2b", "modal",
-        # "daytona", "flyio", "tenki", "local"). Agents share /workspace, so
-        # files written by one agent are visible to the others. Orchestration
-        # stays local. Pass a configured provider instance instead of a name to
-        # customise image/resources.
-        compute: Optional[Any] = None,
+        # Union[str, ComputeProviderProtocol] - where every agent's shell/file
+        # tools run: "docker", "e2b", "modal", "daytona", "flyio", "tenki",
+        # "local". The team shares ONE sandbox and /workspace, so files written
+        # by one agent are visible to the others. Orchestration stays local.
+        # Pass a configured provider instance to customise resources.
+        run_on: Optional[Any] = None,
     ):
         """
         Initialize AgentManager with consolidated feature parameters.
@@ -898,7 +897,7 @@ class AgentTeam(SpawnAnnounceProtocol):
         self.stream = _stream
         self.name = name
         # Remote execution: one shared sandbox for every agent on this team.
-        self.compute = compute
+        self.run_on = run_on
 
         # Callbacks for workflow execution
         self.on_task_start = _on_task_start
@@ -1464,7 +1463,25 @@ class AgentTeam(SpawnAnnounceProtocol):
                 if async_tasks_to_run:
                     await self._gather_with_isolation(async_tasks_to_run)
                     async_tasks_to_run = []
-            
+
+            def _deps_failed(task_id):
+                """Re-check dependency failure at consumption time.
+
+                asequential() runs this check inside the generator, but async
+                tasks are buffered and drained later, so an upstream async task
+                may not have failed yet when the generator yielded the dependent.
+                Re-checking here — after pending async tasks are flushed — makes
+                the failure cascade fire for the async_execution path too.
+                """
+                task = self.tasks[task_id]
+                if getattr(task, 'context', None):
+                    return any(
+                        self.tasks[dep.id].status == "failed"
+                        for dep in task.context
+                        if hasattr(dep, 'id') and dep.id in self.tasks
+                    )
+                return False
+
             async for task_id in process.asequential():
                 if self.tasks[task_id].async_execution:
                     # Collect async tasks to run in parallel
@@ -1472,6 +1489,11 @@ class AgentTeam(SpawnAnnounceProtocol):
                 else:
                     # Before running a sync task, execute all pending async tasks
                     await flush_async_tasks()
+                    # A just-flushed async prerequisite may now be failed; skip
+                    # the dependent so we don't run it with missing upstream context.
+                    if _deps_failed(task_id):
+                        self.tasks[task_id].status = "failed"
+                        continue
                     # Run sync task in an executor to avoid blocking the event loop
                     # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
                     from ..trace.context_events import copy_context_to_callable
@@ -1763,18 +1785,18 @@ class AgentTeam(SpawnAnnounceProtocol):
         """
         # Remote execution: provision ONE sandbox shared by every agent on the
         # team, and tear it down even if execution raises. Re-enters start()
-        # with compute cleared so the wrapper applies exactly once.
-        if getattr(self, "compute", None) is not None:
+        # with run_on cleared so the wrapper applies exactly once.
+        if getattr(self, "run_on", None) is not None:
             from ..managed.shared_compute import SharedCompute
 
-            compute, self.compute = self.compute, None
+            run_on, self.run_on = self.run_on, None
             try:
-                with SharedCompute(compute) as shared:
+                with SharedCompute(run_on) as shared:
                     shared.attach(list(self.agents or []))
                     return self.start(content=content, return_dict=return_dict,
                                       output=output, **kwargs)
             finally:
-                self.compute = compute
+                self.run_on = run_on
 
         # Track execution via telemetry
         if hasattr(self, '_telemetry') and self._telemetry:

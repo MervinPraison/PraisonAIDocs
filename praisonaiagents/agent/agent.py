@@ -2447,6 +2447,40 @@ Your Goal: {self.goal}
         # Sandbox configuration - initialize SandboxMixin
         super().__init__(sandbox=sandbox)
 
+        # NOTE: `sandbox=` deliberately does NOT add code-execution tools.
+        #
+        # An earlier version auto-attached execute_python_code /
+        # execute_shell_command here. That was reverted: `sandbox=` is a
+        # RESTRICTION, and it must never grant a capability the caller did not
+        # ask for. Concretely, the injection
+        #   - escalated privilege: Agent(approval="read_only") exposes no tools,
+        #     but Agent(approval="read_only", sandbox=True) exposed two ungated
+        #     arbitrary-code-execution tools, since the injected names are not in
+        #     the approval registry's dangerous-tool presets; and
+        #   - advertised them to the model as "safely in sandbox" while the
+        #     default subprocess backend enforces none of its own SecurityPolicy
+        #     (network reachable despite allow_network=False; ~/.ssh readable
+        #     despite blocked_paths; `import subprocess` works despite
+        #     blocked_imports).
+        #
+        # `sandbox=` still configures isolation for the explicit, user-invoked
+        # agent.execute_code() / run_shell_command() APIs, which is what it has
+        # always meant. Giving the model a sandboxed execution tool should be an
+        # explicit act by the caller, the way MCP() is.
+
+        # A managed backend takes over the whole turn before any local execution,
+        # so a sandbox set alongside it silently does nothing. Say so.
+        if self.sandbox_config is not None and getattr(self, "backend", None) is not None:
+            import warnings
+
+            warnings.warn(
+                "Agent(sandbox=..., backend=...): the managed backend handles the "
+                "entire turn, so the sandbox= setting is ignored. Configure "
+                "isolation on the backend instead (e.g. LocalAgent(compute='docker')).",
+                FutureWarning,
+                stacklevel=2,
+            )
+
     @staticmethod
     def _resolve_tool_config(tool_config):
         """Resolve tool_config parameter with backward compatibility."""
@@ -2555,8 +2589,15 @@ Your Goal: {self.goal}
             'api_key': getattr(self, 'api_key', None),
             'auth': getattr(self, 'auth', None),
             
-            # Shallow copy tools to avoid deepcopy issues with nested objects
-            'tools': list(self.tools) if self.tools else None,
+            # Shallow copy tools to avoid deepcopy issues with nested objects.
+            # Drop framework-generated sandbox tools: they close over the source
+            # agent, so the constructor must regenerate clone-bound replacements
+            # (see the sandbox wiring below). User tools with colliding names
+            # lack the tag and are preserved.
+            'tools': (
+                [t for t in self.tools if not getattr(t, "_praison_sandbox_tool", False)]
+                if self.tools else None
+            ),
             
             # Skip handoffs entirely - they shouldn't be shared across channels
             # and can contain nested Agent instances that cause RLock issues
@@ -2607,7 +2648,10 @@ Your Goal: {self.goal}
             'interrupt_controller': None,  # Let new instance create its own
             
             # Sandbox config
-            'sandbox': getattr(self, '_sandbox_config', None),
+            # SandboxMixin stores this as `sandbox_config`; reading the
+            # underscore name (never assigned) made every clone silently drop
+            # its sandbox and run unisolated.
+            'sandbox': getattr(self, 'sandbox_config', None),
         }
         
         # Handle deprecated parameters for backward compatibility
@@ -5853,7 +5897,7 @@ Answer:"""
             
             # Convert the result to a GuardrailResult
             return GuardrailResult.from_tuple(result)
-            
+
         except Exception as e:
             logging.error(f"Agent {self.name}: Error in guardrail validation: {e}")
             # On error, return failure

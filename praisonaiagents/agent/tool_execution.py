@@ -22,6 +22,13 @@ from ..config.feature_configs import DEFAULT_TOOL_OUTPUT_LIMIT
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on how many timed-out (still-blocked) tool executors a single
+# agent may retire before it stops recycling and falls back to reusing the
+# existing bounded pool. This keeps the "fresh worker after a timeout"
+# throughput win while capping leaked threads from pathological repeated
+# timeouts so they cannot exhaust process resources.
+_MAX_ORPHANED_TOOL_EXECUTORS = 4
+
 if TYPE_CHECKING:
     pass
 
@@ -787,7 +794,7 @@ class ToolExecutionMixin:
                                         return self._execute_tool_with_circuit_breaker(function_name, arguments)
 
                                 # Use reusable executor to prevent resource leaks
-                                if not hasattr(self, '_tool_executor'):
+                                if not hasattr(self, '_tool_executor') or self._tool_executor is None:
                                     self._tool_executor = concurrent.futures.ThreadPoolExecutor(
                                         max_workers=2, thread_name_prefix=f"tool-{self.name}"
                                     )
@@ -801,6 +808,18 @@ class ToolExecutionMixin:
                                     future.cancel()
                                     logging.warning(f"Tool {function_name} timed out after {tool_timeout}s")
                                     result = {"error": f"Tool timed out after {tool_timeout}s", "timeout": True}
+                                    # The timed-out thread cannot be reclaimed. Retire this
+                                    # executor so the next call gets a fresh worker instead of
+                                    # queuing behind a permanently stuck one — but bound how many
+                                    # orphaned (still-blocked) threads we allow to accumulate:
+                                    # once the cap is reached we stop recycling and keep reusing
+                                    # the existing pool so repeated timeouts can't exhaust process
+                                    # resources with an unbounded number of leaked threads.
+                                    orphaned = getattr(self, '_tool_executor_orphaned', 0)
+                                    if orphaned < _MAX_ORPHANED_TOOL_EXECUTORS:
+                                        self._tool_executor.shutdown(wait=False)
+                                        self._tool_executor = None
+                                        self._tool_executor_orphaned = orphaned + 1
                         else:
                             with tool_progress_channel(_progress_sink), with_injection_context(state):
                                 result = self._execute_tool_with_circuit_breaker(function_name, arguments)
@@ -1129,6 +1148,20 @@ class ToolExecutionMixin:
                     execution_time_ms=(_time.time() - _tool_start_time) * 1000
                 )
                 after_tool_results = self._hook_runner.execute_sync(HookEvent.AFTER_TOOL, after_tool_input, target=function_name)
+
+                # Honour a post-tool block: a plugin/hook can deny the result
+                # (e.g. secret/PII detected) so the original output never
+                # reaches the model. Mirrors the BEFORE_TOOL block path above.
+                if self._hook_runner.is_blocked(after_tool_results):
+                    reason = self._hook_runner.get_blocking_reason(after_tool_results)
+                    logging.warning(f"Tool {function_name} result blocked by AFTER_TOOL hook")
+                    return reason or f"Result of {function_name} was blocked by security policy."
+
+                # Read back any rewritten/redacted tool_output so a plugin can
+                # scrub secrets before the result reaches the model. The bridge
+                # mutates ``after_tool_input.tool_output`` in place.
+                if getattr(after_tool_input, "tool_output", result) is not result:
+                    result = after_tool_input.tool_output
 
                 # Surface any additional_context returned by AFTER_TOOL hooks
                 # back to the model by appending it to the tool result (mirrors
