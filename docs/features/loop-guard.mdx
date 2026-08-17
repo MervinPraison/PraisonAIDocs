@@ -54,6 +54,10 @@ graph LR
 No-progress detection became **result-aware** in [PR #3080](https://github.com/MervinPraison/PraisonAI/pull/3080) (release after 2026-07-16, fixes [#3073](https://github.com/MervinPraison/PraisonAI/issues/3073)). Async / long-running tool workflows that return **changing** results (polling a job `IN_PROGRESS → COMPLETE`, pacing with a `wait` tool) are no longer falsely halted at 8 tool calls. Only a genuinely stuck loop of identical results still trips `no_progress_halt`. No config changes required to pick this up.
 </Note>
 
+<Note>
+Loop Guard now covers the **async tool-execution path** as of [PR #4005](https://github.com/MervinPraison/PraisonAI/pull/4005) (merged 2026-08-17, fixes [#4000](https://github.com/MervinPraison/PraisonAI/issues/4000)). Tool calls made via `agent.achat()` and async workflows are checked pre-execution, recorded post-execution, and can escalate through `WARN → BLOCK → HALT` the same way sync calls always did. Async tool timeouts and raised exceptions also count as failures now, so identical repeats accumulate toward the thresholds. No config changes required to pick this up.
+</Note>
+
 ## Quick Start
 
 <Steps>
@@ -332,6 +336,47 @@ agent._loop_guard.mark_progress("stage-1-complete")
 
 ---
 
+## Sync and Async coverage
+
+Loop Guard applies identically to both execution paths — sync (`agent.start()` / `agent.chat()`) and async (`agent.achat()` / async workflows).
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant LoopGuard
+    participant Tool
+
+    User->>Agent: start / achat with a task
+    Agent->>LoopGuard: check(tool, args, pre=True)
+    LoopGuard-->>Agent: ALLOW / WARN / BLOCK / HALT
+    Agent->>Tool: run (unless BLOCK/HALT)
+    Tool-->>Agent: result or exception
+    Agent->>LoopGuard: record(tool, args, success, result=…)
+    Agent->>LoopGuard: check(tool, args, pre=False)
+    LoopGuard-->>Agent: post-execution decision
+    Agent-->>User: result (with [loop-guard] annotation on WARN)
+```
+
+**What triggers Loop Guard on the async path:**
+
+- Repeated identical async tool calls whose results do not change (`no_progress_*` streak grows).
+- Repeated async tool timeouts — each `asyncio.wait_for` timeout is now recorded as a failure and counts toward the streak.
+- Repeated raised exceptions inside an async tool — each raised call is recorded as a failure the next pre-execution check can act on.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="Poll a flaky endpoint.")
+
+# Async path: identical failing calls escalate WARN → HALT and the run stops.
+result = await agent.achat("Fetch /status until it returns COMPLETE.")
+```
+
+The sync and async paths share the same `LoopGuard` instance per `Agent`, so a mixed workload (sync then async on the same agent) accumulates counts against one turn's thresholds.
+
+---
+
 ## Common Patterns
 
 ### Async polling with changing results
@@ -434,6 +479,10 @@ Monitor your agents' tool usage patterns with `agent._loop_guard.get_stats()`. H
 
 <Accordion title="Reach for mark_progress() only at real checkpoints">
 No-progress detection is result-aware, so a tool that keeps producing new output is trusted even past the count thresholds. Reach for `mark_progress()` only when your workflow has a natural checkpoint (a sub-step completed, a milestone reached) that the result-hash on its own would not reflect.
+</Accordion>
+
+<Accordion title="Drop manual retry caps around async polling">
+Since PR #4005, `agent.achat()` and async workflows route tool calls through the same Loop Guard as `agent.start()`. If you were adding manual retry caps around async polling, you can drop them — the default idempotent thresholds (5 / 8 / 12) and the result-aware no-progress streak apply on both paths.
 </Accordion>
 
 </AccordionGroup>
