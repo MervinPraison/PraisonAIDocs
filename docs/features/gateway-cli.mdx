@@ -132,6 +132,29 @@ curl http://127.0.0.1:8765/health
 **Unknown subcommands degrade gracefully.** `praisonai gateway <typo>` prints the standard usage/error message and exits with a non-zero code, rather than dead-ending with a static list. This applies to both the canonical and wrapper entry points.
 </Info>
 
+<Note>
+`praisonai gateway …` and `praisonai-bot gateway …` now route through **one** command app, so both expose the same verbs and the same `start`. A degraded gateway's retry hints — `praisonai gateway doctor`, `doctor --fix`, `test` — name commands you can run from either binary. An unknown verb (for example `praisonai gateway doctr`) now prints a rendered usage error and exits non-zero instead of the old `Available commands: start, status, hooks` dead-end, so a new error format is expected.
+</Note>
+
+### Which verb do I need?
+
+```mermaid
+graph TB
+    Q{What do I need?}
+    Q -->|Bring it up| Start[start]
+    Q -->|Is it healthy?| Status[status --deep]
+    Q -->|It's degraded| Doctor[doctor / doctor --fix]
+    Q -->|A channel misbehaves| Ctl[pause / resume / reconnect]
+    Q -->|Change wiring| Hooks[hooks add / list / remove]
+    Q -->|Bring it down cleanly| Stop[stop --drain-timeout]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef verb fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class Start,Status,Doctor,Ctl,Hooks,Stop verb
+```
+
 ### Gateway Management
 
 | Command | Description | Example |
@@ -367,6 +390,63 @@ Examples:
 <Warning>
 `--turn` runs an **offline** agent turn via `BotSessionManager.chat`. It does **not** exercise Slack Bolt/socket handlers or @mention routing.
 </Warning>
+</Tab>
+
+<Tab title="mint-link">
+```bash
+praisonai gateway mint-link [OPTIONS]
+
+Options:
+  --ttl INTEGER   Link time-to-live in seconds [default: 600]
+
+Examples:
+  praisonai gateway mint-link
+  praisonai gateway mint-link --ttl 3600
+```
+
+`mint-link` prints a fresh pairing/magic link that binds a cross-platform identity to the gateway, and also writes it to `~/.praisonai/last-link.txt` (mode `600`). The link resolves against `GATEWAY_HOST` / `GATEWAY_PORT` (defaulting to `127.0.0.1:8765`). It exits `1` when magic-link support is unavailable.
+</Tab>
+
+<Tab title="sessions">
+```bash
+praisonai gateway sessions [OPTIONS]
+
+Examples:
+  praisonai gateway sessions          # inspect per-channel session store entries
+```
+
+`sessions` inspects — and can prune — the per-channel session store so an operator can see live conversations without opening the store by hand.
+</Tab>
+
+<Tab title="logs">
+```bash
+praisonai gateway logs [OPTIONS]
+
+Options:
+  -n INTEGER   Number of trailing lines to show
+
+Examples:
+  praisonai gateway logs
+  praisonai gateway logs -n 100
+```
+
+`logs` tails the gateway's stdout/stderr under the daemon runner (`~/.praisonai/logs/bot-stderr.log` on macOS; `journalctl --user -u praisonai-bot` on Linux).
+</Tab>
+
+<Tab title="send">
+```bash
+praisonai gateway send [OPTIONS]
+
+Options:
+  --channel TEXT       Channel to push through (e.g. telegram)
+  --channel-id TEXT    Destination id on that channel
+  -m, --message TEXT   Message body
+
+Examples:
+  praisonai gateway send --channel telegram --channel-id 12345 -m "test"
+```
+
+`send` pushes a one-off message through the outbound messenger so you can smoke-test delivery to a real channel without waiting for an inbound trigger.
 </Tab>
 
 <Tab title="channels">
@@ -1057,6 +1137,24 @@ The `GATEWAY_PORT` environment variable is used by `start`, `stop`, and `status`
 
 ---
 
+## Supervisor exit codes
+
+`praisonai gateway start` returns a supervisor-friendly exit code so a service manager (launchd / systemd / a scheduled task) knows whether to restart the gateway or stop and wait for an operator.
+
+| Code | Meaning | When you see it |
+|------|---------|-----------------|
+| `0` | Clean shutdown / success | Ctrl+C, `SIGTERM` drain, `stop`, a healthy `status` |
+| `75` | Transient failure — supervisor should restart | Network blip, port contention, transient IO |
+| `78` | Fatal configuration error — supervisor should stop | Bad `gateway.yaml`, no platforms, duplicate token, unresolved strict tool |
+
+The installed OS unit maps `78` (`EX_CONFIG`) to **do-not-restart** so a broken config cannot crash-loop the daemon, and treats `75` (`EX_TEMPFAIL`) as restartable. See [Gateway Exit Codes](/features/gateway-exit-codes) for the full contract and per-platform wiring.
+
+<Note>
+The `doctor` verb uses a simpler `0` / `1` scheme (pass / fix-me) documented under [Pre-flight credential check → Exit codes](#exit-codes) — that is separate from the `start` supervisor protocol above.
+</Note>
+
+---
+
 ## Single-Instance Enforcement
 
 PraisonAI enforces a single gateway instance per host:port combination using PID locks.
@@ -1372,6 +1470,37 @@ channels:
 See [Secret References](/features/gateway-secret-references) for the full `{ source, id }` form on `token`, `app_token`, and `verify_token`.
 </Tab>
 </Tabs>
+
+---
+
+## Common Patterns
+
+### Diagnose → repair → verify
+
+Inspect first, repair only if needed, then confirm the gateway came back healthy.
+
+```bash
+praisonai gateway doctor          # read-only report
+praisonai gateway doctor --fix    # apply safe repairs, then re-validate
+praisonai gateway status --deep   # per-channel rows + reload state
+```
+
+### Zero-downtime posture change
+
+`restart` drains in-flight turns for the given window, then relaunches — replaying the launch posture saved in `~/.praisonai/gateway.start.<host>.<port>.json`, so the process comes back with the same flags it was started with.
+
+```bash
+praisonai gateway restart --drain-timeout 60
+```
+
+### Add an inbound trigger
+
+Register a webhook that hands inbound events to an agent and delivers the reply to a channel.
+
+```bash
+praisonai gateway hooks add gmail --agent triage-agent --deliver-to slack:C123
+praisonai gateway hooks list
+```
 
 ---
 
