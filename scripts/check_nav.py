@@ -54,22 +54,28 @@ def iter_page_refs(node):
 
 
 def disk_pages() -> set[str]:
+    """Return every page stem under docs/ in navigation route format.
+
+    Stems are relative to ``docs/``, extensionless, and always
+    forward-slash separated (``as_posix``) so comparisons against
+    ``docs.json`` routes behave identically on Windows.
+    """
     pages: set[str] = set()
     for pattern in ("*.mdx", "*.md"):
         for path in DOCS.rglob(pattern):
-            stem = str(path.relative_to(DOCS))
-            stem = stem[: stem.rfind(".")]
-            pages.add(stem)
+            pages.add(path.relative_to(DOCS).with_suffix("").as_posix())
     return pages
 
 
 def allowed(stem: str) -> bool:
+    """Return True when a page stem may exist on disk without a nav entry."""
     if stem in ALLOWLIST_EXACT:
         return True
     return any(stem.startswith(p) for p in ALLOWLIST_PREFIXES)
 
 
 def main() -> int:
+    """Run all drift checks; return 0 when consistent, 1 with a report otherwise."""
     data = json.loads(DOCS_JSON.read_text(encoding="utf-8"))
     refs = list(iter_page_refs(data["navigation"]))
     disk = disk_pages()
