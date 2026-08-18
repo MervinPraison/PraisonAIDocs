@@ -35,6 +35,8 @@ agent.start("Walk me through setting up PraisonAI for the first time.")
 
 The user launches PraisonAI without API keys; the CLI uses a reachable local model if one is running, otherwise offers the setup wizard instead of failing on the first model call.
 
+All four LLM-bound entrypoints — `praisonai` (bare), `praisonai run`, `praisonai code`, and `praisonai chat` — route their first-run check through the same shared helper, so a keyless newcomer is offered the wizard (or a clean hint) from *any* first command.
+
 ```mermaid
 graph LR
     subgraph "First-run Onboarding"
@@ -59,7 +61,7 @@ graph LR
 
 ```mermaid
 graph TB
-    A[🚀 praisonai / praisonai run] --> B{Cloud key<br/>configured?}
+    A[🚀 praisonai / run / code / chat] --> B{Cloud key<br/>configured?}
     B -->|Yes| C[✅ Run normally]
     B -->|No| LOCAL{Local endpoint<br/>reachable?}
     LOCAL -->|Yes| LN[🖥️ Use local model<br/>print stderr notice → continue]
@@ -247,7 +249,11 @@ The wizard still writes the config; it just doesn't dial the LLM.
 
 ## How It Works
 
-Both `praisonai` (bare) and `praisonai run` perform a credential check before doing any work.
+`praisonai` (bare), `praisonai run`, `praisonai code`, and `praisonai chat` all perform the same credential check before doing any work — each one delegates to the shared `ensure_configured_or_onboard()` helper.
+
+### Shared onboarding helper
+
+Every entrypoint funnels its first-run check through one choke point, `ensure_configured_or_onboard(*, model, interactive)` in `praisonai_code/llm/credentials.py`. It returns the model unchanged when already configured, adopts a reachable local endpoint (with a one-line stderr notice) when keyless and no explicit model is set, exits `1` with `Run: praisonai setup` when keyless and headless, and offers the setup wizard when keyless in an interactive TTY. Because all four commands share it, onboarding behaviour is identical no matter which command a newcomer types first.
 
 ```mermaid
 sequenceDiagram
@@ -314,13 +320,74 @@ When no cloud key is present, PraisonAI adopts a reachable local endpoint before
 
 ## Behaviour by Mode
 
+This table applies to **all four entrypoints** (`praisonai`, `run`, `code`, `chat`) — they share the same `ensure_configured_or_onboard()` gate.
+
 | Scenario | Behaviour |
 |----------|-----------|
 | Cloud key present (env var or stored credential) | Cloud key wins — local detection never overrides. No extra prompts, no added latency. |
 | No cloud key, local endpoint reachable, **TTY** | Prints `No cloud key found; using local model <name>. Run \`praisonai setup\` to add a hosted provider.` on stderr and **continues** into the TUI / the run. |
-| No cloud key, local endpoint reachable, **non-TTY** (`praisonai run`) | Adopts the detected local model + base URL for this run; the run proceeds. |
+| No cloud key, local endpoint reachable, **headless** | Adopts the detected local model + base URL for this run; the run proceeds. |
 | No cloud key, **no** local endpoint, **TTY** | Setup wizard is offered as a non-blocking suggestion (`Would you like to run the setup wizard now? [Y/n]`). |
-| No cloud key, **no** local endpoint, **non-TTY** / `--quiet` / `--output json` | Exit `1` with: `No API key configured. Run: praisonai setup` … `(a running local endpoint such as Ollama would be used automatically)`. |
+| No cloud key, **no** local endpoint, **headless** | Exit `1` with: `No API key configured. Run: praisonai setup` … `(a running local endpoint such as Ollama would be used automatically)`. |
+
+### Headless triggers per entrypoint
+
+"Headless" (`interactive=False`) is decided per command — this is what "non-TTY" means for each:
+
+| Entrypoint | Headless when… |
+|------------|----------------|
+| `praisonai run` | `not sys.stdin.isatty()` OR `--output json` |
+| `praisonai code` | `-p` / `--print` OR piped stdin (non-TTY) |
+| `praisonai chat` | `--json` OR piped stdin (non-TTY) |
+| Bare `praisonai` | `not sys.stdin.isatty()` OR `--quiet` |
+
+### Standalone `pip install praisonai-code` (no wrapper)
+
+Two entrypoints skip the gate when the wrapper isn't installed so the resident TUI can surface its own actionable install hint (`pip install praisonai[tui]`) instead of a raw "No API key configured" exit:
+
+- **Bare `praisonai`** and **interactive `praisonai chat`** (no prompt) run the gate **only when the wrapper is available**. On a bare `praisonai-code` install, the gate is skipped and the TUI shows its own hint.
+- **Single-prompt `chat "…"`** and **every `praisonai code`** invocation always run the gate — no wrapper is needed to dispatch a single turn.
+
+---
+
+## First command is `praisonai code`
+
+A brand-new user whose first-ever command is `praisonai code "add a test for foo"` now lands in onboarding instead of a raw provider error.
+
+<Tabs>
+<Tab title="Interactive TTY">
+```
+$ praisonai code "add a test for foo"
+No API key configured.
+Would you like to run the setup wizard now? [Y/n]: Y
+🚀 PraisonAI Setup Wizard
+Choose your LLM provider: 1
+Enter API key (hidden): ****
+Verifying your setup...
+✅ Verified — your agent is working!
+[code assistant starts]
+```
+</Tab>
+<Tab title="Headless (-p)">
+```
+$ praisonai code -p "add a test for foo" --output json
+Error: No API key configured. Run: praisonai setup
+or set environment variables like OPENAI_API_KEY
+(a running local endpoint such as Ollama would be used automatically)
+$ echo $?
+1
+```
+</Tab>
+<Tab title="Keyless + local Ollama">
+```
+$ praisonai code "add a test for foo"
+No cloud key found; using local model ollama/llama3.2. Run `praisonai setup` to add a hosted provider.
+[code assistant starts against local Ollama]
+```
+</Tab>
+</Tabs>
+
+The equivalent trio for `praisonai chat` uses `--json` for the headless line. See [Chat → First-run credential gate](/cli/chat#first-run-credential-gate) and [Code → First-run credential gate](/cli/code#first-run-credential-gate).
 
 ---
 
@@ -430,6 +497,7 @@ Several ways to avoid the setup prompt:
 | Have a local Ollama running | `ollama serve` (auto-detected, no explicit flag needed) |
 | Inject a zero-disk store (CI) | `export PRAISONAI_AUTH_CONTENT='{...}'` — see below |
 | Answer "No" at the prompt | Type `n` → exits `0` with a hint to run `praisonai setup` |
+| Run headless keyless (fail-fast) | `code -p` / `--print`, or `chat --json` → exits `1` with `Run: praisonai setup` (not "skipping" — this is how headless behaves on a keyless run) |
 
 <Note>
 **Ephemeral / CI environments.** On ephemeral runners you can skip both `setup` and `auth login` entirely — set `PRAISONAI_AUTH_CONTENT` for credentials **and** `PRAISONAI_CONFIG_CONTENT` (or `PRAISONAI_CONFIG` for a mounted file) for the user-config layer. PraisonAI will run without reading or writing anything under `~/.praisonai/`. See [Zero-disk config](/features/security-environment-variables#praisonai_config_content) and [Zero-disk credentials](/cli/auth#zero-disk-mode-praisonai_auth_content).
@@ -478,6 +546,12 @@ The smoke test is convenient locally but wastes a token round-trip in CI. Skip i
   </Card>
   <Card title="Run Command" icon="play" href="/cli/run">
     Run agents from files or prompts
+  </Card>
+  <Card title="Code Command" icon="code" href="/cli/code">
+    Code assistant — first-run credential gate
+  </Card>
+  <Card title="Chat Command" icon="comments" href="/cli/chat">
+    Chat mode — first-run credential gate
   </Card>
   <Card title="Keyless Local-First Run" icon="server" href="/features/keyless-local-first-run">
     Zero-config runs against a local Ollama or OpenAI-compatible model
