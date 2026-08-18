@@ -702,6 +702,19 @@ class AgentTeam(SpawnAnnounceProtocol):
         self._web = web
         self._reflection = reflection
         self._caching = caching
+        # Warn about params that are accepted for API symmetry with Agent but are
+        # not yet applied at the team level, so a truthy value stops being a silent
+        # no-op. Pass these to individual Agent(...) instances instead.
+        _unwired = {
+            "guardrails": guardrails, "web": web, "reflection": reflection,
+            "caching": caching, "learn": learn, "knowledge": knowledge,
+        }
+        _set = [k for k, v in _unwired.items() if v]
+        if _set:
+            logging.warning(
+                f"AgentTeam received {_set} but does not yet apply them at the team "
+                "level; pass these to individual Agent(...) instances instead."
+            )
         # ─────────────────────────────────────────────────────────────────────
         # Extract values from consolidated params using UNIFIED CANONICAL resolver
         # Precedence: Instance > Config > Dict > Array > String > Bool > Default
@@ -1758,6 +1771,21 @@ class AgentTeam(SpawnAnnounceProtocol):
         if agent:
             return str(agent[0])
         return None
+
+    def __repr__(self):
+        """Show where this team's work happens, not just its name."""
+        from ..agent.execution_location import repr_fields
+
+        return (
+            f"AgentTeam(name={self.name!r}, agents={len(self.agents or [])}, "
+            f"{repr_fields(self, shared=True)})"
+        )
+
+    def where_does_it_run(self) -> str:
+        """Plain-English answer to "where does my code actually run?"."""
+        from ..agent.execution_location import explain
+
+        return explain(self, shared=True)
 
     def start(self, content=None, return_dict=False, output=None, **kwargs):
         """Start agent execution with verbose output (beginner-friendly).
