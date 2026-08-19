@@ -1,7 +1,7 @@
 ---
 title: "Scheduler Delivery"
 sidebarTitle: "Scheduler Delivery"
-description: "Push scheduled agent results to Telegram, Discord, Slack, or WhatsApp with one param"
+description: "Push scheduled agent results to Telegram, Discord, Slack, WhatsApp, or Signal with one param"
 icon: "paper-plane"
 ---
 
@@ -24,7 +24,7 @@ graph LR
     subgraph "Scheduler Delivery"
         A[⏰ Scheduled Agent] --> B[📤 deliver token]
         B --> C[🔀 DeliveryRouter]
-        C --> D[✅ Telegram / Discord / Slack / WhatsApp]
+        C --> D[✅ Telegram / Discord / Slack / WhatsApp / Signal]
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -250,7 +250,7 @@ AgentScheduler(agent, task="Notify", deliver="slack:C0123456:1728987654.001234")
 # Delivers into the Slack thread rooted at message ts 1728987654.001234.
 ```
 
-Swap `telegram` for `discord`, `slack`, or `whatsapp` — the grammar is identical.
+Swap `telegram` for `discord`, `slack`, `whatsapp`, or `signal` — the grammar is identical.
 
 ```mermaid
 graph TB
@@ -335,7 +335,7 @@ The line a user puts in `crontab -e`:
 0 * * * *  TELEGRAM_BOT_TOKEN=xxxx praisonai schedule tick
 ```
 
-Before this, running `praisonai schedule tick` out of process silently dropped delivery — the executor computed the result but its `delivery_handler` was `None`, so nothing was pushed. Now the executor falls back to a stateless, token-authenticated standalone sender when no live handler is wired.
+Before this, running `praisonai schedule tick` out of process silently dropped delivery — the executor computed the result but its `delivery_handler` was `None`, so nothing was pushed. Now the executor falls back to a stateless, token-authenticated standalone sender when no live handler is wired. The send is no longer fire-and-forget: each HTTPS call is retried in-process on transient failures — see [Bounded in-process retry](#bounded-in-process-retry).
 
 ```mermaid
 graph LR
@@ -344,8 +344,8 @@ graph LR
         Tick --> Exec[ScheduledAgentExecutor]
         Exec --> Live{live delivery_handler?}
         Live -- yes --> LiveOK[gateway send_message]
-        Live -- no --> Standalone[🌐 standalone sender<br/>Telegram · Slack · Discord]
-        Standalone --> Chat[✅ chat]
+        Live -- no --> Standalone[🌐 standalone sender<br/>Telegram · Slack · Discord · WhatsApp · Signal]
+        Standalone -- retry ×4 on transient --> Chat[✅ chat]
     end
 
     classDef trigger fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -388,6 +388,8 @@ Each platform is gated by its bot token. A bare `deliver: telegram` target (no e
 | `telegram` | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_HOME_CHANNEL` | `POST https://api.telegram.org/bot{token}/sendMessage` | 4096 chars | `message_thread_id` |
 | `slack` | `SLACK_BOT_TOKEN` | `SLACK_HOME_CHANNEL` | `POST https://slack.com/api/chat.postMessage` (Bearer auth) | 39000 chars | `thread_ts` |
 | `discord` | `DISCORD_BOT_TOKEN` | `DISCORD_HOME_CHANNEL` | `POST https://discord.com/api/v10/channels/{id}/messages` (Bot auth) | 2000 chars | `message_reference` (`fail_if_not_exists=false`) |
+| `whatsapp` | `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID` | `WHATSAPP_HOME_CHANNEL` | `POST https://graph.facebook.com/v20.0/{phone_number_id}/messages` (Bearer auth) | 4096 chars | *(ignored — see per-platform note)* |
+| `signal` | `SIGNAL_ACCOUNT`, `SIGNAL_BRIDGE_URL` *(default `http://localhost:8080`)* | `SIGNAL_HOME_CHANNEL` | `POST {SIGNAL_BRIDGE_URL}/v2/send` | 2000 chars | *(n/a)* |
 
 Long results are split with the same markdown-aware `chunk_message` helper the live adapters use, so a result over the size limit is delivered as multiple messages instead of being rejected. On Discord, a target that carries a `thread_id` is preserved via `message_reference` (with `fail_if_not_exists=false`) so the message stays in the same conversation.
 
@@ -429,7 +431,7 @@ Nothing is hidden — a target that cannot be delivered is recorded as `delivery
 | **Unroutable token at schedule creation** (missing/malformed `channel_id`, unknown platform, empty target) | `SchedulerDelivery` logs an actionable warning with `reason` + `hint`; construction still returns so callers that only want a preview aren't blocked. A caller that wants hard-fail behaviour can raise `ScheduleTargetError` explicitly. See [Creation-time validation and preview](#creation-time-validation-and-preview). |
 | Token env unset | Run succeeds; `delivery_error` recorded (`"{TOKEN} not set for standalone delivery"`). |
 | Bare-platform target and no `{PLATFORM}_HOME_CHANNEL` + no registry entry | Run succeeds; `delivery_error` recorded. |
-| Unsupported platform (WhatsApp / custom / etc.) | Run succeeds; `delivery_error` recorded. |
+| Unsupported platform (custom / entry-point / etc.) | Run succeeds; `delivery_error` recorded. |
 | Slack `{"ok": false}` body | Run succeeds; `delivery_error` records the Slack error name |
 | Payload > platform limit | Auto-chunked into multiple messages (see per-platform table below) |
 | Live `delivery_handler` present | Live path wins; standalone sender is never invoked |
@@ -441,7 +443,11 @@ Nothing is hidden — a target that cannot be delivered is recorded as `delivery
 | Telegram | `TELEGRAM_BOT_TOKEN` | `TELEGRAM_HOME_CHANNEL` | 4096 chars | `thread_id` → `message_thread_id` (forum topic) |
 | Slack | `SLACK_BOT_TOKEN` | `SLACK_HOME_CHANNEL` | 39000 chars | `thread_id` → `thread_ts` (parent message ts) |
 | Discord | `DISCORD_BOT_TOKEN` | `DISCORD_HOME_CHANNEL` | 2000 chars | `thread_id` → `message_reference` reply |
-| WhatsApp / others | — | — | — | **Not supported** — delivery raises → `delivery_error` |
+| WhatsApp | `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID` | `WHATSAPP_HOME_CHANNEL` | 4096 chars | **Ignored** — WhatsApp has no thread concept; a scheduler `thread_id` is **not** a WhatsApp `context.message_id` and is deliberately dropped (see the WhatsApp note below) |
+| Signal | `SIGNAL_ACCOUNT` (sender number) | `SIGNAL_HOME_CHANNEL` (recipient) | 2000 chars | Not applicable (Signal has no threads) |
+| Custom / entry-point platforms | — | — | — | **Not supported** — no standalone sender, delivery raises → `delivery_error` |
+
+Signal also reads `SIGNAL_BRIDGE_URL` (defaults to `http://localhost:8080`, matching the live [Signal Bot](/features/signal-bot) adapter) for the `signal-cli-rest-api` bridge endpoint.
 
 #### Telegram
 Set `TELEGRAM_BOT_TOKEN` and either use an explicit `deliver: telegram:<chat_id>` target or set `TELEGRAM_HOME_CHANNEL`. `thread_id` on the target maps to `message_thread_id` (forum topic).
@@ -452,8 +458,54 @@ Set `SLACK_BOT_TOKEN` and either use `deliver: slack:<channel_id>` or set `SLACK
 #### Discord
 Set `DISCORD_BOT_TOKEN` and either use `deliver: discord:<channel_id>` or set `DISCORD_HOME_CHANNEL`. `thread_id` becomes a `message_reference` reply to preserve conversation context; if the referenced message is gone, delivery degrades gracefully to a normal message instead of dropping.
 
-#### WhatsApp / other platforms
-Not supported by the standalone sender. Continue to use a live gateway for those.
+#### WhatsApp
+Set `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID` (the same env the live adapter reads). Target with `deliver: whatsapp:<recipient_number>` or set `WHATSAPP_HOME_CHANNEL`. The payload is a plain-text WhatsApp Cloud API message POSTed to `https://graph.facebook.com/v20.0/{phone_number_id}/messages`.
+
+<Note>
+**No reply-context from `thread_id`.** A scheduler `thread_id` is a *generic conversation identifier*, not a WhatsApp `context.message_id`. Feeding it into `context.message_id` would yield an invalid id the Cloud API rejects as a **permanent 4xx**, so the standalone sender **omits** `context` entirely — matching the live adapter (`bots/whatsapp.py`), which sets `context` only from an explicit `reply_to` inbound message id, never from `thread_id`. This is a deliberate divergence from Slack/Telegram/Discord thread mapping.
+</Note>
+
+#### Signal
+End-to-end encrypted via a `signal-cli-rest-api` bridge (the same one the live [Signal Bot](/features/signal-bot) uses). Set `SIGNAL_ACCOUNT` (your linked sender number, e.g. `+15550000`) and optionally `SIGNAL_BRIDGE_URL` (defaults to `http://localhost:8080`). Target with `deliver: signal:<recipient_number_or_group>` or set `SIGNAL_HOME_CHANNEL`. The bridge must be running and reachable from wherever `praisonai schedule tick` fires — see the [Signal Bot](/features/signal-bot) page for the Docker one-liner.
+
+### Bounded in-process retry
+
+An ephemeral tick (cron / CI / serverless) has no persistent process to drain a durable outbox, so *durability* here is a **bounded in-process retry**. Each HTTPS send is attempted up to **4 times** with exponential backoff (1 s → 2 s → 4 s → 8 s, capped at 20 s, ±20 % jitter). A server-mandated `Retry-After` — integer-seconds *or* HTTP-date — is honoured over the computed backoff. Only transient failures (5xx, 429, network) are retried; a permanent failure (bad token, 4xx) raises on the first attempt so the executor records `delivery_error` immediately rather than burning the tick on a doomed send.
+
+| Field | Value | Source |
+|---|---|---|
+| Max attempts (`_MAX_ATTEMPTS`) | `4` | `_standalone_sender.py` |
+| Initial backoff | `1000 ms` | `BackoffPolicy(initial_ms=1000, ...)` |
+| Max backoff | `20000 ms` | `BackoffPolicy(max_ms=20000, ...)` |
+| Backoff factor | `2.0` | `BackoffPolicy(factor=2.0, ...)` |
+| Jitter | `0.2` (±20 %) | `BackoffPolicy(jitter=0.2)` |
+| Retry-After | Server value wins when present | `server_retry_after(exc)` |
+| Classifier | Shared with interactive replies | `is_recoverable_error(exc)` |
+
+The raw `Retry-After` header is preserved verbatim so `bots._resilience.server_retry_after` can parse **both** integer-seconds and HTTP-date forms — a plain `float(header)` would silently drop an HTTP-date delay under 429 throttling.
+
+```mermaid
+graph TB
+    Fail[❌ Send failed] --> Recoverable{Transient?<br/>5xx / 429 / network}
+    Recoverable -->|No — 4xx, bad token| FailFast[🟥 Raise → delivery_error]
+    Recoverable -->|Yes| Attempts{Attempts < 4?}
+    Attempts -->|No| FailFast
+    Attempts -->|Yes| RetryAfter{Server Retry-After?}
+    RetryAfter -->|Yes| SleepServer[⏳ Sleep Retry-After]
+    RetryAfter -->|No| SleepBackoff[⏳ Sleep backoff<br/>1s → 2s → 4s → 8s ±20%]
+    SleepServer --> Retry[🟩 Retry send]
+    SleepBackoff --> Retry
+
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef wait fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Fail,FailFast fail
+    class Recoverable,Attempts,RetryAfter question
+    class SleepServer,SleepBackoff wait
+    class Retry ok
+```
 
 ### End-to-end: cron deployment walkthrough
 
@@ -900,7 +952,7 @@ Delivery reuses the existing `DeliveryRouter`, so scheduled sends inherit the ga
 | **Idempotency dedup — gateway-hosted scheduled/proactive delivery** | Durable — enqueued via SQLite `OutboundQueue` at `~/.praisonai/state/gateway_outbox.sqlite`. Survives a crash-and-restart: a re-fired job is a no-op INSERT that resolves to the already-`sent` row. Falls back to the router LRU only if the durable store cannot be built. |
 | **Dead-target self-heal** | The router retries and skips/marks dead targets |
 | **Graceful degradation** | When `praisonai-bot` is not installed, a single warning is logged and delivery no-ops — the scheduled run itself never fails |
-| **Out-of-process delivery** | When no live `delivery_handler` is wired (cron / CI / serverless), delivery falls back to a per-platform standalone HTTPS sender (Telegram / Slack / Discord). Uses only `{PLATFORM}_BOT_TOKEN` — no adapter, no persistent process. A missing token or unsupported platform records `delivery_error` (never silently dropped). See [Out-of-process delivery](#out-of-process-delivery). |
+| **Out-of-process delivery** | When no live `delivery_handler` is wired (cron / CI / serverless), delivery falls back to a per-platform standalone HTTPS sender (Telegram / Slack / Discord / **WhatsApp** / **Signal**). Uses only the platform's own env (`{PLATFORM}_BOT_TOKEN`, or the WhatsApp / Signal env vars) — no adapter, no persistent process. Each send is retried in-process up to 4 times with exponential backoff on transient failures (5xx / 429 / network), honouring a server-mandated `Retry-After`; a permanent failure (bad token, 4xx) records `delivery_error` on the first attempt. See [Out-of-process delivery](#out-of-process-delivery) and [Bounded in-process retry](#bounded-in-process-retry). |
 | **Intentional silence** | An exact `NO_REPLY` / `[SILENT]` / `SILENT` output suppresses delivery; the run is still recorded as `succeeded` |
 | **Continuable delivery** | On successful delivery of a `continuable` target, the gateway seeds a resumable session keyed to the reply address. A seed failure logs and never breaks the delivery — the brief still lands. |
 | **No silent drops** | A configured delivery target that cannot be delivered (missing token, unsupported platform, Slack logical error, etc.) is recorded as `delivery_error` on the run — never silently dropped. |
@@ -914,6 +966,8 @@ graph LR
     Router --> Rate[⏱️ Rate limit]
     Router --> Dedup[🔁 LRU dedup]
     Router --> Heal[🩹 Dead-target self-heal]
+    Result -. no live handler .-> Standalone[🌐 standalone sender<br/>Telegram · Slack · Discord · WhatsApp · Signal]
+    Standalone -- retry ×4 on transient --> Chat[✅ chat]
     Missing[📦 bot not installed] --> NoOp[⚠️ Warn + no-op]
 
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
@@ -921,8 +975,8 @@ graph LR
     classDef store fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
 
-    class Result ok
-    class Router,Rate,Dedup,Heal proc
+    class Result,Chat ok
+    class Router,Rate,Dedup,Heal,Standalone proc
     class Outbox store
     class Missing,NoOp warn
 ```
@@ -1004,7 +1058,7 @@ See [Out-of-process delivery](#out-of-process-delivery) for the full contract.
 </Accordion>
 
 <Accordion title="Install the bot extra to enable delivery">
-Delivery needs the `praisonai-bot` package. Without it, the scheduled run still executes — only the push is skipped, with one warning. With the package installed you get two delivery paths automatically: the **live gateway path** when a `delivery_handler` is wired, and the **standalone sender** for Telegram / Slack / Discord when running unattended (cron / CI / serverless). Both paths honour the same `{PLATFORM}_BOT_TOKEN` env vars. See [Out-of-process delivery](#out-of-process-delivery).
+Delivery needs the `praisonai-bot` package. Without it, the scheduled run still executes — only the push is skipped, with one warning. With the package installed you get two delivery paths automatically: the **live gateway path** when a `delivery_handler` is wired, and the **standalone sender** for Telegram / Slack / Discord / WhatsApp / Signal when running unattended (cron / CI / serverless). Each path honours the platform's own env (`{PLATFORM}_BOT_TOKEN`, or the WhatsApp / Signal env vars). See [Out-of-process delivery](#out-of-process-delivery).
 </Accordion>
 
 <Accordion title="Reuse one scheduler instance per job">
