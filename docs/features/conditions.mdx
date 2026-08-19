@@ -16,6 +16,10 @@ agent.start("Execute the follow-up step if the score is above 0.8.")
 
 The user defines workflows; `when` expressions gate tasks and AgentFlow steps on runtime variables.
 
+<Note>
+**Since PraisonAI PR [#4020](https://github.com/MervinPraison/PraisonAI/pull/4020)**, `when`/`then_task`/`else_task` routing is wired into `PraisonAIAgents`. On earlier releases the API existed on `Task` but the `Process` orchestrator never consulted it — `when`-only tasks silently stalled or fell through to unrelated tasks.
+</Note>
+
 ```mermaid
 graph LR
     subgraph "Conditional Execution"
@@ -236,6 +240,72 @@ flow = AgentFlow(
 )
 ```
 
+## Multi-agent Workflows (PraisonAIAgents)
+
+`when`/`then_task`/`else_task` also routes multi-agent workflows built with `PraisonAIAgents`.
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+reviewer  = Agent(name="reviewer",  instructions="Score the draft 0-100 as JSON: {\"score\": <int>}")
+publisher = Agent(name="publisher", instructions="Publish the approved draft")
+writer    = Agent(name="writer",    instructions="Revise the draft")
+
+review  = Task(name="review",  description="Score the draft", agent=reviewer)
+publish = Task(name="publish", description="Publish it",       agent=publisher)
+revise  = Task(name="revise",  description="Revise the draft", agent=writer)
+
+gate = Task(
+    name="gate",
+    description="Route based on score",
+    agent=reviewer,
+    when="{{score}} > 80",
+    then_task="publish",
+    else_task="revise",
+)
+
+PraisonAIAgents(
+    agents=[reviewer, publisher, writer],
+    tasks=[review, gate, publish, revise],
+).start()
+```
+
+```mermaid
+sequenceDiagram
+    participant Reviewer
+    participant Process
+    participant Condition
+    participant Publish
+    participant Revise
+
+    Reviewer->>Process: Result {score: 90}
+    Process->>Process: Build routing context (result.to_dict() + previous_output)
+    Process->>Condition: evaluate_when("{{score}} > 80")
+    alt score > 80
+        Condition-->>Process: then_task
+        Process->>Publish: Route to publish
+    else score <= 80
+        Condition-->>Process: else_task
+        Process->>Revise: Route to revise
+    end
+```
+
+<Note>
+**How the routing context is built** — the `when` expression is evaluated against the **current** task (the one that just completed), not the target:
+
+- The context is `result.to_dict()` (from `json_dict` / `pydantic`) merged with `previous_output = result.raw`.
+- Access structured fields as `{{field_name}}` (e.g. `{{score}}` when the agent returns `{"score": 90}`).
+- Access raw text as `{{previous_output}}`.
+</Note>
+
+<Note>
+**Priority** — when both `when` and `next_tasks` are set on the same task, `when`-routing wins.
+</Note>
+
+<Note>
+**Clean termination** — if the taken branch resolves to `None` (e.g. only `then_task` is set and the condition is false, with no `next_tasks` fallback), the workflow ends cleanly on that path. It does **not** pick an unrelated not-started task.
+</Note>
+
 ## Flow Diagram
 
 ```mermaid
@@ -289,17 +359,19 @@ when="{{score}} > 80 and {{status}} == approved and {{count}} < 10"
 </Accordion>
 
 <Accordion title="Provide both then_task and else_task">
-Always specify both branches to make the flow explicit:
+Specify both branches when you want an explicit fork:
 
 ```python
-# ✅ Good - Both branches defined
+# ✅ Both branches defined - explicit fork
 Task(
     when="{{approved}}",
     then_task="proceed",
     else_task="wait"
 )
 
-# ⚠️ Incomplete - Missing else branch
+# ✅ One-branch routing (early-exit) - intentional shape
+# When the condition is false, the branch resolves to None and the
+# workflow ends cleanly on this path instead of picking an unrelated task.
 Task(
     when="{{approved}}",
     then_task="proceed"
