@@ -66,7 +66,9 @@ bot = TelegramBot(
     agent=agent,
 )
 
-# Drain any messages queued before the last crash — call this at startup
+# Replay anything queued before the last crash.
+# Also fires automatically on channel recovery — no need to wire it yourself.
+# Manual call is only needed for adapters not driven by ChannelSupervisor.
 await bot.drain_outbox()
 
 # Send with durability
@@ -549,7 +551,7 @@ Controls retry timing for both `deliver_with_retry` and `OutboundQueue.drain`.
 
 ---
 
-## Idempotency & Drain on Startup
+## Idempotency & When the Outbox Drains
 
 ### Idempotency Keys
 
@@ -567,7 +569,31 @@ await delivery.send(
 
 If the webhook is redelivered and `send()` is called again with the same key, the outbox skips the enqueue (SQLite `UNIQUE` constraint) and marks the existing row sent.
 
-### Drain on Startup
+### When the Outbox Drains
+
+Held replies go out on **three** triggers, so operators can reason about *when* a queued message is actually re-attempted:
+
+1. **Adapter startup** — replays anything queued before the last crash (`drain_pending()` / `drain_outbox()`).
+2. **Channel recovery** *(new — Issue #4043)* — when `ChannelSupervisor` observes a channel come back after a recoverable outage (network blip, transient API error, stale socket), it fires `drain_outbox()` in the background so held replies go out promptly. Applications do not have to call anything.
+3. **Lazy on next inbound turn** — the next `chat()` turn also opportunistically drains.
+
+```mermaid
+graph LR
+    subgraph "When the outbox drains"
+        Start[🚀 Adapter startup] --> Drain[💾 drain_outbox]
+        Recover[🔁 Channel recovers] --> Drain
+        Chat[💬 Next chat turn] --> Drain
+        Drain --> Send[📤 Held replies go out]
+    end
+
+    classDef trigger fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start,Recover,Chat trigger
+    class Drain process
+    class Send result
+```
 
 Call `drain_pending()` once at adapter startup to replay anything that was queued before the last crash:
 
@@ -585,6 +611,40 @@ The drain replays oldest messages first and skips messages that have exceeded `m
 <Note>
 The hint is recovered from the **stored error string**, not the live exception. Only hints that survive `str(err)` (python-telegram-bot `RetryAfter` repr, HTTP headers folded into the error message, text-form "retry after N") are honoured on drain.
 </Note>
+
+### Recovery-triggered re-drain (Issue #4043)
+
+*Why did my held reply just go out on its own?* When a channel drops on a transient outage, the outbox deliberately **holds** deliverable replies instead of dropping them. Before, those replies sat undelivered until the next inbound `chat()` turn or a process restart. Now `ChannelSupervisor` re-drains that platform's outbox the moment the channel reconnects — see [Channel supervision → Recovery-triggered outbox re-drain](/features/gateway-channel-supervision#recovery-triggered-outbox-re-drain).
+
+<AccordionGroup>
+<Accordion title="Recovery only — not a clean start">
+The re-drain fires only when the channel comes back from **at least one** recoverable failure (`monitor.attempt > 0`). A cold, clean first start does **not** trigger it — the startup drain still covers that path.
+</Accordion>
+
+<Accordion title="Background-scheduled — never blocks recovery">
+It launches as an `asyncio.create_task(...)` and is not awaited by the supervision loop, so a slow or large re-drain can never delay the channel coming back online.
+</Accordion>
+
+<Accordion title="Duck-typed and best-effort">
+The supervisor resolves `drain_outbox` on the supervised object first, then falls back to `bot.adapter.drain_outbox`. No hook → silent no-op. An exception is logged at `WARNING` and swallowed — the outbox's own attempt-and-age dead-letter policy still governs those messages, so a failed re-drain never wedges supervision.
+</Accordion>
+
+<Accordion title="Bounded and idempotent">
+The re-drain is bounded by the outbox's existing attempt-and-age policy and is safe to call more than once because the outbox itself dedupes on `idempotency_key`.
+</Accordion>
+</AccordionGroup>
+
+Log lines from the merged code:
+
+```
+# success (only when something moved):
+Channel '<name>' recovered: re-drained outbox (<S> sent, <F> failed)
+
+# failure (swallowed — retried on the next drain):
+Channel '<name>' outbox re-drain on recovery failed (will retry on next drain): <exc>
+```
+
+Introduced in [PraisonAI PR #4046](https://github.com/MervinPraison/PraisonAI/pull/4046) (fixes [#4043](https://github.com/MervinPraison/PraisonAI/issues/4043)).
 
 ---
 
