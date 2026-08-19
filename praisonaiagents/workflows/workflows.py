@@ -632,10 +632,17 @@ class AgentFlow:
     # REMOTE EXECUTION
     # ============================================================
     # Union[str, ComputeProviderProtocol] - where each step's shell/file tools
-    # run: "docker", "e2b", "modal", "daytona", "flyio", "tenki", "local".
-    # Every step shares ONE sandbox and /workspace, so a file written by one
-    # step is visible to later steps. Orchestration stays local. Pass a
-    # configured provider instance instead of a name to customise resources.
+    # run: "docker", "e2b", "modal", "daytona", "flyio", "tenki", "local",
+    # "subprocess", "sandlock", "ssh", "novita".
+    # Every step shares ONE sandbox and one working directory, so a file written
+    # by one step is visible to later steps. Orchestration -- routing, parallel,
+    # repeat -- stays local, and so does the thinking. Pass a configured
+    # provider instance instead of a name to customise resources.
+    tools_run_on: Optional[Union['ToolPlace', str, Any]] = None
+
+    # Accepted only to fail with a useful message: on an Agent, run_on= moves
+    # the whole agent to a managed runtime, so honouring it here as a synonym
+    # for tools_run_on= would make one word mean two things.
     run_on: Optional[Any] = None
 
     # ============================================================
@@ -692,6 +699,14 @@ class AgentFlow:
 
     def __post_init__(self):
         """Resolve consolidated params to internal values."""
+        from ..agent.placement import resolve_placement
+
+        resolve_placement(
+            "AgentFlow",
+            run_on=self.run_on,
+            tools_run_on=self.tools_run_on,
+            supports_run_on=False,
+        )
         from .workflow_configs import (
             resolve_output_config, resolve_planning_config,
             resolve_memory_config, resolve_hooks_config,
@@ -1115,7 +1130,7 @@ class AgentFlow:
                 "separate Workflow instance per concurrent run."
             )
         try:
-            if self.run_on is None:
+            if self.tools_run_on is None:
                 return self._run_impl(input, llm, verbose, stream)
             # One sandbox for the whole run; torn down even if a step raises.
             with self._shared_compute() as shared:
@@ -1152,10 +1167,10 @@ class AgentFlow:
         return explain(self, shared=True)
 
     def _shared_compute(self):
-        """Build the SharedCompute for this run (see the ``run_on=`` field)."""
+        """Build the SharedCompute for this run (see ``tools_run_on=``)."""
         from ..managed.shared_compute import SharedCompute
 
-        return SharedCompute(self.run_on)
+        return SharedCompute(self.tools_run_on)
 
     def _collect_agents(self) -> List[Any]:
         """Walk steps (including nested route/parallel/loop/repeat/if) for Agents.
@@ -3473,7 +3488,9 @@ class WorkflowManager:
     
     from ..paths import DEFAULT_DIR_NAME as _DIR_NAME
     WORKFLOWS_DIR = f"{_DIR_NAME}/workflows"
-    SUPPORTED_EXTENSIONS = [".md", ".yaml", ".yml"]
+    # Only markdown is parsed by this manager; YAML workflows are handled by
+    # YAMLWorkflowParser. A discovered YAML file fails loudly in _load_workflow.
+    SUPPORTED_EXTENSIONS = [".md"]
     
     def __init__(
         self,
@@ -3785,6 +3802,17 @@ class WorkflowManager:
     
     def _load_workflow(self, file_path: Path) -> Optional[Workflow]:
         """Load a workflow from a file."""
+        # The markdown parser below cannot read YAML workflows; loading a
+        # ``.yaml``/``.yml`` here would silently produce zero steps. Fail loudly
+        # so the mismatch is visible instead of running an empty workflow.
+        if file_path.suffix.lower() in (".yaml", ".yml"):
+            logger.error(
+                "Workflow file '%s' is YAML, but WorkflowManager only parses "
+                "markdown workflows. Use YAMLWorkflowParser / 'praisonai workflow "
+                "run' for YAML workflows.",
+                file_path,
+            )
+            return None
         try:
             content = file_path.read_text(encoding="utf-8")
             frontmatter, body = self._parse_frontmatter(content)
@@ -4093,7 +4121,8 @@ class WorkflowManager:
         stream: bool = False,
         verbose: int = 0,
         checkpoint: Optional[str] = None,
-        resume: Optional[str] = None
+        resume: Optional[str] = None,
+        rebase_checkpoint: bool = False
     ) -> Dict[str, Any]:
         """
         Execute a workflow with context passing between steps.
@@ -4112,6 +4141,9 @@ class WorkflowManager:
             verbose: Verbosity level
             checkpoint: Save checkpoint after each step with this name
             resume: Resume from checkpoint with this name
+            rebase_checkpoint: Force resume at the same step index even when the
+                workflow definition changed since the checkpoint (skips the
+                fingerprint check with a warning)
             
         Returns:
             Execution results with step outputs and status
@@ -4122,6 +4154,7 @@ class WorkflowManager:
             default_llm=default_llm,
             planning=planning,
             resume=resume,
+            rebase_checkpoint=rebase_checkpoint,
         )
         if "error" in loop:
             return loop["error"]
@@ -4165,12 +4198,19 @@ class WorkflowManager:
         default_llm: Optional[str],
         planning: bool,
         resume: Optional[str],
+        rebase_checkpoint: bool = False,
     ) -> Dict[str, Any]:
         """Resolve the workflow and build the initial loop state.
 
         Shared by the sync ``execute`` and async ``aexecute`` drivers so the
         setup (framework validation, variable merge, checkpoint resume) lives
         in a single place. Returns ``{"error": <result dict>}`` on failure.
+
+        On resume the stored ``definition_fingerprint`` is compared against the
+        current workflow. A mismatch means the file was edited between save and
+        resume, so the numeric step index no longer points at the same step;
+        this raises unless ``rebase_checkpoint`` is set to deliberately continue
+        at the same index against the edited definition.
         """
         workflow = self.get_workflow(workflow_name)
         if not workflow:
@@ -4200,14 +4240,61 @@ class WorkflowManager:
 
         results: List[Dict[str, Any]] = []
         start_step = 0
+        resumed_from_step = None
+        fingerprint = self._definition_fingerprint(workflow)
 
         # Resume from checkpoint if specified
         if resume:
             checkpoint_data = self._load_checkpoint(resume)
+            if not checkpoint_data:
+                # Fail closed: an explicit resume onto an absent/misspelled/
+                # deleted checkpoint must not silently re-run from step 1 and
+                # repeat already-completed side effects.
+                return {
+                    "error": {
+                        "success": False,
+                        "error": (
+                            f"checkpoint '{resume}' not found; refusing to resume. "
+                            "Run `workflow checkpoints` to list saved checkpoints, "
+                            "or re-run without --resume to start fresh."
+                        ),
+                        "results": [],
+                    }
+                }
             if checkpoint_data:
+                saved_fingerprint = checkpoint_data.get("definition_fingerprint")
+                if (
+                    saved_fingerprint
+                    and saved_fingerprint != fingerprint
+                    and not rebase_checkpoint
+                ):
+                    return {
+                        "error": {
+                            "success": False,
+                            "error": (
+                                "workflow definition changed since the checkpoint "
+                                f"(fingerprint mismatch: checkpoint={saved_fingerprint}, "
+                                f"current={fingerprint}). Re-run without --resume to start "
+                                "fresh, or pass --rebase-checkpoint to deliberately continue "
+                                "at the same step index against the edited definition."
+                            ),
+                            "results": [],
+                        }
+                    }
+                if (
+                    saved_fingerprint
+                    and saved_fingerprint != fingerprint
+                    and rebase_checkpoint
+                ):
+                    self._log(
+                        "Warning: workflow definition changed since the checkpoint "
+                        f"(checkpoint={saved_fingerprint}, current={fingerprint}); "
+                        "continuing at the same step index because --rebase-checkpoint was set."
+                    )
                 results = checkpoint_data.get("results", [])
                 all_variables = checkpoint_data.get("variables", all_variables)
                 start_step = checkpoint_data.get("completed_steps", 0)
+                resumed_from_step = start_step
                 self._log(f"Resuming workflow from step {start_step + 1}")
 
         return {
@@ -4219,17 +4306,23 @@ class WorkflowManager:
                 "all_variables": all_variables,
                 "success": True,
                 "start_step": start_step,
+                "resumed_from_step": resumed_from_step,
+                "definition_fingerprint": fingerprint,
             },
         }
 
     def _workflow_loop_result(self, workflow: Workflow, state: Dict[str, Any]) -> Dict[str, Any]:
         """Assemble the return dict shared by ``execute`` and ``aexecute``."""
-        return {
+        result = {
             "success": state["success"],
             "workflow": workflow.name,
             "results": state["results"],
             "variables": state["all_variables"],
         }
+        # Surface resume provenance so a resumed run is visible after the fact.
+        if state.get("resumed_from_step") is not None:
+            result["resumed_from_step"] = state["resumed_from_step"]
+        return result
 
     def _run_workflow_loop(
         self,
@@ -4265,8 +4358,9 @@ class WorkflowManager:
             step = workflow.steps[current_step_idx]
             i = current_step_idx
 
-            # Check condition
-            if step.condition:
+            # Check condition (only string conditions are evaluable here; a
+            # dict condition is a routing table handled by branch logic below)
+            if step.condition and isinstance(step.condition, str):
                 condition = self._substitute_variables(step.condition, all_variables)
                 # Simple condition evaluation (could be enhanced)
                 if condition.lower() in ("false", "no", "skip", "0"):
@@ -4329,7 +4423,8 @@ class WorkflowManager:
                         workflow_name=workflow_name,
                         completed_steps=i + 1,
                         results=results,
-                        variables=all_variables
+                        variables=all_variables,
+                        definition_fingerprint=state.get("definition_fingerprint")
                     )
 
                 current_step_idx += 1
@@ -4371,7 +4466,8 @@ class WorkflowManager:
                     workflow_name=workflow_name,
                     completed_steps=i + 1,
                     results=results,
-                    variables=all_variables
+                    variables=all_variables,
+                    definition_fingerprint=state.get("definition_fingerprint")
                 )
 
             # Handle failure
@@ -4388,6 +4484,17 @@ class WorkflowManager:
             # Use getattr with defaults for workflow-specific attributes that may not exist on Task
             branch_condition = getattr(step, 'branch_condition', None)
             next_steps = getattr(step, 'next_steps', None)
+
+            # Unified condition syntax: Task(when=..., then_task=..., else_task=...)
+            # redirects execution by step name based on the evaluated condition.
+            if getattr(step, 'when', None) is not None:
+                when_context = dict(all_variables)
+                when_context['previous_output'] = step_result.get("output")
+                target = step.get_next_task(when_context)
+                if target and target in step_lookup:
+                    current_step_idx, _ = step_lookup[target]
+                    continue
+
             if branch_condition and step_result["output"]:
                 # Evaluate branch condition based on output
                 output_lower = str(step_result["output"]).lower()
@@ -4570,7 +4677,8 @@ class WorkflowManager:
         stream: bool = False,
         verbose: int = 0,
         checkpoint: Optional[str] = None,
-        resume: Optional[str] = None
+        resume: Optional[str] = None,
+        rebase_checkpoint: bool = False
     ) -> Dict[str, Any]:
         """
         Async version of execute() for workflow execution.
@@ -4589,6 +4697,9 @@ class WorkflowManager:
             verbose: Verbosity level
             checkpoint: Save checkpoint after each step with this name
             resume: Resume from checkpoint with this name
+            rebase_checkpoint: Force resume at the same step index even when the
+                workflow definition changed since the checkpoint (skips the
+                fingerprint check with a warning)
             
         Returns:
             Execution results with step outputs and status
@@ -4599,6 +4710,7 @@ class WorkflowManager:
             default_llm=default_llm,
             planning=planning,
             resume=resume,
+            rebase_checkpoint=rebase_checkpoint,
         )
         if "error" in loop:
             return loop["error"]
@@ -4946,6 +5058,40 @@ class WorkflowManager:
         checkpoints_dir = self.workspace_path / DEFAULT_DIR_NAME / "checkpoints"
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
         return checkpoints_dir
+
+    def _definition_fingerprint(self, workflow: Workflow) -> str:
+        """Stable content hash of a workflow's step definition.
+
+        Normalised like ``managed/protocols.py`` hashes environments: it hashes
+        the ordered list of each step's identity (name / action / agent / full
+        config), not the raw file bytes. Whitespace/comment-only edits therefore
+        keep the same fingerprint, while adding, removing, reordering, or
+        changing a step's action or agent configuration produces a new one. Used
+        to refuse a silent resume onto a stale step index after the workflow file
+        was edited.
+
+        Config *values* (not just keys) are hashed so that semantic edits — e.g.
+        changing an agent's instructions, model, tools, condition, or routing —
+        also invalidate the checkpoint rather than silently combining a stale
+        step position with an edited definition.
+        """
+        import hashlib
+        import json
+
+        def _step_identity(step: Any) -> Dict[str, Any]:
+            agent = getattr(step, "agent", None)
+            agent_name = getattr(agent, "name", None) if agent is not None else None
+            config = getattr(step, "agent_config", None) or {}
+            return {
+                "name": getattr(step, "name", None),
+                "action": getattr(step, "action", None),
+                "agent": agent_name,
+                "config": config,
+            }
+
+        payload = [_step_identity(s) for s in (workflow.steps or [])]
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
     
     def _save_checkpoint(
         self,
@@ -4953,7 +5099,8 @@ class WorkflowManager:
         workflow_name: str,
         completed_steps: int,
         results: List[Dict[str, Any]],
-        variables: Dict[str, Any]
+        variables: Dict[str, Any],
+        definition_fingerprint: Optional[str] = None
     ) -> str:
         """
         Save workflow checkpoint for later resumption.
@@ -4964,6 +5111,8 @@ class WorkflowManager:
             completed_steps: Number of completed steps
             results: Results from completed steps
             variables: Current variable state
+            definition_fingerprint: Stable hash of the workflow definition,
+                compared on resume to refuse a stale step index after edits
             
         Returns:
             Path to checkpoint file
@@ -4979,6 +5128,7 @@ class WorkflowManager:
             "completed_steps": completed_steps,
             "results": results,
             "variables": variables,
+            "definition_fingerprint": definition_fingerprint,
             "saved_at": time.time(),
             "saved_at_iso": datetime.now().isoformat()
         }
@@ -5030,6 +5180,7 @@ class WorkflowManager:
                     "name": data.get("name", checkpoint_file.stem),
                     "workflow": data.get("workflow_name", ""),
                     "completed_steps": data.get("completed_steps", 0),
+                    "definition_fingerprint": data.get("definition_fingerprint"),
                     "saved_at": data.get("saved_at_iso", "")
                 })
             except Exception:

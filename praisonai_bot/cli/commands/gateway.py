@@ -139,6 +139,14 @@ def gateway_start(
         help="Fail fast if any tool named in the config cannot be resolved. "
         "Use --no-strict-tools to skip unresolved tools and start anyway (#3553)",
     ),
+    verify_turn: Optional[bool] = typer.Option(
+        None,
+        "--verify-turn/--no-verify-turn",
+        help="Run one real agent turn before serving so a missing/invalid model "
+        "credential fails at startup, not on the first user message. Defaults to "
+        "the config's gateway.preflight.verify_turn (on). Use --no-verify-turn to "
+        "skip in constrained/offline environments (#4042)",
+    ),
     openai_api: bool = typer.Option(
         False,
         "--openai-api",
@@ -297,6 +305,35 @@ def gateway_start(
     # warn-and-continue under --no-strict-tools.
     if config and os.path.exists(config):
         _preflight_tools(config, strict_tools=strict_tools)
+
+    # Turn pre-flight: verify one real agent turn so a missing/invalid model
+    # credential fails HERE (at start), not silently on the first user message
+    # (#4042). The channel + tool probes above prove wiring, never a model
+    # round-trip. Default on via config (gateway.preflight.verify_turn); the
+    # --verify-turn/--no-verify-turn flag overrides for constrained/offline use.
+    #
+    # This is governed by its own toggle, NOT the channel `preflight` flag: an
+    # operator running `--no-preflight --verify-turn` still wants the model
+    # round-trip, so skipping the channel probes must not silently suppress the
+    # requested turn check.
+    if config and os.path.exists(config):
+        import asyncio
+
+        enabled, prompt = _resolve_verify_turn(config)
+        if verify_turn is not None:
+            enabled = verify_turn
+        channels = _load_channels(config)
+        if enabled and channels:
+            ok, detail = asyncio.run(_verify_turn_preflight(config, prompt=prompt))
+            if ok:
+                print(f"Turn pre-flight OK — agent replied to '{prompt}'.")
+            else:
+                print(
+                    f"\nTurn pre-flight failed — the agent did not produce a reply: "
+                    f"{detail}\nCheck the model/provider credentials for this agent, "
+                    "or pass --no-verify-turn to skip this check."
+                )
+                raise typer.Exit(1)
 
     handler = GatewayHandler()
     # Pass True only when the flag is set so an unset flag does not override a
@@ -599,8 +636,10 @@ from praisonai_bot.gateway.preflight import (  # noqa: E402 — re-exported for 
     probe_results_to_dict as _probe_results_to_dict,
     resolve_env_token as _resolve_env_token,
     resolve_platform_dlq_path as _resolve_platform_dlq_path,
+    resolve_verify_turn as _resolve_verify_turn,
     run_shell_readiness_check as _run_shell_readiness_check,
     run_turn_test as _run_gateway_turn_test,
+    verify_turn_preflight as _verify_turn_preflight,
 )
 
 
@@ -1768,6 +1807,63 @@ sessions_app = typer.Typer(
 app.add_typer(sessions_app, name="sessions")
 
 
+diagnostics_app = typer.Typer(
+    help="Produce a portable, pre-sanitised support bundle for the gateway",
+    no_args_is_help=True,
+)
+app.add_typer(diagnostics_app, name="diagnostics")
+
+
+@diagnostics_app.command("export")
+def gateway_diagnostics_export(
+    config: str = typer.Option(
+        "gateway.yaml", "--config", "-c", help="Path to gateway.yaml"
+    ),
+    output_dir: Optional[str] = typer.Option(
+        None, "--output-dir",
+        help="Directory to write the bundle (default: ~/.praisonai/diagnostics)",
+    ),
+    log_lines: int = typer.Option(
+        200, "--log-lines", help="Number of recent (redacted) log lines to include"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Write a single, pre-sanitised diagnostics archive for a bug report.
+
+    Consolidates a human-readable summary, machine-readable diagnostics, the
+    sanitised config *shape* (keys/modes only — no secrets), redacted recent
+    log summaries, best-effort health/status, and the latest forensics snapshot
+    into one ``.zip``. It runs even when the gateway is unhealthy (falling back
+    to local logs) and never includes chat text, prompts, tool outputs,
+    credentials, or raw tokens — safe to attach to an issue.
+
+    Examples:
+        praisonai gateway diagnostics export
+        praisonai gateway diagnostics export --config gateway.yaml
+        praisonai gateway diagnostics export --json
+    """
+    import json
+    import os
+
+    from praisonai_bot.gateway.diagnostics import build_diagnostics_bundle
+
+    config = _resolve_doctor_config(config)
+    config_path = config if config and os.path.exists(config) else None
+
+    result = build_diagnostics_bundle(
+        config_path, output_dir=output_dir, log_lines=log_lines
+    )
+
+    if json_output:
+        print(json.dumps({"path": result["path"], "manifest": result["manifest"]}, indent=2))
+    else:
+        print(f"Wrote diagnostics bundle: {result['path']}")
+        print(
+            "Pre-sanitised (config shape only, secrets redacted, no chat/prompt "
+            "data) — safe to attach to a bug report."
+        )
+
+
 @sessions_app.command("list")
 def gateway_sessions_list(
     platform: Optional[str] = typer.Option(None, "--platform", help="Filter by platform (e.g. slack)"),
@@ -1905,6 +2001,7 @@ Manage the gateway server: praisonai gateway <command>
   [green]doctor[/green]      Validate channel credentials (pre-flight check)
   [green]test[/green]        One-shot readiness (probes + shell + optional turn)
   [green]channels[/green]    List channels from gateway.yaml (use --probe to check creds)
+  [green]diagnostics[/green] Export a pre-sanitised support bundle (diagnostics export)
   [green]send[/green]        Send a test message to a channel
   [green]hooks[/green]       Manage inbound trigger hooks (add | list | remove)
   [green]install[/green]     Install as OS daemon service

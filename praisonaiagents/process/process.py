@@ -74,6 +74,10 @@ class Process:
                     self._state_lock = asyncio.Lock()
         return self._state_lock
 
+    def _task_by_name(self, name):
+        """Return the task whose name matches, or None. First-match, mirrors prior inline lookup."""
+        return next((t for t in self.tasks.values() if t.name == name), None)
+
     def _create_llm_instance(self):
         """Create and return a configured LLM instance for manager tasks."""
         from ..llm import LLM
@@ -115,7 +119,7 @@ class Process:
             if current_task.previous_tasks:
                 # For validation tasks, typically validate the most recent previous task
                 prev_task_name = current_task.previous_tasks[-1]
-                validated_task = next((t for t in self.tasks.values() if t.name == prev_task_name), None)
+                validated_task = self._task_by_name(prev_task_name)
             elif current_task.context:
                 # If no previous_tasks, check context for the validated task
                 for ctx_task in reversed(current_task.context):
@@ -348,6 +352,43 @@ class Process:
                     task_id=loop_task.id
                 )
 
+    def _build_routing_context(self, current_task: Task) -> Dict[str, Any]:
+        """Build a variable context for evaluating a task's `when` condition.
+
+        Combines the task's structured result (json_dict / pydantic fields) with
+        the raw output so expressions like ``{{score}} > 80`` can resolve, and
+        exposes the raw text as ``previous_output``.
+        """
+        context: Dict[str, Any] = {}
+        result = getattr(current_task, "result", None)
+        if result is not None:
+            try:
+                context.update(result.to_dict())
+            except Exception:
+                pass
+            context["previous_output"] = getattr(result, "raw", "")
+        return context
+
+    def _has_when_routing(self, task: Task) -> bool:
+        """True if the task uses the unified when/then_task/else_task routing."""
+        return task.when is not None or task.then_task is not None or task.else_task is not None
+
+    def _resolve_when_routing(self, current_task: Task) -> Optional[Task]:
+        """Resolve the next Task via the unified `when`/`then_task`/`else_task`
+        routing on the current task. Returns None if no such routing applies."""
+        if current_task.when is None and current_task.then_task is None and current_task.else_task is None:
+            return None
+        next_name = current_task.get_next_task(self._build_routing_context(current_task))
+        if not next_name:
+            return None
+        next_task = next((t for t in self.tasks.values() if t.name == next_name), None)
+        if next_task:
+            next_task.status = "not started"
+            logging.debug(f"Routing to {next_task.name} based on when-condition: {current_task.when}")
+        else:
+            logging.warning(f"when-routing target '{next_name}' not found among tasks")
+        return next_task
+
     def _build_task_context(self, current_task: Task) -> str:
         """Build context for a task based on its retain_full_context setting"""
         # Check if we have validation feedback to include
@@ -377,7 +418,7 @@ class Process:
         if current_task.retain_full_context:
             # Original behavior: include all previous tasks
             for prev_name in current_task.previous_tasks:
-                prev_task = next((t for t in self.tasks.values() if t.name == prev_name), None)
+                prev_task = self._task_by_name(prev_name)
                 if prev_task and prev_task.result:
                     context += f"\n{prev_name}: {prev_task.result.raw}"
                     
@@ -391,7 +432,7 @@ class Process:
             if current_task.previous_tasks:
                 # Get the most recent previous task (last in the list)
                 prev_name = current_task.previous_tasks[-1]
-                prev_task = next((t for t in self.tasks.values() if t.name == prev_name), None)
+                prev_task = self._task_by_name(prev_name)
                 if prev_task and prev_task.result:
                     context += f"\n{prev_name}: {prev_task.result.raw}"
                     
@@ -599,7 +640,7 @@ class Process:
         for task in self.tasks.values():
             if task.next_tasks:
                 for next_task_name in task.next_tasks:
-                    next_task = next((t for t in self.tasks.values() if t.name == next_task_name), None)
+                    next_task = self._task_by_name(next_task_name)
                     if next_task:
                         next_task.previous_tasks.append(task.name)
                         logging.debug(f"Added {task.name} as previous task for {next_task_name}")
@@ -770,7 +811,7 @@ Subtask: {st.name}
                             
                             target_tasks = current_task.condition.get(decision_str, []) if decision_str else []
                             task_value = target_tasks[0] if isinstance(target_tasks, list) else target_tasks
-                            next_task = next((t for t in self.tasks.values() if t.name == task_value), None)
+                            next_task = self._task_by_name(task_value)
                             if next_task:
                                 next_task.status = "not started"  # Reset status to allow execution
                                 logging.debug(f"Routing to {next_task.name} based on decision: {decision_str}")
@@ -799,7 +840,7 @@ Subtask: {st.name}
                         logging.debug(f"No input file, marking {current_task.name} as completed")
                         if current_task.next_tasks:
                             next_task_name = current_task.next_tasks[0]
-                            next_task = next((t for t in self.tasks.values() if t.name == next_task_name), None)
+                            next_task = self._task_by_name(next_task_name)
                             current_task = next_task
                         else:
                             current_task = None
@@ -811,8 +852,8 @@ Subtask: {st.name}
                 yield task_id
                 visited_tasks.add(task_id)
 
-                # Only end workflow if no next_tasks AND no conditions
-                if not current_task.next_tasks and not current_task.condition and not any(
+                # Only end workflow if no next_tasks AND no conditions AND no when-routing
+                if not current_task.next_tasks and not current_task.condition and not self._has_when_routing(current_task) and not any(
                     t.task_type == "loop" and current_task.name.startswith(t.name + "_")
                     for t in self.tasks.values()
                 ):
@@ -870,7 +911,7 @@ Subtask: {st.name}
                         else:
                             # Find the target task by name
                             task_value = target_tasks[0] if isinstance(target_tasks, list) else target_tasks
-                            next_task = next((t for t in self.tasks.values() if t.name == task_value), None)
+                            next_task = self._task_by_name(task_value)
                             if next_task:
                                 next_task.status = "not started"  # Reset status to allow execution
                                 
@@ -899,10 +940,26 @@ Subtask: {st.name}
                                 # Don't mark workflow as finished when following condition path
                                 await self._set_workflow_finished(False)
 
+            # Unified condition routing (when/then_task/else_task) takes priority
+            # over next_tasks when configured on the current task.
+            when_routing_exhausted = False
+            if not next_task and current_task:
+                if self._has_when_routing(current_task):
+                    when_task = self._resolve_when_routing(current_task)
+                    if when_task:
+                        next_task = when_task
+                        await self._set_workflow_finished(False)
+                    elif not current_task.next_tasks:
+                        # when-routing is authoritative: it resolved to no target
+                        # (e.g. the taken branch has no then/else_task) and there
+                        # is no next_tasks fallback, so this path ends cleanly
+                        # instead of picking an unrelated not-started task.
+                        when_routing_exhausted = True
+
             # If no condition-based routing, use next_tasks
             if not next_task and current_task and current_task.next_tasks:
                 next_task_name = current_task.next_tasks[0]
-                next_task = next((t for t in self.tasks.values() if t.name == next_task_name), None)
+                next_task = self._task_by_name(next_task_name)
                 if next_task:
                     # Reset the next task to allow re-execution
                     next_task.status = "not started"
@@ -915,7 +972,7 @@ Subtask: {st.name}
                     logging.debug(f"Following next_tasks to {next_task.name}")
 
             current_task = next_task
-            if not current_task:
+            if not current_task and not when_routing_exhausted:
                 current_task = self._find_next_not_started_task() # General fallback if no next task in workflow
 
 
@@ -1166,7 +1223,7 @@ Provide a JSON with the structure:
         for task in self.tasks.values():
             if task.next_tasks:
                 for next_task_name in task.next_tasks:
-                    next_task = next((t for t in self.tasks.values() if t.name == next_task_name), None)
+                    next_task = self._task_by_name(next_task_name)
                     if next_task:
                         next_task.previous_tasks.append(task.name)
 
@@ -1361,7 +1418,7 @@ Subtask: {st.name}
                             
                             target_tasks = current_task.condition.get(decision_str, []) if decision_str else []
                             task_value = target_tasks[0] if isinstance(target_tasks, list) else target_tasks
-                            next_task = next((t for t in self.tasks.values() if t.name == task_value), None)
+                            next_task = self._task_by_name(task_value)
                             if next_task:
                                 next_task.status = "not started"  # Reset status to allow execution
                                 logging.debug(f"Routing to {next_task.name} based on decision: {decision_str}")
@@ -1390,7 +1447,7 @@ Subtask: {st.name}
                         logging.debug(f"No input file, marking {current_task.name} as completed")
                         if current_task.next_tasks:
                             next_task_name = current_task.next_tasks[0]
-                            next_task = next((t for t in self.tasks.values() if t.name == next_task_name), None)
+                            next_task = self._task_by_name(next_task_name)
                             current_task = next_task
                         else:
                             current_task = None
@@ -1402,8 +1459,8 @@ Subtask: {st.name}
                 yield task_id
                 visited_tasks.add(task_id)
 
-                # Only end workflow if no next_tasks AND no conditions
-                if not current_task.next_tasks and not current_task.condition and not any(
+                # Only end workflow if no next_tasks AND no conditions AND no when-routing
+                if not current_task.next_tasks and not current_task.condition and not self._has_when_routing(current_task) and not any(
                     t.task_type == "loop" and current_task.name.startswith(t.name + "_")
                     for t in self.tasks.values()
                 ):
@@ -1459,7 +1516,7 @@ Subtask: {st.name}
                         else:
                             # Find the target task by name
                             task_value = target_tasks[0] if isinstance(target_tasks, list) else target_tasks
-                            next_task = next((t for t in self.tasks.values() if t.name == task_value), None)
+                            next_task = self._task_by_name(task_value)
                             if next_task:
                                 next_task.status = "not started"  # Reset status to allow execution
                                 
@@ -1488,10 +1545,26 @@ Subtask: {st.name}
                                 # Don't mark workflow as finished when following condition path
                                 self._set_workflow_finished_sync(False)
 
+            # Unified condition routing (when/then_task/else_task) takes priority
+            # over next_tasks when configured on the current task.
+            when_routing_exhausted = False
+            if not next_task and current_task:
+                if self._has_when_routing(current_task):
+                    when_task = self._resolve_when_routing(current_task)
+                    if when_task:
+                        next_task = when_task
+                        self._set_workflow_finished_sync(False)
+                    elif not current_task.next_tasks:
+                        # when-routing is authoritative: it resolved to no target
+                        # (e.g. the taken branch has no then/else_task) and there
+                        # is no next_tasks fallback, so this path ends cleanly
+                        # instead of picking an unrelated not-started task.
+                        when_routing_exhausted = True
+
             # If no condition-based routing, use next_tasks
             if not next_task and current_task and current_task.next_tasks:
                 next_task_name = current_task.next_tasks[0]
-                next_task = next((t for t in self.tasks.values() if t.name == next_task_name), None)
+                next_task = self._task_by_name(next_task_name)
                 if next_task:
                     # Reset the next task to allow re-execution
                     next_task.status = "not started"
@@ -1504,7 +1577,7 @@ Subtask: {st.name}
                     logging.debug(f"Following next_tasks to {next_task.name}")
 
             current_task = next_task
-            if not current_task:
+            if not current_task and not when_routing_exhausted:
                 current_task = self._find_next_not_started_task() # General fallback if no next task in workflow
 
 

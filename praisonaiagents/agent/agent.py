@@ -150,6 +150,8 @@ class ServerRegistry:
     # Class-level lock for thread-safe singleton creation
     _instance_lock = threading.Lock()
     
+
+
     @staticmethod
     def get_default_instance():
         """Get default global registry for backward compatibility."""
@@ -512,6 +514,28 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         logging.debug(f"Generated tool definition: {tool_def}")
         return tool_def
 
+    @staticmethod
+    def _hosted_backend_for(provider: str):
+        """Build the managed backend that ``run_on=<provider>`` is shorthand for.
+
+        ``run_on="anthropic"`` and ``backend=HostedAgent(provider="anthropic")``
+        place the agent identically; the first is the readable spelling for the
+        common case, the second is what you reach for when the runtime needs
+        configuring (model, system prompt, its own tools).
+        """
+        try:
+            from praisonai.integrations import HostedAgent
+        except ImportError as exc:
+            raise ImportError(
+                f"Agent(run_on={provider!r}) runs the whole agent on a managed "
+                f"runtime, which ships in the wrapper package.\n"
+                f"  pip install praisonai\n"
+                f"To keep thinking on this machine and move only the tools, use "
+                f"tools_run_on= instead -- that needs no extra install for "
+                f"local places."
+            ) from exc
+        return HostedAgent(provider=provider)
+
     def __init__(
         self,
         # Core identity
@@ -568,6 +592,8 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         tool_config: Optional[Union[bool, 'ToolConfig']] = None,  # Tool execution configuration (timeout, retry, parallel)
         learn: Optional[Union[bool, str, Dict[str, Any], 'LearnConfig']] = None,  # Continuous learning (peer to memory)
         backend: Optional[Any] = None,  # External managed agent backend (e.g., ManagedAgentIntegration)
+        run_on: Optional[Union['ManagedRuntime', str]] = None,  # Run the WHOLE agent on a managed runtime, e.g. "anthropic"
+        tools_run_on: Optional[Union['ToolPlace', str, Any]] = None,  # Run only this agent's TOOLS elsewhere, e.g. "docker"
         runtime: Optional[Union[bool, str, Dict[str, Any], 'AgentRuntimeConfig', 'RuntimeConfig']] = None,  # Model-scoped runtime configuration with capability validation
         interrupt_controller: Optional['InterruptController'] = None,  # G2: Cooperative cancellation
         tool_search: Optional[Union[bool, str, Dict[str, Any], 'ToolSearchConfig']] = False,  # Progressive tool disclosure
@@ -759,8 +785,34 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         verification_hooks = legacy_kwargs.get("verification_hooks", _legacy_defaults["verification_hooks"])
         cli_backend = legacy_kwargs.get("cli_backend", _legacy_defaults["cli_backend"])
 
-        # Add check at start if memory is requested
-        if memory is not None:
+        # ── where does this agent run? ───────────────────────────────────────
+        # Resolved before anything else is built so a contradiction fails at the
+        # call site, with the parameter name the user actually wanted, instead
+        # of surfacing later as tools mysteriously running on the wrong machine.
+        from .placement import resolve_placement
+
+        _placement = resolve_placement(
+            "Agent", run_on=run_on, tools_run_on=tools_run_on, backend=backend
+        )
+        if _placement.whole is not None:
+            backend = self._hosted_backend_for(_placement.whole)
+        self.tools_run_on = _placement.tools
+        self._tools_sandbox = None
+
+        # Add check at start if memory is requested.
+        # Skip the probe for values that resolve to the zero-dependency FileMemory
+        # backend (True, "file", and file-provider dicts without learn); those never
+        # touch the heavy memory.memory module, so probing it just wastes an import.
+        _uses_file_memory = (
+            memory is True
+            or memory == "file"
+            or (
+                isinstance(memory, dict)
+                and not memory.get("learn", False)
+                and memory.get("provider", memory.get("backend", "file")) == "file"
+            )
+        )
+        if memory is not None and not _uses_file_memory:
             try:
                 from ..memory.memory import Memory  # noqa: F401
                 _ = Memory  # Silence unused import warning - we just check availability
@@ -1560,6 +1612,12 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     "Use Agent(policy=PolicyEngine(...)) for tool policy enforcement, "
                     "or pass a validator via guardrails=... / GuardrailConfig(validator=...)."
                 )
+
+        # Apply [defaults].guardrails from config when not explicitly provided,
+        # mirroring the memory/web/caching/etc. resolution above so a config-wide
+        # guardrail safety net is actually honoured instead of silently ignored.
+        if guardrails is None:
+            guardrails = apply_config_defaults("guardrails", None, GuardrailConfig)
 
         # Fast path: None/False -> no guardrails (skip resolve() call)
         if guardrails is None or guardrails is False:
@@ -2609,6 +2667,16 @@ Your Goal: {self.goal}
         )
         return mem_inst
 
+
+    def _backstory_without_sandbox_prompt(self):
+        """This agent's backstory as it was before any sandbox was attached."""
+        shared = getattr(self, "_tools_sandbox", None)
+        if shared is not None:
+            for ref, _tools, original_backstory in getattr(shared, "_patched", []):
+                if ref() is self:
+                    return original_backstory
+        return self.backstory
+
     def clone_for_channel(self) -> "Agent":
         """Return a fully independent copy of this agent for a gateway channel.
         
@@ -2629,7 +2697,10 @@ Your Goal: {self.goal}
             'name': self.name,
             'role': self.role, 
             'goal': self.goal,
-            'backstory': self.backstory,
+            # The pre-attach backstory when a sandbox is live: attach() appends
+            # the capability prompt to backstory, so cloning the current value
+            # and then attaching again gives the clone two copies of it.
+            'backstory': self._backstory_without_sandbox_prompt(),
             'instructions': self.instructions,
             
             # LLM configuration 
@@ -2702,6 +2773,13 @@ Your Goal: {self.goal}
             # underscore name (never assigned) made every clone silently drop
             # its sandbox and run unisolated.
             'sandbox': getattr(self, 'sandbox_config', None),
+
+            # Where the tools run must survive cloning for the same reason the
+            # sandbox must: a gateway-channel clone that quietly drops it runs
+            # every tool on the host while its repr still claims otherwise.
+            # The clone gets its own sandbox instance -- placement is a choice,
+            # not a live connection to share.
+            'tools_run_on': getattr(self, 'tools_run_on', None),
         }
         
         # Handle deprecated parameters for backward compatibility
@@ -4069,6 +4147,18 @@ Summary:"""
                     continue
 
                 # ─────────────────────────────────────────────────────────────
+                # VERIFICATION GATE (opt-in): before any success signal below
+                # can finalise the run, all blocking verification hooks must
+                # pass. On failure, feed captured stdout/stderr back and keep
+                # iterating (never-passing checks end at max_iterations).
+                # No-op when no verification hooks are configured.
+                # ─────────────────────────────────────────────────────────────
+                _gate_feedback = self._verification_gate(response_str, iterations)
+                if _gate_feedback is not None:
+                    prompt = _gate_feedback
+                    continue
+
+                # ─────────────────────────────────────────────────────────────
                 # TOOL-CALL COMPLETION: If the model used tools this turn AND
                 # produced a substantive response, the inner loop completed
                 # the task naturally (model stopped calling tools = done).
@@ -4522,6 +4612,16 @@ Summary:"""
                     continue
 
                 # ─────────────────────────────────────────────────────────────
+                # VERIFICATION GATE (opt-in): blocking hooks must pass before a
+                # success signal below can finalise the run. No-op when unset.
+                # ─────────────────────────────────────────────────────────────
+                _gate_feedback = await self._verification_gate_async(response_str, iterations)
+                if _gate_feedback is not None:
+                    prompt = _gate_feedback
+                    await asyncio.sleep(0)
+                    continue
+
+                # ─────────────────────────────────────────────────────────────
                 # TOOL-CALL COMPLETION: If the model used tools this turn AND
                 # produced a substantive response, the inner loop completed
                 # the task naturally (model stopped calling tools = done).
@@ -4859,27 +4959,171 @@ Summary:"""
     
     def _run_verification_hooks(self) -> List[Dict[str, Any]]:
         """Run all registered verification hooks.
-        
+
+        Preserves the full result payload (``details``/``error``/
+        ``duration_seconds`` — including ``returncode``/``stdout``/``stderr``
+        captured by :class:`CommandVerificationHook`) so callers and the goal
+        judge can gate on executable evidence, not just a boolean.
+
         Returns:
-            List of verification results
+            List of verification result dicts.
         """
-        results = []
-        if hasattr(self, '_verification_hooks') and self._verification_hooks:
-            for hook in self._verification_hooks:
-                try:
-                    result = hook.run()
-                    results.append({
-                        "hook": hook.name,
-                        "success": result.get("success", False) if isinstance(result, dict) else getattr(result, 'success', False),
-                        "output": result.get("output", "") if isinstance(result, dict) else getattr(result, 'output', ""),
-                    })
-                except Exception as e:
-                    results.append({
-                        "hook": getattr(hook, 'name', 'unknown'),
-                        "success": False,
-                        "error": str(e),
-                    })
+        results: List[Dict[str, Any]] = []
+        for hook in getattr(self, '_verification_hooks', None) or []:
+            try:
+                result = hook.run()
+                if isinstance(result, dict):
+                    record = dict(result)
+                    record.setdefault("success", False)
+                elif hasattr(result, "to_dict"):
+                    record = result.to_dict()
+                else:
+                    record = {
+                        "success": getattr(result, "success", False),
+                        "output": getattr(result, "output", ""),
+                        "details": getattr(result, "details", {}),
+                        "error": getattr(result, "error", None),
+                        "duration_seconds": getattr(result, "duration_seconds", 0.0),
+                    }
+                record["hook"] = getattr(hook, "name", "unknown")
+                record["blocking"] = getattr(hook, "blocking", True)
+                results.append(record)
+            except Exception as e:
+                results.append({
+                    "hook": getattr(hook, 'name', 'unknown'),
+                    "blocking": getattr(hook, "blocking", True),
+                    "success": False,
+                    "error": str(e),
+                })
         return results
+
+    def add_verification(self, hook: Any) -> None:
+        """Register a verification hook for the current run.
+
+        Lets an autonomous agent (or caller) add a task-specific completion
+        gate discovered mid-run, e.g. the regression test it just wrote.
+        """
+        if not hasattr(self, "_verification_hooks") or self._verification_hooks is None:
+            self._verification_hooks = []
+        self._verification_hooks.append(hook)
+
+    def remove_verification(self, name: str) -> bool:
+        """Remove a verification hook by name. Returns True if one was removed."""
+        hooks = getattr(self, "_verification_hooks", None) or []
+        remaining = [h for h in hooks if getattr(h, "name", None) != name]
+        removed = len(remaining) != len(hooks)
+        self._verification_hooks = remaining
+        return removed
+
+    def _verification_summary_tail(self, results: List[Dict[str, Any]], limit: int = 800) -> str:
+        """Build a compact human-readable summary of gate results for feedback."""
+        lines = []
+        for r in results:
+            status = "PASS" if r.get("success") else "FAIL"
+            details = r.get("details") or {}
+            rc = details.get("returncode")
+            head = f"[{status}] {r.get('hook')}"
+            if rc is not None:
+                head += f" (exit={rc})"
+            lines.append(head)
+            out = r.get("output") or r.get("error") or ""
+            if out and not r.get("success"):
+                lines.append(str(out)[-limit:])
+        return "\n".join(lines)
+
+    def _verification_gate(self, response_str: str, iterations: int) -> Optional[str]:
+        """Run verification hooks and gate completion.
+
+        Returns ``None`` when no hooks are configured or all blocking hooks
+        pass (loop may finalise with success). Otherwise returns a feedback
+        prompt containing the failing hooks' captured output so the loop can
+        continue and the agent can fix the failure.
+        """
+        if not getattr(self, "_verification_hooks", None):
+            return None
+        results = self._run_verification_hooks()
+        return self._verification_gate_feedback(results)
+
+    async def _verification_gate_async(
+        self, response_str: str, iterations: int
+    ) -> Optional[str]:
+        """Async counterpart of :meth:`_verification_gate`.
+
+        Hook execution (which may shell out via :class:`CommandVerificationHook`)
+        is offloaded to a worker thread so a slow or blocking check never stalls
+        the event loop shared by other concurrent agents.
+        """
+        if not getattr(self, "_verification_hooks", None):
+            return None
+        import asyncio as _asyncio
+
+        results = await _asyncio.to_thread(self._run_verification_hooks)
+        return self._verification_gate_feedback(results)
+
+    def _verification_gate_feedback(
+        self, results: List[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Shared post-processing for the sync/async gates.
+
+        Persists the results, records them durably, and returns a feedback
+        prompt when a blocking hook failed (else ``None`` to allow completion).
+        """
+        self._last_verification_results = results
+        self._record_verification_journal(results)
+        failed = [r for r in results if r.get("blocking", True) and not r.get("success")]
+        if not failed:
+            return None
+        summary = self._verification_summary_tail(failed)
+        return (
+            "Completion is blocked: the following verification checks failed. "
+            "Fix the underlying problem, then continue.\n" + summary
+        )
+
+    def _verification_journal_payloads(
+        self, results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Build durable ``verification``-kind payloads for the run journal."""
+        import hashlib
+
+        payloads: List[Dict[str, Any]] = []
+        for r in results:
+            details = r.get("details") or {}
+            output = r.get("output") or ""
+            payloads.append({
+                "name": r.get("hook"),
+                "success": bool(r.get("success")),
+                "returncode": details.get("returncode"),
+                "command": details.get("command"),
+                "path": details.get("path"),
+                "duration_seconds": r.get("duration_seconds"),
+                "output_hash": hashlib.sha256(str(output).encode()).hexdigest(),
+            })
+        return payloads
+
+    def _record_verification_journal(self, results: List[Dict[str, Any]]) -> None:
+        """Best-effort durable record of gate results to the run journal.
+
+        Only writes when an opt-in durable run is active (``Agent(...,
+        durable=True)``): the active :class:`DurableRunContext` appends each
+        result as a ``verification``-kind :class:`JournalEvent`. When no durable
+        run is active this is a no-op, so the default (journal-off) path stays
+        zero-overhead.
+        """
+        get_ctx = getattr(self, "_get_durable_run_context", None)
+        if not callable(get_ctx):
+            return
+        try:
+            context = get_ctx()
+        except Exception:  # pragma: no cover - defensive
+            context = None
+        if context is None:
+            return
+        try:
+            context.record_verification(
+                self._verification_journal_payloads(results)
+            )
+        except Exception:  # pragma: no cover - journalling is best-effort
+            pass
 
     def get_available_tools(self) -> List[Any]:
         """
