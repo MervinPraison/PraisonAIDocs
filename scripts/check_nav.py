@@ -36,7 +36,13 @@ ALLOWLIST_EXACT = {
     "index",       # landing / redirect targets
     "home",
     "to-site",
+    "features/DOCS_PARITY",
+    "js/DOCS_PARITY",
+    "rust/DOCS_PARITY",
 }
+
+# Directories under docs/ that must never be scanned (not routable pages).
+SKIP_DIR_NAMES = {"node_modules"}
 
 
 def iter_page_refs(node):
@@ -63,6 +69,8 @@ def disk_pages() -> set[str]:
     pages: set[str] = set()
     for pattern in ("*.mdx", "*.md"):
         for path in DOCS.rglob(pattern):
+            if SKIP_DIR_NAMES.intersection(path.relative_to(DOCS).parts):
+                continue
             pages.add(path.relative_to(DOCS).with_suffix("").as_posix())
     return pages
 
