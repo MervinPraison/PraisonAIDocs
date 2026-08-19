@@ -5,7 +5,7 @@ description: "Consent-first automation suggestions and reusable blueprint templa
 icon: "wand-magic-sparkles"
 ---
 
-Automation Suggestions turn recurring requests into scheduled jobs — but only when you tap Accept.
+Automation Suggestions turn recurring requests into scheduled jobs — proposed explicitly, or offered automatically when the assistant notices the same intent recurring — but only ever scheduled when you tap Accept.
 
 ```mermaid
 graph LR
@@ -26,9 +26,52 @@ graph LR
     class Gone off
 ```
 
+Two paths feed one consent gate — a manual `propose()` call, or an automatic `observe()` that fires once a request recurs.
+
+```mermaid
+graph LR
+    subgraph "Two paths, one consent gate"
+        Manual[💬 Manual propose] --> S[💡 Suggestion]
+        Turns[🔁 Repeated turns] --> Observe[👀 observe]
+        Observe -->|threshold reached| S
+        S --> Accept[✓ Accept]
+        Accept --> Job[✅ Scheduled Job]
+    end
+
+    classDef in fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef proc fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Manual,Turns in
+    class Observe,S,Accept proc
+    class Job ok
+```
+
 ## Quick Start
 
 <Steps>
+<Step title="Let the assistant offer it (feed each turn)">
+Feed each completed turn's inferred blueprint + slots. After the same intent recurs a few times, the engine offers it — you still tap Accept.
+
+```python
+from praisonai.scheduler.suggestion_engine import SuggestionEngine
+
+engine = SuggestionEngine()
+
+# Called from your bot/gateway/CLI after each completed turn:
+sug_id = engine.observe(
+    "morning-brief",
+    slots={"hour": 8, "weekdays": "mon-fri"},
+    principal="telegram:12345",  # optional, isolates per user
+)
+
+if sug_id:
+    print(f"Offered automation as {sug_id} — waiting for user to accept.")
+```
+
+Nothing runs until the user taps `✓ Accept`. Below the threshold (default 3), `observe()` just counts and returns `None`.
+</Step>
+
 <Step title="See pending suggestions">
 Type `/automations` in chat. The bot lists each pending suggestion with its own Accept/Dismiss buttons.
 ```
@@ -77,10 +120,137 @@ sequenceDiagram
 |------|---------|--------------|
 | Accept an existing suggestion | `/automations` → `✓ Accept` | Materialises the suggested blueprint into one job and marks the suggestion accepted. |
 | Create directly from a template | `/blueprint <name> [slot=value ...]` | Resolves slots against blueprint defaults and schedules the job immediately. |
+| Auto-offered on recurrence | `engine.observe(...)` (called per turn by your bot/gateway) | Silently counts. Once the intent recurs `threshold` times inside `window_seconds`, calls `propose()` once, resets the counter, and surfaces the same 💡 Accept/Dismiss card. |
 
 <Note>
 Button taps travel through the shared callback contract: `sug:accept:<id>` accepts a suggestion, `sug:dismiss:<id>` dismisses it. The interactive registry decodes `sug:accept:<id>` as namespace `sug` with the remainder as the payload — a Telegram-side detail you never type by hand.
 </Note>
+
+---
+
+## Auto-generating suggestions with `observe()`
+
+`observe()` is the recurrence generator — a caller feeds every turn's inferred intent, and the engine offers an automation once it recurs.
+
+```mermaid
+sequenceDiagram
+    participant Bot as Bot / Gateway
+    participant Engine as SuggestionEngine
+    participant Store as SuggestionStore
+    participant Chat
+
+    Bot->>Engine: observe(...) — turn 1
+    Engine-->>Bot: None (below threshold)
+    Bot->>Engine: observe(...) — turn 2
+    Engine-->>Bot: None (below threshold)
+    Bot->>Engine: observe(...) — turn 3
+    Engine->>Engine: threshold met → reset counter
+    Engine->>Store: propose(...)
+    Store-->>Engine: suggestion id
+    Engine-->>Bot: sug_id
+    Bot->>Chat: 💡 offer with [✓ Accept] [✕ Dismiss]
+```
+
+Both entry points end in the same store and both require Accept — pick the one that matches who notices the recurrence.
+
+```mermaid
+graph TB
+    Q{Who notices the recurrence?} -->|Assistant, per-turn feed| OB[👀 observe]
+    Q -->|Your code already knows| PR[💬 propose]
+    OB --> S[💡 Suggestion store]
+    PR --> S
+    S --> AC[✓ Accept required]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef proc fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class OB,PR,S proc
+    class AC ok
+```
+
+Use `observe()` when the assistant should notice recurrence itself (per-turn feed from a bot/gateway). Use `propose()` when your code already knows an automation is worth offering (manual CLI, dashboard, explicit rule).
+
+`observe()` is deterministic, not ML — a per-intent trailing count keyed on `(principal, blueprint_name, frozen(slots))`. Two module-level constants set its defaults:
+
+| Constant | Type | Value | Purpose |
+|----------|------|-------|---------|
+| `DEFAULT_RECURRENCE_THRESHOLD` | `int` | `3` | Times the same intent must recur before it is auto-proposed. |
+| `DEFAULT_RECURRENCE_WINDOW_SEC` | `float` | `604800` (7 days) | Trailing window in which occurrences count; older observations are pruned. |
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `blueprint_name` | `str` | — (required) | Blueprint the recurring intent maps to. |
+| `slots` | `Optional[Dict[str, Any]]` | `None` | Slot values that identify the specific intent. Same blueprint + different slots = distinct intent. Nested lists/dicts/sets are supported (frozen internally). |
+| `deliver` | `str` | `""` | Suggested delivery target, forwarded to `propose()`. |
+| `reason` | `str` | `""` | Human-readable explanation. When omitted, a default `"Noticed a recurring '<blueprint>' request (Nx); offering to automate it."` is used. |
+| `principal` | `Optional[str]` | `None` | Owning end-user identity on a multi-user gateway. Counts are isolated per principal. |
+| `threshold` | `int` | `3` (`DEFAULT_RECURRENCE_THRESHOLD`) | Occurrences required before auto-proposing. |
+| `window_seconds` | `float` | 7 days (`DEFAULT_RECURRENCE_WINDOW_SEC`) | Trailing window in which occurrences count. |
+| `ttl_seconds` | `float` | 3 days (`DEFAULT_TTL_SEC` from `suggestion_store`) | TTL forwarded to `propose()`. |
+
+### Example
+
+```python
+from praisonai.scheduler.suggestion_engine import SuggestionEngine
+
+engine = SuggestionEngine()
+
+# Feed one observation per completed turn.
+# 1st and 2nd calls: returns None (below threshold=3).
+engine.observe("morning-brief", slots={"hour": 8}, principal="telegram:alice")
+engine.observe("morning-brief", slots={"hour": 8}, principal="telegram:alice")
+
+# 3rd call: threshold met — engine.propose() runs, store returns a suggestion id.
+sug_id = engine.observe(
+    "morning-brief",
+    slots={"hour": 8},
+    principal="telegram:alice",
+    reason="Alice asks for a morning brief around 8am every day.",
+)
+
+# Different slots for the same user = distinct intent. This is turn 1 of its own count.
+engine.observe("morning-brief", slots={"hour": 9}, principal="telegram:alice")
+
+# Different principal = fully separate count. Bob's first observation is turn 1.
+engine.observe("morning-brief", slots={"hour": 8}, principal="telegram:bob")
+```
+
+<Note>
+`observe()` returns the new suggestion ID **only** when this observation crossed the threshold **and** the store admitted the proposal. It returns `None` in three cases: still below threshold, the store's pending cap is full, or the store's dedup window already holds this identical intent.
+</Note>
+
+<Warning>
+Counters are per-`(principal, blueprint, slots)`, so one user's recurrence can never trigger another's suggestion. After a fire, the counter resets to empty and the store's dedup window guards the identical intent — Accept-once, Dismiss-forever still holds for auto-proposals.
+</Warning>
+
+### Tuning
+
+Adjust `threshold` and `window_seconds` to fit the workflow:
+
+```python
+# Fire immediately on the first observation — handy for testing.
+engine.observe("morning-brief", slots={"hour": 8}, threshold=1)
+
+# Wait for stronger evidence over a longer window (30 days).
+engine.observe(
+    "morning-brief",
+    slots={"hour": 8},
+    threshold=5,
+    window_seconds=3600 * 24 * 30,
+)
+
+# Nested slots are supported — the recurrence key is frozen recursively.
+engine.observe(
+    "morning-brief",
+    slots={"weekdays": ["mon", "tue"], "opts": {"tz": "UTC"}},
+)
+```
+
+Immediately after a fire, another observation with the same key is below-threshold again *and* the store dedups the identical intent, so there is no double-offer. `self._observations` is process-local best-effort memory — a restart merely resets counters; the durable state stays in the `SuggestionStore`.
 
 ---
 
@@ -158,6 +328,8 @@ Drive the same engine from the shell — full flags in [Schedule CLI](/docs/cli/
 | `praisonai schedule suggestion-dismiss <id>` | Dismiss a suggestion |
 | `praisonai schedule suggestion-propose <blueprint>` | Manually propose a blueprint as a suggestion |
 
+`observe()` is a Python-level generator called from your bot/gateway; there is no CLI entry point today. Use `praisonai schedule suggestion-propose <blueprint>` for a one-shot manual proposal.
+
 ---
 
 ## Python Usage
@@ -199,9 +371,17 @@ from praisonai.scheduler.suggestion_engine import SuggestionEngine
 
 engine = SuggestionEngine()
 
+# Primary generator: feed each completed turn's inferred intent.
 # Inside an agent turn on a bot gateway — no principal= needed.
 # The engine defaults it from SessionContext.unified_user_id.
-sug_id = engine.propose(
+sug_id = engine.observe(
+    "morning-brief",
+    slots={"hour": 8, "weekdays": "mon-fri"},
+    deliver="telegram",
+)
+
+# Fallback: propose directly when your code already knows to offer.
+engine.propose(
     "morning-brief",
     slots={"hour": 8, "weekdays": "mon-fri"},
     deliver="telegram",
@@ -261,6 +441,21 @@ Bot  → "📋 Create an automation from a template:
 User → /blueprint morning-brief hour=8 weekdays=mon-fri focus=tech
 Bot  → "✅ Automation scheduled from 'morning-brief'. Added job 'morning-brief' (schedule cron:0 8 * * mon,tue,wed,thu,fri)"
 ```
+
+**Flow D — Auto-offered after a recurring request:**
+
+```
+User → "Give me the morning brief"           (turn 1 → observe → below threshold)
+User → next day: "morning brief please"      (turn 2 → observe → below threshold)
+User → next day: "brief me on the morning"   (turn 3 → observe → threshold met → propose)
+Bot  → "💡 Noticed a recurring 'morning-brief' request (3x); offering to automate it."
+       morning-brief · hour=8
+       [✓ Accept]  [✕ Dismiss]
+User → taps ✓ Accept
+Bot  → "✅ Automation scheduled. Added job 'morning-brief' ..."
+```
+
+Mapping natural-language turns → `blueprint_name` + `slots` is the caller's job (bot/gateway), not something `observe()` infers by itself.
 
 **Flow C — Two users, one bot, no cross-talk (multi-tenant):**
 
@@ -381,6 +576,25 @@ The commands also degrade gracefully: if the scheduler extra isn't installed, th
 ## Best Practices
 
 <AccordionGroup>
+  <Accordion title="Wire observe() on your gateway to generate suggestions on their own">
+    Add one `engine.observe(...)` call per completed turn, passing the inferred blueprint + slots. That single line is what makes the assistant offer automations without a manual `propose()`. Thread `principal=` from `SessionContext.unified_user_id` so recurrence counts stay isolated per user.
+
+    ```python
+    from praisonai.scheduler.suggestion_engine import SuggestionEngine
+
+    engine = SuggestionEngine()
+
+    # After each completed turn:
+    engine.observe(
+        "morning-brief",
+        slots={"hour": 8, "weekdays": "mon-fri"},
+        principal="telegram:12345",
+    )
+    ```
+  </Accordion>
+  <Accordion title="Tune threshold and window_seconds to fit the workflow">
+    Use `threshold=1` for a fast signal that fires on the first observation (handy for testing). Use `threshold=5, window_seconds=3600 * 24 * 30` when you want stronger evidence over a 30-day window before offering. The recurrence counter is process-local in-memory state, so a restart resets it — only the `SuggestionStore` is durable.
+  </Accordion>
   <Accordion title="Isolate suggestions per user on multi-user gateways">
     For multi-user gateways, pass the resolved end-user identity as `principal=` when reading or mutating suggestions — one user's pending queue is then invisible and non-mutable to another's. See [Per-User Scheduler Isolation](/features/scheduler-multi-tenant) for the full multi-tenant model.
 
