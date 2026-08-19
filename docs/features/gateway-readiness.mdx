@@ -11,6 +11,73 @@ Use this checklist before starting a gateway or relying on a Slack/Telegram bot 
 ``praisonai gateway test --turn`` and ``praisonai gateway doctor --turn`` run an **offline** agent turn via ``BotSessionManager.chat``. They do **not** exercise Slack Bolt/socket handlers or @mention routing. A passing turn test does **not** guarantee live @mention delivery.
 </Warning>
 
+## Turn pre-flight
+
+Your bot's model credential is now checked at **startup** — not on the first user message. `praisonai gateway start` runs one real agent turn (prompt `"ping"`) before serving, so a missing, invalid, or out-of-quota model key fails at start with exit `1` instead of surfacing on the first inbound message.
+
+```yaml
+gateway:
+  preflight:
+    verify_turn: true            # default on
+    verify_turn_prompt: "ping"
+```
+
+```bash
+praisonai gateway start                     # runs the real-turn check
+praisonai gateway start --no-verify-turn    # skip for offline envs
+```
+
+This differs from the channel/tool probes below: those prove **wiring** (tokens resolve, tools load) but never exercise a model round-trip. The turn pre-flight sends a real prompt to the agent and waits for a reply.
+
+```mermaid
+sequenceDiagram
+    participant Operator
+    participant GatewayStart as gateway start
+    participant Preflight as verify_turn_preflight
+    participant Agent
+    participant LLM as Model provider
+
+    Operator->>GatewayStart: praisonai gateway start
+    GatewayStart->>Preflight: prompt="ping"
+    Preflight->>Agent: chat("ping")
+    Agent->>LLM: API call
+    alt Credential valid
+        LLM-->>Agent: reply
+        Agent-->>Preflight: text
+        Preflight-->>GatewayStart: (ok, "pong")
+        GatewayStart-->>Operator: Turn pre-flight OK — starting
+    else Missing / invalid key or timeout
+        LLM-->>Agent: 401 / 429 / timeout
+        Agent-->>Preflight: error
+        Preflight-->>GatewayStart: (False, detail)
+        GatewayStart-->>Operator: Fail — set model key or --no-verify-turn
+    end
+```
+
+The turn pre-flight is governed by its **own** toggle, independent of `--preflight` / `--no-preflight`. Running `--no-preflight --verify-turn` still exercises the model round-trip. It runs against the **first configured channel** by default.
+
+### YAML keys
+
+```yaml
+gateway:
+  preflight:
+    verify_turn: true              # default true — run one real agent turn at start
+    verify_turn_prompt: "ping"     # default "ping" — cheap, deterministic
+    verify_turn_timeout: 60        # default 60.0 seconds — bounds the round-trip
+```
+
+| Key | Type | Default | Purpose |
+|-----|------|---------|---------|
+| `verify_turn` | `bool` | `true` | Whether `gateway start` runs the real-turn pre-flight. |
+| `verify_turn_prompt` | `str` | `"ping"` | Prompt sent to the agent for the check. |
+| `verify_turn_timeout` | `float` | `60.0` | Bounds the agent round-trip (seconds) so a stalled provider fails fast. |
+
+<Note>
+The turn pre-flight uses the same per-agent `base_url` / `api_key` overrides as the live gateway, so a custom provider is tested against the same endpoint it will serve — not the default provider.
+</Note>
+
+---
+
 ## Five-tier diagnostics
 
 ```mermaid
@@ -128,6 +195,8 @@ If the turn test passes but Slack is silent, check for duplicate bots, stale ses
 | Deep status + DLQ hint | `praisonai gateway status --deep --config PATH` |
 | Pre-Slack shell smoke | `praisonai gateway test --config PATH --channel slack --turn "..."` |
 | Automated start gate | `praisonai gateway start --preflight` |
+| Automated start gate (turn) | `praisonai gateway start` (default on) |
+| Skip turn gate | `praisonai gateway start --no-verify-turn` |
 | Tool resolution start gate | `praisonai gateway start --strict-tools` |
 | After start | `praisonai gateway status` + log check |
 
@@ -412,9 +481,23 @@ from praisonai_bot.gateway.preflight import (
     resolve_env_token,              # (value) — handles ${VAR} and {source, id} secret refs
     apply_probe_ca_bundle,          # honours PRAISONAI_SSL_CA_BUNDLE precedence
     run_shell_readiness_check,      # (config_path) -> ShellReadinessResult(ok, message, issues)
-    run_turn_test,                  # (config_path, channel_name, prompt) -> (ok, message)
+    run_turn_test,                  # (config_path, channel_name, prompt, run_timeout=None) -> (ok, message)
     check_gateway_running,          # (config_path, timeout=5.0) -> (ok, message)
+    resolve_verify_turn,            # (config_path) -> (enabled: bool, prompt: str)
+    verify_turn_preflight,          # (config_path, channel_name=None, prompt="ping", run_timeout=None) -> (ok, detail)
+    VERIFY_TURN_TIMEOUT_DEFAULT,    # 60.0
 )
+```
+
+`resolve_verify_turn` and `verify_turn_preflight` are also re-exported from `praisonai_bot.cli.commands.gateway`. Gate CI on a successful real agent turn:
+
+```python
+import asyncio
+from praisonai_bot.gateway.preflight import verify_turn_preflight
+
+ok, detail = asyncio.run(verify_turn_preflight("bot.yaml", prompt="ping"))
+if not ok:
+    raise SystemExit(f"Agent turn pre-flight failed: {detail}")
 ```
 
 ### Tiered check helpers
