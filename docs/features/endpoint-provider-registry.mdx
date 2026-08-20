@@ -8,12 +8,18 @@ icon: "plug"
 ```python
 from praisonaiagents import Agent
 
-agent = Agent(name="registry-agent", instructions="Use the endpoint provider registry.")
-agent.start("List all registered LLM endpoint providers.")
+agent = Agent(
+    name="Endpoint Agent",
+    instructions="Invoke the acme endpoint provider and summarise the result."
+)
+
+agent.start("Call the acme-echo endpoint with {'x': 1}")
 ```
 
 
-Endpoint Provider Registry lets you plug custom server-side providers (recipe, agents-api, MCP, A2A, and your own) into `praisonai serve` — no fork required.
+Endpoint Provider Registry lets you plug custom server-side providers (recipe, agents-api, MCP, A2A, `openai-compat`, and your own) into PraisonAI via a **single** Python entry-point group — no fork required.
+
+Publish once under `praisonai.endpoint_providers`. One plugin is then visible to `get_provider()`, `praisonai endpoints types`, **and** `praisonai endpoints invoke --type`.
 
 ```bash
 export PRAISON_ENDPOINT_URL="http://localhost:8765"
@@ -26,24 +32,25 @@ from praisonai.endpoints.registry import get_provider
 provider = get_provider("mcp", base_url="http://localhost:8765")
 ```
 
-The user starts `praisonai serve` with a registered provider; HTTP traffic flows through discovery and the chosen endpoint adapter.
+A plugin published once under `praisonai.endpoint_providers` reaches both the provider registry and the CLI dispatch surface.
 
 ```mermaid
 graph LR
-    A[📦 Your pip package] --> B[🔌 Entry Point\npraisonai.endpoint_providers]
-    B --> C[📝 ProviderRegistry]
-    C --> D[🚀 praisonai serve / discovery]
+    A[📦 Your pip package] --> B[🔌 praisonai.endpoint_providers]
+    B --> C[📝 ProviderRegistry<br/>get_provider]
+    B --> D[⌨️ CLI dispatch<br/>endpoints invoke --type]
+    C --> E[✅ serve / discovery]
+    D --> E
 
     classDef package fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef entrypoint fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef registry fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef serve fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
 
     class A package
     class B entrypoint
-    class C registry
-    class D serve
-
+    class C,D registry
+    class E done
 ```
 
 ## Quick Start
@@ -116,43 +123,117 @@ The registry is thread-safe and loads plugins lazily. Built-ins are discovered o
 
 ---
 
-## CLI Endpoint Dispatch Registry
+## One Group, Two Readers
 
-PraisonAI ships **two** endpoint registries. This page documents the top-level **provider registry** (`praisonai.endpoint_providers`). A separate **CLI dispatch registry** resolves how the CLI invokes each endpoint type at runtime.
+There is **one** canonical entry-point group: `praisonai.endpoint_providers`. Two readers scan it — the top-level **provider registry** (instantiates `BaseProvider` classes for serve / discovery) and the **CLI dispatch registry** (resolves `endpoints invoke --type`). One plugin contract serves both surfaces; the CLI adapts your `BaseProvider` subclass into its internal dispatch shape.
 
-| Registry | Entry-point group | Purpose |
-|----------|-------------------|---------|
-| Provider registry (this page) | `praisonai.endpoint_providers` | Instantiate `BaseProvider` classes for serve / discovery |
-| CLI dispatch registry | `praisonai.endpoints.providers` | Map endpoint type → bound invoke method in the CLI |
+| Reader | Surface it powers |
+|--------|-------------------|
+| `praisonai.endpoints.registry.get_provider()` | `praisonai serve`, discovery |
+| CLI dispatch registry | `praisonai endpoints invoke --type`, `praisonai endpoints types` |
 
-### Built-in CLI Dispatch Keys
+### Built-in Dispatch Keys
 
-| Key | Invoke target | Notes |
-|-----|---------------|-------|
-| `recipe` | `_invoke_recipe` | Recipe runner endpoint |
-| `agents-api` | `_invoke_agents_api` | OpenAI Agents-API compatible |
-| `mcp` | `_invoke_mcp` | MCP server endpoint |
-| `tools-mcp` | `_invoke_mcp` | Alias of `mcp` |
-| `a2a` | `_invoke_a2a` | A2A protocol |
-| `a2u` | `_invoke_a2u` | A2U protocol |
+| Key | Provider | Notes |
+|-----|----------|-------|
+| `recipe` | Recipe runner | Default when `--type` is omitted |
+| `agents-api` | Agents API | OpenAI Agents-API compatible |
+| `mcp` | MCP server | MCP server endpoint |
+| `tools-mcp` | MCP tools-only | Tools exposed as MCP |
+| `a2a` | A2A protocol | Agent-to-agent |
+| `a2u` | A2U protocol | Agent-to-user |
+| `openai-compat` | OpenAI-compatible HTTP | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/tools/invoke` |
 
 ```mermaid
 sequenceDiagram
-    participant CLI as praisonai serve
-    participant Reg as EndpointProviderRegistry
-    participant Invoke as bound invoke method
+    participant CLI as endpoints invoke --type
+    participant Reg as CLI dispatch registry
+    participant Prov as BaseProvider subclass
     participant EP as Endpoint
 
-    CLI->>Reg: get(type="mcp")
-    Reg-->>CLI: invoke_mcp callable
-    CLI->>Invoke: invoke_mcp(endpoint, input, config)
-    Invoke->>EP: start / handle request
+    CLI->>Reg: resolve(type="mcp")
+    Reg-->>CLI: provider class
+    CLI->>Prov: invoke(name, input, config)
+    Prov->>EP: handle request
     EP-->>CLI: response
 ```
 
-<Info>
-If you're writing a pip plugin for **CLI dispatch**, use entry-point group `praisonai.endpoints.providers`. For the **top-level provider registry** (instantiating provider classes), use `praisonai.endpoint_providers`.
-</Info>
+<Warning>
+`praisonai.endpoints.providers` is a **deprecated alias**. It is still scanned, but importing a plugin published under it emits a `DeprecationWarning` naming the canonical group. On a name clash the canonical group wins. Publish new plugins under `praisonai.endpoint_providers`.
+</Warning>
+
+### Which Group Do I Publish Under?
+
+```mermaid
+graph TB
+    Q{Publishing an<br/>endpoint provider?} -->|New plugin| CANON[✅ praisonai.endpoint_providers]
+    Q -->|Existing plugin on the old group| MIG[⚠️ Still works,<br/>warns on import]
+    MIG --> CANON
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class MIG warn
+    class CANON ok
+```
+
+---
+
+## Migration From the Deprecated Group
+
+Rename the entry-point group in your `pyproject.toml`. The class and its methods are unchanged.
+
+<CodeGroup>
+```toml pyproject.toml (canonical)
+[project.entry-points."praisonai.endpoint_providers"]
+my-custom = "mypkg.endpoints:MyCustomProvider"
+```
+
+```toml pyproject.toml (deprecated — warns)
+[project.entry-points."praisonai.endpoints.providers"]
+my-custom = "mypkg.endpoints:MyCustomProvider"
+```
+</CodeGroup>
+
+**Constants** exported by `praisonai/endpoints/registry.py`:
+
+| Name | Value |
+|------|-------|
+| `ENTRY_POINT_GROUP` | `"praisonai.endpoint_providers"` |
+| `LEGACY_ENTRY_POINT_GROUPS` | `("praisonai.endpoints.providers",)` |
+
+---
+
+## Streaming
+
+Implement `invoke_stream` — **not** `invoke(stream=True)` — to support `--stream`. When `--stream` is passed the CLI adapter calls `provider.invoke_stream(name, input_data, config)`, which yields `{"event": ..., "data": ...}` frames. An `event == "error"` frame prints the error and returns exit code `3` (runtime error); other frames print as `[event] data` and it returns `0`.
+
+```python
+from typing import Any, Dict, Iterator, Optional
+from praisonai.endpoints.providers.base import BaseProvider, InvokeResult
+
+class MyStreamingProvider(BaseProvider):
+    def invoke(self, name, input_data=None, config=None, stream=False) -> InvokeResult:
+        return InvokeResult(ok=True, status="success", data={"echo": input_data})
+
+    def invoke_stream(
+        self,
+        name: str,
+        input_data: Optional[Dict[str, Any]] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        yield {"event": "start", "data": {"name": name}}
+        yield {"event": "token", "data": "hello"}
+        yield {"event": "done", "data": "[DONE]"}
+```
+
+```bash
+praisonai endpoints invoke chat_completions --type openai-compat \
+  --input-json '{"messages": [{"role": "user", "content": "Hi"}]}' \
+  --stream
+```
 
 ---
 
@@ -186,14 +267,15 @@ If you're writing a pip plugin for **CLI dispatch**, use entry-point group `prai
 | `tools-mcp` | `endpoints/providers/tools_mcp.py` | MCP tools-only endpoint |
 | `a2a` | `endpoints/providers/a2a.py` | A2A protocol endpoint |
 | `a2u` | `endpoints/providers/a2u.py` | A2U protocol endpoint |
+| `openai-compat` | `endpoints/providers/openai_compat.py` | OpenAI-compatible HTTP endpoint |
 
 ---
 
 ## Common Patterns
 
 <AccordionGroup>
-<Accordion title="Override a Built-in">
-Last-write-wins behavior lets you replace built-in providers:
+<Accordion title="Override a Built-in (runtime only)">
+The runtime `register_provider()` path is last-write-wins — it can replace a built-in in the current process:
 
 ```python
 from praisonai.endpoints.registry import register_provider
@@ -204,9 +286,13 @@ class MyRecipeProvider(BaseProvider):
         # Custom implementation
         pass
 
-# Override built-in recipe provider
+# Override built-in recipe provider at runtime
 register_provider("recipe", MyRecipeProvider)
 ```
+
+<Note>
+A **pip-installed plugin cannot** override a built-in. The CLI dispatch registry re-asserts its built-in loaders *after* entry-point discovery, so an entry point may add a new type but never replace a shipped one (`recipe`, `mcp`, `openai-compat`, …). This inverts the base `PluginRegistry` precedence, where entry points normally override built-ins. Only the runtime `register_provider()` call above overrides.
+</Note>
 </Accordion>
 
 <Accordion title="Multiple Aliases">
