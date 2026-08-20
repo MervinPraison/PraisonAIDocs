@@ -145,7 +145,7 @@ sequenceDiagram
 | Step | What happens |
 |---|---|
 | 1 | Agent calls tool via `_execute_tool_with_circuit_breaker` (sync) or `execute_tool_async` (async) |
-| 2 | On error — a returned error string **or a raised exception** — `_classify_error_type` tags it: `timeout`, `rate_limit`, `connection_error`, or `unknown`. On the async path the flattened error dict also carries an explicit `retryable` verdict |
+| 2 | On error — a returned error string **or a raised exception** — `_classify_error_type` tags it: `timeout`, `rate_limit`, `connection_error`, or `unknown`. On the async path the flattened error dict carries the framework's private `_praison_retryable` verdict, which the retry loop reads and then strips before returning — so it never reaches the model nor collides with a tool's own `retryable` field |
 | 3 | `_effective_tool_retry_policy` resolves the one active policy (per-tool > agent `ToolConfig` > translated `ExecutionConfig`) — both retry loops share it |
 | 4 | If `policy.should_retry(error_type, attempt)` is true, wait `policy.get_delay_ms(attempt)` ms and retry |
 | 5 | `HookEvent.ON_RETRY` fires before each retry with the new `OnRetryInput` fields |
@@ -205,11 +205,11 @@ Both paths share the same terminal rule for raised exceptions:
 | `ToolExecutionError(is_retryable=True)` | retried up to `max_attempts` |
 | Any other exception (e.g. `RuntimeError`, network error) | retried up to `max_attempts` |
 
-On the async path a raised exception is flattened into an error dict carrying a `retryable` verdict, then the retry loop honours it:
+On the async path a raised exception is flattened into an error dict carrying the private `_praison_retryable` verdict, then the retry loop honours it and strips it before returning:
 
 ```mermaid
 graph LR
-    Raise[Tool raises] --> Flatten[Flatten to error dict + retryable verdict]
+    Raise[Tool raises] --> Flatten["Flatten to error dict + <code>_praison_retryable</code> verdict (private, stripped on return)"]
     Flatten --> Decide{Retry?}
     Decide -->|retryable=true & attempts left| Backoff[Backoff]
     Backoff --> Raise
@@ -222,6 +222,57 @@ graph LR
     class Raise,Return err
     class Flatten,Decide,Backoff proc
 ```
+
+---
+
+## Your tool's own `retryable` field is safe
+
+Many HTTP-API wrappers return payloads shaped like `{"error": "...", "retryable": true}`. That field is the **tool's** payload and is preserved untouched on the surfaced result. The framework's own verdict lives on the private `_praison_retryable` key, which is stripped before the result reaches the model or the caller — the two never collide.
+
+To make a *returned* error retry, tag its error type via `RetryPolicy(retry_on=...)`. A word in the tool's payload is **not** how retry is controlled.
+
+```python
+from praisonaiagents import Agent, tool
+
+@tool
+def call_upstream(endpoint: str) -> dict:
+    """Return a payload that includes its own retryable field."""
+    return {"error": "upstream 503", "retryable": True}
+
+agent = Agent(name="api", tools=[call_upstream])
+
+result = agent.execute_tool("call_upstream", {"endpoint": "/status"})
+
+assert result.get("retryable") is True        # tool payload survives
+assert "_praison_retryable" not in result      # framework control key stripped
+```
+
+The same holds on the async path — the body still runs **exactly once**:
+
+```python
+import asyncio
+from praisonaiagents import Agent, tool
+
+@tool
+def call_upstream(endpoint: str) -> dict:
+    """Return a payload that includes its own retryable field."""
+    return {"error": "upstream 503", "retryable": True}
+
+agent = Agent(name="api", tools=[call_upstream])
+
+result = asyncio.run(agent.execute_tool_async("call_upstream", {"endpoint": "/status"}))
+
+assert result.get("retryable") is True
+assert "_praison_retryable" not in result
+```
+
+---
+
+## Returned error dicts run once
+
+A tool that **returns** an error dict has already reached its own decision — the body ran to completion. Re-running it would duplicate side effects (charge money, send a message, write a row) for a decision the tool already made. The sync outer loop therefore surfaces such a dict **exactly once**, regardless of what fields it contains.
+
+To make a returned error retry-eligible, register its error type via `RetryPolicy(retry_on={...})` — the inner loop honours that classification, and the outer loop will not double-drive it.
 
 ---
 
@@ -374,6 +425,7 @@ graph TB
 - `approval_denied`, `permission_denied`, `approval_error`, `circuit_open`, **`loop_blocked`**
 - Python exceptions: `ValueError`, `TypeError`, `AttributeError` from tool code
 - Raised `ValueError` / `TypeError` / `AttributeError` from tool code are terminal on both sync and async paths.
+- Argument-binding errors (missing/extra parameters resolved from the schema) are terminal — they never retry regardless of policy.
 
 <Tip>
 A `loop_blocked` result comes from [Loop Guard](/features/loop-guard). Bumping `max_attempts` cannot bypass it — configure the loop-guard thresholds instead.
