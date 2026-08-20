@@ -425,8 +425,67 @@ On the console backend, the prompt now offers **five** choices: `[o] once`, `[s]
 ## Configuration
 
 <Warning>
-The default `console` backend requires a sync call stack. If you decorate a tool with `@require_approval` and invoke it from an async agent (`achat`, `astart`, async tools, async callbacks), the call now raises `PermissionError`. Configure a non-console backend (HTTP, Slack, webhook) or drive the agent from sync code.
+The default `console` backend needs a sync call stack. Calling a sync `@require_approval` tool from an async context raises `PermissionError` **before** the backend is asked — see [Denial guarantees](#denial-guarantees) (guarantee 5). Configure a non-console backend or drive the agent from sync code.
 </Warning>
+
+### Denial guarantees
+
+When you gate a tool with `@require_approval`, PraisonAI guarantees the following. These are enforced by the test suite.
+
+```python
+from praisonaiagents import Agent, require_approval
+
+@require_approval(risk_level="critical")
+def wipe_database(target: str) -> str:
+    """Never runs unless a human says yes."""
+    return f"wiped {target}"
+
+agent = Agent(
+    name="Ops",
+    instructions="Only wipe when the operator approves.",
+    tools=[wipe_database],
+)
+# If the operator denies, PermissionError is raised and wipe_database's body
+# never runs. If the approval backend crashes, the same thing happens
+# (fail-closed). If the operator approves with modified_args={"target": "sandbox"},
+# the tool runs against 'sandbox' instead of the original argument.
+agent.start("Wipe prod")
+```
+
+| # | Guarantee | What it means for you |
+|---|-----------|-----------------------|
+| 1 | Denied means blocked | If the approver returns `approved=False`, the tool body never runs. Sync and async tools both raise `PermissionError: Execution of <tool> denied: <reason>`. |
+| 2 | Denials are never cached | Denying `write_file(path='/etc/passwd')` once does not silently deny the next identical call — the backend is asked again. Only *approvals* are cached (see [Argument-aware approval cache](#argument-aware-approval-cache)). |
+| 3 | Fail-closed on backend errors | If the approval backend raises, the call is denied with `PermissionError: Approval request failed for <tool>`. The tool body never runs on a broken backend. |
+| 4 | Approver rewrites are applied | If the approval callback returns `modified_args={"target": "sandbox"}`, the tool runs with the rewritten values — the callback can sanitise a dangerous call into a safe one. |
+| 5 | Sync tools refuse from async contexts | Calling a sync `@require_approval` tool from inside a running event loop raises `PermissionError` without asking the backend, because the default console prompt cannot do I/O on the loop. Use an async tool or a non-console backend. |
+
+```mermaid
+graph TB
+    Call[🔧 @require_approval tool call] --> Ctx{Sync tool<br/>in running loop?}
+    Ctx -->|yes| Refuse[⛔ PermissionError:<br/>Approval request failed]
+    Ctx -->|no| Ask[🛡️ Ask approval backend]
+    Ask -->|backend raises| Fail[⛔ PermissionError:<br/>Approval request failed]
+    Ask -->|approved=False| Deny[⛔ PermissionError:<br/>Execution of tool denied]
+    Ask -->|approved=True| Modified{modified_args?}
+    Modified -->|yes| RunMod[▶️ Run with rewritten args]
+    Modified -->|no| Run[▶️ Run with original args]
+    Deny -.->|next identical call| Ask
+
+    classDef call fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Call call
+    class Ctx,Ask,Modified gate
+    class Run,RunMod ok
+    class Refuse,Fail,Deny bad
+```
+
+The dotted arrow from `Deny` back to `Ask` is the "denials are not cached" guarantee — each denied call re-invokes the backend rather than reusing a cached decision.
+
+These behaviours are covered by `tests/unit/approval/test_approval_denial_blocks_execution.py` in the SDK — if you refactor the approval path, keep those tests green.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -755,7 +814,7 @@ The in-process approval registry is now agent-scoped too: an in-context approval
 
 | Error | Cause | Fix |
 |-------|--------|-----|
-| `PermissionError: Approval request failed for <tool>` | Async agent with console backend | Configure a non-console backend |
+| `PermissionError: Approval request failed for <tool>` | Async agent with console backend, or the backend raised (fail-closed) | Configure a non-console backend — see [Denial guarantees](#denial-guarantees) |
 | `RuntimeError: Tool '<tool>' requires approval but cannot use console I/O from async context.` | Same root cause, surfaced earlier | Same fix |
 | Tool I expected to be called was never tried by the model | Tool name is in the active deny set / preset and is pruned from the LLM's view | Either widen permissions (e.g. `approval="full"`) or change your `permissions` rules; check the agent's `_perm_deny` at runtime |
 
