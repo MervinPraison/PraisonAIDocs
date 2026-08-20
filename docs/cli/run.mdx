@@ -20,6 +20,10 @@ Single-word direct prompts that look like reserved commands or common typos now 
 `praisonai run` exits **`1`** whenever the agent fails to produce a result. Under `--output json` / `--output stream-json` the failure surfaces as `{"status": "failed", "code": "run_failed"}` with an actionable remediation. See [Exit Codes](#exit-codes) for the full table.
 </Info>
 
+<Info>
+`praisonai run` exits **`2`** when the run hits its `max_iter` / `max_steps` budget and wraps up with a partial-progress summary. Under `--output json` / `--output stream-json` this surfaces as `{"status": "truncated", "result": "<summary>"}`, so CI and scripts never mistake a truncated run for a completed one. See [Exit Codes](#exit-codes) and the [Truncated payload](#truncated-payload-output-json-output-stream-json) subsection.
+</Info>
+
 <Note>
 `praisonai run "..."` with no cloud key and no `--model` picks a reachable local model automatically. If Ollama (or any OpenAI-compatible local server) is running, you'll see a one-line stderr notice and the run continues:
 
@@ -393,29 +397,38 @@ praisonai run --output verbose "What is the capital of France?"
 graph LR
     subgraph "praisonai run outcome"
         Start[📝 Agent.start/run result] --> Check{🔍 non-empty?}
-        Check -->|Yes: real answer| Ok[✅ exit 0<br/>Run completed]
         Check -->|No: None or empty| Fail[❌ exit 1<br/>run_failed + remediation]
+        Check -->|Yes: real answer| Reason{🔍 last_stop_reason<br/>== "max_steps"?}
+        Reason -->|No| Ok[✅ exit 0<br/>Run completed]
+        Reason -->|Yes| Trunc[⚠️ exit 2<br/>status: "truncated"<br/>summary preserved]
     end
 
     classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef truncated fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef failure fill:#8B0000,stroke:#7C90A0,color:#fff
 
     class Start input
-    class Check gate
+    class Check,Reason gate
     class Ok success
+    class Trunc truncated
     class Fail failure
 ```
 
 | Exit | When | Emitted where |
 |------|------|---------------|
-| `0` | Agent returned a non-empty result | All modes |
-| `1` | Agent returned `None` or empty (swallowed LLM/auth error, guardrail block, tool failure, `max_iter` without completion) | All run modes (direct prompt, YAML file, `--agent`, `--attach`, `--profile`, `--profile-deep`) |
+| `0` | Agent returned a non-empty result **and** did not hit the step/iteration limit | All modes |
+| `1` | Agent returned `None` or empty (swallowed LLM/auth error, guardrail block, tool failure) | All run modes (direct prompt, YAML file, `--agent`, `--attach`, `--profile`, `--profile-deep`) |
 | `1` | No API key configured in CI mode | Direct prompt |
 | `1` | Worktree flag combined with `--attach`, `--agent`, `--command`, or `--profile` | Direct prompt |
 | `1` | Warm-runtime major-version mismatch on `--attach` | `--attach <id>` |
+| `2` | Run hit its `max_iter` / `max_steps` budget and returned a wrap-up summary (`agent.last_stop_reason == "max_steps"`) | Actions path (`_run_prompt`), `--agent` (custom-agent) path, `--profile` / `--profile-deep` (profiling report is still printed first) |
 | `2` | Single-word direct prompt collides with a reserved command / typo guard | Direct prompt |
+
+<Note>
+Exit `2` covers two independent cases: **truncation** (a new terminal outcome introduced by PR [#4100](https://github.com/MervinPraison/PraisonAI/pull/4100)) and the pre-existing **reserved-command guard**. They share the code but are unrelated — a truncated run always emits `status: "truncated"` under `--output json`, while the guard fails fast before any run.
+</Note>
 
 ### Failure payload (`--output json` / `--output stream-json`)
 
@@ -442,6 +455,28 @@ Re-run with --verbose to see the underlying error, or check credentials with: pr
 The failure contract applies to **every** run path — direct prompt, YAML file, `--agent`, `--attach`, `--profile`, and `--profile-deep`. Profiled runs still print the profiling report before exiting non-zero, so you keep the profile even on failure.
 </Note>
 
+### Truncated payload (`--output json` / `--output stream-json`)
+
+When a run hits its `max_iter` / `max_steps` budget, the CLI keeps the wrap-up summary but marks the run **truncated** and exits `2`:
+
+```json
+{"status": "truncated", "result": "…wrap-up summary text preserved verbatim…"}
+```
+
+In interactive (non-JSON) mode the CLI also prints a one-line stderr notice so a human knows the answer is partial:
+
+```
+Run hit the step/iteration limit; the answer above is a summary of partial progress, not a completed task. Re-run with a higher --max-iter/max_steps to finish.
+```
+
+JSON / stream-JSON consumers do **not** receive this stderr warning (the CLI checks `output.is_json_mode`) — the `status: "truncated"` field is the machine signal.
+
+<Note>
+**stream-json contract:** the terminal `run.result` event is emitted with `ok: false` (not `ok: true`), in lockstep with exit `2`. A stream-json consumer therefore never sees a contradictory success terminal event ahead of the `truncated` status. The classification runs `bridge.emit_run_result(result, ok=succeeded and not truncated)`, covered by the regression test `test_actions_stream_reports_truncated_run_not_ok`.
+</Note>
+
+See [Step Budget](/features/max-steps) for how `max_steps` truncation works, and [Agent Run Outcomes → CLI Mapping](/docs/features/agent-run-outcomes#cli-mapping-praisonai-run) for the SDK-to-CLI status mapping.
+
 ### CI usage
 
 Test the run in-process first — the CLI's exit-code contract mirrors this success test.
@@ -464,17 +499,32 @@ if ! praisonai run "Summarise yesterday's PRs"; then
   echo "Agent run failed"
   exit 1
 fi
-
-# Or branch on the JSON status
-result=$(praisonai run --output json "Summarise yesterday's PRs")
-status=$(echo "$result" | jq -r '.status')
-if [ "$status" = "failed" ]; then
-  echo "$result" | jq -r '.message'
-  exit 1
-fi
 ```
 
-See [Agent Run Outcomes → CLI Mapping](/docs/features/agent-run-outcomes#cli-mapping-praisonai-run) for how the SDK-level statuses collapse into this single exit signal.
+Branch on the JSON `status` to handle all three outcomes — `success`, `truncated`, and `failed`:
+
+```bash
+result=$(praisonai run --output json "Refactor the auth module and add tests")
+status=$(echo "$result" | jq -r '.status // "success"')
+case "$status" in
+  success)   echo "done" ;;
+  truncated) echo "hit the step limit; consider re-running with a higher --max-iter"; exit 2 ;;
+  failed)    echo "$result" | jq -r '.message'; exit 1 ;;
+esac
+```
+
+Or branch on the exit code directly:
+
+```bash
+praisonai run "…big task…"
+case $? in
+  0) echo "done" ;;
+  1) echo "run failed" ;;
+  2) echo "truncated — partial answer above" ;;
+esac
+```
+
+See [Step Budget](/features/max-steps) for the truncation contract, and [Agent Run Outcomes → CLI Mapping](/docs/features/agent-run-outcomes#cli-mapping-praisonai-run) for how the SDK-level statuses map to these exit signals.
 
 ---
 
