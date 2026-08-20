@@ -16,14 +16,19 @@ praisonai schedule [OPTIONS] COMMAND [ARGS]...
 
 | Command | Description |
 |---------|-------------|
-| `add` | Add a scheduled job |
+| `add` | Add a scheduled job (supports `--once` for auto-removal after one fire) |
 | `start` | Start scheduled agent execution |
 | `stop` | Stop scheduled job(s) |
-| `list` | List scheduled jobs |
+| `list` | List scheduled jobs (merges store-backed jobs and daemon schedulers) |
+| `runs` | Show past run history for a store-backed schedule |
+| `pause` | Pause a store-backed schedule (stops firing, keeps it) |
+| `resume` | Resume a paused store-backed schedule |
+| `update` | Update a store-backed schedule's cadence / message |
+| `remove` | Remove a store-backed schedule (run history is retained) |
 | `logs` | View scheduler logs |
 | `restart` | Restart a scheduled job |
-| `delete` | Delete a scheduled job |
-| `describe` | Show job details |
+| `delete` | Delete a scheduled job — now finds store jobs first, falls back to daemon |
+| `describe` | Show job details — now prefers store, falls back to daemon |
 | `stats` | Show scheduler statistics |
 | `blueprint` | Create a job from a blueprint template |
 | `blueprint-list` | List available blueprints |
@@ -58,6 +63,7 @@ praisonai schedule add "job-name" \
 | `--command-timeout` | | Max seconds the `--command` may run before it is killed (default `60`). |
 | `--model` | | Pin this job to a specific model (e.g. `openai/gpt-4o-mini`). Snapshotted so unattended runs stay stable and drift fails closed. |
 | `--pin / --no-pin` | | Default `--pin`. Enforce the model snapshot so drift fails closed (only takes effect once `--model` captures one). `--no-pin` follows whatever the default becomes. |
+| `--once` | | One-shot job: auto-remove after its single fire (maps to `delete_after_run`). Ideal for `at:` / `in ...` reminders so a spent job does not linger in listings. |
 | `--channel` | | [Legacy] Delivery platform: `telegram`, `discord`, `slack`, `whatsapp` |
 | `--channel-id` | | [Legacy] Target chat/channel ID |
 | `--session-id` | | Session ID to preserve conversation context |
@@ -237,9 +243,24 @@ praisonai schedule start
 
 ### List scheduled jobs
 
+`list` merges store-backed jobs (created with `schedule add`) and daemon schedulers in one view. Store jobs are tagged `[store]`.
+
 ```bash
 praisonai schedule list
 praisonai schedule list --json
+```
+
+Store jobs print as `[store] <name> (id: <id>) [enabled|paused] — <cadence> — last run: <ts>`:
+
+```text
+Store schedules (1):
+  [store] morning-brief (id: sch_a1b2c3) [enabled] — cron: 0 8 * * 1-5 — last run: 2026-03-01 08:00
+```
+
+`list --json` returns a single document splitting the two sources:
+
+```json
+{"store": [...], "daemon": [...]}
 ```
 
 ### View logs
@@ -258,8 +279,11 @@ praisonai schedule stop all
 
 ### Delete a job
 
+`delete` finds store jobs first (by id, then by name) and removes them; it falls back to the daemon PID handler for legacy jobs.
+
 ```bash
-praisonai schedule delete job-123 --yes
+praisonai schedule delete morning-brief --yes
+praisonai schedule delete sch_a1b2c3 --yes
 ```
 
 ### Skip the model turn when there are no new emails
@@ -308,8 +332,106 @@ praisonai schedule add "flex-brief" -s daily -m "summarise" --no-pin
 
 See [Scheduler Model Pin](/features/scheduler-model-pin) for the full feature page.
 
+## Managing store-backed schedules
+
+A store-backed schedule is a job authored by `schedule add`, persisted in `~/.praisonai/config.yaml`, and managed from the CLI without hand-editing YAML. `list`, `delete`, and `describe` are now unified across store and daemon jobs, and five subcommands manage the store surface end to end. The agent-callable equivalents live in [Schedule Tools](/tools/schedule-tools).
+
+```mermaid
+graph LR
+    Add[➕ add] --> List[📋 list]
+    List --> Pause[⏸️ pause]
+    Pause <--> Resume[▶️ resume]
+    Resume --> Update[✏️ update]
+    Update --> Remove[🗑️ remove]
+    List --> Runs[🔎 runs]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef inspect fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Add start
+    class List,Pause,Resume,Update step
+    class Runs inspect
+    class Remove done
+```
+
+### Which command should I use?
+
+Store subcommands and daemon subcommands overlap, so pick by how the job was created.
+
+```mermaid
+graph TD
+    Q{How was the job created?}
+    Q -->|"schedule add"| Store["Store-backed<br/>pause / resume / update / remove"]
+    Q -->|"schedule start"| Daemon["Daemon scheduler<br/>stop / restart / delete"]
+    Q -->|Not sure| Check["Run schedule list —<br/>store jobs are tagged [store]"]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef daemon fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class Store store
+    class Daemon daemon
+    class Check check
+```
+
+### Add a one-shot reminder
+
+```bash
+# One-shot reminder that auto-cleans after firing
+praisonai schedule add "standup-ping" \
+  --schedule "in 20 minutes" \
+  --message "Time for standup" \
+  --deliver telegram --once
+```
+
+### Pause and resume
+
+```bash
+# Pause and resume without losing state
+praisonai schedule pause morning-brief
+praisonai schedule resume morning-brief
+```
+
+### Update cadence or message
+
+```bash
+# Change cadence without remove + re-add
+praisonai schedule update morning-brief -s "cron:0 8 * * 1-5"
+
+# Change only the message
+praisonai schedule update morning-brief -m "Send the updated morning brief"
+```
+
+<Note>
+`update` clears `last_run_at` when the cadence changes so the new schedule runs fresh — this avoids the "updated one-shot never fires" trap.
+</Note>
+
+### Show past runs
+
+```bash
+# Show past runs (status, duration, delivered, error)
+praisonai schedule runs morning-brief --limit 10
+praisonai schedule runs morning-brief --json
+```
+
+### Remove a store-backed schedule
+
+```bash
+# Remove by id or name (id resolves first, so duplicate names are safe)
+praisonai schedule remove morning-brief --yes
+```
+
+<Note>
+`remove` retains run history — query it any time with `praisonai schedule runs <name|id>`.
+</Note>
+
 ## See Also
 
+- [Schedule Tools](/tools/schedule-tools) - Agent-callable equivalents: add, list, pause, resume, update, remove
 - [Scheduler Delivery](/features/scheduler-delivery) - Push scheduled results to Telegram/Discord/Slack/WhatsApp from Python, YAML, or CLI
 - [Automation Suggestions](/features/automation-suggestions) - Consent-first suggestions and blueprint templates
 - [Scheduler Model Pin](/features/scheduler-model-pin) - Pin scheduled jobs to a specific model
