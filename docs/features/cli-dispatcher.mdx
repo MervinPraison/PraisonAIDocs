@@ -172,7 +172,7 @@ sequenceDiagram
 |-----------|---------|---------------|
 | `main()` | Entry router | Applies 8 rules in order |
 | `_find_first_command()` | Positional finder | Skips flags **and their values** (value-aware), finds the first positional — so `--session abc123 agents.yaml` discovers `agents.yaml`, not `abc123` |
-| `_mistyped_command_suggestions()` | Typo guard | Returns close command matches for a lone non-prefix-related typo, or `[]` when any guard condition fails |
+| `_mistyped_command_suggestions()` | Typo guard | Returns close command matches for a lone typo that isn't an **extension** of a registered command (truncations like `deplo`→`deploy` are kept and suggested), or `[]` when any guard condition fails |
 | `_split_global_flags()` | Global-flag partitioner | Splits argv into `(global_flag_tokens, rest)` so global-only flags can be hoisted ahead of the synthesised `run` |
 | `_get_global_option_names()` / `_global_only_option_names()` | Root-callback introspection | Reads the **root Typer callback**'s options; the global-only set (root minus `run`) is what gets hoisted |
 | `_get_typer_commands()` | Auto-discovery | Cached command introspection |
@@ -197,12 +197,12 @@ sequenceDiagram
 | 2 | `--help` / `-h` | Typer help (auto-generated, lists every subcommand) |
 | 3 | No arguments | Typer interactive TUI |
 | 4 | First arg is a Typer command | Typer subcommand |
-| 5 | Lone positional that is a close, non-prefix-related match to a registered command | **Exit 2** — `No such command`, `Did you mean: …?`, plus a `praisonai run "<token>"` escape hatch |
+| 5 | Lone positional that is a close match to a registered command and is not an extension of a registered command | **Exit 2** — `No such command`, `Did you mean: …?`, plus a `praisonai run "<token>"` escape hatch |
 | 6 | Bare free-text prompt (all flags `run`-supported like `--model`, `--continue`, `--session`, `--output`, `--stream`) | **Typer `run`** (modern engine) |
 | 7 | Workflow YAML file, all flags `run`-supported | **Typer `run <file>`** (modern engine) |
 | 8 | Everything else (legacy-only flag) | Legacy — a one-line stderr notice fires when a legacy-only flag is what forced the fallback |
 
-Rule 5 fires when `_mistyped_command_suggestions(argv, first_cmd)` returns a non-empty list — a **lone** positional token, no whitespace or path separator, not ending in `.yaml`/`.yml`, no file of that name on disk, not itself a registered command, whose `difflib.get_close_matches(..., cutoff=0.8)` yields a registered command that is **not** prefix-related to the token. A token that starts with a command, or that a command starts with, is dropped — so `tests` (→ `test`) and `server` (→ `serve`) stay valid one-word prompts. Rule 6 fires when `_looks_like_bare_prompt(argv, first_cmd)` returns `True` — that is, when `first_cmd` is non-empty, doesn't end with `.yaml`/`.yml`, and **either** no dash-prefixed token appears anywhere in argv **or** every flag present is one that Typer `run` itself accepts (`--model`, `--continue`, `--session`, `--output`, `--stream`, …, derived at dispatch time by introspecting `run`'s Click parameters). Rule 7 fires when `_looks_like_yaml_run_target(argv, first_cmd)` returns `True` — the first positional ends in `.yaml`/`.yml` and every flag is `run`-supported — forwarding `praisonai agents.yaml …` as `run agents.yaml …` so the workflow runs inside the modern session/output/credential/permission envelope. A single genuinely legacy-only flag (`--auto`, `--serve`, `--n8n`, …) still forces legacy. The short-form `-s` (legacy `--save`) and `-f` (legacy `--file`) live in `_LEGACY_COLLIDING_SHORT_OPTS` and also stay on legacy, so an existing script is never silently reinterpreted. If `run`-option discovery fails, both predicates fall back to the original conservative any-flag→legacy rule.
+Rule 5 fires when `_mistyped_command_suggestions(argv, first_cmd)` returns a non-empty list — a **lone** positional token, no whitespace or path separator, not ending in `.yaml`/`.yml`, no file of that name on disk, not itself a registered command, whose `difflib.get_close_matches(..., cutoff=0.8)` yields a registered command that the token does **not extend**. A token that a command starts with (an **extension** like `tests` for `test`, `server` for `serve`) is dropped so it stays a valid one-word prompt. The **opposite** direction — a token that is a **truncation** of a command (`deplo` for `deploy`, `versio` for `version`) — is now kept and surfaced as a suggestion instead of being forwarded to (and billed by) the model. Rule 6 fires when `_looks_like_bare_prompt(argv, first_cmd)` returns `True` — that is, when `first_cmd` is non-empty, doesn't end with `.yaml`/`.yml`, and **either** no dash-prefixed token appears anywhere in argv **or** every flag present is one that Typer `run` itself accepts (`--model`, `--continue`, `--session`, `--output`, `--stream`, …, derived at dispatch time by introspecting `run`'s Click parameters). Rule 7 fires when `_looks_like_yaml_run_target(argv, first_cmd)` returns `True` — the first positional ends in `.yaml`/`.yml` and every flag is `run`-supported — forwarding `praisonai agents.yaml …` as `run agents.yaml …` so the workflow runs inside the modern session/output/credential/permission envelope. A single genuinely legacy-only flag (`--auto`, `--serve`, `--n8n`, …) still forces legacy. The short-form `-s` (legacy `--save`) and `-f` (legacy `--file`) live in `_LEGACY_COLLIDING_SHORT_OPTS` and also stay on legacy, so an existing script is never silently reinterpreted. If `run`-option discovery fails, both predicates fall back to the original conservative any-flag→legacy rule.
 
 ### Never-silent legacy fallback
 
@@ -229,10 +229,14 @@ $ echo $?
 2
 ```
 
-The guard is deliberately narrow — it fires **only** when a single positional token has no whitespace, no `/` or path separator, does not end in `.yaml`/`.yml`, names no file on disk, is not itself a command, and `difflib.get_close_matches(..., cutoff=0.8)` returns a registered command that is **not** prefix-related. Prefix-related matches are dropped, so legitimate one-word prompts still run.
+The guard is deliberately narrow — it fires **only** when a single positional token has no whitespace, no `/` or path separator, does not end in `.yaml`/`.yml`, names no file on disk, is not itself a command, and `difflib.get_close_matches(..., cutoff=0.8)` returns a registered command that the token does **not extend**. Extensions (`tests` for `test`, `server` for `serve`) are dropped so legitimate one-word prompts still run; truncations (`deplo`, `versio`) are kept and suggested.
 
-| You type | difflib ≥ 0.8 match | Prefix-related? | Outcome |
+| You type | difflib ≥ 0.8 match | Extends the command? | Outcome |
 |---|---|---|---|
+| `praisonai deplo` | `deploy` | no | **exit 2**, suggests `deploy` |
+| `praisonai versio` | `version` | no | **exit 2**, suggests `version` |
+| `praisonai serv` | `serve` | no | **exit 2**, suggests `serve` |
+| `praisonai tes` | `test` | no | **exit 2**, suggests `test` |
 | `praisonai deploi` | `deploy` | no | **exit 2**, suggests `deploy` |
 | `praisonai versoin` | `version` | no | **exit 2**, suggests `version` |
 | `praisonai cofig` | `config` | no | **exit 2**, suggests `config` |
@@ -313,8 +317,12 @@ praisonai --output-format json agents.yaml  # → --output-format json run agent
 | `praisonai --output-format json agents.yaml` | **Typer `run`** | hoisted → `--output-format json run agents.yaml` |
 | `praisonai "hi" -o json` | **Typer `run`** | `-o` is shared, never hoisted → `run "hi" -o json` |
 | `praisonai deploi` | **Exit 2** | `No such command 'deploi'. Did you mean: deploy?` |
-| `praisonai tests` | **Typer `run`** | prefix-related match dropped — a valid one-word prompt |
-| `praisonai server` | **Typer `run`** | prefix-related match dropped — a valid one-word prompt |
+| `praisonai deplo` | **Exit 2** | `No such command 'deplo'. Did you mean: deploy?` |
+| `praisonai versio` | **Exit 2** | `No such command 'versio'. Did you mean: version?` |
+| `praisonai serv` | **Exit 2** | `No such command 'serv'. Did you mean: serve?` |
+| `praisonai tes` | **Exit 2** | `No such command 'tes'. Did you mean: test?` |
+| `praisonai tests` | **Typer `run`** | extension of `test` — a valid one-word prompt |
+| `praisonai server` | **Typer `run`** | extension of `serve` — a valid one-word prompt |
 | `praisonai deploi the app` | **Typer `run`** | more than one positional → free text |
 | `praisonai agents.yaml --serve` | **Legacy** | unchanged — the legacy escape hatch still works |
 
@@ -390,12 +398,12 @@ There are now **two** guards, and they fire on different paths.
 
 | Guard | Where | Fires on | Behaviour |
 |---|---|---|---|
-| Mistyped-verb guard (new) | modern dispatcher, `praisonai/__main__.py` | a lone non-prefix-related close typo of a registered command, on **any** invocation | stderr `No such command` + `Did you mean` + `praisonai run "…"` hint, **exit 2** |
+| Mistyped-verb guard (new) | modern dispatcher, `praisonai/__main__.py` | a lone close typo of a registered command that isn't an extension of it, on **any** invocation | stderr `No such command` + `Did you mean` + `praisonai run "…"` hint, **exit 2** |
 | Reserved-verb guard (existing) | legacy path, `classify_unknown_command` in `praisonai/cli/legacy/dispatch/argparse_builder.py` | only once a legacy-only flag (`--auto`, `--serve`, `--n8n`, …) already forced legacy | stderr hint, exit 2 |
 
 ```mermaid
 graph TB
-    Bare[🔎 lone token, no flags] --> M{🛡 close typo of<br/>a command? non-prefix}
+    Bare[🔎 lone token, no flags] --> M{🛡 close typo of<br/>a command? not an extension}
     M -->|Yes| Guard[❌ No such command<br/>Did you mean … — exit 2]
     M -->|No| Run[🧰 Typer run<br/>prompt to model]
     Flagged[🔎 legacy invocation<br/>legacy-only flag] --> G{🛡 Reserved verb<br/>or close typo?}
@@ -420,7 +428,9 @@ graph TB
 | `praisonai show` (bare) | ❌ | routes to Typer `run` as the prompt `show` — no ≥ 0.8 command match |
 | `praisonai memoyr` (bare) | ✅ | modern guard fires: `No such command 'memoyr'. Did you mean: memory?`, exit 2 |
 | `praisonai deploi` (bare) | ✅ | modern guard fires: `Did you mean: deploy?`, exit 2 |
-| `praisonai tests` (bare) | ❌ | prefix-related match dropped — routes to `run` as the prompt `tests` |
+| `praisonai deplo` (bare) | ✅ | modern guard fires: `Did you mean: deploy?`, exit 2 |
+| `praisonai serv` (bare) | ✅ | modern guard fires: `Did you mean: serve?`, exit 2 |
+| `praisonai tests` (bare) | ❌ | extension of `test` — routes to `run` as the prompt `tests` |
 | `praisonai show --auto` | ✅ | legacy-only flag forces legacy; reserved-verb guard runs, stderr hint, exit 2 |
 
 <Warning>
@@ -441,11 +451,11 @@ To add a new subcommand, simply register it in `praisonai/cli/app.py` using `app
 </Accordion>
 
 <Accordion title="Two ways to type it, one engine underneath">
-`praisonai "build a weather agent"` and `praisonai run "build a weather agent"` reach the same modern engine. Bare prompts — single word or multi word, quoted or unquoted — route to Typer `run` and inherit session continuity, `--output` modes, the credential gate, and permissions/checkpoints. A single word like `hello` or a reserved verb like `show` is sent to the model as a literal prompt, not blocked — neither is a close command match. The one exception is a close, non-prefix typo of a real command (`deploi`, `memoyr`): the mistyped-verb guard blocks it with exit 2 and suggests the command.
+`praisonai "build a weather agent"` and `praisonai run "build a weather agent"` reach the same modern engine. Bare prompts — single word or multi word, quoted or unquoted — route to Typer `run` and inherit session continuity, `--output` modes, the credential gate, and permissions/checkpoints. A single word like `hello` or a reserved verb like `show` is sent to the model as a literal prompt, not blocked — neither is a close command match. The one exception is a close typo of a real command that isn't an extension of it (`deploi`, `memoyr`, `deplo`, `versio`): the mistyped-verb guard blocks it with exit 2 and suggests the command.
 </Accordion>
 
 <Accordion title="My one-word prompt got blocked">
-Only close, non-prefix typos of a real command are blocked. If you meant a literal prompt, use `praisonai run "<word>"` — the error message already prints that escape hatch — or add more words so it's no longer a lone token. `hello` and `show` are never blocked (no ≥ 0.8 command match), and `tests` / `server` stay valid prompts because they're prefix-related to `test` / `serve`.
+Only close typos of a real command that aren't extensions of it are blocked. If you meant a literal prompt, use `praisonai run "<word>"` — the error message already prints that escape hatch — or add more words so it's no longer a lone token. `hello` and `show` are never blocked (no ≥ 0.8 command match), and `tests` / `server` stay valid prompts because they **extend** `test` / `serve` (contain the command as a prefix). Truncations of a command (`deplo`, `versio`) do the opposite and are caught with a suggestion.
 </Accordion>
 
 <Accordion title="How to force the legacy path">
