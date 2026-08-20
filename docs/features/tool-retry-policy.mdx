@@ -146,7 +146,7 @@ sequenceDiagram
 |---|---|
 | 1 | Agent calls tool via `_execute_tool_with_circuit_breaker` (sync) or `execute_tool_async` (async) |
 | 2 | On error, `_classify_error_type` tags it: `timeout`, `rate_limit`, `connection_error`, or `unknown` |
-| 3 | `_get_tool_retry_policy` resolves the active policy (tool > agent > default) |
+| 3 | `_effective_tool_retry_policy` resolves the one active policy (per-tool > agent `ToolConfig` > translated `ExecutionConfig`) — both retry loops share it |
 | 4 | If `policy.should_retry(error_type, attempt)` is true, wait `policy.get_delay_ms(attempt)` ms and retry |
 | 5 | `HookEvent.ON_RETRY` fires before each retry with the new `OnRetryInput` fields |
 
@@ -160,24 +160,71 @@ raise Exception("HTTP 429: Too Many Requests")
 
 ---
 
+## RetryPolicy is the single budget
+
+The effective `RetryPolicy` is the **one budget** for tool-body runs. `RetryPolicy.max_attempts` genuinely caps how many times a tool runs, and the `ExecutionConfig` spelling (`max_retry_limit` / `retry_*`) is translated into that same policy in one place.
+
+```python
+from praisonaiagents import Agent, tool
+from praisonaiagents.config.feature_configs import ToolConfig
+from praisonaiagents.tools import RetryPolicy
+
+@tool
+def charge_card(amount: int) -> str:
+    """Charge a payment — must run at most once."""
+    return f"Charged {amount}"
+
+# Run a non-idempotent tool exactly once — no duplicate charges
+agent = Agent(
+    name="billing",
+    tools=[charge_card],
+    tool_config=ToolConfig(retry_policy=RetryPolicy(max_attempts=1)),
+)
+agent.start("Charge the customer $50")
+```
+
+<Warning>
+Set `RetryPolicy(max_attempts=1)` for **non-idempotent** tools — a payment, an email, a `POST`. This now runs the tool **exactly once**, preventing duplicate side effects.
+</Warning>
+
+<Note>
+`ExecutionConfig.retry_*` and `ToolConfig(retry_policy=...)` are **two spellings of one budget**, not two separate loops. See [Tool Retry & Backoff](/features/tool-retry-backoff) and [ExecutionConfig](/configuration/execution-config) for the `ExecutionConfig` spelling.
+</Note>
+
+How many times a failing tool body actually runs:
+
+| Configuration | Tool-body runs |
+|---|---|
+| `ExecutionConfig(max_retry_limit=0)` | 1× |
+| `ExecutionConfig(max_retry_limit=2)` | 3× |
+| `ToolConfig(retry_policy=RetryPolicy(max_attempts=1))` | 1× |
+| `ToolConfig(retry_policy=RetryPolicy(max_attempts=2))` | 2× |
+
+---
+
 ## Precedence Ladder
 
 ```mermaid
 graph TB
     A["🔧 @tool(retry_policy=RetryPolicy(...))"] -->|Overrides| B["🤖 Agent(tool_config=ToolConfig(retry_policy=...))"]
     AN["🔧 @tool(retry_policy=None)"] -->|"None → falls through"| B
-    B -->|Overrides| C["📋 Default RetryPolicy()"]
+    B -->|Overrides| C["⚙️ ExecutionConfig(max_retry_limit, retry_*)<br/>translated → RetryPolicy"]
+    C -->|Defaults to| D["📋 RetryPolicy(max_attempts=3)"]
     
     classDef highest fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef none fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef agent fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef exec fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef default fill:#10B981,stroke:#7C90A0,color:#fff
     
     class A highest
     class AN none
     class B agent
-    class C default
+    class C exec
+    class D default
 ```
+
+When no `retry_policy` is set, the fallback is the policy **translated from `ExecutionConfig`** (`max_retry_limit` / `retry_*`), which defaults to `RetryPolicy(max_attempts=3)` when `ExecutionConfig` is untouched. Users who never set `retry_policy=` see **no behaviour change** — the translated policy reproduces `max_retry_limit + 1` attempts and the same backoff.
 
 `retry_policy=None` on `@tool(...)` means **use the fallback** — the tool-level slot is treated as empty, not as "no retries". To disable retries for a specific tool, pass an explicit `RetryPolicy(max_attempts=1)` instead.
 
@@ -213,10 +260,13 @@ from praisonaiagents.tools import RetryPolicy
 agent = Agent(tool_config=ToolConfig(retry_policy=RetryPolicy(max_attempts=3)))
 ```
 
-**Default (lowest priority):**
+**Translated `ExecutionConfig` fallback (lowest priority):**
 ```python
-# Uses RetryPolicy() defaults when no policy specified
-agent = Agent(tools=[tool])
+from praisonaiagents import Agent, ExecutionConfig
+
+# max_retry_limit / retry_* are translated into the effective RetryPolicy.
+# Untouched ExecutionConfig → RetryPolicy(max_attempts=3).
+agent = Agent(tools=[tool], execution=ExecutionConfig(max_retry_limit=4))
 ```
 
 ---
