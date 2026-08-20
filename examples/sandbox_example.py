@@ -28,7 +28,7 @@ standard_sandbox = SandboxConfig(
 )
 
 # Docker sandbox for full isolation
-docker_sandbox = SandboxConfig.docker(image="python:3.11-slim")
+docker_sandbox = SandboxConfig.docker(image="python:3.12-slim")
 
 # Custom sandbox configuration
 custom_sandbox = SandboxConfig(
