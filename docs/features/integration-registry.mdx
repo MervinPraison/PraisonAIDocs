@@ -14,6 +14,8 @@ agent.start("List all registered integrations and their status.")
 
 The user installs a third-party package; entry points register CLI and agent backends in one registry.
 
+Third-party discovery via the `praisonai.integrations` entry-point group is fully supported from [PraisonAI PR #4154](https://github.com/MervinPraison/PraisonAI/pull/4154) (2026-08-20) onwards; on earlier releases the group was silently ignored and only runtime registration (below) worked.
+
 Integration Registry enables third-party developers to add custom CLI tools, managed agents, and agent backends to PraisonAI through a centralized plugin system.
 
 ```mermaid
@@ -33,6 +35,26 @@ graph LR
     class D import
 
 ```
+
+## Choose Your Registration Path
+
+Pick a registration path based on how the integration ships.
+
+```mermaid
+graph TB
+    Start[Need a new integration?] --> Q1{Ships with PraisonAI?}
+    Q1 -->|Yes| Builtin[Use built-in name<br/>e.g. ClaudeCodeIntegration]
+    Q1 -->|No| Q2{Distributed via pip?}
+    Q2 -->|Yes| Plugin[Add entry point<br/>praisonai.integrations]
+    Q2 -->|No, same process| Runtime[register_lazy at startup]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+    class Start,Q1,Q2 q
+    class Builtin,Plugin,Runtime done
+```
+
+---
 
 ## Quick Start
 
@@ -63,21 +85,28 @@ from praisonai.integrations import MyIntegration
 
 <Step title="Distribute as a pip plugin">
 ```toml
-# pyproject.toml of your third-party package
+# your-plugin/pyproject.toml
 [project.entry-points."praisonai.integrations"]
-MyIntegration = "my_pkg.integration:MyIntegration"
-```
-
-```bash
-pip install my-praisonai-integration
+acme = "acme_praison:AcmeIntegration"
 ```
 
 ```python
-# Now this works in any praisonai-using project:
-from praisonai.integrations import MyIntegration
+# after `pip install your-plugin` — no praisonai code changes needed
+from praisonai.integrations import acme
+integration = acme(workspace="/path/to/project")
 ```
+
+The left-hand side (`acme`) is the name users import; the right-hand side is the dotted path to the class. Names collide case-insensitively with built-ins, and built-ins always win.
 </Step>
 </Steps>
+
+<Warning>
+On PraisonAI releases prior to PR #4154 (merged 2026-08-20), entry-point-based
+plugins were discovered and then silently discarded — `from praisonai.integrations
+import my_plugin` raised `AttributeError` even when the plugin was correctly
+installed. If entry-point discovery seems to do nothing, upgrade to a release
+that includes PR #4154. Runtime `register_lazy(...)` registration always worked.
+</Warning>
 
 ---
 
@@ -98,12 +127,22 @@ sequenceDiagram
     Mod-->>User: MyIntegration
 ```
 
-Before PR #1763, `praisonai/integrations/__init__.py` had a 70-line `if/elif` ladder in `__getattr__` that mapped attribute names to lazy imports. After #1763, the ladder is replaced by a 4-line dispatch backed by `INTEGRATIONS_REGISTRY`. The registry:
+- Third-party plugins in the `praisonai.integrations` entry-point group are discovered once, lazily, the first time anything imports from `praisonai.integrations`.
+- Discovery only stores each plugin's loader; no third-party code runs until you actually import that name.
+- Built-in integrations are registered after discovery and take precedence on name collisions — you cannot silently override a built-in by shipping a plugin with the same name.
+- `from praisonai.integrations import <name>` raises `AttributeError` for unknown names (native Python behaviour); `.resolve("<name>")` on the registry raises `ValueError`.
 
-- Subclasses the generic `PluginRegistry[T]` from `praisonai._registry`
-- Loads built-in integrations lazily (CLI tools, managed agents, sandboxed agents, hosted/local agent backends, registry helpers)
-- Supports third-party integrations via the new entry-point group `praisonai.integrations` — distribute a pip package, no code changes to praisonai
-- Exposes a `get_by_attr(module_name, attr_name)` helper that raises `AttributeError` (not `ValueError`) so the dispatch slots into module-level `__getattr__`
+### Precedence
+
+Registration sources resolve in a fixed order when names collide.
+
+| Source | When registered | On name collision |
+|---|---|---|
+| Third-party entry-point plugin | On first registry access | Overridden by built-in |
+| Built-in integration | Right after entry-point discovery | Wins over plugin |
+| `register_lazy(...)` at runtime | Whenever the caller invokes it | Last write wins |
+
+Built-ins can never be silently shadowed by a same-named plugin; a plugin with a colliding name is discovered but overwritten immediately.
 
 ---
 
@@ -114,7 +153,7 @@ Before PR #1763, `praisonai/integrations/__init__.py` had a 70-line `if/elif` la
 | `get_integrations_registry()` | → `IntegrationRegistry` | Return the process-default registry, building it lazily on first call (thread-safe) |
 | `INTEGRATIONS_REGISTRY.register_lazy(name, loader, *, aliases=None)` | `name: str`, `loader: () -> Any`, `aliases: list[str] \| None` | Register a lazily-loaded integration |
 | `INTEGRATIONS_REGISTRY.resolve(name)` | `name: str` → `Any` | Materialize an integration; `ValueError` if unknown |
-| `INTEGRATIONS_REGISTRY.get_by_attr(module, attr)` | `module: str`, `attr: str` → `Any` | Same as `resolve` but raises `AttributeError` (for use inside `__getattr__`) |
+| `get_by_attr(module, attr)` | `module: str`, `attr: str` → `Any` | Same as `resolve` but raises `AttributeError`; used by `praisonai.integrations.__getattr__` so `from praisonai.integrations import <name>` gets the right error type on typos |
 
 <Note>
 `INTEGRATIONS_REGISTRY` remains available as a module-level name for backward compatibility — the first access triggers construction. Use `get_integrations_registry()` in new code to make the lazy build explicit. Underscore-prefixed submodule names (for example `from praisonai.integrations import _unified_registry`) now import normally instead of triggering registry construction.
@@ -266,6 +305,14 @@ from praisonai.integrations import ClaudeCodeIntegration
 # ❌ Bad - internal import path
 from praisonai.integrations.claude_code import ClaudeCodeIntegration
 ```
+</Accordion>
+
+<Accordion title="Never Reuse a Built-in Name">
+Built-ins always win on name collisions. If you ship a plugin under an
+existing built-in name, users will silently get the built-in — pick a name
+unique to your package. Names are compared case-insensitively, so
+`ClaudeCodeIntegration`, `claudecodeintegration`, and `CLAUDECODEINTEGRATION`
+are the same key.
 </Accordion>
 </AccordionGroup>
 
