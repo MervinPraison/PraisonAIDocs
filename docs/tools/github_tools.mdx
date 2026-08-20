@@ -50,7 +50,7 @@ graph LR
 ```
 
 <Note>
-**Prerequisites:** **git** installed with the working directory inside a repository (`github_create_branch`, `github_commit_and_push`); **`origin` remote** configured for push; **`gh` CLI** installed and authenticated via `gh auth login` (`github_create_pull_request`).
+**Prerequisites:** **git** installed with the working directory inside a repository (`github_create_branch`, `github_commit_and_push`); **`origin` remote** configured for push; **`gh` CLI** installed and authenticated via `gh auth login` (`github_create_pull_request`). `user.email` should match the identity you expect to author commits — the foreign-author guard reads `git config user.email`.
 </Note>
 
 ## Quick Start
@@ -95,6 +95,11 @@ sequenceDiagram
     Agent-->>User: Result
 ```
 
+You don't have to think about branch safety — the tool quietly does the right thing.
+
+> **User:** "Commit and push what I have."
+> **Agent:** *(tool auto-creates `praisonai/fix-login-a1b2c3`, pushes there, and reports the branch name back)*
+
 ## Tools
 
 ### `github_create_branch(branch_name: str) -> str`
@@ -107,15 +112,65 @@ Creates and checks out a new branch (`git checkout -B`).
 
 Returns a success message or an error string.
 
-### `github_commit_and_push(commit_message: str) -> str`
+### `github_commit_and_push(commit_message, branch=None, allow_unsafe_branch=False) -> str`
 
-Stages all changes, commits, and pushes to `origin` on the current branch.
+Stages all changes, commits, and pushes to `origin` — with branch-safety guardrails that refuse unsafe pushes and never force-push.
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `commit_message` | `str` | Commit message |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `commit_message` | `str` | — | Commit message |
+| `branch` | `Optional[str]` | `None` | Target branch. Defaults to the current branch. |
+| `allow_unsafe_branch` | `bool` | `False` | Opt-in override for default-branch and foreign-author refusals. Divergence is never overridable. |
 
 Returns a success message, `"No changes to commit."`, or an error string.
+
+#### Branch-safety rules
+
+The tool checks these rules before committing, so a refusal leaves your changes intact.
+
+1. **Agent branches are always allowed.** Any branch whose name starts with `praisonai/` skips the default and foreign-author checks.
+2. **The default branch is never pushed directly.** On `main` (or when `branch="main"`), the tool creates a fresh `praisonai/{slug}-{6hex}` branch from HEAD and pushes there instead.
+3. **Foreign commits are refused.** If the target branch carries commits authored by someone other than your `git config user.email`, the push stops.
+4. **Divergence is refused, never forced.** If the remote branch is not an ancestor of HEAD, the push stops — this is never overridable.
+5. **Override with care.** `allow_unsafe_branch=True` (or env `PRAISONAI_GIT_ALLOW_UNSAFE_BRANCH=true`) bypasses rules 2 and 3, but never rule 4.
+
+```python
+from praisonaiagents.tools import github_commit_and_push
+
+# On main: direct push refused, tool creates and pushes an agent branch.
+github_commit_and_push("docs: clarify setup steps")
+# -> "Successfully committed and pushed changes to new agent branch
+#     'praisonai/docs-clarify-setup-steps-a1b2c3' (refused direct push
+#     to default branch 'main')"
+```
+
+```mermaid
+graph TB
+    Start[github_commit_and_push] --> HasChanges{Changes?}
+    HasChanges -->|No| Noop[Return: No changes to commit]
+    HasChanges -->|Yes| IsDefault{Target = default branch?}
+    IsDefault -->|Yes| AutoBranch[Auto-create praisonai/slug-hex]
+    IsDefault -->|No| IsAgent{Starts with praisonai/?}
+    AutoBranch --> DivCheck
+    IsAgent -->|Yes| DivCheck{Remote diverged?}
+    IsAgent -->|No| ForeignCheck{Foreign authors on branch?}
+    ForeignCheck -->|Yes| Refuse1[Refuse - unless allow_unsafe_branch=True]
+    ForeignCheck -->|No| DivCheck
+    DivCheck -->|Yes| Refuse2[Refuse - never overridable]
+    DivCheck -->|No| Push[Commit and push]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef action fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef refuse fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class HasChanges,IsDefault,IsAgent,ForeignCheck,DivCheck check
+    class AutoBranch action
+    class Refuse1,Refuse2,Noop refuse
+    class Push ok
+```
 
 ### `github_create_pull_request(title, body, head_branch, base_branch="main") -> str`
 
@@ -143,16 +198,40 @@ Returns a success message with the PR URL, or an error if `gh` is missing or una
 ## Common patterns
 
 <Tabs>
+<Tab title="Auto-branch (safest)">
+```python
+from praisonaiagents.tools import github_commit_and_push
+
+# Agent is on main; direct push refused, tool creates praisonai/<slug>-<hex>.
+github_commit_and_push("docs: clarify setup steps")
+# -> "Successfully committed and pushed changes to new agent branch
+#     'praisonai/docs-clarify-setup-steps-a1b2c3' (refused direct push
+#     to default branch 'main')"
+
+# Explicit target — same auto-branch behaviour if it is the default.
+github_commit_and_push("fix parser", branch="main")
+
+# Opt in to push a non-default, non-agent branch you own.
+github_commit_and_push(
+    "release notes",
+    branch="release/v2",
+    allow_unsafe_branch=True,
+)
+```
+</Tab>
+
 <Tab title="Full PR flow">
 ```python
-github_create_branch("feature/docs-update")
+github_create_branch("praisonai/docs-update")
 github_commit_and_push("docs: update README")
 github_create_pull_request(
     title="Update README",
     body="Clarifies setup steps.",
-    head_branch="feature/docs-update",
+    head_branch="praisonai/docs-update",
 )
 ```
+
+Any branch name starting with `praisonai/` skips the default and foreign-author refusals.
 </Tab>
 
 <Tab title="Non-main base">
@@ -186,7 +265,15 @@ Run `gh auth login` before agents call `github_create_pull_request`. The tool ch
 </Accordion>
 
 <Accordion title="Keep commits scoped">
-`github_commit_and_push` stages **all** changes (`git add .`). Review the working tree before the agent commits.
+`github_commit_and_push` stages **all** changes (`git add .`), so review the working tree for a tidy commit. An over-broad `git add .` no longer risks an over-broad push to `main` — the tool refuses unsafe pushes before committing.
+</Accordion>
+
+<Accordion title="Prefer the auto-branch flow">
+Leaving `branch=None` while on the default branch is the safest, one-line way to ship a change. The tool picks a `praisonai/…` name, pushes there, and reports the name in its return string.
+</Accordion>
+
+<Accordion title="When to set allow_unsafe_branch">
+Only for a branch you own (e.g. `release/v2`) that carries commits by someone other than the current committer — never for the default branch as a habit. Set env `PRAISONAI_GIT_ALLOW_UNSAFE_BRANCH=true` for CI. Divergence (force-push) is never allowed regardless.
 </Accordion>
 
 <Accordion title="Write descriptive PR bodies">
