@@ -43,21 +43,44 @@ HERE = "this machine"
 # a place that never executes.
 _ALIASES = {"native": "sandlock", "local": "subprocess"}
 
+# ...but only for the SANDBOX registry. "local" resolves to two different
+# backends depending on which parameter carried it:
+#   run_in="local"        -> SandboxManager collapses it to subprocess:
+#                            scrubbed environment, blocked commands and paths
+#   tools_run_on="local"  -> the wrapper's LocalCompute: a plain shell in the
+#                            current directory, full environment inherited,
+#                            no security policy at all
+# Describing the second in the first's words overstates it, which is the exact
+# failure this module exists to prevent. One word, two backends -- so the
+# phrase has to depend on where the word came from.
+_COMPUTE_ONLY_WORDS = {"local": "a plain shell on this machine (no policy applied)"}
+
 # Tiers that separate a process but do NOT contain it. Verified: under the
 # subprocess backend, outbound network still works and ~/.ssh is readable even
 # though SecurityPolicy declares them blocked.
 _NOT_A_BOUNDARY = {"subprocess", "local", "native"}
 
 
-def say_place(name: Any) -> str:
-    """Turn a provider name into a phrase a non-developer can read."""
+def say_place(name: Any, *, via: str = "sandbox") -> str:
+    """Turn a place name into a phrase a non-developer can read.
+
+    ``via`` says which registry resolved the name -- ``"compute"`` for
+    ``tools_run_on=``, ``"sandbox"`` for ``run_in=``. It only matters for names
+    that mean different backends in each (see ``_COMPUTE_ONLY_WORDS``).
+    """
     if name is None:
         return HERE
     if name is True:
         return _PLACE_WORDS["subprocess"]
     if not isinstance(name, str):
-        # A configured provider instance: use its own declared name if it has one.
+        # A configured provider instance: use its own declared name if it has
+        # one. Normalise BEFORE the compute-only check, or a backend holding a
+        # LocalCompute object (provider_name="local") skips the branch and gets
+        # described in the subprocess backend's stronger words -- the exact
+        # overstatement this module exists to prevent.
         name = getattr(name, "provider_name", None) or type(name).__name__
+    if via == "compute" and name.lower() in _COMPUTE_ONLY_WORDS:
+        return _COMPUTE_ONLY_WORDS[name.lower()]
     key = str(name).lower()
     key = _ALIASES.get(key, key)
     return _PLACE_WORDS.get(key, str(name))
@@ -68,6 +91,21 @@ def _backend_places(backend: Any) -> Optional[Dict[str, str]]:
     if backend is None:
         return None
 
+    # Ask the backend what it is, rather than guessing from its class name.
+    # Name-matching missed any backend that did not happen to contain "Hosted"
+    # or "Anthropic" -- a self-hosted DockerManagedAgent reported that it was
+    # thinking on this machine while the whole loop ran in a container.
+    declared = getattr(backend, "provider_name", None)
+    if isinstance(declared, str):
+        try:
+            from .placement import managed_runtimes
+
+            if declared.lower() in managed_runtimes():
+                where = say_place(declared)
+                return {"thinks_on": where, "tools_run_on": where}
+        except Exception:
+            pass
+
     cls = type(backend).__name__
     # Hosted runtimes move the entire turn off this machine.
     if "Hosted" in cls or "Anthropic" in cls:
@@ -75,10 +113,13 @@ def _backend_places(backend: Any) -> Optional[Dict[str, str]]:
         where = say_place(provider)
         return {"thinks_on": where, "tools_run_on": where}
 
-    # Local/sandboxed agents keep the loop here and may push tools out.
+    # Local/sandboxed agents keep the loop here and may push tools out. A
+    # backend's compute object is a COMPUTE-registry provider, so it is read
+    # with the compute vocabulary: a LocalCompute here is the unrestricted
+    # shell, not the subprocess backend "local" collapses to under run_in=.
     compute = getattr(backend, "_compute", None) or getattr(backend, "compute", None)
     if compute is not None:
-        return {"thinks_on": HERE, "tools_run_on": say_place(compute)}
+        return {"thinks_on": HERE, "tools_run_on": say_place(compute, via="compute")}
     return {"thinks_on": HERE, "tools_run_on": HERE}
 
 
@@ -96,7 +137,7 @@ def describe(obj: Any, *, shared: bool = False) -> Dict[str, str]:
 
         where_tools = getattr(obj, "tools_run_on", None)
         if where_tools is not None:
-            where = say_place(where_tools)
+            where = say_place(where_tools, via="compute")
             places["tools_run_on"] = f"{where} (shared)" if shared else where
 
         # run_on= puts the WHOLE agent on a managed runtime, so it moves the
