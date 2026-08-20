@@ -145,7 +145,7 @@ sequenceDiagram
 | Step | What happens |
 |---|---|
 | 1 | Agent calls tool via `_execute_tool_with_circuit_breaker` (sync) or `execute_tool_async` (async) |
-| 2 | On error, `_classify_error_type` tags it: `timeout`, `rate_limit`, `connection_error`, or `unknown` |
+| 2 | On error — a returned error string **or a raised exception** — `_classify_error_type` tags it: `timeout`, `rate_limit`, `connection_error`, or `unknown`. On the async path the flattened error dict also carries an explicit `retryable` verdict |
 | 3 | `_effective_tool_retry_policy` resolves the one active policy (per-tool > agent `ToolConfig` > translated `ExecutionConfig`) — both retry loops share it |
 | 4 | If `policy.should_retry(error_type, attempt)` is true, wait `policy.get_delay_ms(attempt)` ms and retry |
 | 5 | `HookEvent.ON_RETRY` fires before each retry with the new `OnRetryInput` fields |
@@ -156,6 +156,71 @@ An error is tagged `rate_limit` when its message contains either `"rate…limit"
 # Both of these classify as rate_limit and are retried by default:
 raise Exception("Rate limit exceeded")
 raise Exception("HTTP 429: Too Many Requests")
+```
+
+---
+
+### Sync / async parity
+
+`RetryPolicy` applies identically on the sync path (`agent.execute_tool(...)`, `agent.start(...)`) and the async path (`agent.execute_tool_async(...)`, `agent.achat(...)`) — including tools that raise exceptions.
+
+<Note>
+Fixed in PR #4141. Before that release, `agent.achat(...)` would silently **not** retry a raised exception, even when `ToolConfig(retry_policy=RetryPolicy(max_attempts=N))` was set. The sync path already retried; the async path returned on the first attempt.
+</Note>
+
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonaiagents.config.feature_configs import ToolConfig
+from praisonaiagents.tools import RetryPolicy
+
+calls = []
+
+def flaky():
+    """Simulate a transient failure."""
+    calls.append(1)
+    raise RuntimeError("temporary glitch")
+
+agent = Agent(
+    instructions="Use the flaky tool.",
+    tools=[flaky],
+    tool_config=ToolConfig(retry_policy=RetryPolicy(max_attempts=3, initial_delay_ms=0)),
+)
+
+# Sync path — retries 3 times
+try: agent.execute_tool("flaky", {})
+except Exception: pass
+
+# Async path — also retries 3 times (parity restored in PR #4141)
+try: asyncio.run(agent.execute_tool_async("flaky", {}))
+except Exception: pass
+```
+
+Both paths share the same terminal rule for raised exceptions:
+
+| Exception raised by tool | Retried? |
+|---|---|
+| `ValueError`, `TypeError`, `AttributeError` | terminal — programming errors |
+| `ToolExecutionError(is_retryable=False)` (e.g. Loop Guard HALT) | terminal — explicit verdict honoured |
+| `ToolExecutionError(is_retryable=True)` | retried up to `max_attempts` |
+| Any other exception (e.g. `RuntimeError`, network error) | retried up to `max_attempts` |
+
+On the async path a raised exception is flattened into an error dict carrying a `retryable` verdict, then the retry loop honours it:
+
+```mermaid
+graph LR
+    Raise[Tool raises] --> Flatten[Flatten to error dict + retryable verdict]
+    Flatten --> Decide{Retry?}
+    Decide -->|retryable=true & attempts left| Backoff[Backoff]
+    Backoff --> Raise
+    Decide -->|retryable=false / max reached| Return[Return error]
+
+    classDef err fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Raise,Return err
+    class Flatten,Decide,Backoff proc
 ```
 
 ---
@@ -308,6 +373,7 @@ graph TB
 **Non-retryable error types** (always short-circuit):
 - `approval_denied`, `permission_denied`, `approval_error`, `circuit_open`, **`loop_blocked`**
 - Python exceptions: `ValueError`, `TypeError`, `AttributeError` from tool code
+- Raised `ValueError` / `TypeError` / `AttributeError` from tool code are terminal on both sync and async paths.
 
 <Tip>
 A `loop_blocked` result comes from [Loop Guard](/features/loop-guard). Bumping `max_attempts` cannot bypass it — configure the loop-guard thresholds instead.
