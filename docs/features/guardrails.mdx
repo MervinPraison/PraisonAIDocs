@@ -166,6 +166,122 @@ Input-side validation runs on both `chat()` / `start()` and `achat()` / `astart(
 
 ---
 
+## Class-based Guardrails (Object Protocol)
+
+Any Python object exposing `validate_input(content, **kwargs)`, `validate_output(content, **kwargs)`, or `validate_tool_call(tool_name, arguments, **kwargs)` is accepted directly by `Agent(guardrails=...)`. Pass a single instance, or a list of instances, and the SDK wraps them in a `GuardrailChain` for you.
+
+```python
+from praisonaiagents import Agent
+
+class ProfanityFilter:
+    def validate_input(self, content, **kwargs):
+        if "badword" in content.lower():
+            return False, "Content contains inappropriate language"
+        return True, content
+
+    def validate_output(self, content, **kwargs):
+        return self.validate_input(content, **kwargs)
+
+    def validate_tool_call(self, tool_name, arguments, **kwargs):
+        return (False, arguments) if tool_name == "rm" else (True, arguments)
+
+agent = Agent(
+    name="Support",
+    instructions="Answer customer questions.",
+    guardrails=ProfanityFilter(),           # single instance
+)
+
+agent.start("Please help with my order")
+```
+
+A list of instances is chained in order:
+
+```python
+from praisonaiagents import Agent
+
+class UpperCaser:
+    def validate_output(self, content, **kwargs):
+        return True, content.upper()
+
+agent = Agent(
+    name="Support",
+    instructions="Answer customer questions.",
+    guardrails=[ProfanityFilter(), UpperCaser()],   # runs in the given order
+)
+```
+
+```mermaid
+graph TB
+    Start([What kind of guardrail?]) --> Q1{Single vs multiple?}
+    Q1 -->|Single object| A["Agent(guardrails=obj)"]
+    Q1 -->|Multiple objects| B["Agent(guardrails=[o1, o2, ...])"]
+    Q1 -->|Mixed with a callable?| C["Wrap yourself in<br/>GuardrailChain"]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1 question
+    class A,B,C answer
+```
+
+<Note>
+**Since PraisonAI PR [#4122](https://github.com/MervinPraison/PraisonAI/pull/4122)** (2026-08-20), class-based guardrails are wrapped into a `GuardrailChain` automatically. On earlier releases a bare instance (or list of instances) fell through every dispatch branch and the agent was constructed with **no** guardrail — no exception, no warning. If you tried the pattern before and saw content sail through unfiltered, upgrade past commit `c904372` and no code change is needed.
+</Note>
+
+---
+
+## Fail-loud on unsupported guardrail values
+
+Values that cannot be turned into any enforceable validator raise `TypeError` at `Agent(...)` construction, instead of silently disabling enforcement.
+
+```python
+from praisonaiagents import Agent
+
+def my_fn(output):
+    return True, output
+
+Agent(name="x", instructions="x", guardrails=123)              # TypeError
+Agent(name="x", instructions="x", guardrails=[my_fn])          # TypeError (list of callable)
+Agent(name="x", instructions="x", guardrails=object())         # TypeError
+Agent(name="x", instructions="x", guardrails=ProfanityFilter)  # TypeError (class, not instance)
+Agent(name="x", instructions="x", guardrails=[ProfanityFilter(), my_fn])  # TypeError (mixed)
+```
+
+The exception message names the value and the supported shapes so you can fix the call without hunting:
+
+```
+TypeError: guardrails=123 (type int) is not a supported guardrail. Pass a
+validator callable taking one TaskOutput, an object implementing
+validate_input/validate_output/validate_tool_call, a list of such objects,
+a GuardrailConfig, or a string LLM-validation prompt.
+```
+
+| Value | Accepted? | Notes |
+|-------|-----------|-------|
+| `None`, `False` | ✅ | No guardrail (fast path, unchanged) |
+| `True` | ✅ | Default config |
+| callable `fn(output) -> (bool, Any)` | ✅ | Output-only, unchanged |
+| `"Ensure the answer is polite"` (string) | ✅ | `LLMGuardrail`, output-only |
+| `GuardrailConfig(...)` | ✅ | Full control |
+| `["strict"]` (preset list) | ✅ | Preset resolves through `GuardrailConfig` |
+| `ProfanityFilter()` (protocol instance) | ✅ *new in #4122* | Wrapped in `GuardrailChain` |
+| `[ProfanityFilter(), UpperCaser()]` | ✅ *new in #4122* | Chained in order |
+| `[]`, `()` | ✅ | No-op (kept backwards-compatible) |
+| `GuardrailChain([...])` | ✅ | Passthrough |
+| `ProfanityFilter` (class, not instance) | ❌ `TypeError` | Instantiate it first |
+| `123`, `3.5`, `object()` | ❌ `TypeError` | Not a validator |
+| `[my_callable]`, `(my_callable,)` | ❌ `TypeError` | Wrap in `GuardrailChain([...])` yourself |
+| `[ProfanityFilter(), my_callable]` (mixed) | ❌ `TypeError` | Must be all objects or all callables |
+| `["policy:strict"]` | ❌ `ValueError` | Existing behaviour — use `Agent(policy=...)` |
+
+<Warning>
+**Behavioural change (PraisonAI [#4122](https://github.com/MervinPraison/PraisonAI/pull/4122)).** Before this PR, unsupported guardrail values were silently discarded and the agent ran with **zero** enforcement — the caller believed a validator was active while none was wired. The `TypeError` above is now raised at construction time to surface the mistake immediately. Same "safe by default" rationale as the existing policy-string `ValueError`.
+</Warning>
+
+---
+
 ## Which Validator Should I Use?
 
 Pick a validator strategy based on how you need to check the output.
@@ -370,6 +486,53 @@ Use `chat()` (or the non-streaming path of `start()` / `astart()`) when you need
 
 ---
 
+## Tool-Call Validation (`validate_tool_call`)
+
+When a guardrail object exposes `validate_tool_call(tool_name, arguments, **kwargs) -> (bool, dict)`, it is consulted before every tool call. A return of `(False, ...)` blocks the tool call.
+
+```python
+from praisonaiagents import Agent
+
+class ToolGate:
+    def validate_tool_call(self, tool_name, arguments, **kwargs):
+        if tool_name.startswith("rm") or tool_name.startswith("delete_"):
+            return False, arguments
+        return True, arguments
+
+agent = Agent(
+    name="File Assistant",
+    instructions="Help organise files, but never delete anything.",
+    guardrails=ToolGate(),
+    tools=[list_files, move_file, delete_file],
+)
+agent.start("Clean up my downloads folder")
+# -> delete_file / rm* calls are blocked; the agent gets a denial and can adapt.
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Guard as ToolGate
+    participant Tool
+
+    User->>Agent: chat("clean up my folder")
+    Agent->>Guard: validate_tool_call("delete_file", {...})
+    Guard-->>Agent: (False, args)
+    Note over Agent: Tool call blocked — surfaced back to LLM
+    Agent->>Guard: validate_tool_call("move_file", {...})
+    Guard-->>Agent: (True, args)
+    Agent->>Tool: move_file(...)
+    Tool-->>Agent: ok
+    Agent-->>User: "Moved 12 files to archive; deletes were blocked."
+```
+
+<Note>
+**Since PraisonAI PR [#4122](https://github.com/MervinPraison/PraisonAI/pull/4122)** (2026-08-20), `validate_tool_call` is wired for guardrail objects and `GuardrailChain`s. On earlier releases the check-site read an attribute that was never assigned, so `validate_tool_call` was unreachable dead code and every tool call went through. String and LLM-string guardrails (`guardrails="Be polite"`) are **excluded** from this wiring on purpose — running an extra LLM call before every tool call would be a hot-path regression.
+</Note>
+
+---
+
 ## Configuration Options
 
 <Card title="GuardrailConfig SDK Reference" icon="code" href="/sdk/reference/praisonaiagents/modules/feature_configs">
@@ -394,6 +557,10 @@ agent = Agent(guardrails=GuardrailConfig(
     max_retries=3,
     on_fail="retry",
 ))
+
+# Level 4: Object protocol (single instance or list of instances)
+agent = Agent(guardrails=ProfanityFilter())
+agent = Agent(guardrails=[ProfanityFilter(), UpperCaser()])
 
 # Level 5: GuardrailChain (compose multiple guardrails)
 from praisonaiagents.guardrails import GuardrailChain, LLMGuardrail
@@ -472,6 +639,8 @@ Each guardrail can expose three validation entry points, all called through the 
 | `validate_tool_call` | Before a tool call executes |
 
 Any object with matching method names satisfies `GuardrailProtocol` — it is duck-typed, so a guardrail only needs the methods it actually uses.
+
+Since PraisonAI PR [#4122](https://github.com/MervinPraison/PraisonAI/pull/4122), you can also pass such an object directly to `Agent(guardrails=...)` without constructing a `GuardrailChain` yourself. See [Class-based Guardrails](#class-based-guardrails-object-protocol) above.
 
 <Note>
 Policy-string guardrails (`guardrails=["policy:strict"]`) are enforced on the agent path — a policy that denies still blocks the run.
