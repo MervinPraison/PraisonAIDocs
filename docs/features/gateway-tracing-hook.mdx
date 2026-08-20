@@ -17,7 +17,7 @@ agent = Agent(name="Support", instructions="Help the customer.")
 agent.start("Where is my order?")
 ```
 
-Wrap each stage of the gateway pipeline in a span your own OpenTelemetry exporter can pick up.
+Wrap each stage of the gateway pipeline in a span your own OpenTelemetry exporter can pick up — and carry W3C trace context (`traceparent` / `tracestate`) across process boundaries so the trace tree doesn't break at the gateway.
 
 The user sends a turn; the gateway opens a span around every stage — inbound, admission, agent run, each LLM and tool call, outbox, delivery — so latency and failures show up per stage in Jaeger, Tempo, Datadog, or Honeycomb.
 
@@ -42,6 +42,8 @@ graph LR
     class LLM,Tool,Outbox process
     class Delivery done
 ```
+
+When an exporter is attached, an inbound `traceparent` from a caller becomes the parent of `agent.run`, and the active context is propagated to downstream LLM / MCP / tool calls.
 
 ## Quick Start
 
@@ -92,6 +94,30 @@ with tracer.stage("agent.run", correlation_id="c1", session="s1") as span:
 A production exporter follows the same shape but calls `tracer.start_as_current_span(...)` from the OpenTelemetry SDK inside `stage`. That exporter lives in the separate `praisonai-plugins` package — core ships only the seam and the no-op default.
 
 </Step>
+
+<Step title="Continue an inbound trace — parent agent.run under the caller">
+
+An inbound request arrives carrying a `traceparent`; pull it out with `extract_carrier` and pass it as `parent_carrier` so `agent.run` continues the caller's trace instead of starting a fresh detached one.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import resolve_trace_hook
+
+tracer = resolve_trace_hook(None)  # swap for a real exporter in production
+
+# inbound.headers e.g. {"traceparent": "00-...-...-01", "tracestate": "..."}
+parent = tracer.extract_carrier(inbound.headers)
+
+agent = Agent(name="Support", instructions="Help the customer.")
+
+with tracer.stage("agent.run", correlation_id="turn-42",
+                  parent_carrier=parent, session="s1"):
+    reply = agent.start("Where is my order?")
+```
+
+With the no-op default, `extract_carrier` returns `None` and `stage` ignores `parent_carrier` — the code is safe to write before you attach an exporter.
+
+</Step>
 </Steps>
 
 ---
@@ -125,6 +151,33 @@ sequenceDiagram
 | Exit `with` | The hook ends the span |
 | Exception raised | Propagates out and the span is marked failed — implementations must not swallow it |
 
+### With W3C trace-context propagation
+
+When an exporter is attached, the gateway continues the caller's trace on ingress and re-injects the active context on egress, so a single distributed trace flows `inbound → agent.run → tool / mcp / llm` across processes.
+
+```mermaid
+sequenceDiagram
+    participant Caller as Upstream Caller
+    participant GW as Gateway
+    participant Hook as trace
+    participant Agent as Agent
+    participant LLM as LLM Provider
+
+    Caller->>GW: inbound + traceparent
+    GW->>Hook: extract_carrier(headers)
+    Hook-->>GW: parent carrier
+    GW->>Hook: stage("agent.run", parent_carrier=parent)
+    Hook->>Hook: enter under caller's span
+    GW->>Agent: astart(text)
+    Agent->>Hook: inject_context(egress_headers)
+    Agent->>LLM: POST /chat + traceparent
+    LLM-->>Agent: reply
+    Agent-->>GW: reply
+    GW-->>Caller: reply
+```
+
+With the no-op default, `extract_carrier` returns `None` and `inject_context` leaves the carrier untouched, so the same code runs unchanged with no exporter attached — `agent.run` simply starts a fresh root span.
+
 ---
 
 ## Configuration Options
@@ -143,6 +196,12 @@ Core exposes the seam through five top-level symbols on `praisonaiagents.gateway
 </Card>
 <Card title="resolve_trace_hook" icon="wand-magic-sparkles">
   Returns the supplied hook, or the no-op default when passed `None`.
+</Card>
+<Card title="inject_context" icon="arrow-right-from-bracket">
+  Write the active W3C `traceparent` onto an outbound carrier at an egress boundary. No-op in the default.
+</Card>
+<Card title="extract_carrier" icon="arrow-right-to-bracket">
+  Read W3C `traceparent` / `tracestate` from an inbound header mapping and return a carrier for `stage(..., parent_carrier=...)`. Returns `None` in the default.
 </Card>
 </CardGroup>
 
@@ -164,10 +223,31 @@ def stage(
     name: str,
     *,
     correlation_id: Optional[str] = None,
+    parent_carrier: Optional[Mapping[str, str]] = None,   # NEW
     **attrs: Any,
 ) -> AbstractContextManager[Any]:
     ...
 ```
+
+### Propagation methods (new in [#4103](https://github.com/MervinPraison/PraisonAI/pull/4103))
+
+Two additive methods move W3C trace context across process boundaries — one at egress, one at ingress:
+
+```python
+def inject_context(self, carrier: MutableMapping[str, str]) -> None:
+    """Write the active span context into `carrier` as W3C headers."""
+```
+
+```python
+def extract_carrier(
+    self, carrier: Mapping[str, str]
+) -> Optional[Mapping[str, str]]:
+    """Return a propagation carrier extracted from inbound `carrier`, or None."""
+```
+
+<Note>
+In `NullGatewayTraceHook`, `inject_context` is a no-op that leaves `carrier` untouched, and `extract_carrier` always returns `None`. There is no OpenTelemetry import in core.
+</Note>
 
 ---
 
@@ -255,6 +335,40 @@ class MyGateway:
             ...
 ```
 
+### Pattern 4: Continue a caller's trace on ingress
+
+Extract the inbound carrier once and pass it as `parent_carrier`, so `agent.run` nests under the caller's span:
+
+```python
+# inbound.headers e.g. {"traceparent": "00-...", "tracestate": "..."}
+parent = self._trace.extract_carrier(inbound.headers)
+
+with self._trace.stage(
+    "agent.run",
+    correlation_id=current_correlation_id(),
+    parent_carrier=parent,   # None with the no-op default; agent.run then starts a fresh root
+    session=sid,
+):
+    reply = await agent.astart(text)
+```
+
+End to end the user sees one distributed trace — `inbound → agent.run → tool / mcp / llm` — where the agent turn hangs off the caller's span instead of starting over.
+
+### Pattern 5: Inject the active context on egress
+
+Seed the outbound headers with the provider's own headers, then inject so the active context wins over any stale `traceparent`:
+
+```python
+# LLM / MCP / HTTP-tool egress: propagate the active trace to downstream services.
+# Seed with provider headers first, then inject so the active context wins over
+# any stale traceparent / tracestate.
+headers = dict(provider_headers)
+self._trace.inject_context(headers)  # no-op unless an exporter is attached
+await http.post(url, headers=headers, json=payload)
+```
+
+End to end the downstream service's span nests under `agent.run`, so the same distributed trace continues across the process boundary instead of breaking at the egress call.
+
 ---
 
 ## Best Practices
@@ -272,6 +386,15 @@ An exception propagating out of the `with` block is what marks the span as faile
 <Accordion title="Prefer the shared NULL_GATEWAY_TRACE_HOOK instance">
 The no-op default is stateless, so reuse the shared `NULL_GATEWAY_TRACE_HOOK` singleton instead of constructing `NullGatewayTraceHook()` per call.
 </Accordion>
+<Accordion title="Seed provider headers before injecting the active context">
+Build the egress headers with `dict(provider_headers)` first, then call `inject_context(headers)`. The active `traceparent` then overwrites any stale one already present in the provider headers, so downstream spans nest under the current turn rather than an old trace.
+</Accordion>
+<Accordion title="Extract once per turn at the ingress boundary">
+Call `extract_carrier(inbound.headers)` once when the turn arrives and reuse the returned carrier for the `agent.run` stage. Re-extracting inside nested stages is wasteful and risks parenting a span under the wrong context.
+</Accordion>
+<Accordion title="`parent_carrier=None` is always safe">
+With the no-op default, `stage` ignores `parent_carrier` and behaves exactly as before. Code that always passes `parent_carrier=self._trace.extract_carrier(inbound.headers)` works whether or not an exporter is attached.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -283,18 +406,25 @@ graph TB
     Q{Have a tracer?}
     Q -->|No| Null[Use NULL_GATEWAY_TRACE_HOOK<br/>zero-cost default]
     Q -->|OTel-SDK exporter| Plugin[Use the praisonai-plugins<br/>OTel hook]
-    Q -->|Building your own| Custom[Implement stage name,<br/>correlation_id, **attrs<br/>context-manager factory]
+    Q -->|Need cross-service<br/>trace continuity?| Prop[Use the praisonai-plugins OTel hook<br/>it implements inject_context / extract_carrier]
+    Q -->|Building your own| Custom[Implement stage name,<br/>correlation_id, parent_carrier, **attrs<br/>context-manager factory]
 
     classDef q fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef null fill:#10B981,stroke:#7C90A0,color:#fff
     classDef plugin fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef prop fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef custom fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class Q q
     class Null null
     class Plugin plugin
+    class Prop prop
     class Custom custom
 ```
+
+<Info>
+The additions in [#4103](https://github.com/MervinPraison/PraisonAI/pull/4103) are fully additive. Existing `stage(name, correlation_id=..., **attrs)` call sites continue to work unchanged. The default `NullGatewayTraceHook` remains a zero-cost no-op with no OpenTelemetry import in core.
+</Info>
 
 ---
 
