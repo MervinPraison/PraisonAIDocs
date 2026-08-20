@@ -637,6 +637,27 @@ For Windows users requiring resource limits, use Docker backend instead.
 
 For strong isolation on Windows, use the **Docker** or **E2B** backend — the subprocess backend on Windows is intended for development against trusted code only. See [issue #3214](https://github.com/MervinPraison/PraisonAI/issues/3214).
 </Tab>
+<Tab title="Docker">
+Docker enforces `max_processes` per **container** via `--pids-limit`, so unlike `RLIMIT_NPROC` — which is per user — the number means what it says:
+
+```python
+from praisonaiagents import ResourceLimits
+
+limits = ResourceLimits(
+    memory_mb=512,        # → --memory 512m
+    max_processes=128,    # → --pids-limit 128 (floored at MIN_CONTAINER_PIDS)
+    timeout_seconds=30,   # Wall clock timeout
+)
+```
+
+The pids cap has a **floor of `MIN_CONTAINER_PIDS = 128`** (importable from `praisonai_sandbox.docker`). The container applies `max(max_processes, 128)` on both `run_command()` and the `execute()` path (`_build_docker_command()`).
+
+The floor exists because `max_processes` defaults to `10` — a value chosen for the `setrlimit` world. A raw `--pids-limit 10` kills the container before the shell finishes starting, so `docker run` exits `125` with "No such container". The floor still bounds a fork bomb; it just stops the bound from being the bug.
+
+<Warning>
+Before PR #4107, `run_command()` accepted `max_processes` and **ignored it**, so fork bombs were unbounded on the bridged `execute_command` tool path. Both paths now honor it.
+</Warning>
+</Tab>
 </Tabs>
 
 ---
@@ -761,10 +782,9 @@ Security warnings travel **only** through `result.metadata["security_warnings"]`
 
 ### Path Traversal Protection
 
-`DockerSandbox` and `SubprocessSandbox` validate every path passed to
-`write_file`, `read_file`, and `list_files`. Paths that resolve outside
-the sandbox root — via `../`, absolute paths, or symlink escapes — are
-rejected:
+`DockerSandbox` and `SubprocessSandbox` reject every path passed to
+`write_file`, `read_file`, and `list_files` that resolves outside the
+sandbox root — via `../`, absolute paths, or symlink escapes:
 
 ```python
 # Inside an agent's sandbox
@@ -773,13 +793,42 @@ sandbox.read_file("/etc/shadow")                  # returns None
 sandbox.list_files("../..")                       # returns []
 ```
 
-<Note>
-**Windows note:** Symlink escape rejection only triggers when the OS actually creates symlinks. Default non-admin Windows users cannot create symlinks (Python raises `OSError: [WinError 1314] A required privilege is not held by the client`) unless **Windows Developer Mode** is enabled (Settings → System → For developers) or the process holds `SeCreateSymbolicLinkPrivilege`. On such Windows setups, path-traversal protection via `../` and absolute paths still applies; the symlink branch is effectively unreachable. See [PR #3224](https://github.com/MervinPraison/PraisonAI/pull/3224) / [issue #3214](https://github.com/MervinPraison/PraisonAI/issues/3214).
-</Note>
-
 Blocked attempts are logged as
 `Path traversal attempt blocked: <path>`. This is in addition to the
 container/OS isolation the sandbox already provides — defense in depth.
+
+#### Symlink-safe file I/O on Docker
+
+Your `write_file` / `read_file` are symlink-race safe on the Docker backend — no change to how you call them:
+
+```python
+from praisonaiagents import Agent, SandboxConfig
+
+agent = Agent(
+    name="Analyst",
+    instructions="Write results to report.txt",
+    sandbox=SandboxConfig.docker(image="python:3.12-slim"),
+)
+```
+
+On Docker the sandbox directory is **bind-mounted into the container**, so any check that verifies a name string and *then* opens it can be raced from inside. A container running a loop of `ln -s /etc/passwd notes.txt` against repeated writes could swap the name between a regular file and a symlink and win the race — escaping to arbitrary host files and disclosing a host secret within a few hundred attempts.
+
+No amount of stricter string checking fixes this: anything verified before the open can be invalidated after it.
+
+The fix walks each path one component at a time relative to an open directory descriptor (`dir_fd=`) with `O_NOFOLLOW` at every step. A symlink substituted at any level fails the open instead of redirecting it. Two helpers in `praisonai_sandbox._compat` implement the walk:
+
+| Helper | What it does |
+|--------|--------------|
+| `open_in_sandbox(temp_dir, path, flags, mode=0o600)` | Opens a path descriptor-relative with `O_NOFOLLOW` per component. Returns an open fd, or `None` if any component is a symlink or the path escapes. |
+| `makedirs_in_sandbox(temp_dir, path)` | Creates parent directories the same way, refusing symlinks at every level. |
+
+<Warning>
+Before this fix, the Docker check was a `safe_sandbox_path()` **string** validation followed by a name-based `open()` — a TOCTOU window a container could win repeatably. `safe_sandbox_path()` still exists but is **no longer load-bearing** for opens: it is used only for `list_files()` and the Windows fallback. Do not rely on it being symlink-safe on the Docker backend — the descriptor walk is what's safe.
+</Warning>
+
+<Note>
+**Windows note:** `os.O_NOFOLLOW` / `os.O_DIRECTORY` / `os.supports_dir_fd` don't exist on Windows, so `_HAS_OPENAT` is `False` and the resolved-string guard (`safe_sandbox_path()`) is used instead. That is safe here because Docker Desktop runs Linux containers inside a VM — there is no host-shared directory to race. Non-admin Windows users also cannot create symlinks unless **Developer Mode** is enabled or the process holds `SeCreateSymbolicLinkPrivilege`. See [PR #3224](https://github.com/MervinPraison/PraisonAI/pull/3224) / [issue #3214](https://github.com/MervinPraison/PraisonAI/issues/3214).
+</Note>
 
 On the docker backend, `list_files()` resolves symlinks on both sides — the sandbox root and every walked path — before comparing them, and silently drops any entry that would still resolve outside the sandbox root. This defends against the macOS `/var → /private/var` symlink and any similar case, so host paths are never returned:
 
