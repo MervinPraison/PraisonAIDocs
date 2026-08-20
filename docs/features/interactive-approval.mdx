@@ -25,20 +25,23 @@ graph LR
     A[Agent] --> B[Tool call]
     B --> C{Needs approval?}
     C -->|Yes| D[Terminal prompt]
-    D --> E[once / session / always / no]
+    D --> E[once / session / always / no / deny & redirect]
     E -->|session| F[Reuse this run]
     E -->|always| G[Persist rule]
+    E -->|deny & redirect| R[Feedback → next turn]
     C -->|No| H[Execute]
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef redirect fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class A agent
     class B tool
     class C,D check
     class E,F,G,H ok
+    class R redirect
 
 ```
 
@@ -77,8 +80,8 @@ Agent: Coder
 Arguments:
   command: git status -s
 
-Allow execute_command?  [o] once   [s] this session   [a] always (bash:git status *)   [n] no
-Choice [o/s/a/n] (n):
+Allow execute_command?  [o] once   [s] this session   [a] always (bash:git status *)   [n] no   [d] deny & redirect
+Choice [o/s/a/n/d] (n):
 ```
 
 Each key chooses **how long** the approval lasts:
@@ -87,6 +90,7 @@ Each key chooses **how long** the approval lasts:
 - `[s] session` — auto-approve matching calls (same permission target) for the rest of this run. **Never persisted** — restarting the process starts over.
 - `[a] always` — persist an allow-rule to `approvals.json`. The suggested pattern in parentheses (e.g. `bash:git status *`, `edit:src/app.py`) is what gets saved; it is auto-derived from the tool + arguments.
 - `[n] no` — deny (also selected on Ctrl-C / EOF).
+- `[d] deny & redirect` — deny this call and, at the follow-up prompt (`What should the agent do instead?`), type a one-line instruction. The agent's next turn receives it as course-correction (via `ApprovalDecision.feedback`), so it doesn't retry the same call as-is.
 
 <Note>
 The ConsoleBackend keystroke prompt offers no single "allow ALL uses of this tool" key — author a blanket `bash:*` rule with `praisonai permissions allow "bash:*"` when you need one. The Rich/Textual TUI used by `praisonai code` / `praisonai chat` has a separate **Always Allow All** option for this — see [Rich / Textual TUI](#rich-%2F-textual-tui-praisonai-code-praisonai-chat).
@@ -111,27 +115,33 @@ sequenceDiagram
     participant B as ConsoleBackend
     participant R as ApprovalRegistry
     participant PM as PermissionManager
+    participant A as Agent
 
     Note over B: Prompt shows suggested pattern:<br/>always (bash:git status *)
-    B->>U: Allow?  [o] once  [s] session  [a] always  [n] no
+    B->>U: Allow?  [o] once  [s] session  [a] always  [n] no  [d] deny & redirect
     U-->>B: choice
-    B->>R: ApprovalDecision(scope, scope_pattern)
-
-    alt scope == "once"
+    alt scope == "once" (approve)
         R-->>B: allow this call only
     else scope == "session"
-        R->>R: _session_scoped_targets.add((agent, target))<br/>(in-memory only)
-        R-->>B: allow + reuse for matching calls this run
+        R->>R: _session_scoped_targets.add((agent, target))
+        R-->>B: allow + reuse this run
     else scope == "always"
         R->>PM: approve(target, reusable_scope=True, pattern=…)
         PM->>PM: append to approvals.json
         R-->>B: allow + persist for future runs
+    else choice == "n" (plain deny)
+        R-->>A: ApprovalDecision(approved=False, feedback=None)
+    else choice == "d" (deny & redirect)
+        B->>U: What should the agent do instead?
+        U-->>B: "edit tests/app.py instead"
+        R-->>A: ApprovalDecision(approved=False, feedback="edit tests/app.py instead")
+        Note over A: Next turn sees:<br/>"Tool 'execute_command' was denied by the user.<br/>Do not retry it as-is. User guidance: edit tests/app.py instead"
     end
 ```
 
 ## Scope choice
 
-Four options in one row — this diagram picks the right one.
+Five options in one row — this diagram picks the right one.
 
 ```mermaid
 graph TB
@@ -140,16 +150,19 @@ graph TB
     Q -->|Yes, several times this run| S["[s] session<br/>in-memory only"]
     Q -->|Yes, forever across runs| A["[a] always<br/>writes approvals.json"]
     Q -->|Not what I meant to run| N["[n] no"]
+    Q -->|Wrong call, but I know a better one| D["[d] deny & redirect<br/>type what to do instead"]
 
     classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
     classDef persist fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef redirect fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class Q q
     class O,S safe
     class A persist
     class N deny
+    class D redirect
 ```
 
 | Choice | Where it lives | Scope key | Survives restart? |
@@ -157,6 +170,8 @@ graph TB
 | `[o] once` | Nothing persisted | Cache key `(tool_name, sha256(args))` (existing per-call cache) | No |
 | `[s] session` | In-memory `ApprovalRegistry._session_scoped_targets` | `(agent_name, permission_target)` | **No** — vanishes when the process ends |
 | `[a] always` | `approvals.json` via `PermissionManager` | Suggested pattern (e.g. `bash:git status *`) with `reusable_scope=True` | **Yes** |
+| `[n] no` | Nothing persisted | — | No |
+| `[d] deny & redirect` | **Nothing persisted.** `feedback` string is fed back to the agent as the denied tool's `error_msg` for the next turn. | — | No — feedback is one-turn only, never remembered across calls |
 
 <Note>
 A nameless `always` grant degrades to `session`. An `always` grant without an `agent_name` would match *any* later agent making the same target call, so the registry refuses to persist it and keeps it in-memory for this run only — which is why an "always" click sometimes doesn't outlive the run.
@@ -285,7 +300,10 @@ graph TB
 
 ## Reject with a reason
 
-When you deny a tool call in `praisonai code` or `praisonai chat` (Rich mode), the TUI asks for an optional one-line reason. The agent receives that reason as the denied tool's result and adjusts its next step — no more silent retries.
+Denying isn't just "stop" — you can steer. Two entry points collect guidance and hand it back to the agent as the denied tool's result, so the next turn course-corrects instead of retrying blindly.
+
+- **Terminal `ConsoleBackend` (single-key prompt)** — pick `[d] deny & redirect` at the main prompt, then answer the follow-up `What should the agent do instead?` prompt. Empty input / Ctrl-C / EOF at the follow-up falls back to a plain deny (`feedback=None`).
+- **Rich / Textual TUI** — deny still opens the existing "Reason for denial (optional)" inline prompt; behaviour unchanged.
 
 ```python
 from praisonaiagents import Agent
@@ -298,28 +316,28 @@ agent = Agent(
 agent.start("Refactor utils.py — feel free to run tests")
 ```
 
-The agent proposes `bash: rm -rf .venv`, you deny with a reason, and the agent picks a safer alternative on its next turn.
+The agent proposes `bash: rm -rf .venv`, you deny with a redirect, and the agent picks a safer alternative on its next turn.
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant TUI as Rich TUI
+    participant Console as ConsoleBackend
     participant Agent
 
-    Agent->>TUI: Approve tool call?
-    User->>TUI: Deny
-    TUI->>User: Reason for denial (optional): _
-    User->>TUI: "don't touch .venv"
-    TUI->>Agent: ApprovalResponse(REJECT, reason="don't touch .venv")
-    Agent->>Agent: sees denied + reason as tool result
-    Agent-->>User: retries with a different plan
+    Agent->>Console: Approve tool call?
+    User->>Console: [d] deny & redirect
+    Console->>User: What should the agent do instead? _
+    User->>Console: "edit tests/app.py instead"
+    Console->>Agent: ApprovalDecision(approved=False, feedback="edit tests/app.py instead")
+    Note over Agent: Tool result becomes:<br/>"Tool 'execute_command' was denied by the user.<br/>Do not retry it as-is. User guidance: edit tests/app.py instead"
+    Agent-->>User: retries with the correction
 
     classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef tui fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef console fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
 
     class User user
-    class TUI tui
+    class Console console
     class Agent agent
 ```
 
@@ -327,29 +345,29 @@ sequenceDiagram
 
 | Step | What happens |
 |------|--------------|
-| 1. Agent proposes a sensitive tool call | Rich option list appears |
-| 2. You pick **Deny** | The frontend prints `Reason for denial (optional, steers the agent):` |
-| 3. You type a reason (or press Enter to skip) | Blank input, EOF, or Ctrl-C preserves today's plain-denial behaviour |
-| 4. Frontend emits `ApprovalResponse(decision=REJECT, reason=...)` | Reason is included in `to_dict()` for observability |
-| 5. Core returns the reason as the denied tool's result | The agent's next turn sees *why* and can steer |
+| 1. Agent proposes a sensitive tool call | Prompt appears with the `[d] deny & redirect` key |
+| 2. You pick **`[d]`** | The backend prompts `What should the agent do instead?` |
+| 3. You type a one-line instruction (or press Enter to skip) | Blank input, EOF, or Ctrl-C falls back to a plain deny (`feedback=None`) |
+| 4. Backend returns `ApprovalDecision(approved=False, feedback=...)` | `feedback` is a new `Optional[str]` field, defaulting to `None` |
+| 5. `tool_execution.py` folds `feedback` into the denied tool's `error_msg` | The agent's next turn sees the correction as the tool's result |
 
 ### When the prompt appears
 
 | Where you deny | Reason prompt? |
 |---|---|
+| Console backend (single-key `[o/s/a/n/d]`) | **Pick `[d] deny & redirect` for the guidance follow-up. `[n]` stays a plain deny with no prompt.** |
 | Rich frontend (`praisonai code`, `praisonai chat` in Rich mode) | Yes — inline prompt after Deny |
-| Textual dialog (`ApprovalDialog.on_button_pressed`) | Accepts a `reason` argument, kept ready for a reason-capture widget |
+| Textual dialog (`ApprovalDialog.on_button_pressed`) | Accepts a `reason` argument |
 | Live Textual TUI (`y`/`n` key handler) | Not yet — denies without collecting a reason |
-| Console backend (single-key `[o/s/a/n]`) | Already prompted for a reason before #3180 |
-| Ctrl-C / EOF | No prompt — treated as plain denial (unchanged) |
-| Bot/chat-channel (Telegram / Slack / Discord) | Not covered by #3180 — button reject only |
+| Ctrl-C / EOF at main prompt | No prompt — treated as plain denial |
+| Bot/chat-channel (Telegram / Slack / Discord) | Not covered by #4101 — button reject only |
 
 <Tip>
-Skip the reason (press Enter) when the agent's proposal is obviously wrong and no correction is worth typing — the plain-denial path is unchanged.
+Skip the guidance (press Enter at the follow-up, or pick plain `[n]`) when the agent's proposal is obviously wrong and no correction is worth typing — the plain-denial path is unchanged.
 </Tip>
 
 <Note>
-The reason is a plain string returned as the denied tool call's result — it is not a system prompt, is not persisted to `approvals.json`, and never affects future approvals. It only informs the agent's very next decision on this call.
+The guidance is a plain string returned as the denied tool call's result — it is not a system prompt, is not persisted to `approvals.json`, and never affects future approvals. It only informs the agent's very next decision on this call. Blank input keeps today's plain denial.
 </Note>
 
 ## Rich / Textual TUI (`praisonai code`, `praisonai chat`)
@@ -459,6 +477,7 @@ Press `[a]` to write an allow-rule to `approvals.json` via `PermissionManager` (
 | `[s] this session` | In-memory only — nothing written | *(not persisted)* |
 | `[a] always` | Narrow command-prefix / path | `bash:git status *`, `edit:utils.py`, `write:.env` |
 | `[n] no` | This call only | *(not persisted)* |
+| `[d] deny & redirect` | This call only, with one-turn feedback to the agent | *(not persisted — feedback is passed to the model as the denied tool's result and forgotten after the next turn)* |
 
 `[a]` uses the shared `suggest_scope_pattern` helper so the CLI, YAML `--allow`/`--deny`, and Python `PermissionManager` all scope identically. Compound commands (`&&`, `|`, `;`, `$(...)`) fall back to a **literal single-use** pattern so a persisted rule can only match the exact invocation you approved. For a blanket `<tool>:*` rule, author it directly with `praisonai permissions allow "bash:*"`.
 
@@ -527,6 +546,10 @@ The preview is your last chance to catch an unintended edit. For `edit` / `apply
 
 <Accordion title="Give a name to your agent before pressing [a]">
 A nameless `always` grant can't be persisted — it would match any later agent, so the registry keeps it in-memory for this run only. Set `Agent(name=...)` so `[a]` writes a durable, agent-scoped rule.
+</Accordion>
+
+<Accordion title="Reach for [d] when the agent is close but wrong">
+Use `[d] deny & redirect` when the agent's proposal is *nearly* right but you can point it at the correct target in a sentence — "edit `tests/app.py` instead", "use `staging.env`, not `production.env`", "run `pytest -k login` first". The next turn sees your instruction as the denied tool's result and adjusts, instead of retrying the same call. Use plain `[n]` when the agent just needs to stop.
 </Accordion>
 
 </AccordionGroup>
