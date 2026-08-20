@@ -110,6 +110,54 @@ If you ran an older version, reclaim any accumulated leaks with `praisonai manag
 
 ---
 
+## …and the `run_on=` finalizer that was never registered ([PR #4109](https://github.com/MervinPraison/PraisonAI/pull/4109))
+
+The PR #4107 fix above only fires when a finalizer actually runs. On `ComputeManagedAgent` — the backend behind `run_on=` — **no finalizer had ever been registered**, so the release path was never invoked and the instance survived the whole process.
+
+<Warning>
+`ComputeManagedAgent` defaults to `keep_alive=True` — the instance is meant to survive *between calls*, not *between processes*. Without a finalizer, it survived the whole script:
+
+- For `docker`, that was one container per script.
+- For `e2b`, `modal`, `daytona`, `tenki`, `flyio`, that was a **billed cloud instance** whose only other reaper is the provider's idle timer.
+- **Docker and Fly.io have no idle timer**, so those instances lived indefinitely.
+</Warning>
+
+Your `run_on=` instance is now reclaimed when your script exits — no code change:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="builder", instructions="You build things.", run_on="docker")
+agent.start("Write a script that prints the first 10 primes, then run it")
+# When the script exits, the container is reclaimed automatically.
+```
+
+Verified before/after: containers left after a `run_on=` script exits went from **1 → 0**; an ordinary run is still 42 → 42.
+
+The mechanism is a `weakref.finalize` registered inside `_ensure()` right after `provision()` succeeds:
+
+```python
+# praisonai/integrations/compute_managed_agent.py (inside _ensure())
+self._finalizer = weakref.finalize(self, _release, provider, self._instance, self._place)
+```
+
+- It runs on **garbage collection** *and* at **interpreter exit** — not one or the other.
+- It deliberately does **not** close over the backend `self` — closing over `self` would keep the backend alive and prevent the very collection it waits for.
+
+`_release(provider, instance_id, place)` is a module-level function that shuts the instance down safely on any thread:
+
+- No running loop (`asyncio.get_running_loop()` raises) → `asyncio.run(_shutdown())`.
+- A loop is already running → it bridges through `concurrent.futures.ThreadPoolExecutor(max_workers=1)` so the shutdown coroutine runs on its own loop instead of `RuntimeError`-ing. Without this bridge, GC landing inside async workflow code would raise and silently leak — the same class of bug PR #4107 fixed one layer down. This matches the pattern `SharedCompute` already uses.
+- Errors are logged at **warning** and swallowed — teardown stays quiet.
+
+<Note>
+**Explicit `ashutdown()` detaches the finalizer.** An intentional teardown calls `self._finalizer.detach()` before shutting down, so the finalizer that fires shortly after never double-reclaims the same instance.
+</Note>
+
+PR #4107 made the release path survive interpreter shutdown; PR #4109 made sure the release path is actually invoked on `run_on=`. Together they close the container-leak story end to end for both `sandbox=` and `run_on=`.
+
+---
+
 ## When a provider can't be queried
 
 | Situation | Behaviour |
