@@ -68,6 +68,10 @@ graph LR
   </Step>
 </Steps>
 
+<Note>
+`auth=` is honoured on every construction shape — a bare model name (`llm="claude-sonnet-4-5"`), a `provider/model` string, a dict, a `base_url`, or no `llm=` at all. All five route to the subscription.
+</Note>
+
 ## How It Works
 
 Subscription Auth enables agents to use your existing subscriptions without requiring separate API keys.
@@ -95,6 +99,18 @@ sequenceDiagram
     Note over Provider,Store: Expired token → user runs `claude /login`,<br/>PraisonAI never rotates the shared session.
 ```
 
+### Cloning & multi-channel
+
+`clone_for_channel()` forwards `auth=`, so gateway and multi-channel setups that duplicate the agent per channel keep subscription billing.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="t", llm="anthropic/claude-sonnet-4-5", auth="claude-code")
+clone = agent.clone_for_channel()
+# clone.auth == "claude-code"
+```
+
 ## Supported Providers
 
 Which subscription auth provider should you use?
@@ -103,8 +119,10 @@ Which subscription auth provider should you use?
 graph TB
     subgraph "Choose Your Provider"
         Q1{Have Claude Pro?} --> |Yes| ClaudeCode["auth='claude-code'"]
+        ClaudeCode --> ClaudeDefault["No llm= →<br/>anthropic/claude-sonnet-4-5"]
         Q1 --> |No| Q2{Have Qwen?}
         Q2 --> |Yes| QwenCli["auth='qwen-cli'"]
+        QwenCli --> QwenDefault["No llm= →<br/>openai/qwen3-coder-plus"]
         Q2 --> |No| Q3{Have ChatGPT Plus?}
         Q3 --> |Yes| Codex["auth='codex'<br/>(experimental)"]
         Q3 --> |No| Q4{Have Gemini?}
@@ -115,10 +133,12 @@ graph TB
     classDef working fill:#10B981,stroke:#7C90A0,color:#fff
     classDef experimental fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef fallback fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef auto fill:#6366F1,stroke:#7C90A0,color:#fff
     
     class ClaudeCode,QwenCli working
     class Codex,GeminiCli experimental
     class ApiKey fallback
+    class ClaudeDefault,QwenDefault auto
 ```
 
 | `auth=` value | Subscription | Token source | Status |
@@ -128,11 +148,28 @@ graph TB
 | `codex` | ChatGPT Plus | `~/.codex/auth.json` | ⚠️ **Experimental** |
 | `gemini-cli` | Gemini | `~/.gemini/oauth_creds.json` | ⚠️ **Experimental** |
 
+<Note>
+Omit `llm=`/`model=` and the working providers pick their vendor's default: `claude-code` → `anthropic/claude-sonnet-4-5`, `qwen-cli` → `openai/qwen3-coder-plus`. `codex` and `gemini-cli` raise `AuthError` **at construction time**, not at request time.
+</Note>
+
 <Warning>
-**Experimental Status**: `codex` and `gemini-cli` providers are registered but currently raise `AuthError` because they need custom API transports. These will be supported in future releases once proper transport layers are implemented.
+**Experimental Status**: `codex` and `gemini-cli` providers are registered but their constructor raises `AuthError` because they need custom API transports. `Agent(auth="codex")` fails immediately at construction — previously it constructed silently and then downgraded to your API key. These will be supported once proper transport layers are implemented.
 </Warning>
 
 ## Common Patterns
+
+### No model needed
+
+Skip `llm=` and the provider's vendor model is chosen for you.
+
+```python
+from praisonaiagents import Agent
+
+# No llm= — defaults to anthropic/claude-sonnet-4-5 for claude-code,
+# openai/qwen3-coder-plus for qwen-cli.
+agent = Agent(name="t", auth="claude-code")
+agent.start("Hello")
+```
 
 ### Choose your refresh path
 
@@ -169,6 +206,10 @@ agent = Agent(
 bot = Bot("telegram", agent=agent)
 bot.run()
 ```
+
+<Note>
+`Bot(...)` clones the agent per channel via `clone_for_channel()`, which now preserves `auth=` — every channel keeps billing to your subscription.
+</Note>
 
 ### Switching between API key and subscription
 
@@ -224,6 +265,10 @@ register_subscription_provider("mine", lambda: MyAuth())
 ## Best Practices
 
 <AccordionGroup>
+  <Accordion title="Fail-fast at construction">
+    `Agent(auth=...)` resolves credentials eagerly at construction. An unknown provider id, missing credentials, or an experimental provider raises `AuthError` from the `Agent(...)` call itself rather than silently falling back to your API key at request time. This is deliberate — a silent downgrade means money leaves the wrong account.
+  </Accordion>
+
   <Accordion title="Token Security">
     Tokens are read locally from your CLI tools and never persisted by PraisonAI. They stay in memory only during agent execution. PraisonAI does not refresh or write them back — see "Read-only for claude-code" below.
   </Accordion>
@@ -291,7 +336,38 @@ claude /login
 
 ### Codex / Gemini raise `AuthError`
 
-**Expected behavior**: These providers are experimental and not yet usable. They're registered for future use but currently raise `AuthError` with messages about needing custom transports.
+**Expected behavior**: These providers are experimental and not yet usable. They raise `AuthError` **at construction time** — `Agent(auth="codex")` raises immediately, not at first request.
+
+```python
+from praisonaiagents import Agent
+
+Agent(name="t", auth="codex")
+# AuthError: Codex provider is experimental — needs Responses API transport wiring
+```
+
+### `AuthError: Unknown subscription provider`
+
+**Cause**: A typo or unregistered id in `auth=`. Valid ids are `claude-code`, `codex`, `gemini-cli`, and `qwen-cli`. The typo now surfaces at construction rather than silently billing your API key.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.auth.subscription.protocols import AuthError
+
+try:
+    Agent(name="t", llm="gpt-4o-mini", auth="nonexistent-provider")
+except AuthError as e:
+    print(e)
+# Unknown subscription provider 'nonexistent-provider'.
+# Registered: ['claude-code', 'codex', 'gemini-cli', 'qwen-cli']
+```
+
+### I passed a bare model name and it silently billed my API key
+
+**Cause**: Before [PR #4147](https://github.com/MervinPraison/PraisonAI/pull/4147), `auth=` was dropped when `llm=` was a bare model name (or omitted), so requests went out on `OPENAI_API_KEY`. This is fixed — upgrade `praisonai-agents` to a version that includes the fix and every `llm=` shape honours `auth=`.
+
+### Mixing an OpenAI model with subscription auth
+
+**Behavior**: Responses-API-eligible models (`gpt-4o*`, `o1`, `o3`, `openai/*`) with subscription auth now route to the subscription's vendor. The simpler path is to omit `llm=` and let the auto-default pick the right vendor for your seat.
 
 ### Token Detection Priority (Claude Pro)
 
