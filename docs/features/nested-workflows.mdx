@@ -373,6 +373,56 @@ flow = AgentFlow(steps=[
 flow.start("Do work in parallel — each branch retries independently")
 ```
 
+## Failure propagation in nested patterns
+
+As of PraisonAI [#4194](https://github.com/MervinPraison/PraisonAI/pull/4194), a failing step inside any nested pattern (`loop`, `parallel`, `when`/`if_`, `route`, `repeat`) propagates the same way it does at the top level: the run is marked `status="failed"` and the exception text is never handed forward as the next step's input.
+
+```mermaid
+flowchart TD
+    Step[⚙️ Nested step raises] --> Check{on_error?}
+    Check -->|stop default| Abort[🛑 Propagate stop → workflow aborts]
+    Check -->|continue| Next[▶️ Next step runs]
+    Abort --> Failed[❌ status = failed]
+    Next --> Failed
+
+    classDef step fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef cfg fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    class Step step
+    class Check cfg
+    class Abort,Next warn
+    class Failed warn
+```
+
+- **`on_error="stop"` (the `Task` default)** — a failing inner step raises a `stop` signal that the pattern executor propagates all the way out to the top-level workflow. The enclosing workflow aborts, not just the pattern iteration, and downstream top-level steps do not run.
+- **`on_error="continue"`** — the workflow keeps going past the failing step, but the final `result["status"]` is `"failed"`, and the error is not fed forward to the next step.
+
+<Warning>
+Runs that previously reported `completed` while containing a failed step now correctly report `failed`. See PR [#4194](https://github.com/MervinPraison/PraisonAI/pull/4194) — the old behaviour silently swallowed nested failures.
+</Warning>
+
+```python
+from praisonaiagents import Task, AgentFlow, WorkflowContext, StepResult, loop
+
+def boom(ctx: WorkflowContext) -> StepResult:
+    raise RuntimeError("boom")
+
+def after(ctx: WorkflowContext) -> StepResult:
+    return StepResult(output="this never runs")
+
+workflow = AgentFlow(
+    steps=[
+        loop(steps=[Task(name="boom", handler=boom, max_retries=0)], over="items"),
+        Task(name="after", handler=after),
+    ],
+    variables={"items": ["only"]},
+)
+result = workflow.start("go")
+
+print(result["status"])                                     # "failed"
+print(any(s["step"] == "after" for s in result["steps"]))   # False — stop propagated out
+```
+
 ## Depth Limit Protection
 
 <Warning>
@@ -414,9 +464,9 @@ except ValueError as e:
   </Accordion>
   
   <Accordion title="Handle Errors Gracefully">
-    Add error handling in your step functions to prevent one failed item from stopping the entire workflow.
+    Add error handling in your step functions if you want per-item recovery inside a loop.
 
-    When an iteration inside `loop(parallel=True)` raises, that iteration is replaced with `{"step": "loop_{idx}", "output": "Error: {e}"}` and the loop continues — the other iterations are not aborted. The error is logged as `Parallel loop iteration {idx} failed: {e}`. Add try/except inside your step function if you need per-item recovery beyond this default (e.g. to convert an error into a valid `StepResult` that downstream steps can consume normally).
+    As of PraisonAI [#4194](https://github.com/MervinPraison/PraisonAI/pull/4194), a raising iteration inside `loop(parallel=True)` is recorded as `{"step": "loop_{idx}", "output": None, "error": str(e)}` — the exception text is no longer folded into `output`. The run is marked `status="failed"` as soon as any iteration fails, even if the loop keeps processing later items. Sequential loop iterations now honour `on_error="stop"` (the `Task` default): a failing step halts the current iteration and, via the propagated stop signal, the enclosing workflow, so downstream top-level steps do not run. Add try/except inside your step function only when you want to convert an error into a valid `StepResult` that downstream steps can consume normally.
   </Accordion>
 </AccordionGroup>
 
