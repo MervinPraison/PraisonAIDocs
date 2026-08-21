@@ -200,6 +200,26 @@ class ToolCall:
     type: str
     function: Dict[str, Any]
 
+def _extract_tool_call_name_and_args(tool_call):
+    """Parse a tool call's function name and JSON arguments.
+
+    Handles both the ToolCall dataclass and OpenAI-SDK objects. Returns a
+    tuple of (name, args, tool_call_id, err); err is None on success and the
+    caught exception otherwise. Callers keep their own failure handling.
+    """
+    tool_call_id = tool_call.id if hasattr(tool_call, 'id') else tool_call.get('id')
+    function_name = None
+    try:
+        if isinstance(tool_call, ToolCall):
+            function_name = tool_call.function["name"]
+            raw_arguments = tool_call.function["arguments"]
+        else:
+            function_name = tool_call.function.name
+            raw_arguments = tool_call.function.arguments
+        return function_name, json.loads(raw_arguments), tool_call_id, None
+    except (json.JSONDecodeError, KeyError, AttributeError, TypeError) as e:
+        return function_name, None, tool_call_id, e
+
 def process_stream_chunks(chunks):
     """Process streaming chunks into combined response"""
     if not chunks:
@@ -1906,13 +1926,19 @@ class OpenAIClient:
                 # replies for this turn (keeps tool replies consecutive).
                 _deferred_media_followups = []
                 for tool_call in tool_calls:
-                    # Handle both ToolCall dataclass and OpenAI object
-                    if isinstance(tool_call, ToolCall):
-                        function_name = tool_call.function["name"]
-                        arguments = json.loads(tool_call.function["arguments"])
-                    else:
-                        function_name = tool_call.function.name
-                        arguments = json.loads(tool_call.function.arguments)
+                    # Handle both ToolCall dataclass and OpenAI object.
+                    # Guard the parse itself so malformed/truncated argument
+                    # JSON is reported back to the model instead of aborting
+                    # the whole run (matches chat_completion_with_tools_stream).
+                    function_name, arguments, _tool_call_id, err = _extract_tool_call_name_and_args(tool_call)
+                    if err is not None:
+                        logging.warning(f"Failed to parse tool call arguments: {err}")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": _tool_call_id,
+                            "content": json.dumps({"error": f"Invalid arguments JSON: {err}"}),
+                        })
+                        continue
                     
                     # Always trigger callback for tool call tracking (even when verbose=False)
                     display_tool_call_fn = _get_display_tool_call()
@@ -1921,7 +1947,6 @@ class OpenAIClient:
                     # Capture failures and report them back to the model instead of
                     # aborting the whole run (safe-by-default, matching the streaming
                     # path chat_completion_with_tools_stream).
-                    _tool_call_id = tool_call.id if hasattr(tool_call, 'id') else tool_call.get('id')
                     try:
                         tool_result = execute_tool_fn(
                             function_name,
@@ -2209,13 +2234,19 @@ class OpenAIClient:
                 # replies for this turn (keeps tool replies consecutive).
                 _deferred_media_followups = []
                 for tool_call in tool_calls:
-                    # Handle both ToolCall dataclass and OpenAI object
-                    if isinstance(tool_call, ToolCall):
-                        function_name = tool_call.function["name"]
-                        arguments = json.loads(tool_call.function["arguments"])
-                    else:
-                        function_name = tool_call.function.name
-                        arguments = json.loads(tool_call.function.arguments)
+                    # Handle both ToolCall dataclass and OpenAI object.
+                    # Guard the parse itself so malformed/truncated argument
+                    # JSON is reported back to the model instead of aborting
+                    # the whole run (matches chat_completion_with_tools_stream).
+                    function_name, arguments, _tool_call_id, err = _extract_tool_call_name_and_args(tool_call)
+                    if err is not None:
+                        logging.warning(f"Failed to parse tool call arguments: {err}")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": _tool_call_id,
+                            "content": json.dumps({"error": f"Invalid arguments JSON: {err}"}),
+                        })
+                        continue
                     
                     # Always trigger callback for tool call tracking (even when verbose=False)
                     display_tool_call_fn = _get_display_tool_call()
@@ -2228,7 +2259,6 @@ class OpenAIClient:
                     # Capture failures and report them back to the model instead of
                     # aborting the whole run (safe-by-default, matching the streaming
                     # path chat_completion_with_tools_stream).
-                    _tool_call_id = tool_call.id if hasattr(tool_call, 'id') else tool_call.get('id')
                     try:
                         if asyncio.iscoroutinefunction(execute_tool_fn):
                             tool_result = await execute_tool_fn(
@@ -2451,16 +2481,14 @@ class OpenAIClient:
                     _deferred_media_followups = []
                     for tool_call in tool_calls:
                         # Handle both ToolCall dataclass and OpenAI object
-                        try:
-                            if isinstance(tool_call, ToolCall):
-                                function_name = tool_call.function["name"]
-                                arguments = json.loads(tool_call.function["arguments"])
-                            else:
-                                function_name = tool_call.function.name
-                                arguments = json.loads(tool_call.function.arguments)
-                        except json.JSONDecodeError as e:
+                        function_name, arguments, _, err = _extract_tool_call_name_and_args(tool_call)
+                        if err is not None:
+                            # Preserve original behaviour: only malformed JSON is
+                            # reported to the caller; other errors propagate.
+                            if not isinstance(err, json.JSONDecodeError):
+                                raise err
                             if verbose:
-                                yield f"\n[Error parsing arguments for {function_name if 'function_name' in locals() else 'unknown function'}: {str(e)}]"
+                                yield f"\n[Error parsing arguments for {function_name if function_name is not None else 'unknown function'}: {str(err)}]"
                             continue
                         
                         # Always trigger callback for tool call tracking (even when verbose=False)

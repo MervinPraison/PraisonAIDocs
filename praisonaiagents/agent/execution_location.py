@@ -58,7 +58,11 @@ _COMPUTE_ONLY_WORDS = {"local": "a plain shell on this machine (no policy applie
 # Tiers that separate a process but do NOT contain it. Verified: under the
 # subprocess backend, outbound network still works and ~/.ssh is readable even
 # though SecurityPolicy declares them blocked.
-_NOT_A_BOUNDARY = {"subprocess", "local", "native"}
+# `native` is deliberately absent: it aliases sandlock, which applies Landlock,
+# seccomp, a scrubbed environment and deny-all networking. Listing it here made
+# tools_run_on="native" and tools_run_on="sandlock" -- the same backend --
+# disagree about whether they contain anything.
+_NOT_A_BOUNDARY = {"subprocess", "local"}
 
 
 def say_place(name: Any, *, via: str = "sandbox") -> str:
@@ -83,7 +87,23 @@ def say_place(name: Any, *, via: str = "sandbox") -> str:
         return _COMPUTE_ONLY_WORDS[name.lower()]
     key = str(name).lower()
     key = _ALIASES.get(key, key)
-    return _PLACE_WORDS.get(key, str(name))
+
+    known = _PLACE_WORDS.get(key)
+    if known:
+        return known
+
+    # A place contributed by another package can name itself; the bare name is
+    # the last resort rather than the only option, because the phrase table is
+    # a literal that cannot know about packages installed later.
+    try:
+        from ..managed._compute_bridge import contributed_display_name
+
+        declared = contributed_display_name(key)
+        if declared:
+            return declared
+    except Exception:
+        pass
+    return str(name)
 
 
 def _backend_places(backend: Any) -> Optional[Dict[str, str]]:
@@ -93,7 +113,7 @@ def _backend_places(backend: Any) -> Optional[Dict[str, str]]:
 
     # Ask the backend what it is, rather than guessing from its class name.
     # Name-matching missed any backend that did not happen to contain "Hosted"
-    # or "Anthropic" -- a self-hosted DockerManagedAgent reported that it was
+    # or "Anthropic" -- a self-hosted docker backend reported that it was
     # thinking on this machine while the whole loop ran in a container.
     declared = getattr(backend, "provider_name", None)
     if isinstance(declared, str):

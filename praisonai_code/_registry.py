@@ -8,8 +8,9 @@ based plugin discovery with thread-safe registration and dependency injection.
 from __future__ import annotations
 
 import threading
+import warnings
 from importlib.metadata import entry_points
-from typing import Callable, Dict, Generic, Optional, Type, TypeVar
+from typing import Callable, Dict, Generic, Iterable, Optional, Type, TypeVar
 import logging
 
 T = TypeVar("T")
@@ -35,7 +36,8 @@ class PluginRegistry(Generic[T]):
         *,
         entry_point_group: str,
         builtins: Optional[Dict[str, Callable[[], Type[T]]]] = None,
-        discover_entry_points: bool = True
+        discover_entry_points: bool = True,
+        legacy_entry_point_groups: Iterable[str] = (),
     ) -> None:
         """Initialize the registry.
         
@@ -47,19 +49,35 @@ class PluginRegistry(Generic[T]):
                 Pass False to build an isolated registry that only contains the
                 supplied builtins / explicitly registered plugins (useful for
                 opt-out and deterministic tests).
+            legacy_entry_point_groups: Deprecated spellings of
+                ``entry_point_group`` that are still honoured. Plugins found
+                only under a legacy group are registered and a
+                ``DeprecationWarning`` naming the canonical group is emitted.
+                The canonical group always wins on a name clash.
         """
         self._entry_point_group = entry_point_group
+        self._legacy_entry_point_groups = tuple(legacy_entry_point_groups)
         self._loaders: Dict[str, Callable[[], Type[T]]] = {}  # lazy loaders
         self._items: Dict[str, Type[T]] = {}  # resolved cache
         self._aliases: Dict[str, str] = {}  # alias -> canonical name
         self._lock = threading.RLock()  # Use RLock for re-entrant access
+        # Names this package ships as builtins. Entry-point discovery must never
+        # replace one: an installed third-party distribution declaring a built-in
+        # name would otherwise take over that name on every surface, with no
+        # warning (the loaders behind ``sandbox``/``managed_backends`` decide
+        # where user code runs). Runtime ``register()`` may still override — that
+        # is deliberate dependency injection, not silent registration order.
+        self._builtin_names: set[str] = set()
         
         # Store built-in loaders (normalized) without calling them
         if builtins:
             for name, loader in builtins.items():
                 self._add_loader(name, loader)
+                self._builtin_names.add(name.lower())
         
         if discover_entry_points:
+            # Legacy groups first so the canonical spelling wins on a clash.
+            self._discover_legacy_entry_points()
             self._discover_entry_points()
 
     def _add_loader(self, name: str, loader: Callable[[], Type[T]]) -> None:
@@ -71,10 +89,51 @@ class PluginRegistry(Generic[T]):
         """Discover entry point loaders without loading them."""
         try:
             for ep in entry_points(group=self._entry_point_group):
+                if ep.name.lower() in self._builtin_names:
+                    # Packages legitimately re-declare their own builtins as
+                    # entry points for external discoverability, so a collision
+                    # here is expected on a stock install -> DEBUG, not WARNING.
+                    logger.debug(
+                        "Entry point %r in group %s matches a built-in loader; "
+                        "keeping the built-in.",
+                        ep.name,
+                        self._entry_point_group,
+                    )
+                    continue
                 self._add_loader(ep.name, ep.load)
         except Exception:
             # entry_points() might not be available in older Python versions
             logger.debug("Entry points not available for group %s", self._entry_point_group)
+
+    def _discover_legacy_entry_points(self) -> None:
+        """Discover plugins published under a deprecated group spelling."""
+        for group in self._legacy_entry_point_groups:
+            try:
+                discovered = list(entry_points(group=group))
+            except Exception:
+                logger.debug("Entry points not available for group %s", group)
+                continue
+            for ep in discovered:
+                warnings.warn(
+                    f"Entry-point group {group!r} is deprecated (found plugin "
+                    f"{ep.name!r}); publish it under {self._entry_point_group!r} "
+                    "instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                if ep.name.lower() in self._builtin_names:
+                    # Same rule as the canonical path: a third-party distribution
+                    # must never replace a built-in, whichever group it publishes
+                    # under. Legacy discovery runs first, so without this the
+                    # deprecated spelling is a bypass for the guard.
+                    logger.debug(
+                        "Legacy entry point %r in group %s matches a built-in "
+                        "loader; keeping the built-in.",
+                        ep.name,
+                        group,
+                    )
+                    continue
+                self._add_loader(ep.name, ep.load)
 
     def register(
         self, 

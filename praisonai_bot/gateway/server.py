@@ -4207,7 +4207,10 @@ class WebSocketGateway:
         # zero-cost, sub-second notification forwarding. Independent of
         # ``action`` so it composes with either.
         if getattr(hook, "deliver_only", False):
-            message = hook.resolve_message(payload) or ""
+            # No agent consumes this turn — the rendered message is delivered
+            # verbatim to the channel. Skip the untrusted-request fence so the
+            # recipient never sees literal ``<external_request_payload>`` markup.
+            message = hook.resolve_message(payload, fence=False) or ""
             if not hook.deliver_to:
                 return {
                     "ok": False,
@@ -5160,8 +5163,13 @@ class WebSocketGateway:
 
     async def _deliver_scheduled_result(
         self, delivery: Any, text: str,
-    ) -> None:
+    ) -> bool:
         """Route a scheduled job result to the correct channel bot.
+
+        Returns whether the payload actually reached the target. Returning
+        ``None`` on every path (issue #4193) made "the handler did not raise"
+        the success signal, so a routing failure was recorded as a successful
+        delivery. ``True`` means delivered, ``False`` means it did not.
 
         Args:
             delivery: A ``DeliveryTarget`` with ``channel`` and ``channel_id``.
@@ -5174,7 +5182,7 @@ class WebSocketGateway:
 
         if not channel or not channel_id:
             logger.warning("Delivery target missing channel or channel_id, skipping")
-            return
+            return False
 
         router = self.delivery_router
         if router is not None:
@@ -5223,7 +5231,7 @@ class WebSocketGateway:
                 logger.error(
                     "Failed to deliver scheduled result to %s:%s", channel, channel_id,
                 )
-            return
+            return bool(delivered)
 
         # Fallback: router unavailable — preserve the prior bare-send behaviour.
         bot = self.get_channel_bot(channel)
@@ -5238,7 +5246,7 @@ class WebSocketGateway:
             logger.warning(
                 "No channel bot '%s' found for scheduled delivery", channel,
             )
-            return
+            return False
 
         try:
             await bot.send_message(
@@ -5253,6 +5261,8 @@ class WebSocketGateway:
             logger.error(
                 "Failed to deliver to %s:%s: %s", channel, channel_id, e,
             )
+            return False
+        return True
 
     def _seed_continuable_session(self, delivery: Any, text: str) -> None:
         """Seed a resumable session so a reply to a delivered brief has context.
@@ -5379,6 +5389,38 @@ class WebSocketGateway:
         # issue #3231); any other status is a genuine miss for this key.
         return outbox.status_for(idem) == "sent"
 
+    def _build_run_policy(self) -> Optional[Any]:
+        """Construct the unattended-run safety policy for scheduled jobs.
+
+        Returns a ``RunPolicy`` with fail-closed defaults (deliver-on-failure,
+        prompt scan, denied toolsets) so scheduled runs are protected out of the
+        box. Optional ``gateway.yaml`` overrides live under a ``scheduler:``
+        block (``deliver_on_failure``, ``denied_toolsets``, ``audit_dir``).
+        Returns ``None`` only when the wrapper policy module is not co-installed,
+        preserving today's no-policy behaviour in that minimal deployment.
+        """
+        try:
+            from praisonai.scheduler.run_policy import (
+                DEFAULT_DENIED_TOOLSETS,
+                RunPolicy,
+            )
+        except ImportError as e:  # pragma: no cover - wrapper not co-installed
+            logger.debug("RunPolicy unavailable, scheduler runs unguarded: %s", e)
+            return None
+
+        cfg = (self._loaded_config or {}).get("scheduler", {}) or {}
+        denied = cfg.get("denied_toolsets")
+        denied_toolsets = (
+            set(denied) if isinstance(denied, (list, tuple, set))
+            else set(DEFAULT_DENIED_TOOLSETS)
+        )
+        return RunPolicy(
+            deliver_on_failure=bool(cfg.get("deliver_on_failure", True)),
+            scan_assembled_prompt=bool(cfg.get("scan_prompt", True)),
+            denied_toolsets=denied_toolsets,
+            audit_dir=cfg.get("audit_dir"),
+        )
+
     def _start_scheduler_tick(self, interval: float = 15.0) -> None:
         """Start a background task that polls the scheduler for due jobs.
 
@@ -5386,6 +5428,7 @@ class WebSocketGateway:
         - a ``ScheduleRunner`` with the canonical default store
         - this gateway's agent registry for resolution
         - ``_deliver_scheduled_result`` for outbound delivery
+        - a default ``RunPolicy`` so unattended runs are guarded
         """
         async def _run():
             try:
@@ -5413,8 +5456,23 @@ class WebSocketGateway:
                 runner=runner,
                 agent_resolver=_resolve_agent,
                 delivery_handler=self._deliver_scheduled_result,
+                run_policy=self._build_run_policy(),
             )
-            await executor.run_loop(interval=interval)
+            # Refresh the policy each tick from the (possibly hot-reloaded)
+            # config so a live change to the ``scheduler:`` block — delivery,
+            # prompt scan, denied toolsets, audit dir — applies on the next tick
+            # without a process restart. ``_build_run_policy`` reads the current
+            # ``_loaded_config``; rebuilding is cheap (a small dataclass) and
+            # keeps a long-lived gateway from pinning stale unattended-run
+            # settings. Falls back to ``run_loop`` when the executor predates
+            # per-tick policy refresh.
+            try:
+                while True:
+                    executor._run_policy = self._build_run_policy()
+                    await executor.tick_all()
+                    await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                pass
 
         self._scheduler_task = asyncio.create_task(_run())
         logger.info("Scheduler tick started (interval=15s)")
@@ -7152,7 +7210,11 @@ class WebSocketGateway:
             if env_val:
                 init_kwargs[param] = env_val
         for key, value in ch_cfg.items():
-            if key in ("platform", "token"):
+            # ``platform``/``token`` are wired explicitly above; ``adapter`` is a
+            # loader-only YAML import ref (Issue #4104) that self-registers the
+            # class — it must never reach the adapter constructor, whose
+            # signature does not accept it.
+            if key in ("platform", "token", "adapter"):
                 continue
             init_kwargs[key] = value
 

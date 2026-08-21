@@ -124,6 +124,7 @@ from ..config.param_resolver import resolve, ArrayMode
 from ..config.presets import (
     OUTPUT_PRESETS, EXECUTION_PRESETS, MEMORY_PRESETS, MEMORY_URL_SCHEMES,
     WEB_PRESETS, PLANNING_PRESETS, REFLECTION_PRESETS, CACHING_PRESETS,
+    CONTEXT_PRESETS, AUTONOMY_PRESETS,
     DEFAULT_OUTPUT_MODE,
 )
 from ..config.feature_configs import (
@@ -137,6 +138,64 @@ from ..config.feature_configs import (
 # Single source of truth defined in config.feature_configs and imported here
 # (re-exported for backward compatibility) so OutputConfig.tool_output_limit,
 # ToolConfig.output_limit, and this constant cannot drift apart.
+
+# ============================================================================
+# Preset-string validation
+# ============================================================================
+# Agent params whose string form must name a preset from a CLOSED set. Each
+# entry maps the param name to a zero-arg callable returning the accepted
+# names, so registries outside praisonaiagents.config stay lazily imported —
+# the table is only consulted when the caller actually passed a string.
+#
+# Deliberately NOT listed (their string form is free-form, not a preset):
+#   knowledge= (source path/URL), guardrails= (LLM validator prompt),
+#   skills= (skill path/name), runtime= (open plugin registry), auth= (open
+#   provider registry validated loudly at use time).
+def _approval_preset_names():
+    """Accepted approval= strings: deny-set presets + PermissionMode aliases."""
+    from ..approval.registry import PERMISSION_PRESETS
+    from ..permissions.rules import _MODE_ALIASES
+    # "true"/"false" are legacy stringified bools accepted by the branch below.
+    return set(PERMISSION_PRESETS) | set(_MODE_ALIASES) | {"true", "false"}
+
+
+_PRESET_STRING_PARAMS = {
+    "output": lambda: OUTPUT_PRESETS.keys(),
+    "execution": lambda: EXECUTION_PRESETS.keys(),
+    "context": lambda: CONTEXT_PRESETS.keys(),
+    "autonomy": lambda: AUTONOMY_PRESETS.keys(),
+    "approval": _approval_preset_names,
+    # Mirrors the LearnMode branch in __init__.
+    "learn": lambda: ("disabled", "agentic", "propose"),
+    # Mirrors the self-improve mode branch in __init__.
+    "self_improve": lambda: (
+        "inline", "blocking", "sync", "background", "async",
+        "true", "on", "yes", "1", "false", "off", "no", "0",
+    ),
+}
+
+
+def _validate_preset_params(params):
+    """Fail loudly on a typo'd preset name instead of silently using defaults.
+
+    Args:
+        params: Mapping of param name -> raw value. Non-string values are
+            ignored; string values must name a preset from the closed set
+            declared in ``_PRESET_STRING_PARAMS``.
+
+    Raises:
+        ValueError: With a "Did you mean ...?" suggestion and the valid names.
+    """
+    from ..config.parse_utils import validate_preset_string
+
+    for name, value in params.items():
+        if not isinstance(value, str):
+            continue
+        # output= doubles as an output-file path (output="report.md").
+        if name == "output" and _is_file_path(value):
+            continue
+        validate_preset_string(name, value, _PRESET_STRING_PARAMS[name]())
+
 
 class ServerRegistry:
     """Registry for API server state per-port."""
@@ -308,6 +367,15 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         ("OLLAMA_HOST", "ollama/llama3.2"),
     )
 
+    # Default model per subscription auth provider, used only when the caller
+    # gave `auth=` without a model. A subscription seat is tied to one vendor,
+    # so the plain OpenAI default would ship the OAuth token to the wrong
+    # endpoint. Overridable by passing model=/llm=.
+    _AUTH_DEFAULT_MODELS = {
+        "claude-code": "anthropic/claude-sonnet-4-5",
+        "qwen-cli": "openai/qwen3-coder-plus",
+    }
+
     @classmethod
     def _resolve_default_model(cls):
         """Resolve a provider-aware default model from present credentials.
@@ -335,6 +403,33 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     cls._default_model_checked = True
         return cls._default_model
     
+    def _apply_default_llm(self, model) -> None:
+        """Adopt a container-level default model, unless this agent chose one.
+
+        ``AgentTeam(llm=...)`` and ``AgentFlow(llm=...)`` document their model as
+        the *default* for their agents. An agent that named its own model keeps
+        it -- that is already how AgentFlow builds the agents it creates
+        (``llm=config.get("llm", model)``), so both containers follow one rule.
+        """
+        if not model or self._llm_explicit or self._panel_descriptor is not None:
+            return
+        self.llm = model
+        self._llm_instance = None
+        # A used agent caches a dispatcher (chat_mixin) bound to the old model --
+        # the OpenAI path bakes model= into it, the custom path wraps the old
+        # llm_instance. Drop it so the next chat rebuilds against the new model.
+        if getattr(self, '_unified_dispatcher', None) is not None:
+            self._unified_dispatcher = None
+        if self._llm_init_params is not None:
+            # base_url path: keep the connection settings, swap the model.
+            self._llm_init_params = {**self._llm_init_params, 'model': model}
+        elif isinstance(model, str) and "/" in model:
+            params = {'model': model, **self._llm_option_kwargs}
+            if self.api_key:
+                params['api_key'] = self.api_key
+            self._llm_init_params = params
+            self._using_custom_llm = True
+
     def _ensure_llm_instance(self):
         """Lazy-create LLM instance from deferred init params (avoids import at Agent())."""
         if self._llm_instance is not None:
@@ -945,7 +1040,20 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # Uses unified resolver: Instance > Config > Array > String > Bool > Default
         # Note: Imports moved to module level for performance
         # ============================================================
-        
+        # Reject a typo'd preset name (e.g. output="streem", approval="read_onl")
+        # before any of the fast paths below silently fall back to defaults.
+        # memory/planning/reflection/web/caching/tool_search already raise via
+        # their own resolvers; this covers the params that did not.
+        _validate_preset_params({
+            "output": output,
+            "execution": execution,
+            "context": context,
+            "autonomy": autonomy,
+            "approval": approval,
+            "learn": learn,
+            "self_improve": self_improve,
+        })
+
         # Initialize extracted values with defaults
         user_id = None
         session_id = None
@@ -1366,13 +1474,18 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             elif isinstance(learn, dict):
                 _learn_config = LearnConfig(**learn)
             elif isinstance(learn, str):
-                # String mode: "disabled", "agentic", "propose"
+                # String mode: "disabled", "agentic", "propose".
+                # Normalise case/whitespace so this branch agrees with the
+                # closed-set validation in _validate_preset_params (which
+                # already accepted "AGENTIC"/" agentic "); otherwise a validated
+                # value would fall through to the else and silently disable.
                 from ..memory.learn.protocols import LearnMode
-                if learn == "disabled":
+                _learn_mode = learn.strip().lower()
+                if _learn_mode == "disabled":
                     _learn_config = None
-                elif learn == "agentic":
+                elif _learn_mode == "agentic":
                     _learn_config = LearnConfig(mode=LearnMode.AGENTIC)
-                elif learn == "propose":
+                elif _learn_mode == "propose":
                     _learn_config = LearnConfig(mode=LearnMode.PROPOSE)
                 else:
                     # Unknown string mode, disable learning
@@ -1504,15 +1617,40 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 knowledge = _knowledge_config
             elif isinstance(_knowledge_config, KnowledgeConfig):
                 embedder_config = _knowledge_config.embedder_config
-                if _knowledge_config.config:
-                    retrieval_config = _knowledge_config.config
-                else:
-                    retrieval_config = {
-                        'top_k': _knowledge_config.retrieval_k,
-                        'threshold': _knowledge_config.retrieval_threshold,
-                        'rerank': _knowledge_config.rerank,
-                        'rerank_model': _knowledge_config.rerank_model,
-                    }
+                # Every declared field is forwarded. Previously only top_k /
+                # rerank survived: 'threshold' was spelled 'min_score' by
+                # RetrievalConfig.from_dict, 'rerank_model' had no field at
+                # all, and chunking + vector_store were never forwarded, so
+                # those settings were silently inert.
+                _chunker = _knowledge_config.chunker or {}
+                _strategy = _knowledge_config.chunking_strategy
+                _strategy = getattr(_strategy, 'value', _strategy)
+                _vector_store = _knowledge_config.vector_store or {}
+                retrieval_config = {
+                    'enabled': _knowledge_config.auto_retrieve,
+                    'top_k': _knowledge_config.retrieval_k,
+                    'min_score': _knowledge_config.retrieval_threshold,
+                    'rerank': _knowledge_config.rerank,
+                    'rerank_model': _knowledge_config.rerank_model,
+                    'chunking_strategy': _chunker.get('type', _strategy),
+                    'chunk_size': _chunker.get('chunk_size', _knowledge_config.chunk_size),
+                    'chunk_overlap': _chunker.get(
+                        'chunk_overlap', _knowledge_config.chunk_overlap),
+                }
+                if _vector_store:
+                    _vs = dict(_vector_store)
+                    _vs_provider = _vs.pop('provider', None)
+                    if _vs_provider:
+                        retrieval_config['vector_store_provider'] = _vs_provider
+                    _vs_inner = _vs.pop('config', None)
+                    if isinstance(_vs_inner, dict):
+                        _vs.update(_vs_inner)
+                    if 'collection_name' in _vs:
+                        retrieval_config['collection_name'] = _vs.pop('collection_name')
+                    if 'path' in _vs:
+                        retrieval_config['persist_path'] = _vs.pop('path')
+                    if _vs:
+                        retrieval_config['vector_store_config'] = _vs
                 # Forward embedder settings so they reach Knowledge (mem0).
                 # embedder is a provider shorthand (e.g. "gemini"); embedder_config
                 # is the full mem0 embedder dict. Only override when explicitly set.
@@ -1520,6 +1658,11 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     retrieval_config.setdefault('embedder_provider', _knowledge_config.embedder)
                 if _knowledge_config.embedder_config:
                     retrieval_config.setdefault('embedder_config', _knowledge_config.embedder_config)
+                # `config=` is an escape hatch for keys the dataclass does not
+                # model. It now overrides the resolved values instead of
+                # replacing the whole dict, which silently reset retrieval_k.
+                if _knowledge_config.config:
+                    retrieval_config.update(_knowledge_config.config)
                 knowledge = _knowledge_config.sources if _knowledge_config.sources else None
             elif isinstance(_knowledge_config, list):
                 knowledge = _knowledge_config
@@ -1630,11 +1773,36 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             # String could be LLM prompt - passthrough for later processing
             _guardrails_config = guardrails
         else:
-            from ..config.param_resolver import resolve_guardrails as _resolve_guardrails
-            _guardrails_config = _resolve_guardrails(
-                value=guardrails,
-                config_class=GuardrailConfig,
-            )
+            # A protocol-conforming guardrail *object* (validate_input /
+            # validate_output / validate_tool_call) is not ``callable()``, so it
+            # used to fall straight through to the resolver, which returns None
+            # for an unknown object - the validator was silently discarded and
+            # the agent ran with zero enforcement. Adapt it into a
+            # ``GuardrailChain``, which is callable (so it satisfies the existing
+            # guardrail runner) and forwards every protocol method.
+            from ..guardrails.protocols import is_guardrail_object
+            if is_guardrail_object(guardrails):
+                from ..guardrails import GuardrailChain
+                _guardrails_config = GuardrailChain([guardrails])
+            elif isinstance(guardrails, (list, tuple)) and any(
+                is_guardrail_object(g) for g in guardrails
+            ):
+                _bad = [g for g in guardrails if not is_guardrail_object(g)]
+                if _bad:
+                    raise TypeError(
+                        "guardrails=[...] may not mix guardrail objects with "
+                        f"{[type(g).__name__ for g in _bad]}. Every item must implement "
+                        "validate_input/validate_output/validate_tool_call, or wrap the "
+                        "list yourself with GuardrailChain([...])."
+                    )
+                from ..guardrails import GuardrailChain
+                _guardrails_config = GuardrailChain(list(guardrails))
+            else:
+                from ..config.param_resolver import resolve_guardrails as _resolve_guardrails
+                _guardrails_config = _resolve_guardrails(
+                    value=guardrails,
+                    config_class=GuardrailConfig,
+                )
         
         # Same fail-loud guard for GuardrailConfig.policy/.policies passed
         # directly — those fields are never consumed downstream, so silently
@@ -1646,6 +1814,32 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 "GuardrailConfig.policy/.policies are not enforced. "
                 "Use Agent(policy=PolicyEngine(...)) for tool policy enforcement, "
                 "or pass a validator via GuardrailConfig(validator=...)."
+            )
+
+        # Fail loud when the value could not be turned into an enforceable
+        # guardrail, instead of storing something that never runs. Silently
+        # dropping a validator the caller explicitly asked for is a "safe by
+        # default" violation, same rationale as the policy-string guard above.
+        # An empty list/tuple resolves to None (no validator was actually
+        # supplied), which the resolver already treated as a no-op on main -
+        # keep that backward-compatible instead of raising on an empty opt-in.
+        _is_empty_guardrails = (
+            isinstance(guardrails, (list, tuple)) and len(guardrails) == 0
+        )
+        if (
+            guardrails is not None
+            and guardrails is not False
+            and not _is_empty_guardrails
+            and not (
+                callable(_guardrails_config)
+                or isinstance(_guardrails_config, (GuardrailConfig, str))
+            )
+        ):
+            raise TypeError(
+                f"guardrails={guardrails!r} (type {type(guardrails).__name__}) is not a "
+                "supported guardrail. Pass a validator callable taking one TaskOutput, an "
+                "object implementing validate_input/validate_output/validate_tool_call, a "
+                "list of such objects, a GuardrailConfig, or a string LLM-validation prompt."
             )
 
         if _guardrails_config is not None:
@@ -1788,14 +1982,23 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 redact_secrets=_tool_config.redact_secrets
             )
         
-        # Gap 2: Store parallel tool calls setting for ToolCallExecutor selection
-        self.parallel_tool_calls = _tool_config.parallel if _tool_config else parallel_tool_calls
+        # Gap 2: one setting, two spellings. ExecutionConfig.parallel_tool_calls
+        # is the source of truth (it is what chat/achat/iter_stream forward to
+        # the LLM); ToolConfig.parallel is a deprecated alias that feeds it.
+        self.parallel_tool_calls, _exec_config = Agent._merge_parallel_tool_calls(
+            _tool_config, _exec_config
+        )
         # G2: Store interrupt controller for cooperative cancellation
         self.interrupt_controller = interrupt_controller
         # Check for model name in environment variable if not provided
         self._using_custom_llm = False
         self._llm_instance = None
         self._llm_init_params = None
+        # Did the caller name a model? Recorded before llm/model are normalised
+        # so a container-level default (AgentTeam(llm=)/AgentFlow(llm=)) can fill
+        # in agents that never chose one without overriding those that did.
+        # auth= pins the vendor too, so it counts as an explicit choice.
+        self._llm_explicit = llm is not None or model is not None or auth is not None
         self._panel_descriptor = None
         self._panel_llm_kwargs = {}
         # Flag to track if final result has been displayed to prevent duplicates
@@ -1855,6 +2058,20 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             else:
                 llm = model  # model= takes precedence
         
+        # Resolve the subscription auth provider eagerly. `auth=` is opt-in, so
+        # this costs nothing for everyone else, and a user who asked to be
+        # billed against a subscription must never be silently downgraded to
+        # API-key billing: an unknown id, an unusable provider or missing
+        # credentials all have to fail at construction, not at request time
+        # where the surrounding error handling turns them into a None result.
+        if auth is not None:
+            from ..auth import resolve_subscription_credentials
+            resolve_subscription_credentials(auth)
+            # A subscription seat is tied to one vendor, so the OpenAI default
+            # model would ship the provider's OAuth token to the wrong endpoint.
+            if llm is None:
+                llm = self._AUTH_DEFAULT_MODELS.get(auth) or llm
+        
         # Store rate limiter (optional, zero overhead when None).
         # Auto-build a RateLimiter from max_rpm when no explicit limiter is
         # provided so ExecutionConfig(max_rpm=N) actually throttles requests.
@@ -1870,9 +2087,11 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         self._openai_base_url = base_url
         self.__openai_client = None
         
-        # Expose base_url and api_key as properties for tests
+        # Expose base_url, api_key and auth as properties for tests and for
+        # clone_for_channel(), which serialises them back into the constructor.
         self.base_url = base_url
         self.api_key = api_key
+        self.auth = auth
 
         # Resolve Agent(retry=...) into LLM init kwargs so the custom-LLM path
         # (any "provider/model", dict, or base_url config) honours it, instead of
@@ -1887,6 +2106,19 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             _retry_init_params = {'max_retries': _rc.max_retries}
         elif retry is False:
             _retry_init_params = {'max_retries': 0}
+
+        # Connection/execution options that every LLM construction branch
+        # forwards. Kept so a container default applied after construction
+        # (_apply_default_llm) builds the same LLM the constructor would have.
+        self._llm_option_kwargs = {
+            'metrics': metrics,
+            'max_iter': max_iter,
+            'web_search': web_search,
+            'web_fetch': web_fetch,
+            'prompt_caching': prompt_caching,
+            'claude_memory': claude_memory,
+            **_retry_init_params,
+        }
 
         # Panel (multi-model) descriptor: "panel:<name>" or {"provider": "panel"}.
         # Resolved lazily into a PanelLLM; composes with the normal tool loop.
@@ -1988,7 +2220,26 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 self.tools = tools
         # Otherwise, fall back to OpenAI environment/name (cached for performance)
         else:
-            self.llm = llm or Agent._get_default_model()
+            model_name = llm or Agent._get_default_model()
+            if auth:
+                # A subscription auth provider only takes effect inside LLM
+                # (which injects the resolved OAuth credentials), so a bare
+                # model name plus auth= must still build an LLM instance rather
+                # than falling through to the plain OpenAI client.
+                llm_params = {'model': model_name, 'auth': auth}
+                if api_key:
+                    llm_params['api_key'] = api_key
+                llm_params['metrics'] = metrics
+                llm_params['web_search'] = web_search
+                llm_params['web_fetch'] = web_fetch
+                llm_params['prompt_caching'] = prompt_caching
+                llm_params['claude_memory'] = claude_memory
+                llm_params['max_iter'] = max_iter
+                if _retry_init_params:
+                    llm_params.update(_retry_init_params)
+                self._llm_init_params = llm_params
+                self._using_custom_llm = True
+            self.llm = model_name
         
         # Store fallback models for resilience (defensive copy to avoid external mutations)
         self.fallback_models = list(fallback_models) if fallback_models else []
@@ -2001,11 +2252,10 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             # Single tool name string - resolve from registry
             self.tools = self._resolve_tool_names([tools])
         elif isinstance(tools, (list, tuple)):
-            # Check if list contains strings (tool names) that need resolution
-            if tools and all(isinstance(t, str) for t in tools):
-                self.tools = self._resolve_tool_names(tools)
-            else:
-                self.tools = list(tools)
+            # Resolve tool-name strings PER ELEMENT. An all-or-nothing `all(...)`
+            # test silently left every name unresolved as soon as one callable
+            # was present, so `tools=[my_tool, 'read_file']` dropped 'read_file'.
+            self.tools = self._resolve_tools_list(tools)
         else:
             self.tools = tools or []
         
@@ -2222,7 +2472,13 @@ Your Goal: {self.goal}
             # unchanged; anything else falls through to the canonical
             # PermissionMode resolver, so all spellings share one model.
             from ..approval.registry import PERMISSION_PRESETS
-            preset_deny = PERMISSION_PRESETS.get(approval.strip().lower())
+            # Normalise -/_ too so "read-only" hits the deny-set preset instead
+            # of falling through to PermissionMode.resolve (which returns None
+            # for deny-set names), which would silently produce an EMPTY deny
+            # set — the exact read-only-sandbox bypass this validation prevents.
+            preset_deny = PERMISSION_PRESETS.get(
+                approval.strip().lower().replace("-", "_")
+            )
             self._approval_backend = None
             self._approve_all_tools = False
             self._approval_timeout = 0
@@ -2590,6 +2846,47 @@ Your Goal: {self.goal}
             )
 
     @staticmethod
+    def _merge_parallel_tool_calls(tool_config, exec_config):
+        """Merge the two spellings of "run batched tool calls in parallel".
+
+        ``ExecutionConfig.parallel_tool_calls`` is the single source of truth:
+        it is the value ``chat()``, ``achat()`` and ``iter_stream()`` forward to
+        the LLM. ``ToolConfig.parallel`` is a deprecated alias -- ``None`` means
+        "not set here", an explicit ``True``/``False`` feeds the source of truth.
+
+        Returns ``(resolved_bool, exec_config)``. The ExecutionConfig is copied
+        (never mutated) when the alias contributes a value, so a config instance
+        shared between agents is not rewritten behind the caller's back.
+        """
+        alias = getattr(tool_config, 'parallel', None) if tool_config is not None else None
+        current = bool(getattr(exec_config, 'parallel_tool_calls', False))
+        if alias is None:
+            return current, exec_config
+        alias = bool(alias)
+        if alias == current:
+            return current, exec_config
+        # The two spellings disagree. Only raise when the source of truth was set
+        # *explicitly* -- an omitted ExecutionConfig.parallel_tool_calls (its bool
+        # default) must not masquerade as a real value, or an explicit
+        # ToolConfig(parallel=False) would be silently overridden (and vice versa).
+        explicit = getattr(exec_config, '_parallel_tool_calls_explicit', current)
+        if explicit:
+            raise TypeError(
+                f"Agent(tool_config=ToolConfig(parallel={alias}), "
+                f"execution=ExecutionConfig(parallel_tool_calls={current})) is not "
+                "valid: both name the same setting and they disagree.\n"
+                "  ToolConfig.parallel is a deprecated alias for "
+                "ExecutionConfig.parallel_tool_calls.\n"
+                "  To run batched tool calls in parallel:  "
+                "Agent(execution=ExecutionConfig(parallel_tool_calls=True))\n"
+                "  To run them sequentially (the default): drop both spellings."
+            )
+        import copy as _copy
+        exec_config = _copy.copy(exec_config)
+        exec_config.parallel_tool_calls = alias
+        return alias, exec_config
+
+    @staticmethod
     def _resolve_tool_config(tool_config):
         """Resolve tool_config parameter with backward compatibility."""
         # Import here to avoid circular imports
@@ -2714,9 +3011,16 @@ Your Goal: {self.goal}
             # Drop framework-generated sandbox tools: they close over the source
             # agent, so the constructor must regenerate clone-bound replacements
             # (see the sandbox wiring below). User tools with colliding names
-            # lack the tag and are preserved.
+            # lack the tag and are preserved. as_tool() handoff closures also
+            # close over the source agent; swap each back for its source Handoff
+            # so the clone's _process_handoffs rebinds it to the clone instead of
+            # delegating with the original agent's history/tools/memory.
             'tools': (
-                [t for t in self.tools if not getattr(t, "_praison_sandbox_tool", False)]
+                [
+                    getattr(t, "_praison_handoff_source", t)
+                    for t in self.tools
+                    if not getattr(t, "_praison_sandbox_tool", False)
+                ]
                 if self.tools else None
             ),
             
@@ -5480,6 +5784,8 @@ Summary:"""
                 "to persist/share memory across runs.", mem_user_id,
             )
         
+        from ..memory.adapters.registry import resolve_memory_adapter_name as _resolve_memory_adapter_name
+
         if memory is True or memory == "file":
             # Use FileMemory (zero dependencies)
             from ..memory.file_memory import FileMemory
@@ -5487,11 +5793,15 @@ Summary:"""
                 user_id=mem_user_id,
                 verbose=1 if getattr(self, 'verbose', False) else 0
             )
-        elif isinstance(memory, str) and memory in ("sqlite", "chromadb", "mem0", "mongodb", "redis", "postgres"):
-            # Use full Memory class with specific provider
+        elif isinstance(memory, str) and _resolve_memory_adapter_name(memory):
+            # Full Memory class, backend name passed through untouched.
+            # Rewriting "sqlite" -> "rag" here made memory="sqlite" build a
+            # ChromaDB store while Memory({"provider": "sqlite"}) built a real
+            # SQLite one. The accepted set now comes from the registry, so
+            # register_memory_adapter() backends are reachable from here.
             try:
                 from ..memory.memory import Memory
-                config = {"provider": memory if memory != "sqlite" else "rag"}
+                config = {"provider": _resolve_memory_adapter_name(memory)}
                 self._memory_instance = Memory(config)
             except ImportError:
                 logging.warning(f"Memory provider '{memory}' requires additional dependencies. Falling back to FileMemory.")
@@ -6090,6 +6400,10 @@ Answer:"""
 
     def _setup_guardrail(self):
         """Setup the guardrail function based on the provided guardrail parameter."""
+        # ``tool_execution._check_tool_policy_and_guardrails`` reads
+        # ``self._tool_call_guardrails`` but nothing ever assigned it, so the
+        # whole ``validate_tool_call`` surface was dead code. Always define it.
+        self._tool_call_guardrails = []
         if self.guardrail is None:
             self._guardrail_fn = None
             return
@@ -6154,14 +6468,50 @@ Answer:"""
         else:
             raise ValueError("Agent guardrail must be either a callable or a string description")
 
+        # Register the tool-call surface when the guardrail actually exposes one.
+        # Output-only (string/LLM) guardrails are excluded on purpose: running an
+        # LLM validation before every tool call would be a hot-path regression,
+        # the same reasoning that keeps them out of the input gate above.
+        _fn = self._guardrail_fn
+        if (
+            _fn is not None
+            and callable(getattr(_fn, "validate_tool_call", None))
+            and not getattr(_fn, "_praison_output_only", False)
+        ):
+            self._tool_call_guardrails = [_fn]
+
     def _process_handoffs(self):
         """Process handoffs and convert them to tools that can be used by the agent."""
-        if not self.handoffs:
-            return
-            
         # Import here to avoid circular imports
         from .handoff import Handoff
-        
+
+        # as_tool() returns a Handoff, and its own docstring passes the result in
+        # tools=[...]. tools= stores objects verbatim, so an unconverted Handoff
+        # is invisible to both the LLM tool schema and execute_tool(). Convert in
+        # place here -- the first point where the parent agent that
+        # to_tool_function() needs actually exists.
+        if isinstance(self.tools, list):
+            for index, tool_item in enumerate(self.tools):
+                if isinstance(tool_item, Handoff):
+                    try:
+                        tool_func = tool_item.to_tool_function(self)
+                        # Retain the source Handoff so clone_for_channel() can
+                        # rebind it to the clone. The generated closure captures
+                        # THIS agent (its chat_history/tools/memory); a shallow
+                        # clone that copied the closure verbatim would delegate
+                        # using the original agent's state, leaking one channel's
+                        # context into another.
+                        tool_func._praison_handoff_source = tool_item
+                        self.tools[index] = tool_func
+                    except Exception as e:
+                        logging.error(
+                            f"Failed to convert as_tool()/handoff {tool_item} "
+                            f"passed in tools=: {e}"
+                        )
+
+        if not self.handoffs:
+            return
+
         for handoff_item in self.handoffs:
             try:
                 if isinstance(handoff_item, Handoff):
@@ -6685,14 +7035,46 @@ Answer:"""
         backend = cli_backend or self._cli_backend
         if not backend:
             raise RuntimeError("CLI backend not configured")
-        
+
+        # Bound before the try so the failure hook can carry the backend's
+        # result (and its audit metadata) when execution returned an error.
+        result = None
         try:
             # Import backend types
             from ..cli_backend import CliSessionBinding
             
-            # Build session binding for state management
+            # Build session binding for state management. A session the agent
+            # has already delegated a turn for is a resume: the backend then
+            # continues the CLI-side conversation (and skips re-sending the
+            # system prompt where configured) instead of starting fresh.
             session_id = getattr(self, '_session_id', None) or f"agent-{self.agent_id}"
-            session_binding = CliSessionBinding(session_id=session_id)
+            started_sessions = getattr(self, '_cli_backend_sessions_started', None)
+            if started_sessions is None:
+                started_sessions = set()
+                self._cli_backend_sessions_started = started_sessions
+            # Serialise session establishment per session id: without the
+            # lock, concurrent turns could both observe "not started" and
+            # spawn two fresh CLI conversations for one session.
+            session_locks = getattr(self, '_cli_backend_session_locks', None)
+            if session_locks is None:
+                session_locks = {}
+                self._cli_backend_session_locks = session_locks
+            session_lock = session_locks.setdefault(session_id, asyncio.Lock())
+            try:
+                await session_lock.acquire()
+            except RuntimeError:
+                # The stored lock is bound to a previous (closed) event loop —
+                # common when sync callers wrap each turn in its own loop.
+                # Re-key a fresh lock for this loop; cross-loop turns are
+                # serial by construction, so mutual exclusion is preserved.
+                session_lock = asyncio.Lock()
+                session_locks[session_id] = session_lock
+                await session_lock.acquire()
+            lock_held = True
+            session_binding = CliSessionBinding(
+                session_id=session_id,
+                is_resume=session_id in started_sessions,
+            )
             
             # Get system prompt from agent configuration
             system_prompt = None
@@ -6729,13 +7111,9 @@ Answer:"""
                 system_prompt=system_prompt
             )
 
-            await self._emit_cli_backend_hook(
-                backend=backend,
-                session_id=session_id,
-                result=result,
-            )
-            
-            # Check for CLI backend errors
+            # Check for CLI backend errors BEFORE the (cancellable) hook and
+            # before marking the session started, so a failed turn never
+            # records a resumable session.
             if result is None:
                 raise RuntimeError(
                     f"CLI backend returned no result for agent={self.display_name!r}, "
@@ -6746,26 +7124,73 @@ Answer:"""
                     f"CLI backend failed for agent={self.display_name!r}, "
                     f"session_id={session_id!r}: {result.error}"
                 )
-            
-            # Update chat history with the exchange
-            if hasattr(self, '_append_to_chat_history'):
-                self._append_to_chat_history({
-                    "role": "user", 
-                    "content": prompt
-                })
-                if result.content:
+
+            # A successful turn establishes the CLI-side session; subsequent
+            # turns under the same session_id are resumes. Recorded (and the
+            # lock released) BEFORE the hook await: cancellation during the
+            # hook must not lose the resume state or hold the lock.
+            started_sessions.add(session_id)
+            session_lock.release()
+            lock_held = False
+
+            # The external command has completed at this point. Hook emission
+            # and history bookkeeping failures are contained here so they are
+            # never reported as backend-execution failures — that mislabel
+            # invites callers to retry work the CLI already finished.
+            try:
+                await self._emit_cli_backend_hook(
+                    backend=backend,
+                    session_id=session_id,
+                    result=result,
+                )
+
+                # Update chat history with the exchange
+                if hasattr(self, '_append_to_chat_history'):
                     self._append_to_chat_history({
-                        "role": "assistant", 
-                        "content": result.content
+                        "role": "user",
+                        "content": prompt
                     })
-            
-            return result.content if result else None
-            
+                    if result.content:
+                        self._append_to_chat_history({
+                            "role": "assistant",
+                            "content": result.content
+                        })
+            except Exception as post_exc:
+                logging.warning(
+                    f"Post-execution bookkeeping failed after successful CLI "
+                    f"backend turn (agent={self.display_name!r}, "
+                    f"session_id={session_id!r}): {post_exc}"
+                )
+
+            return result.content
+
+        except asyncio.CancelledError:
+            # Cancellation is BaseException: it bypasses ``except Exception``,
+            # so release here or later turns on this session block forever.
+            # ``lock_held`` guards against releasing a lock a concurrent turn
+            # has since acquired; names may be unbound if cancellation preceded
+            # their assignment.
+            try:
+                if lock_held and session_lock.locked():
+                    session_lock.release()
+            except (NameError, UnboundLocalError, RuntimeError):
+                pass
+            raise
         except Exception as e:
+            # Release the per-session lock on any failure path; ``session_lock``
+            # may be unbound when the exception preceded its assignment.
+            try:
+                if lock_held and session_lock.locked():
+                    session_lock.release()
+            except (NameError, UnboundLocalError, RuntimeError):
+                pass
+            # ``result`` carries the backend's error result (and its audit
+            # metadata) when execution completed with an error; it is None when
+            # the failure preceded execution.
             await self._emit_cli_backend_hook(
                 backend=backend,
                 session_id=session_id,
-                result=None,
+                result=result,
                 error=str(e),
             )
             raise RuntimeError(

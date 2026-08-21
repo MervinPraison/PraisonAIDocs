@@ -1565,18 +1565,32 @@ Write the complete compiled report:"""
                         result.get("approval_error") or
                         result.get("circuit_open") or
                         result.get("loop_blocked") or
-                        result.get("retryable") is False):
+                        result.get("_praison_retryable") is False):
+                        result.pop("_praison_retryable", None)
                         return result
                     
                     # Determine error type for retry policy
                     error_type = self._classify_error_type(result, last_exception)
                     
-                    # Check if we should retry
-                    if not retry_policy.should_retry(error_type, attempt):
+                    # Check if we should retry. A tool that *raised* is flattened
+                    # into an error dict before it can be classified, so it always
+                    # arrives here as "unknown" — which no default retry_on
+                    # contains. The sync path escalates exactly those error types
+                    # to its own retry loop (tool_execution.py:853-866); honouring
+                    # the impl's explicit `retryable` flag is how the async path
+                    # reaches the same decision instead of never retrying at all.
+                    # `_praison_retryable` is a private control-plane key (see
+                    # _execute_tool_async_impl): a tool's own result may legitimately
+                    # contain "retryable" (common for HTTP-API wrappers) and must
+                    # never steer our retry loop.
+                    if (not retry_policy.should_retry(error_type, attempt)
+                            and result.get("_praison_retryable") is not True):
+                        result.pop("_praison_retryable", None)
                         return result
                     
                     # Don't retry on last attempt
                     if attempt == retry_policy.max_attempts - 1:
+                        result.pop("_praison_retryable", None)
                         return result
                     
                     # Emit retry hook event  
@@ -1775,7 +1789,7 @@ Write the complete compiled report:"""
                         result = {
                             "error": f"Tool timed out after {tool_timeout}s",
                             "timeout": True,
-                            "retryable": False,
+                            "_praison_retryable": False,
                         }
                 else:
                     result = await _invoke()
@@ -1815,7 +1829,26 @@ Write the complete compiled report:"""
                 # sync path. The next pre-execution check will then BLOCK/HALT.
                 if loop_guard is not None:
                     loop_guard.record(function_name, arguments, False, result=None)
-                return {"error": f"Error executing {function_name}: {str(e)}"}
+                # Carry the retry verdict with the flattened exception. Without it
+                # the caller only sees an opaque error string, classifies it as
+                # "unknown" (never in RetryPolicy.retry_on) and gives up — while
+                # the sync path, which still has the exception object, retries.
+                # Mirror the sync path exactly: a ToolExecutionError already
+                # carries an explicit is_retryable verdict (e.g. a terminal
+                # non-retryable failure) and must be honoured verbatim; for any
+                # other exception apply the same terminal rule — programming
+                # errors are terminal, everything else may be retried.
+                if isinstance(e, ToolExecutionError):
+                    retryable = e.is_retryable
+                else:
+                    retryable = not isinstance(e, (ValueError, TypeError, AttributeError))
+                # Private control-plane key: a tool's own result may legitimately
+                # contain "retryable" (common for HTTP-API wrappers) and must not
+                # collide with the framework's verdict nor leak to the model.
+                return {
+                    "error": f"Error executing {function_name}: {str(e)}",
+                    "_praison_retryable": retryable,
+                }
 
         except ToolExecutionError:
             # A loop-guard HALT must propagate to stop the run, mirroring the sync
@@ -1825,18 +1858,26 @@ Write the complete compiled report:"""
             logging.error(f"Error in execute_tool_async: {str(e)}", exc_info=True)
             return {"error": f"Error in execute_tool_async: {str(e)}"}
 
-    def launch(self, path: str = '/', port: int = 8000, host: str = '0.0.0.0', debug: bool = False, protocol: str = "http"):
+    def launch(self, path: str = '/', port: int = 8000, host: str = '127.0.0.1', debug: bool = False, protocol: str = "http"):
         """
         Launch the agent as an HTTP API endpoint or MCP server.
         
         This method now delegates to protocol-based launchers to follow
         the protocol-driven architecture. Heavy implementations (FastAPI/uvicorn)
         are only imported when needed through lazy loading.
-        
+
+        Request authorisation matches ``PraisonAIAgents.launch``: when
+        ``PRAISONAI_LAUNCH_AUTH_TOKEN`` is set, every HTTP route requires that
+        bearer token (401 otherwise). When it is unset and ``host`` is
+        non-loopback, a one-time token is generated and printed rather than
+        serving an unauthenticated endpoint on all interfaces.
+
         Args:
             path: API endpoint path (default: '/') for HTTP, or base path for MCP.
             port: Server port (default: 8000)
-            host: Server host (default: '0.0.0.0')
+            host: Server host (default: '127.0.0.1'; changed from '0.0.0.0' to
+                avoid binding all interfaces by default — pass '0.0.0.0'
+                explicitly to expose externally).
             debug: Enable debug mode (default: False)
             protocol: "http" to launch as FastAPI, "mcp" to launch as MCP server.
             
@@ -1859,6 +1900,8 @@ Write the complete compiled report:"""
         For now, it maintains backward compatibility while following lazy import patterns.
         """
         global _server_started, _registered_agents, _shared_apps, _server_lock
+
+        from .launch_security import authorise_launch_request, resolve_launch_host
 
         # Try to import FastAPI dependencies - lazy loading
         try:
@@ -1884,7 +1927,15 @@ Write the complete compiled report:"""
             print("\nOr install all API dependencies with:")
             print("pip install 'praisonaiagents[api]'")
             return None
-                
+
+        # Fail-closed bind guard: refuse to serve keyless on a non-loopback host
+        # (auto-generates and prints a one-time token instead). Matches the
+        # serve/jobs precedent and keeps this path in lock-step with
+        # PraisonAIAgents.launch. Applied only after the dependency guard above
+        # so a launch that bails out (missing deps) cannot mutate the
+        # process-wide launch token and retroactively 401 a running endpoint.
+        host = resolve_launch_host(host)
+
         should_start = False
         with _server_lock:
             # Initialize port-specific collections if needed (once per port)
@@ -1937,6 +1988,8 @@ Write the complete compiled report:"""
             # Define the endpoint handler
             @_shared_apps[port].post(path)
             async def handle_agent_query(request: Request, query_data: Optional[AgentQuery] = None):
+                if not authorise_launch_request(request):
+                    raise HTTPException(status_code=401, detail="Unauthorized")
                 # Handle both direct JSON with query field and form data
                 if query_data is None:
                     try:

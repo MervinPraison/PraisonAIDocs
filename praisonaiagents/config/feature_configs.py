@@ -25,7 +25,7 @@ Usage:
     # With config
     agent = Agent(
         instructions="...",
-        memory=MemoryConfig(backend="redis", user_id="user123"),
+        memory=MemoryConfig(backend="sqlite", user_id="user123"),
         knowledge=KnowledgeConfig(sources=["docs/"], rerank=True),
         tool_search=ToolSearchConfig(enabled="auto", threshold_pct=15),
     )
@@ -52,14 +52,54 @@ if TYPE_CHECKING:
 
 
 class MemoryBackend(str, Enum):
-    """Memory storage backends."""
+    """Memory storage backends.
+
+    Every member must have an adapter in ``praisonaiagents.memory.adapters``
+    (FILE is served by ``FileMemory``). Declaring a backend with no adapter
+    used to silently swap in a local SQLite/JSON store.
+    """
     FILE = "file"
     SQLITE = "sqlite"
-    REDIS = "redis"
-    VALKEY = "valkey"
-    POSTGRES = "postgres"
+    CHROMA = "chroma"
     MEM0 = "mem0"
     MONGODB = "mongodb"
+    DAKERA = "dakera"
+    IN_MEMORY = "in_memory"
+
+
+#: Accepted before but never implemented: requests were silently redirected.
+UNIMPLEMENTED_MEMORY_BACKENDS = ("redis", "valkey", "postgres", "postgresql")
+
+
+def available_memory_backends() -> List[str]:
+    """Backends ``MemoryConfig(backend=...)`` accepts, read from the registry.
+
+    Adapters added via ``register_memory_adapter()`` are accepted automatically.
+    """
+    from ..memory.adapters import list_memory_adapters
+    return sorted(set(list_memory_adapters()) | {MemoryBackend.FILE.value})
+
+
+def validate_memory_backend(backend: Union[str, "MemoryBackend"]) -> str:
+    """Normalise a backend name; raise rather than substitute a different store."""
+    from .parse_utils import make_preset_error
+    from ..memory.adapters.registry import MEMORY_PROVIDER_ALIASES
+
+    name = backend.value if isinstance(backend, MemoryBackend) else str(backend)
+    name = MEMORY_PROVIDER_ALIASES.get(name.strip().lower(), name.strip().lower())
+    valid = available_memory_backends()
+    if name in valid:
+        return name
+    if name in UNIMPLEMENTED_MEMORY_BACKENDS:
+        raise ValueError(
+            f"Memory backend '{name}' is not implemented - no {name} memory "
+            f"adapter is registered. Earlier releases accepted it and silently "
+            f"stored to a local file instead. Valid backends: {', '.join(valid)}. "
+            f"To keep using {name}, pass a live store (memory=<instance> or "
+            f"db(url=...)), or register an adapter with "
+            f"register_memory_adapter('{name}', MyAdapter)."
+        )
+    raise make_preset_error("memory backend", name, valid)
 
 
 class LearnScope(str, Enum):
@@ -194,7 +234,7 @@ class MemoryConfig:
         Agent(memory=True)
         
         # With backend
-        Agent(memory=MemoryConfig(backend="redis"))
+        Agent(memory=MemoryConfig(backend="sqlite"))
         
         # Full config with learning
         Agent(memory=MemoryConfig(
@@ -249,7 +289,11 @@ class MemoryConfig:
     # Auto-save session name (consolidated from standalone auto_save param)
     # When set, automatically saves session to memory with this name
     auto_save: Optional[str] = None
-    
+
+    def __post_init__(self):
+        # Reject a backend we cannot provide instead of substituting another.
+        self.backend = validate_memory_backend(self.backend)
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         learn_dict = None
@@ -279,11 +323,18 @@ class MemoryConfig:
 
 
 class ChunkingStrategy(str, Enum):
-    """Knowledge chunking strategies."""
+    """Knowledge chunking strategies.
+
+    Every member must resolve to a chunker via
+    ``praisonaiagents.knowledge.chunking.normalize_chunker_type``. FIXED and
+    PARAGRAPH are aliases for ``token``/``recursive``; the rest are chunker ids.
+    """
     FIXED = "fixed"
+    PARAGRAPH = "paragraph"
+    TOKEN = "token"
+    RECURSIVE = "recursive"
     SEMANTIC = "semantic"
     SENTENCE = "sentence"
-    PARAGRAPH = "paragraph"
 
 
 @dataclass
@@ -322,10 +373,12 @@ class KnowledgeConfig:
     embedder: str = "openai"
     embedder_config: Optional[Dict[str, Any]] = None
     
-    # Chunking (direct fields)
-    chunking_strategy: Union[str, ChunkingStrategy] = ChunkingStrategy.SEMANTIC
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
+    # Chunking (direct fields). Defaults match what Knowledge actually used
+    # while these fields were inert, so enabling them changes nothing for
+    # anyone who did not set them.
+    chunking_strategy: Union[str, ChunkingStrategy] = ChunkingStrategy.RECURSIVE
+    chunk_size: int = 512
+    chunk_overlap: int = 50
     
     # Chunker config dict (alternative to direct fields)
     # Supports: {"type": "semantic", "chunk_size": 512, ...}
@@ -887,8 +940,12 @@ class ExecutionConfig:
     
     # Parallel tool execution (Gap 2): Enable parallel execution of batched LLM tool calls
     # When True, multiple tool calls from LLM are executed concurrently instead of sequentially
-    # Default False preserves existing behavior for backward compatibility
-    parallel_tool_calls: bool = False
+    # Default False preserves existing behavior for backward compatibility.
+    # This is the single source of truth; ToolConfig.parallel is a deprecated alias.
+    # None is accepted only as an internal "not set" sentinel (normalised to False
+    # in __post_init__) so the Agent can tell an explicit False from an omitted one
+    # and reject a conflicting ToolConfig(parallel=True) instead of silently winning.
+    parallel_tool_calls: Optional[bool] = None
 
     # Durable tool-loop replay. Default-off keeps the execution hot path free
     # of journal construction and SQLite writes.
@@ -898,6 +955,11 @@ class ExecutionConfig:
 
     def __post_init__(self) -> None:
         """Post-initialization processing with deprecation warnings and validation."""
+        # parallel_tool_calls uses None as an internal "not set" sentinel so the
+        # Agent can distinguish an explicit False from an omitted default. Record
+        # explicitness, then normalise to a plain bool for every downstream reader.
+        self._parallel_tool_calls_explicit = self.parallel_tool_calls is not None
+        self.parallel_tool_calls = bool(self.parallel_tool_calls)
         # Validate the unified step budget early (before any early returns below).
         if self.max_steps is not None and self.max_steps < 1:
             raise ValueError("ExecutionConfig.max_steps must be >= 1 when set.")
@@ -1049,7 +1111,7 @@ class ExecutionConfig:
             max_context_tokens=data.get("max_context_tokens", None),
             compaction_strategy=compaction_strategy,
             max_budget=data.get("max_budget", None),
-            parallel_tool_calls=data.get("parallel_tool_calls", False),
+            parallel_tool_calls=data.get("parallel_tool_calls", None),
             durable=data.get("durable", False),
             journal_path=data.get("journal_path", None),
             resume_run_id=data.get("resume_run_id", None),
@@ -1151,8 +1213,13 @@ class ToolConfig:
     # Retry policy for tool execution with exponential backoff
     retry_policy: Optional[Any] = None  # RetryPolicy instance
     
-    # Enable parallel execution of batched LLM tool calls
-    parallel: bool = False
+    # DEPRECATED ALIAS for ExecutionConfig.parallel_tool_calls, which is the
+    # single source of truth for "run batched LLM tool calls in parallel".
+    # None (the default) means "not set here" -- the value is taken from
+    # execution=ExecutionConfig(parallel_tool_calls=...). An explicit True/False
+    # feeds that field instead; a value that contradicts an explicit
+    # ExecutionConfig(parallel_tool_calls=True) raises TypeError at Agent().
+    parallel: Optional[bool] = None
     
     # Tool output handling and artifact storage
     output_limit: int = DEFAULT_TOOL_OUTPUT_LIMIT  # Maximum bytes before spilling to artifact store
@@ -1215,7 +1282,7 @@ class ToolConfig:
         return cls(
             timeout=data.get("timeout"),
             retry_policy=retry_policy,
-            parallel=data.get("parallel", False),
+            parallel=data.get("parallel"),
             output_limit=data.get("output_limit", DEFAULT_TOOL_OUTPUT_LIMIT),
             output_max_lines=data.get("output_max_lines"),
             output_direction=data.get("output_direction", "both"),
