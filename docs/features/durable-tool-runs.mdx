@@ -14,18 +14,22 @@ graph LR
         T1 --> Crash[💥 Crash]
         Crash --> Resume[🔁 resume_run_id]
         Resume --> Replay[📒 Tool 1 from journal]
-        Replay --> T2[🔧 Tool 2 live]
+        Replay --> Inflight{🔎 Tool 2 in-flight?}
+        Inflight -->|restart_safe=True| T2[🔧 Tool 2 live]
+        Inflight -->|effectful / undeclared| Gate[🛑 NotSafelyResumable]
         T2 --> Done[✅ Success]
     end
 
     classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Start start
     class T1,T2,Replay,Resume process
-    class Crash warn
+    class Inflight config
+    class Crash,Gate warn
     class Done success
 ```
 
@@ -131,6 +135,8 @@ Each terminal outcome maps to an auto-finalize state and controls whether `resum
 
 A retryable failure leaves the run resumable. A non-retryable failure marks it `failed` and non-resumable.
 
+A per-tool `NotSafelyResumable` outcome does not by itself change the run status; the loop continues and the run finalizes normally on the next iteration.
+
 ---
 
 ## Configuration Options
@@ -155,6 +161,118 @@ def charge_card(amount: float, customer_id: str, idempotency_key: str = "") -> d
 ```
 
 The key shape is `"{run_id}:{seq}:{function_name}"` — the same on resume, so a tool that dedups on it stays safe even before journal replay records its result.
+
+`restart_safe` and `idempotency_key` are complementary: `restart_safe=True` says the tool may be replayed at all; the auto-injected `idempotency_key` gives it a stable per-call key to dedupe on when it is. See [Restart-Safety Contract for Tools](#restart-safety-contract-for-tools) below.
+
+---
+
+## Restart-Safety Contract for Tools
+
+A tool can declare whether it is safe to re-run after a crash — on resume, an in-flight tool is only re-executed when this declaration says so, otherwise it surfaces a typed outcome for the operator to reconcile.
+
+```mermaid
+graph TB
+    Inflight[🔎 In-flight call on resume] --> Check{restart_safe?}
+    Check -->|True| Replay[🔧 Re-executed live]
+    Check -->|False| Gate[🛑 NotSafelyResumable]
+    Check -->|None / undeclared| Heuristic{Read-only name?}
+    Heuristic -->|Yes| Replay
+    Heuristic -->|Uncertain| Gate
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Inflight start
+    class Check,Heuristic config
+    class Replay process
+    class Gate warn
+```
+
+Declare it on the decorator: `True` for read-only or idempotent tools, `False` for anything that sends, writes, charges, or deletes.
+
+```python
+from praisonaiagents import Agent, ExecutionConfig, tool
+
+@tool(restart_safe=True)
+def fetch_report(report_id: str) -> dict:
+    return report_api.get(report_id)
+
+@tool(restart_safe=False)
+def send_invoice(customer_id: str, amount: int) -> str:
+    return billing.send(customer_id, amount)
+
+agent = Agent(
+    name="Billing Agent",
+    instructions="Fetch the report, then send the invoice.",
+    tools=[fetch_report, send_invoice],
+    execution=ExecutionConfig(durable=True),
+)
+agent.start("Bill customer C-99 for report R-42")
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `restart_safe` | `Optional[bool]` | `None` | Declare replay behaviour for durable resume. `True` = safe to re-run (read-only / idempotent). `False` = effectful; must never be silently re-executed on resume. `None` = undeclared — falls back to the read-only name heuristic and fails closed when uncertain. |
+
+Pick the value by asking whether the tool has an external side effect that is not safe to repeat.
+
+```mermaid
+graph TB
+    Q1{External side effect?<br/>send / write / charge / delete} -->|No| Safe[restart_safe=True]
+    Q1 -->|Yes| Q2{Idempotent?<br/>dedups on idempotency_key}
+    Q2 -->|Yes| Safe
+    Q2 -->|No| Unsafe[restart_safe=False]
+
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Q1,Q2 config
+    class Safe process
+    class Unsafe warn
+```
+
+The class attribute form `BaseTool.restart_safe` is the equivalent for subclass-style tools.
+
+---
+
+## When resume returns `NotSafelyResumable`
+
+An effectful or undeclared tool that was in-flight at the crash is not re-run — the resumed turn records a typed outcome instead, so the operator can reconcile the external action.
+
+```python
+{
+    "error": (
+        "Tool '<name>' was in-flight when the durable run crashed and is not "
+        "declared restart_safe; its outcome could not be confirmed. It was not "
+        "re-executed on resume to avoid a duplicate side effect. Reconcile the "
+        "external action manually or mark the tool @tool(restart_safe=True) if "
+        "it is idempotent."
+    ),
+    "error_type": "NotSafelyResumable",
+    "not_safely_resumable": True,
+    "restart_safe": False,
+}
+```
+
+Reconcile the external action out of band (or with an idempotency check) and re-drive the loop, or mark the tool `restart_safe=True` if it is genuinely idempotent.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Tool
+    participant Journal
+
+    User->>Agent: agent.start(prompt)
+    Agent->>Tool: send_invoice()
+    Note over Agent,Journal: 💥 crash before result journalled
+    User->>Agent: set resume_run_id, start(same prompt)
+    Journal-->>Agent: send_invoice was in-flight, not restart_safe
+    Agent-->>User: {"error_type": "NotSafelyResumable", ...} — not re-executed
+```
 
 ---
 
@@ -246,6 +364,14 @@ The default `~/.praisonai/runs/journal.db` is lost when a container is recreated
 
 <Accordion title="Keep tools idempotent as belt-and-braces">
 Opt into the auto-injected `idempotency_key` so a tool that crashes *before* recording its result still dedups on retry.
+</Accordion>
+
+<Accordion title="Declare restart_safe on every tool used in a durable run">
+`True` for read-only / idempotent tools; `False` for anything that sends, writes, charges, or deletes. Undeclared tools fall back to a name heuristic and fail closed on uncertainty — safe, but noisier than an explicit declaration.
+</Accordion>
+
+<Accordion title="Handle NotSafelyResumable on resume">
+If a resumed turn returns `error_type: "NotSafelyResumable"`, the in-flight side effect was not re-driven. Reconcile the external action, then either mark the tool `restart_safe=True` (if truly idempotent) or continue the turn out of band.
 </Accordion>
 
 <Accordion title="Distinguish retryable vs terminal failures">
