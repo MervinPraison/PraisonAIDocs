@@ -30,6 +30,38 @@ graph LR
 
 Context compaction is lossy — messages that fall outside the compaction window are gone. This feature runs one bounded child agent with `search_memory` and `store_memory` **before** compaction, so stable user-provided facts in the older slice are saved to long-term memory first. It never blocks compaction: if the child times out or fails, compaction still runs.
 
+<Note>
+As of PraisonAI [#4203](https://github.com/MervinPraison/PraisonAI/pull/4203), this flush durably commits staged facts on **every** built-in memory backend — `file`, `sqlite`, `chroma`, `mongodb`, `mem0`, and `learn`. Earlier releases only committed on `FileMemory`; on every other backend the commit raised, the error was silently swallowed, and compaction proceeded having saved nothing.
+</Note>
+
+### Supported Backends
+
+Every built-in `Memory` backend now implements `commit_memory_batch` / `acommit_memory_batch`, so the flush persists facts before compaction on all of them.
+
+| Backend | Durable pre-compaction flush |
+|---|---|
+| `file` | ✅ |
+| `sqlite` | ✅ |
+| `chroma` | ✅ |
+| `mongodb` | ✅ |
+| `mem0` | ✅ |
+| `learn` | ✅ |
+
+```mermaid
+graph LR
+    Flush[🧠 Pre-compaction flush] --> FM[✅ file]
+    Flush --> SQL[✅ sqlite]
+    Flush --> CH[✅ chroma]
+    Flush --> MG[✅ mongodb]
+    Flush --> M0[✅ mem0]
+    Flush --> LN[✅ learn]
+
+    classDef feature fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    class Flush feature
+    class FM,SQL,CH,MG,M0,LN ok
+```
+
 ## Quick Start
 
 <Steps>
@@ -164,10 +196,17 @@ Invalid values are ignored with a logged warning — the code-level config stand
 ## Behaviour Guarantees
 
 - **Never blocks compaction.** Every failure path returns a `MemoryFlushResult(attempted=True, completed=False, ...)` and logs a warning; compaction proceeds unchanged.
-- **Atomic commit-or-nothing.** Child writes are staged and committed only after successful, in-time completion. A timed-out worker cannot mutate the parent memory store.
+- **Atomic commit-or-nothing.** Child writes are staged and committed only after successful, in-time completion. A timed-out worker cannot mutate the parent memory store. Each staged write is re-gated by the shared deadline and `commit_guard`; a cancelled or expired flush persists nothing on any backend.
+- **Works on every backend.** `commit_memory_batch` maps each staged `add_*` write to the backend's `store_*` method (`add_short_term` → `store_short_term`, `add_long_term` → `store_long_term`) so `sqlite` / `chroma` / `mongodb` / `mem0` / `learn` durably persist facts, not just `file`.
 - **Sync path in a daemon thread.** A stuck provider cannot delay process shutdown.
 - **Tool payloads excluded.** Only `user` and `assistant` text is serialised.
 - **Prompt-injection posture.** The child treats the transcript as data, not instructions, refuses to store credentials or secrets, and uses only the two provided memory tools.
+
+<Warning>
+**Deadlock note.** `commit_memory_batch` explicitly does **not** hold the memory `_write_lock` while dispatching writes — each `store_*` method serialises its own SQLite writes under that non-reentrant `threading.Lock`, so nesting would deadlock. If you subclass `Memory` with custom `store_*` methods, keep them responsible for their own locking and do not re-acquire `_write_lock` from `commit_memory_batch`.
+</Warning>
+
+The async variant `acommit_memory_batch` prefers a `store_*_async` method when the adapter exposes one; otherwise it offloads the blocking `store_*` call to `asyncio.to_thread` so the event loop stays responsive. Each write is gated by the same deadline / cancellation guard as the sync path, so late or cancelled facts are never persisted after compaction resumes.
 
 ---
 

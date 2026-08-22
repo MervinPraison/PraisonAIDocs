@@ -131,6 +131,10 @@ def aggregator(ctx: WorkflowContext) -> StepResult:
     return StepResult(output=f"Combined: {len(outputs)} results")
 ```
 
+<Note>
+**Index alignment under `partial_ok`.** A failed branch contributes `None` at the same index as its step, so `parallel_outputs[i]` is always the result of `parallel_step.steps[i]`. As of PraisonAI [#4203](https://github.com/MervinPraison/PraisonAI/pull/4203), a downstream reader of `parallel_outputs[i]` can no longer silently receive a later branch's result once an earlier branch fails.
+</Note>
+
 ## Examples
 
 ### With Agents
@@ -316,6 +320,54 @@ def aggregator(ctx: WorkflowContext) -> StepResult:
     else:
         return StepResult(output=f"Insufficient data: {len(errors)} failures")
 ```
+
+### Stop propagation from nested steps
+
+A branch step with `on_error="stop"` halts the **whole workflow**, not just the parallel block — even under `on_failure="partial_ok"`. As of PraisonAI [#4203](https://github.com/MervinPraison/PraisonAI/pull/4203), `parallel(...)` propagates a nested stop up to the enclosing workflow, matching `route()` / `loop()` / `repeat()` / `if_()`.
+
+```python
+from praisonaiagents import Task, parallel, AgentFlow
+
+risky = Task(name="charge_customer", handler=charge, on_error="stop")   # halts on failure
+safe  = Task(name="log_event", handler=log_event)
+
+wf = AgentFlow(steps=[
+    parallel([risky, safe], on_failure="partial_ok"),
+    Task(name="ship_order", handler=ship),   # must NOT run if charge_customer failed
+])
+wf.run(input=order)
+# charge_customer fails → workflow halts with status="failed"; ship_order never runs.
+# Printed: 🛑 Workflow stopped by nested parallel step
+```
+
+```mermaid
+sequenceDiagram
+    participant WF as Workflow
+    participant P as parallel()
+    participant R as risky (on_error=stop)
+    participant S as safe
+
+    WF->>P: enter parallel block
+    par
+        P->>R: run risky
+        R-->>P: raise → stop=True
+    and
+        P->>S: run safe
+        S-->>P: ok
+    end
+    P-->>WF: {steps, outputs=[None, ok], stop=True}
+    WF->>WF: status="failed"; break
+    Note over WF: 🛑 Workflow stopped by nested parallel step
+```
+
+The interaction between the parallel block's `on_failure` mode and a branch step's `on_error` is:
+
+| `on_failure` (parallel) | Branch step's `on_error` | Result |
+|---|---|---|
+| `partial_ok` | `continue` (default) | Branch error recorded, other branches keep running, workflow proceeds |
+| `partial_ok` | `stop` | Branch error recorded, workflow halts with `status="failed"` **after the parallel block** |
+| `fail_fast` | any | First failure raises `WorkflowStepError`, workflow halts |
+| `fail_all` | any | All branches run, then `WorkflowStepError` raised if any failed |
 
 ### Exception Handling with fail_fast/fail_all
 
