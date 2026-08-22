@@ -708,7 +708,9 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             llm: Model name string ("gpt-4o", "anthropic/claude-3-sonnet"), LLMConfig object, or custom LLM.
                 Can accept LLMConfig(model="gpt-4o", fallback_models=["claude-3-5-sonnet", "gpt-4o-mini"]).
                 Defaults to OPENAI_MODEL_NAME env var or "gpt-4o-mini".
-            model: Alias for llm parameter. Also accepts LLMConfig objects.
+            model: The model to use, e.g. "gpt-4o-mini" or "anthropic/claude-sonnet-4-5".
+                Also accepts an LLMConfig object. This is the canonical name;
+                llm= is a deprecated alias for it. Passing both raises TypeError.
             base_url: Custom LLM endpoint URL (e.g., for Ollama). Kept separate for auth.
             api_key: API key for LLM provider. Kept separate for auth.
             tools: List of tools, functions, callables, or MCP instances.
@@ -1094,7 +1096,8 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         
         # Fast path: string preset lookup (most common case)
         if isinstance(output, str):
-            output_lower = output.lower()
+            from ..config.parse_utils import canonical_preset_key
+            output_lower = canonical_preset_key(output)
             preset_value = OUTPUT_PRESETS.get(output_lower)
             if preset_value is not None:
                 _output_config = OutputConfig(**preset_value) if isinstance(preset_value, dict) else preset_value
@@ -1219,7 +1222,8 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         elif isinstance(execution, ExecutionConfig):
             _exec_config = execution
         elif isinstance(execution, str):
-            preset_value = EXECUTION_PRESETS.get(execution.lower())
+            from ..config.parse_utils import canonical_preset_key
+            preset_value = EXECUTION_PRESETS.get(canonical_preset_key(execution))
             if preset_value is not None:
                 _exec_config = ExecutionConfig(**preset_value) if isinstance(preset_value, dict) else preset_value
             else:
@@ -2018,7 +2022,11 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # Seed from clone_for_channel()'s forwarded list (if any); an explicit
         # LLMConfig(fallback_models=[...]) on llm=/model= still takes precedence.
         fallback_models = _cloned_fallback_models  # Initialize for internal use
-        
+
+        # One rule for the alias pair: passing both is refused, everywhere.
+        from ..utils.model_alias import resolve_model_alias
+        resolve_model_alias(llm, model, type(self).__name__)
+
         # Check if llm is an LLMConfig object
         from ..config import LLMConfig
         if isinstance(llm, LLMConfig):
@@ -3372,7 +3380,8 @@ Your Goal: {self.goal}
         elif isinstance(self._context_param, str):
             # String preset: "sliding_window", "summarize", "truncate"
             from ..config.presets import CONTEXT_PRESETS
-            preset_config = CONTEXT_PRESETS.get(self._context_param)
+            from ..config.parse_utils import canonical_preset_key
+            preset_config = CONTEXT_PRESETS.get(canonical_preset_key(self._context_param))
             if preset_config is not None:
                 # Convert preset to ContextConfig, then to ManagerConfig
                 try:
@@ -3747,7 +3756,8 @@ Summary:"""
         elif isinstance(autonomy, str):
             # String preset: "suggest", "auto_edit", "full_auto"
             from ..config.presets import AUTONOMY_PRESETS
-            preset_config = AUTONOMY_PRESETS.get(autonomy)
+            from ..config.parse_utils import canonical_preset_key
+            preset_config = AUTONOMY_PRESETS.get(canonical_preset_key(autonomy))
             if preset_config is not None:
                 config = AutonomyConfig.from_dict(preset_config)
             else:
