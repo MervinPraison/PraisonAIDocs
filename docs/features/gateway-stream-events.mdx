@@ -5,7 +5,7 @@ description: "Live progress events the gateway forwards over WebSocket after a c
 icon: "waveform-lines"
 ---
 
-The gateway relays six structured progress events to WebSocket clients once they negotiate the `streaming` capability, so UIs can paint reasoning, tool progress, and the final answer as they arrive.
+The gateway relays ten structured progress events to WebSocket clients once they negotiate the `streaming` capability, so UIs can paint reasoning, tool progress, model fallbacks, retries, live todos, tool results, and the final answer as they arrive.
 
 ```python
 from praisonaiagents import Agent
@@ -24,6 +24,10 @@ graph LR
     GW -->|reasoning_stream| WS
     GW -->|tool_call_stream| WS
     GW -->|tool_progress_stream| WS
+    GW -->|model_fallback_stream| WS
+    GW -->|retry_stream| WS
+    GW -->|todo_stream| WS
+    GW -->|tool_result_stream| WS
     GW -->|stream_error| WS
     GW -->|stream_end| WS
 
@@ -77,6 +81,16 @@ async def main():
             print("[reasoning]", event.data)
         elif event.type == "tool_progress_stream":
             print("[tool]", event.data)
+        elif event.type == "model_fallback_stream":
+            md = event.data["metadata"]
+            print(f"[fallback] {md['from_model']} → {md['to_model']} ({md['reason_category']})")
+        elif event.type == "retry_stream":
+            md = event.data["metadata"]
+            print(f"[retry] attempt {md['attempt']}/{md['max_attempts']} in {md['delay']}s")
+        elif event.type == "todo_stream":
+            print("[todos]", event.data["metadata"]["todos"])
+        elif event.type == "tool_result_stream":
+            print("[result]", event.data["tool_call"])
         elif event.type == "stream_error":
             print("[error]", event.data)
         elif event.type == "stream_end":
@@ -102,11 +116,22 @@ Each streaming event maps to an `EventType` in `praisonaiagents.gateway.protocol
 | `TOOL_CALL_STREAM` | `tool_call_stream` | tool call frame | Tool call streamed to client |
 | `REASONING_STREAM` | `reasoning_stream` | `DELTA_TEXT` with `is_reasoning=True` | Model emits reasoning/thinking |
 | `TOOL_PROGRESS_STREAM` | `tool_progress_stream` | tool progress frame | Tool reports in-flight progress |
+| `MODEL_FALLBACK_STREAM` | `model_fallback_stream` | `metadata: { from_model, to_model, reason_category, fallback_index }` | Primary model failed; agent switched to a backup |
+| `RETRY_STREAM` | `retry_stream` | `metadata: { attempt, max_attempts, delay, reason }` | Backing off before retrying a rate-limited / transient failure |
+| `TODO_STREAM` | `todo_stream` | `metadata: { todos: [...] }` — full ordered list | Agent updates its plan / todo list |
+| `TOOL_RESULT_STREAM` | `tool_result_stream` | `tool_call: {...}`, `metadata: {...}` | A tool execution completed with a result |
 | `STREAM_ERROR` | `stream_error` | error frame | Streaming pipeline hits an error |
 | `STREAM_END` | `stream_end` | terminal marker | Stream completes |
 
+### What each new event means to a live UI
+
+- **`model_fallback_stream`** — the primary model went down and the agent switched to a backup mid-turn. Render a "switched to backup model" banner instead of leaving the token stream frozen. `metadata.from_model` is the model that failed, `metadata.to_model` is now serving the turn, `metadata.reason_category` classifies the failure (`rate_limit`, `unavailable`, `error`), and `metadata.fallback_index` is the 0-based position in the fallback chain.
+- **`retry_stream`** — the agent is backing off before retrying a rate-limited or transient failure. Render a countdown ("retrying in 3s… attempt 2/5") so the pause reads as progress, not a freeze. `metadata.attempt` / `metadata.max_attempts` drive the counter, `metadata.delay` is seconds until the next attempt, and `metadata.reason` is a short human string.
+- **`todo_stream`** — the agent mutated its plan. `metadata.todos` is the full ordered list (each item carries its status and text), so re-render the whole checklist from it.
+- **`tool_result_stream`** — a tool finished with a result. `tool_call` carries the name, args, id, and result — render a tool result card; `metadata` holds any extra context.
+
 <Note>
-`reasoning_stream`, `tool_progress_stream`, and `stream_error` are additive. Existing `token_stream` consumers keep working unchanged — gate the new events on `client.supports_event(...)`.
+`reasoning_stream`, `tool_progress_stream`, `stream_error`, and the four newer events — `model_fallback_stream`, `retry_stream`, `todo_stream`, and `tool_result_stream` — are additive. Existing `token_stream` consumers keep working unchanged — gate each new event on `client.supports_event(...)` so a legacy gateway that never advertises them degrades silently.
 </Note>
 
 ---
@@ -163,6 +188,29 @@ sequenceDiagram
     UI-->>User: render answer, clear chip
 ```
 
+When the primary model fails mid-turn, `model_fallback_stream` and `retry_stream` fill the visible-progress gap so the token stream never looks frozen.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI
+    participant Gateway
+    participant Agent
+
+    Agent->>Gateway: token deltas
+    Gateway-->>UI: token_stream
+    UI-->>User: paint tokens
+    Agent->>Gateway: primary model down
+    Gateway-->>UI: model_fallback_stream (gpt-4o → claude)
+    UI-->>User: "switched to backup model" banner
+    Agent->>Gateway: rate limited, backing off
+    Gateway-->>UI: retry_stream (attempt 2/5, delay 3s)
+    UI-->>User: "retrying in 3s…" countdown
+    Agent->>Gateway: token deltas resume
+    Gateway-->>UI: token_stream
+    UI-->>User: tokens resume
+```
+
 ---
 
 ## Common Patterns
@@ -207,6 +255,45 @@ async def main():
             show_chip(event.data)          # display in-flight tool progress
         elif event.type == "stream_end":
             clear_chip()                   # remove the chip when the stream ends
+            break
+
+asyncio.run(main())
+```
+</Tab>
+
+<Tab title="Backup-Model Banner">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+
+async def main():
+    client = GatewayClient(url="ws://localhost:8765", agent_id="assistant", capabilities=["streaming"])
+    await client.connect()
+
+    async for event in client.events():
+        if event.type == "model_fallback_stream":
+            md = event.data["metadata"]
+            show_banner(f"Switched to {md['to_model']} ({md['reason_category']})")
+        elif event.type == "stream_end":
+            break
+
+asyncio.run(main())
+```
+</Tab>
+
+<Tab title="Live Todo / Plan Progress">
+```python
+import asyncio
+from praisonai.gateway import GatewayClient
+
+async def main():
+    client = GatewayClient(url="ws://localhost:8765", agent_id="assistant", capabilities=["streaming"])
+    await client.connect()
+
+    async for event in client.events():
+        if event.type == "todo_stream":
+            render_checklist(event.data["metadata"]["todos"])  # full ordered list
+        elif event.type == "stream_end":
             break
 
 asyncio.run(main())
