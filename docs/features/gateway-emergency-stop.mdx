@@ -1,0 +1,276 @@
+---
+title: "Gateway Emergency Stop"
+sidebarTitle: "Emergency Stop"
+description: "One durable, fail-safe operator brake — halt every new-work admission point instantly, without killing in-flight runs, and resume without a restart"
+icon: "octagon-pause"
+---
+
+One shared brake every new-work seam can consult — halt new admissions instantly, keep in-flight runs, resume without a restart.
+
+```mermaid
+graph LR
+    subgraph "Global Operator Brake"
+        Op[👤 Operator] -->|engage reason, actor| Sentinel[💾 Durable Sentinel<br/>gateway.pause]
+        Sentinel -->|is_engaged| WS[📥 WebSocket Inbound]
+        Sentinel -->|is_engaged| KB[📥 Kanban Dispatch]
+        Sentinel -->|is_engaged| SCH[📥 Scheduler Tick]
+        WS -->|held| Held[🚫 New work refused]
+        KB -->|held| Held
+        SCH -->|held| Held
+        InFlight[🤖 In-flight runs] -.->|untouched| Finish[✅ Finish normally]
+    end
+
+    classDef op fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef store fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef seam fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef held fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Op op
+    class Sentinel store
+    class WS,KB,SCH seam
+    class Held held
+    class InFlight,Finish ok
+```
+
+## Quick Start
+
+<Steps>
+
+<Step title="Default — no config, behaviour unchanged">
+
+A gateway with no `control` block defaults to `backend: "off"`, a no-op brake that is byte-for-byte today's behaviour.
+
+```python
+from praisonaiagents import Agent
+from praisonai_bot.gateway import WebSocketGateway
+
+agent = Agent(name="Support", instructions="Help users")
+WebSocketGateway(agent=agent).start()   # gateway.control defaults to "off" -> NullEmergencyStop
+```
+
+</Step>
+
+<Step title="Enable the durable file brake">
+
+Selecting `backend: "file"` instantiates a durable sentinel that survives a restart and is shared across replicas that point at the same `path`.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import EmergencyStopConfig, GatewayConfig
+from praisonai_bot.gateway import WebSocketGateway
+
+agent = Agent(name="Support", instructions="Help users")
+
+gateway = WebSocketGateway(
+    agent=agent,
+    config=GatewayConfig(
+        control=EmergencyStopConfig(
+            backend="file",
+            path="~/.praisonai/state/gateway.pause",
+        ),
+    ),
+)
+gateway.start()
+```
+
+</Step>
+
+<Step title="Or configure it in gateway.yaml">
+
+```yaml
+gateway:
+  control:
+    backend: file      # "off" (default, no-op) | "file" (durable sentinel)
+    path: ~/.praisonai/state/gateway.pause
+```
+
+</Step>
+
+<Step title="Drive the brake from Python (works today)">
+
+Engage, inspect, and release the durable brake directly — the sentinel behaviour is available today.
+
+```python
+from praisonaiagents.gateway import EmergencyStopConfig
+
+brake = EmergencyStopConfig(
+    backend="file",
+    path="/var/lib/praisonai/gateway.pause",
+).to_estop()
+
+brake.engage(reason="cost spike", actor="mervin")
+assert brake.is_engaged() is True
+
+state = brake.state()
+# state.engaged, state.reason, state.actor, state.at
+
+brake.disengage()
+assert brake.is_engaged() is False
+```
+
+</Step>
+
+</Steps>
+
+---
+
+## How It Works
+
+The operator engages one durable sentinel; every admission seam consults it to refuse new work, while runs already in flight are untouched and finish normally.
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant Stop as FileEmergencyStop<br/>(sentinel)
+    participant Seam as Admission Seam
+    participant Run as In-flight Run
+
+    Op->>Stop: engage(reason, actor)
+    Note over Stop: writes durable sentinel
+    Seam->>Stop: is_engaged()
+    Stop-->>Seam: True
+    Note over Seam: new work refused
+    Note over Run: existing run keeps going -> finishes
+    Op->>Stop: disengage()
+    Seam->>Stop: is_engaged()
+    Stop-->>Seam: False
+    Note over Seam: admissions resume — no restart
+```
+
+| Piece | Role |
+|---|---|
+| `EmergencyStopConfig` | User-facing knob — selects `off` or `file`, wired as `control=…` |
+| `EmergencyStopProtocol` | Pure contract: `is_engaged` / `engage` / `disengage` / `state` |
+| `NullEmergencyStop` | Default backend for `"off"` — never engaged, inert |
+| `FileEmergencyStop` | Durable backend for `"file"` — JSON sentinel, atomic write, fail-safe reads |
+| `EmergencyStopState` | Frozen audit snapshot: `engaged`, `reason`, `actor`, `at` |
+
+`engage` and `disengage` are idempotent — engaging twice or disengaging a missing sentinel is safe.
+
+---
+
+## Fail-Safe Behaviour
+
+An ambiguous brake holds new work rather than letting it run freely: any sentinel that cannot be read with confidence counts as **engaged**.
+
+| Sentinel state | `is_engaged()` | `state().engaged` | `state().reason` |
+|---|---|---|---|
+| Missing | `False` | `False` | `""` |
+| Present, valid JSON object | `True` | `True` | as written |
+| Present, unreadable / corrupt / permission error | `True` | `True` | `"unreadable-sentinel"` |
+| Valid JSON object, non-numeric `at` (e.g. `[]`) | `True` | `True` | `"unreadable-sentinel"` |
+
+```python
+from pathlib import Path
+from praisonaiagents.gateway import FileEmergencyStop
+
+sentinel = Path("/tmp/demo.pause")
+sentinel.write_text("{ not valid json")
+brake = FileEmergencyStop(str(sentinel))
+assert brake.is_engaged() is True     # ambiguous sentinel -> holds new work
+assert brake.state().reason == "unreadable-sentinel"
+```
+
+---
+
+## Configuration Options
+
+`EmergencyStopConfig` from `praisonaiagents.gateway`.
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `backend` | `str` | `"off"` | `"off"` (no-op, default) or `"file"` (durable sentinel). Any other value raises `ValueError`. |
+| `path` | `Optional[str]` | `None` | Sentinel file location. **Required** when `backend="file"`, else `ValueError`. |
+
+Properties and methods:
+
+- `enabled` → `bool` — `True` when `backend != "off"`.
+- `to_estop()` → the concrete brake (`NullEmergencyStop` for `"off"`, `FileEmergencyStop(path)` for `"file"`).
+- `to_dict()` / `from_dict()` — YAML/JSON roundtrip; `from_dict(None)` tolerates a missing block.
+
+Wired into `GatewayConfig` as `control` and surfaces in `GatewayConfig.to_dict()` as `{"control": {"backend": "off", "path": None}}` when defaults hold.
+
+<Card icon="code" href="/sdk/reference/praisonaiagents/modules/feature_configs">
+  Full field, type, and default reference for `EmergencyStopConfig`, `EmergencyStopProtocol`, `NullEmergencyStop`, `FileEmergencyStop`, and `EmergencyStopState`
+</Card>
+
+---
+
+## When to Enable
+
+Match the backend to whether an on-call operator needs an instant, durable hold.
+
+```mermaid
+graph TB
+    Start{Do operators need an<br/>instant, durable hold?} -->|Single-node dev| Off1[backend='off'<br/>default, no config]
+    Start -->|Production, no operator control| Off2[backend='off'<br/>default, no config]
+    Start -->|Production with on-call<br/>needing an instant hold| File[backend='file'<br/>durable sentinel]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef off fill:#7C90A0,stroke:#7C90A0,color:#fff
+    classDef opt fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start q
+    class Off1,Off2 off
+    class File opt
+```
+
+---
+
+## Backward Compatibility
+
+`off` is the default and reproduces today's behaviour byte-for-byte — no brake is engaged, `is_engaged()` is always `False`, and no new dependency is added.
+
+---
+
+## Roadmap (what this ships vs. what comes next)
+
+<Note>
+Kept intentionally minimal per the lightweight-and-powerful mandate: this PR ships the **shared core contract + fail-safe policy + config selector** only. The heavy bot-side wiring (WS inbound, kanban dispatch, scheduler seams) and the `praisonai gateway pause/resume` CLI belong in the wrapper/bot packages and are a natural follow-up that consumes this contract.
+</Note>
+
+Today's release ships the pure protocol, the `off`/`file` selector, and the audit-safe state snapshot. Selecting `backend: "file"` instantiates the durable brake and wires it into `GatewayConfig.control`; you can already engage it and inspect `state()` from Python. Consultation at the WebSocket inbound, kanban dispatch, and scheduler seams — plus a `praisonai gateway pause/resume` CLI — is follow-up work in the bot/wrapper packages.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+
+<Accordion title="Put the sentinel on durable, shared storage">
+Point `path` at a location that survives a restart and is visible to every replica — a mounted volume, not a container's ephemeral `/tmp`. That is what makes the hold outlast a crash and apply fleet-wide.
+</Accordion>
+
+<Accordion title="Always pass reason and actor when engaging">
+`engage(reason="cost spike", actor="mervin")` records who paused and why in the sentinel, surfaced by `state()` for `/health` and audit. An unlabelled hold is hard to explain later.
+</Accordion>
+
+<Accordion title="Trust the fail-safe, but alert on it">
+An unreadable or corrupt sentinel counts as engaged on purpose — new work stays held. Treat `state().reason == "unreadable-sentinel"` as a signal to inspect the file, not as a normal engaged state.
+</Accordion>
+
+<Accordion title="Leave it off unless an operator needs the brake">
+Single-node dev and deployments without on-call control gain nothing from a durable sentinel. Keep `backend: "off"` there for zero cost and unchanged behaviour.
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Gateway Turn Lock" icon="lock" href="/features/gateway-turn-lock">
+  Serialise turns cluster-wide.
+</Card>
+<Card title="Gateway Admission Control" icon="gauge-high" href="/features/gateway-admission-control">
+  Concurrency ceiling & backpressure.
+</Card>
+<Card title="Gateway Graceful Drain" icon="power-off" href="/features/gateway-graceful-drain">
+  Drain toward shutdown — orthogonal to the brake.
+</Card>
+<Card title="Gateway Channel Supervision" icon="sliders" href="/features/gateway-channel-supervision">
+  Per-channel pause vs. this fleet-wide brake.
+</Card>
+</CardGroup>
