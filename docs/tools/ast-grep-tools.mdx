@@ -180,6 +180,10 @@ Searches code using AST patterns. Returns structured JSON results.
 | `path` | `str` | `"."` | File or directory to search |
 | `json_output` | `bool` | `True` | Return JSON format |
 
+<Info>
+A path that starts with `-` (e.g. `-my-dir`) is passed as a literal path, not a flag. The tool inserts `--` before the path in the `sg` argv.
+</Info>
+
 ```python
 # Find all Python function definitions
 result = ast_grep_search("def $FN($$$)", lang="python", path="./src")
@@ -205,6 +209,20 @@ Rewrites code matching an AST pattern. **Dry-run by default** (shows changes wit
 | `lang` | `str` | required | Programming language |
 | `path` | `str` | `"."` | File or directory |
 | `dry_run` | `bool` | `True` | Preview only — set `False` to apply |
+
+#### Return values
+
+| Case | Return string |
+|------|---------------|
+| Real rewrite applied (`dry_run=False`) | `Applied N changes` (from `sg`'s stderr receipt) |
+| Preview only (`dry_run=True`) with matches | `[DRY RUN] <sg output>` |
+| Pattern matched nothing, `dry_run=True` | `No matches found for rewrite` |
+| Pattern matched nothing, `dry_run=False` | `No changes made` |
+| `sg` exited non-zero | `Error: <stderr or stdout>` |
+
+<Tip>
+The `Applied N changes` receipt confirms that files were rewritten. `No changes made` now really means nothing was written — trust both messages.
+</Tip>
 
 <Warning>
 Setting `dry_run=False` will modify files in place. Always preview first with the default `dry_run=True`.
@@ -244,6 +262,95 @@ result = ast_grep_scan(path="./src")
 # Scan with custom rules
 result = ast_grep_scan(path="./src", rule_file="./rules/security.yml")
 ```
+
+---
+
+## Path Confinement
+
+`path` and `rule_file` are constrained to the current workspace. Anything that resolves outside is rejected before `sg` runs — no destructive rewrite can escape the project.
+
+```mermaid
+flowchart LR
+    In[📥 path arg] --> Check{🛡️ inside workspace?}
+    Check -->|yes| Run[⚙️ sg runs]
+    Check -->|no| Reject[❌ Error: outside the workspace]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class In input
+    class Check gate
+    class Run ok
+    class Reject bad
+```
+
+```python
+from praisonaiagents.tools import ast_grep_search, ast_grep_rewrite, ast_grep_scan
+
+# Rejected — absolute path outside the workspace
+ast_grep_search("def $F($$$)", lang="python", path="/etc")
+# -> "Error: path '/etc' is outside the workspace"
+
+# Rejected — traversal outside the workspace
+ast_grep_rewrite("a", "b", lang="python", path="../outside", dry_run=False)
+# -> "Error: path '../outside' is outside the workspace"
+
+# Rejected — rule file outside the workspace
+ast_grep_scan(path=".", rule_file="/tmp/rules.yml")
+# -> "Error: rule_file '/tmp/rules.yml' is outside the workspace"
+```
+
+<Warning>
+If you previously passed absolute paths or `..`-traversal paths to reach sibling projects, those calls now return an error. Run the tools from inside the workspace you want to touch.
+</Warning>
+
+---
+
+## Output Limits
+
+Each call returns at most **10,000 characters**. When `sg` produces more (millions of matches against a big tree are common), the full buffer is written to a workspace-local artifact and the returned string is a head + tail preview plus an unmissable pointer.
+
+```mermaid
+flowchart LR
+    Out[📤 sg output] --> Cap{📏 ≤ 10,000 chars?}
+    Cap -->|yes| Pass[✅ returned unchanged]
+    Cap -->|no| Spill[⚙️ write full buffer to artifact]
+    Spill --> Pointer[✅ head + tail + Full output saved to: path]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Out input
+    class Cap gate
+    class Spill proc
+    class Pass ok
+    class Pointer ok
+```
+
+| Situation | What the agent sees |
+|-----------|--------------------|
+| Output ≤ 10,000 chars | The full output, unchanged |
+| Output > 10,000 chars | Head + tail preview, the word `truncated`, and a line `Full output saved to: <path>` |
+
+```python
+from praisonaiagents.tools import ast_grep_search
+
+result = ast_grep_search("def $F($$$)", lang="python", path=".")
+# For a huge tree the tail of `result` looks like:
+# ...
+# Full output saved to: .praisonai_tool_output/ast_grep_search-<id>.txt
+
+# The advertised path is inside the workspace, so the agent's read_file / grep
+# tools can open it directly to inspect the full buffer.
+```
+
+| Env var | Effect |
+|---------|--------|
+| `PRAISONAI_TOOL_OUTPUT_DIR` | When set, spill artifacts land here instead of the default `.praisonai_tool_output/` under the workspace root |
 
 ---
 
@@ -466,12 +573,17 @@ pip install praisonaiagents[autonomy]
 
 ## Error Handling
 
-All functions include comprehensive error handling:
-- **Not installed**: Returns helpful install instructions
-- **Empty pattern**: Returns clear error message
-- **Timeout**: 60s for search, 120s for rewrite/scan
-- **Subprocess errors**: Captured and returned as strings
-- **No matches**: Returns "No matches found" (not an error)
+All functions return errors as strings — they never crash the agent:
+- **Not installed** — returns install instructions (unchanged).
+- **Empty pattern / empty replacement** — returns a clear error string (unchanged).
+- **Path outside the workspace** — returns `Error: path '<value>' is outside the workspace`. See [Path Confinement](#path-confinement).
+- **Rule file outside the workspace** (scan) — returns `Error: rule_file '<value>' is outside the workspace`.
+- **Non-zero exit from `sg`** — returns `Error: <stderr or stdout>` (broadened from stderr-only).
+- **No matches (search / scan)** — returns `No matches found` / `No issues found`.
+- **No matches (rewrite)** — `No matches found for rewrite` (`dry_run=True`) or `No changes made` (`dry_run=False`).
+- **Rewrite applied** — returns `sg`'s stderr receipt, e.g. `Applied N changes`.
+- **Timeout** — 60s for search, 120s for rewrite and scan.
+- **Output > 10,000 chars** — bounded preview plus `Full output saved to: <path>` pointer. See [Output Limits](#output-limits).
 
 ## Related
 
