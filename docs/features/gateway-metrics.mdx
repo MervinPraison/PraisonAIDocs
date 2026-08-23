@@ -1,7 +1,7 @@
 ---
 title: "Gateway Metrics"
 sidebarTitle: "Gateway Metrics"
-description: "Prometheus-format message-flow metrics from the PraisonAI gateway"
+description: "Prometheus-format counters, gauges, and latency histograms from the PraisonAI gateway"
 icon: "chart-line"
 ---
 
@@ -10,13 +10,17 @@ The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` 
 </Note>
 
 
-Scrape `GET /metrics` on the PraisonAI gateway to feed Prometheus — counters and gauges for every hop of the message flow, zero new dependencies.
+Scrape `GET /metrics` on the PraisonAI gateway to feed Prometheus — counters, gauges, **and latency histograms** for every hop of the message flow, zero new dependencies.
 
 ```python
 from praisonaiagents import Agent
+from praisonai.bots import GatewayMetrics
 
 agent = Agent(name="assistant", instructions="Be helpful")
-agent.start("Handle user messages while metrics export on GET /metrics")
+
+metrics = GatewayMetrics()
+with metrics.timer("gateway_turn_latency_seconds", labels={"platform": "telegram"}):
+    agent.start("Handle user messages while metrics export on GET /metrics")
 ```
 
 ```bash
@@ -24,7 +28,7 @@ curl -sH "Authorization: Bearer $PRAISONAI_GATEWAY_AUTH_TOKEN" http://localhost:
 ```
 
 
-The user scrapes `GET /metrics` while messaging the gateway; counters and gauges record inbound, agent, and outbound hops.
+The user scrapes `GET /metrics` while messaging the gateway; counters, gauges, and latency histograms record inbound, agent, and outbound hops.
 
 ```mermaid
 graph LR
@@ -92,6 +96,15 @@ graph LR
     # HELP channel_recoveries Total supervision recoveries per channel.
     # TYPE channel_recoveries gauge
     channel_recoveries{channel="telegram"} 2.0
+    # HELP gateway_turn_latency_seconds Turn latency (inbound received -> reply delivered).
+    # TYPE gateway_turn_latency_seconds histogram
+    gateway_turn_latency_seconds_bucket{platform="telegram",le="0.1"} 0
+    gateway_turn_latency_seconds_bucket{platform="telegram",le="0.25"} 1
+    gateway_turn_latency_seconds_bucket{platform="telegram",le="0.5"} 3
+    gateway_turn_latency_seconds_bucket{platform="telegram",le="1.0"} 5
+    gateway_turn_latency_seconds_bucket{platform="telegram",le="+Inf"} 5
+    gateway_turn_latency_seconds_sum{platform="telegram"} 1.87
+    gateway_turn_latency_seconds_count{platform="telegram"} 5
     ```
   </Step>
 </Steps>
@@ -124,6 +137,21 @@ Gauges are sampled on every scrape — not pushed on a timer. The `/metrics` end
 ---
 
 ## Configuration Options
+
+Pick the metric type that matches what you are measuring.
+
+```mermaid
+graph TB
+    Q{What are you<br/>measuring?} -->|A monotonic count of events| C[Counter · inc]
+    Q -->|A point-in-time level| G[Gauge · set_gauge]
+    Q -->|A duration or size distribution| H[Histogram · observe / timer]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class C,G,H opt
+```
 
 ### Authentication
 
@@ -171,6 +199,49 @@ If `auth_token` is not set in the gateway config, the endpoint is open to all ca
 `messages_inbound_total` is incremented on every inbound message via `_record_channel_inbound`, carrying a single `channel` label — one time series per configured channel (including Telegram polling injected through `_inject_routing_handler`). The `praisonai gateway test --check-inbound` command scrapes this counter to compute a per-window delta as live-delivery proof. See [Inbound tier](/docs/features/gateway-readiness#inbound-tier-check-inbound).
 </Note>
 
+### Histograms
+
+Histograms record latency distributions per hop, so you can compute p50/p95/p99 straight from `/metrics`.
+
+```mermaid
+graph LR
+    Stage[⏱️ Stage] -->|observe seconds| Hist[📊 Histogram]
+    Hist -->|_bucket _sum _count| Endpoint[(📈 /metrics)]
+    Endpoint --> Percentiles[p50 / p95 / p99]
+
+    classDef stage fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef hist fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Stage stage
+    class Hist,Endpoint hist
+    class Percentiles ok
+```
+
+Five histograms are pre-registered with help text:
+
+| Name | Help |
+|------|------|
+| `gateway_turn_latency_seconds` | Turn latency (inbound received -> reply delivered). |
+| `gateway_llm_latency_seconds` | LLM-call latency in seconds. |
+| `gateway_tool_latency_seconds` | Tool-call latency in seconds. |
+| `gateway_queue_wait_seconds` | Admission/queue wait time before dispatch. |
+| `gateway_outbound_latency_seconds` | Outbound send latency in seconds. |
+
+`observe(name, seconds, buckets=DEFAULT_BUCKETS, labels=None)` records a duration into cumulative buckets plus running `_sum` / `_count`. `timer(name, ...)` is a context manager that times its body with `time.perf_counter()` and calls `observe`. Both default to `DEFAULT_BUCKETS`:
+
+```python
+DEFAULT_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+```
+
+<Note>
+**Histogram invariants (enforced by the SDK):**
+- Buckets must be **finite** and **strictly increasing** — `NaN`, `±Inf`, duplicates, or decreases raise `ValueError`.
+- The `+Inf` bucket is appended automatically at render time — supply only finite bounds.
+- A histogram `name` is **pinned to its first bucket set**; re-observing the same name with different buckets raises `ValueError`.
+- `"le"` is a **reserved label** and cannot appear in your `labels` dict.
+</Note>
+
 ---
 
 ## Common Patterns
@@ -189,8 +260,16 @@ gateway.record_metric("messages_inbound_total", labels={"channel": "telegram"})
 
 ```python
 snap = gateway.metrics_snapshot()
-# {"counters": {"messages_inbound_total{channel=\"telegram\"}": 1.0, ...},
-#  "gauges":   {"active_sessions": 5.0, ...}}
+# {
+#   "counters":  {"messages_inbound_total{channel=\"telegram\"}": 1.0, ...},
+#   "gauges":    {"active_sessions": 5.0, ...},
+#   "histograms":{
+#       "gateway_turn_latency_seconds_count":               2.0,
+#       "gateway_turn_latency_seconds_sum":                 1.8,
+#       "gateway_turn_latency_seconds_bucket{le=\"0.5\"}":  1.0,
+#       "gateway_turn_latency_seconds_bucket{le=\"2.5\"}":  2.0,
+#   },
+# }
 ```
 
 ### Prometheus scrape config
@@ -217,6 +296,48 @@ metrics.set_gauge("active_sessions", 5.0)
 print(metrics.counter_value("messages_inbound_total", labels={"channel": "telegram"}))
 print(metrics.render_prometheus())
 ```
+
+### Timing a stage with `timer()`
+
+```python
+from praisonai.bots import GatewayMetrics
+
+metrics = GatewayMetrics()
+
+with metrics.timer("gateway_turn_latency_seconds", labels={"platform": "telegram"}):
+    reply = run_turn(event)
+```
+
+### Recording a measured duration with `observe()`
+
+```python
+from praisonai.bots import GatewayMetrics
+
+metrics = GatewayMetrics()
+
+metrics.observe("gateway_llm_latency_seconds", llm_elapsed_seconds)
+metrics.observe(
+    "gateway_tool_latency_seconds",
+    tool_elapsed_seconds,
+    labels={"tool": "search"},
+)
+```
+
+### Custom buckets for a different latency profile
+
+```python
+from praisonai.bots import GatewayMetrics
+
+metrics = GatewayMetrics()
+
+metrics.observe(
+    "gateway_queue_wait_seconds",
+    wait_seconds,
+    buckets=(0.001, 0.005, 0.01, 0.05, 0.1),
+)
+```
+
+The bucket set is pinned to the histogram name on first observation — re-observing with different bounds raises `ValueError`.
 
 ---
 
@@ -246,12 +367,25 @@ print(metrics.render_prometheus())
   <Accordion title="Don't depend on push frequency for gauges">
     `active_sessions`, `outbox_depth`, and `approval_pending` are point-in-time samples taken at scrape time — they are not time-averaged. Use them as snapshots, not as rate inputs.
   </Accordion>
+
+  <Accordion title="Alert on p95/p99 turn latency">
+    Turn-latency histograms feed SLOs directly. Use `histogram_quantile` over the `_bucket` rate to alert on p95:
+    ```yaml
+    - alert: GatewayTurnLatencyHigh
+      expr: |
+        histogram_quantile(
+          0.95,
+          sum by (le, platform) (rate(gateway_turn_latency_seconds_bucket[5m]))
+        ) > 3
+      for: 5m
+    ```
+  </Accordion>
 </AccordionGroup>
 
 ---
 
 <Note>
-Metrics show *rates and totals*; for per-turn latency and error spans, attach a hook via [Gateway Tracing Hook](/features/gateway-tracing-hook).
+Histograms now cover turn / LLM / tool / queue-wait / outbound **latency distributions** — use them for SLOs (p50/p95/p99). For per-stage **error spans** and cross-service correlation, attach a hook via [Gateway Tracing Hook](/features/gateway-tracing-hook).
 </Note>
 
 ## Related
