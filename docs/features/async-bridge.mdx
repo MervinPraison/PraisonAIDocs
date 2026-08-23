@@ -326,7 +326,7 @@ This error used to leak from SDK internals before the async bridge was implement
 
 ### TimeoutError: run_sync_or_offload() worker did not complete within {N}s
 
-The offloaded coroutine did not finish inside `timeout + 1s`. Check for blocking I/O or a missing `await`, or raise `PRAISONAI_RUN_SYNC_TIMEOUT` if the work is legitimately long-running.
+This timeout branch is only reachable when the caller is inside a running loop **and** has opted into `PRAISONAI_ALLOW_LOOP_BLOCKING=true` (the offload path). A plain-sync caller still hits the same `TimeoutError` via `run_sync`. The offloaded coroutine did not finish inside `timeout + 1s` — check for blocking I/O or a missing `await`, or raise `PRAISONAI_RUN_SYNC_TIMEOUT` if the work is legitimately long-running. Prefer migrating to `await arun_sync_or_offload(...)` / `await praisonai.arun(...)` so the loop is never blocked.
 
 ### PermissionError in approval system
 
@@ -445,48 +445,57 @@ See also: [Approval Protocol](/features/approval-protocol) and [Gateway](/featur
 
 ---
 
-## `run_sync_or_offload` — safe from any calling context
+## `run_sync_or_offload` — strict inside a running loop
 
-Use `run_sync_or_offload()` when your code path can be reached from either a normal script or from inside a running event loop (FastAPI, Jupyter, async tests) — one helper, no `RuntimeError`.
+Use `run_sync_or_offload()` on a code path that can be reached from a plain script **or** from inside a running event loop (FastAPI, Jupyter, async tests). On a plain-sync caller it dispatches to `run_sync`. Inside a running loop it now **raises `RuntimeError` by default** ([PR #4261](https://github.com/MervinPraison/PraisonAI/pull/4261)) and steers you to the awaitable siblings — it never silently pins the loop.
 
 ```mermaid
 graph LR
-    subgraph "run_sync_or_offload"
-        A{🔍 Running loop?} -->|No| B[🚀 run_sync]
-        B --> C[🌉 Shared bridge]
-        A -->|Yes| D[🧵 Offload thread]
-        D --> E[🌉 Same bridge]
-        C --> F[✅ Result]
-        E --> F
-    end
+    A{🔍 Running loop?} -->|No| B[✅ run_sync — shared bridge]
+    A -->|Yes| C{🔧 PRAISONAI_ALLOW_LOOP_BLOCKING=true?}
+    C -->|No — default| D[❌ RuntimeError<br/>use arun / arun_sync_or_offload]
+    C -->|Yes — opt-in| E[⚠️ offload + join<br/>blocks loop up to timeout+1s]
 
-    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef warn fill:#6366F1,stroke:#7C90A0,color:#fff
 
-    class A decision
-    class B,C,D,E process
-    class F result
+    class A,C decision
+    class B ok
+    class D error
+    class E warn
 ```
 
 <Steps>
-<Step title="Import and call">
+<Step title="Plain sync caller — works">
 ```python
 from praisonai._async_bridge import run_sync_or_offload
 
 async def fetch(): return 42
 
-value = run_sync_or_offload(fetch())
+value = run_sync_or_offload(fetch())  # no running loop → run_sync
 ```
 </Step>
 
-<Step title="Inside a FastAPI handler">
-Same helper, no code change — it just works:
+<Step title="Inside a FastAPI handler — await instead">
+A sync call inside a running loop now raises `RuntimeError`. Make the handler `async` and `await` the coroutine directly:
 
 ```python
 @app.post("/run")
-def run(prompt: str):
-    return {"answer": run_sync_or_offload(agent.astart(prompt))}
+async def run(prompt: str):
+    return {"answer": await agent.astart(prompt)}
+```
+
+For an existing sync entry point you cannot convert to `async def`, `await` the awaitable sibling:
+
+```python
+from praisonai._async_bridge import arun_sync_or_offload
+
+@app.post("/run")
+async def run(prompt: str):
+    return {"answer": await arun_sync_or_offload(agent.astart(prompt))}
+    # or: await praisonai.arun(...)
 ```
 </Step>
 </Steps>
@@ -495,29 +504,57 @@ def run(prompt: str):
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `coro` | `Awaitable[T]` | — | The coroutine to await. |
+| `coro` | `Awaitable[T]` | — | The coroutine to run. Refused inside a loop (strict mode) — it is `.close()`'d so it does not leak as a "coroutine was never awaited" warning. |
 | `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300s) | Same env var as `run_sync`. |
-| `thread_name` | `str` | `"praisonai-sync-offload"` | Name of the offload worker thread (shows up in stack traces). |
+| `thread_name` | `str` | `"praisonai-sync-offload"` | Name of the offload worker thread (only used under the `PRAISONAI_ALLOW_LOOP_BLOCKING` opt-in). |
 
-Called from a plain sync caller, it dispatches to the active `AsyncBridge` via `run_sync`, sharing its background loop and connection pools. Called from inside a running loop, it copies the caller's ContextVars onto a worker thread that hands the coroutine to the **same** bridge — never a fresh `asyncio.new_event_loop()` — so a caller-installed `scoped_bridge()` binding still wins and LiteLLM/HTTPX per-loop connection pools are preserved. Exceptions re-raise on the caller thread.
+Called from a plain sync caller, it dispatches to the active `AsyncBridge` via `run_sync`, sharing its background loop and connection pools. Called from inside a running loop **with `PRAISONAI_ALLOW_LOOP_BLOCKING=true`**, it copies the caller's ContextVars onto a worker thread that hands the coroutine to the **same** bridge — never a fresh `asyncio.new_event_loop()` — so a caller-installed `scoped_bridge()` binding still wins and LiteLLM/HTTPX per-loop connection pools are preserved. Exceptions re-raise on the caller thread.
+
+### The strict `RuntimeError`
+
+In the default (strict) mode, a call from inside a running loop raises with this message — grep for it in a traceback:
+
+```text
+run_sync_or_offload() would block the running event loop for up to 300s. From an async context, await one of:
+  - praisonai.arun(...)
+  - adapter.arun(...)
+  - praisonai._async_bridge.arun_sync_or_offload(coro)
+Set PRAISONAI_ALLOW_LOOP_BLOCKING=true to opt into the legacy blocking behaviour.
+```
 
 ### How it differs from `run_sync`
 
-| Helper | Plain sync caller | Inside a running loop |
-|--------|-------------------|-----------------------|
-| `run_sync` | ✅ works | ❌ `RuntimeError` |
-| `run_sync_or_offload` | ✅ works | ✅ offloads onto a worker thread (blocks the caller) |
-| `arun_sync_or_offload` | — (must be awaited) | ✅ **non-blocking** await; the loop stays responsive |
+| Helper | Plain sync caller | Inside a running loop (default) | Inside a running loop (`PRAISONAI_ALLOW_LOOP_BLOCKING=true`) |
+|--------|-------------------|---------------------------------|--------------------------------------------------------------|
+| `run_sync` | ✅ works | ❌ `RuntimeError` | ❌ `RuntimeError` |
+| `run_sync_or_offload` | ✅ works | ❌ `RuntimeError` (points at awaitable siblings) | ⚠️ offloads onto a worker thread + joins (blocks the loop for up to `timeout+1s`) |
+| `arun_sync_or_offload` | — (must be awaited) | ✅ **non-blocking** await; the loop stays responsive | ✅ **non-blocking** await |
 
 <Note>
-`run_sync_or_offload()` now bounds `thread.join()` at `timeout + 1.0s`. If the worker is still alive it raises `TimeoutError("run_sync_or_offload() worker did not complete within {timeout}s")`. The extra second covers thread hand-off/teardown so the join does not spuriously time out before the worker records its own error.
+Under the `PRAISONAI_ALLOW_LOOP_BLOCKING` opt-in, `run_sync_or_offload()` bounds `thread.join()` at `timeout + 1.0s`. If the worker is still alive it cancels the in-flight future and raises `TimeoutError("run_sync_or_offload() worker did not complete within {timeout}s")`. The extra second covers thread hand-off/teardown so the join does not spuriously time out before the worker records its own error.
 </Note>
+
+### Migration
+
+Any caller that today relies on offload-inside-a-loop must either (a) migrate to the awaitable sibling (`await praisonai.arun(...)`, `await adapter.arun(...)`, or `await arun_sync_or_offload(...)`), or (b) set `PRAISONAI_ALLOW_LOOP_BLOCKING=true` as an interim measure. See [PR #4261](https://github.com/MervinPraison/PraisonAI/pull/4261).
 
 ### Best Practices
 
 <AccordionGroup>
-<Accordion title="Prefer run_sync_or_offload for any 3-way surface (CLI + YAML + Python)">
-The caller's context isn't knowable at write time — the same code path can be reached from a plain script, a YAML run, or a Python call inside a running loop. `run_sync_or_offload` handles all three without a `RuntimeError`, while still reusing the shared bridge and its connection pools.
+<Accordion title="Prefer arun / arun_sync_or_offload inside a loop">
+Inside a running loop, `await` the awaitable sibling so the loop stays responsive. The sync helper now raises `RuntimeError` by design rather than parking the loop.
+
+```python
+# Good — loop stays responsive
+answer = await arun_sync_or_offload(agent.astart(prompt))
+
+# Raises RuntimeError inside a running loop (strict default)
+answer = run_sync_or_offload(agent.astart(prompt))
+```
+</Accordion>
+
+<Accordion title="Keep run_sync_or_offload for plain-sync surfaces">
+On a CLI or plain-script entry point there is no running loop, so `run_sync_or_offload` dispatches to `run_sync` and reuses the shared bridge and its connection pools.
 
 ```python
 from praisonai._async_bridge import run_sync_or_offload
@@ -527,19 +564,12 @@ def surface_entry(prompt: str) -> str:
 ```
 </Accordion>
 
-<Accordion title="Keep run_sync for sync-only paths">
-`run_sync` fails loudly inside a loop, which is what you want for a code path that must never be called from one — the `RuntimeError` surfaces an architectural bug instead of silently offloading.
-
-```python
-from praisonai._async_bridge import run_sync
-
-def cli_only(prompt: str) -> str:
-    return run_sync(agent.astart(prompt))
-```
+<Accordion title="Set PRAISONAI_ALLOW_LOOP_BLOCKING=true only for controlled migration windows">
+The opt-in restores the pre-#4261 offload-and-join behaviour, which blocks the caller's event loop for up to `timeout + 1s`. Use it only as a bounded interim measure while migrating a known-safe path to the awaitable sibling — never as a long-term default.
 </Accordion>
 </AccordionGroup>
 
-This helper landed in [PraisonAI #3492](https://github.com/MervinPraison/PraisonAI/pull/3492); its callers (`praisonai.auto`, `persistence.orchestrator`, `api.agent_invoke`) are migrated onto it.
+This helper landed in [PraisonAI #3492](https://github.com/MervinPraison/PraisonAI/pull/3492); the strict-inside-a-loop default landed in [PR #4261](https://github.com/MervinPraison/PraisonAI/pull/4261). Its callers (`praisonai.auto`, `persistence.orchestrator`, `api.agent_invoke`) are migrated onto it.
 
 ### Related
 
@@ -548,7 +578,7 @@ This helper landed in [PraisonAI #3492](https://github.com/MervinPraison/Praison
 Module-level runner for sync-only paths.
 </Card>
 <Card title="scoped_bridge" icon="lock" href="/features/async-bridge#per-session-scoped-bridge">
-Per-session bridge that `run_sync_or_offload` preserves across the offload hop.
+Per-session bridge preserved across the offload hop when `PRAISONAI_ALLOW_LOOP_BLOCKING=true`.
 </Card>
 <Card title="Agent-Centric Tools" icon="wrench" href="/cli/agent-tools#timeouts-cancellation">
 The Tier-2 `_run_sync` (PR #3361) mirrors the same design.
@@ -625,13 +655,13 @@ Unlike `run_sync_or_offload`, this variant does **not** park the running loop th
 
 <AccordionGroup>
 <Accordion title="Await it from async handlers, not run_sync_or_offload">
-Inside a running loop, `run_sync_or_offload` offloads onto a worker thread and blocks the caller until the coroutine finishes. `arun_sync_or_offload` awaits instead, so the loop keeps serving other requests.
+Inside a running loop, `run_sync_or_offload` raises `RuntimeError` by default (and only offloads-and-blocks under `PRAISONAI_ALLOW_LOOP_BLOCKING=true`). `arun_sync_or_offload` awaits instead, so the loop keeps serving other requests.
 
 ```python
 # Good — loop stays responsive
 answer = await arun_sync_or_offload(agent.astart(q))
 
-# Blocks the caller until done
+# Raises RuntimeError inside a running loop (strict default)
 answer = run_sync_or_offload(agent.astart(q))
 ```
 </Accordion>
@@ -644,7 +674,7 @@ Plain scripts and CLI entry points can't `await`. Use `run_sync_or_offload` (or 
 ### Related
 
 <CardGroup cols={2}>
-<Card title="run_sync_or_offload" icon="arrows-left-right" href="/features/async-bridge#run-sync-or-offload-safe-from-any-calling-context">
+<Card title="run_sync_or_offload" icon="arrows-left-right" href="/features/async-bridge#run-sync-or-offload-strict-inside-a-running-loop">
 Sync sibling for non-async callers.
 </Card>
 <Card title="scoped_bridge" icon="lock" href="/features/async-bridge#per-session-scoped-bridge">
