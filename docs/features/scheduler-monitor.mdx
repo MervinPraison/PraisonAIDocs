@@ -203,6 +203,55 @@ GateResult(run=True, context="2 new releases", state_updates={"last_hash": "def4
 
 ---
 
+## URL Monitor Reliability & Safety
+
+Every URL probe runs behind a bounded, hardened path. These are the guarantees an operator can rely on before pointing a monitor at anything they don't own end-to-end.
+
+```mermaid
+graph LR
+    Probe[🔎 Probe URL] --> Scheme{scheme<br/>http/https?}
+    Scheme -->|no| Reject1[❌ Rejected]
+    Scheme -->|yes| DNS[🌐 Resolve DNS]
+    DNS --> Public{every address<br/>public?}
+    Public -->|no| Reject2[❌ Rejected]
+    Public -->|yes| Pin[📌 Pin to validated IP]
+    Pin --> Deadline[⏱️ Total-deadline watchdog]
+    Deadline --> Fetch[⬇️ Fetch ≤ 64 KiB]
+    Fetch --> Hash[🔐 Hash + diff]
+
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef guard fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef reject fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+    class Probe,DNS,Pin,Fetch step
+    class Scheme,Public,Deadline guard
+    class Reject1,Reject2 reject
+    class Hash done
+```
+
+| Guarantee | Value |
+|---|---|
+| Total wall-clock deadline (connect + body read) | `30 s` (`MonitorGate(timeout=…)`) |
+| Response body cap | `64 KiB` — anything larger is rejected |
+| Retained preview used for diffing | `2048 B` |
+| Diff seeded into the agent message | up to `8000` chars |
+| Schemes allowed | `http`, `https` only |
+| Embedded credentials (`https://user:pass@…`) | rejected before any connect |
+| Private / loopback / link-local addresses | rejected before any connect |
+| Connection pinning | fixed to the validated IP — a DNS re-resolve can't smuggle in a private IP |
+| TLS | full hostname + CA verification |
+| Redirects | not followed |
+
+<Note>
+**Slow-body drip protection ([PR #4237](https://github.com/MervinPraison/PraisonAI/pull/4237)):** the total-deadline watchdog now aborts even on `Connection: close` responses where `http.client` has already nulled the socket. Previously a hostile page dripping one byte per socket window could stall the entire sequential scheduler tick — the fix retains a raw socket handle so the watchdog can still shut the connection down.
+</Note>
+
+<Warning>
+The retained preview is currently smaller (2048 B) than the digest window (64 KiB), so a change that lands past byte 2048 reports `"Monitor output changed outside retained preview."` as the seeded diff — the run still fires, but the diff is a marker rather than the bytes that changed. Track [PraisonAI #4233](https://github.com/MervinPraison/PraisonAI/issues/4233) for the follow-up that bounds the preview to the digest window.
+</Warning>
+
+---
+
 ## Monitor vs Pre-Run vs Command
 
 Three scheduler features feel similar but solve different problems.
@@ -329,6 +378,10 @@ Return `state_updates=None` on an error probe so prior state is untouched — a 
 
 <Accordion title="Keep stored state bounded">
 State is a small scratchpad, not a database. Store cursors and hashes, not full payloads, so a runaway write can't grow unbounded.
+</Accordion>
+
+<Accordion title="Prefer a small endpoint over a full page for URL monitors">
+Each URL probe is capped at a total wall-clock deadline (default 30 s) covering connect and body read, so a slow-drip attacker can no longer stall the scheduler tick. A legitimate page you don't need still costs a fetch on every tick, though — prefer a small JSON endpoint over a full page and the whole loop stays cheap.
 </Accordion>
 </AccordionGroup>
 
