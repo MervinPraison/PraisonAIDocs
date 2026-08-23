@@ -157,9 +157,14 @@ agents = AgentTeam(
 | `truncate` | Remove oldest messages first | Fast, simple; keeps tool pairs intact | Loses early context |
 | `sliding_window` | Keep N most recent messages | Preserves recent; keeps tool pairs intact | Loses early context |
 | `prune_tools` | Truncate old tool outputs | Keeps messages | May lose tool details |
+| `non_destructive` | Compact only messages marked non-critical; preserves everything else | Best when tool outputs are heavy but must not be summarised | Tagged messages still occupy storage |
 | `summarize` | Replace old messages with summary | Preserves meaning | Slower, uses API |
 | `conversation` | Structured summaries with topic/goal tracking | Preserves narrative | Requires analysis |
 | `smart` | Combine strategies intelligently | Best balance | More complex |
+
+<Note>
+**Requires PraisonAI PR #4242 (merged Aug 2026).** Before this fix, only `smart` actually ran end-to-end. Setting `strategy` to any of `truncate`, `sliding_window`, `summarize`, `prune_tools`, `non_destructive`, or `conversation` raised `TypeError` inside `ContextManager` and was silently swallowed — the history was returned unchanged and the hard-limit emergency truncation never fired. Upgrade to a build that includes PR #4242 to get the strategy you configured.
+</Note>
 
 <Note>
 **Tool-call/tool-result pairs stay intact.** Every strategy — including the default `truncate` — snaps its compaction boundary so an assistant `tool_calls` message and its matching `tool` result are never separated. Long-running sessions on OpenAI, Anthropic, and Azure OpenAI keep working after compaction; you do not need a workaround for the `messages with role 'tool' must be a response to a preceding message with 'tool_calls'` 400.
@@ -170,6 +175,7 @@ agents = AgentTeam(
 - **`truncate`**: Simple chatbots, Q&A agents
 - **`sliding_window`**: Long conversations where recent context matters most
 - **`prune_tools`**: Tool-heavy agents with large outputs
+- **`non_destructive`**: Heavy tool outputs you must keep — tags old messages out of the effective window instead of deleting them
 - **`summarize`**: When historical context is critical
 - **`conversation`**: Multi-hour planning sessions, iterative development — automatically falls back to `smart` when compaction ratio isn't meaningful, making it safe as a default for long-running agents
 - **`smart`** (recommended): Production use, balances all concerns
@@ -208,6 +214,8 @@ For `truncate`, the token-budget loop additionally drops a leading assistant `to
 | 95% | CRITICAL | Aggressive optimization required |
 | 100% | OVERFLOW | Immediate truncation to prevent API error |
 
+"Immediate truncation" at 100% now counts the system prompt and tool schemas in the overhead, not just history tokens. An agent whose system prompt or tool block grew large will trip emergency truncation earlier than before — this is intentional and keeps the request inside the model window.
+
 ### Automatic Handling
 
 When `auto_compact=True`, the system automatically:
@@ -216,6 +224,38 @@ When `auto_compact=True`, the system automatically:
 2. Triggers optimization when threshold is reached
 3. Applies the configured strategy
 4. Logs the optimization event
+5. If the configured strategy fails, falls back to emergency truncation targeting ~80% of the model window (result payload includes `emergency_truncated: True`)
+
+### Failure Fallback
+
+If the configured strategy raises, `_apply_context_management` no longer returns the history unchanged. It:
+
+1. Logs the failure at `error` level (was `warning`).
+2. Recomputes the model limit via `get_model_limit`.
+3. Adds the system prompt and tool-schema token cost as overhead.
+4. If `history + overhead > 95%` of the window, calls `emergency_truncate` targeting `max(1, int(model_limit * 0.8) - overhead)`.
+5. Returns `{"emergency_truncated": True}` so observability sinks can see the fallback fired.
+
+A misconfigured strategy therefore never sends an over-budget request — the hard limit stays in place.
+
+```python
+from praisonaiagents import Agent, ManagerConfig
+
+agent = Agent(
+    instructions="You are a support assistant.",
+    context=ManagerConfig(
+        strategy="truncate",  # Any of the seven strategies is now reliable
+        auto_compact=True,
+        compact_threshold=0.8,
+    ),
+)
+
+# When the configured strategy fails, the fallback still keeps the request
+# inside the model window and marks the result.
+result = agent.chat("Long conversation continues here...")
+# result.metadata may include:
+#   {"emergency_truncated": True}
+```
 
 <Note>
 Compaction never emits an orphaned `tool` message. The recent-window boundary and any per-message drop pass keep the assistant `tool_calls` message and its matching `tool` result together — so strict providers (OpenAI, Anthropic, Azure OpenAI) never receive a partial pair.
@@ -415,6 +455,9 @@ sequenceDiagram
   </Accordion>
   <Accordion title="Revisit strategy after model changes">
     A larger context window may let you switch to lighter strategies and save latency.
+  </Accordion>
+  <Accordion title="Verify your build includes PR #4242 before non-smart strategies">
+    If you pinned PraisonAI at a build before PR #4242, only `strategy="smart"` actually compacted. All other values raised `TypeError` inside `ContextManager` and were silently swallowed — including the emergency truncation. Verify your build includes PR #4242 (merged Aug 2026) before shipping a non-smart strategy to production.
   </Accordion>
   <Accordion title="Tool-using bots stay valid across compaction">
     When your agent calls tools inside a long conversation, compaction never separates an assistant `tool_calls` message from its `tool` result. This holds for every strategy — `truncate`, `sliding_window`, `prune_tools`, `summarize`, `conversation`, and `smart`. Long-lived Telegram/Slack/gateway bots on strict providers keep working across weeks of history without provider `400`s.
