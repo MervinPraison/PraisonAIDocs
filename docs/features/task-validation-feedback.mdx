@@ -36,6 +36,16 @@ AgentTeam(agents=[writer], tasks=[task]).start()
 The retry-with-feedback prompt wiring described below (upstream output + guardrail feedback injected into the next attempt's prompt) requires a `praisonaiagents` build from **2026-07-28 or later** (see upstream fixes `36da000` and `de5a95d`). On earlier builds `task.validation_feedback` was populated on the Task object, but the retry attempt's LLM prompt was assembled without it — the retry ran with the same original prompt as attempt 1.
 </Note>
 
+<Note>
+Decision routing is **case- and whitespace-insensitive** as of the `praisonaiagents`
+build merging [MervinPraison/PraisonAI#4260](https://github.com/MervinPraison/PraisonAI/pull/4260)
+(2026-08-23). On earlier builds a verdict with a trailing newline —
+`"invalid\n"`, which is what LLMs routinely return — missed the `condition` lookup and
+the workflow finished silently as though everything passed: the task was **not retried**,
+`validation_feedback` was **not populated**, and no exception was raised. Upgrade if your
+judge task's `condition` keys are not matching what the model returns.
+</Note>
+
 The user asks for output that must meet a guardrail; failed validation sends feedback into the next retry until the check passes or retries are exhausted.
 
 ```mermaid
@@ -124,6 +134,74 @@ sequenceDiagram
         ```
     </Step>
 </Steps>
+
+## How the router reads your verdict
+
+The `Process` router applies `.lower().strip()` to the model's decision before looking it up in `condition`, so case and surrounding whitespace never break a match.
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+writer = Agent(name="Writer", instructions="Write a short paragraph.")
+judge = Agent(name="Judge", instructions="Reply with exactly one word: valid or invalid.")
+
+write = Task(
+    name="write_article",
+    description="Write a paragraph about renewable energy.",
+    agent=writer,
+    is_start=True,
+    next_tasks=["judge_article"],
+)
+
+judge_article = Task(
+    name="judge_article",
+    description="Judge the paragraph. Reply with exactly one word: valid or invalid.",
+    agent=judge,
+    task_type="decision",
+    condition={
+        "valid": [],                    # lowercase, no whitespace, no punctuation
+        "invalid": ["write_article"],   # route back to retry
+    },
+)
+
+PraisonAIAgents(
+    agents=[writer, judge],
+    tasks=[write, judge_article],
+).start()
+```
+
+These model outputs all route to the `invalid` branch:
+
+| Model output | Routes as |
+|---|---|
+| `"invalid"` | `invalid` |
+| `"Invalid"` | `invalid` |
+| `"INVALID"` | `invalid` |
+| `"invalid\n"` | `invalid` |
+| `" invalid "` | `invalid` |
+
+<Warning>
+An **unmatched decision and a deliberate exit take the same branch** — no exception, no warning. `"Invalid."` (trailing punctuation), `"not valid"` (paraphrase), or any verdict absent from `condition` falls through to the exit branch and the workflow finishes silently. To stay on the routed path:
+
+- Keep `condition` keys **lowercase, whitespace-free, and punctuation-free**.
+- Instruct the judge agent to reply with exactly one allowed verdict — `"Reply with exactly one word: valid or invalid."`
+- Add a key for **every** verdict you expect the judge to return.
+
+Detect a silent miss by watching for the log line `Workflow exit condition met on decision: <key>` when you expected a retry.
+</Warning>
+
+## Which verdicts trigger validation feedback
+
+Only a closed set of verdicts populate `task.validation_feedback` when routed back to a previous task — `Process.VALIDATION_FAILURE_DECISIONS` in `praisonaiagents/process/process.py` is the source of truth:
+
+```python
+VALIDATION_FAILURE_DECISIONS = [
+    "invalid", "retry", "failed", "error", "unsuccessful",
+    "fail", "errors", "reject", "rejected", "incomplete",
+]
+```
+
+A verdict outside this list (for example `"revise"`) can still route to a retry task via `condition`, but it will **not** populate `validation_feedback` with the judge's reasoning. Use one of the listed verdicts as your retry key when you want the feedback dict populated.
 
 ## Validation Methods
 
