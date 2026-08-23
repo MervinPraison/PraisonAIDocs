@@ -5,7 +5,7 @@ description: "Automatically retry failing tool calls with exponential backoff an
 icon: "rotate"
 ---
 
-`ExecutionConfig` retry settings re-run retryable tool failures and guardrail validation errors with exponential backoff and jitter. For tools, `max_retry_limit` / `retry_*` are **translated into the effective `RetryPolicy`** — the single tool-retry budget shared with `ToolConfig(retry_policy=...)`.
+`ExecutionConfig` retry settings re-run retryable tool failures and guardrail validation errors with exponential backoff and jitter (for tools that have not declared themselves unsafe to re-run — see [Retrying Non-Idempotent Tools](#retrying-non-idempotent-tools)). For tools, `max_retry_limit` / `retry_*` are **translated into the effective `RetryPolicy`** — the single tool-retry budget shared with `ToolConfig(retry_policy=...)`.
 
 ```python
 from praisonaiagents import Agent, tool
@@ -148,6 +148,8 @@ These fields are one spelling of the tool-retry budget. An explicit `ToolConfig(
 
 | Outcome | Retried? |
 |---|---|
+| Tool declares `@tool(restart_safe=False)` / `.idempotent = False` — **any** retryable error | ❌ (runs exactly once) |
+| Tool listed in `MUTATING_TOOLS` — any retryable error | ❌ (runs exactly once) |
 | Wall-clock (outer) timeout — **idempotent** tool | ✅ |
 | Wall-clock (outer) timeout — mutating / unknown tool | ❌ |
 | Circuit breaker open | ✅ |
@@ -158,6 +160,63 @@ These fields are one spelling of the tool-retry budget. An explicit `ToolConfig(
 
 <Note>
 A wall-clock timeout is retried **only** when the tool is idempotent — unknown tools default to non-idempotent (safe). Opt in with `.idempotent = True`; see [Tool Timeouts → Retry-on-timeout is opt-in](/features/tool-timeout#retry-on-timeout-is-opt-in-for-mutating-tools).
+</Note>
+
+<Note>
+A tool that **explicitly** declares itself unsafe (`restart_safe=False`, `.idempotent = False`, or listed in `MUTATING_TOOLS`) is vetoed from **every** retryable error, not just timeouts. Undeclared tools keep the behaviour above.
+</Note>
+
+---
+
+## Retrying Non-Idempotent Tools
+
+A tool that declares itself unsafe to re-run is executed exactly once, even when the error would otherwise be retryable — the body already ran and may have completed its side effect before raising, so retrying would duplicate it.
+
+```mermaid
+graph TB
+    Fail[🔧 Tool fails with a retryable error] --> Q{Declared unsafe?}
+    Q -->|Undeclared| Retry[🔄 Retries per policy]
+    Q -->|restart_safe=True / idempotent=True| Retry
+    Q -->|restart_safe=False / idempotent=False<br/>or in MUTATING_TOOLS| Once[🛑 Runs once — failure returned as-is]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Fail agent
+    class Q config
+    class Retry process
+    class Once warn
+```
+
+Declare it on the decorator and the retry budget is ignored for that tool:
+
+```python
+from praisonaiagents import Agent, tool
+
+@tool(restart_safe=False)
+def charge_card(amount: str) -> str:
+    """Charge a customer's card — must never be re-driven."""
+    return billing.charge(amount)
+
+agent = Agent(
+    name="Billing Agent",
+    instructions="Charge the customer for the pending invoice.",
+    tools=[charge_card],
+    max_retry_limit=3,   # ignored for charge_card — it runs once
+)
+agent.start("Charge invoice #A-1042 for $99")
+```
+
+The declaration is discovered in this order (first match wins):
+
+- `tool.idempotent` set to a `bool` on the tool object.
+- `tool.restart_safe` — the public `@tool(restart_safe=...)` / `BaseTool.restart_safe` contract.
+- Membership in the shared `MUTATING_TOOLS` set.
+
+<Note>
+This is the **same declaration** honoured by durable resume: an in-flight `restart_safe=False` tool returns `NotSafelyResumable`, and a failing one is not re-driven here. See [Durable Runs → Restart-Safety Contract](/features/durable-tool-runs#restart-safety-contract-for-tools).
 </Note>
 
 ---
@@ -204,8 +263,12 @@ Jitter spreads retry timing across agents and reduces thundering-herd spikes on 
 `ValueError`, `TypeError`, and `AttributeError` are treated as code bugs and are not retried.
 </Accordion>
 
+<Accordion title="Mark tools with side effects as non-idempotent">
+A tool that sends, writes, charges, or deletes should declare `@tool(restart_safe=False)` (or set `.idempotent = False`). The tool body runs before it can raise, so retrying after a transient error would duplicate the side effect. Declared-unsafe tools run exactly once regardless of `max_retry_limit`.
+</Accordion>
+
 <Accordion title="Backoff is capped at 60s">
-Very large backoff factors cannot exceed a 60-second base delay per attempt.
+Very large backoff factors cannot exceed a 60-second base delay per attempt. The cap only matters when retries actually happen — declared-unsafe tools do not retry.
 </Accordion>
 
 <Accordion title="Guardrails share these settings">
