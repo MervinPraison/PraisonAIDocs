@@ -16,6 +16,8 @@ agent = Agent(name="Support", instructions="Help users")
 # On a memory-limited host (a $5 VPS, a Fly machine, a k8s cgroup),
 # the gateway automatically soft-evicts the coldest warm caches under
 # pressure before the OOM killer fires — no config needed.
+# A persistent session store (SQLite, Postgres) is what makes soft
+# eviction rebuildable, so it must be configured for eviction to be active.
 bot = BotOS(agent=agent, platforms=["telegram"])
 bot.start()
 ```
@@ -25,23 +27,22 @@ Each evicted session is transparently rebuilt from the persisted session store o
 ```mermaid
 graph LR
     subgraph "Memory-Pressure Eviction"
-        Warm[📦 Warm Cache Registry] --> Probe[📊 MemoryPressureProtocol<br/>cgroup + rss]
+        Warm[📦 BotSessionManager<br/>warm_sessions] --> Probe[📊 CgroupMemoryPressure<br/>cgroup + RssAnon]
         Probe --> Plan[🧠 plan_pressure_evictions]
-        Plan --> List[📋 Coldest-first List]
-        List --> Evict[🧹 Gateway Soft-Evict]
-        Evict --> Free[✅ Memory Reclaimed]
+        Plan --> Enact[🧹 BotSessionManager<br/>sweep_under_pressure]
+        Enact --> Free[✅ Memory Reclaimed]
     end
 
     classDef store fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef probe fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef plan fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef list fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef enact fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef free fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Warm store
     class Probe probe
     class Plan plan
-    class List,Evict list
+    class Enact enact
     class Free free
 ```
 
@@ -53,8 +54,8 @@ graph LR
 
 <Steps>
 
-<Step title="On by default on cgroup-aware hosts">
-No knob to set. When the host can read a cgroup v1/v2 memory limit, the gateway samples RSS and soft-evicts the coldest rebuildable caches under pressure. On a host that can't report a cgroup limit, the planner returns nothing — the gateway simply never soft-evicts (legacy behaviour).
+<Step title="On by default on cgroup-aware Linux hosts">
+No knob to set. On a Linux host that can read a cgroup v1/v2 memory limit, the gateway samples RSS and soft-evicts the coldest rebuildable caches under pressure on its periodic tick. On a host that can't report a cgroup limit (macOS/Windows, unconstrained host), the sweep is a no-op — legacy behaviour is preserved exactly.
 
 ```python
 from praisonaiagents import Agent
@@ -66,40 +67,29 @@ bot.start()
 ```
 </Step>
 
-<Step title="Inspect a plan yourself">
-Feed `WarmSession` facts to the pure planner and read back the coldest-first eviction order:
+<Step title="Add a persistent store to make eviction rebuildable">
+A cache is only evicted when its transcript is durably persisted, so it can be losslessly rebuilt on the next turn. A `BotSessionManager` reads/writes that store via its `store=` argument. Without a store, nothing is flushed, nothing is evicted, and the sweep is a no-op.
 
 ```python
-from praisonaiagents.gateway import (
-    WarmSession,
-    plan_pressure_evictions,
-)
+from praisonaiagents.session.store import DefaultSessionStore
+from praisonai_bot.bots._session import BotSessionManager
 
-warm = [
-    WarmSession(session_id="hot",  last_activity=300.0),
-    WarmSession(session_id="cold", last_activity=10.0),
-    WarmSession(session_id="mid",  last_activity=100.0),
-]
-
-# 1 GiB budget, currently 950 MiB — over 90% of 1000, so shed coldest-first.
-victims = plan_pressure_evictions(budget_mb=1000.0, rss_mb=950.0, warm_sessions=warm)
-assert victims == ["cold", "mid", "hot"]
+# A persistent store makes each warm cache rebuildable — the precondition
+# for soft eviction. See Gateway Session Persistence for store options.
+session_manager = BotSessionManager(store=DefaultSessionStore("./sessions"))
 ```
+
+For a full `BotOS` deployment, configure the store through `gateway.yaml` (`session.persist: true`) — see [Gateway Session Persistence](/features/gateway-session-persistence).
 </Step>
 
-<Step title="Implement your own probe">
-Satisfy `MemoryPressureProtocol` to report the budget + RSS from a custom platform:
+<Step title="Trigger the sweep yourself">
+Running the session manager standalone (no `BotOS`)? Call the enactor directly with the concrete cgroup probe:
 
 ```python
-from praisonaiagents.gateway import MemoryPressureProtocol
+from praisonai_bot.gateway import CgroupMemoryPressure
 
-class MyProbe:
-    def cgroup_limit_mb(self):
-        return 512.0
-    def anon_rss_mb(self):
-        return 128.0
-
-assert isinstance(MyProbe(), MemoryPressureProtocol)  # runtime_checkable
+# session_manager is your BotSessionManager instance
+evicted = session_manager.sweep_under_pressure(CgroupMemoryPressure(), headroom=0.9)
 ```
 </Step>
 
@@ -190,21 +180,73 @@ Returns `[]` when RSS is within budget, the budget is unknown (`None` / `<= 0`),
 
 ---
 
+## Using `CgroupMemoryPressure`
+
+`CgroupMemoryPressure` is the concrete, stdlib-only `MemoryPressureProtocol` the gateway uses to read the real cgroup budget and anonymous RSS.
+
+```python
+from praisonai_bot.gateway import CgroupMemoryPressure
+
+probe = CgroupMemoryPressure()
+probe.cgroup_limit_mb()  # -> float | None (MiB)
+probe.anon_rss_mb()      # -> float (MiB)
+```
+
+| Method | Reads | Unavailable degrades to |
+|---|---|---|
+| `cgroup_limit_mb()` | cgroup v2 `memory.high` / `memory.max`, then cgroup v1 `memory.limit_in_bytes` | `None` |
+| `anon_rss_mb()` | `RssAnon` from `/proc/self/status` | `0.0` |
+
+A nested cgroup's lower limit is preferred: `cgroup_limit_mb()` resolves the process's own cgroup path from `/proc/self/cgroup` first, then falls back to the filesystem root. Every source degrades safely, so on a host with no cgroup limit the sweep is a no-op.
+
+---
+
+## Wrapper-side wiring
+
+`BotSessionManager` is the runtime enactor — it snapshots warm caches, calls the pure planner, and soft-evicts the losers.
+
+### `warm_sessions`
+
+```python
+BotSessionManager.warm_sessions() -> List[WarmSession]
+```
+
+Snapshots the warm per-session caches as core `WarmSession` facts (LRU `last_activity`, `in_flight`, `flushed`). A cache is `flushed` only when a persistent store is configured **and** its last store write succeeded.
+
+### `sweep_under_pressure`
+
+```python
+BotSessionManager.sweep_under_pressure(
+    memory_pressure: MemoryPressureProtocol,
+    headroom: float = 0.9,
+) -> int
+```
+
+Reads the real cgroup budget/RSS from `memory_pressure`, calls `plan_pressure_evictions`, and soft-evicts the coldest rebuildable caches LRU-first — re-sampling RSS to shed the minimum. Returns the number evicted. A no-op (returns `0`) when no cgroup limit is reported.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `memory_pressure` | `MemoryPressureProtocol` | *(required)* | The probe reporting `cgroup_limit_mb()` and `anon_rss_mb()` — typically `CgroupMemoryPressure()`. |
+| `headroom` | `float` | `0.9` | Shed until RSS is back within `headroom × budget`. Passed through to the planner's `headroom_ratio`. |
+
+---
+
 ## How It Works
 
 The gateway samples its own memory, asks the planner for the order to evict, then enacts it — re-sampling RSS as it goes.
 
 ```mermaid
 sequenceDiagram
-    participant Sampler as Gateway Sampler
+    participant Probe as CgroupMemoryPressure
+    participant Enactor as BotSessionManager.sweep_under_pressure
     participant Planner as plan_pressure_evictions
-    participant Enactor as Gateway Enactor
-    Sampler->>Sampler: read cgroup_limit_mb() + anon_rss_mb()
-    Sampler->>Planner: budget, rss, warm_sessions
-    Planner-->>Sampler: full LRU-ordered session_id list
+    Enactor->>Probe: cgroup_limit_mb() + anon_rss_mb()
+    Probe-->>Enactor: budget, rss
+    Enactor->>Planner: budget, rss, warm_sessions()
+    Planner-->>Enactor: full LRU-ordered session_id list
     loop for each victim
-        Enactor->>Enactor: re-sample RSS
-        alt back within headroom_ratio × budget
+        Enactor->>Probe: re-sample anon_rss_mb()
+        alt back within headroom × budget
             Enactor-->>Enactor: stop
         else still over
             Enactor->>Enactor: soft-evict victim (rebuilt next turn)
@@ -218,8 +260,8 @@ The planner returns the **full ordered list**, not a prefix — the gateway re-s
 
 | Guard | Why |
 |---|---|
-| `in_flight=True` | An executing turn must not be aborted. |
-| `flushed=False` | An unflushed transcript is not yet rebuildable from the store — evicting it would lose data. |
+| `in_flight=True` | An executing turn must not be aborted. Re-checked at enact time — a turn may have started against a planned victim between the plan and the enact. |
+| `flushed=False` | An unflushed transcript is not yet rebuildable from the store — evicting it would lose data. `flushed=True` requires a configured store **and** a successful last write; a caught store-write failure clears the marker, so the sweep skips the cache. |
 
 **Degraded modes** — the planner never crashes the gateway it protects, returning `[]` when:
 
@@ -257,12 +299,24 @@ assert plan_pressure_evictions(1000.0, 800.0, warm, headroom_ratio=0.7) == ["a"]
 
 A Fly machine with a **512 MiB** cgroup limit hosts a Telegram bot that has accumulated **60 warm session caches**. A burst pushes RSS to **490 MiB** — over `0.9 × 512 ≈ 460 MiB`.
 
-1. The sampler reads `cgroup_limit_mb() = 512`, `anon_rss_mb() = 490`.
+1. `CgroupMemoryPressure` reads `cgroup_limit_mb() = 512`, `anon_rss_mb() = 490`.
 2. `plan_pressure_evictions` names the **40 evictable** sessions LRU-first (in-flight and unflushed ones are skipped).
-3. The gateway evicts down the list, re-sampling RSS, and stops at **~460 MiB**.
+3. `sweep_under_pressure` evicts down the list, re-sampling RSS, and stops at **~460 MiB**.
 4. Those users get their cache rebuilt transparently on their next turn.
 
 No user-visible impact. No OOM kill.
+
+On each periodic tick the gateway already runs `reap_stale`; the new sweep sits alongside it and is a no-op when the host has no cgroup limit:
+
+```python
+from praisonai_bot.gateway import CgroupMemoryPressure
+
+probe = CgroupMemoryPressure()
+
+# session_manager is your BotSessionManager instance
+session_manager.reap_stale(max_age_seconds=3600)
+session_manager.sweep_under_pressure(probe, headroom=0.9)
+```
 
 ---
 
@@ -348,5 +402,5 @@ assert victims == ["s"]
 </CardGroup>
 
 <Note>
-Introduced in [PraisonAI PR #3805](https://github.com/MervinPraison/PraisonAI/pull/3805) (fixes [#3804](https://github.com/MervinPraison/PraisonAI/issues/3804)).
+Core planner introduced in [PraisonAI PR #3805](https://github.com/MervinPraison/PraisonAI/pull/3805) (fixes [#3804](https://github.com/MervinPraison/PraisonAI/issues/3804)). Wrapper-side wiring (`CgroupMemoryPressure`, `BotSessionManager.warm_sessions` / `sweep_under_pressure`, per-turn in-flight and flushed guards) added in [PR #4296](https://github.com/MervinPraison/PraisonAI/pull/4296) (fixes [#4294](https://github.com/MervinPraison/PraisonAI/issues/4294)).
 </Note>
