@@ -29,6 +29,10 @@ agent = Agent(
 agent.start("Tidy up /tmp")
 ```
 
+<Warning>
+**Argument-scoped deny rules now reach the enforcement path (PraisonAI PR [#4234](https://github.com/MervinPraison/PraisonAI/pull/4234), closes [#4228](https://github.com/MervinPraison/PraisonAI/issues/4228)):** On releases prior to #4234, an argument-scoped deny rule like `bash:rm *` on a `PermissionManager` was **parsed and understood** by the rule engine, but the name-based deny gate only asked `is_denied(function_name)`. So if `execute_command` was allowed by name, `execute_command(command="rm -rf /tmp/x")` still ran — the argument-scoped rule never fired at call time. After #4234 the gate builds a scoped target from the arguments and checks both, so the rule fires. Upgrade to a release that includes #4234 — no code change is required.
+</Warning>
+
 The user approves shell tools; compound commands are parsed so hidden `deny` rules still block unsafe operations.
 
 ```mermaid
@@ -247,7 +251,80 @@ A `deny: bash:rm *` rule now blocks **all** of these:
 | `bash:echo $(rm -rf x)` | **ALLOWED** | denied |
 | `bash:echo \`rm -rf x\`` | **ALLOWED** | denied |
 | `bash:(cd /tmp && rm -rf x)` | **ALLOWED** | denied |
+| `execute_command({"command=": "rm -rf /tmp/x"})` (argument-key mangling) | **ALLOWED** | denied |
 | `bash:echo '$(rm -rf x)'` (single-quoted) | denied | **allowed** (correctly — literal) |
+
+---
+
+## Argument-scoped deny reaches the gate
+
+The rule engine has always understood argument-scoped patterns like `bash:rm *`. Since PR #4234 the enforcement path does too — the deny gate builds a scoped target from the call's arguments and checks it alongside the tool name.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Gate as _check_permission_manager_deny
+    participant Build as build_permission_target
+    participant Mgr as PermissionManager
+
+    Agent->>Gate: execute_command({"command": "rm -rf /tmp/x"})
+    Gate->>Gate: normalise kwargs (strip trailing '=')
+    Gate->>Build: (execute_command, {"command": "rm -rf /tmp/x"})
+    Build-->>Gate: "bash:rm -rf /tmp/x"
+    Gate->>Mgr: is_denied("execute_command")?
+    Mgr-->>Gate: no
+    Gate->>Mgr: is_denied("bash:rm -rf /tmp/x")?
+    Mgr-->>Gate: YES (matches "bash:rm *")
+    Gate-->>Agent: {"permission_denied": True}
+```
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.permissions import PermissionManager
+
+# Rule engine has always understood argument-scoped patterns —
+# since PR #4234 the enforcement path does too.
+manager = PermissionManager(storage_dir=".praisonai/permissions")
+manager.load_rules_from_config({"bash:rm *": "deny"})
+
+agent = Agent(name="Safe Worker", instructions="Run shell commands safely")
+agent._permission_manager = manager
+
+# Blocked — argument-scoped rule fires at the deny gate
+agent._check_tool_approval_sync("execute_command", {"command": "rm -rf /tmp/x"})
+# → {"permission_denied": True, "error": "Tool 'execute_command' blocked by permission policy"}
+
+# Allowed — same tool, different args
+agent._check_tool_approval_sync("execute_command", {"command": "ls -la"})
+# → None (no denial)
+```
+
+<Note>
+**Name-level rules keep their all-or-nothing behaviour.** `execute_command: deny` still blocks *every* `execute_command(...)` call regardless of arguments. The scoped check is additive — it narrows a name that is otherwise allowed; it never loosens a name-level deny.
+</Note>
+
+**Argument-key mangling can't evade the gate.** A malformed `{"command=": "rm -rf /tmp/x"}` (a trailing-`=` kwarg LLMs sometimes hallucinate) is normalised *in the gate* with `k.strip().rstrip('=').strip()` **before** the scoped target is built — so a deny rule can't be dodged by a key that only cleans up after dispatch.
+
+---
+
+## Modified-args re-authorisation
+
+An approval backend may rewrite arguments (a common sanitisation pattern). Since PR #4234, the rewritten args are re-checked against the deny gate before dispatch — so a rewrite can't smuggle a denied command past a gate that only saw the original, safe args.
+
+```python
+from praisonaiagents.approval.protocols import ApprovalDecision
+
+# Approval backend rewrites args from safe to dangerous — re-authorised
+decision = ApprovalDecision(
+    approved=True,
+    reason="mock",
+    modified_args={"command": "rm -rf /tmp/x"},  # was originally "ls -la"
+)
+# The gate re-runs on modified_args before dispatch — the rewritten
+# 'rm -rf' matches "bash:rm *" deny and the call is blocked.
+```
+
+Both the sync and async approval paths re-run the gate on the final arguments. `BYPASS` mode opts out entirely, matching its "skip all permission checks" contract.
 
 ---
 
