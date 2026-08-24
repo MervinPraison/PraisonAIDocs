@@ -168,6 +168,10 @@ raise Exception("HTTP 429: Too Many Requests")
 Fixed in PR #4141. Before that release, `agent.achat(...)` would silently **not** retry a raised exception, even when `ToolConfig(retry_policy=RetryPolicy(max_attempts=N))` was set. The sync path already retried; the async path returned on the first attempt.
 </Note>
 
+<Note>
+**Parity also fixed for the `restart_safe=False` veto in PR [#4299](https://github.com/MervinPraison/PraisonAI/pull/4299)** (issue [#4298](https://github.com/MervinPraison/PraisonAI/issues/4298)). PR #4141 restored async retry for raised exceptions; PR #4299 restored async **veto** for tools that declared themselves unsafe. Before #4299, `agent.achat()` / `agent.execute_tool_async()` re-ran a `@tool(restart_safe=False)` body up to `max_attempts` times even though the sync path already honoured the declaration.
+</Note>
+
 On the sync path a tool that exhausts its per-tool retries raises `ToolExecutionError`, which propagates directly out of `agent.chat()` / `agent.start()` (fix in PR #4252). It is **not** routed through the LLM error classifier — so a tool message that looks like a rate limit (e.g. `"429 too many requests"`) does **not** trigger an LLM backoff `time.sleep` or a redundant model call. The per-tool retry wrapper (`max_attempts`) is what governs tool-error retries; `retry` / `RetryBackoffConfig` are LLM-error-driven and never fire on a tool failure. See [Error Handling → Tool Failure Behavior](/features/error-handling#tool-failure-behavior).
 
 ```python
@@ -196,6 +200,40 @@ except Exception: pass
 # Async path — also retries 3 times (parity restored in PR #4141)
 try: asyncio.run(agent.execute_tool_async("flaky", {}))
 except Exception: pass
+```
+
+The veto is now honoured on both paths too (PR #4299) — a declared-unsafe tool runs exactly once whether called sync or async:
+
+```python
+import asyncio
+from praisonaiagents import Agent, tool
+from praisonaiagents.config.feature_configs import ToolConfig
+from praisonaiagents.tools import RetryPolicy
+
+calls = []
+
+@tool(restart_safe=False)
+def charge_card(amount: str) -> str:
+    """Charge a card — must never be silently re-driven."""
+    calls.append(amount)
+    raise RuntimeError("gateway 502")
+
+agent = Agent(
+    instructions="Charge the customer.",
+    tools=[charge_card],
+    tool_config=ToolConfig(retry_policy=RetryPolicy(max_attempts=3, initial_delay_ms=0)),
+)
+
+# Sync path — runs once (was already correct)
+try: agent.execute_tool("charge_card", {"amount": "100"})
+except Exception: pass
+assert len(calls) == 1
+
+calls.clear()
+# Async path — also runs once (fixed in PR #4299)
+try: asyncio.run(agent.execute_tool_async("charge_card", {"amount": "100"}))
+except Exception: pass
+assert len(calls) == 1
 ```
 
 Both paths share the same terminal rule for raised exceptions:
@@ -399,6 +437,24 @@ from praisonaiagents import Agent, ExecutionConfig
 # max_retry_limit / retry_* are translated into the effective RetryPolicy.
 # Untouched ExecutionConfig → RetryPolicy(max_attempts=3).
 agent = Agent(tools=[tool], execution=ExecutionConfig(max_retry_limit=4))
+```
+
+### Task-scoped tools
+
+A tool passed to a task via `tools_override` (not registered on the agent) participates in the same idempotency lookup as an agent-level tool. Its `restart_safe=False` / `idempotent=False` declaration is honoured on both sync and async paths (PR #4299). Task-scoped tools shadow same-named agent tools when both are present, so a safer per-task override wins.
+
+```python
+from praisonaiagents import Agent, tool
+
+@tool(restart_safe=False)
+def charge_card(amount: str) -> str:
+    """Charge a customer — the per-task safe version, wins over any agent-level tool."""
+    ...
+
+agent = Agent(instructions="Billing.", tools=[])  # no agent-level tools
+await agent.execute_tool_async(
+    "charge_card", {"amount": "100"}, tools_override=[charge_card]
+)  # runs exactly once
 ```
 
 ---
