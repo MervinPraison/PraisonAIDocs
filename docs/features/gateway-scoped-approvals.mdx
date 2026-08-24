@@ -162,6 +162,58 @@ Every grant is stored as `(agent_id, tool_name, arg_signature)`.
 | `allow_always` | `bool` | `False` | Persist the grant; when `False` the resolution applies only to this one request |
 | `scope_to_agent` | `bool` | `True` | Grant is scoped to the requesting agent; set `False` for pre-#2622 global grants |
 | `scope_to_args` | `bool` | `False` | Also key the grant on the argument SHA — subsequent calls with different arguments will re-prompt |
+| `resolver` | `Optional[str]` | `None` | Identity of the principal resolving this request. Recorded on the audit trail and the allow-always grant. `None` keeps today's anonymous `"gateway"` attribution. |
+
+The gateway's `POST /approval/resolve` handler derives `resolver` automatically from the authenticated request — see [Operator identity attribution](/features/gateway-approval-attribution#how-resolver-identity-is-captured).
+
+---
+
+## Per-request Reviewer Custody
+
+Bind a single request to specific reviewers so only they can resolve it — a finer boundary than the coarse [APPROVALS scope](/features/gateway-operator-scopes).
+
+Pass `authorized_reviewers` on the `ApprovalRequest`; unauthorised resolvers are rejected and the request stays pending.
+
+```python
+from praisonaiagents.approval import ApprovalRequest
+
+request = ApprovalRequest(
+    tool_name="deploy",
+    arguments={"target": "prod"},
+    risk_level="high",
+    agent_name="deployer",
+    authorized_reviewers=["operator:alice", "operator:oncall"],  # only these may resolve
+)
+```
+
+```mermaid
+sequenceDiagram
+    participant UI as 📱 Operator UI
+    participant GW as 🚪 Gateway
+    participant Mgr as 🛡️ ExecApprovalManager
+
+    UI->>GW: resolve (resolver="operator:bob")
+    GW->>Mgr: resolve(rid, Resolution(resolver="operator:bob"))
+    alt resolver not in authorized_reviewers
+        Mgr-->>GW: False + re-insert pending
+        GW-->>UI: 404 resolver not authorised
+    else authorised (or unbound)
+        Mgr-->>GW: True
+        GW-->>UI: 200 OK
+    end
+```
+
+| Behaviour | Detail |
+|---|---|
+| Default | `None` — any resolver may resolve (legacy behaviour) |
+| Unauthorised resolver | Returns `False`; the request is **re-inserted** into the pending map so an authorised reviewer can resolve it later |
+| Rejection response | `404` with `{"error": "Request not found, already resolved, or resolver not authorised"}` — same status as "not found" so IDs cannot be enumerated |
+| First-answer-wins | Preserved between authorised reviewers via the atomic pop |
+| Durability | The binding survives a gateway restart (persisted and rehydrated by the SQLite store) |
+
+<Note>
+Custody is enforced by the gateway backend. Other approval backends that do not implement reviewer custody ignore `authorized_reviewers`.
+</Note>
 
 ---
 
@@ -214,11 +266,15 @@ curl -H "Authorization: Bearer $TOKEN" \
 {
   "allow_list": ["read_file"],
   "grants": [
-    {"agent_id": "shell-bot", "tool_name": "shell_exec", "arg_signature": null, "created_at": 1720000000.0, "approver": "gateway:human"},
+    {"agent_id": "shell-bot", "tool_name": "shell_exec", "arg_signature": null, "created_at": 1720000000.0, "approver": "operator:alice"},
     {"agent_id": "*", "tool_name": "read_file", "arg_signature": null, "created_at": 1720000000.0, "approver": "gateway:operator"}
   ]
 }
 ```
+
+<Note>
+When the resolving request populates `Resolution.resolver` (e.g. `"operator:alice"`), the `approver` on the grant carries that real principal. `"gateway:human"` is only the default when no resolver is supplied.
+</Note>
 </Tab>
 
 <Tab title="POST">
@@ -309,6 +365,9 @@ This is defence-in-depth, not a security boundary: a resolver that can approve r
 </Card>
 <Card title="Gateway Operator Scopes" icon="user-lock" href="/features/gateway-operator-scopes">
   Authorisation for admin endpoints
+</Card>
+<Card title="Approval Attribution" icon="user-check" href="/features/gateway-approval-attribution">
+  Who approved a request and per-request reviewer custody
 </Card>
 <Card title="Durable Approvals" icon="database" href="/features/durable-approvals">
   Restart-safe bot pending-approval queue
