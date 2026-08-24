@@ -127,7 +127,143 @@ db(state_url="mongodb://localhost:27017/praisonai")
 db(state_url="mongodb://user:pass@host:27017/praisonai?replicaSet=rs0")
 ```
 
-For async workloads, use `create_state_store("async_mongodb", ...)`.
+For async workloads, use `create_state_store("async_mongodb", ...)` — see [Async MongoDB (motor)](#async-mongodb-motor).
+
+### Method reference
+
+Both `mongodb` and `async_mongodb` implement the full `StateStore` contract. Every method has an `async_*` twin that runs natively on the event loop; the sync method is a wrapper safe to call from any context.
+
+| Method | Async twin | Purpose |
+|--------|-----------|---------|
+| `get(key)` | `async_get(key)` | Fetch a stored value (respects TTL) |
+| `set(key, value, ttl=None)` | `async_set(key, value, ttl=None)` | Store a value with optional TTL in seconds |
+| `delete(key)` | `async_delete(key)` | Remove a key |
+| `exists(key)` | `async_exists(key)` | Check if a key exists |
+| `list_keys(prefix=None)` | `async_list_keys(prefix=None)` | List keys with an optional prefix filter |
+| `clear(prefix=None)` | `async_clear(prefix=None)` | Delete many keys, optionally under a prefix |
+| `keys(pattern="*")` | `async_keys(pattern="*")` | Glob pattern match — `*` and `?`; patterns are `re.escape`-d before wildcards re-enable |
+| `ttl(key)` | `async_ttl(key)` | Remaining seconds until expiry, or `None` if no TTL / expired |
+| `expire(key, ttl)` | `async_expire(key, ttl)` | Set or reset TTL on an existing key |
+| `hget(key, field)` | `async_hget(key, field)` | Read one field from a hash-shaped value |
+| `hset(key, field, value)` | `async_hset(key, field, value)` | Write one field into a hash-shaped value (upsert) |
+| `hgetall(key)` | `async_hgetall(key)` | Read all fields of a hash-shaped value |
+| `hdel(key, *fields)` | `async_hdel(key, *fields)` | Delete fields from a hash; returns count actually removed |
+
+<Note>
+`hset` stores fields as opaque top-level keys, so a dotted field like `"a.b"` round-trips through `hget` / `hgetall` verbatim rather than being reinterpreted as a nested MongoDB path.
+</Note>
+
+<Note>
+`hdel` returns the number of fields **actually present and removed**, matching the `StateStore` contract and the Firestore / DynamoDB backends. Deleting a mix of present and absent fields reports only the real deletions.
+</Note>
+
+---
+
+## Async MongoDB (motor)
+
+The async backend (`async_mongodb`) uses `motor` for non-blocking I/O — pick it inside FastAPI, async handlers, or any live event loop.
+
+```bash
+pip install motor
+```
+
+### Sync or async?
+
+```mermaid
+graph TB
+    Start[Need MongoDB state?] --> Q{Async app<br/>or event loop?}
+    Q -->|Yes<br/>FastAPI, async handlers| Async[Use async_mongodb<br/>pip install motor]
+    Q -->|No<br/>plain scripts, sync agents| Sync[Use mongodb<br/>pip install pymongo]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef choice fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef option fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q choice
+    class Async,Sync option
+```
+
+### Agent with an async store
+
+Create the async store, then pass it to the agent's memory config:
+
+```python
+from praisonaiagents import Agent, MemoryConfig
+from praisonai.persistence import create_state_store
+
+# Aliases "motor" and "mongodb_async" resolve to the same store
+store = create_state_store("async_mongodb", url="mongodb://localhost:27017", database="praisonai")
+
+agent = Agent(
+    name="AsyncBot",
+    instructions="You are a helpful assistant.",
+    memory=MemoryConfig(db=store, session_id="async-session"),
+)
+
+await agent.astart("Remember I prefer dark mode")
+```
+
+### Direct store usage
+
+Every operation has a native `async_*` method for use inside an event loop:
+
+```python
+import asyncio
+from praisonai.persistence import create_state_store
+
+async def main():
+    store = create_state_store("async_mongodb", url="mongodb://localhost:27017")
+
+    # Set / get with TTL (seconds)
+    await store.async_set("user:123:prefs", {"theme": "dark"}, ttl=3600)
+    prefs = await store.async_get("user:123:prefs")
+
+    # Pattern matching (glob: * and ?)
+    session_keys = await store.async_keys("session:*")
+
+    # TTL introspection and refresh
+    remaining = await store.async_ttl("user:123:prefs")   # seconds left, or None
+    await store.async_expire("user:123:prefs", 7200)       # reset to 2h
+
+    # Hash operations for structured state
+    await store.async_hset("user:123", "email", "a@b.com")
+    email = await store.async_hget("user:123", "email")
+    all_fields = await store.async_hgetall("user:123")
+    removed = await store.async_hdel("user:123", "email", "phone")  # count removed
+
+    await store.async_close()
+
+asyncio.run(main())
+```
+
+<Tip>
+Every `async_*` method has a sync wrapper of the same name without the prefix (`store.get`, `store.keys`, `store.hset`, …). The wrappers route through the async bridge, so they are safe from sync scripts, worker threads, and code running inside a live event loop.
+</Tip>
+
+### Request flow
+
+A typical FastAPI request reads and writes session state through the async store without blocking the loop.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant FastAPI
+    participant Agent
+    participant Store as AsyncMongoDBStateStore
+    participant MongoDB
+
+    User->>FastAPI: POST /chat (session-id: abc)
+    FastAPI->>Agent: astart(prompt)
+    Agent->>Store: async_get("session:abc")
+    Store->>MongoDB: find_one({"_id": "session:abc"})
+    MongoDB-->>Store: doc
+    Store-->>Agent: state
+    Agent->>Store: async_set("session:abc", new_state, ttl=3600)
+    Store->>MongoDB: replace_one(upsert=True)
+    Agent-->>FastAPI: response
+    FastAPI-->>User: JSON
+```
 
 ---
 
