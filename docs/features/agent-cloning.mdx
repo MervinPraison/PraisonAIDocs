@@ -104,7 +104,8 @@ Agent cloning creates a fresh instance with the same configuration but isolated 
 | `llm`, `base_url`, `api_key`, `auth` | Copied as-is |
 | `tools` | Shallow-copied (`list(self.tools)`) |
 | `handoffs` | Reset to `None` (channels should not share handoffs) |
-| Feature configs: `knowledge`, `planning`, `reflection`, `guardrails`, `web`, `context`, `autonomy`, `output`, `execution`, `templates`, `caching`, `hooks`, `skills`, `approval`, `learn`, `sandbox` | Forwarded from the stored `_<name>_config` attributes |
+| Feature configs: `knowledge`, `planning`, `reflection`, `web`, `context`, `autonomy`, `output`, `execution`, `templates`, `caching`, `hooks`, `skills`, `learn`, `sandbox` | Forwarded from the stored `_<name>_config` attributes |
+| `guardrails`, `approval` | Forwarded from the stored `_<name>_config` attributes (**since PraisonAI [#4285](https://github.com/MervinPraison/PraisonAI/pull/4285)** — earlier releases dropped both silently on the clone; see the Note below) |
 | `memory=MemoryConfig(...)` / `memory=db("…")` / `memory={"…": …}` | Config re-resolved per clone → **isolated backend** |
 | `memory=<live Memory / FileMemory instance>` | Deep-copied (or rebuilt from `type(mem)(mem.cfg)`); on failure clones share it and a `logging.warning` is emitted |
 | `tool_config` (which holds `timeout`, `retry_policy`, `parallel`), `runtime` / `_runtime_config` | Forwarded |
@@ -119,6 +120,10 @@ Agent cloning creates a fresh instance with the same configuration but isolated 
 
 <Note>
 **Per-clone sandbox isolation (fixed in PraisonAI 826c2e6 + 9d6f6dc):** `clone_for_channel()` now reads `sandbox_config` correctly (previously it read `_sandbox_config`, which is never assigned, so every clone silently ran unisolated). Framework-generated `execute_python_code` / `execute_shell_command` tools are tagged with `_praison_sandbox_tool = True` and stripped from the clone before regeneration, so each clone gets its own `SandboxManager` — no shared isolation state across channels. User-defined tools with those same names lack the tag and are preserved unchanged.
+</Note>
+
+<Note>
+**Per-clone guardrail and approval forwarding (fixed in PraisonAI [#4285](https://github.com/MervinPraison/PraisonAI/pull/4285), closes [#4284](https://github.com/MervinPraison/PraisonAI/issues/4284)):** `clone_for_channel()` now forwards the configured guardrail and approval policy to every clone. Earlier releases silently dropped both — so an operator who set a PII/secret/profanity guardrail or a `read_only`/`safe`/`full` preset (or a full `ApprovalConfig`) on an agent and then *served* it got **no output guardrail** and **no approval policy** on the clone. This mattered because `clone_for_channel()` is the code path that serves untrusted traffic — one clone per channel in the [bot gateway](/features/bot-gateway) (Slack/Telegram/webhook) and one clone per HTTP call in the invoke API. The policy now travels with the clone; upgrading requires no code change.
 </Note>
 
 <Note>
@@ -206,6 +211,55 @@ agents = create_channel_agents({
     'instructions': 'You are a helpful support agent',
     'llm': 'gpt-4o-mini'
 })
+```
+
+### Guardrails and approval travel with each clone
+
+A base agent's guardrail and approval policy are preserved on every per-channel clone, so served traffic stays policy-enforced (since PraisonAI [#4285](https://github.com/MervinPraison/PraisonAI/pull/4285)).
+
+```python
+from praisonaiagents import Agent
+
+def reject_pii(output):
+    """Refuse output that contains PII."""
+    return False, "contains PII"
+
+# One base agent, served on many channels
+base = Agent(
+    name="Support",
+    instructions="Help customers.",
+    llm="gpt-4o-mini",
+    guardrails=reject_pii,     # output validation
+    approval="read_only",      # only read-only tools
+)
+
+# The bot gateway calls clone_for_channel() per channel — both policies travel with the clone
+telegram = base.clone_for_channel()
+discord  = base.clone_for_channel()
+
+assert telegram._guardrail_fn is not None        # guardrail preserved
+assert telegram._approval_config == "read_only"  # approval preserved
+```
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant Base as Base Agent
+    participant GW as Bot Gateway
+    participant Clone as Per-channel Clone
+    participant User as Untrusted User
+
+    Op->>Base: Agent(guardrails=reject_pii, approval="read_only")
+    Op->>GW: serve base agent on Slack/Telegram/webhook
+    GW->>Base: clone_for_channel() per channel
+    Base->>Clone: constructor with forwarded guardrails + approval
+    Note over Clone: policies travel with the clone (PR #4285)
+    User->>Clone: message via channel
+    Clone->>Clone: run guardrail + approval checks
+    Clone-->>User: policy-enforced response
+
+    %% classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    %% classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
 ```
 
 ### Per-tenant clone in a multi-tenant API
