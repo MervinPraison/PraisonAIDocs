@@ -1211,7 +1211,15 @@ Your Goal: {self.goal}"""
         return content
 
     def _extract_llm_response_content(self, response) -> Optional[str]:
-        """Return assistant message text, a tool-call summary, or str(response) as fallback."""
+        """Return assistant message text, or a tool-call summary.
+
+        A well-formed response that simply carries no content -- a content filter,
+        a refusal, or ``finish_reason="length"`` with zero output tokens -- yields
+        the empty string.  ``str(response)`` is reserved for responses this method
+        could not parse at all, where the repr is a diagnostic rather than an
+        answer; returning it for a merely empty message put the raw SDK object's
+        repr in front of the user and into ``chat_history``.
+        """
         if not response:
             return None
         try:
@@ -1226,6 +1234,17 @@ Your Goal: {self.goal}"""
                     if tool_calls:
                         names = [getattr(tc.function, "name", "?") for tc in tool_calls]
                         return f"[tool_calls: {', '.join(names)}]"
+                    # Parsed cleanly; the model returned no content.  A refusal
+                    # (safety) is carried in ``message.refusal`` independently of
+                    # ``finish_reason`` -- surface it so an empty answer isn't silent.
+                    finish_reason = getattr(choice, "finish_reason", None)
+                    refusal = getattr(msg, "refusal", None)
+                    if refusal or finish_reason not in (None, "stop"):
+                        logging.warning(
+                            f"Agent {self.name}: model returned no content "
+                            f"(finish_reason={finish_reason!r}, refused={bool(refusal)})"
+                        )
+                    return ""
         except (AttributeError, IndexError, TypeError) as e:
             logging.warning(
                 f"Failed to extract LLM response content (falling back to str): {e}"
@@ -1725,7 +1744,7 @@ Your Goal: {self.goal}"""
             return max_retries
         return 2
 
-    def _chat_completion(self, messages, temperature=1.0, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, _retry_depth=0, _fallback_index=0):
+    def _chat_completion(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, _retry_depth=0, _fallback_index=0):
         start_time = time.time()
 
         # --- Proactive Context Budget Management (default-on) ---
@@ -1849,6 +1868,11 @@ Your Goal: {self.goal}"""
                     stream = False  # Set for the main execution below
                 else:
                     raise  # Re-raise if it's a different ValueError
+            except ToolExecutionError:
+                # A tool failed during the streaming attempt. Re-raise so it is
+                # not relabelled as an LLM error and so the tool is not executed
+                # a second time by the non-streaming fallback below.
+                raise
             except Exception as e:
                 from ..errors import LLMError
                 # Don't retry if it's an LLMError that has exhausted retries
@@ -1952,6 +1976,8 @@ Your Goal: {self.goal}"""
             return final_response
 
         except BudgetExceededError:
+            raise
+        except ToolExecutionError:
             raise
         except Exception as e:
             from ..errors import LLMError
@@ -2119,7 +2145,7 @@ Your Goal: {self.goal}"""
         self, 
         exc: Exception, 
         messages, 
-        temperature=1.0, 
+        temperature=None, 
         tools=None, 
         stream=True,
         reasoning_steps=False,
@@ -2309,7 +2335,7 @@ Your Goal: {self.goal}"""
     def _execute_unified_chat_completion(
         self, 
         messages, 
-        temperature=1.0, 
+        temperature=None, 
         tools=None, 
         stream=None,
         reasoning_steps=False,
@@ -2443,7 +2469,7 @@ Your Goal: {self.goal}"""
     async def _execute_unified_achat_completion(
         self, 
         messages, 
-        temperature=1.0, 
+        temperature=None, 
         tools=None, 
         stream=True,  # Async methods keep stream=True default (async adapters support streaming vs sync smart fallback)
         reasoning_steps=False,
@@ -2781,7 +2807,11 @@ Your Goal: {self.goal}"""
                 
                 model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
                 model_limit = get_model_limit(model_name)
-                current_tokens = estimate_messages_tokens(optimized)
+                # Count the whole request (history + system prompt + tool schemas),
+                # otherwise a large prompt/tool block can push the call over the
+                # window while the history alone stays under the threshold.
+                overhead = self._estimate_request_overhead_tokens(system_prompt, tools)
+                current_tokens = estimate_messages_tokens(optimized) + overhead
                 
                 # If over 95% of limit, apply emergency truncation
                 if current_tokens > model_limit * 0.95:
@@ -2789,19 +2819,66 @@ Your Goal: {self.goal}"""
                         f"[{self.name}] Context at {current_tokens} tokens (limit: {model_limit}), "
                         f"applying emergency truncation"
                     )
-                    target = int(model_limit * 0.8)  # Target 80% of limit
+                    # Leave room for the fixed overhead so the full request lands
+                    # near 80% of the window rather than the history alone.
+                    target = max(1, int(model_limit * 0.8) - overhead)
                     optimized = self.context_manager.emergency_truncate(optimized, target)
                     result["emergency_truncated"] = True
-                    result["tokens_after"] = estimate_messages_tokens(optimized)
+                    result["tokens_after"] = estimate_messages_tokens(optimized) + overhead
             except Exception as e:
                 logging.debug(f"Hard limit check skipped: {e}")
             
             return optimized, result
             
         except Exception as e:
-            # Context management should never break the chat flow
-            logging.warning(f"Context management error (continuing without): {e}")
+            # Context management should never break the chat flow, but silently
+            # returning the unchanged history disables the hard-limit truncation
+            # too and sends an over-budget request. Fall back to emergency
+            # truncation so we still fit within the model window.
+            logging.error(f"Context management failed: {e}")
+            try:
+                from ..context.budgeter import get_model_limit
+                from ..context.tokens import estimate_messages_tokens
+
+                model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
+                model_limit = get_model_limit(model_name)
+                # Include the system prompt and tool schemas in the budget: the
+                # request can exceed the window on those alone even when the
+                # history is under the threshold.
+                overhead = self._estimate_request_overhead_tokens(system_prompt, tools)
+                if estimate_messages_tokens(messages) + overhead > model_limit * 0.95:
+                    target = max(1, int(model_limit * 0.8) - overhead)
+                    truncated = self.context_manager.emergency_truncate(messages, target)
+                    return truncated, {"emergency_truncated": True}
+            except Exception as inner:
+                logging.debug(f"Emergency truncation fallback skipped: {inner}")
             return messages, None
+
+    def _estimate_request_overhead_tokens(
+        self,
+        system_prompt: str = "",
+        tools: Optional[list] = None,
+    ) -> int:
+        """Estimate non-history request tokens (system prompt + tool schemas).
+
+        Emergency-truncation thresholds must budget the full request, not just
+        the message history, or a large system prompt / tool block can push the
+        call over the model window undetected.
+        """
+        try:
+            from ..context.tokens import (
+                estimate_tokens_heuristic,
+                estimate_tool_schema_tokens,
+            )
+        except Exception:
+            return 0
+
+        overhead = 0
+        if system_prompt:
+            overhead += estimate_tokens_heuristic(system_prompt)
+        if tools:
+            overhead += estimate_tool_schema_tokens(tools)
+        return overhead
 
     def _truncate_tool_output(self, tool_name: str, output: str, tool_call_id: str | None = None) -> str:
         """
@@ -2888,7 +2965,7 @@ Your Goal: {self.goal}"""
             )
         return rendered
 
-    def chat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None) -> Optional[str]:
+    def chat(self, prompt: str, temperature: Optional[float] = None, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None) -> Optional[str]:
         """
         Chat with the agent.
         
@@ -3498,11 +3575,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 reflection_output = _get_display_functions()['ReflectionOutput'](**reflection_data)
                             else:
                                 # Use OpenAI's structured output for OpenAI models
+                                _reflection_kwargs = {}
+                                if temperature is not None:
+                                    _reflection_kwargs['temperature'] = temperature
                                 reflection_response = self._openai_client.sync_client.beta.chat.completions.parse(
                                     model=self.reflect_llm if self.reflect_llm else self.llm,
                                     messages=messages,
-                                    temperature=temperature,
-                                    response_format=_get_display_functions()['ReflectionOutput']
+                                    response_format=_get_display_functions()['ReflectionOutput'],
+                                    **_reflection_kwargs
                                 )
 
                                 reflection_output = reflection_response.choices[0].message.parsed
@@ -3567,6 +3647,22 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 logging.error("Reflection parsing failed.", exc_info=True)
                                 messages.append({"role": "assistant", "content": "Self Reflection failed."})
                                 reflection_count += 1
+                                if reflection_count >= self.max_reflect:
+                                    # Bound the retry, as the async path does. Without this
+                                    # a persistently unparseable reflection (e.g. a
+                                    # structured-output refusal, where message.parsed is
+                                    # None) loops forever, two LLM calls at a time.
+                                    if self.verbose:
+                                        _get_display_functions()['display_self_reflection']("Maximum reflection count reached after repeated parse errors, returning current response", console=self.console)
+                                    self._append_to_chat_history({"role": "assistant", "content": response_text})
+                                    try:
+                                        validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id)
+                                        self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
+                                        return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
+                                    except Exception as guard_e:
+                                        logging.error(f"Agent {self.name}: Guardrail validation failed after reflection error: {guard_e}")
+                                        self._rollback_chat_history_to(chat_history_length)
+                                        return None
                                 continue  # Continue even after error to try again
                     except Exception:
                         # Catch any exception from the inner try block and re-raise to outer handler
@@ -3586,7 +3682,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
         return clean_triple_backticks(output)
 
-    async def achat(self, prompt: str, temperature: float = 1.0, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None):
+    async def achat(self, prompt: str, temperature: Optional[float] = None, tools: Optional[List[Any]] = None, output_json: Optional[Any] = None, output_pydantic: Optional[Any] = None, reasoning_steps: bool = False, stream: Optional[bool] = None, task_name: Optional[str] = None, task_description: Optional[str] = None, task_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, force_retrieval: bool = False, skip_retrieval: bool = False, attachments: Optional[List[str]] = None, tool_choice: Optional[str] = None, seed: Optional[int] = None, cancel_token: Optional[Any] = None):
         """Async version of chat method with self-reflection support.
         
         Args:
@@ -4147,11 +4243,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             self._rollback_chat_history_to(chat_history_length)
                                             return None
                                     
+                                    _areflection_kwargs = {}
+                                    if temperature is not None:
+                                        _areflection_kwargs['temperature'] = temperature
                                     reflection_response = await self._openai_client.async_client.beta.chat.completions.parse(
                                         model=self.reflect_llm if self.reflect_llm else self.llm,
                                         messages=reflection_messages,
-                                        temperature=temperature,
-                                        response_format=_get_display_functions()['ReflectionOutput']
+                                        response_format=_get_display_functions()['ReflectionOutput'],
+                                        **_areflection_kwargs
                                     )
                                     
                                     reflection_output = reflection_response.choices[0].message.parsed
@@ -4265,9 +4364,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             tool_call_kwargs = dict(
                                 model=self.llm,
                                 messages=messages,
-                                temperature=temperature,
                                 tools=formatted_tools,
                             )
+                            if temperature is not None:
+                                tool_call_kwargs['temperature'] = temperature
                             if effective_tool_choice:
                                 tool_call_kwargs['tool_choice'] = effective_tool_choice
                             response = await self._openai_client.async_client.chat.completions.create(
@@ -4281,11 +4381,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self._execute_callback_and_display(original_prompt, result, time.time() - start_time, task_name, task_description, task_id)
                             return await self._atrigger_after_agent_hook(original_prompt, result, start_time)
                         elif output_json or output_pydantic:
+                            _json_kwargs = {}
+                            if temperature is not None:
+                                _json_kwargs['temperature'] = temperature
                             response = await self._openai_client.async_client.chat.completions.create(
                                 model=self.llm,
                                 messages=messages,
-                                temperature=temperature,
-                                response_format={"type": "json_object"}
+                                response_format={"type": "json_object"},
+                                **_json_kwargs
                             )
                             response_text = response.choices[0].message.content
                             if get_logger().getEffectiveLevel() == logging.DEBUG:
@@ -4295,10 +4398,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self._execute_callback_and_display(original_prompt, response_text, time.time() - start_time, task_name, task_description, task_id)
                             return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
                         else:
+                            _plain_kwargs = {}
+                            if temperature is not None:
+                                _plain_kwargs['temperature'] = temperature
                             response = await self._openai_client.async_client.chat.completions.create(
                                 model=self.llm,
                                 messages=messages,
-                                temperature=temperature
+                                **_plain_kwargs
                             )
                         
                         response_text = response.choices[0].message.content
@@ -4335,11 +4441,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                             logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                                         return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
                                     
+                                    _areflection_kwargs = {}
+                                    if temperature is not None:
+                                        _areflection_kwargs['temperature'] = temperature
                                     reflection_response = await self._openai_client.async_client.beta.chat.completions.parse(
                                         model=self.reflect_llm if self.reflect_llm else self.llm,
                                         messages=reflection_messages,
-                                        temperature=temperature,
-                                        response_format=_get_display_functions()['ReflectionOutput']
+                                        response_format=_get_display_functions()['ReflectionOutput'],
+                                        **_areflection_kwargs
                                     )
                                     
                                     reflection_output = reflection_response.choices[0].message.parsed
@@ -4365,10 +4474,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         {"role": "user", "content": "Now regenerate your response using the reflection you made"}
                                     ]
                                     
+                                    _regen_kwargs = {}
+                                    if temperature is not None:
+                                        _regen_kwargs['temperature'] = temperature
                                     new_response = await self._openai_client.async_client.chat.completions.create(
                                         model=self.llm,
                                         messages=regenerate_messages,
-                                        temperature=temperature
+                                        **_regen_kwargs
                                     )
                                     response_text = new_response.choices[0].message.content
                                     reflection_count += 1
@@ -5256,7 +5368,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             agent_id=getattr(self, 'name', None),
         )
 
-    def _chat_completion_with_retry(self, messages, temperature=1.0, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
+    def _chat_completion_with_retry(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
         """
         Wrapper for _execute_unified_chat_completion that adds jittered exponential backoff retry logic.
         
@@ -5343,7 +5455,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # This should never be reached, but just in case
         raise RuntimeError("Retry loop completed without returning or raising an exception")
 
-    async def _achat_completion_with_retry(self, messages, temperature=1.0, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
+    async def _achat_completion_with_retry(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
         """
         Async wrapper for _execute_unified_achat_completion that adds jittered exponential backoff retry logic.
         
