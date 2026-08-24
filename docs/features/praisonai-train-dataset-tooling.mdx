@@ -401,6 +401,10 @@ Any `_AxisRecipe` recipe (including `tamil` and inline `CustomRecipe`) automatic
 
 Quality-check an instruction dataset — dedup, boilerplate/refusal, script purity, truncation, restates-question — plus dataset-level diversity metrics. Thresholds mirror Self-Instruct / LIMA / AlpaGasus / Deita defaults.
 
+<Warning>
+**Script purity defaults to the Tamil block.** `validate` drops outputs that fall below a purity floor for a *target Unicode block*, and that block defaults to Tamil (`script_range: [2944, 3071]  # U+0B80–U+0BFF`). For any other language, set `script_range` in your config (e.g. `[65, 591]` for Latin) — otherwise non-Tamil outputs are dropped as `low_script_purity` and the run exits `1`.
+</Warning>
+
 ### CLI flags
 
 | Flag | Short | YAML key | Type | Required | Description |
@@ -461,6 +465,11 @@ Drop checks remove a row; flag checks keep it but count it.
 `metrics.translation.share` is the fraction of kept rows that are translation tasks; `by_direction` counts them by direction (`en_ta`, `ta_en`, `unknown`); `exempted` is the number of English-target rows the task-aware exemption actually rescued from the `low_script_purity` drop. Because both the exemption and the metric use the same detector (`translation_intent`), the numbers always reconcile.
 
 Malformed JSONL lines are skipped with a `⚠ skipping malformed JSON on line N` warning — the run still succeeds on the remaining rows.
+
+### Behaviour worth knowing
+
+- **Atomic write** — `validate` writes to a sibling temp file next to the destination and `os.replace`s it only when **at least one row survived QC**. An `--out` that aliases the input is never truncated when everything is dropped; the existing corpus stays byte-for-byte intact. File mode and symlink destinations are handled the same as `generate`/`dedup`.
+- **Zero-kept exits `1`** — when QC drops every row, `validate` exits `1` with `error: no rows kept — all rows were dropped by QC ({drops}); any existing --out was left intact`. The `drops` dict names the actual reasons — typically `low_script_purity` for wrong-language corpora. Previously the command silently exited `0` and could truncate an aliased `--out` to zero bytes. Fixed in [PraisonAI PR #4316](https://github.com/MervinPraison/PraisonAI/pull/4316).
 
 ### Example config
 
@@ -584,6 +593,75 @@ class NoUrls:
 ```
 
 Once imported, it participates in the next `score()` / `validate` run automatically.
+
+---
+
+## Export trials with QC (`from-trials --qc`)
+
+Turn passing agent trials into a training corpus and quality-check them in one pass — `--qc` reuses the `validate` filter but auto-disables the target-script check, because agent trajectories are English by construction.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Trials as run_trials
+    participant Export as export_trials
+    participant QC as filter_rows_for_export
+
+    User->>Trials: run_trials(agent, package, k=8)
+    Trials-->>User: TrialReport
+    User->>Export: export_trials(report, "train.jsonl", qc=True)
+    Export->>QC: rows + qc_cfg
+    Note over QC: script-purity check auto-disabled<br/>(English agent trajectories)
+    QC-->>Export: kept rows + drops dict
+    Export-->>User: ExportSummary(written, skipped_qc, qc_drops, ...)
+```
+
+`--qc` runs dedup, boilerplate/refusal, length, and diversity — **not** the Tamil script-purity check. The export QC path sets `script_drop`/`script_flag` to `0` so nothing falls below the target-script floor, which is why English trajectories survive instead of being dropped wholesale as `low_script_purity`.
+
+Opt back into a script check for another language by passing `qc_cfg` to `export_trials()` with `script_range` (and/or `script_drop` / `script_flag`). Any one of those keys re-enables the target-script check with the QC filter's own defaults (`0.50` / `0.70`) — so a documented `qc_cfg={"script_range": [...]}` no longer silently passes wrong-script rows.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.eval import EvalPackage, EvalCase, run_trials
+from praisonai_train.data import export_trials
+
+agent = Agent(name="summariser", instructions="Summarise the input in one sentence.")
+package = EvalPackage(name="suite", cases=[
+    EvalCase(name="short", input="PraisonAI is an agent framework.",
+             verify=lambda output, expected: "agent" in output.lower()),
+])
+
+report = run_trials(agent, package, k=8)
+
+# English agent trajectories — QC keeps them (script check auto-disabled).
+summary = export_trials(report, "train.jsonl", qc=True)
+print(summary)
+# written=42 skipped_failed=6 ... skipped_qc=3 qc_drops={'exact_dup': 3}
+
+# Spanish trajectories: opt back into the Latin script check.
+summary = export_trials(
+    report, "train.jsonl", qc=True,
+    qc_cfg={"script_range": (0x0041, 0x024F)},   # Latin block
+)
+```
+
+The CLI mirrors this — pass `--qc`, and when QC drops everything the error names the real reasons instead of guessing.
+
+```bash
+praisonai-train data from-trials trials.json --qc -o data/train.jsonl
+# error: no rows exported — QC dropped all rows: {'low_script_purity': 8}
+```
+
+### `ExportSummary` QC fields
+
+`export_trials()` returns an `ExportSummary` that now tracks QC removals.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `skipped_qc` | `int` | Rows removed by the QC filter (previously untracked). |
+| `qc_drops` | `dict[str, int]` | Per-reason drop counts (e.g. `{"low_script_purity": 42, "exact_dup": 3}`). |
+
+`str(summary)` appends ` skipped_qc=N`, and ` qc_drops={...}` when non-empty.
 
 ---
 
@@ -879,6 +957,8 @@ The callback runs on the hot path after every completed request. Throttle any pr
 
 <Accordion title="Match script_range to your language">
 The defaults target the Tamil block (`[2944, 3071]`). Set `script_range` to your language's Unicode block so `low_script_purity` and `script_review` measure the right script.
+
+`from-trials --qc` auto-disables the target-script check for English agent trajectories, so exports aren't dropped as `low_script_purity` out of the box. For other languages, pass `qc_cfg={"script_range": [...]}` to `export_trials()` to re-enable the check with the QC defaults (`0.50` / `0.70`).
 </Accordion>
 
 <Accordion title="Prefer task_type metadata over text detection">
