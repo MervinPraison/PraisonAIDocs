@@ -48,6 +48,10 @@ agent.start("Remove unused imports in utils.py")
 **Approval on served agents (PraisonAI PR [#4285](https://github.com/MervinPraison/PraisonAI/pull/4285), closes [#4284](https://github.com/MervinPraison/PraisonAI/issues/4284)):** `Agent.clone_for_channel()` now forwards the configured approval policy (string preset, `bool`, `ApprovalConfig`, dict, or backend object) to every per-channel clone. On earlier releases the clone was constructed with the approval policy dropped — the operator's `read_only` / `safe` / custom config was silently ignored on every [bot gateway](/features/bot-gateway) channel and every invoke-API call. Upgrade to a release that includes #4285 — no code change is required. See [Agent Cloning → Guardrails and approval travel with each clone](/features/agent-cloning#guardrails-and-approval-travel-with-each-clone).
 </Warning>
 
+<Warning>
+**Config objects no longer weaken the default deny set (PraisonAI PR [#4234](https://github.com/MervinPraison/PraisonAI/pull/4234), closes [#4228](https://github.com/MervinPraison/PraisonAI/issues/4228)):** Before #4234, passing `approval=ApprovalConfig(timeout=30)` or `approval={"timeout": 30}` — a knob about *how long to wait* — silently dropped **all 8** default denials, leaving `execute_command`, `delete_file`, `kill_process`, and `execute_code` callable. Configuring approval was a *weaker* posture than passing nothing. A config object with **no** `permissions=` policy now inherits the same env-driven default deny set that `approval=None` uses. Upgrade to a release that includes #4234 — no code change is required. See [Config objects never weaken the default deny set](#config-objects-never-weaken-the-default-deny-set).
+</Warning>
+
 The user requests a code change; the agent pauses for approval before running dangerous tools.
 
 ```mermaid
@@ -373,6 +377,10 @@ agent.start("Show me what's in main.py")
 | `approval={"permissions": {"*": "deny", ...}}` | Yes — anything matched as `deny` removed | Custom allow-lists |
 | `approval={"permissions": {"bash:rm *": "deny", ...}}` | **Yes — pattern-matched deny rules removed (native + MCP)** | Fine-grained rule-based safety |
 
+<Note>
+**Schema *and* call-time now agree (PR #4234).** Prior to #4234, a pattern-matched deny rule like `bash:rm *` was pruned from the LLM's schema but **not** enforced at call time if the tool was allowed by name — the deny gate only checked the tool name. After #4234, both the schema and the call-time gate honour argument-scoped patterns uniformly. See [Command-Aware Permissions → argument-scoped deny enforcement](/features/command-aware-permissions).
+</Note>
+
 ### Pattern-based rules and MCP tools
 
 The same pruning path now covers pattern-based rules — not just presets. Rules loaded from `.praisonai/permissions/`, YAML, CLI flags, or a `PermissionManager` are consulted via `PermissionManager.is_denied()` when the schema is built, and MCP tools go through the identical gate.
@@ -400,6 +408,85 @@ MCP tools using a `tool:<name>` prefix match rules written against either the ba
 <Tip>
 When you set `approval="safe"` on a code-review agent and notice the model never tries to edit or run shell — that's pruning working. No prompts appear because the model isn't asking.
 </Tip>
+
+---
+
+## Config objects never weaken the default deny set
+
+A config object that only tunes `timeout=`, `backend=`, etc. keeps the full default deny set — configuring approval is never weaker than passing nothing.
+
+```mermaid
+graph TB
+    In[approval= ?] --> A{approval is None?}
+    A -->|Yes| Def[🛡️ Env-driven default deny set]
+    A -->|No| B{Config object?<br/>ApprovalConfig / dict}
+    B -->|No — string / bool / backend| Legacy[🔧 Existing string/bool/backend path]
+    B -->|Yes| C{permissions= supplied?}
+    C -->|No — absent| Def
+    C -->|Yes — even empty| Owned[📜 Declarative policy owns denial]
+    Env[PRAISONAI_TOOL_SAFETY=off] -.-> Bypass[⚡ Empty deny set]
+    Def -.->|env override| Bypass
+
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef owned fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef bypass fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A,B,C gate
+    class Def,Legacy safe
+    class Owned owned
+    class Bypass,Env bypass
+```
+
+Precedence, from weakest input to strongest:
+
+| # | You pass | Deny set applied |
+|---|----------|------------------|
+| 1 | `approval=None` | Env-driven default deny set |
+| 2 | `approval=ApprovalConfig(timeout=30)` (no `permissions=`) | Env-driven default deny set |
+| 3 | `approval={"timeout": 30}` (no `permissions=`) | Env-driven default deny set |
+| 4 | `approval=ApprovalConfig(permissions={...})` | Empty — the policy owns denial |
+| 5 | `approval=ApprovalConfig(permissions={})` | Empty — explicit opt-out is intentional |
+| 6 | `PRAISONAI_TOOL_SAFETY=off` | Empty — full bypass, regardless of config |
+
+The default deny set contains eight tools: `execute_command`, `kill_process`, `execute_code`, `acp_execute_command`, `delete_file`, `move_file`, `copy_file`, `acp_delete_file`.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.approval.protocols import ApprovalConfig
+
+# Configuration change (timeout only) — default denials PRESERVED
+Agent(name="t", instructions="t", approval=ApprovalConfig(timeout=30))._perm_deny
+# → includes execute_command, delete_file, kill_process, execute_code, …
+
+# Dict form is symmetric
+Agent(name="t", instructions="t", approval={"timeout": 30})._perm_deny
+# → includes execute_command, …
+
+# Explicit declarative policy — the policy owns denial, the preset does not shadow it
+Agent(
+    name="t",
+    instructions="t",
+    approval=ApprovalConfig(permissions={"bash:rm *": "deny"}),
+)._perm_deny
+# → frozenset()   (the PermissionManager holds the rule)
+```
+
+<Note>
+**`permissions=None` vs `permissions={}`.** The fallback is triggered by an `is None` check, not falsiness. `permissions=None` (absent) **inherits** the env-driven default deny set. `permissions={}` (an explicit empty policy) is a caller who *intentionally* opted into an empty declarative policy — it keeps owning denial and the preset stays empty. Reach for `permissions={}` only when you mean "no denials from me".
+</Note>
+
+<Warning>
+Once you pass a config object, `PRAISONAI_TOOL_SAFETY=off` (or `full` / `none` / `0` / `false`) is the **only** way to get an empty deny set — short of an explicit `permissions=` policy that owns denial itself.
+
+```python
+# PRAISONAI_TOOL_SAFETY=off
+Agent(name="t", instructions="t", approval=ApprovalConfig(timeout=30))._perm_deny
+# → frozenset()
+```
+</Warning>
+
+An unknown `PRAISONAI_TOOL_SAFETY` value falls back to the `"default"` preset (with a logged warning), so a typo never silently empties the deny set.
 
 ---
 
