@@ -194,11 +194,13 @@ Three runtime NOTEs surface behaviour that used to be silent — read them if th
 
 ## Preflight validation
 
-Before any model download or GPU load, the trainer fails fast with one friendly line for the four most common non-developer misconfigurations.
+Before any model download or GPU load, the trainer fails fast with one friendly line for the five most common non-developer misconfigurations.
 
 ```mermaid
 graph TB
-    Start[praisonai-train llm config.yaml] --> P{Preflight}
+    Start[praisonai-train llm config.yaml] --> Ver{Training deps<br/>current?}
+    Ver -->|Missing / too old| VER[❌ deps missing or too old]
+    Ver -->|OK| P{Preflight}
     P -->|No CUDA GPU| GPU[❌ No CUDA GPU detected]
     P -->|Publishing on, no HF token| HF[❌ No Hugging Face credentials]
     P -->|< 10 GB free on training disk| Disk[❌ Low disk]
@@ -211,13 +213,16 @@ graph TB
     classDef pass fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Start entry
-    class P check
-    class GPU,HF,Disk,Q fail
+    class P,Ver check
+    class GPU,HF,Disk,Q,VER fail
     class Go pass
 ```
 
+The version-floor check runs **first** — it lives inside the lazy import helper, before the trainer reaches the CUDA probe.
+
 | Preflight check | Message when it fails | Fix |
 |---|---|---|
+| Training dependency versions | `Training dependencies are missing or too old.` + `Missing: <names>` / `<name> <ver> is older than the required <floor>` + `Install with: pip install -U "<name>>=<floor>" ...` | Run the printed `pip install -U ...` command — it upgrades all six at once. |
 | CUDA GPU (skipped when `train: false`) | `No CUDA GPU detected. Fine-tuning needs a GPU. On a rented box check the driver; on CPU it cannot run.` | Use a GPU box; on a rented VM re-install CUDA drivers. Set `train: false` to publish/export on CPU without training. |
 | Hugging Face credentials (only when `huggingface_save` / `huggingface_save_gguf` / `push_to_hub` is on) | `Publishing to Hugging Face is enabled but no credentials were found. Run 'huggingface-cli login' or 'export HF_TOKEN=hf_...'. To train without publishing, set huggingface_save: false.` | Run `huggingface-cli login` (cached tokens count) **or** `export HF_TOKEN=hf_...`. |
 | Low disk (`< 10 GB` free on `output_dir` or `.`) | `Low disk: only 3.2 GB free on the training disk (need ~10 GB minimum). Free up space or set output_dir to a larger disk.` | Free space, or set `output_dir` in `config.yaml` to a larger volume. |
@@ -366,7 +371,9 @@ Fine-tuning validates the environment up front and fails with a single actionabl
 
 ```mermaid
 graph TB
-    Start[🚀 praisonai-train llm] --> GPU{CUDA GPU?}
+    Start[🚀 praisonai-train llm] --> Ver{Training deps current?}
+    Ver -->|No| E0[ERROR: deps missing or too old]
+    Ver -->|Yes| GPU{CUDA GPU?}
     GPU -->|No| E1[ERROR: No CUDA GPU detected]
     GPU -->|Yes| Tok{Publishing + HF creds?}
     Tok -->|Missing| E2[ERROR: no HF credentials]
@@ -382,13 +389,14 @@ graph TB
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Start input
-    class GPU,Tok,Disk,Quant question
-    class E1,E2,E3,E4 error
+    class Ver,GPU,Tok,Disk,Quant question
+    class E0,E1,E2,E3,E4 error
     class Run success
 ```
 
 What to expect:
 
+- **Training deps missing or too old** → a single `Training dependencies are missing or too old.` block naming each package plus one `pip install -U ...` command, raised before any heavy import.
 - **No CUDA GPU / missing HF credentials / low disk (`< 10 GB`) / bad `quantization_method`** → a single `ERROR: {reason}` line and exit `1`, checked before any download starts.
 - **`Ctrl-C`** → prints `Interrupted.` and exits `130`.
 - **Unknown config keys** → one grouped `WARNING:` block with a `did you mean '{key}'?` suggestion for each; training continues.
@@ -408,6 +416,52 @@ Push a fine-tuned model to Hugging Face and Ollama.
 ```bash
 export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN in your shell}"
 ```
+
+### Conda setup: what the script installs on your machine
+
+`setup_conda_env.sh` probes the host for a GPU **before** creating the env, so a non-Nvidia box gets a truthful build instead of a working-looking CUDA one.
+
+```mermaid
+graph TB
+    Start[setup_conda_env.sh] --> D{Detect accelerator}
+    D -->|nvidia-smi OR /proc/driver/nvidia/gpus| Cuda[cuda]
+    D -->|rocminfo OR amd-smi| Rocm[rocm]
+    D -->|Linux, none of the above| Cpu[cpu]
+    Cuda --> CudaOut[pytorch=2.6.0 pytorch-cuda=12.4<br/>-c pytorch -c nvidia]
+    Rocm --> RocmOut[pytorch=2.6.0 CPU build<br/>+ WARNING → pytorch.org]
+    Cpu --> CpuOut[pytorch=2.6.0 CPU build<br/>+ WARNING: llm refuses CPU]
+
+    classDef entry fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef probe fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start entry
+    class D,Cuda,Rocm,Cpu probe
+    class CudaOut good
+    class RocmOut,CpuOut warn
+```
+
+The probe order is `nvidia-smi` → `/proc/driver/nvidia/gpus` → `rocminfo` / `amd-smi` → CPU. The `pytorch-cuda=12.4` pin now lives in exactly one place, chosen by the detected accelerator, so the two `conda create` branches cannot disagree.
+
+An **AMD** host installs the CPU build and prints — the installer does **not** build a ROCm stack for you, so follow the [official PyTorch instructions](https://pytorch.org/get-started/locally/) then re-run:
+
+```text
+WARNING: an AMD GPU was detected. This installer only knows the CUDA
+         and CPU builds, so it will install the CPU one. Follow
+         https://pytorch.org/get-started/locally/ for a ROCm build,
+         then re-run this script.
+```
+
+A **CPU-only Linux** host installs the CPU build and prints — the env is usable for dataset work and exports, but not fine-tuning (see [GPU check](#gpu-check)):
+
+```text
+WARNING: no GPU detected. Fine-tuning needs one -- praisonai-train
+         llm refuses to run on CPU. The environment will still be
+         usable for dataset work and exports.
+```
+
+**macOS** still gets a CPU build with no warning (unchanged).
 
 ### Chat Template
 
@@ -488,7 +542,7 @@ praisonai train init
 ## Requirements
 
 <Note>
-Training dependencies are checked at startup via `unsloth` package availability but only fully loaded when training commands run.
+Training dependencies are version-checked at runtime — **before** any heavy import — across six packages (`torch`, `transformers`, `unsloth`, `trl`, `peft`, `bitsandbytes`). A missing or too-old package raises a single actionable line plus one `pip install -U ...` command that fixes all of them (PraisonAI PR #4365).
 </Note>
 
 **Install training dependencies:**
@@ -510,13 +564,58 @@ Pick the flavour that matches your flow: **agent training** (`praisonai-train`) 
 | `peft` | `>= 0.13.0` |
 | `accelerate` | `>= 0.34.0` |
 | `bitsandbytes` | `>= 0.45.0` |
-| `torch` | `>= 2.6.0` (CUDA 12.4) |
+| `torch` | `>= 2.6.0` |
 
-Verified end-to-end on unsloth 2026.7.4 / trl 0.24.0 / torch 2.10 / peft 0.19.1, across Qwen2.5-0.5B and Gemma-2-2B.
+The **CUDA-12.4 pin is imposed by the conda installer, not required by torch** — a torch 2.6 wheel built for another CUDA (or ROCm) also satisfies the runtime check. Verified end-to-end on unsloth 2026.7.4 / trl 0.24.0 / torch 2.10 / peft 0.19.1, across Qwen2.5-0.5B and Gemma-2-2B.
 
 <Warning>
-Older Unsloth releases (`< 2025.9.1`) and the pre-0.9 TRL API are no longer supported. If you had pinned `trl<0.9.0`, upgrade to `trl>=0.18.2`. The conda setup script now targets Python 3.11 + CUDA 12.4 + torch 2.6.0.
+Older Unsloth releases (`< 2025.9.1`) and the pre-0.9 TRL API are no longer supported. If you had pinned `trl<0.9.0`, upgrade to `trl>=0.18.2`. The conda setup script now targets Python 3.11 + CUDA 12.4 + torch 2.6.0. On AMD or CPU-only hosts the installer now says so up front rather than silently creating a broken CUDA env.
 </Warning>
+
+### Runtime version-floor enforcement
+
+The six floors are checked **at runtime**, not just by pip — because pip is routinely bypassed.
+
+```mermaid
+graph LR
+    Start[praisonai-train llm] --> Check{Version floors<br/>satisfied?}
+    Check -->|Missing / too old| Fail[❌ one line + pip install -U ...]
+    Check -->|All six OK| Go[✅ heavy imports begin]
+
+    classDef entry fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef pass fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start entry
+    class Check check
+    class Fail fail
+    class Go pass
+```
+
+`pip install --no-deps`, a hand-built conda env, and older `setup_conda_env.sh` torch pins all install a stack pip never validated. The trainer re-checks the six floors itself, before importing torch/transformers/unsloth/etc.
+
+| Package | Floor |
+|---------|-------|
+| `torch` | `2.6.0` |
+| `transformers` | `4.51.3` |
+| `unsloth` | `2025.9.1` |
+| `trl` | `0.18.2` |
+| `peft` | `0.13.0` |
+| `bitsandbytes` | `0.45.0` |
+
+A matching release with a `dev` or `rc` suffix satisfies the floor — `2.6.0rc1` counts as `2.6.0`, so testing an upstream prerelease is not blocked.
+
+A missing or stale stack prints one block naming exactly what to fix:
+
+```text
+Training dependencies are missing or too old.
+Missing: unsloth
+torch 2.5.1 is older than the required 2.6.0
+Install with: pip install -U "unsloth>=2025.9.1" "torch>=2.6.0"
+```
+
+Run the `pip install -U "<name>>=<floor>" ...` command the trainer printed — it upgrades every listed package in one go.
 
 **Required for training:**
 1. Huggingface token
@@ -1075,7 +1174,9 @@ The trainer runs a preflight pass on load — **before** any model, dataset, GPU
 
 ```mermaid
 graph TB
-    Start[📋 config.yaml] --> Req{Required keys?}
+    Start[📋 config.yaml] --> Ver{Training deps current?}
+    Ver -->|missing / too old| E0[❌ pip install -U ...]
+    Ver -->|ok| Req{Required keys?}
     Req -->|missing| E1[❌ minimal example]
     Req -->|ok| Tgt{Publish target set?}
     Tgt -->|missing| E2[❌ hf_model_name / ollama_model required]
@@ -1095,8 +1196,8 @@ graph TB
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Start input
-    class Req,Tgt,Gpu,Cred,Disk,Quant decision
-    class E1,E2,E3,E4,E5,E6 error
+    class Ver,Req,Tgt,Gpu,Cred,Disk,Quant decision
+    class E0,E1,E2,E3,E4,E5,E6 error
     class Ok success
 ```
 
@@ -1106,6 +1207,7 @@ graph TB
 
 | Check | Trigger | Failure message (paraphrased) |
 |---|---|---|
+| Training dependency versions | `praisonai-train llm` invoked with a missing/stale `torch` / `transformers` / `unsloth` / `trl` / `peft` / `bitsandbytes` | `Training dependencies are missing or too old.` + `Missing: <names>` / `<name> <ver> is older than the required <floor>` + `Install with: pip install -U "<name>>=<floor>" ...` |
 | Required keys | `model_name`, `max_seq_length`, or `dataset` missing | `Config is missing required keys: [...]. Minimal example: ...` |
 | Publish target set | `huggingface_save` / `huggingface_save_gguf` true but `hf_model_name` missing | `hf_model_name is required when huggingface_save or huggingface_save_gguf is enabled.` |
 | Publish target set | `ollama_save: true` but `ollama_model` missing | `ollama_model is required when ollama_save is enabled.` |
@@ -1131,6 +1233,21 @@ Enforced only when `train: true` (the default). A publish-only or export-only ru
 ```
 No CUDA GPU detected. Fine-tuning needs a GPU. On a rented box check the driver; on CPU it cannot run.
 ```
+
+### Version floors
+
+Six packages are version-checked at runtime, before any heavy import — `pip install --no-deps` and hand-built conda envs routinely bypass pip's metadata.
+
+| Package | Floor |
+|---------|-------|
+| `torch` | `2.6.0` |
+| `transformers` | `4.51.3` |
+| `unsloth` | `2025.9.1` |
+| `trl` | `0.18.2` |
+| `peft` | `0.13.0` |
+| `bitsandbytes` | `0.45.0` |
+
+Run the `pip install -U "<name>>=<floor>" ...` line the trainer prints — it upgrades every stale package at once. See [Runtime version-floor enforcement](#runtime-version-floor-enforcement) for the full behaviour.
 
 ### Hugging Face credentials
 
