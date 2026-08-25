@@ -181,6 +181,7 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         self._ack: AckReactor = AckReactor(
             ack_emoji=self.config.ack_emoji,
             done_emoji=self.config.done_emoji,
+            scope=getattr(self.config, "ack_scope", "group-mentions"),
         )
         
         # Pairing system
@@ -647,9 +648,9 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                     logger.error(f"Message handler error: {e}")
             
             if self._agent and not message.is_command:
-                # Ack reaction
+                # Ack reaction (scope-gated: quiet on ambient group chatter)
                 ack_ctx = None
-                if self._ack.enabled:
+                if self._ack.enabled and self._ack.should_ack_message(message):
                     async def _tg_react(emoji, **kw):
                         try:
                             from telegram import ReactionTypeEmoji
@@ -934,12 +935,16 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
 
                 # File-based custom slash commands (Issue #3729): resolve
                 # ``.praisonai/commands/{command}.md`` and submit the rendered
-                # body as a normal chat turn. Falls through to chat on a miss.
+                # body as a normal chat turn. On a miss (no such custom command)
+                # the raw command text is dispatched to the agent so an unknown
+                # or misspelled slash command is never a silent no-op — matching
+                # the Slack reference adapter's fall-through (Issue #4318).
                 text = update.message.text or ""
                 parts = text.split(maxsplit=1)
                 arguments = parts[1] if len(parts) > 1 else ""
                 rendered = self.render_custom_command(command, arguments)
-                if rendered is not None:
+                prompt = rendered if rendered is not None else text
+                if prompt is not None:
                     user_name = (
                         update.message.from_user.username
                         or update.message.from_user.first_name
@@ -947,7 +952,7 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                     ) if update.message.from_user else ""
                     try:
                         response = await self._session.chat(
-                            self._agent, user_id, rendered,
+                            self._agent, user_id, prompt,
                             chat_id=str(update.message.chat_id) if update.message.chat_id else "",
                             user_name=user_name,
                             message_id=str(update.message.message_id),
@@ -1567,11 +1572,17 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         reply_to: Optional[int] = None,
     ) -> None:
         """Send a long message, splitting with markdown-aware chunking."""
-        from ._chunk import chunk_message
+        from ._chunk import chunk_message, enforce_hard_cap, _calculate_length
 
         max_len = self.config.max_message_length
+        # Telegram measures message length in UTF-16 code units, not Python
+        # codepoints — a single emoji is 2 UTF-16 units. Measuring in
+        # codepoints lets an emoji-heavy reply exceed 4096 UTF-16 units and be
+        # rejected as "message too long", so use the platform's declared unit
+        # (Issue #4319).
+        length_unit = self.platform_capabilities().length_unit
 
-        if len(text) <= max_len:
+        if _calculate_length(text, length_unit) <= max_len:
             kwargs = {"chat_id": chat_id, "text": text}
             if reply_to:
                 kwargs["reply_to_message_id"] = reply_to
@@ -1591,7 +1602,16 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                 }
             )
         else:
-            chunks = chunk_message(text, max_length=max_len, preserve_fences=True)
+            chunks = chunk_message(
+                text,
+                max_length=max_len,
+                preserve_fences=True,
+                length_unit=length_unit,
+            )
+            # Guarantee no chunk exceeds the platform cap; an over-cap code
+            # fence would otherwise raise "Message is too long" and drop the
+            # entire reply (Issue #4319).
+            chunks = enforce_hard_cap(chunks, max_len, length_unit=length_unit)
             for i, chunk in enumerate(chunks):
                 kwargs = {"chat_id": chat_id, "text": chunk}
                 if i == 0 and reply_to:

@@ -197,75 +197,6 @@ def _validate_preset_params(params):
         validate_preset_string(name, value, _PRESET_STRING_PARAMS[name]())
 
 
-class ServerRegistry:
-    """Registry for API server state per-port."""
-    
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._server_started = {}  # Dict of port -> started boolean
-        self._registered_agents = {}  # Dict of port -> Dict of path -> agent_id  
-        self._shared_apps = {}  # Dict of port -> FastAPI app
-    
-    # Class-level lock for thread-safe singleton creation
-    _instance_lock = threading.Lock()
-    
-
-
-    @staticmethod
-    def get_default_instance():
-        """Get default global registry for backward compatibility."""
-        if not hasattr(ServerRegistry, '_default_instance'):
-            # Double-checked locking pattern with shared class-level lock
-            with ServerRegistry._instance_lock:
-                if not hasattr(ServerRegistry, '_default_instance'):
-                    ServerRegistry._default_instance = ServerRegistry()
-        return ServerRegistry._default_instance
-    
-    def is_server_started(self, port: int) -> bool:
-        with self._lock:
-            return self._server_started.get(port, False)
-    
-    def set_server_started(self, port: int, started: bool) -> None:
-        with self._lock:
-            self._server_started[port] = started
-    
-    def get_shared_app(self, port: int):
-        with self._lock:
-            return self._shared_apps.get(port)
-    
-    def set_shared_app(self, port: int, app) -> None:
-        with self._lock:
-            self._shared_apps[port] = app
-    
-    def register_agent(self, port: int, path: str, agent_id: str) -> None:
-        with self._lock:
-            if port not in self._registered_agents:
-                self._registered_agents[port] = {}
-            self._registered_agents[port][path] = agent_id
-    
-    def get_registered_agents(self, port: int) -> dict:
-        with self._lock:
-            return self._registered_agents.get(port, {}).copy()
-
-    def cleanup_agent_registrations(self, agent_id: str) -> None:
-        """Remove all registrations for an agent ID and clean empty port state."""
-        with self._lock:
-            ports_to_clean = []
-            for port, path_dict in self._registered_agents.items():
-                paths_to_remove = [path for path, registered_id in path_dict.items() if registered_id == agent_id]
-                for path in paths_to_remove:
-                    del path_dict[path]
-                if not path_dict:
-                    ports_to_clean.append(port)
-
-            for port in ports_to_clean:
-                self._registered_agents.pop(port, None)
-                self._server_started.pop(port, None)
-
-# Backward compatibility - use default instance
-def _get_default_server_registry() -> ServerRegistry:
-    return ServerRegistry.get_default_instance()
-
 # Don't import FastAPI dependencies here - use lazy loading instead
 
 if TYPE_CHECKING:
@@ -1856,6 +1787,12 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             elif isinstance(_guardrails_config, str):
                 # LLM validator prompt
                 guardrail = _guardrails_config
+
+        # Persist the resolved value so clone_for_channel() can forward it.
+        # Without this the attribute never exists, its getattr(..., None) in
+        # clone_for_channel() yields None, and every served clone runs with no
+        # output guardrail at all (one clone per gateway channel / HTTP call).
+        self._guardrails_config = _guardrails_config
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve WEB param - FAST PATH
@@ -2461,6 +2398,11 @@ Your Goal: {self.goal}
         # ApprovalConfig = full control (all_tools, timeout, etc.)
         # str = permission preset ("safe", "read_only", "full")
         from ..approval.protocols import ApprovalConfig
+        # Persist the approval kwarg exactly as given: it round-trips through the
+        # constructor (str | bool | ApprovalConfig | dict | backend object).
+        # clone_for_channel() reads this; without it the attribute never exists
+        # and every served clone loses its approval policy.
+        self._approval_config = approval
         self._perm_deny = frozenset()  # Permission tier deny set (empty = no denials)
         self._perm_allow = None        # Permission tier allow set (None = allow all)
         # Optional pattern-based PermissionManager (rules from
@@ -2563,6 +2505,17 @@ Your Goal: {self.goal}
             # Store permissions if provided (for CI-safe declarative policies)
             self._approval_permissions = getattr(approval, 'permissions', None)
             self._permission_mode = getattr(approval, 'permission_mode', None)
+            # Configuring approval must never be a WEAKER posture than passing
+            # nothing. When no declarative ``permissions`` policy is supplied,
+            # fall back to the same env-driven default deny set the bare
+            # ``approval is None`` path uses, so e.g. ``ApprovalConfig(timeout=30)``
+            # keeps the default denials (execute_command, delete_file, …) instead
+            # of silently dropping all of them. ``is None`` (not falsiness) so an
+            # explicit empty policy (``permissions={}``) is still an intentional
+            # policy that owns denial — only a genuinely absent policy inherits
+            # the env-driven default deny set.
+            if self._approval_permissions is None:
+                self._perm_deny = self._resolve_default_deny_set()
         elif isinstance(approval, dict):
             # Dict config: convert to ApprovalConfig
             approval_config = ApprovalConfig(**approval)
@@ -2571,6 +2524,12 @@ Your Goal: {self.goal}
             self._approval_timeout = approval_config.timeout
             self._approval_permissions = getattr(approval_config, 'permissions', None)
             self._permission_mode = getattr(approval_config, 'permission_mode', None)
+            # See the ApprovalConfig branch above: never weaken the default
+            # posture just because a config object was passed. ``is None`` so an
+            # explicit empty policy (``approval={"permissions": {}}``) still owns
+            # denial rather than inheriting the default deny set.
+            if self._approval_permissions is None:
+                self._perm_deny = self._resolve_default_deny_set()
         else:
             # Plain backend object — dangerous tools only, backend default timeout
             self._approval_backend = approval
@@ -6420,6 +6379,31 @@ Answer:"""
         except Exception:
             return False
 
+    @staticmethod
+    def _resolve_default_deny_set() -> frozenset:
+        """Return the env-driven default permission deny set.
+
+        Mirrors the ``approval is None`` path: honour ``PRAISONAI_TOOL_SAFETY``
+        (``off``/``full``/``none``/``0``/``false`` → no denials), otherwise use
+        the named preset (defaulting to ``"default"``, which blocks destructive
+        ops like ``execute_command``/``delete_file``/``kill_process``/
+        ``execute_code``). An unknown env value falls back to ``"default"``.
+
+        Shared by the ``ApprovalConfig``/``dict`` branches so configuring
+        approval never silently drops the default denials — passing a config
+        object must not be a weaker posture than passing nothing.
+        """
+        _raw_safety_env = os.environ.get("PRAISONAI_TOOL_SAFETY")
+        _safety_env = (_raw_safety_env or "").strip().lower()
+        if _safety_env in ("off", "full", "none", "0", "false"):
+            return frozenset()
+        from ..approval.registry import PERMISSION_PRESETS
+        _resolved = _safety_env or "default"
+        _preset = PERMISSION_PRESETS.get(_resolved)
+        if _preset is None:
+            _preset = PERMISSION_PRESETS.get("default")
+        return _preset if _preset is not None else frozenset()
+
     def _setup_guardrail(self):
         """Setup the guardrail function based on the provided guardrail parameter."""
         # ``tool_execution._check_tool_policy_and_guardrails`` reads
@@ -6637,7 +6621,7 @@ Answer:"""
         else:
             return False, None, guardrail_result.error
 
-    def _apply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None):
+    def _apply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None, cancel_token=None):
         """Apply guardrail validation with retry logic (sync version)."""
         retry_count = 0
         current_response = response_text
@@ -6678,7 +6662,7 @@ Answer:"""
             # Regenerate response for retry
             try:
                 retry_prompt = f"{prompt}\n\nNote: Previous response failed validation due to: {error}. Please provide an improved response."
-                response = self._chat_completion([{"role": "user", "content": retry_prompt}], temperature, tools, task_name=task_name, task_description=task_description, task_id=task_id)
+                response = self._chat_completion([{"role": "user", "content": retry_prompt}], temperature, tools, task_name=task_name, task_description=task_description, task_id=task_id, cancel_token=cancel_token)
                 if response and response.choices:
                     content = response.choices[0].message.content
                     current_response = content.strip() if content else ""
@@ -6853,8 +6837,12 @@ Answer:"""
         if AgentRuntimeConfig and isinstance(runtime, AgentRuntimeConfig):
             return runtime
         
-        # If already a RuntimeConfig instance, return as-is
+        # If already a RuntimeConfig instance, normalise its runtime name so a
+        # typo in preferred_runtime (e.g. "nativ") raises instead of silently
+        # dropping capabilities. resolve_runtime returns a normalised copy.
         if RuntimeConfig and hasattr(RuntimeConfig, '__name__') and isinstance(runtime, RuntimeConfig):
+            if resolve_runtime:
+                return resolve_runtime(runtime)
             return runtime
         
         # Handle capability validation style (bool, RuntimeConfig)
@@ -6863,8 +6851,13 @@ Answer:"""
                 result = resolve_runtime(runtime)
                 if result is not None:
                     return result
-            except (TypeError, ValueError):
-                pass  # Try AgentRuntimeConfig path
+            except ValueError:
+                # An invalid runtime *name* (e.g. a typo) must surface rather
+                # than falling through and being stored verbatim, which would
+                # silently drop most capabilities.
+                raise
+            except TypeError:
+                pass  # Not this style; try AgentRuntimeConfig path
         
         # Handle turn-based style (AgentRuntimeConfig)
         if AgentRuntimeConfig:
@@ -6919,16 +6912,17 @@ Answer:"""
             else:
                 raise TypeError(f"Invalid capability type: {type(cap)}")
         
-        # Determine runtime name
-        runtime_name = getattr(self._runtime_config, 'preferred_runtime', 'native')
+        # Determine runtime name. Normalise so spelling variants (NATIVE,
+        # " native ", native) map to the same matrix instead of silently
+        # dropping capabilities; an unknown name raises rather than degrading.
+        raw_runtime = getattr(self._runtime_config, 'preferred_runtime', None) or 'native'
+        from ..config.feature_configs import canonical_runtime_name
+        runtime_name = canonical_runtime_name(raw_runtime)
         
         # Get runtime capabilities based on runtime type
         if runtime_name == 'native':
             runtime_matrix = get_native_runtime_capabilities()
-        elif runtime_name in ('plugin-harness', 'harness', 'plugin', 'reduced'):
-            runtime_matrix = get_reduced_harness_capabilities()
         else:
-            # Unknown runtime, use reduced capabilities as safe default
             runtime_matrix = get_reduced_harness_capabilities()
         
         # Validate capabilities
@@ -7431,8 +7425,7 @@ Answer:"""
 
         try:
             # Tear down the routes launch() actually registered (module-level
-            # state in execution_mixin.py). ServerRegistry above is a separate,
-            # unpopulated structure and cleaning it up is a no-op.
+            # state in execution_mixin.py).
             from .execution_mixin import cleanup_launch_registration
             cleanup_launch_registration(self._agent_id)
 

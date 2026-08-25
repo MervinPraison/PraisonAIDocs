@@ -126,6 +126,7 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
         self._ack: AckReactor = AckReactor(
             ack_emoji=self.config.ack_emoji,
             done_emoji=self.config.done_emoji,
+            scope=getattr(self.config, "ack_scope", "group-mentions"),
         )
         
         # Pairing system
@@ -386,7 +387,11 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
                             handler(bot_message)
                     except Exception as e:
                         logger.error(f"Command handler error: {e}")
-                return
+                    return
+                # Unknown/unimplemented slash command: fall through to normal
+                # agent dispatch below rather than a silent no-op, matching the
+                # Slack reference adapter so a misspelled or not-yet-implemented
+                # command reaches the agent instead of vanishing (Issue #4318).
             
             should_respond = False
             if message.guild is None:
@@ -408,8 +413,15 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
                     user_id = str(message.author.id)
                     
                     # Ack reaction - show processing indicator
+                    # (scope-gated: quiet on ambient guild chatter)
+                    _is_mention = (
+                        message.guild is None
+                        or self._client.user.mentioned_in(message)
+                    )
                     ack_ctx = None
-                    if self._ack.enabled:
+                    if self._ack.enabled and self._ack.should_ack_message(
+                        bot_message, is_mention=_is_mention
+                    ):
                         async def _discord_react(emoji, **kw):
                             try:
                                 await message.add_reaction(emoji)
@@ -553,7 +565,7 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
 
     async def _send_long_message(self, channel, text: str, reference=None) -> None:
         """Send a long message, splitting with markdown-aware chunking."""
-        from ._chunk import chunk_message
+        from ._chunk import chunk_message, enforce_hard_cap
 
         max_len = min(self.config.max_message_length, 2000)
         
@@ -564,6 +576,10 @@ class DiscordBot(OutboundResilienceMixin, ChatCommandMixin, MessageHookMixin):
                 await channel.send(text)
         else:
             chunks = chunk_message(text, max_length=max_len, preserve_fences=True)
+            # Guarantee no chunk exceeds the 2000-char cap; an over-cap code
+            # fence would otherwise raise a 400 and drop the entire reply
+            # (Issue #4319).
+            chunks = enforce_hard_cap(chunks, max_len)
             for i, chunk in enumerate(chunks):
                 if i == 0 and reference:
                     await channel.send(chunk, reference=reference)

@@ -1958,7 +1958,7 @@ class ToolExecutionMixin:
         )
         return any(marker in name for marker in edit_markers)
 
-    def _check_permission_manager_deny(self, function_name):
+    def _check_permission_manager_deny(self, function_name, arguments=None):
         """Return an error dict if the PermissionManager hard-denies the tool.
 
         Ensures the pattern-based ``PermissionManager`` (rules from
@@ -1966,18 +1966,51 @@ class ToolExecutionMixin:
         uniformly — native functions **and** MCP tools — since both flow through
         ``_execute_tool_impl``. Returns ``None`` when no manager is attached or
         the tool is not denied, preserving backward compatibility.
+
+        Both the tool *name* and the argument-scoped target (e.g.
+        ``bash:rm -rf /tmp/x`` built from ``execute_command(command=...)``) are
+        checked so an argument-level ``deny`` rule — which the rule engine can
+        already match — actually fires. Without this the deny tier was a
+        name-only decision: once a shell tool was allowed by name, no rule could
+        narrow it. The argument target reuses ``build_permission_target`` so it
+        speaks the same vocabulary as the allow side's scoped grants.
         """
         manager = getattr(self, "_permission_manager", None)
         if manager is None:
             return None
-        try:
-            if manager.is_denied(function_name, getattr(self, "name", None)):
-                return {
-                    "error": f"Tool '{function_name}' blocked by permission policy",
-                    "permission_denied": True,
-                }
-        except Exception as e:
-            logging.debug("permission manager is_denied failed for %s: %s", function_name, e)
+        agent_name = getattr(self, "name", None)
+        targets = [function_name]
+        if arguments:
+            try:
+                from ..approval.utils import build_permission_target
+                # Normalise argument keys the same way ``_cast_arguments`` does
+                # before dispatch (strip trailing '='/whitespace LLMs hallucinate)
+                # so ``command=`` still resolves to the ``command`` command-key
+                # and an argument-scoped deny (``bash:rm *``) cannot be evaded by
+                # a malformed kwarg name that only normalises *after* this gate.
+                normalized_args = arguments
+                if isinstance(arguments, dict):
+                    normalized_args = {
+                        (k.strip().rstrip('=').strip() if isinstance(k, str) else k): v
+                        for k, v in arguments.items()
+                    }
+                scoped_target = build_permission_target(function_name, normalized_args)
+                if scoped_target and scoped_target != function_name:
+                    targets.append(scoped_target)
+            except Exception as e:  # noqa: BLE001
+                logging.debug(
+                    "could not build argument-scoped permission target for %s: %s",
+                    function_name, e,
+                )
+        for target in targets:
+            try:
+                if manager.is_denied(target, agent_name):
+                    return {
+                        "error": f"Tool '{function_name}' blocked by permission policy",
+                        "permission_denied": True,
+                    }
+            except Exception as e:
+                logging.debug("permission manager is_denied failed for %s: %s", target, e)
         return None
 
     def _is_bypass_mode(self) -> bool:
@@ -2012,7 +2045,7 @@ class ToolExecutionMixin:
         # Pattern-based PermissionManager deny gate (native + MCP, uniform).
         # BYPASS mode skips this gate as its contract requires.
         if not self._is_bypass_mode():
-            manager_denial = self._check_permission_manager_deny(function_name)
+            manager_denial = self._check_permission_manager_deny(function_name, arguments)
             if manager_denial is not None:
                 return manager_denial
 
@@ -2032,6 +2065,14 @@ class ToolExecutionMixin:
         if decision.modified_args:
             arguments = decision.modified_args
             logging.info(f"Using modified arguments: {arguments}")
+            # Re-authorize: an approval backend may have rewritten the arguments
+            # into a command that an argument-scoped deny rule prohibits. The
+            # earlier gate only saw the original args, so re-run it against the
+            # final ones before dispatch. BYPASS still opts out entirely.
+            if not self._is_bypass_mode():
+                manager_denial = self._check_permission_manager_deny(function_name, arguments)
+                if manager_denial is not None:
+                    return manager_denial
 
         from ..approval import get_approval_registry
         get_approval_registry().mark_approved(
@@ -2050,7 +2091,7 @@ class ToolExecutionMixin:
         # Pattern-based PermissionManager deny gate (native + MCP, uniform).
         # BYPASS mode skips this gate as its contract requires.
         if not self._is_bypass_mode():
-            manager_denial = self._check_permission_manager_deny(function_name)
+            manager_denial = self._check_permission_manager_deny(function_name, arguments)
             if manager_denial is not None:
                 return manager_denial
 
@@ -2071,6 +2112,12 @@ class ToolExecutionMixin:
         if decision.modified_args:
             arguments = decision.modified_args
             logging.info(f"Using modified arguments: {arguments}")
+            # Re-authorize modified args against the deny gate — see the sync
+            # path for rationale. BYPASS still opts out entirely.
+            if not self._is_bypass_mode():
+                manager_denial = self._check_permission_manager_deny(function_name, arguments)
+                if manager_denial is not None:
+                    return manager_denial
 
         from ..approval import get_approval_registry
         get_approval_registry().mark_approved(
@@ -2996,18 +3043,31 @@ class ToolExecutionMixin:
         else:
             return f"Unknown bridge tool: {function_name}"
 
-    def _tool_declares_not_idempotent(self, tool_name):
+    def _tool_declares_not_idempotent(self, tool_name, tools_override=None):
         """True only when the tool *explicitly* declares itself unsafe to re-run.
 
-        Distinct from ``_is_tool_idempotent``, which answers False for unknown
-        tools as a safe default. Gating a retry on that would stop retrying every
-        unregistered user tool; gating it on an *explicit* declaration vetoes only
-        what the author actually marked, so existing retry behaviour is unchanged
-        for everything else.
+        Deliberately narrower than ``_is_tool_idempotent``, which answers False
+        for unknown tools as a safe default: gating a retry on that would stop
+        retrying every unregistered user tool.
+
+        This keys on an explicit declaration and nothing else. In particular it
+        must NOT consult the shared ``MUTATING_TOOLS`` name registry -- that is a
+        73-name list maintained for the escalation loop guard, and using it here
+        silently removed the retry from any *undeclared* tool that happened to
+        share a name with an entry (``write_file``, ``store_memory``, ``mkdir``...).
+
+        ``tools_override`` mirrors the resolution order in ``_execute_tool_impl`` /
+        ``_execute_tool_async_impl``: a task-scoped tool passed via ``tools_override``
+        shadows an agent-level tool of the same name, so its declaration must win.
+        Without this an override-only ``restart_safe=False`` tool would be missed
+        here and silently retried.
         """
         tools = getattr(self, 'tools', [])
         if not isinstance(tools, (list, tuple)):
             tools = []
+        if isinstance(tools_override, (list, tuple)):
+            # Override tools take precedence and are searched first.
+            tools = list(tools_override) + list(tools)
         for tool in tools:
             name_attr = getattr(tool, '__name__', None) or getattr(tool, 'name', None)
             if name_attr == tool_name:
@@ -3019,12 +3079,21 @@ class ToolExecutionMixin:
                     explicit = getattr(tool, 'restart_safe', None)
                 if isinstance(explicit, bool):
                     return not explicit
-                break
-        try:
-            from ..escalation.loop_guard import MUTATING_TOOLS
-        except Exception:
-            return False
-        return tool_name in MUTATING_TOOLS
+                return False
+        # A tool from the process-global registry (only reachable under
+        # ToolConfig(allow_global_tools=True)) can carry its own declaration;
+        # ``_is_tool_idempotent`` consults it, so this must too.
+        if getattr(self, '_allow_global_tools', False):
+            try:
+                from ..tools.registry import get_registry
+                global_tool = get_registry().get(tool_name)
+                for attr in ('idempotent', 'restart_safe'):
+                    explicit = getattr(global_tool, attr, None)
+                    if isinstance(explicit, bool):
+                        return not explicit
+            except Exception:
+                pass
+        return False
 
     def _is_tool_idempotent(self, tool_name):
         """Whether re-running ``tool_name`` is safe (no duplicated side effects).
