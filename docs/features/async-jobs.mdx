@@ -227,6 +227,79 @@ sequenceDiagram
     New->>DB: J1 = FAILED (error="Interrupted by service restart")
 ```
 
+## Backpressure & Admission Control
+
+A flood of submits now returns `503` instead of accepting an unbounded backlog.
+
+The executor gates admission in two tiers: `max_concurrent` caps how many run bodies execute at once, while `max_queued` caps how many jobs are admitted (queued + running) before new submits are rejected.
+
+```mermaid
+graph LR
+    Submit[📤 POST /runs] --> Check{running_tasks >= max_queued?}
+    Check -->|Yes| Reject[🛑 503 + Retry-After]
+    Check -->|No| Reserve[📋 Reserve slot]
+    Reserve --> Persist[💾 Save QUEUED]
+    Persist --> Sem{Semaphore free?}
+    Sem -->|Yes| Run[🤖 Run body]
+    Sem -->|No| Wait[⏳ Wait]
+    Wait --> Run
+    Run --> Done[✅ Complete]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef run fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Submit input
+    class Check,Sem check
+    class Reject stop
+    class Reserve,Persist,Wait,Run run
+    class Done ok
+```
+
+When admission is saturated, `JobExecutor.submit()` raises `JobQueueFull(retry_after=1.0)`. The router deletes the stranded `QUEUED` row via `store.delete(job.id)` — freeing the idempotency key — and returns `HTTPException(status_code=503, detail="Job queue is full; retry later.", headers={"Retry-After": "1"})`.
+
+Set the ceiling on the constructor:
+
+```python
+from praisonai.jobs import JobExecutor, SqliteJobStore
+
+executor = JobExecutor(
+    store=SqliteJobStore(path="/var/lib/praisonai/jobs.db"),
+    max_concurrent=10,   # run at most 10 bodies at once
+    max_queued=50,       # admit at most 50 (queued + running); default is max_concurrent * 10
+)
+```
+
+| Constructor arg | Default | Effect |
+|---|---|---|
+| `max_queued` | `max_concurrent * 10` (i.e. `100` with defaults) | Admission ceiling. New submits over this cap raise `JobQueueFull`, which the router maps to `503` with `Retry-After: 1`. |
+
+<Note>
+**New in PR #4336:** the Jobs API returns `503 Service Unavailable` with a `Retry-After` header when the executor's admission ceiling (`max_queued`, default `max_concurrent × 10`) is hit. The stranded `QUEUED` row is deleted, so retrying the same `Idempotency-Key` is safe. `max_queued` is a `JobExecutor` constructor argument — pass a custom executor to `create_app(executor=...)` to change it (`get_executor()` reads `PRAISONAI_MAX_CONCURRENT_JOBS` and `PRAISONAI_JOB_TIMEOUT` from the environment, but not `max_queued`).
+</Note>
+
+Honour `Retry-After` on the client and reuse the same `Idempotency-Key` so the retry de-duplicates cleanly:
+
+```python
+import httpx
+import time
+
+def submit_with_retry(prompt: str, api_url: str = "http://127.0.0.1:8005"):
+    while True:
+        r = httpx.post(
+            f"{api_url}/api/v1/runs",
+            json={"prompt": prompt},
+            headers={"Idempotency-Key": "task-123"},
+        )
+        if r.status_code != 503:
+            r.raise_for_status()
+            return r.json()["job_id"]
+        # Queue is full — respect Retry-After before retrying the same key.
+        time.sleep(float(r.headers.get("Retry-After", "1")))
+```
+
 ## Start Server
 
 ```bash
@@ -292,11 +365,51 @@ def wait_for_completion(job_id):
 
 ## SSE Streaming
 
+Multiple viewers of the same `job_id` now each receive every progress update — one disconnecting no longer freezes the others.
+
 ```python
 with httpx.stream("GET", f"http://127.0.0.1:8005/api/v1/runs/{job_id}/stream") as r:
     for line in r.iter_lines():
         if line.startswith("data:"):
             print(line[5:])
+```
+
+```mermaid
+sequenceDiagram
+    participant TabA as Viewer A
+    participant TabB as Viewer B
+    participant API as Jobs API
+    participant Exec as JobExecutor
+
+    TabA->>API: GET /runs/{id}/stream
+    API->>Exec: register_progress_callback(id, cb_A)
+    TabB->>API: GET /runs/{id}/stream
+    API->>Exec: register_progress_callback(id, cb_B)
+    Exec-->>TabA: progress event
+    Exec-->>TabB: progress event
+    TabB--xAPI: disconnect
+    API->>Exec: unregister_progress_callback(id, cb_B)
+    Exec-->>TabA: progress event (A still receives)
+```
+
+<Note>
+**New in PR #4336:** `/api/v1/runs/{id}/stream` now supports **multiple concurrent viewers of the same job**. Every subscriber receives every progress update. If you call `JobExecutor.register_progress_callback` / `unregister_progress_callback` directly, note that `unregister_progress_callback` now takes an optional second argument: pass the specific callback to remove only that subscriber; call without a callback to clear all subscribers (the shutdown path).
+</Note>
+
+When driving `JobExecutor` directly, remove only your own subscriber so co-registered viewers keep streaming:
+
+```python
+def make_viewer():
+    async def on_progress(job):
+        print(job.progress_percentage, job.progress_step)
+    return on_progress
+
+cb = make_viewer()
+executor.register_progress_callback(job_id, cb)
+try:
+    ...
+finally:
+    executor.unregister_progress_callback(job_id, cb)  # remove ONLY this subscriber
 ```
 
 ## Webhook Callback
@@ -413,6 +526,9 @@ praisonai run cancel <job_id>
   <Accordion title="Set PRAISONAI_JOBS_DB_PATH in production">
     Export `PRAISONAI_JOBS_DB_PATH=/var/lib/praisonai/jobs.db` so `SqliteJobStore` persists jobs and idempotency keys across restarts. With `ENVIRONMENT=production` and no path set, `create_app()` raises `RuntimeError` rather than silently losing state.
   </Accordion>
+  <Accordion title="Handle 503 backpressure on the client">
+    Size `max_queued` to your worker capacity and retry on `503` using the `Retry-After` header with the same `Idempotency-Key`. The rejected `QUEUED` row is deleted, so the retry starts clean instead of colliding with a stranded record.
+  </Accordion>
 </AccordionGroup>
 
 ---
@@ -428,5 +544,8 @@ praisonai run cancel <job_id>
   </Card>
   <Card icon="database" href="/features/durable-tool-runs" title="Durable Tool Runs">
     Persist and resume tool executions across restarts.
+  </Card>
+  <Card icon="gauge" href="/features/rate-limiter" title="Rate Limiter">
+    Shape request bursts before they reach the admission ceiling.
   </Card>
 </CardGroup>
