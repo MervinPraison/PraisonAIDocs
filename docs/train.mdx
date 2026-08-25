@@ -607,33 +607,83 @@ Both commands are the two models the SDK actually tests (2× RTX A6000). Forcing
 
 ### Assistant-only Loss
 
-Response-only loss is on by default via `assistant_only_loss: auto` — the trainer probes the tokenizer and enables masking only when the template supports it.
+Response-only loss trains on assistant replies only — prompts are masked out of the loss. It's on by default via `assistant_only_loss: auto`.
 
 ```yaml
-assistant_only_loss: auto   # default — probe the template, mask if supported
+assistant_only_loss: auto   # default — mask whenever any route is available
 ```
 
-The trainer calls the tokenizer's chat template with `return_assistant_tokens_mask=True`; if the template exposes `{% generation %}` markers, masking is enabled, otherwise the trainer trains on the full sequence with no error.
+The trainer masks through **two routes**, chosen automatically:
+
+1. **`assistant_only_loss`** (TRL's built-in) — used when the chat template ships `{% generation %}` markers.
+2. **`train_on_responses_only`** (Unsloth's turn-marker masking) — the fallback that masks by locating literal turn-marker strings. It works on Llama, Qwen, Gemma, Mistral, and Phi templates — none of which ship `{% generation %}` today.
+
+```mermaid
+graph TB
+    Start[assistant_only_loss] --> Use{Masking wanted?}
+    Use -->|false| Full[Train on full sequence]
+    Use -->|true / auto| Gen{Template has<br/>generation blocks?}
+    Gen -->|Yes| TRL[Route: assistant_only_loss<br/>TRL built-in]
+    Gen -->|No| Mark{Turn markers<br/>known for template?}
+    Mark -->|Yes| Uns[Route: train_on_responses_only<br/>Unsloth turn markers]
+    Mark -->|No| Err[ValueError — no route available]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef route fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef err fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Use,Gen,Mark decision
+    class TRL,Uns route
+    class Full ok
+    class Err err
+```
+
+`auto` resolves to *mask whenever any route is available* — the template supports `{% generation %}`, **or** turn markers are known for it.
 
 | Value | Behaviour | When to use |
 |-------|-----------|-------------|
-| `auto` | Probe the template; mask if supported, else full-sequence SFT | **Recommended default** — safe on any template |
-| `true` | Force masking; fails fast at model-prep time if unsupported | You know your template emits `{% generation %}` markers |
+| `auto` | Mask whenever any route is available, else full-sequence SFT | **Recommended default** — masks correctly on every listed template |
+| `true` | Force masking; fails fast at model-prep time if no route is available | You want masking guaranteed |
 | `false` | Force off — train on the full sequence | You want full-sequence loss regardless |
 
 `train_on_responses_only` is accepted as an alias for `assistant_only_loss` if you're migrating from an older config. Both real YAML booleans (`assistant_only_loss: true`) and the string forms (`"true"` / `"false"` / `"yes"` / `"no"` / `"on"` / `"off"`) work.
 
+The run-summary `Loss mask:` line names which route actually ran:
+
+| Route | Line printed |
+|-------|--------------|
+| off | `Loss mask:   full sequence (training on prompts too)` |
+| `assistant_only_loss` | `Loss mask:   assistant replies only (TRL assistant_only_loss)` |
+| `train_on_responses_only` | `Loss mask:   assistant replies only (unsloth turn markers)` |
+
+Each Unsloth chat template maps to a marker family used by the turn-marker route:
+
+| Chat template | Family | Instruction marker | Response marker |
+|---|---|---|---|
+| `llama-3`, `llama3`, `llama-3.1`, `llama-31`, `llama` | llama-3 | `<\|start_header_id\|>user<\|end_header_id\|>\n\n` | `<\|start_header_id\|>assistant<\|end_header_id\|>\n\n` |
+| `chatml`, `qwen-2.5`, `qwen3`, `phi-4`, `gpt-oss`, `yi-chat`, `unsloth`, `gemma_chatml`, … | chatml | `<\|im_start\|>user\n` | `<\|im_start\|>assistant\n` |
+| `gemma`, `gemma2`, `gemma-3`, `gemma3`, `gemma-3n`, `gemma-4` | gemma | `<start_of_turn>user\n` | `<start_of_turn>model\n` |
+| `mistral` | mistral | `[INST]` | `[/INST]` |
+| `phi-3`, `phi-35`, `phi-3.5` | phi | `<\|user\|>\n` | `<\|assistant\|>\n` |
+| `zephyr` | zephyr | `<\|user\|>\n` | `<\|assistant\|>\n` |
+
+Marker resolution matches **longest-first** (so `llama-3.1` beats `llama`), is case-insensitive, and normalises hyphens/dots (`gemma-2` == `gemma2`). When `chat_template` is unset the resolver falls back to the model's **repo name only** (not the `unsloth/` org prefix). An unknown model resolves to no markers — the trainer refuses to guess rather than mask on the wrong boundary and train on nothing.
+
 <Warning>
-`assistant_only_loss: true` on a template without `{% generation %}` markers raises `ValueError` at model-prep time:
+`assistant_only_loss: true` when **neither** route is available raises `ValueError` at model-prep time:
 
 ```
-ValueError: assistant_only_loss is enabled but the chat template for
-'<model_name>' has no assistant-turn markers ({% generation %}). Set
-assistant_only_loss: auto (recommended) or false, or use a chat_template
-that supports masking.
+assistant_only_loss is enabled but neither masking route is available for
+'<model_name>': the chat template has no {% generation %} markers, and no
+turn markers are known for it. Set assistant_only_loss: false to train on
+the full sequence, or choose a chat_template from: <sorted list of known
+template keys>.
 ```
 
-Use `auto` (recommended) or `false`, or set a `chat_template` that supports masking.
+Set `assistant_only_loss: false` to train on the full sequence, or choose a known `chat_template` from the list above.
 </Warning>
 
 ## Initilise praisonai train
@@ -888,12 +938,17 @@ All `lora_*` keys and the runtime keys (`dataset_num_proc`, `packing`, `dataset_
 No publish flags — trains and saves the LoRA to `lora_model/`, pushing nowhere.
 
 ```yaml
+method: sft                # sft (default) | dpo | orpo | kto — see Preference Training
 model_name: "unsloth/gemma-2-2b-it-bnb-4bit"
 max_seq_length: 2048
 dataset:
   - name: "yahma/alpaca-cleaned"
     num_samples: 20        # subset for a fast smoke test (honored as of #3279)
 ```
+
+<Note>
+`method` selects the training objective. `sft` is supervised fine-tuning (default); `dpo`, `orpo`, and `kto` are preference-tuning objectives that need paired / labelled datasets. See [Preference Training](/features/train-preference-tuning) for the full walkthrough.
+</Note>
 
 </Tab>
 <Tab title="Publish to HF + Ollama">
@@ -953,8 +1008,17 @@ Both real YAML booleans (`train: true`) and the string forms (`train: "true"`) w
 The full-config reference below shows every optional key with its default.
 
 ```yaml
+# Training method — sft (default) | dpo | orpo | kto. Case-insensitive.
+method: sft
+
 model_name: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
 model_parameters: "8b"
+
+# Preference-tuning knobs (dpo / orpo / kto only) — commented out for SFT.
+# beta: 0.1                 # preference-loss temperature (dpo/orpo/kto)
+# max_prompt_length: 1024   # prompt truncation (default: max_seq_length // 2)
+# desirable_weight: 1.0     # kto only — weight on thumbs-up examples
+# undesirable_weight: 1.0   # kto only — weight on thumbs-down examples
 
 # Publishing — all default OFF. Set the flag AND its target to push.
 huggingface_save: true
@@ -1009,8 +1073,8 @@ loftq_config: null
 # Omit to use the model's own built-in template.
 chat_template: "llama-3.1"      # or "gemma", "gemma-2", "qwen-2.5", "mistral", "phi-3", ...
 
-# Optional: mask non-assistant tokens out of the loss (needs a template with {% generation %} blocks).
-assistant_only_loss: false
+# Optional: mask prompts out of the loss (auto picks a masking route; see Assistant-only Loss).
+assistant_only_loss: auto
 
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 2
@@ -1049,19 +1113,33 @@ The trainer prints these at runtime — they change results without erroring, so
 **No length set means 2800 steps.** With neither `num_train_epochs` nor `max_steps` set, the trainer silently defaults to `max_steps: 2800`. Set `num_train_epochs: 1-3` (or `max_steps`) explicitly to control training length. When both are set, `max_steps` wins.
 </Note>
 
+<Note>
+**`dataset.processing_func` is ignored.** The key was advertised in shipped templates but never read. It now logs `WARNING: dataset.processing_func (...) is not supported and will be ignored; formatting is chosen automatically from the dataset's columns.` Remove it — the trainer picks the format from the dataset's columns.
+</Note>
+
+<Note>
+**`quantization_method` accepts a single-element list.** Older templates wrote it as `["q4_k_m"]`; the trainer unwraps `[x]` to `x` in both `for_export()` and `validate_config()`, so both the scalar and the one-element list work.
+</Note>
+
 ### New / newly-honored fine-tuning config keys
 
 These keys map straight to the trainer in `praisonai_train/train/llm/trainer.py` — all optional, all backward-compatible.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
+| `method` | `str` | `"sft"` | Training method — `sft`, `dpo`, `orpo`, or `kto`. Case-insensitive. An unknown value raises `ValueError` listing every supported method. See [Preference Training](/features/train-preference-tuning). |
 | `model` | `str` | — | Alias for `model_name`. Accepted for parity with the `--model` CLI flag; if both are set, `model_name` wins. |
 | `chat_template` | `str \| null` | `null` (use model's own) | Override the tokenizer's built-in chat template. Common values: `"gemma"`, `"qwen-2.5"`, `"llama-3.1"`. Trainer raises `ValueError` if the model has no template **and** this is unset. |
-| `assistant_only_loss` | `"auto" \| bool` | `"auto"` | Compute loss only on assistant turns. `"auto"` probes the tokenizer and enables masking iff the template supports it; `true` forces on (errors if unsupported); `false` forces off. `train_on_responses_only` is accepted as an alias. |
+| `assistant_only_loss` | `"auto" \| bool` | `"auto"` | Mask prompts out of the loss. `"auto"` masks whenever a route is available (TRL `{% generation %}` **or** Unsloth turn markers); `true` forces on (errors only when **neither** route is available); `false` forces off. `train_on_responses_only` is accepted as an alias. SFT only — ignored for preference methods. |
+| `beta` | `float` | trainer default | **dpo / orpo / kto.** Preference-loss temperature, passed straight to the trainer's `beta`. |
+| `max_prompt_length` | `int` | `max_seq_length // 2` | **dpo / orpo / kto.** Prompt truncation length for preference methods. |
+| `desirable_weight` | `float` | trainer default | **kto only.** Weight on thumbs-up (`label: true`) examples. |
+| `undesirable_weight` | `float` | trainer default | **kto only.** Weight on thumbs-down (`label: false`) examples. |
 | `train` | `bool` | `true` | Set `false` to skip training **and** publishing (validation still runs). |
 | `huggingface_save` | `bool` | `false` | Push merged LoRA to Hugging Face. Requires `hf_model_name`. |
 | `huggingface_save_gguf` | `bool` | `false` | Push GGUF quantizations to Hugging Face. Requires `hf_model_name`. |
 | `ollama_save` | `bool` | `false` | Push to Ollama. Requires `ollama_model`. |
+| `quantization_method` | `str \| list[str]` | — | GGUF/Ollama quantization. A single-element list (e.g. `["q4_k_m"]`, as shipped by older templates) is unwrapped to the scalar automatically. |
 | `dataset[].num_samples` | `int` | — | Train on the first N rows of the split. Must be a positive integer — validated on load. **Now honored** as of #3279 (was silently ignored before). |
 | `lora_r` | `int` | `16` | LoRA rank. **Now honored from config** (was hardcoded pre-#3274). |
 | `lora_alpha` | `int` | `16` | LoRA alpha. **Now honored from config**. |
@@ -1525,6 +1603,8 @@ Three behaviours that used to surprise users now print an explicit `NOTE:` / `WA
 - **`num_samples` takes the first N rows before shuffle** — repeated runs with the same seed use the same deterministic subset.
 - **`split_type` of `validation` / `valid` / `test` / `eval` is ADDED to the training set** — no validation set is held out. Warned via `WARNING: dataset split_type '{x}' is ADDED to the training set`.
 - **Default `max_steps: 2800`** fires when neither `num_train_epochs` nor `max_steps` is set: `NOTE: neither num_train_epochs nor max_steps set; defaulting to max_steps: 2800. Set num_train_epochs: 1-3 (or max_steps) to be explicit.` When **both** are set, `max_steps` silently wins (logged at DEBUG).
+- **`dataset.processing_func` is ignored** — advertised in old templates but never read. Warned via `WARNING: dataset.processing_func (...) is not supported and will be ignored; formatting is chosen automatically from the dataset's columns.`
+- **`quantization_method: ["q4_k_m"]` (single-element list) is unwrapped to the scalar** — older templates shipped it as a one-element list; both forms now work.
 
 ---
 
@@ -1539,7 +1619,7 @@ Two optional keys control how conversations are formatted and which tokens count
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `chat_template` | `str` | `None` | Unsloth chat-template name (e.g. `"llama-3.1"`, `"gemma"`, `"gemma-2"`, `"qwen-2.5"`, `"qwen-3"`, `"mistral"`, `"phi-3"`, `"chatml"`). Omit to keep the model's own built-in template. See Unsloth's `get_chat_template` for the full list. |
-| `assistant_only_loss` | `bool` | `false` | Compute loss only on assistant turns (model-agnostic response-only loss). Requires a chat template exposing `{% generation %}` blocks. |
+| `assistant_only_loss` | `"auto" \| bool` | `"auto"` | Mask prompts out of the loss. Masks via TRL's `{% generation %}` route when the template has it, else Unsloth's turn-marker route for any known template family (Llama / Qwen / Gemma / Mistral / Phi). See [Assistant-only Loss](#assistant-only-loss). |
 
 <Note>
 Omit `chat_template` unless you're intentionally overriding — the model's own template is almost always what you want.
@@ -1547,18 +1627,18 @@ Omit `chat_template` unless you're intentionally overriding — the model's own 
 
 ### Model-agnostic response-only training
 
-Leave `assistant_only_loss: auto` to let the trainer mask the loss to assistant turns whenever the template supports it — falling back to full-sequence SFT otherwise. Force it with `true` only when you know your template emits `{% generation %}` blocks.
+Leave `assistant_only_loss: auto` to let the trainer mask the loss to assistant turns whenever **any** route is available. Because none of Unsloth's chat templates ship `{% generation %}` today, the marker-based route (`train_on_responses_only`) is what actually masks on Gemma / Qwen / Llama / Mistral / Phi — no template change needed.
 
 ```yaml
 model_name: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
 chat_template: "llama-3.1"
-assistant_only_loss: true   # force on — errors fast if the template can't mask
+assistant_only_loss: true   # force on — errors only if NO route is available
 ```
 
-This uses TRL's model-agnostic `SFTConfig(assistant_only_loss=True)` instead of the old Llama-only `train_on_responses_only` markers. If you set `assistant_only_loss: true`, also set a `chat_template` that supports assistant masks (e.g. Unsloth's `llama-3.1`, `gemma-2`, `qwen-2.5`).
+The trainer picks the route automatically: TRL's `assistant_only_loss` when the template exposes `{% generation %}` blocks, otherwise Unsloth's `train_on_responses_only` turn markers for any known template family. You only hit an error when neither route exists — an unknown template with no known markers.
 
 <Warning>
-`assistant_only_loss: true` on a template without `{% generation %}` markers raises `ValueError` at model-prep time. Use `auto` (recommended) or `false`, or set a `chat_template` that supports masking (e.g. an Unsloth "llama-3.1-lite" style template extended with generation blocks).
+`assistant_only_loss: true` raises `ValueError` at model-prep time **only when neither masking route is available** — the template has no `{% generation %}` blocks *and* no turn markers are known for it. Set `assistant_only_loss: false`, or choose a known `chat_template` (Llama / Qwen / Gemma / Mistral / Phi families). See [Assistant-only Loss](#assistant-only-loss) for the full error text and the template → marker table.
 </Warning>
 
 <Warning>
@@ -1590,9 +1670,10 @@ graph TB
     Qw --> Mask
     M --> Mask
     P --> Mask
-    Mask -->|Yes| Gen[✅ Pick a template with<br/>generation blocks]
+    Mask -->|Yes| Gen[✅ auto masks via unsloth<br/>turn markers — no template change]
     Mask -->|No| Done[✅ Ready to train]
     Omit --> Done
+    Gen --> Done
 
     classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
