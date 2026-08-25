@@ -1,26 +1,29 @@
 ---
-title: "Remote Training"
-sidebarTitle: "Remote Training"
-description: "Ship your config and dataset to a GPU box over SSH, run the fine-tune there, fetch the artefacts back"
+title: "Remote GPU training over SSH"
+sidebarTitle: "Train Remote"
+description: "Train on another GPU box over plain SSH — runs survive your laptop closing"
 icon: "server"
 ---
 
-Remote training runs your `praisonai-train llm` job on another machine you reach over SSH — the tiny local CLI stays on your laptop, the GPU box does the heavy work, and the artefacts come back to you.
+Train on a remote GPU host over plain SSH. The run outlives your SSH session, so closing your laptop does not kill training.
 
 ```mermaid
 graph LR
-    subgraph "Remote training"
-        L[💻 local CLI] -->|scp config + dataset| R[🖥️ remote GPU]
-        R -->|nohup train| T[🚀 praisonai_train llm]
-        T -->|scp back| A[✅ artefacts]
+    subgraph "Remote SSH training"
+        L[💻 Your laptop] -->|ssh/scp| H[🖥️ Remote GPU host]
+        H --> R[🧠 Detached training run]
+        R --> A[📦 Adapter]
+        L -.->|reattach anytime| R
     end
 
-    classDef in fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef local fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef remote fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef run fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef out fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class L in
-    class R,T proc
+    class L local
+    class H remote
+    class R run
     class A out
 ```
 
@@ -30,13 +33,40 @@ Reachable through the integrated CLI (`praisonai train remote …`) from Praison
 
 ## Quick Start
 
-<Steps>
-<Step title="Check the host and start a run">
+You have a config, a dataset, and an SSH alias for a GPU box (`gpubox` in `~/.ssh/config`).
 
-Have SSH access to a machine with a GPU and a working `praisonai-train[llm]` install. Point the CLI at it by its SSH alias. `start` prints a run id and streams the log until the run ends.
+<Steps>
+<Step title="Check the host is ready">
+```bash
+praisonai-train remote preflight gpubox
+```
+
+Prints `gpubox is ready to train.` — or exits non-zero with the reason (no CUDA GPU, `python3` not usable, host unreachable).
+</Step>
+
+<Step title="Start training">
+```bash
+praisonai-train remote start gpubox \
+  -c config.yaml \
+  -d data/train.jsonl
+```
+
+Prints the run id **and** the stop command **before** streaming — so a Ctrl-C during the follow still leaves you with the handle:
+
+```
+✓ started run-1787... on gpubox
+  tail:  praisonai-train remote tail gpubox run-1787...
+  stop:  praisonai-train remote stop gpubox run-1787...
+step 1 | loss 2.14
+...
+```
+</Step>
+
+<Step title="Or start and get your shell back">
+Use `--no-follow` if you want the shell back immediately.
 
 ```bash
-praisonai train remote start gpu-box --config config.yaml --dataset data.jsonl
+praisonai-train remote start gpubox -c config.yaml -d data/train.jsonl --no-follow
 ```
 </Step>
 
@@ -61,9 +91,50 @@ praisonai train remote fetch gpu-box run-1787667005 lora_model --out ./out
 
 ---
 
-## How it works
+## Reattach, inspect, fetch, stop
 
 The run is launched under `setsid` (or plain `nohup` on macOS, which has no `setsid`), so it **outlives the SSH session that started it** and its children — dataloader workers, torchrun ranks — sit in one process group `stop` can take down together. The run id names a directory on the far host; that id is enough to reattach, inspect, fetch, or stop the run later.
+
+Everything after `start` takes only `host` and `run_id`.
+
+```bash
+# Stream the log again (survives log rotation)
+praisonai-train remote tail gpubox run-1787...
+
+# Is it still going?
+praisonai-train remote status gpubox run-1787...
+# → running | completed | failed (exit N) | unknown
+
+# Bring the adapter back
+praisonai-train remote fetch gpubox run-1787... lora_model -o ./out
+
+# Kill it
+praisonai-train remote stop gpubox run-1787...
+```
+
+---
+
+## Deciding which command to run
+
+```mermaid
+graph TB
+    Start{What do you need?}
+    Start -->|Is this box usable?| P[preflight]
+    Start -->|Kick off training| S[start]
+    Start -->|Watch a running job's log| T[tail]
+    Start -->|Is it still running?| ST[status]
+    Start -->|Get the adapter/log back| F[fetch]
+    Start -->|Kill a run| K[stop]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef c fill:#189AB4,stroke:#7C90A0,color:#fff
+    class Start q
+    class P,S,T,ST,F,K c
+```
+
+---
+
+## How It Works
 
 ```mermaid
 sequenceDiagram
@@ -81,7 +152,14 @@ sequenceDiagram
     CLI->>Host: scp run-dir/lora_model back
 ```
 
-Before shipping anything, `start` runs a **preflight**: the host must be reachable, its Python importable, and `nvidia-smi` must report at least `--gpus` GPUs. A shortfall refuses the run rather than wasting an upload.
+Runs launch under `nohup` in a detached session. The pid is written to `<run_dir>/train.pid` and the exit code to `<run_dir>/status`, so `status`, `tail` and `stop` work from any machine that can `ssh` to the host.
+
+| Guarantee | How it's kept |
+|-----------|---------------|
+| Runs outlive your SSH session | `start` launches under `nohup` in its own session; a dropped connection can't kill training. |
+| Reattach with just the run id | `tail`, `status`, `fetch`, `stop` reconnect from `host` + `run_id` alone. |
+| No password prompt hangs | SSH runs in `BatchMode=yes` with a 10s connect timeout — a clean failure, never a stuck prompt. |
+| No third-party dependency | Shells out to standard `ssh`/`scp` — no paramiko, no fabric. |
 
 ---
 
@@ -259,9 +337,115 @@ Not `python -m praisonai_train llm config.yaml [DATASET]` — that earlier shape
 
 ---
 
+## Why "not ready" is not a crash
+
+Preflight failures and stopping something that isn't running are **answers**, not errors — but they still exit non-zero (preflight) or print `was not running` (stop) so scripts can't mistake them for success.
+
+<AccordionGroup>
+<Accordion title="Preflight refuses an unready box">
+```bash
+$ praisonai-train remote preflight gpubox
+✗ gpubox cannot train
+  needs 1 GPU(s), found 0 (no CUDA GPU visible to nvidia-smi)
+$ echo $?
+1
+```
+A script reading only the exit status will not ship a job to a box that can't run it.
+</Accordion>
+
+<Accordion title="Stop is honest about no-ops">
+```bash
+$ praisonai-train remote stop gpubox run-1787
+run-1787 was not running on gpubox
+```
+Reporting success for a no-op would let a script believe it killed a run still burning GPU hours.
+</Accordion>
+
+<Accordion title="Nothing ships without a config">
+```bash
+$ praisonai-train remote start gpubox -c nope.yaml
+Error: Invalid value for '--config' / '-c': Path 'nope.yaml' does not exist.
+```
+The missing config is refused before any SSH happens.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Prerequisites
+
+<AccordionGroup>
+<Accordion title="Key-based SSH (no password prompts)">
+The runner uses `ssh` in `BatchMode=yes` — password prompts are never accepted. Set up key auth:
+
+```bash
+ssh-copy-id gpubox
+ssh gpubox echo ok   # must print `ok` without a prompt
+```
+
+Alias config lives in `~/.ssh/config`:
+
+```
+Host gpubox
+    HostName gpu-01.example.com
+    User me
+    IdentityFile ~/.ssh/id_ed25519
+```
+</Accordion>
+
+<Accordion title="A usable Python and GPU on the host">
+The default `--python python3` must exist and be able to import `praisonai_train`. `nvidia-smi` must list at least `--gpus` GPUs.
+</Accordion>
+
+<Accordion title="Standard OpenSSH only">
+No paramiko, fabric, or SSH library required — the runner shells out to `ssh`/`scp`.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Python API
+
+Script the same flow with `RemoteRunner` — each method reconnects, so a runner can be rebuilt from just `host` + `run_id`.
+
+```python
+from praisonai_train.remote import RemoteError, RemoteRunner
+
+runner = RemoteRunner(alias="gpubox")
+
+# Is the box ready?
+verdict = runner.preflight(expect_gpus=1)
+if not verdict.ok:
+    raise SystemExit(verdict.why_not())
+
+# Start detached — returns immediately with a handle.
+run = runner.start(config_path="config.yaml", dataset_path="data/train.jsonl")
+print(run.run_id)
+
+# Reattach, inspect, fetch, stop later.
+runner.tail(run, on_line=print)
+print(runner.status(run))              # running | completed | failed (exit N) | unknown
+runner.fetch(run, remote_rel="lora_model", dest="./out")
+runner.stop(run)                       # True only if something was actually killed
+```
+
+| Export | Purpose |
+|--------|---------|
+| `RemoteRunner` | Driver: `preflight` / `start` / `tail` / `status` / `fetch` / `stop`. |
+| `RemoteRun` | Handle to one run (`host`, `run_id`, `remote_dir`, `log_path`). |
+| `RemotePreflight` | Verdict of a readiness check (`ok`, `reasons`, `why_not()`). |
+| `RemoteHost` | One SSH destination (`alias`, `python`, `workdir`). |
+| `RemoteError` | Raised for actionable failures (unready host, refused start, missing artifact). |
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Preflight before you ship a big dataset">
+`praisonai-train remote preflight gpubox --gpus 2` catches a bad `~/.ssh/config`, a missing driver, or a mis-installed Python before you ship a multi-GB dataset.
+</Accordion>
+
 <Accordion title="Keep run ids to the safe alphabet">
 `--run-id my_run.2` is fine. Anything a shell would interpret is rejected up-front. Don't try to be clever — the safe alphabet is intentional.
 </Accordion>
@@ -270,8 +454,20 @@ Not `python -m praisonai_train llm config.yaml [DATASET]` — that earlier shape
 `--workdir ~/.praisonai-train` (the default) is fine. Only letters, digits, `.`, `_`, `-`, `/`, and an optional leading `~` are allowed; `$(pwd)`, spaces, `;`, and quotes are refused before any SSH. See [Workdir](#workdir).
 </Accordion>
 
+<Accordion title="Ctrl-C the follow, not the run">
+`start` prints the id and stop hint before streaming. If you Ctrl-C the follow, the run keeps going — reattach with `remote tail <host> <run_id>`.
+</Accordion>
+
+<Accordion title="Script polling with status">
+`start --no-follow` returns immediately with the run id. Poll with `remote status` in a loop, then `fetch` when it reads `completed`.
+</Accordion>
+
 <Accordion title="Fetch only from the run directory">
 Fetch is scoped to the run's own artefacts. If you need something outside the run directory, log into the box directly with `ssh` — the CLI won't do it.
+</Accordion>
+
+<Accordion title="Fetch only what you need">
+`fetch` uses `scp -r` — pull `lora_model` for the adapter or `train.log` for the log. Avoid pulling the whole run directory.
 </Accordion>
 
 <Accordion title="Use a short ~/.ssh/config alias">
@@ -293,5 +489,14 @@ Everything the CLI does is one hop, per-alias. A short entry with the host, user
 </Card>
 <Card title="Train" icon="graduation-cap" href="/train">
   `config.yaml` reference for the run that ships to the box.
+</Card>
+<Card title="Train Export" icon="upload" href="/features/praisonai-train-export">
+Publish the adapter you fetched back — to Hugging Face, GGUF, or Ollama.
+</Card>
+<Card title="Multi-GPU Training" icon="microchip" href="/features/praisonai-train-multigpu">
+Fine-tune across every GPU on the host with torchrun.
+</Card>
+<Card title="Checkpointing" icon="database" href="/features/praisonai-train-checkpointing">
+Resume from checkpoints if a long run dies mid-way.
 </Card>
 </CardGroup>
