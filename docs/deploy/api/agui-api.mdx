@@ -120,6 +120,15 @@ while (true) {
 event: run_started
 data: {"type": "run_started", "threadId": "thread-123", "runId": "run-456"}
 
+event: tool_call_start
+data: {"type": "tool_call_start", "toolCallId": "call-1", "toolCallName": "search"}
+
+event: custom
+data: {"type": "custom", "name": "praisonai.tool_progress", "value": {"content": "Fetched 12 results", "tool_call": {"id": "call-1"}, "metadata": {"progress": 0.5}}}
+
+event: tool_call_end
+data: {"type": "tool_call_end", "toolCallId": "call-1"}
+
 event: text_message_start
 data: {"type": "text_message_start", "messageId": "msg-2"}
 
@@ -135,6 +144,8 @@ data: {"type": "text_message_end", "messageId": "msg-2"}
 event: run_finished
 data: {"type": "run_finished", "threadId": "thread-123", "runId": "run-456"}
 ```
+
+The `custom` event carries a `praisonai.*` name. Clients that do not recognise a custom name must ignore it — see [PraisonAI custom events](#praisonai-custom-events).
 
 ### GET /status
 
@@ -170,13 +181,72 @@ print(response.json())
 |-------|-------------|
 | `run_started` | Agent run has started |
 | `run_finished` | Agent run completed |
-| `run_error` | Error occurred during run |
+| `run_error` | Terminal error — includes mid-stream provider failures |
 | `text_message_start` | New text message started |
 | `text_message_content` | Text content delta |
 | `text_message_end` | Text message completed |
 | `tool_call_start` | Tool call started |
 | `tool_call_args` | Tool call arguments |
 | `tool_call_end` | Tool call completed |
+| `custom` (`praisonai.*`) | PraisonAI-specific events for recoverable failures and progress — see below |
+
+## PraisonAI custom events
+
+AG-UI has no first-class frames for recoverable failures or user-visible progress. PraisonAI carries these as `custom` events with a `praisonai.*` name. AG-UI clients are expected to ignore custom event names they do not recognise, so adding these is backwards-compatible.
+
+| Custom event name | When it fires | `value` shape |
+|-------------------|---------------|---------------|
+| `praisonai.retry` | LLM call is being retried after a transient failure | `{ message, metadata }` |
+| `praisonai.model_fallback` | Provider swapped to a fallback model | `{ message, metadata }` |
+| `praisonai.stream_unavailable` | Streaming path failed; falling back to non-streaming | `{ message, metadata }` |
+| `praisonai.tool_progress` | A running tool emitted progress | `{ content, tool_call, metadata }` |
+| `praisonai.todo_updated` | The agent's todo list changed | `{ content, tool_call, metadata }` |
+
+Recoverable events (`retry`, `model_fallback`, `stream_unavailable`) are deliberately **not** `run_error` — the run continues. `run_error` is terminal in AG-UI.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant LLM
+
+    User->>Agent: Request
+    Agent->>LLM: Call (primary model)
+    LLM-->>Agent: Transient failure
+    Agent-->>User: custom praisonai.retry
+    Agent->>LLM: Call (fallback model)
+    Agent-->>User: custom praisonai.model_fallback
+    LLM-->>Agent: Tool call
+    Agent-->>User: tool_call_start
+    Agent-->>User: custom praisonai.tool_progress
+    Agent-->>User: tool_call_end
+    Agent-->>User: text_message_start / content / end
+    Agent-->>User: run_finished
+```
+
+Branch on `event.type === 'custom'` and inspect `event.name` for the `praisonai.` prefix:
+
+```javascript
+function handleEvent(event) {
+  if (event.type === 'custom' && event.name.startsWith('praisonai.')) {
+    switch (event.name) {
+      case 'praisonai.retry':
+      case 'praisonai.model_fallback':
+      case 'praisonai.stream_unavailable':
+        console.warn(`${event.name}: ${event.value.message}`);
+        break;
+      case 'praisonai.tool_progress':
+      case 'praisonai.todo_updated':
+        console.log(`${event.name}:`, event.value.content);
+        break;
+      default:
+        break;  // ignore unknown praisonai.* events
+    }
+    return;
+  }
+  // ...handle standard AG-UI events (text_message_*, tool_call_*, run_*)
+}
+```
 
 ## Message Format
 
@@ -197,10 +267,14 @@ print(response.json())
 
 ## Error Events
 
+A terminal error reaches the client as `run_error`. This now includes **mid-stream provider failures** — a provider-side error part-way through a response is surfaced as `run_error` instead of being silently swallowed.
+
 ```
 event: run_error
 data: {"type": "run_error", "threadId": "thread-123", "runId": "run-456", "error": "Error message"}
 ```
+
+For **recoverable** conditions where the run continues (retry, model fallback, streaming fallback), the client receives a `custom` `praisonai.*` event instead — see [PraisonAI custom events](#praisonai-custom-events).
 
 ## CopilotKit Integration
 
