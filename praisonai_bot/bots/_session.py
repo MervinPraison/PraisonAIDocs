@@ -16,6 +16,7 @@ calls from the same user; different users run in parallel.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import re
 import time
@@ -33,6 +34,91 @@ if TYPE_CHECKING:
     from praisonaiagents.gateway import WarmSession, MemoryPressureProtocol
 
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------
+# Durability degradation registry (Issue #4339)
+#
+# Gateway state (webhook idempotency, session history) is durable by default.
+# When a durable store genuinely cannot be initialised the boundary that owns
+# it records a *durability-degraded* fact here instead of only logging a
+# warning, so the gateway can surface it through the surfaces operators already
+# read (``gateway doctor`` / ``gateway status``) — the same treatment channel
+# credential degradation already gets. This reuses the core degraded-owner
+# vocabulary (``owner_kind="gateway"``) so no new protocol is introduced; the
+# gateway's ``health()`` merges this process-local registry alongside its own.
+# --------------------------------------------------------------------------
+try:
+    from praisonaiagents.gateway import DegradedCapabilityRegistry as _DegRegistry
+    _DURABILITY_REGISTRY: Optional[Any] = _DegRegistry()
+except Exception:  # pragma: no cover - core registry unavailable
+    _DURABILITY_REGISTRY = None
+
+
+def record_durability_degraded(
+    component: str,
+    *,
+    reason: str,
+    recovery: str = "praisonai gateway doctor --fix",
+) -> None:
+    """Record that a durable store fell back to non-durable, in-memory operation.
+
+    ``component`` is the owned state that lost durability (e.g. ``"session"`` or
+    ``"idempotency"``); ``reason`` is a redacted, operator-safe explanation.
+    Best-effort and never raises into the caller's hot path — if the core
+    registry is unavailable this is a no-op (behaviour then matches the old
+    log-only path).
+    """
+    registry = _DURABILITY_REGISTRY
+    if registry is None:
+        return
+    try:
+        from praisonaiagents.gateway import DegradedOwner
+
+        registry.mark(
+            DegradedOwner(
+                owner_kind="gateway",
+                owner_id=f"durability:{component}",
+                state="cold",
+                reason=reason,
+                retry_hint=recovery,
+            )
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def clear_durability_degraded(component: str) -> None:
+    """Clear a previously-recorded durability degradation for ``component``."""
+    registry = _DURABILITY_REGISTRY
+    if registry is None:
+        return
+    try:
+        registry.clear("gateway", f"durability:{component}")
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def durability_degraded_owners() -> List[Any]:
+    """Return the current durability-degraded owners (empty when all durable)."""
+    registry = _DURABILITY_REGISTRY
+    if registry is None:
+        return []
+    try:
+        return list(registry.list_degraded())
+    except Exception:  # pragma: no cover - defensive
+        return []
+
+
+# Turn-local resolved profile namespace (Issue #4341). A ``chat()`` turn binds
+# the profile it resolved into this ContextVar for the duration of that turn, so
+# every ``_storage_key`` recomputation after an await point uses *this* turn's
+# tenant scope — never a value another concurrent route staged in the meantime.
+# ContextVars are copied per task, so overlapping routed turns each see their own
+# binding. ``None`` means unscoped (fail-closed: an unscoped turn never borrows
+# another tenant's namespace).
+_ACTIVE_PROFILE_NS: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "praisonai_bot_active_profile_ns", default=None
+)
 
 # Matches one or more leading arrival-time prefixes of the form
 # ``[… YYYY-MM-DD HH:MM …]`` (Issue #2834). Kept deliberately narrow — it only
@@ -217,6 +303,19 @@ class BotSessionManager:
         # Keyed by ``id(agent)`` so a shared session serving multiple agents
         # never crosses policies.
         self._pending_tool_policies: Dict[int, Any] = {}
+        # Per-tenant profile namespace staged by a routing handler (Issue #4341).
+        # When a route resolves to a ``profile``, the gateway stages its
+        # namespace here (keyed by ``id(agent)``, exactly like the tool-policy
+        # seam) so the very next ``chat()`` for that agent enters the tenant
+        # scope for the turn. ``chat()`` consumes-and-clears it and binds the
+        # value into a per-turn ContextVar, so overlapping routed turns never
+        # share a namespace. Empty/``None`` means unscoped — a route with no
+        # profile never borrows another tenant's memory (fail-closed).
+        self._pending_profile_namespaces: Dict[int, str] = {}
+        # Fallback staging for callers that stage without an agent (or read
+        # ``_storage_key`` outside a ``chat()`` turn): the most-recently staged
+        # namespace, consumed once by the next ``chat()`` on any agent.
+        self._staged_profile_namespace: Optional[str] = None
         # Session reset policy for automatic lifecycle management
         self._reset_policy = reset_policy or SessionResetPolicy(mode="none")
         # Per-user last agent-emitted presentation. ``chat()`` keeps the return
@@ -518,13 +617,34 @@ class BotSessionManager:
         if self._scope_for(effective_chat_type) == "per_chat" and chat_id:
             prefix = self._platform or "bot"
             account_key = account or "default"
-            return f"{prefix}:acct:{account_key}:chat:{chat_id}:{thread_id}"
-        if self._identity_resolver is not None and self._platform:
+            base = f"{prefix}:acct:{account_key}:chat:{chat_id}:{thread_id}"
+        elif self._identity_resolver is not None and self._platform:
             try:
-                return self._identity_resolver.resolve(self._platform, user_id)
+                base = self._identity_resolver.resolve(self._platform, user_id)
             except Exception as e:  # pragma: no cover — defensive
                 logger.warning("identity resolver failed: %s", e)
-        return user_id
+                base = user_id
+        else:
+            base = user_id
+        # Per-tenant memory isolation (Issue #4341): when a route resolved to a
+        # ``profile``, its namespace is bound turn-locally in ``_ACTIVE_PROFILE_NS``
+        # so every storage key is prefixed with the tenant scope. Reading the
+        # ContextVar (not a shared field) means a key recomputed after an await
+        # point always uses *this* turn's tenant — an overlapping route for
+        # another tenant can never rewrite it. This keys memory/session state per
+        # profile so two routes on one process never share a transcript. A route
+        # with no profile stays unprefixed and never falls into a tenant's scope.
+        # Prefer the turn-local binding; fall back to the instance staging only
+        # when no turn is active (e.g. a direct ``_storage_key`` read before
+        # ``chat()`` runs). The ContextVar never leaks across turns because
+        # ``chat()`` resets it in ``finally``; the staged field is consumed by
+        # the next ``chat()`` so it cannot silently persist either.
+        profile_ns = _ACTIVE_PROFILE_NS.get()
+        if profile_ns is None:
+            profile_ns = self._staged_profile_namespace
+        if profile_ns:
+            return f"profile:{profile_ns}:{base}"
+        return base
 
     def _persist_key(self, storage_key: str) -> str:
         """Derive the persistent-store key from an in-memory storage key.
@@ -777,6 +897,40 @@ class BotSessionManager:
         else:
             self._pending_tool_policies[key] = tool_policy
 
+    def set_profile_namespace(
+        self, profile: Optional[str], agent: Optional["Agent"] = None
+    ) -> None:
+        """Enter (or clear) a per-tenant profile scope for the next turn.
+
+        Used by the gateway's routing handler when a route resolves to a
+        ``profile`` (Issue #4341). The handler runs synchronously right before
+        the adapter's own ``_session.chat()`` in the same dispatch. The resolved
+        namespace is *staged* on the instance (keyed by ``id(agent)`` when an
+        agent is given, so a shared session serving multiple agents never
+        crosses tenants). ``chat()`` then consumes-and-clears the staged value
+        and binds it turn-locally in a per-task ContextVar for the duration of
+        that turn — so overlapping routed turns never share a namespace and a
+        stale scope never leaks into a later turn. Every ``_storage_key`` for
+        the turn is prefixed with ``profile:<name>:`` so two routes multiplexed
+        on one process never share a transcript. Passing ``None``/blank clears
+        the scope so a route with no profile never inherits another tenant's
+        namespace (fail-closed: unscoped routes stay unscoped, never borrowed).
+        """
+        cleaned = str(profile).strip() if profile is not None else ""
+        # Stage on the instance (not a process-wide ContextVar) so a stage never
+        # leaks into an unrelated session or a later turn: ``chat()`` consumes
+        # this and binds it turn-locally, resetting on exit. Keep both a
+        # per-agent slot (so a shared session serving multiple agents never
+        # crosses tenants) and a last-staged fallback for agentless callers and
+        # direct ``_storage_key`` reads before ``chat()`` runs.
+        self._staged_profile_namespace = cleaned or None
+        if agent is not None:
+            key = id(agent)
+            if cleaned:
+                self._pending_profile_namespaces[key] = cleaned
+            else:
+                self._pending_profile_namespaces.pop(key, None)
+
     @staticmethod
     def _apply_tool_policy(
         agent: "Agent", tool_policy: Optional[Any]
@@ -904,6 +1058,22 @@ class BotSessionManager:
         if tool_policy is None:
             tool_policy = staged_policy
 
+        # Per-tenant profile scope (Issue #4341): bind the resolved namespace
+        # turn-locally for the whole turn so every ``_storage_key`` recomputed
+        # after an await point below uses *this* turn's tenant — an overlapping
+        # route for another tenant cannot rewrite it. Prefer the value staged by
+        # the routing handler for this agent (popped so it applies exactly once);
+        # otherwise the last-staged instance fallback (for agentless callers).
+        # Reset in the finally so it never leaks into an unrelated later turn
+        # sharing this task (fail-closed: unscoped stays unscoped).
+        staged_profile = self._pending_profile_namespaces.pop(id(agent), None)
+        if staged_profile is None:
+            staged_profile = self._staged_profile_namespace
+        # Consume the last-staged fallback so it applies to exactly one turn and
+        # never silently persists into a later unscoped call (fail-closed).
+        self._staged_profile_namespace = None
+        profile_token = _ACTIVE_PROFILE_NS.set(staged_profile or None)
+
         # Mint/adopt an end-to-end correlation id and bind it for this turn so
         # ingress, the agent run, and outbound delivery share one stable id in
         # structured logs. Adopts an explicit correlation_id, else the platform
@@ -950,6 +1120,13 @@ class BotSessionManager:
                         reset_correlation_id(cid_token)
                     except Exception as e:  # pragma: no cover — defensive
                         logger.debug("Failed to reset correlation id: %s", e)
+                # Reset the turn-local profile scope on this early return too so
+                # a deduped duplicate never leaves a tenant namespace bound for a
+                # later unrelated call sharing this task (Issue #4341).
+                try:
+                    _ACTIVE_PROFILE_NS.reset(profile_token)
+                except Exception as e:  # pragma: no cover — defensive
+                    logger.debug("Failed to reset profile namespace: %s", e)
                 return ""
                 
         # Resolve the routing context once so per_chat scope (Issue #2376)
@@ -1127,8 +1304,13 @@ class BotSessionManager:
                     self._in_flight[_inflight_key] = self._in_flight.get(_inflight_key, 0) + 1
                     # Load history (may hit disk via run_in_executor for async safety)
                     loop = asyncio.get_running_loop()
+                    # Run in the current context so the turn-local profile scope
+                    # (Issue #4341) is visible to ``_storage_key`` on the executor
+                    # thread — ``run_in_executor`` does not copy ContextVars, so
+                    # without this the history key would drop the tenant prefix.
+                    _load_ctx = contextvars.copy_context()
                     user_history = await loop.run_in_executor(
-                        None, partial(self._load_history, user_id, **route)
+                        None, partial(_load_ctx.run, partial(self._load_history, user_id, **route))
                     )
                     
                     # Update last active timestamp AFTER history load and reset check
@@ -1250,7 +1432,6 @@ class BotSessionManager:
                                         emitter.remove_callback(bridged_stream_callback)
                             else:
                                 # Legacy non-streaming path: use agent.chat() in executor with cancel_token and timeout
-                                import contextvars
                                 import inspect
                                 _ctx = contextvars.copy_context()
 
@@ -1348,10 +1529,17 @@ class BotSessionManager:
 
                     # Persist outside the agent_lock — it's session-scoped and
                     # the agent is no longer touched. ``route`` keys the shared
-                    # per_chat session when active (empty otherwise).
+                    # per_chat session when active (empty otherwise). Run in the
+                    # current context so the turn-local profile scope (Issue
+                    # #4341) reaches ``_storage_key`` on the executor thread —
+                    # otherwise the save would land in the unscoped key.
+                    _save_ctx = contextvars.copy_context()
                     await loop.run_in_executor(
                         None,
-                        partial(self._save_history, user_id, updated_history, **route),
+                        partial(
+                            _save_ctx.run,
+                            partial(self._save_history, user_id, updated_history, **route),
+                        ),
                     )
 
                     # Normalise an agent-emitted presentation (if any) into
@@ -1452,6 +1640,13 @@ class BotSessionManager:
                     reset_correlation_id(cid_token)
                 except Exception as e:  # pragma: no cover — defensive
                     logger.debug("Failed to reset correlation id: %s", e)
+            # Reset the turn-local profile scope so this turn's tenant namespace
+            # never leaks into an unrelated later call sharing this task, and a
+            # subsequent unscoped route always fails closed (Issue #4341).
+            try:
+                _ACTIVE_PROFILE_NS.reset(profile_token)
+            except Exception as e:  # pragma: no cover — defensive
+                logger.debug("Failed to reset profile namespace: %s", e)
 
     async def chat_with_run_control(
         self,
@@ -2184,7 +2379,10 @@ def build_session_manager(config, platform: str, *, run_control=None) -> BotSess
     Returns:
         Configured BotSessionManager instance
     """
-    # Try to get the default session store
+    # Try to get the default session store. Sessions are durable by default;
+    # a genuine store-init failure is recorded as a durability-degraded fact
+    # (Issue #4339) — surfaced by ``gateway doctor`` / ``gateway status`` — not
+    # just logged, so an operator is told their bot is now running non-durably.
     try:
         from praisonaiagents.session import get_default_session_store
     except ImportError:
@@ -2194,11 +2392,22 @@ def build_session_manager(config, platform: str, *, run_control=None) -> BotSess
         try:
             store = get_default_session_store()
         except Exception as exc:
+            # Raw exception (which may embed a filesystem path) stays in the log
+            # only; the operator-facing reason is redacted so health() and
+            # ``gateway status`` never echo backend paths (#4339).
             logger.warning(
                 "Default session store unavailable; falling back to in-memory store: %s",
                 exc,
             )
+            record_durability_degraded(
+                "session",
+                reason="session store unavailable (running in-memory)",
+            )
             store = None
+        else:
+            # Store came up (or was restored): clear any prior degraded fact so
+            # a recovered gateway no longer reports non-durable sessions.
+            clear_durability_degraded("session")
     
     # Extract reset policy from config
     reset_policy = None
