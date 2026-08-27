@@ -7,6 +7,10 @@ icon: "webhook"
 Middleware lets your agent intercept every LLM call and every tool call — log them, modify inputs, retry on failure, or block execution entirely.
 
 <Note>
+As of PraisonAI [#4334](https://github.com/MervinPraison/PraisonAI/pull/4334) (2026-08-25), model middleware (`@before_model` / `@after_model` / `@wrap_model_call`) now fires on every model call for both sync (`agent.start`, `agent.chat`) and async (`agent.astart`, `agent.achat`) paths. Prior to this fix only tool hooks were wired — model hooks registered but never ran. If you defined model hooks that "seemed to do nothing" before, they will now execute. Zero-overhead fast path preserved: agents with no model hooks bypass the middleware chain entirely.
+</Note>
+
+<Note>
 As of PraisonAI [#3086](https://github.com/MervinPraison/PraisonAI/pull/3086) (2026-07-16), tool middleware (`before_tool` / `after_tool` / `wrap_tool_call`) gates **async** tool calls as well — the same hooks fire around `agent.astart(...)` and `execute_tool_async(...)`. No API change; existing hooks work unmodified.
 </Note>
 
@@ -171,6 +175,13 @@ Execution order for a model call:
 3. The real LLM call executes
 4. All `after_model` hooks run in **reverse** registration order
 
+Under the hood:
+- `_chat_completion_with_retry` / `_achat_completion_with_retry` build a `ModelRequest` (with `InvocationContext`), pass it through `MiddlewareManager.execute_model_call`, and unwrap the returned `ModelResponse` back to the agent's expected return shape.
+- The retry/backoff logic is the **final handler** of the middleware chain — so if a hook wraps `call_next`, it wraps the retry loop.
+- `before_model` / `wrap_model_call` mutations to `request.messages`, `request.temperature`, and `request.tools` are threaded into the retry core.
+- `after_model` / `wrap_model_call` edits to `response.content` win over the raw provider payload; unchanged content passes the original object through untouched.
+- The async path runs the sync middleware chain in an executor and bridges back to the async retry core via `asyncio.run_coroutine_threadsafe` — hooks are written the same way for sync and async.
+
 The same order applies for tool calls with `before_tool`, `wrap_tool_call`, and `after_tool` — including **async** tool calls:
 
 ```mermaid
@@ -238,6 +249,28 @@ from praisonaiagents.hooks import (
 ---
 
 ## Common Patterns
+
+**Short-circuit the model with a cached response:**
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import wrap_model_call, ModelResponse
+
+_cache = {}
+
+@wrap_model_call
+def cache_model(request, call_next):
+    key = (request.model, tuple((m["role"], m["content"]) for m in request.messages))
+    if key in _cache:
+        return _cache[key]
+    response = call_next(request)
+    _cache[key] = response
+    return response
+
+agent = Agent(name="Cached", instructions="Answer briefly.", hooks=[cache_model])
+agent.start("What is 2+2?")   # hits the LLM
+agent.start("What is 2+2?")   # served from cache
+```
 
 **Inject a system prompt on every call:**
 
@@ -321,7 +354,7 @@ See [HOL Guard Tool Policy](/features/hol-guard-tool-policy) for a complete fail
 </Accordion>
 
 <Accordion title="Zero overhead when hooks are empty">
-  The middleware manager checks for registered hooks before executing any code. When `hooks=[]` (the default), the fast path skips all hook processing entirely — for both sync (`execute_tool`) and async (`execute_tool_async`) tool calls. The async path only spins up the thread-pool middleware worker when tool-level hooks are actually registered.
+  The middleware manager checks for registered hooks before executing any code. When `hooks=[]` (the default), the fast path skips all hook processing entirely — for both model calls (`_chat_completion_with_retry` / `_achat_completion_with_retry`) and tool calls (sync `execute_tool` and async `execute_tool_async`). Agents with no model hooks call the retry core directly, and the async path only spins up the thread-pool middleware worker when hooks are actually registered.
 </Accordion>
 </AccordionGroup>
 
