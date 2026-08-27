@@ -14,7 +14,7 @@ agent = Agent(name="configured", instructions="Use defaults from config.toml.")
 agent.start("Hello — apply my saved model and memory settings.")
 ```
 
-The user sets defaults in `.praisonai/config.toml`; explicit Agent parameters still override the file.
+The user sets defaults in `.praisonai/config.toml`; explicit Agent parameters still override the file. Config files are **deep-merged** across the whole precedence chain — your global `~/.praisonai/config.*` supplies defaults, and every project config down to your current directory overrides only the keys it sets.
 
 ```mermaid
 graph LR
@@ -22,7 +22,7 @@ graph LR
         direction TB
         A["📝 Explicit<br/>Agent(memory=MemoryConfig(...))"]
         B["🌍 Environment<br/>PRAISONAI_PLUGINS=true"]
-        C["📄 Config File<br/>.praisonai/config.toml"]
+        C["📄 Config Files<br/>global → ancestors → project<br/>(deep-merged)"]
         D["⚙️ Defaults<br/>Built-in values"]
     end
     
@@ -33,45 +33,50 @@ graph LR
     
     style A fill:#8B0000,color:#fff
     style B fill:#189AB4,color:#fff
-    style C fill:#189AB4,color:#fff
+    style C fill:#6366F1,color:#fff
     style D fill:#6366F1,color:#fff
     style AGENT fill:#8B0000,color:#fff
 ```
 
 ## How It Works
 
+PraisonAI discovers every config file from your global home down to your current directory, then deep-merges them so unset keys fall through and the nearest project file wins for keys it sets.
+
 ```mermaid
 sequenceDiagram
-    participant User
-    participant Agent
-    participant Feature as Configuration File
+    participant CWD as cwd (project)
+    participant Discover as Discover (walk-up)
+    participant Files as [global, ancestor1, …, project]
+    participant Merge as Deep Merge
+    participant Resolved as Resolved Config
 
-    User->>Agent: Request
-    Agent->>Feature: Process request
-    Feature-->>Agent: Result    Agent-->>User: Response
+    CWD->>Discover: locate config files
+    Discover->>Files: global → ancestors → nearest
+    Files->>Merge: fold left → right
+    Merge->>Resolved: nearest key wins, rest falls through
+    Resolved-->>CWD: merged config
 ```
-
-    classDef agent fill:#8B0000,color:#fff
-    classDef tool fill:#189AB4,color:#fff
 
 **Precedence (highest to lowest):**
 1. Explicit parameters in code
 2. Environment variables
-3. Config file
-4. Built-in defaults
+3. Nearest project config (deepest ancestor of `cwd`)
+4. Ancestor project configs (root → parent-of-`cwd`)
+5. User global (`~/.praisonai/config.*`)
+6. Built-in defaults
 
 <CardGroup cols={2}>
-  <Card title="Project Config" icon="folder">
-    `.praisonai/config.toml` — project-specific defaults
+  <Card title="Nearest Project Config" icon="folder">
+    `.praisonai/config.toml` nearest to `cwd` — wins for keys it sets
   </Card>
-  <Card title="Root Config" icon="file">
-    `praisonai.toml` — project root alternative
+  <Card title="Ancestor Configs" icon="folder-tree">
+    Any `.praisonai/config.*` in a parent directory — merged underneath
   </Card>
   <Card title="User Global" icon="user">
-    `~/.praisonai/config.toml` — applies across projects
+    `~/.praisonai/config.toml` — lowest, supplies defaults for all
   </Card>
   <Card title="Environment Override" icon="globe">
-    `PRAISONAI_*` env vars beat config file values
+    `PRAISONAI_*` env vars beat every config file value
   </Card>
 </CardGroup>
 
@@ -115,13 +120,92 @@ PraisonAI now validates field names automatically — see [Automatic Field Valid
 
 ## Config File Locations
 
-Config files are searched in this order:
+Every config file found from your home directory down to `cwd` is **deep-merged**. Unset keys fall through to a lower layer; the nearest project file wins for the keys it sets.
 
-| Location | Scope |
-|----------|-------|
-| `.praisonai/config.toml` · `.yaml` · `.yml` | Project-specific |
-| `praisonai.toml` · `.yaml` · `.yml` | Project root |
-| `~/.praisonai/config.toml` · `.yaml` · `.yml` | User global |
+**Discovery order (lowest → highest precedence):**
+
+| Order | Location | Scope |
+|-------|----------|-------|
+| 1 (lowest) | `~/.praisonai/config.toml` · `.yaml` · `.yml` | User global — defaults for every project |
+| 2 … n-1 | `.praisonai/config.*` · `praisonai.*` in each **ancestor** of `cwd` | Walked root → `cwd` |
+| n (highest) | `.praisonai/config.*` · `praisonai.*` nearest to `cwd` | Nearest project file wins |
+
+Within a single directory, the **first matching filename** supplies that layer, in this order:
+
+```
+.praisonai/config.toml → .praisonai/config.yaml → .praisonai/config.yml
+→ praisonai.toml → praisonai.yaml → praisonai.yml
+```
+
+---
+
+## Deep Merge Semantics
+
+Config files merge recursively — a project override for one key keeps every other key from the layers below.
+
+| Value shape | Behaviour |
+|-------------|-----------|
+| Both sides are a mapping (`dict`) | Recurse key-by-key |
+| Scalar, list, or `None` | The higher layer **replaces** the lower — no list concatenation |
+
+Merge inputs are never mutated, so loading is safe to repeat and caching still works via `clear_config_cache()`.
+
+```yaml
+# ~/.praisonai/config.yaml (global)
+defaults:
+  model: anthropic/claude-3-5-sonnet-latest
+  small_model: anthropic/claude-3-5-haiku-latest
+plugins:
+  pii_guardrail:
+    redact: [email, phone]
+
+# .praisonai/config.yaml (project) — one key
+plugins:
+  enabled: true
+
+# merged result
+defaults:
+  model: anthropic/claude-3-5-sonnet-latest   # kept from global
+  small_model: anthropic/claude-3-5-haiku-latest
+plugins:
+  enabled: true                               # added by project
+  pii_guardrail:
+    redact: [email, phone]                    # kept from global
+```
+
+Lists replace, they never concatenate:
+
+```yaml
+# global
+plugins:
+  enabled: [a, b]
+
+# project
+plugins:
+  enabled: [c]
+
+# merged → [c], NOT [a, b, c]
+```
+
+<Note>
+**Single-file fast path:** when only one config file exists (global-only *or* project-only), the resolved dict is byte-identical to parsing that file alone — 100% backward compatible with the pre-merge behaviour.
+</Note>
+
+---
+
+## Ancestor Discovery
+
+Project configs are discovered by walking **up** from `Path.cwd()` through every parent to the filesystem root. Each directory contributes its own `.praisonai/config.*` (or root-level `praisonai.*`), and the **nearest** one to `cwd` wins for the keys it sets. The global `~/.praisonai/config.*` always sits underneath.
+
+Running `praisonai run …` from `~/work/monorepo/apps/frontend/`:
+
+```
+~/.praisonai/config.yaml                              ← global   (lowest)
+~/work/monorepo/.praisonai/config.yaml                ← ancestor (middle)
+~/work/monorepo/apps/frontend/.praisonai/config.yaml  ← nearest  (highest, wins)
+```
+
+All three are deep-merged. A repo-root config sets defaults for every package; a package-level config overrides just the keys it names (e.g. `model`); the global user config still supplies everything neither one sets.
 
 ---
 
@@ -565,7 +649,9 @@ agent = Agent(
 
 ## Programmatic Access
 
-Access config values programmatically:
+`get_config()` and `get_default()` return the **merged view** across global, ancestor, and project files.
+
+`set_plugin_enabled(name, enabled)` writes to the **highest-precedence existing file** (the one that actually wins the merge) — or creates a project-local `.praisonai/config.yaml` when none exist — so CLI writes always land in the same file the runtime reads. It seeds from the target file only (not the merged view), so writes round-trip cleanly without persisting inherited keys.
 
 ```python
 from praisonaiagents.config.loader import (
@@ -575,9 +661,10 @@ from praisonaiagents.config.loader import (
     get_plugins_config,
     get_plugin_options,
     is_plugins_enabled,
+    set_plugin_enabled,       # writes to the highest-precedence file
 )
 
-# Get entire config
+# Get entire config (merged across global → ancestors → project)
 config = get_config()
 print(config.plugins.enabled)
 print(config.defaults.model)
@@ -602,6 +689,11 @@ if is_plugins_enabled():
 # Read per-plugin option maps ({plugin_name: options_dict})
 options = get_plugin_options()
 print(options.get("pii_guardrail", {}))
+
+# Persist a plugin's enabled state to the highest-precedence file
+# (or create .praisonai/config.yaml if none exists yet)
+target = set_plugin_enabled("pii_guardrail", True)
+print(f"Wrote to {target}")
 ```
 
 ---
@@ -753,21 +845,29 @@ flowchart TB
     subgraph "Resolution Order"
         EXPLICIT["1️⃣ Explicit Parameter<br/>memory=MemoryConfig(...)"]
         ENV["2️⃣ Environment Variable<br/>PRAISONAI_MEMORY_BACKEND"]
-        CONFIG["3️⃣ Config File<br/>[defaults.memory]"]
-        DEFAULT["4️⃣ Built-in Default<br/>backend='file'"]
+        NEAREST["3️⃣ Nearest project config<br/>deepest ancestor of cwd"]
+        ANCESTOR["4️⃣ Ancestor project configs<br/>root → parent-of-cwd"]
+        GLOBAL["5️⃣ User global<br/>~/.praisonai/config.*"]
+        DEFAULT["6️⃣ Built-in Default<br/>backend='file'"]
     end
     
     EXPLICIT --> |"Wins"| RESULT["Final Value"]
     ENV --> |"If no explicit"| RESULT
-    CONFIG --> |"If no env"| RESULT
+    NEAREST --> |"If no env"| RESULT
+    ANCESTOR --> |"Falls through"| RESULT
+    GLOBAL --> |"Falls through"| RESULT
     DEFAULT --> |"Fallback"| RESULT
     
     style EXPLICIT fill:#8B0000,color:#fff
     style ENV fill:#189AB4,color:#fff
-    style CONFIG fill:#189AB4,color:#fff
+    style NEAREST fill:#6366F1,color:#fff
+    style ANCESTOR fill:#6366F1,color:#fff
+    style GLOBAL fill:#6366F1,color:#fff
     style DEFAULT fill:#6366F1,color:#fff
     style RESULT fill:#10B981,color:#fff
 ```
+
+The three config-file layers (nearest → ancestor → global) are **deep-merged**, not first-wins: a key set only in the global file still applies when no project file overrides it.
 
 ---
 
@@ -873,7 +973,26 @@ doom_loop_detection = true
   </Accordion>
 
   <Accordion title="Remember the precedence order">
-    Configuration resolves as **Explicit Agent parameter > Environment variable > Config file > Built-in default**. When a setting seems ignored, check for a higher-precedence source (an env var like `PRAISONAI_PLUGINS=true` or an explicit kwarg) before editing the TOML.
+    Configuration resolves as **Explicit Agent parameter > Environment variable > Nearest project config > Ancestor configs > User global > Built-in default**. The config-file layers are deep-merged, so when a setting seems ignored, check for a higher-precedence source (an env var like `PRAISONAI_PLUGINS=true`, an explicit kwarg, or a nearer project file) before editing a lower layer.
+  </Accordion>
+
+  <Accordion title="Split defaults across global and project">
+    Put reusable defaults — `model`, `small_model`, plugin options, telemetry — in `~/.praisonai/config.yaml`, and keep only project-specific overrides in `.praisonai/config.yaml`. Deep-merge folds them together, so the project file stays tiny.
+
+    ```yaml
+    # ~/.praisonai/config.yaml (global — reusable defaults)
+    defaults:
+      model: anthropic/claude-3-5-sonnet-latest
+      small_model: anthropic/claude-3-5-haiku-latest
+
+    # .praisonai/config.yaml (project — just the override)
+    plugins:
+      enabled: true
+    ```
+  </Accordion>
+
+  <Accordion title="CLI writes land in the winning file">
+    `set_plugin_enabled()` (and the CLI plugin toggles) write to the **highest-precedence existing config file** — the one that actually wins the merge — or create `.praisonai/config.yaml` when none exist. This avoids editing a lower-precedence global whose change would be silently overridden on reload.
   </Accordion>
 
   <Accordion title="Keep the file in version control">
