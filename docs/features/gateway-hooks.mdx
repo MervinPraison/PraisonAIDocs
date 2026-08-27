@@ -114,7 +114,7 @@ sequenceDiagram
         Ev-->>Ext: HTTP 200 {"ok":true,"skipped":"event"}
     end
     GW->>Dedup: reserve idempotency key
-    Note over Dedup: default: in-memory · sqlite for restart durability
+    Note over Dedup: default: sqlite (durable) · memory for tests
     alt duplicate
         Dedup-->>GW: already in-flight
         GW-->>Ext: HTTP 200 (no-op)
@@ -242,7 +242,7 @@ Only these nine options are exposed through the CLI. The full `HookConfig` (HMAC
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `store_backend` | `str` | `"memory"` | `"memory"` (per-process, zero-dep) or `"sqlite"` (durable, survives restart). Unknown values fall back to `"memory"` with a debug log. |
+| `store_backend` | `str` | `"sqlite"` | `"sqlite"` (default, durable) — `"memory"` (per-process, zero-dep, opt-in for tests / ephemeral runs) or `"sqlite"` (durable, survives restart). Unset means `"sqlite"` ([Issue #4339](https://github.com/MervinPraison/PraisonAI/issues/4339)). Unknown values fall back to `"memory"` with a debug log. |
 
 Also accepted as siblings when `hooks:` is a list:
 
@@ -300,16 +300,20 @@ The gateway deduplicates concurrent and retried deliveries:
 External services that retry on timeout (e.g. GitHub webhooks, Linear) are safe to point directly at inbound hooks without additional dedup logic on your side.
 </Note>
 
-### Dedup Store — Memory vs Durable (SQLite)
+### Dedup Store — Durable (SQLite) by default vs Memory
 
-By default the dedup store is in-memory (per process). A webhook provider that retries **after a gateway restart within its retry window** — or a deployment with `replicas > 1` — needs the dedup key to survive that, otherwise the retry starts a **duplicate agent run** (duplicate reply, duplicate tool action).
+The dedup store is **durable (SQLite) by default** — a webhook provider that retries **after a gateway restart within its retry window** keeps its dedup key, so the retry does not start a **duplicate agent run** (duplicate reply, duplicate tool action).
 
-Opt in to the durable SQLite backend:
+<Warning>
+**Changed default ([Issue #4339](https://github.com/MervinPraison/PraisonAI/issues/4339)):** the dedup store is now durable (SQLite) by default. Previously it was in-memory, so a restart inside a provider's retry window could re-process a redelivered webhook (duplicate reply, duplicate tool action). To keep the old behaviour explicitly (for tests / ephemeral runs), set `hooks.idempotency.store_backend: memory`.
+</Warning>
+
+Explicitly opt **out** to the in-memory backend for tests / ephemeral runs:
 
 ```yaml
 hooks:
   idempotency:
-    store_backend: sqlite      # "memory" (default) | "sqlite"
+    store_backend: memory      # explicit opt-out — "sqlite" (default) | "memory"
   hooks:
     - path: gmail
       agent: assistant
@@ -320,7 +324,7 @@ When `hooks:` is a top-level **list** (the common shape), use the sibling key in
 
 ```yaml
 hooks_idempotency:
-  store_backend: sqlite
+  store_backend: memory
 
 hooks:
   - path: gmail
@@ -330,18 +334,18 @@ hooks:
 
 | Backend | Survives restart? | Shared across replicas? | Dependencies | When to use |
 |---------|-------------------|--------------------------|--------------|-------------|
-| `memory` (default) | ❌ | ❌ | none | Single-replica dev / low-stakes deployments |
-| `sqlite` | ✅ | ✅ (when the DB file is shared) | stdlib `sqlite3` only | Production, any provider with retries, multi-replica |
+| `sqlite` (default) | ✅ | ✅ (when the DB file is shared) | stdlib `sqlite3` only | Production, any provider with retries, multi-replica |
+| `memory` | ❌ | ❌ | none | Tests / ephemeral runs (explicit opt-out) |
 
 ```mermaid
 graph TB
     subgraph "Dedup Store Backend"
         M[💾 In-Memory<br/>per-process<br/>lost on restart]
-        S[🗄️ SQLite<br/>~/.praisonai/state/hook_idempotency.sqlite<br/>survives restart · shareable across replicas]
+        S[🗄️ SQLite default<br/>~/.praisonai/state/hook_idempotency.sqlite<br/>survives restart · shareable across replicas]
     end
-    Choose{Restart or multi-replica?}
-    Choose -->|No| M
-    Choose -->|Yes| S
+    Choose{Tests / ephemeral only?}
+    Choose -->|Yes, opt out| M
+    Choose -->|No — default| S
 
     classDef choice fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef mem fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -359,7 +363,7 @@ graph TB
 - `reserve` is a crash-safe `UNIQUE` insert — a redelivery **and** a concurrent duplicate both fail on the primary-key constraint (this is the inbound analogue of the outbound queue's `UNIQUE idempotency_key`).
 - Bounded: max `10,000` recorded entries + `24h` TTL, pruned lazily on `reserve`.
 - **Crash recovery:** a durable `inflight` reservation whose run neither recorded nor released it (only cause: a process crash *during* the hook) is reclaimable after a `15 min` `inflight_lease_seconds` lease, so the provider's post-restart retry re-runs instead of being deduplicated for the full TTL. `recorded` keys are never touched by the lease.
-- On any failure to build the SQLite store, the gateway falls back to the in-memory default so inbound delivery keeps working (a warning is logged).
+- On any failure to build the SQLite store, the gateway falls back to in-memory so inbound delivery keeps working (a warning is logged). On fallback it also **records a durability-degraded fact** (`owner_kind="gateway"`, `owner_id="durability:idempotency"`) — visible in `praisonai gateway status` and `health()["degraded_owners"]` with `retry_hint="praisonai gateway doctor --fix"`. The reason is redacted (the raw store path stays in the log). The fact **clears automatically** the moment the durable store comes up (fresh start or hot-reload). See [Gateway State Durability](/features/gateway-durability) and [Degraded Capabilities](/features/gateway-degraded-capabilities).
 
 <Note>
 For a custom store, implement `IdempotencyStoreProtocol` and inject it — the memory and SQLite backends are the two built-ins.
