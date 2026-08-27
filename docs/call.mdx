@@ -10,8 +10,11 @@ Turn an Agent into a phone assistant — start the call server and connect a pho
 ```bash
 export OPENAI_API_KEY="${OPENAI_API_KEY:?Set OPENAI_API_KEY in your shell}"
 export NGROK_AUTH_TOKEN="${NGROK_AUTH_TOKEN:?Set NGROK_AUTH_TOKEN in your shell}"
+export PRAISONAI_CALL_PUBLIC_BASE="${PRAISONAI_CALL_PUBLIC_BASE:?Set to the wss:// host Twilio will connect to, e.g. wss://your-app.ngrok.io}"
 praisonai call --public
 ```
+
+When `--public` prints the ngrok URL, copy the `wss://` variant back into `PRAISONAI_CALL_PUBLIC_BASE` before dialling in — the server refuses to derive it from the request `Host` header.
 
 ```mermaid
 graph LR
@@ -44,6 +47,7 @@ PraisonAI Call is a feature that enables voice-based interaction with AI models 
 pip install "praisonai[call]"
 export OPENAI_API_KEY="${OPENAI_API_KEY:?Set OPENAI_API_KEY in your shell}"
 export NGROK_AUTH_TOKEN="${NGROK_AUTH_TOKEN:?Set NGROK_AUTH_TOKEN in your shell}"
+export PRAISONAI_CALL_PUBLIC_BASE="${PRAISONAI_CALL_PUBLIC_BASE:?Set to the wss:// host Twilio will connect to, e.g. wss://your-app.ngrok.io}"
 praisonai call --public
 ```
 
@@ -156,6 +160,7 @@ set PRAISONAI_CALL_BIND_HOST to 127.0.0.1 when binding locally
 | `CALL_SERVER_TOKEN` | Production / any non-local exposure | Server requires `Authorization: Bearer <token>` |
 | `PRAISONAI_CALL_AUTH=disabled` | Local development only | Bypasses auth — **only honored if `PRAISONAI_CALL_BIND_HOST` is localhost** |
 | `PRAISONAI_CALL_BIND_HOST` | Whenever you launch without the `praisonai call`/`praisonai serve` CLI | Declares the real bind host so the auth-disabled guard can verify it |
+| `PRAISONAI_CALL_PUBLIC_BASE` | Any deployment terminating a Twilio inbound call | `ws://`/`wss://` base URL used to build the outbound `/media-stream?session=…` URL handed to Twilio. Server returns 503 on `/incoming-call` if unset. See [Public base URL for Twilio media-stream](#public-base-url-for-twilio-media-stream). |
 | `PRAISONAI_CALL_LOAD_DOTENV` | Only to restore legacy import-time `.env` loading | When `"true"` (case-insensitive), importing `praisonai.api.call` loads `.env` at import time. Unset by default — importing the module no longer touches `os.environ`. |
 | `PRAISONAI_ALLOW_LOCAL_TOOLS` | Any call-server verb that should honour `./tools.py` | Server entry points call `_load_local_tools()`; unset → the `tools` registry stays empty even if `build_call_app(load_local_tools=True)` is passed. See [Local Tools Loading](/features/local-tools-loading). |
 
@@ -171,14 +176,15 @@ As of [PR #4261](https://github.com/MervinPraison/PraisonAI/pull/4261), `import 
 sequenceDiagram
     participant Import as import praisonai.api.call
     participant Build as build_call_app()
-    participant Tools as _load_local_tools()
+    participant State as app.state.call_state
+    participant Tools as _load_local_tools_into(state)
     participant Uvicorn as run_server()
 
     Import->>Import: no app, no heavy imports, no tools scan
     Uvicorn->>Build: build_call_app(load_local_tools=True)
-    Build->>Build: lazy-import FastAPI + register routes
-    Build->>Tools: load ./tools.py (if PRAISONAI_ALLOW_LOCAL_TOOLS=true)
-    Tools-->>Build: tools registry (clear + rebuild)
+    Build->>State: create CallAppState (tools=[], pending_sessions={})
+    Build->>Tools: load ./tools.py into state.tools (if PRAISONAI_ALLOW_LOCAL_TOOLS=true)
+    Tools-->>Build: state.tools populated
     Build-->>Uvicorn: app ready for uvicorn.run(app)
 ```
 
@@ -192,7 +198,11 @@ app = build_call_app(load_local_tools=False)  # or True + PRAISONAI_ALLOW_LOCAL_
 # mount under your own FastAPI, or hand to uvicorn.run(app, ...)
 ```
 
-The `load_local_tools` flag is only honoured when `PRAISONAI_ALLOW_LOCAL_TOOLS=true` is also set, matching the CLI opt-in. The shared `tools` list is `.clear()`'d before each rebuild, so calling `build_call_app(load_local_tools=True)` twice in one process is idempotent — it does not accumulate duplicate tool definitions.
+The `load_local_tools` flag is only honoured when `PRAISONAI_ALLOW_LOCAL_TOOLS=true` is also set, matching the CLI opt-in. Each `build_call_app()` call creates its own `CallAppState` (hung off `app.state.call_state`) holding both the tool registry and the pending one-shot session tokens. Two apps in the same process therefore never share tool schemas or cross-consume each other's stream tokens.
+
+<Note>
+Co-hosting multiple call apps in one process is now safe: `state.tools` and `state.pending_sessions` are scoped to the app, not module-global. `praisonai.api.call.app` (the lazy singleton) still exists for legacy imports and keeps its own state, isolated from any explicitly built app.
+</Note>
 
 <Note>
 `praisonai.api.call.app` still resolves — a module-level `__getattr__` lazily builds it on first attribute access, so third-party code that imports the name directly keeps working. Touching `.app` **builds a FastAPI app** (and pulls its transitive deps); code that only wants `import_tools_from_file` should not touch `.app`.
@@ -299,6 +309,73 @@ sequenceDiagram
     WS-->>Twilio: audio stream
 ```
 
+### Public base URL for Twilio media-stream
+
+`/incoming-call` builds the outbound `wss://…/media-stream?session=<token>` URL from the server-side `PRAISONAI_CALL_PUBLIC_BASE` env var — never from the request `Host` header. The old behaviour let an authenticated `/incoming-call` caller redirect Twilio's live media leg to any host (SSRF / call-audio exfiltration), so the server now refuses to serve `/incoming-call` when the env var is unset.
+
+<Warning>
+**Breaking change (Twilio operators):** anyone who relied on the previous "host from the `Host` header" behaviour must now export `PRAISONAI_CALL_PUBLIC_BASE`. `praisonai call --public` (ngrok) users export `PRAISONAI_CALL_PUBLIC_BASE=wss://<the-ngrok-host>` before dialling in. The old behaviour is not restorable via a flag — it was the SSRF surface being closed.
+</Warning>
+
+```bash
+# Production — a real wss:// domain
+export PRAISONAI_CALL_PUBLIC_BASE="wss://praison.example.com"
+praisonai call --host 0.0.0.0
+
+# ngrok dev — copy the wss:// host ngrok prints
+export NGROK_AUTH_TOKEN="${NGROK_AUTH_TOKEN:?Set NGROK_AUTH_TOKEN in your shell}"
+export PRAISONAI_CALL_PUBLIC_BASE="wss://your-app.ngrok.io"
+praisonai call --public
+```
+
+**Validation rules** — pick a legal value:
+
+- Scheme MUST be `ws://` or `wss://` (not `http`/`https`).
+- Host MUST be present (bare `wss://` with no host is rejected).
+- Cleartext `ws://` is permitted ONLY for local hosts (`localhost`, `127.0.0.1`, `::1`, `[::1]`); `ws://` to a non-local host is rejected because it would expose live audio AND the one-shot session token over an unencrypted transport.
+
+**Failure modes:**
+
+```
+503 Service Unavailable
+PRAISONAI_CALL_PUBLIC_BASE is not configured; refusing to derive the media-stream URL from the client Host header.
+```
+
+```
+500 Internal Server Error
+PRAISONAI_CALL_PUBLIC_BASE must be a ws:// or wss:// URL
+```
+
+```
+500 Internal Server Error
+PRAISONAI_CALL_PUBLIC_BASE must include a host
+```
+
+```
+500 Internal Server Error
+PRAISONAI_CALL_PUBLIC_BASE must use wss:// for non-local hosts; cleartext ws:// would expose live audio and the session token
+```
+
+```mermaid
+sequenceDiagram
+    participant Twilio
+    participant Call as /incoming-call
+    participant Env as PRAISONAI_CALL_PUBLIC_BASE
+    participant WS as /media-stream
+
+    Twilio->>Call: POST /incoming-call (auth)
+    Call->>Env: read base URL
+    alt env unset
+        Env-->>Call: none
+        Call-->>Twilio: 503 (refuse to trust Host header)
+    else env set & valid
+        Env-->>Call: wss://praison.example.com
+        Call->>Call: mint one-shot session token
+        Call-->>Twilio: TwiML with wss://praison.example.com/media-stream?session=…
+        Twilio->>WS: connect
+    end
+```
+
 ## Binding & Network Access
 
 The call server binds to `127.0.0.1` by default, so it is only reachable from the same machine.
@@ -350,6 +427,8 @@ praisonai call --public
 - Integration with other PraisonAI features
 
 ## Adding Tools
+
+Declare `tools = [...]` in your `tools.py` exactly as before — the call server now loads it into each app's own `state.tools` registry rather than a module-global list.
 
 1. Create a file called `tools.py`
 2. Add the following code:
@@ -433,6 +512,9 @@ RUN pip install --no-cache-dir --upgrade "praisonai[call]"
 # Expose the port the app runs on
 EXPOSE 8090
 
+# The wss:// host Twilio will connect to — the server returns 503 on /incoming-call if unset.
+ENV PRAISONAI_CALL_PUBLIC_BASE=wss://your-public-hostname.example.com
+
 # Bind to all container interfaces — the container boundary is the security boundary.
 # Pair with CALL_SERVER_TOKEN for any externally-published port.
 CMD ["praisonai", "call", "--host", "0.0.0.0"]
@@ -471,6 +553,10 @@ Export `OPENAI_API_KEY`, `NGROK_AUTH_TOKEN`, and `CALL_SERVER_TOKEN` in your she
 
 <Accordion title="Use the x-call-token header for direct WebSocket clients">
 `/media-stream` no longer accepts `?token=` in the query string. Direct callers must pass `x-call-token: $CALL_SERVER_TOKEN` as a WebSocket handshake header. Twilio flows are unaffected.
+</Accordion>
+
+<Accordion title="Set PRAISONAI_CALL_PUBLIC_BASE to the exact host Twilio will connect to">
+Never rely on the request `Host` header — the server refuses to (503). Use `wss://` for anything non-local; `ws://` is only accepted for `localhost`/`127.0.0.1`.
 </Accordion>
 
 <Accordion title="Add tools for real actions">
