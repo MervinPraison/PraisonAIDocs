@@ -2947,7 +2947,14 @@ Your Goal: {self.goal}"""
                 from ..approval import get_approval_registry
 
                 registry = get_approval_registry()
-                agent_name = getattr(self, "display_name", getattr(self, "name", None))
+                # Key the grant by the unique per-instance scope id (not the
+                # display name, which defaults to "Agent" for every unnamed
+                # agent and would leak this grant onto other agents in the
+                # same process). Falls back to name/display_name for objects
+                # without a scope id.
+                agent_name = getattr(self, "_approval_scope_id", None) or getattr(
+                    self, "display_name", getattr(self, "name", None)
+                )
                 if agent_name:  # Only approve if we have a stable agent identifier
                     for _tn in tool_names:
                         try:
@@ -3927,7 +3934,12 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 self._ensure_knowledge_processed()
             
             if not skip_retrieval and self.knowledge:
-                search_results = self.knowledge.search(prompt, agent_id=self.agent_id)
+                # Knowledge.search is synchronous (Mem0 embedding + vector-store
+                # I/O). Offload to a thread so it never blocks the event loop for
+                # other coroutines sharing the loop.
+                search_results = await asyncio.to_thread(
+                    self.knowledge.search, prompt, agent_id=self.agent_id
+                )
                 if search_results:
                     if isinstance(search_results, dict) and 'results' in search_results:
                         knowledge_content = "\n".join([result['memory'] for result in search_results['results']])
@@ -5170,6 +5182,17 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self._append_to_chat_history(
                                 {"role": "assistant", "content": followup_text}
                             )
+                        else:
+                            # Tools ran and the model then said nothing. Simply
+                            # returning here is indistinguishable from a model
+                            # that had nothing to say, and that is exactly how
+                            # this reached users: the generator ended having
+                            # yielded not one character, and the caller could
+                            # only report "no output" for a turn whose tools
+                            # had all succeeded. Fail loudly instead.
+                            raise RuntimeError(
+                                "the model called {} tool(s) and then returned "
+                                "no answer".format(len(tool_calls_data)))
                     else:
                         # Add complete response to chat history (text-only response)
                         if response_text:
