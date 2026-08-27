@@ -247,43 +247,62 @@ graph TB
 <Accordion title="BaseTool compatibility">
 When PraisonAI wraps a framework tool with `tool_timeout`, the resulting proxy is an instance of a dynamic subclass of the original tool's class — so `isinstance(proxy, BaseTool)` (and any framework-specific base check used by CrewAI / LangChain / `praisonaiagents.tool_execution` for dispatch) still returns `True`. A `BaseTool` subclass with `tool_timeout` set on its owning agent executes normally through the same `isinstance`-routed `.run` path as an unwrapped tool; the wrapper adds a deadline but does not change dispatch. See [PraisonAI Package Integration → Cross-generator tool isolation](/docs/developers/wrapper#cross-generator-tool-isolation) for the multi-generator behaviour.
 </Accordion>
+
+<Accordion title="ACP/LSP tools now honour tool_timeout">
+Prior to PR #4477, ACP/LSP agent-centric tools injected by `PraisonAIAdapter._maybe_inject_centric_tools` bypassed the per-run `tool_timeout` guard, so a hung LSP server or blocked ACP file op could hang the agent (and, under `praisonai serve`, the request thread) indefinitely. The wrapper now threads the same guard through to injected tools via `cli_config["_tool_timeout_wrap"]`. If you have `config.acp: true` in your YAML with `--tool-timeout` set, LSP/ACP calls now raise `ToolTimeoutError` at the declared deadline instead of hanging.
+</Accordion>
 </AccordionGroup>
 
 ---
 
 ## YAML `tool_timeout` precedence (multi-agent configs)
 
-When you declare `tool_timeout` on agents or roles in YAML, PraisonAI resolves one effective per-tool timeout for the shared tool dict.
+When you declare `tool_timeout` on agents or roles in YAML, PraisonAI now honours each agent's declared budget independently.
+
+Precedence (per agent):
+
+1. **CLI `tool_timeout` wins for every agent** — an explicit `--tool-timeout` value overrides YAML for all agents.
+2. **Per-agent YAML value wins over the CLI absence.** Each agent's declared value is applied to its own tool calls.
+3. **Uniform declared values** (all agents declare the same value, or only one agent declares) still take a shared-wrap fast path — behaviour is identical to the pre-PR-#4477 uniform case.
+4. **Heterogeneous per-agent values** (different agents declare different values) are now honoured per-agent — the tightest value no longer collapses onto every agent.
+5. **Agents without a declared `tool_timeout`** fall through to the CLI value, or to no timeout if neither is set.
+6. **Booleans are ignored** — only `int`/`float` values count.
+
+```mermaid
+graph TB
+    Q{Any agent declares<br/>tool_timeout?}
+    Q -->|No| N[No wrap applied]
+    Q -->|Yes| U{All declared<br/>values identical?}
+    U -->|Yes| S[Uniform wrap:<br/>single guard on shared tools_dict]
+    U -->|No| H[Per-agent resolver:<br/>each agent's tools get its own guard]
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef path fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q,U question
+    class N,S,H path
+```
+
+A heterogeneous config where both budgets are honoured — `fast_router` aborts cheap tools at 5s, `slow_analyst` keeps its 120s window:
 
 ```yaml
-agents:
-  - name: fast_agent
-    instructions: "Answer quickly"
-    tool_timeout: 5
-  - name: slow_agent
-    instructions: "Deep analysis"
-    tool_timeout: 60
-```
-
-Precedence:
-
-1. **CLI `tool_timeout` wins.** An explicit value passed on the command line overrides everything.
-2. **Otherwise the tightest (`min`) declared value applies** across all `roles:` and `agents:` — here `5.0s`, not `60`.
-3. **Any agent whose declared value isn't the tightest gets a warning** naming it.
-4. **Booleans are ignored** — only `int`/`float` values count. If nothing declares a timeout, no timeout is applied.
-
-Copy this into your CI log filters:
-
-```
-Agent 'slow_agent' declared tool_timeout=60 but a shared tool dict forces the tightest value 5.0s for the whole run.
+roles:
+  fast_router:
+    role: Router
+    tool_timeout: 5      # quick-abort on cheap tools
+    tools: [internet_search]
+  slow_analyst:
+    role: Analyst
+    tool_timeout: 120    # long window for large-doc scraping
+    tools: [scrape_page]
 ```
 
 <Warning>
-**What changed (PR #3176):** the effective timeout used to be the **largest** (`max`) declared value — a fast agent could inherit a slow agent's budget and never time out. It is now the **tightest** (`min`). If a CI config passed only because a slow agent's `max()` masked a fast agent's timeout, the fast agent may now fail sooner. Single-agent configs and configs where only one agent declares `tool_timeout` are unaffected — the change only matters when *multiple* agents declare *different* values.
+**What changed (PR #4477).** Before this fix, heterogeneous per-agent `tool_timeout` values silently collapsed to the **tightest** value across the whole run — the slow analyst inherited the fast router's 5s budget and never completed. That silent downgrade is now removed. If a CI config passed only because a slow agent quietly inherited a fast agent's tighter budget (masking a real timeout), the slow agent may now run longer than before. Uniform configs (all-equal declared values) are unaffected.
 </Warning>
 
 <Note>
-This precedence applies to the YAML per-agent `tool_timeout` field resolved for the shared tool dict. It is independent of the per-call `timeout_ms` argument to `execute_batch` documented above.
+This precedence applies to the YAML per-agent `tool_timeout` field. It is independent of the per-call `timeout_ms` argument to `execute_batch` documented above.
 </Note>
 
 ---
