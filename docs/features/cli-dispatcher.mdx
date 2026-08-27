@@ -213,6 +213,36 @@ sequenceDiagram
 
 Rule 5 fires when `_is_implemented_legacy_verb(first_cmd)` returns `True` — the first token names a verb the legacy dispatcher implements (it is in the shared `LEGACY_SPECIAL_COMMANDS` oracle) and is not one of the ordering-hold verbs in `_LEGACY_VERB_ROUTING_EXCLUSIONS`. The invocation is forwarded to `_run_legacy(argv)` **before** the bare-prompt/LLM rule, so `praisonai thinking status` reaches the `thinking` handler instead of being billed as a prompt. This closed the [#4327](https://github.com/MervinPraison/PraisonAI/issues/4327) regression where 29 implemented verbs cost ~2.5k tokens per invocation and exited `0`. Rule 6 fires when `_mistyped_command_suggestions(argv, first_cmd)` returns a non-empty list — a **lone** positional token, no whitespace or path separator, not ending in `.yaml`/`.yml`, no file of that name on disk, not itself a registered command, whose `difflib.get_close_matches(..., cutoff=0.8)` yields a registered command that the token does **not extend**. A token that a command starts with (an **extension** like `tests` for `test`, `server` for `serve`) is dropped so it stays a valid one-word prompt. The **opposite** direction — a token that is a **truncation** of a command (`deplo` for `deploy`, `versio` for `version`) — is now kept and surfaced as a suggestion instead of being forwarded to (and billed by) the model. Rule 7 fires when `_looks_like_bare_prompt(argv, first_cmd)` returns `True` — that is, when `first_cmd` is non-empty, doesn't end with `.yaml`/`.yml`, and **either** no dash-prefixed token appears anywhere in argv **or** every flag present is one that Typer `run` itself accepts (`--model`, `--continue`, `--session`, `--output`, `--stream`, …, derived at dispatch time by introspecting `run`'s Click parameters). Rule 8 fires when `_looks_like_yaml_run_target(argv, first_cmd)` returns `True` — the first positional ends in `.yaml`/`.yml` and every flag is `run`-supported — forwarding `praisonai agents.yaml …` as `run agents.yaml …` so the workflow runs inside the modern session/output/credential/permission envelope. A single genuinely legacy-only flag (`--auto`, `--serve`, `--n8n`, …) still forces legacy. The short-form `-s` (legacy `--save`) and `-f` (legacy `--file`) live in `_LEGACY_COLLIDING_SHORT_OPTS` and also stay on legacy, so an existing script is never silently reinterpreted. If `run`-option discovery fails, both predicates fall back to the original conservative any-flag→legacy rule.
 
+### Second-level split inside the legacy `run` branch
+
+Once an invocation reaches the legacy dispatcher's `run` branch (either because the user typed `praisonai run …` directly, or because a legacy-only flag forced fallback there), a second predicate decides between the async-jobs API and the modern agent runner:
+
+- **First positional is not a flag, not a reserved job verb (`submit / status / result / cancel / list / stream`), and either ends with `.yaml`/`.yml` or names an existing file** → forwarded to the modern Typer agent runner (`commands/run.py` `run_app`).
+- **Anything else** (a reserved job verb, a free-text token that isn't a file, an empty positional list) → forwarded to `handle_run_command` (async-jobs argparse parser).
+
+The reserved-verb guard is deliberately narrow — it matches the bare token equal to a job verb, so a same-named path with a separator (`./submit`) still routes to the modern engine and only a stray literal `submit` file in cwd is overridden. This preserves the pre-existing `praisonai run submit …` script contract.
+
+```mermaid
+graph TB
+    Start[📋 praisonai run FIRST-TOKEN] --> Flag{🔍 starts<br/>with -?}
+    Flag -->|Yes| Jobs[🤖 Jobs API<br/>argparse]
+    Flag -->|No| Verb{🔍 reserved job verb?<br/>submit/status/result/<br/>cancel/list/stream}
+    Verb -->|Yes| Jobs
+    Verb -->|No| File{🔍 ends in .yaml/.yml<br/>or existing file?}
+    File -->|Yes| Runner[✅ Modern agent runner<br/>run_app]
+    File -->|No| Jobs
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef jobs fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef runner fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Flag,Verb,File check
+    class Jobs jobs
+    class Runner runner
+```
+
 ### Never-silent legacy fallback
 
 When an invocation reaches the legacy engine solely because it contains a flag that `run` doesn't accept, `praisonai` prints a one-line stderr notice pointing at the modern equivalent:
@@ -347,6 +377,9 @@ praisonai --output-format json agents.yaml  # → --output-format json run agent
 | `praisonai server` | **Typer `run`** | extension of `serve` — a valid one-word prompt |
 | `praisonai deploi the app` | **Typer `run`** | more than one positional → free text |
 | `praisonai agents.yaml --serve` | **Legacy** | unchanged — the legacy escape hatch still works |
+| `praisonai run agents.yaml` | **Typer `run` (via legacy branch → `run_app`)** | Modern agent runner — this is what PR #4424 fixed; used to exit 2 with `invalid choice` |
+| `praisonai run submit "task"` | **Jobs API (unchanged)** | Reserved verb — legacy `handle_run_command` runs; same script contract as before |
+| `praisonai run ./submit` (file named `submit` in cwd) | **Typer `run` (via legacy branch → `run_app`)** | Path separator dodges the reserved-verb guard |
 
 <Warning>
 Two implemented verbs — `containers` and `vector-stores` — are deliberately kept on the bare-prompt path (i.e. still billed to an LLM) via `_LEGACY_VERB_ROUTING_EXCLUSIONS`. Their handlers fabricate a success with zero network (see issue [#4322](https://github.com/MervinPraison/PraisonAI/issues/4322)); routing them now would promote a fabricated success from unreachable to user-visible. The exclusion will be lifted once #4322 lands.
