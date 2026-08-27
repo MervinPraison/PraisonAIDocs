@@ -25,6 +25,10 @@ The user asks to inspect the filesystem; the agent calls MCP tools on the connec
 MCP tool turns are treated specially: a mid-response network failure surfaces `provider_outcome_unknown` instead of silently re-running the tool. See [Replay-Safe Retries](/features/replay-safe-retries).
 </Note>
 
+<Warning>
+**Fail-closed behavior (PraisonAI [#4423](https://github.com/MervinPraison/PraisonAI/pull/4423), merged 2026-08-26):** `MCP(...)` now raises when a stdio server times out, errors on init, or advertises zero tools — instead of returning a usable-but-empty object that silently degrades `Agent(tools=mcp)` into a tool-less chat. Wrap construction in `try/except` if your app should degrade gracefully. Filters (`allowed_tools` / `disabled_tools`) that intentionally remove every tool are still allowed. See [Errors on construction](#errors-on-construction).
+</Warning>
+
 ## Which MCP package do I need?
 
 Three packages cover three MCP roles — connecting, light serving, and full hosting.
@@ -290,6 +294,117 @@ sequenceDiagram
 
 ---
 
+## Errors on construction
+
+Since PraisonAI [#4423](https://github.com/MervinPraison/PraisonAI/pull/4423) the stdio `MCP(...)` client fails closed instead of returning an empty tool list. Three errors can surface from `MCP.__init__`:
+
+| Exception | When | What to do |
+|-----------|------|-----------|
+| `TimeoutError` | The MCP server did not finish the handshake within `timeout=` seconds. | Increase `timeout=`, or diagnose why the subprocess never responded (Node not installed, wrong `npx` shim on Windows, offline `-y` install). |
+| `RuntimeError: MCP initialization failed: ...` | The runner surfaced an init error from the server. | Read the wrapped error; usually a wrong command, missing package, or a server that crashed on startup. |
+| `RuntimeError: MCP server produced 0 tools ...` | The server initialized but listed no tools. Most common on Windows when `npx` is not the `.cmd` shim. | On Windows: `MCP(command="npx.cmd", args=["-y", "@pkg"])`. Or switch to a Python MCP server: `MCP(command=sys.executable, args=["server.py"])`. |
+
+An explicit `allowed_tools` / `disabled_tools` filter that legitimately removes every tool is **not** an error and does not raise.
+
+Pick the right recovery based on which error you see.
+
+```mermaid
+graph TB
+    Q{Which error<br/>from MCP?} 
+    Q -->|TimeoutError| T[Raise timeout=<br/>or check Node / npx]
+    Q -->|RuntimeError:<br/>init failed| I[Read wrapped error<br/>fix command / package]
+    Q -->|RuntimeError:<br/>0 tools| Z{On Windows?}
+    Z -->|Yes| W[Use command='npx.cmd']
+    Z -->|No| P[Use command=sys.executable<br/>args=['server.py']]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef timeout fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef fix fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q,Z question
+    class T timeout
+    class I,W,P fix
+```
+
+Wrap construction if you want to degrade gracefully.
+
+```python
+from praisonaiagents import Agent, MCP
+
+try:
+    tools = MCP("npx -y @modelcontextprotocol/server-time", timeout=30)
+except (TimeoutError, RuntimeError) as e:
+    print(f"MCP unavailable: {e}")
+    tools = []
+
+agent = Agent(instructions="You are a helpful assistant.", tools=tools)
+agent.start("What is the current time?")
+```
+
+### Timeout
+
+```python
+from praisonaiagents import MCP
+
+try:
+    tools = MCP("npx -y @modelcontextprotocol/server-time", timeout=5)
+except TimeoutError as e:
+    print(e)
+    # MCP initialization timed out after 5 seconds
+    # (command='npx' args=['-y', '@modelcontextprotocol/server-time']).
+```
+
+### Init error
+
+```python
+from praisonaiagents import MCP
+
+try:
+    tools = MCP("python /path/does/not/exist.py", timeout=30)
+except RuntimeError as e:
+    print(e)
+    # MCP initialization failed: <underlying error>
+    # (command='python' args=['/path/does/not/exist.py']).
+```
+
+### Zero tools on Windows
+
+```python
+import sys
+from praisonaiagents import Agent, MCP
+
+# Old shape that used to silently return zero tools on Windows:
+# tools = MCP("npx -y @modelcontextprotocol/server-time")   # now raises
+
+# Windows fix — pass the .cmd shim explicitly:
+tools = MCP(command="npx.cmd", args=["-y", "@modelcontextprotocol/server-time"])
+
+# Or use a Python MCP server (works on every platform):
+tools = MCP(command=sys.executable, args=["path/to/server.py"])
+
+agent = Agent(instructions="Use the time tool.", tools=tools)
+agent.start("What is the current time in UTC?")
+```
+
+### Intentional empty via filter
+
+A filter that removes every tool is a valid empty config and does not raise.
+
+```python
+from praisonaiagents import MCP
+
+# Server advertises tools, but the caller disables all of them.
+tools = MCP(
+    "npx -y @modelcontextprotocol/server-filesystem /tmp",
+    disabled_tools=["read_file", "write_file", "list_directory"],
+)
+assert list(tools) == []
+```
+
+On Windows, see [Windows SDK Quickstart → Troubleshooting](/features/windows-sdk-quickstart#troubleshooting). For transport details, see [MCP Transports](/mcp/transports#fail-closed-on-empty-or-timed-out-servers).
+
+---
+
 ## MCP Server Types
 
 ```mermaid
@@ -391,6 +506,10 @@ Never hardcode API keys or tokens in your code. Pass them as environment variabl
 
 <Accordion title="Combine multiple servers">
 Agents can use tools from multiple MCP servers simultaneously. Unpack each server's tools with `*MCP(...)` and combine them into a single `tools` list for maximum capability. Loading via [`load_mcp_tools`](/features/load-mcp-tools) auto-namespaces each server's tools (e.g. `filesystem_search`, `github_search`) so overlapping names never collide.
+</Accordion>
+
+<Accordion title="Handle server availability">
+`MCP(...)` fails closed since PraisonAI [#4423](https://github.com/MervinPraison/PraisonAI/pull/4423): a stdio server that times out, errors on init, or lists zero tools raises `TimeoutError` or `RuntimeError` at construction. Wrap the constructor in `try/except (TimeoutError, RuntimeError)` when your app should keep running without those tools, and log the wrapped `command` / `args` / `init_error` in the error message for diagnosis.
 </Accordion>
 </AccordionGroup>
 
