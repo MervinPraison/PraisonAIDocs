@@ -1,0 +1,258 @@
+---
+title: "Remote Training"
+sidebarTitle: "Remote Training"
+description: "Ship your config and dataset to a GPU box over SSH, run the fine-tune there, fetch the artefacts back"
+icon: "server"
+---
+
+Remote training runs your `praisonai-train llm` job on another machine you reach over SSH — the tiny local CLI stays on your laptop, the GPU box does the heavy work, and the artefacts come back to you.
+
+```mermaid
+graph LR
+    subgraph "Remote training"
+        L[💻 local CLI] -->|scp config + dataset| R[🖥️ remote GPU]
+        R -->|nohup train| T[🚀 praisonai_train llm]
+        T -->|scp back| A[✅ artefacts]
+    end
+
+    classDef in fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef out fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class L in
+    class R,T proc
+    class A out
+```
+
+<Note>
+Reachable through the integrated CLI (`praisonai train remote …`) from PraisonAI [PR #4367](https://github.com/MervinPraison/PraisonAI/pull/4367) onward — before that the whole group was unregistered and only worked from a standalone `praisonai-train` install. It speaks plain `ssh`/`scp` through `subprocess`, so there is **no third-party dependency**: any host in your `~/.ssh/config` works.
+</Note>
+
+## Quick Start
+
+<Steps>
+<Step title="Check the host and start a run">
+
+Have SSH access to a machine with a GPU and a working `praisonai-train[llm]` install. Point the CLI at it by its SSH alias. `start` prints a run id and streams the log until the run ends.
+
+```bash
+praisonai train remote start gpu-box --config config.yaml --dataset data.jsonl
+```
+</Step>
+
+<Step title="Check on it later">
+
+Every command reattaches from just the host and run id, so a dropped laptop connection never kills training.
+
+```bash
+praisonai train remote status gpu-box run-1787667005
+```
+</Step>
+
+<Step title="Fetch the artefacts back">
+
+Pull the adapter (or any file inside the run directory) home.
+
+```bash
+praisonai train remote fetch gpu-box run-1787667005 lora_model --out ./out
+```
+</Step>
+</Steps>
+
+---
+
+## How it works
+
+The run is launched under `nohup` in its own session, so it **outlives the SSH session that started it**. The run id names a directory on the far host; that id is enough to reattach, inspect, fetch, or stop the run later.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as local CLI
+    participant Host as remote GPU
+
+    User->>CLI: remote start gpu-box -c config.yaml -d data.jsonl
+    CLI->>Host: preflight (reachable? python? GPUs?)
+    CLI->>Host: scp config.yaml + dataset
+    CLI->>Host: nohup python -m praisonai_train llm data.jsonl --config config.yaml
+    Host-->>CLI: run id
+    CLI-->>User: tail log until status file appears
+    User->>CLI: remote fetch gpu-box <run-id> lora_model
+    CLI->>Host: scp run-dir/lora_model back
+```
+
+Before shipping anything, `start` runs a **preflight**: the host must be reachable, its Python importable, and `nvidia-smi` must report at least `--gpus` GPUs. A shortfall refuses the run rather than wasting an upload.
+
+---
+
+## Commands
+
+Every command takes the SSH `host` alias first. Runs are addressed by the run id `start` prints.
+
+### `remote preflight`
+
+Check the host can train, before shipping anything to it.
+
+```bash
+praisonai train remote preflight gpu-box --gpus 1
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `host` (arg) | str | **required** | SSH alias, as in `~/.ssh/config`. |
+| `--gpus` | int | `1` | How many GPUs the host must have. |
+| `--python` | str | `python3` | Interpreter to use on the host. |
+| `--workdir` | str | `~/.praisonai-train` | Directory to work in on the host. |
+| `--json` / `-j` | flag | `false` | Emit a machine-readable verdict. A not-ready host still exits `1`. |
+
+### `remote start`
+
+Ship the job and start it. The run outlives this command.
+
+```bash
+praisonai train remote start gpu-box --config config.yaml --dataset data.jsonl
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `host` (arg) | str | **required** | SSH alias, as in `~/.ssh/config`. |
+| `--config` / `-c` | path | **required** | Training config to ship (must exist locally). |
+| `--dataset` / `-d` | path | — | Local dataset to ship alongside it (must exist). |
+| `--gpus` | int | `1` | How many GPUs the run expects to find. |
+| `--run-id` | str | auto (`run-<epoch>`) | Name the run directory. Must pass the [run-id rules](#run-ids). |
+| `--python` | str | `python3` | Interpreter on the remote host. |
+| `--workdir` | str | `~/.praisonai-train` | Directory to work in on the host. |
+| `--follow` / `--no-follow` | flag | `--follow` | Stream the log until the run ends. |
+
+### `remote tail`
+
+Reattach to a running job's log; prints the final status when it ends.
+
+```bash
+praisonai train remote tail gpu-box run-1787667005
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `host` (arg) | str | **required** | SSH alias. |
+| `run_id` (arg) | str | **required** | The run id `start` printed. |
+| `--python` | str | `python3` | Interpreter on the host. |
+| `--workdir` | str | `~/.praisonai-train` | Directory to work in on the host. |
+
+### `remote status`
+
+Whether a run is still going, and how it ended if not — prints `running`, `completed`, `failed (exit N)`, or `unknown`.
+
+```bash
+praisonai train remote status gpu-box run-1787667005
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `host` (arg) | str | **required** | SSH alias. |
+| `run_id` (arg) | str | **required** | The run id. |
+| `--python` | str | `python3` | Interpreter on the host. |
+| `--workdir` | str | `~/.praisonai-train` | Directory to work in on the host. |
+
+### `remote fetch`
+
+Bring an artefact back — the adapter, a checkpoint, the log.
+
+```bash
+praisonai train remote fetch gpu-box run-1787667005 lora_model --out ./out
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `host` (arg) | str | **required** | SSH alias. |
+| `run_id` (arg) | str | **required** | The run id. |
+| `remote_path` (arg) | str | **required** | Path inside the run directory. Must pass the [fetch-path rules](#fetch-paths). |
+| `--out` / `-o` | path | `.` | Local directory to copy into. |
+| `--python` | str | `python3` | Interpreter on the host. |
+| `--workdir` | str | `~/.praisonai-train` | Directory to work in on the host. |
+
+### `remote stop`
+
+Stop a run. Reports whether anything was actually running — a no-op prints `<run-id> was not running on <host>` rather than a false "stopped".
+
+```bash
+praisonai train remote stop gpu-box run-1787667005
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `host` (arg) | str | **required** | SSH alias. |
+| `run_id` (arg) | str | **required** | The run id. |
+| `--python` | str | `python3` | Interpreter on the host. |
+| `--workdir` | str | `~/.praisonai-train` | Directory to work in on the host. |
+
+---
+
+## Run IDs
+
+`--run-id` (when passed) must be a plain identifier: **letters, digits, dot, dash and underscore only; starting with a letter or digit; up to 64 characters**. Anything else is refused:
+
+```text
+RemoteError: run id 'x;touch /tmp/pwned' is not usable: letters, digits, dot, dash and underscore only, starting with a letter or digit, up to 64 chars.
+```
+
+This validator was added in [PR #4367](https://github.com/MervinPraison/PraisonAI/pull/4367): a shell metacharacter inside `--run-id` was interpolated into the remote path and executed by the far-side shell. Values like `x;touch /tmp/pwned`, `$(id)`, `` `id` ``, `a b`, `../escape`, `/absolute`, an empty string, and `-leading-dash` are all refused. `run-1787667005` and `my_run.2` are fine.
+
+## Fetch paths
+
+`fetch <run> <path>` treats `<path>` as **relative to the run directory** on the remote host. These are refused up-front:
+
+- absolute paths (`/etc/passwd`)
+- any path containing `..` (`../../../../etc/passwd`, `a/../../b`)
+- empty or whitespace-only paths
+
+```text
+RemoteError: '../../../../etc/passwd' points outside the run directory. Fetch paths are relative to it, e.g. 'lora_model' or 'train.log'.
+```
+
+The runner also `shlex.quote()`s the scp target, so a shell metacharacter that survives validation cannot be executed on the remote side — validation catches the typo, quoting catches everything else. `lora_model` and `outputs/checkpoint-100` are accepted.
+
+## Command shape on the remote side
+
+The remote invocation is:
+
+```bash
+python -m praisonai_train llm [DATASET] --config config.yaml
+```
+
+Not `python -m praisonai_train llm config.yaml [DATASET]` — that earlier shape produced two positionals, which Typer rejected with exit `2` before the GPU was touched. If a `remote start` log ends in `Error: Got unexpected extra argument` on an old version, upgrade to a release carrying [PR #4367](https://github.com/MervinPraison/PraisonAI/pull/4367).
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Keep run ids to the safe alphabet">
+`--run-id my_run.2` is fine. Anything a shell would interpret is rejected up-front. Don't try to be clever — the safe alphabet is intentional.
+</Accordion>
+
+<Accordion title="Fetch only from the run directory">
+Fetch is scoped to the run's own artefacts. If you need something outside the run directory, log into the box directly with `ssh` — the CLI won't do it.
+</Accordion>
+
+<Accordion title="Use a short ~/.ssh/config alias">
+Everything the CLI does is one hop, per-alias. A short entry with the host, user, and identity keeps the CLI arguments short.
+</Accordion>
+
+<Accordion title="Ship the config you want">
+`remote start` ships the config you pass and overwrites `config.yaml` on the box too. Don't rely on the box to already have a matching one.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="CLI: train" icon="terminal" href="/cli/train">
+  All `praisonai train` subcommands.
+</Card>
+<Card title="Train" icon="graduation-cap" href="/train">
+  `config.yaml` reference for the run that ships to the box.
+</Card>
+</CardGroup>
