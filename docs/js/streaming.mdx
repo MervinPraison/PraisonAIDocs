@@ -5,34 +5,68 @@ description: "Display AI responses in real-time as they are generated"
 icon: "wave-pulse"
 ---
 
-Stream agent responses word-by-word for instant feedback — no waiting for the full response.
+Stream agent responses token-by-token — print to the terminal, or iterate tokens yourself to render them in a browser, webview, mobile app, or server.
 
 ```mermaid
 graph LR
-    subgraph "Streaming Response"
+    subgraph "TS Agent Streaming"
         U[💬 User] --> A[🤖 Agent]
-        A --> S[⚡ Stream]
-        S -->|token by token| D[📺 Display]
+        A --> C{🔀 How?}
+        C -->|CLI default| Term[📺 Terminal]
+        C -->|for await token| Iter[⚡ Async Iterable]
+        C -->|for await event| Evt[📨 Structured Events]
     end
 
     classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef stream fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef choice fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef output fill:#10B981,stroke:#7C90A0,color:#fff
 
     class U user
     class A agent
-    class S stream
-    class D output
-    classDef agent fill:#8B0000,color:#fff
-    classDef tool fill:#189AB4,color:#fff
+    class C choice
+    class Term,Iter,Evt output
+```
+
+## Which Mode Do I Want?
+
+Pick the surface that matches where the answer renders.
+
+```mermaid
+graph TB
+    Start[I want to stream…] --> Q1{Where does the answer render?}
+    Q1 -->|Terminal / CLI| Default[Just call agent.start / agent.chat]
+    Q1 -->|Browser, webview, mobile, server| Q2{Do I need tool / error / finish events?}
+    Q2 -->|No, just tokens| StreamM[agent.stream — async iterable of strings]
+    Q2 -->|Yes, structured| StreamE[agent.streamEvents — async iterable of AgentEvent]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ans fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q1,Q2 q
+    class Default,StreamM,StreamE ans
 ```
 
 ## Quick Start
 
 <Steps>
-<Step title="Simple Usage">
-Streaming is on by default — just create an agent and chat.
+<Step title="Iterate tokens with stream()">
+Render tokens live anywhere — the `for await` loop pulls them at its own pace.
+
+```typescript
+import { Agent } from 'praisonai';
+
+const agent = new Agent({
+  instructions: 'You are a storyteller'
+});
+
+for await (const token of agent.stream('Tell me a short story about a robot')) {
+  process.stdout.write(token);  // or send to a WebSocket, React state, etc.
+}
+```
+</Step>
+
+<Step title="Terminal default (start / chat)">
+On the CLI, streaming is already on — tokens print to the terminal.
 
 ```typescript
 import { Agent } from 'praisonai';
@@ -46,19 +80,23 @@ await agent.chat('Tell me a story about a robot');
 ```
 </Step>
 
-<Step title="With Configuration">
-Turn off streaming when you need the complete response at once.
+<Step title="Structured events with streamEvents()">
+Same agent, structured events — handle text, finish, and error.
 
 ```typescript
 import { Agent } from 'praisonai';
 
-const agent = new Agent({
-  instructions: 'Summarize text',
-  stream: false
-});
+const agent = new Agent({ instructions: 'You are helpful' });
 
-const response = await agent.chat('Summarize this article...');
-console.log(response);  // Complete response returned all at once
+for await (const event of agent.streamEvents('Hi')) {
+  if (event.type === 'text') {
+    process.stdout.write(event.delta);
+  } else if (event.type === 'finish') {
+    console.log('\n\nDone. Full text:', event.text);
+  } else if (event.type === 'error') {
+    console.error('Stream failed:', event.error);
+  }
+}
 ```
 </Step>
 
@@ -149,22 +187,52 @@ try {
 
 ---
 
+## Cancellation
+
+Break out of the loop to stop the stream cleanly — no more tokens are queued and the in-flight provider request is aborted.
+
+```typescript
+let received = '';
+for await (const token of agent.stream('Write a very long essay')) {
+  received += token;
+  if (received.length > 500) break;  // stops the stream cleanly
+}
+```
+
+You can also pass an `AbortSignal` to cancel a turn from outside the loop.
+
+```typescript
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 2000);  // stop after 2s
+
+for await (const token of agent.stream('Long essay', { signal: controller.signal })) {
+  process.stdout.write(token);
+}
+```
+
+---
+
 ## How It Works
 
 ```mermaid
 sequenceDiagram
-    participant User
+    participant Browser
+    participant Server
     participant Agent
     participant LLM
 
-    User->>Agent: chat("question")
-    Agent->>LLM: Request (stream=true)
-    loop Each token
-        LLM-->>Agent: Token chunk
-        Agent-->>User: Display token
+    Browser->>Server: POST /chat "question"
+    Server->>Agent: for await (token of agent.stream(...))
+    Agent->>LLM: streaming request
+    loop each token
+        LLM-->>Agent: chunk
+        Agent-->>Server: yield token
+        Server-->>Browser: SSE / WebSocket frame
+        Browser-->>Browser: append to DOM
     end
     LLM-->>Agent: [DONE]
-    Agent-->>User: Complete response
+    Agent-->>Server: finish event
+    Server-->>Browser: close stream
 ```
 
 When tools are configured, the round routes through `streamText` on every provider — text spoken before the tool call streams as tokens, then the tool runs, then the answer after it streams too.
@@ -310,7 +378,36 @@ try {
 
 ---
 
+## AgentEvent Reference
+
+`streamEvents()` yields a discriminated union. Switch on `event.type`.
+
+| Event | Fields | When |
+|-------|--------|------|
+| `text` | `{ type: 'text'; delta: string }` | Each incremental token |
+| `tool_call` | `{ type: 'tool_call'; callId: string; name: string; args: Record<string, unknown> }` | A tool is about to run |
+| `tool_result` | `{ type: 'tool_result'; callId: string; name: string; ok: boolean; output: string }` | A tool finished (`ok` signals success) |
+| `finish` | `{ type: 'finish'; text: string }` | Once, at the end of a successful run — carries the full response |
+| `error` | `{ type: 'error'; error: Error }` | Once, if the run threw |
+
+<Note>
+Match a `tool_result` to its `tool_call` by `callId` — it is the only reliable pairing key. `plain stream()` skips tool events and yields text only.
+</Note>
+
+## AgentStreamOptions Reference
+
+Both `stream()` and `streamEvents()` accept an optional second argument.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `previousResult` | `string` | `undefined` | Substituted for the `{{previous}}` placeholder in `instructions` (same semantics as the second arg to `start()`) |
+| `signal` | `AbortSignal` | `undefined` | Turn-scoped cancellation. Aborting it stops the provider request so no further tokens are generated or billed |
+
+---
+
 ## Configuration Options
+
+The `stream` config option controls the terminal default and whether token deltas are produced.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
@@ -321,36 +418,48 @@ try {
 | `maxToolCallsPerTurn` | `number` | `10` | Cap tool calls executed in a single round |
 | `agent.stream(prompt, { signal })` | `AbortSignal` | `undefined` | Turn-scoped abort signal for the streaming call; aborting it stops the underlying provider request |
 
+<Note>
+When the run does not stream tokens (`stream: false`, tools in use, or a structured `outputSchema`), `stream()` still yields the full response as a single token — callers never silently receive nothing.
+</Note>
+
 ---
 
 ## Common Patterns
 
-### Interactive Chat Application
+### Stream to a Server-Sent Events endpoint
 
 ```typescript
 import { Agent } from 'praisonai';
-import * as readline from 'readline';
+import express from 'express';
 
-const agent = new Agent({
-  instructions: 'You are a helpful assistant',
-  stream: true,
-  verbose: true
+const agent = new Agent({ instructions: 'You are helpful' });
+const app = express();
+
+app.get('/chat', async (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  for await (const token of agent.stream(String(req.query.q))) {
+    res.write(`data: ${token}\n\n`);
+  }
+  res.end();
 });
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-async function chat() {
-  rl.question('You: ', async (input) => {
-    if (input === 'exit') { rl.close(); return; }
-    await agent.chat(input);
-    chat();
-  });
-}
-
-chat();
+app.listen(3000);
 ```
 
-### Long-Form Content Generation
+### Log the full text once with streamEvents()
+
+```typescript
+import { Agent } from 'praisonai';
+
+const agent = new Agent({ instructions: 'You are helpful' });
+
+for await (const event of agent.streamEvents('Explain streaming in one line')) {
+  if (event.type === 'text') process.stdout.write(event.delta);
+  if (event.type === 'finish') console.log('\n[full]', event.text);
+}
+```
+
+### Terminal default (unchanged)
 
 ```typescript
 import { Agent } from 'praisonai';
@@ -360,23 +469,8 @@ const writer = new Agent({
   stream: true
 });
 
-// See the story unfold as it is written
+// See the story unfold in the terminal as it is written
 await writer.chat('Write a 500-word story about a time-traveling chef');
-```
-
-### Batch Processing (Disable Streaming)
-
-```typescript
-import { Agent } from 'praisonai';
-
-const agent = new Agent({
-  instructions: 'Classify the sentiment of the text as positive, neutral, or negative',
-  stream: false  // Faster for batch jobs
-});
-
-const texts = ['Great product!', 'It is okay', 'Very disappointed'];
-const results = await Promise.all(texts.map(t => agent.chat(t)));
-console.log(results);
 ```
 
 ---
@@ -384,16 +478,16 @@ console.log(results);
 ## Best Practices
 
 <AccordionGroup>
-  <Accordion title="Keep stream: true for user-facing interfaces">
-    Streaming dramatically improves perceived performance. Users see responses immediately rather than waiting. Keep it enabled for any chat or interactive application.
+  <Accordion title="Use stream() for UI hosts">
+    Anywhere tokens must land in a DOM, SSE, WebSocket, or React Native view, `for await (const token of agent.stream(...))` gives you each token to route yourself.
   </Accordion>
 
-  <Accordion title="Disable streaming for batch processing">
-    When processing many documents or requests without a live user, `stream: false` is faster and simpler — you get back the complete string directly from `chat()`.
+  <Accordion title="Use streamEvents() when you need finish/error semantics">
+    Switch to `streamEvents()` to close a socket, log the full text once, react to tool activity, or fall back on error — the `finish`, `error`, `tool_call`, and `tool_result` events carry that context.
   </Accordion>
 
-  <Accordion title="Use verbose for development">
-    Set `verbose: true` during development to see formatted streaming output in the console. Disable it in production API endpoints where you only need the return value.
+  <Accordion title="Break the loop to cancel">
+    No separate `AbortController` is needed for the streaming surface itself — breaking out of the `for await` loop detaches the token sink and aborts the in-flight request. Pass `opts.signal` only when you need to cancel from outside the loop.
   </Accordion>
 
   <Accordion title="Streaming works with all providers — including with tools">
@@ -406,6 +500,14 @@ console.log(results);
 
   <Accordion title="Break or abort — both stop billing">
     `Agent.stream()` owns the upstream request and cancels it in the iterator's `finally`. Breaking a `for await` loop, or aborting a `signal` you passed via `agent.stream(prompt, { signal })`, both stop provider tokens from being generated. Use `agent.lastStopReason === 'cancelled'` to distinguish a user Stop from a real failure in your error handler.
+  </Accordion>
+
+  <Accordion title="Non-streaming paths still work with stream()">
+    Even when tools or `outputSchema` disable token deltas, `stream()` yields the full response as a single item, so callers always receive an answer.
+  </Accordion>
+
+  <Accordion title="Keep the CLI default alone">
+    Omitting the token sink (i.e. calling `start()` or `chat()`) still writes to `process.stdout`, so existing CLI scripts don't change.
   </Accordion>
 </AccordionGroup>
 
