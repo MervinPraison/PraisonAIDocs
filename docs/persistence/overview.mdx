@@ -89,6 +89,46 @@ Reference: PraisonAI PR [#3812](https://github.com/MervinPraison/PraisonAI/pull/
 └─────────────┴─────────────┴─────────────┘
 ```
 
+## Two Entry Points, One Owner
+
+`PraisonAIDB` is the single owner of the "agent lifecycle → store" write hooks; `PersistenceOrchestrator` is a thin façade that delegates those hooks to it.
+
+```mermaid
+graph TB
+    subgraph "User Entry Points"
+        A["Agent + MemoryConfig(db=PraisonAIDB(...))<br/>recommended"]
+        B["wrap_agent_with_persistence<br/>PersistentAgent<br/>create_persistent_session"]
+    end
+
+    A --> C["PraisonAIDB adapter<br/>single owner of lifecycle → store hooks"]
+    B --> D["PersistenceOrchestrator<br/>thin façade + LRU cache + knowledge/state helpers"]
+    D -->|"delegates on_message / on_agent_end<br/>via PraisonAIDB._from_stores(...)"| C
+
+    C --> E[Conversation Store]
+    C --> F[State Store]
+    C --> G[Knowledge Store]
+
+    classDef entry fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef owner fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef facade fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class A,B entry
+    class C owner
+    class D facade
+    class E,F,G store
+```
+
+Both entry points share the same store-write logic:
+
+- **`PraisonAIDB`** (the live path) owns the lifecycle-hook and store-dispatch logic — `on_message` / `aon_message`, `on_agent_end` / `aon_agent_end`, and the sync/async dispatch decision. `MemoryConfig(db=PraisonAIDB(...))` routes straight to it and is the recommended user-facing wiring.
+- **`PersistenceOrchestrator`** delegates its store-write side to a `PraisonAIDB` instance built lazily from its own stores (internal `PraisonAIDB._from_stores(...)` plumbing), while keeping its unique surface: the resume-aware `on_agent_start` return contract, the LRU session cache, and the knowledge / state / context helpers.
+- The orchestrator path (via `wrap_agent_with_persistence`, `PersistentAgent`, or `create_persistent_session`) continues to work unchanged and now shares the same store-write logic under the hood.
+
+<Note>
+Reference: PraisonAI PR [#4394](https://github.com/MervinPraison/PraisonAI/pull/4394) (fixes [#4383](https://github.com/MervinPraison/PraisonAI/issues/4383)). The public API is unchanged — this is an internal consolidation. `_from_stores` is internal plumbing, not a public API.
+</Note>
+
 ## Key Features
 
 - **Zero Config**: SQLite works out of the box with `memory=True`
@@ -101,7 +141,7 @@ Reference: PraisonAI PR [#3812](https://github.com/MervinPraison/PraisonAI/pull/
 
 Persistence sync wrappers (`get_session`, `add_message`, `get`, `set`, `delete`, `list_keys`, `clear`, `close`, …) are safe to call from any context — plain sync scripts, worker threads, or code running inside a live event loop (FastAPI, Streamlit, background tasks). They route through a canonical async bridge, so you will not see `RuntimeError: This event loop is already running` anymore.
 
-**Async hooks offloading (PR #1829)**: Sync conversation stores plugged into async hooks are now automatically offloaded via `asyncio.to_thread()` rather than blocking the event loop. The orchestrator uses `isinstance(store, AsyncConversationStore)` to determine whether to await the store directly or wrap it in thread execution.
+**Async hooks offloading (PR #1829)**: Sync conversation stores plugged into async hooks are now automatically offloaded via `asyncio.to_thread()` rather than blocking the event loop. `PraisonAIDB` owns this dispatch (`_call_store` / `_dispatch_async`): it uses `isinstance(store, AsyncConversationStore)` to decide whether to await the store directly or wrap it in thread execution. As of PR [#4394](https://github.com/MervinPraison/PraisonAI/pull/4394), `PersistenceOrchestrator` delegates its store writes through these same helpers rather than keeping a second copy, so the offloading behaviour is identical no matter which entry point you use.
 
 <Note>
 **Async state-store hook naming (PR [#4287](https://github.com/MervinPraison/PraisonAI/pull/4287))**: The DB adapter's async lifecycle hooks now call `async_set` / `async_get` on the state store rather than the non-existent `aset` / `aget` names. Previously the async path silently fell back to sync methods off-loaded to a thread that re-entered the async bridge, pinning the event loop under load. No user action — async agents backed by any state store (Redis, MongoDB, DynamoDB, …) now stay non-blocking end-to-end.
@@ -121,7 +161,7 @@ No user action required — the behaviour is on by default, and existing rows wr
 
 As of PR #1763, you can also opt into the dedicated `sync_sqlite` backend (`mode="sync"`) — it provides per-call connection locking (`threading.RLock`) for multi-agent scenarios where you'd rather not depend on the legacy sync wrappers.
 
-The `DbAdapter`'s lazy store initialisation is also race-free: the first thread to touch the adapter constructs the stores, and subsequent threads see the ready instance.
+The `DbAdapter`'s lazy store initialisation is also race-free: the first thread to touch the adapter constructs the stores, and subsequent threads see the ready instance. Since PR [#4394](https://github.com/MervinPraison/PraisonAI/pull/4394), `PersistenceOrchestrator`'s message-write and session-end operations delegate to `PraisonAIDB` (through `_call_store` / `_dispatch_async`), so this race-free guarantee now covers both entry points.
 
 The session cache inside `PersistenceOrchestrator` is also thread-safe as of PR #1609. Reads return a `deepcopy` of the cached `ConversationSession`, so multiple agents sharing one orchestrator can read/update sessions concurrently without races.
 
