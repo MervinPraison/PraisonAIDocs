@@ -204,6 +204,14 @@ When your agent uses tools, streaming happens in two phases: the initial respons
 
 Tools can also emit incremental progress while they run using `emit_tool_progress()` — these arrive as `TOOL_PROGRESS` events in your stream callback before the tool returns its result. See [Tool Progress Streaming](/features/tool-progress-streaming).
 
+<Note>
+**Where the two-phase flow lives.** The follow-up completion after tools is issued by the custom-LLM streaming path (`praisonaiagents/llm/llm.py::get_response_stream`), which most providers route through. The follow-up **keeps** `tools` available and is fetched non-streamed, then yielded as a single block — so the model can call another tool if it needs to. This is not bounded to a single round.
+</Note>
+
+<Warning>
+The native sync-OpenAI streaming path (`agent/chat_mixin.py::_start_stream_impl`) does **not** yet issue a follow-up completion after a tool runs: the streamed generator ends once tool results are appended to chat history. If you rely on `start(stream=True)` with tools on the sync OpenAI adapter and see no synthesized answer, use the non-streaming path (`chat()` / `start()` without `stream=True`) for that turn.
+</Warning>
+
 ```mermaid
 sequenceDiagram
     participant U as User
@@ -212,16 +220,18 @@ sequenceDiagram
     participant T as Tools
     
     U->>A: Request with stream=True
-    A->>L: Phase 1 (streamed)
+    A->>L: Phase 1 (streamed, retry-wrapped)
     L-->>A: "I'll use tool_name..."
     A->>T: Execute tool_name()
     T-->>A: Tool result
-    A->>L: Phase 2 follow-up (streamed) 
-    L-->>A: Synthesized response
+    A->>L: Phase 2 follow-up (non-streamed, retry-wrapped)
+    L-->>A: Synthesized response (single block)
     A-->>U: Combined stream
     
-    Note over L: Both phases use retry-wrapped LLM calls
+    Note over L: Custom-LLM path — Phase 2 keeps tools and can loop again
 ```
+
+The Phase 2 follow-up is fetched with `stream=False` and yielded as one block — it is **not** a token stream. It carries the accumulated `messages` (system prompt, user turn, the assistant tool-call message, and the tool-result messages) and **keeps** `tools`, so the model may call another tool rather than being forced to answer.
 
 ```python
 from praisonaiagents import Agent, tool
@@ -240,13 +250,13 @@ for chunk in agent.start("What's the weather in Paris?", stream=True):
     print(chunk, end="", flush=True)
 ```
 
-Both phases go through the same retry-wrapped LLM path, so transient rate-limit or network errors are retried automatically without any caller intervention.
+On the custom-LLM path both phases go through the same `_completion_with_retry` wrapper, so transient rate-limit or network errors are retried automatically without any caller intervention. If every retry is exhausted on the follow-up, the stream ends with the error sentinel documented below rather than dropping silently.
 
 ---
 
 ## Error Handling in the Stream
 
-If the LLM call fails after retries, the stream ends with a visible error sentence instead of silently dropping.
+If the follow-up LLM call fails after retries, the stream ends with a visible error sentence instead of silently dropping. This sentinel is emitted from the custom-LLM streaming path (`praisonaiagents/llm/llm.py::get_response_stream`) — the native sync-OpenAI path does not currently emit it.
 
 You may receive this exact sentinel string:
 
