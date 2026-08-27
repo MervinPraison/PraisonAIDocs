@@ -1,11 +1,20 @@
 ---
 title: "Mobile Engines"
 sidebarTitle: "Engines"
-description: "The two mobile engines and which one owns the turn write"
-icon: "microchip"
+description: "One interface, three engines, a conformance suite, and how the in-process engine persists a turn."
+icon: "plug"
 ---
 
-The mobile app offers two engines, and only the in-process one writes a completed turn into the app's local session. The engine list is built from the session via a factory, so the in-process engine cannot exist without the store it writes through.
+The mobile app picks an engine from a factory that is handed the store engines write through, so the in-process engine records a turn to the same session the chat list reads. Everything above the seam is written against `AgentEnginePort` and nothing else.
+
+```ts
+import { createRemoteHttpEngine } from "praisonai-mobile/engines/remote-http";
+
+const engine = createRemoteHttpEngine({ baseUrl: "http://127.0.0.1:8765", http });
+for await (const event of engine.run(request, signal)) {
+  if (event.type === "delta") process.stdout.write(event.text);
+}
+```
 
 ```mermaid
 graph LR
@@ -35,6 +44,22 @@ graph LR
     class Factory process
     class InProc inproc
     class Remote remote
+```
+
+```mermaid
+graph LR
+    Controller[⚙️ Run Controller] --> Port[🔌 AgentEnginePort]
+    Port --> TS[🧠 praisonai-ts]
+    Port --> HTTP[🌐 remote-http]
+    Port --> Fake[🧪 scripted fake]
+
+    classDef ctrl fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef port fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef impl fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Controller ctrl
+    class Port port
+    class TS,HTTP,Fake impl
 ```
 
 ## Quick Start
@@ -72,6 +97,22 @@ export function enginesFor(deps: RegistryDeps): readonly EngineChoice[] {
 
 <Step title="Build engines from the session">
 `AppDeps.engines` is a factory `(persistence) => EngineChoice[]`. The composition root builds it from the session, so an engine cannot exist without the store it writes through.
+</Step>
+
+<Step title="Run a turn">
+```ts
+for await (const event of engine.run(request, signal)) {
+  console.log(event.type);
+}
+```
+`run` returns an `AsyncIterable`, so `for await` gives free backpressure and one cancellation path.
+</Step>
+
+<Step title="Answer an approval">
+```ts
+const recorded = await engine.decide(approvalId, "allow");
+```
+Approval is a reverse channel while the stream is live, so it is a method, not an event.
 </Step>
 </Steps>
 
@@ -142,22 +183,67 @@ The user message is written **when the turn succeeds**, not when the user presse
 
 ---
 
-## When to Pick Which Engine
+## The Port
 
-The deciding question is whether the transcript must be readable locally without a network round-trip.
+`AgentEnginePort` is the entire agent-framework coupling.
+
+| Member | Type | Purpose |
+|--------|------|---------|
+| `id` | `string` | Stable id, written into persisted chats. |
+| `protocolVersion` | `number` | Checked once at boot; a mismatch fails boot with a name. |
+| `capabilities` | `EngineCapabilities` | What the engine can **report**, checked before the first token. |
+| `run(request, signal)` | `AsyncIterable<RunEvent>` | One turn: `start` first, exactly one terminal event last. |
+| `decide(approvalId, choice)` | `Promise<boolean>` | Answer an approval; `false` for an unknown or decided id. |
+| `cancel(runId)` | `Promise<boolean>` | Stop a run; `false` when it was not live. |
+| `dispose()` | `Promise<void>` | Release clients and sockets. Idempotent. |
+
+---
+
+## The Three Engines
+
+Three implementations pass the same conformance suite, which is what makes "swappable" a fact.
+
+| Engine | Where | Talks to |
+|--------|-------|----------|
+| `praisonai-ts` | `engines/src/praisonai-ts` | The agent loop, in-process on the device. |
+| `remote-http` | `engines/src/remote-http` | A PraisonAI engine over HTTP + SSE. |
+| scripted fake | `testing/` | Nothing — replays canned events for tests. |
+
+---
+
+## Conformance
+
+Passing `engines/src/conformance.ts` **is** the definition of implementing the seam.
+
+```ts
+export interface EngineHarness {
+  readonly name: string;
+  create(scenario: ScenarioName): Promise<AgentEnginePort>;
+  readonly unsupported?: Partial<Record<ScenarioName, string>>;
+}
+```
+
+The suite also asserts the negative direction: an engine declaring `approvals: false` must never emit an `approval_request`. Every unsupported scenario is printed on each run, so a contract that quietly shrinks is visible rather than silently green.
+
+<Info>
+`praisonai-ts` declares 5 of 11 events unsupported because upstream `Agent.streamEvents()` emits only `text` / `finish` / `error`. See `src/praisonai-mobile/docs/gaps.md`.
+</Info>
+
+---
+
+## When To Pick Which Engine
 
 ```mermaid
 graph TB
-    Start{Need the transcript<br/>readable in the local<br/>mobile session with no<br/>network round-trip?} -->|Yes| InProc[📱 praisonai-ts]
-    Start -->|No| Remote[🌐 remote-http]
+    Start{What do you need?} -->|Tool rows, approvals,<br/>reasoning in the UI| HTTP[remote-http]
+    Start -->|On-device, no server| TS[praisonai-ts]
+    Start -->|Deterministic tests| Fake[scripted fake]
 
     classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef inproc fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef remote fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Start q
-    class InProc inproc
-    class Remote remote
+    class HTTP,TS,Fake pick
 ```
 
 ---
@@ -204,6 +290,18 @@ The session already knows which conversation is open. Taking direction from the 
 <Accordion title="Read null as 'not on disk'">
 When `record` returns null the write failed. Null travels to the UI as "do not offer Fork or Delete", because those affordances would address a message that does not exist. Index `0` is valid, so a falsy check is a trap.
 </Accordion>
+
+<Accordion title="Read capabilities before rendering">
+`capabilities` is a property, not a method, so the UI decides what to render before the first token arrives.
+</Accordion>
+
+<Accordion title="Never fake an unsupported scenario">
+Declaring a gap in the `unsupported` map is honest; faking it hides a defect the conformance suite exists to catch.
+</Accordion>
+
+<Accordion title="Return false, never a lie">
+`decide` and `cancel` return `false` for an unknown id — reporting success for an id the engine never issued is a lie the UI cannot detect.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -222,5 +320,11 @@ When `record` returns null the write failed. Null travels to the UI as "do not o
 </Card>
 <Card title="Shell & Adapters" icon="mobile-screen" href="/features/mobile/shell-and-adapters">
   The keyboard snapshot and the pinch-zoom guard.
+</Card>
+<Card title="Protocol" icon="network-wired" href="/features/mobile/protocol">
+The 11 events every engine speaks.
+</Card>
+<Card title="Capabilities & Gaps" icon="list-check" href="/features/mobile/capabilities-and-gaps">
+What each engine emits today.
 </Card>
 </CardGroup>
