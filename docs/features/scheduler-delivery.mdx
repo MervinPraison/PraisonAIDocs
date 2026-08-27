@@ -818,6 +818,76 @@ A [Scheduler Monitor](/features/scheduler-monitor) job that finds its watched so
 
 ---
 
+## Reading the outcome from stats {#delivery-outcomes}
+
+Every scheduled run lands in exactly one of four delivery outcomes, and each outcome bumps its **own** counter — `delivered_deliveries` or `undelivered_deliveries` — read from `scheduler.get_stats()`.
+
+```mermaid
+graph LR
+    Run[⏰ Scheduled run] --> Outcome{Delivery outcome}
+    Outcome -->|Router accepted| Delivered[✅ DELIVERED<br/>delivered_deliveries +1]
+    Outcome -->|Router said no / raised| Undelivered[🟥 UNDELIVERED<br/>undelivered_deliveries +1]
+    Outcome -->|NO_REPLY / SILENT| Suppressed[🟡 SUPPRESSED<br/>0 / 0]
+    Outcome -->|No deliver= target| NotConfigured[🟦 NOT_CONFIGURED<br/>0 / 0]
+
+    classDef run fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef delivered fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef undelivered fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef suppressed fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef notconfig fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Run run
+    class Outcome q
+    class Delivered delivered
+    class Undelivered undelivered
+    class Suppressed suppressed
+    class NotConfigured notconfig
+```
+
+`delivered_deliveries` and `undelivered_deliveries` are **explicit** counters — a run only bumps the counter for its own outcome, never inferred by subtracting one from the other. `SUPPRESSED` (intentional silence) and `NOT_CONFIGURED` (no `deliver=` target) runs contribute **zero** to *both*, so an alert like `delivered_deliveries + undelivered_deliveries < successful_executions` is a real signal of quiet or unconfigured runs, not a bug.
+
+### Per-outcome counter table
+
+| Run outcome | `delivered_deliveries` | `undelivered_deliveries` | Callback fired |
+|---|---|---|---|
+| `DELIVERED` (router accepted) | **+1** | 0 | `on_success(result)` |
+| `UNDELIVERED` (router returned `False`) | 0 | **+1** | `on_failure("scheduled result could not be delivered")` |
+| `UNDELIVERED` (delivery raised) | 0 | **+1** | `on_failure("scheduled result could not be delivered")` |
+| `SUPPRESSED` (`NO_REPLY` / `[SILENT]` / `SILENT`) | 0 | 0 | `on_success(result)` |
+| `NOT_CONFIGURED` (no `deliver=` target) | 0 | 0 | `on_success(result)` |
+
+The invariant holds on both the sync and async scheduler:
+
+```
+delivered_deliveries + undelivered_deliveries ≤ successful_executions
+```
+
+The gap is exactly the `SUPPRESSED` + `NOT_CONFIGURED` runs — successful executions that were never meant to reach a chat target.
+
+### Monitoring recipe
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import AgentScheduler
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+scheduler = AgentScheduler(agent, task="Morning brief", deliver="telegram:123456")
+
+stats = scheduler.get_stats()
+attempted     = stats["delivered_deliveries"] + stats["undelivered_deliveries"]
+quiet_runs    = stats["successful_executions"] - attempted   # SUPPRESSED + NOT_CONFIGURED
+delivery_rate = (
+    stats["delivered_deliveries"] / attempted * 100 if attempted else None
+)
+```
+
+<Note>
+**What did *not* change.** [PraisonAI PR #4464](https://github.com/MervinPraison/PraisonAI/pull/4464) adds **no** new stat, knob, or protocol — it only makes the two existing counters explicit (initialised to `0` on every scheduler instance, bumped only for their own outcome) and pins their per-outcome semantics with regression tests. The invariant above holds for both the sync and async scheduler and will continue to.
+</Note>
+
+---
+
 ## Creation-time validation and preview
 
 A scheduled job now pre-flights its delivery target at creation, so "where will this go?" is answered before it ever fires — an unroutable token surfaces an actionable warning the moment you create the schedule, instead of being silently dropped at fire time.
