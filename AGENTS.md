@@ -94,7 +94,15 @@ PraisonAI has three SDK implementations. Use these paths as source of truth:
 | **TypeScript/JS** | `praisonai-package/src/praisonai-ts/src/` (submodule only) | `docs/js/` | `docs/js/DOCS_PARITY.md` |
 | **Rust** | `praisonai-package/src/praisonai-rust/src/` (submodule only) | `docs/rust/` | `docs/rust/DOCS_PARITY.md` |
 
-**Documentation Parity Trackers** show which features have documentation and which need docs:
+> [!NOTE]
+> **Two parity trackers, two questions.** PraisonAI uses two distinct parity systems — do not conflate them.
+>
+> - **`DOCS_PARITY.md`** (this repo, one per SDK) answers: *"Does documentation exist for each SDK feature category?"* Labels: `✅ Documented`, `⚠️ Stub`, `❌ Undocumented`.
+> - **`PARITY.md`** (main PraisonAI repo, one per non-Python SDK) answers: *"Does a matching exported symbol name exist in this SDK for each Python export?"* Labels: `✅ exported`, `⏳ missing`.
+>
+> `PARITY.md` counts exported symbol **names**, not behaviour. An `✅ exported` cell means the name is present in the SDK's public surface — it does **not** verify the capability is reachable, wired up, or behaves like its Python counterpart. Counts include barrel re-exports, so raw totals are not directly comparable across SDKs. For capabilities with a testable contract, rely on their conformance suite rather than the `PARITY.md` table.
+
+**Documentation Parity Trackers** (`DOCS_PARITY.md`) measure **docs-vs-code** — whether each SDK feature category has a documentation page. They are distinct from the main-repo `PARITY.md` trackers, which measure **code-vs-code** (exported symbol-name presence, not behaviour — see the note above). `DOCS_PARITY.md` labels:
 - ✅ Documented categories (real content)
 - ⚠️ Stub documentation (< 50 lines, needs content)
 - ❌ Undocumented categories (needs documentation)
