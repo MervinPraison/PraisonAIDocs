@@ -3,7 +3,7 @@
  * @see .github/workflows/auto-pr-comment.yml, claude.yml
  */
 
-const KICK_AUTHORS = new Set(['MervinPraison', 'github-actions[bot]']);
+const KICK_AUTHORS = new Set(['MervinPraison', 'github-actions[bot]', 'praisonai-triage-agent[bot]']);
 
 async function listAllComments(github, owner, repo, issueNumber) {
   if (typeof github.paginate === 'function') {
