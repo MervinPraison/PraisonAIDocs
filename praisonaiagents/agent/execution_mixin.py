@@ -297,7 +297,33 @@ class ExecutionMixin:
             raise
         except Exception as exc:  # noqa: BLE001 - normalised into outcome
             return RunOutcome.from_exception(exc)
-        return RunOutcome.completed(output=str(result) if result is not None else None)
+        return self._outcome_for_result(result)
+
+    def _outcome_for_result(self, result):
+        """Map a normally-returned run result into a canonical RunOutcome.
+
+        A run that returned without raising is ``completed`` *unless* the core
+        recorded a provider block/refusal/truncation on ``last_stop_reason`` from
+        the LLM ``finish_reason``/refusal signal — in which case the specific,
+        actionable terminal reason (``content_filtered | refused |
+        length_truncated``) is surfaced instead of a silent empty ``completed``.
+        Any other stop reason (``completed``/``max_steps``/unknown) preserves the
+        existing ``completed`` semantics, so behaviour is unchanged on success.
+        """
+        from .run_outcome import RunOutcome, PROVIDER_BLOCK_REASONS
+        output = str(result) if result is not None else None
+        # Read the recorded classification without letting a lookup problem mask a
+        # provider block as a successful ``completed``. Only an expected
+        # missing-state lookup (``AttributeError``) is treated as "no reason
+        # recorded"; anything else propagates rather than silently succeeding.
+        reason = None
+        try:
+            reason = getattr(self, "last_stop_reason", None)
+        except AttributeError:
+            reason = None
+        if reason in PROVIDER_BLOCK_REASONS:
+            return RunOutcome(reason=reason, output=output)
+        return RunOutcome.completed(output=output)
 
     def run(self, prompt: str, **kwargs: Any) -> Optional[str]:
         """Execute agent silently and return structured result.
@@ -383,7 +409,7 @@ class ExecutionMixin:
             result = executor()
         except BaseException as exc:  # noqa: BLE001 - normalised into outcome
             return RunOutcome.from_exception(exc)
-        return RunOutcome.completed(output=str(result) if result is not None else None)
+        return self._outcome_for_result(result)
 
     def _delegate_to_backend(self, prompt: str, **kwargs) -> Optional[str]:
         """Delegate execution to external managed backend (e.g., ManagedAgentIntegration).
@@ -1699,6 +1725,18 @@ Write the complete compiled report:"""
                 logging.error(f"Function {function_name} not found in tools")
                 return {"error": f"Function {function_name} not found in tools"}
 
+            # Circuit breaker (pre-execution) — parity with the sync path
+            # (_execute_tool_with_circuit_breaker_impl). Without this the async
+            # tool path never engages the per-agent breaker, so a persistently
+            # failing external tool is hammered indefinitely via achat()/astart()
+            # and the model never receives the ``circuit_open`` signal the async
+            # retry loop already checks for. The helpers are pure/sync.
+            breaker_precheck = getattr(self, '_circuit_breaker_precheck', None)
+            if breaker_precheck is not None:
+                open_result = breaker_precheck(function_name)
+                if open_result is not None:
+                    return open_result
+
             # Loop guard (pre-execution) — parity with the sync path in
             # tool_execution.py. The async path previously had no loop-guard or
             # doom-loop protection, so a repeatedly-failing tool could be hammered
@@ -1778,6 +1816,87 @@ Write the complete compiled report:"""
                             None, copy_context_to_callable(lambda: call_target(**call_arguments))
                         )
 
+                # Circuit-breaker parity with the sync path (tool_execution.py).
+                # The async tool path previously had no breaker, so a repeatedly
+                # failing tool could be hammered every turn via achat()/async
+                # workflows. Wrap the invocation through the same per-agent/per-tool
+                # breaker (CircuitBreaker.acall is event-loop safe) so repeated
+                # failures OPEN the circuit and short-circuit further calls. A
+                # CircuitBreakerException is surfaced as an error dict carrying
+                # circuit_open=True, which the retry loop in
+                # _execute_tool_async_with_retry already treats as terminal.
+                breaker = None
+                # Sentinel exception type so the `except` clause below is always a
+                # valid type even when the circuit_breaker module is unavailable
+                # (a never-raised local class never matches a real exception).
+                class _CircuitBreakerException(Exception):
+                    pass
+                try:
+                    from ..tools.circuit_breaker import (
+                        get_circuit_breaker,
+                        CircuitBreakerConfig,
+                        CircuitBreakerException as _CircuitBreakerException,
+                    )
+                    breaker_name = f"tool_{id(self)}_{function_name}"
+                    breaker = get_circuit_breaker(
+                        breaker_name,
+                        CircuitBreakerConfig(
+                            failure_threshold=5,
+                            recovery_timeout=60.0,
+                            timeout=30.0,
+                            graceful_degradation=True,
+                        ),
+                    )
+                    if hasattr(self, "_register_breaker_finalizer"):
+                        self._register_breaker_finalizer(breaker_name)
+                except ImportError:
+                    # Circuit breaker not available - fall back to direct invocation.
+                    logging.debug("Circuit breaker not available on async path, executing directly")
+
+                # Sentinel used to register an error-dict result as a breaker
+                # failure without losing the dict, mirroring the sync path's
+                # _ToolFailure wrapper (tool_execution.py). Approval/permission/
+                # policy/guardrail denials are NOT treated as breaker failures.
+                class _ToolFailure(Exception):
+                    def __init__(self, error_dict):
+                        self.error_dict = error_dict
+                        super().__init__(error_dict.get("error", "Tool execution failed"))
+
+                async def _invoke_for_breaker():
+                    r = await _invoke()
+                    if isinstance(r, dict) and r.get("error") and \
+                       not r.get("approval_denied") and \
+                       not r.get("permission_denied") and \
+                       not r.get("approval_error") and \
+                       not r.get("policy_denied") and \
+                       not r.get("guardrail_denied"):
+                        raise _ToolFailure(r)
+                    return r
+
+                async def _invoke_guarded():
+                    if breaker is None:
+                        return await _invoke()
+                    try:
+                        return await breaker.acall(_invoke_for_breaker)
+                    except _ToolFailure as tf:
+                        # Failure was counted by the breaker; return the original dict.
+                        return tf.error_dict
+
+                def _circuit_open_result():
+                    # Record the rejection as a failure so repeated open-circuit
+                    # rejections still feed the loop guard, then surface an error
+                    # dict carrying circuit_open=True — the retry loop in
+                    # _execute_tool_async_with_retry treats it as terminal.
+                    if loop_guard is not None:
+                        loop_guard.record(function_name, arguments, False, result=None)
+                    return {
+                        "error": f"Tool '{function_name}' circuit breaker open - too many recent failures",
+                        "circuit_open": True,
+                        "agent_name": getattr(self, "name", None),
+                        "session_id": getattr(self, "_session_id", None),
+                        "remediation": "Wait for recovery_timeout (60s) or investigate recent tool failures.",
+                    }
+
                 # Apply the per-agent tool timeout (ToolConfig.timeout) so the async
                 # path matches the sync path in tool_execution.py. asyncio.wait_for
                 # cannot kill a stuck sync tool running in the executor (same caveat
@@ -1786,7 +1905,10 @@ Write the complete compiled report:"""
                 tool_timeout = getattr(self, '_tool_timeout', None)
                 if tool_timeout and tool_timeout > 0:
                     try:
-                        result = await asyncio.wait_for(_invoke(), timeout=tool_timeout)
+                        result = await asyncio.wait_for(_invoke_guarded(), timeout=tool_timeout)
+                    except _CircuitBreakerException as cbe:
+                        logging.warning(f"Tool '{function_name}' circuit breaker open: {cbe}")
+                        return _circuit_open_result()
                     except asyncio.TimeoutError:
                         logging.warning(f"Tool {function_name} timed out after {tool_timeout}s")
                         # Mark as non-retryable: asyncio.wait_for cannot cancel a sync
@@ -1803,7 +1925,30 @@ Write the complete compiled report:"""
                             "_praison_retryable": False,
                         }
                 else:
-                    result = await _invoke()
+                    try:
+                        result = await _invoke_guarded()
+                    except _CircuitBreakerException as cbe:
+                        logging.warning(f"Tool '{function_name}' circuit breaker open: {cbe}")
+                        return _circuit_open_result()
+
+                # Circuit breaker (post-execution) — record the outcome so
+                # repeated failures open the breaker, mirroring the sync path's
+                # breaker.call. Approval/permission/policy/guardrail denials are
+                # NOT counted as tool failures (same exclusions the sync wrapper
+                # applies in _execute_tool_with_circuit_breaker_impl), so a gated
+                # tool never trips the breaker.
+                breaker_record = getattr(self, '_circuit_breaker_record', None)
+                if breaker_record is not None:
+                    is_breaker_failure = (
+                        isinstance(result, dict)
+                        and result.get("error")
+                        and not result.get("approval_denied")
+                        and not result.get("permission_denied")
+                        and not result.get("approval_error")
+                        and not result.get("policy_denied")
+                        and not result.get("guardrail_denied")
+                    )
+                    breaker_record(function_name, not is_breaker_failure)
 
                 # Loop guard (post-execution) — record the outcome and surface a
                 # block/halt decision back to the model on this same turn, mirroring
@@ -1834,6 +1979,17 @@ Write the complete compiled report:"""
 
             except Exception as e:
                 logging.error(f"Error executing {function_name}: {str(e)}", exc_info=True)
+                # Circuit breaker (failure on raised exception) — a raised tool
+                # exception is a failure just like an error-dict result, and the
+                # sync path's ``breaker.call`` counts it. Record it here so the
+                # breaker still opens after repeated raises; otherwise the
+                # post-invoke record block above is skipped and raised failures
+                # never trip the breaker. Approval/permission/policy/guardrail
+                # denials surface as error dicts (handled above), not raises, so
+                # this path only ever sees genuine tool failures.
+                breaker_record = getattr(self, '_circuit_breaker_record', None)
+                if breaker_record is not None:
+                    breaker_record(function_name, False)
                 # Record the failed invocation so repeated identical failures
                 # accumulate toward the loop-guard BLOCK/HALT thresholds — a raised
                 # tool exception is a failure just like an error-dict result on the

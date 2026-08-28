@@ -174,6 +174,8 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
         self._execution_count = 0
         self._success_count = 0
         self._failure_count = 0
+        self._undelivered_count = 0
+        self._delivered_count = 0
         self._start_time: Optional[datetime] = None
         
         # Sync lock for async primitives creation and bound loop tracking
@@ -397,6 +399,9 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
             "success_rate": (self._success_count / self._execution_count * 100) if self._execution_count > 0 else 0,
             "total_cost_usd": round(self._total_cost, 4),
             "remaining_budget": round(self.max_cost - self._total_cost, 4) if self.max_cost is not None else None,
+            # Explicit delivery-outcome counters (Issue #4454): never inferred
+            # from success minus undelivered, so NOT_CONFIGURED / SUPPRESSED
+            # runs never over-report a delivery.
             "delivered_deliveries": getattr(self, "_delivered_count", 0),
             "undelivered_deliveries": getattr(self, "_undelivered_count", 0),
         }
@@ -529,7 +534,8 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
                 if attempt < max_retries - 1:
                     wait_time = backoff_delay(attempt)
                     logger.info(f"Waiting {wait_time}s before async retry after timeout...")
-                    await asyncio.sleep(wait_time)
+                    if await self._sleep_or_stop(wait_time):
+                        return
             except Exception as e:
                 last_exc = e
                 logger.error(f"Async agent execution failed on attempt {attempt + 1}: {e}")
@@ -537,7 +543,8 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
                 if attempt < max_retries - 1:
                     wait_time = backoff_delay(attempt)
                     logger.info(f"Waiting {wait_time}s before async retry...")
-                    await asyncio.sleep(wait_time)
+                    if await self._sleep_or_stop(wait_time):
+                        return
         
         async with self._stats_lock:
             self._failure_count += 1
@@ -548,7 +555,26 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
             else RuntimeError(f"Failed after {max_retries} attempts")
         )
         await asyncio.to_thread(self._update_state_if_daemon)
-    
+
+    async def _sleep_or_stop(self, wait_time: float) -> bool:
+        """Interruptible retry backoff.
+
+        Mirrors the sync scheduler's ``self._stop_event.wait(wait_time)`` and
+        the scheduled-run sleep elsewhere in this file: waits ``wait_time``
+        seconds but returns immediately if ``stop()`` is called, so a graceful
+        shutdown is never held hostage for the full backoff ``cap``.
+
+        Returns ``True`` if stop() was requested during the wait.
+        """
+        if self._stop_event is None:
+            await asyncio.sleep(wait_time)
+            return False
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=wait_time)
+            return True  # event fired → stop requested
+        except asyncio.TimeoutError:
+            return False  # normal backoff completed
+
     async def execute_once(self) -> Any:
         """
         Execute agent immediately (one-time execution).

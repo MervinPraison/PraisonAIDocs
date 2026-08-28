@@ -1338,6 +1338,28 @@ class AgentTeam(SpawnAnnounceProtocol):
             logger.warning(f"Task {task_id}: Guardrail processing error (retry {task.retry_count}/{task.max_retries}): {e}")
             return task_output, True  # Signal retry needed
 
+    async def _aapply_task_guardrail(self, task, task_id, task_output):
+        """Async wrapper for _apply_task_guardrail.
+
+        A string/LLMGuardrail guardrail fires a *blocking* LLM call inside
+        _apply_task_guardrail. Offload it to a thread so it does not stall the
+        event loop (and every other task running concurrently under
+        asyncio.gather in arun_all_tasks/astart), mirroring the executor-offload
+        pattern used for synchronous memory calls in async_memory_mixin.
+        """
+        loop = asyncio.get_event_loop()
+        # Preserve contextvars (trace emission, session context) across the
+        # executor thread so a custom task guardrail sees the same contextual
+        # state as the synchronous path, matching every other run_in_executor
+        # call site in this module.
+        from ..trace.context_events import copy_context_to_callable
+        return await loop.run_in_executor(
+            None,
+            copy_context_to_callable(
+                lambda: self._apply_task_guardrail(task, task_id, task_output)
+            ),
+        )
+
     def _run_task_start_hook(self, task, task_id):
         """Run the on_task_start hook and propagate global variables to the task.
 
@@ -1417,8 +1439,9 @@ class AgentTeam(SpawnAnnounceProtocol):
             if task.status in ["not started", "in progress"]:
                 task_output = await self.aexecute_task(task_id)
                 if task_output and self.completion_checker(task, task_output.raw):
-                    # Apply guardrail validation using shared helper
-                    task_output, should_retry = self._apply_task_guardrail(task, task_id, task_output)
+                    # Apply guardrail validation using shared helper (offloaded to
+                    # a thread so a blocking LLM guardrail does not stall the loop)
+                    task_output, should_retry = await self._aapply_task_guardrail(task, task_id, task_output)
                     if should_retry:
                         retries += 1
                         continue
@@ -2587,21 +2610,110 @@ class AgentTeam(SpawnAnnounceProtocol):
         
         return False
 
+    def _own_agent_names(self) -> set:
+        """Names of this instance's own agents, for token-report scoping."""
+        return {
+            getattr(agent, "name", None)
+            for agent in (self.agents or [])
+            if getattr(agent, "name", None)
+        }
+
+    def _scoped_recent_interactions(self, own_names: set) -> List[Dict[str, Any]]:
+        """Return this instance's own recorded interactions, most-recent last.
+
+        The process-wide collector keeps a bounded window of every agent's
+        interactions; filter it to this instance's agent names so per-model
+        totals, interaction counts, and the detailed report never leak another
+        concurrent instance's records.
+        """
+        try:
+            interactions = get_token_collector().get_recent_interactions(
+                limit=get_token_collector()._max_recent
+            )
+        except Exception:
+            interactions = get_token_collector().get_recent_interactions(limit=100)
+        return [i for i in interactions if i.get("agent") in own_names]
+
+    def _scoped_token_summary(self) -> Dict[str, Any]:
+        """Return the global token summary filtered to this instance's agents.
+
+        The process-wide TokenCollector aggregates every agent in the process,
+        so two concurrent PraisonAIAgents instances would otherwise read each
+        other's totals. Scope every reported field — ``by_agent``, ``by_model``,
+        ``total_interactions`` and the totals — to this instance's own agent
+        names so per-instance/per-tenant cost accounting reports only its own
+        spend. ``by_agent`` is taken from the collector's aggregate breakdown;
+        ``by_model`` and ``total_interactions`` are re-derived from this
+        instance's own interaction records (the aggregate cannot be split by
+        model per agent). Falls back to the unfiltered summary when this
+        instance has no named agents to scope by.
+        """
+        summary = get_token_collector().get_session_summary()
+        own_names = self._own_agent_names()
+        by_agent = summary.get("by_agent", {})
+        # No named agents to scope by (or nothing tracked yet): fall back to the
+        # unfiltered summary rather than silently reporting zeros.
+        if not own_names or not by_agent:
+            return summary
+
+        scoped_by_agent = {
+            name: metrics for name, metrics in by_agent.items() if name in own_names
+        }
+        totals = {
+            "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+            "reasoning_tokens": 0, "audio_input_tokens": 0, "audio_output_tokens": 0,
+            "total_tokens": 0,
+        }
+        for metrics in scoped_by_agent.values():
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    totals[key] = totals.get(key, 0) + value
+
+        # Re-derive per-model totals and the interaction count from this
+        # instance's own records so they are not copied wholesale from the
+        # process-global summary (which mixes in other instances' models and
+        # counts). The collector's ``by_agent`` aggregate cannot be split by
+        # model, so the per-interaction window is the correct source.
+        own_interactions = self._scoped_recent_interactions(own_names)
+        by_model: Dict[str, Dict[str, int]] = {}
+        for interaction in own_interactions:
+            model = interaction.get("model")
+            metrics = interaction.get("metrics") or {}
+            if not model:
+                continue
+            bucket = by_model.setdefault(model, {})
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    bucket[key] = bucket.get(key, 0) + value
+
+        return {
+            "total_interactions": len(own_interactions),
+            "total_tokens": totals.get("total_tokens", 0),
+            "total_metrics": totals,
+            "by_model": by_model,
+            "by_agent": scoped_by_agent,
+        }
+
     def get_token_usage_summary(self) -> Dict[str, Any]:
-        """Get a summary of token usage across all agents and tasks."""
+        """Get a summary of token usage across this team's agents and tasks."""
         if not get_token_collector:
             return {"error": "Token tracking not available"}
         
-        return get_token_collector().get_session_summary()
+        return self._scoped_token_summary()
     
     def get_detailed_token_report(self) -> Dict[str, Any]:
         """Get a detailed token usage report."""
         if not get_token_collector:
             return {"error": "Token tracking not available"}
         
-        collector = get_token_collector()
-        summary = collector.get_session_summary()
-        recent = collector.get_recent_interactions(limit=20)
+        summary = self._scoped_token_summary()
+        own_names = self._own_agent_names()
+        if own_names:
+            # Only surface this instance's own interactions so the detailed
+            # report never exposes another concurrent instance's records.
+            recent = self._scoped_recent_interactions(own_names)[-20:]
+        else:
+            recent = get_token_collector().get_recent_interactions(limit=20)
         
         # Calculate cost estimates (example rates)
         cost_per_1k_input = 0.0005  # $0.0005 per 1K input tokens
@@ -2629,7 +2741,7 @@ class AgentTeam(SpawnAnnounceProtocol):
             print("Token tracking not available")
             return
         
-        summary = get_token_collector().get_session_summary()
+        summary = self._scoped_token_summary()
         
         print("\n" + "="*50)
         print("TOKEN USAGE SUMMARY")

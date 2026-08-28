@@ -492,6 +492,14 @@ Respond with ONLY a valid JSON tool call in this format:
         self.max_reflect = extra_settings.get('max_reflect', 3)
         self.min_reflect = extra_settings.get('min_reflect', 1)
         self.reasoning_steps = extra_settings.get('reasoning_steps', False)
+        # Unified, provider-portable reasoning-effort control (Issue #4452).
+        # Accepts a graded level (off|minimal|low|medium|high) or a legacy
+        # ``thinking_budget`` int; both normalise to one internal value that is
+        # translated to each provider's native parameter in
+        # ``_build_completion_params``. ``None``/``off`` is a zero-overhead no-op.
+        self.reasoning_effort = extra_settings.get(
+            'reasoning_effort', extra_settings.get('thinking_budget')
+        )
         self.metrics = extra_settings.get('metrics', False)
         # Auto-detect XML tool format for known models, or allow manual override
         self.xml_tool_format = extra_settings.get('xml_tool_format', 'auto')
@@ -2974,6 +2982,7 @@ Respond with ONLY a valid JSON tool call in this format:
                         response_text = resp["choices"][0]["message"]["content"]
                         final_response = resp
                         _final_llm_response = resp  # Store for token usage extraction
+                        self._record_finish_reason(resp)
                         
                         # Emit StreamEvent for reasoning content if callback provided
                         if _emit and reasoning_content:
@@ -3201,6 +3210,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                                 )
                                             )
                                             _final_llm_response = final_response  # Store for token usage extraction
+                                            self._record_finish_reason(final_response)
                                             # Handle None content from Gemini
                                             response_content = final_response["choices"][0]["message"].get("content")
                                             response_text = response_content if response_content is not None else ""
@@ -3390,6 +3400,7 @@ Respond with ONLY a valid JSON tool call in this format:
                                         )
                                     )
                                     _final_llm_response = final_response  # Store for token usage extraction
+                                    self._record_finish_reason(final_response)
                                 # Handle None content from Gemini
                                 response_content = final_response["choices"][0]["message"].get("content")
                                 response_text = response_content if response_content is not None else ""
@@ -4840,6 +4851,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                         )
                     )
+                    self._record_finish_reason(resp)
                     reasoning_content = resp["choices"][0]["message"].get("provider_specific_fields", {}).get("reasoning_content")
                     response_text = resp["choices"][0]["message"]["content"]
                     
@@ -4948,6 +4960,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                             )
                         )
+                        self._record_finish_reason(tool_response)
                         # Handle None content from Gemini
                         response_content = tool_response.choices[0].message.get("content")
                         response_text = response_content if response_content is not None else ""
@@ -5118,6 +5131,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                             )
                         )
+                        self._record_finish_reason(resp)
                         reasoning_content = resp["choices"][0]["message"].get("provider_specific_fields", {}).get("reasoning_content")
                         response_text = resp["choices"][0]["message"]["content"]
                         
@@ -5169,6 +5183,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     **{k:v for k,v in kwargs.items() if k != 'reasoning_steps'}
                                 )
                             )
+                            self._record_finish_reason(resp)
                             response_text = resp["choices"][0]["message"].get("content") or ""
                             # If the response also contains new tool_calls, treat this as a
                             # tool-calling round rather than a final answer (Anthropic pattern)
@@ -5643,6 +5658,47 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 logging.warning(f"Failed to track token usage: {e}")
             return None
     
+    def _record_finish_reason(self, response: Union[Dict[str, Any], Any]) -> None:
+        """Classify the provider ``finish_reason``/refusal and record it.
+
+        Sets ``self._last_stop_reason`` to a distinct provider block/refusal/
+        truncation reason (``content_filtered | refused | length_truncated``)
+        when the last completion was blocked, so a blocked/refused/truncated turn
+        is surfaced as an explicit terminal reason instead of a silent empty
+        ``completed``. Only updates when the reason is still ``"completed"`` so a
+        prior ``max_steps`` (sticky truncation) is never downgraded. Absent or
+        unrecognised finish reasons are a no-op — zero overhead on success.
+        """
+        try:
+            finish_reason = None
+            refusal = None
+            if isinstance(response, dict):
+                choices = response.get("choices") or []
+                if choices:
+                    choice = choices[0]
+                    finish_reason = choice.get("finish_reason")
+                    msg = choice.get("message") or {}
+                    if isinstance(msg, dict):
+                        refusal = msg.get("refusal")
+                    else:
+                        refusal = getattr(msg, "refusal", None)
+            else:
+                choices = getattr(response, "choices", None) or []
+                if choices:
+                    choice = choices[0]
+                    finish_reason = getattr(choice, "finish_reason", None)
+                    msg = getattr(choice, "message", None)
+                    refusal = getattr(msg, "refusal", None) if msg is not None else None
+            if finish_reason is None and not refusal:
+                return
+            from ..agent.run_outcome import classify_finish_reason
+            reason = classify_finish_reason(finish_reason, refusal)
+            if reason is not None and self._last_stop_reason == "completed":
+                self._last_stop_reason = reason
+        except Exception:
+            # Never let outcome classification break the response path.
+            return
+
     def _extract_token_usage(self, response: Union[Dict[str, Any], Any]) -> Optional[TokenUsage]:
         """Extract token usage from LiteLLM response for public API."""
         try:
@@ -5776,9 +5832,23 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             'max_tool_calls_per_turn', 'parallel_tool_calls',  # Tool execution settings
             'in_loop_compaction', 'clear_threshold_pct', 'compact_threshold_pct',  # In-loop context management
             'keep_recent_tool_results',  # In-loop context management
+            'reasoning_effort', 'thinking_budget',  # Reasoning-effort (translated below, Issue #4452)
         ]
         for param in internal_params:
             params.pop(param, None)
+
+        # Translate the unified reasoning-effort level to the target provider's
+        # native request parameter (Issue #4452): OpenAI/xAI reasoning models get
+        # ``reasoning_effort``, Anthropic/Gemini get an extended-thinking budget,
+        # and models with no reasoning control are left untouched. A per-call
+        # override wins over the instance-level setting; ``off``/unset is a no-op.
+        effort = override_params.get('reasoning_effort', self.reasoning_effort)
+        if effort is not None:
+            from ..thinking.effort import resolve_reasoning_params
+            reasoning_params = resolve_reasoning_params(effort, self.model)
+            # Don't clobber an explicit native param the caller already set.
+            for key, value in reasoning_params.items():
+                params.setdefault(key, value)
 
         # Reasoning models (o1/o3/gpt-5.x) require max_completion_tokens and
         # reject the legacy max_tokens parameter plus several sampling params.

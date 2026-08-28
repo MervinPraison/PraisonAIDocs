@@ -1244,6 +1244,13 @@ Your Goal: {self.goal}"""
                             f"Agent {self.name}: model returned no content "
                             f"(finish_reason={finish_reason!r}, refused={bool(refusal)})"
                         )
+                        # Record a distinct terminal reason so the empty answer is
+                        # actionable end-to-end (RunOutcome / CLI exit / --output
+                        # json) instead of a silent "completed" with empty text.
+                        from .run_outcome import classify_finish_reason
+                        stop_reason = classify_finish_reason(finish_reason, refusal)
+                        if stop_reason is not None:
+                            self._last_stop_reason = stop_reason
                     return ""
         except (AttributeError, IndexError, TypeError) as e:
             logging.warning(
@@ -1747,6 +1754,12 @@ Your Goal: {self.goal}"""
     def _chat_completion(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, _retry_depth=0, _fallback_index=0, cancel_token=None):
         start_time = time.time()
 
+        # Reset the agent-level finish-reason classification at the start of each
+        # OpenAI-native turn so a provider block/refusal recorded on a previous
+        # run (see ``_extract_llm_response_content``) never leaks into this one.
+        # The LiteLLM path resets its own backend flag independently.
+        self._last_stop_reason = "completed"
+
         # --- Proactive Context Budget Management (default-on) ---
         # Analyzes token budget BEFORE LLM call and applies appropriate strategy
         try:
@@ -1995,7 +2008,6 @@ Your Goal: {self.goal}"""
             
             # Use structured error classification for all error types (replaces legacy heuristic checks)
             from ..llm.error_classifier import classify_llm_error
-            from ..llm.retry_utils import jittered_backoff
             
             model_name = self.llm if isinstance(self.llm, str) else "unknown"
             session_id = getattr(self, '_session_id', 'unknown')
@@ -4722,6 +4734,19 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             from .tools_placement import ensure_tools_placed
             ensure_tools_placed(self)
 
+        # Input-side guardrail runs BEFORE begin_durable_run so a rejected prompt
+        # never opens (and therefore never finalizes) a durable run -- exact
+        # parity with chat()/achat(), which validate input before begin_durable_run
+        # and return early. Doing it here (not in _start_stream_impl) keeps a
+        # blocked stream from being recorded as a "succeeded" durable run.
+        if hasattr(self, '_validate_input_with_guardrail'):
+            _in_ok, _in_prompt, _in_err = self._validate_input_with_guardrail(prompt)
+            if not _in_ok:
+                logging.warning(f"Agent {getattr(self, 'name', '')}: input blocked by guardrail: {_in_err}")
+                yield f"[Input blocked by guardrail: {_in_err}]"
+                return
+            prompt = _in_prompt
+
         durable_context = None
         durable_token = None
         try:
@@ -4763,6 +4788,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 "applied to streamed responses (iter_stream / stream=True). "
                 "Use chat() for guardrail-validated output."
             )
+        # Input-side guardrail validation is performed by _start_stream (before
+        # begin_durable_run), so the prompt reaching this generator is already
+        # validated/transformed. Kept out of this impl so a blocked prompt never
+        # opens a durable run that would then finalize as "succeeded".
         try:
             # Reset the final display flag for each new conversation
             self._final_display_shown = False
@@ -5737,6 +5766,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
     async def _achat_completion_with_retry_core(self, messages, temperature=None, tools=None, stream=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None, stream_callback=None, emit_events=True):
         """Async retry/backoff core for chat completion (middleware-agnostic)."""
+        # Reset the agent-level finish-reason classification at the start of each
+        # async OpenAI-native turn, mirroring the sync ``_chat_completion`` reset,
+        # so a provider block/refusal recorded on a previous run (see
+        # ``_extract_llm_response_content``) never leaks into this one. The LiteLLM
+        # path resets its own backend flag independently.
+        self._last_stop_reason = "completed"
+
         retry_config = getattr(self, '_retry_config', None)
         if not retry_config:
             return await self._execute_unified_achat_completion(

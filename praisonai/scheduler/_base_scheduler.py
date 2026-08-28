@@ -5,11 +5,36 @@ Shared, lock-agnostic scheduler logic for both sync and async variants.
 import os
 import json
 import logging
+import tempfile
 from enum import Enum
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(path: str, payload: dict) -> None:
+    """Write JSON to ``path`` atomically.
+
+    Writes to a temp file in the same directory then ``os.replace`` (atomic on
+    POSIX, overwrites on Windows) so a crash mid-write can never leave the
+    state file empty or partially-truncated — which would make the cron
+    catch-up feature (issue #3526) silently re-anchor on next start.
+    """
+    dirn = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=dirn)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class DeliveryOutcome(str, Enum):
@@ -329,8 +354,11 @@ class _BaseAgentScheduler:
     _failure_count: int
     _total_cost: float
     _start_time: Optional[datetime]
-    # Delivery-outcome accounting (Issue #4454): a run whose configured
-    # delivery fails is counted as ``undelivered`` — never a plain success.
+    # Delivery-outcome accounting (Issue #4454): tracked with explicit counters
+    # rather than inferred from success counts, so a run with no target
+    # (NOT_CONFIGURED) or intentional silence (SUPPRESSED) is never mislabelled
+    # as delivered, and a run whose delivery fails is counted ``undelivered`` —
+    # never a plain success.
     _delivered_count: int = 0
     _undelivered_count: int = 0
 
@@ -537,7 +565,9 @@ class _BaseAgentScheduler:
             ),
             # Delivery-outcome accounting (Issue #4454): distinguish a run that
             # actually reached the user from one whose delivery failed. A run
-            # can be a successful *execution* yet an undelivered *result*.
+            # can be a successful *execution* yet an undelivered *result*. Both
+            # use explicit counters (not success-minus-undelivered inference) so
+            # NOT_CONFIGURED / SUPPRESSED runs never over-report a delivery.
             "delivered_deliveries": getattr(self, "_delivered_count", 0),
             "undelivered_deliveries": getattr(self, "_undelivered_count", 0),
         }
@@ -569,10 +599,17 @@ class _BaseAgentScheduler:
                         last_run = getattr(self, "_last_run_at", None)
                         if last_run is not None:
                             state["last_run_at"] = last_run
-                        with open(path, "w") as f:
-                            json.dump(state, f, indent=2)
+                        _atomic_write_json(path, state)
                         break
-                except Exception:
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        "Corrupt scheduler state %s (skipping): %s", path, e
+                    )
+                    continue
+                except OSError as e:
+                    logger.warning(
+                        "Cannot access scheduler state %s: %s", path, e
+                    )
                     continue
         except Exception as e:
             logger.debug("Failed to update state: %s", e)
@@ -602,7 +639,16 @@ class _BaseAgentScheduler:
                         if last_run is not None:
                             self._last_run_at = float(last_run)
                         break
-                except Exception:
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        "Corrupt scheduler state %s (skipping, will re-anchor): %s",
+                        path, e,
+                    )
+                    continue
+                except OSError as e:
+                    logger.warning(
+                        "Cannot access scheduler state %s: %s", path, e
+                    )
                     continue
         except Exception as e:
             logger.debug("Failed to load persisted last_run_at: %s", e)

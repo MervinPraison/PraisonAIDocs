@@ -626,6 +626,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         message_steering: Optional[Union[bool, 'MessageSteeringProtocol']] = False,  # Real-time message steering during execution
         sandbox: Optional[Union[bool, 'SandboxConfig']] = None,  # Sandbox for safe code execution
         retry: Optional[Union[bool, Dict[str, Any], 'RetryBackoffConfig']] = None,  # Retry configuration with exponential backoff
+        reasoning_effort: Optional[str] = None,  # Provider-portable reasoning effort: off|minimal|low|medium|high (Issue #4452)
         **legacy_kwargs: Any,  # Deprecated params (see _LEGACY_AGENT_PARAMS) consolidated into config objects
     ):
         """Initialize an Agent instance.
@@ -799,6 +800,10 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # LLMConfig(fallback_models=[...])), so accept it here without exposing
         # it in the signature and seed the local below.
         _cloned_fallback_models = legacy_kwargs.pop("fallback_models", None)
+        # `thinking_budget` is a backward-compatible alias for `reasoning_effort`
+        # (Issue #4452); accept it here (like fallback_models) without exposing
+        # it in the signature so the unknown-kwarg guard below does not reject it.
+        _thinking_budget_alias = legacy_kwargs.pop("thinking_budget", None)
         _unknown = set(legacy_kwargs) - _legacy_defaults.keys()
         if _unknown:
             # Unknown kwargs are rejected rather than swallowed, so a typo can
@@ -1026,7 +1031,11 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         planning_reasoning = False
         policy = None
         output_style = None
-        thinking_budget = None
+        # `thinking_budget` (popped above) is a backward-compatible alias for
+        # `reasoning_effort` (Issue #4452). Fold the legacy int budget / graded
+        # level into one internal effort value for the LLM request pipeline.
+        if reasoning_effort is None and _thinking_budget_alias is not None:
+            reasoning_effort = _thinking_budget_alias
         skills_dirs = None
         
         # ─────────────────────────────────────────────────────────────────────
@@ -2092,6 +2101,11 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             'claude_memory': claude_memory,
             **_retry_init_params,
         }
+        # Forward the unified reasoning-effort control to every LLM-construction
+        # branch (Issue #4452). Only set when provided so unset stays a no-op and
+        # older dict/string branches that don't spread these kwargs are unaffected.
+        if reasoning_effort is not None:
+            self._llm_option_kwargs['reasoning_effort'] = reasoning_effort
 
         # Panel (multi-model) descriptor: "panel:<name>" or {"provider": "panel"}.
         # Resolved lazily into a PanelLLM; composes with the normal tool loop.
@@ -2213,7 +2227,14 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 self._llm_init_params = llm_params
                 self._using_custom_llm = True
             self.llm = model_name
-        
+
+        # Thread the unified reasoning-effort control into whichever LLM-init
+        # params the branch chain above produced (Issue #4452), so it reaches the
+        # LLM request pipeline regardless of how the model was specified. Only set
+        # when provided and not already present, keeping unset a zero-cost no-op.
+        if reasoning_effort is not None and getattr(self, "_llm_init_params", None):
+            self._llm_init_params.setdefault('reasoning_effort', reasoning_effort)
+
         # Store fallback models for resilience (defensive copy to avoid external mutations)
         self.fallback_models = list(fallback_models) if fallback_models else []
         
@@ -2752,7 +2773,28 @@ Your Goal: {self.goal}
         self._auto_memory = auto_memory
         self._policy = policy
         self._output_style = output_style
-        self._thinking_budget = thinking_budget
+        # Backward-compatible: `thinking_budget` property mirrors the legacy int
+        # budget when supplied via the alias (Issue #4452); the unified effort is
+        # what actually drives the request pipeline via `_llm_init_params`.
+        self._thinking_budget = (
+            _thinking_budget_alias
+            if isinstance(_thinking_budget_alias, int)
+            else None
+        )
+        # Store the resolved unified reasoning-effort as a canonical graded level
+        # (off|minimal|low|medium|high) for session persistence. A legacy int
+        # ``thinking_budget`` alias is normalised to its nearest level so the
+        # persisted/queried value is always provider-portable (Issue #4452). The
+        # LLM request pipeline still accepts the raw value too, so behaviour is
+        # unchanged when unset.
+        if reasoning_effort is not None:
+            try:
+                from ..thinking.effort import normalize_effort
+                self._reasoning_effort = normalize_effort(reasoning_effort)
+            except Exception:
+                self._reasoning_effort = reasoning_effort
+        else:
+            self._reasoning_effort = None
         
         # Context management (lazy loaded for zero overhead when disabled)
         # Smart default: auto-enable context when tools are present
@@ -3198,7 +3240,50 @@ Your Goal: {self.goal}
     
     @thinking_budget.setter
     def thinking_budget(self, value: Optional[int]) -> None:
-        self._thinking_budget = value
+        # `thinking_budget` is a backward-compatible alias for the unified
+        # `reasoning_effort` control (Issue #4452). Setting it must route through
+        # the same request-pipeline sync as `reasoning_effort`, otherwise the
+        # CLI's `--thinking` (which assigns this property after construction)
+        # stays dormant — the value would be stored but never emitted.
+        self._thinking_budget = value if isinstance(value, int) else None
+        self.reasoning_effort = value
+
+    @property
+    def reasoning_effort(self) -> Optional[str]:
+        """Unified, provider-portable reasoning-effort level (Issue #4452).
+
+        One of ``off|minimal|low|medium|high``. Core translates it to the
+        target provider's native parameter (OpenAI/xAI ``reasoning_effort``,
+        Anthropic/Gemini extended-thinking budget) on the request path.
+        """
+        return getattr(self, "_reasoning_effort", None)
+
+    @reasoning_effort.setter
+    def reasoning_effort(self, value: Optional[str]) -> None:
+        # Normalise to a canonical graded level so the stored/persisted value is
+        # always provider-portable, whether set as a level or a legacy int budget.
+        if value is not None:
+            try:
+                from ..thinking.effort import normalize_effort
+                value = normalize_effort(value)
+            except Exception:
+                pass
+        self._reasoning_effort = value
+        # Keep the live LLM-init params in sync so a post-construction change
+        # still reaches the request pipeline (mirrors thinking_budget aliasing).
+        if getattr(self, "_llm_init_params", None) is not None:
+            if value is None:
+                self._llm_init_params.pop('reasoning_effort', None)
+            else:
+                self._llm_init_params['reasoning_effort'] = value
+        # If an LLM instance has already been built (lazy cache), update it too so
+        # a post-construction change still takes effect without a rebuild.
+        instance = getattr(self, "_llm_instance", None)
+        if instance is not None:
+            try:
+                instance.reasoning_effort = value
+            except Exception:
+                pass
 
     @property
     def total_cost(self) -> float:
@@ -3658,10 +3743,21 @@ Summary:"""
 
         One of ``"completed"`` (task finished), ``"max_steps"`` (the unified
         step budget from ``ExecutionConfig.max_steps`` was reached and the run was
-        truncated) or ``"error"``. Lets CLI/CI callers branch on truncation
-        instead of parsing a magic string. Reads from whichever backend
-        (OpenAI-native or LiteLLM) executed the last turn.
+        truncated), a provider block/refusal/truncation
+        (``"content_filtered" | "refused" | "length_truncated"``) derived from the
+        LLM ``finish_reason``/refusal signal, or ``"error"``. Lets CLI/CI callers
+        branch on the terminal reason instead of parsing a magic string. Reads
+        from whichever backend (OpenAI-native or LiteLLM) executed the last turn.
         """
+        # OpenAI-native path records the finish-reason classification directly on
+        # the agent (see ``_extract_llm_response_content``); prefer it so a
+        # provider block/refusal isn't masked by a backend default of "completed".
+        own = getattr(self, '_last_stop_reason', None)
+        # Prefer a specific agent-owned provider block/refusal/truncation before
+        # any backend fallback so a stale backend reason (e.g. ``max_steps``)
+        # cannot mask the OpenAI-native classification recorded for this turn.
+        if own and own != "completed":
+            return own
         # Read from the already-instantiated backends only. ``__openai_client``
         # is the raw (name-mangled) attribute, never the lazy ``_openai_client``
         # property, so this never triggers OpenAI client creation for
@@ -3671,8 +3767,10 @@ Summary:"""
             if backend is None:
                 continue
             reason = getattr(backend, '_last_stop_reason', None)
-            if reason:
+            if reason and reason != "completed":
                 return reason
+        if own:
+            return own
         return "completed"
 
     @property
@@ -6716,7 +6814,23 @@ Answer:"""
         current_response = response_text
         
         while retry_count <= self.max_guardrail_retries:
-            success, result, error = self._validate_with_guardrail(current_response)
+            # A string/LLMGuardrail guardrail fires a *blocking* LLM call inside
+            # _validate_with_guardrail. Offload it to a thread so it does not
+            # stall the event loop (and every other concurrently-running task
+            # under asyncio.gather), mirroring async_memory_mixin's
+            # _run_memory_in_thread executor-offload pattern.
+            loop = asyncio.get_event_loop()
+            # Preserve contextvars (trace emission, session context) across the
+            # executor thread so a custom guardrail sees the same contextual
+            # state as the synchronous path, matching every other
+            # run_in_executor call site in the SDK.
+            from ..trace.context_events import copy_context_to_callable
+            success, result, error = await loop.run_in_executor(
+                None,
+                copy_context_to_callable(
+                    lambda: self._validate_with_guardrail(current_response)
+                ),
+            )
             
             if success:
                 logging.info(f"Agent {self.name}: Guardrail validation passed")
