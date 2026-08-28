@@ -72,9 +72,12 @@ The approval table is cleared at the start of every turn and again when `setChat
 An engine may number `approvalId` per run — the protocol only guarantees uniqueness within a single run. Reusing an id across turns once shadowed the new request behind the previous turn's answered entry: turn 1's prompt rendered as `sent/allow` with dead buttons, still carrying turn 0's `args`. A user could be shown `rm -rf /` as already-allowed because an earlier `ls` reused the id.
 
 ```ts
-// At the start of each turn AND inside setChat(next):
+// setChat now also resets the turn itself, not only the approvals table.
+turn = initialTurn;
 approvals = emptyApprovals;
 ```
+
+Without the `turn` reset, `send()` publishes the stale turn before the new run starts, so New chat cleared the screen only until the user's next message — and the previous chat's **pending approval reappeared with live buttons**. A prompt to run `rm -rf /`, abandoned by starting a new chat, came back with live buttons on the next Send, and Allow posted the decision to the engine.
 
 The within-turn rule is unchanged: the same `approvalId` twice inside one run is still the engine repeating itself — one prompt, not two.
 
@@ -91,6 +94,21 @@ graph TB
     class T0,Switch old
     class Clear clear
     class T1 new
+```
+
+Before the `turn` reset, New chat cleared only the screen — the stale approval reappeared on the next Send.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Screen as Phone screen
+    participant Sheet as Approval sheet
+    User->>Sheet: sees "run rm -rf /" prompt
+    User->>Screen: taps New chat (abandons it)
+    Screen-->>User: blank chat
+    User->>Screen: types something unrelated, Send
+    Sheet-->>User: old "rm -rf /" prompt reappears with live buttons
+    User->>Sheet: Allow — posts the decision to the engine
 ```
 
 ---
@@ -179,6 +197,36 @@ sequenceDiagram
 ```
 
 If you switch apps or lock the phone mid-answer, the run is cancelled — you won't come back to a burning credit meter.
+
+### A user-stopped turn reads as `cancelled`, not `transport`
+
+The controller branches in the read-loop's `catch` on `abort.signal.aborted`. If the abort was ours — tapping Stop cancels the engine, aborts the reader, and the underlying `fetch` errors the body stream — the turn ends `cancelled` with the grey "Stopped" notice. If the stream dies on its own — socket reset, mid-stream 5xx — the turn ends with a `transport` error and the red "Connection lost" retry.
+
+```ts
+// controller.ts — who aborted the stream decides the outcome.
+turn = abort.signal.aborted
+  ? apply(turn, { type: "cancelled", msgId: turn.msgId ?? "unknown", runId })
+  : apply(turn, { type: "error", msgId: turn.msgId ?? "unknown", kind: "transport", message });
+```
+
+```mermaid
+graph TB
+    Catch[💥 stream throws in catch] --> Ask{🔍 abort.signal.aborted?}
+    Ask -->|our abort| Cancelled[🛑 cancelled — grey Stopped]
+    Ask -->|stream died| Transport[🌐 transport — red Connection lost + Retry]
+
+    classDef catch fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef branch fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef cancelled fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef transport fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Catch catch
+    class Ask branch
+    class Cancelled cancelled
+    class Transport transport
+```
+
+The pair is deliberate: hiding a genuine network failure behind a calm "Stopped" removes the retry the user needs; painting a deliberate Stop as "Connection lost" tells a screen reader the wrong thing and offers a Retry button the user didn't ask for.
 
 ### Stop is idempotent and race-safe
 
@@ -295,6 +343,10 @@ A `false` from the engine does not set `aborted`, so the next tap reaches the en
 
 <Accordion title="Overlapping stops share one cancel">
 The background dispose and the Stop button both report the real outcome, so a real cancellation is never surfaced as a refusal.
+</Accordion>
+
+<Accordion title="Distinguish cancelled from transport by who aborted the stream">
+The engine's goodbye frame usually loses the race against the reader's abort, so `cancelled` used to be virtually unreachable. Reading `abort.signal.aborted` at catch time makes the outcome deterministic: a user-tapped Stop reads as `cancelled` (grey "Stopped"), and a stream that dies on its own reads as `transport` (red "Connection lost" with Retry).
 </Accordion>
 
 <Accordion title="Stop and flush on background">
