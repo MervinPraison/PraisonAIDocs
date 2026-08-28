@@ -189,6 +189,28 @@ sequenceDiagram
 
 ---
 
+## Daemon state persistence
+
+The scheduler daemon writes catch-up state to `~/.praisonai/schedulers/<name>.json`. As of [PraisonAI #4537](https://github.com/MervinPraison/PraisonAI/pull/4537):
+
+- **Writes are atomic** — the state file is written to a temp file, `fsync`'d, then renamed into place with `os.replace`. A crash mid-write can no longer produce a truncated JSON file that silently disables cron catch-up on next start.
+- **Corrupt / unreadable state files log a warning** — you'll see `Corrupt scheduler state ...` or `Cannot access scheduler state ...` in the logs, then the scheduler re-anchors from process start (previous behaviour with no log).
+
+If a scheduled run misses its slot after a crash, grep the logs for those two messages first. The sync scheduler shares the same behaviour — see [Scheduler CLI → Daemon state persistence](/cli/scheduler#daemon-state-persistence).
+
+```mermaid
+sequenceDiagram
+    participant Scheduler
+    participant Tmp as ~/.praisonai/schedulers/.state-XXX.tmp
+    participant State as ~/.praisonai/schedulers/name.json
+
+    Scheduler->>Tmp: write json + flush + fsync
+    Scheduler->>State: os.replace(Tmp, State)
+    Note over State: atomic swap — either old or new, never partial
+```
+
+---
+
 ## Multi-process safety (at-most-once)
 
 Without an atomic claim, two workers polling the same store could each fire the same due job — causing double-posts, double-charges, or duplicated side effects.
@@ -514,6 +536,8 @@ Use exponential backoff with jitter. Both sync and async schedulers share the sa
 # - Same behavior as sync AgentScheduler
 await scheduler.start("hourly", max_retries=5)
 ```
+
+`await scheduler.stop()` interrupts a retry backoff instantly — you don't need to configure a shorter `cap` just to make shutdown responsive. See the [Graceful Shutdown](#graceful-shutdown) accordion.
 </Accordion>
 
 <Accordion title="Graceful Shutdown">
@@ -527,6 +551,24 @@ finally:
     stats = await scheduler.get_stats()
     await scheduler.stop()
     print(f"Final stats: {stats}")
+```
+
+<Note>
+**`stop()` is prompt during retry backoff.** As of [PraisonAI #4537](https://github.com/MervinPraison/PraisonAI/pull/4537), `await scheduler.stop()` interrupts an in-flight retry sleep immediately — it will not hold for the full backoff `cap` (default 300 s). Shutdown is bounded by the current in-flight agent run, so containers stopped via SIGTERM shut down inside the normal grace window. This matches the sync scheduler's [interruptible backoff](/cli/scheduler#interruptible-backoff-pr-1673).
+</Note>
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Scheduler
+    participant Backoff
+
+    App->>Scheduler: run
+    Scheduler->>Backoff: retry attempt failed → sleep(wait_time)
+    App->>Scheduler: await stop()
+    Note over Backoff: stop_event fires
+    Backoff-->>Scheduler: return immediately (no wait_time)
+    Scheduler-->>App: graceful shutdown
 ```
 </Accordion>
 
