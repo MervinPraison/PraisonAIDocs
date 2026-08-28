@@ -263,16 +263,60 @@ Precedence (per agent):
 
 1. **CLI `tool_timeout` wins for every agent** — an explicit `--tool-timeout` value overrides YAML for all agents.
 2. **Per-agent YAML value wins over the CLI absence.** Each agent's declared value is applied to its own tool calls.
-3. **Uniform declared values** (all agents declare the same value, or only one agent declares) still take a shared-wrap fast path — behaviour is identical to the pre-PR-#4477 uniform case.
-4. **Heterogeneous per-agent values** (different agents declare different values) are now honoured per-agent — the tightest value no longer collapses onto every agent.
-5. **Agents without a declared `tool_timeout`** fall through to the CLI value, or to no timeout if neither is set.
+3. **Uniform declared values** (**every** agent declares `tool_timeout` **and** every value is identical) take a shared-wrap fast path. If any agent omits `tool_timeout`, the shared wrap is skipped entirely — even if the remaining declarations agree.
+4. **Heterogeneous per-agent values** (different agents declare different values) are honoured per-agent — the tightest value no longer collapses onto every agent.
+5. **Agents without a declared `tool_timeout`** fall through to the CLI value if set, otherwise their tools run with **no imposed timeout** — they do **not** inherit another agent's declared value via the shared dict.
 6. **Booleans are ignored** — only `int`/`float` values count.
+
+<Warning>
+**Correction (PR #4468).** A previous version of the wrapper treated a **single** declared `tool_timeout` (e.g. one agent sets it, others omit it) as "uniform" and wrapped every shared tool with that value — so the undeclared agents silently inherited it and their long-running calls failed with `ToolTimeoutError`. That behaviour is removed: if any agent omits `tool_timeout`, the shared wrap is skipped and undeclared agents run **without** an imposed timeout. If you want a common budget across a mixed config, declare it on every agent (or pass `--tool-timeout` at the CLI).
+</Warning>
+
+<Tabs>
+  <Tab title="Mixed — one declares, one omits">
+    ```yaml
+    roles:
+      strict_router:
+        tool_timeout: 5          # declared
+        tools: [internet_search]
+      scraper:
+        # omitted — no imposed timeout
+        tools: [scrape_page]
+    ```
+
+    Result: `strict_router` tools wrap at 5 s; `scraper` tools run **unwrapped**.
+    No shared-dict wrap is installed.
+  </Tab>
+
+  <Tab title="Uniform — every agent declares the same value">
+    ```yaml
+    roles:
+      strict_router:
+        tool_timeout: 5
+        tools: [internet_search]
+      scraper:
+        tool_timeout: 5          # declared, same value
+        tools: [scrape_page]
+    ```
+
+    Result: shared-wrap fast path — one 5 s guard on every tool in `tools_dict`.
+  </Tab>
+
+  <Tab title="CLI override">
+    ```bash
+    praisonai run agents.yaml --tool-timeout 5
+    ```
+
+    Result: CLI wins for every agent regardless of what they declared.
+  </Tab>
+</Tabs>
 
 ```mermaid
 graph TB
-    Q{Any agent declares<br/>tool_timeout?}
-    Q -->|No| N[No wrap applied]
-    Q -->|Yes| U{All declared<br/>values identical?}
+    Q{Does every agent<br/>declare tool_timeout?}
+    Q -->|No agents in config| N[No wrap applied]
+    Q -->|No — some omit it| P[Per-agent resolver:<br/>declared agents get their value;<br/>undeclared agents get no wrap]
+    Q -->|Yes — every agent declares| U{All declared<br/>values identical?}
     U -->|Yes| S[Uniform wrap:<br/>single guard on shared tools_dict]
     U -->|No| H[Per-agent resolver:<br/>each agent's tools get its own guard]
 
@@ -280,7 +324,7 @@ graph TB
     classDef path fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Q,U question
-    class N,S,H path
+    class N,P,S,H path
 ```
 
 A heterogeneous config where both budgets are honoured — `fast_router` aborts cheap tools at 5s, `slow_analyst` keeps its 120s window:
