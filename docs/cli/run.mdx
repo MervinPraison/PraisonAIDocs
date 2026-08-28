@@ -24,6 +24,10 @@ Single-word direct prompts that look like reserved commands or common typos now 
 `praisonai run` exits **`2`** when the run hits its `max_iter` / `max_steps` budget and wraps up with a partial-progress summary. Under `--output json` / `--output stream-json` this surfaces as `{"status": "truncated", "result": "<summary>"}`, so CI and scripts never mistake a truncated run for a completed one. See [Exit Codes](#exit-codes) and the [Truncated payload](#truncated-payload-output-json-output-stream-json) subsection.
 </Info>
 
+<Info>
+Exit **`2`** also covers three provider-block outcomes — `content_filtered`, `refused`, and `length_truncated` — when the model's `finish_reason` / `refusal` signals a content-filter block, safety refusal, or length cutoff. Under `--output json` the `status` carries the specific reason (`{"status": "<reason>", "result": "<partial text or null>"}`). See the [Provider-block payload](#provider-block-payload-output-json-output-stream-json) subsection.
+</Info>
+
 <Note>
 `praisonai run "..."` with no cloud key and no `--model` picks a reachable local model automatically. If Ollama (or any OpenAI-compatible local server) is running, you'll see a one-line stderr notice and the run continues:
 
@@ -495,7 +499,11 @@ praisonai run --output verbose "What is the capital of France?"
 graph LR
     subgraph "praisonai run outcome"
         Start[📝 Agent.start/run result] --> Check{🔍 non-empty?}
-        Check -->|No: None or empty| Fail[❌ exit 1<br/>run_failed + remediation]
+        Check -->|No: None or empty| Block{🔍 last_stop_reason<br/>provider block?}
+        Block -->|content_filtered| CF[🛡️ exit 2<br/>status: "content_filtered"]
+        Block -->|refused| Ref[🚫 exit 2<br/>status: "refused"]
+        Block -->|length_truncated| Len[✂️ exit 2<br/>status: "length_truncated"]
+        Block -->|No| Fail[❌ exit 1<br/>run_failed + remediation]
         Check -->|Yes: real answer| Reason{🔍 last_stop_reason<br/>== "max_steps"?}
         Reason -->|No| Ok[✅ exit 0<br/>Run completed]
         Reason -->|Yes| Trunc[⚠️ exit 2<br/>status: "truncated"<br/>summary preserved]
@@ -508,9 +516,9 @@ graph LR
     classDef failure fill:#8B0000,stroke:#7C90A0,color:#fff
 
     class Start input
-    class Check,Reason gate
+    class Check,Reason,Block gate
     class Ok success
-    class Trunc truncated
+    class Trunc,CF,Ref,Len truncated
     class Fail failure
 ```
 
@@ -523,10 +531,13 @@ graph LR
 | `1` | `--image` combined with `--agent` / `--profile` / a YAML file / `--output actions`, or a comma inside a single `--image` value | Direct-prompt run |
 | `1` | Warm-runtime major-version mismatch on `--attach` | `--attach <id>` |
 | `2` | Run hit its `max_iter` / `max_steps` budget and returned a wrap-up summary (`agent.last_stop_reason == "max_steps"`) | Actions path (`_run_prompt`), `--agent` (custom-agent) path, `--profile` / `--profile-deep` (profiling report is still printed first) |
+| `2` | Provider content filter blocked the response (`agent.last_stop_reason == "content_filtered"`) | All three run paths (`_run_prompt`, `--agent`, `--profile` / `--profile-deep`) |
+| `2` | Model refused to answer / safety refusal (`agent.last_stop_reason == "refused"`) | All three run paths |
+| `2` | Response hit the model's output length limit (`agent.last_stop_reason == "length_truncated"`) | All three run paths |
 | `2` | Single-word direct prompt collides with a reserved command / typo guard | Direct prompt |
 
 <Note>
-Exit `2` covers two independent cases: **truncation** (a new terminal outcome introduced by PR [#4100](https://github.com/MervinPraison/PraisonAI/pull/4100)) and the pre-existing **reserved-command guard**. They share the code but are unrelated — a truncated run always emits `status: "truncated"` under `--output json`, while the guard fails fast before any run.
+Exit `2` covers several independent cases: **step-limit truncation** (`status: "truncated"`, PR [#4100](https://github.com/MervinPraison/PraisonAI/pull/4100)), the three **provider blocks** (`status: "content_filtered" \| "refused" \| "length_truncated"`, PR [#4472](https://github.com/MervinPraison/PraisonAI/pull/4472)), and the pre-existing **reserved-command guard**. They share the exit code but are unrelated — each incomplete-run case emits its specific `status` under `--output json`, while the guard fails fast before any run.
 </Note>
 
 ### Failure payload (`--output json` / `--output stream-json`)
@@ -576,6 +587,26 @@ JSON / stream-JSON consumers do **not** receive this stderr warning (the CLI che
 
 See [Step Budget](/features/max-steps) for how `max_steps` truncation works, and [Agent Run Outcomes → CLI Mapping](/docs/features/agent-run-outcomes#cli-mapping-praisonai-run) for the SDK-to-CLI status mapping.
 
+### Provider-block payload (`--output json` / `--output stream-json`)
+
+When the model's `finish_reason` / `refusal` signals a content-filter block, safety refusal, or length cutoff, the CLI preserves any partial text but marks the run with the **specific reason** and exits `2`:
+
+```json
+{"status": "content_filtered", "result": "<partial text or null>"}
+{"status": "refused", "result": "<partial text or null>"}
+{"status": "length_truncated", "result": "<partial text or null>"}
+```
+
+In interactive (non-JSON) mode the CLI prints the matching human-readable warning to stderr:
+
+```
+Run blocked: the provider's content filter blocked the response.
+Run refused: the model declined to answer (safety refusal).
+Run truncated: the response hit the model's output length limit.
+```
+
+JSON / stream-JSON consumers do **not** receive the stderr warning — the `status` field carries the machine signal. A provider block wins over a generic empty-result failure, so an actionable reason is never masked as a plain `run_failed`. See [Provider block outcomes](/features/run-outcome#provider-block-outcomes) for the SDK-level classifier and precedence.
+
 ### CI usage
 
 Test the run in-process first — the CLI's exit-code contract mirrors this success test.
@@ -606,9 +637,12 @@ Branch on the JSON `status` to handle all three outcomes — `success`, `truncat
 result=$(praisonai run --output json "Refactor the auth module and add tests")
 status=$(echo "$result" | jq -r '.status // "success"')
 case "$status" in
-  success)   echo "done" ;;
-  truncated) echo "hit the step limit; consider re-running with a higher --max-iter"; exit 2 ;;
-  failed)    echo "$result" | jq -r '.message'; exit 1 ;;
+  success)          echo "done" ;;
+  truncated)        echo "hit the step limit; consider re-running with a higher --max-iter"; exit 2 ;;
+  content_filtered) echo "provider blocked the response; try rephrasing"; exit 2 ;;
+  refused)          echo "model declined; try a different model"; exit 2 ;;
+  length_truncated) echo "response cut off; re-run with a higher --max-tokens"; exit 2 ;;
+  failed)           echo "$result" | jq -r '.message'; exit 1 ;;
 esac
 ```
 
@@ -619,7 +653,7 @@ praisonai run "…big task…"
 case $? in
   0) echo "done" ;;
   1) echo "run failed" ;;
-  2) echo "truncated — partial answer above" ;;
+  2) echo "incomplete run (truncated / content_filtered / refused / length_truncated) — check --output json status" ;;
 esac
 ```
 
