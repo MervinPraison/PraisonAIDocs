@@ -18,6 +18,9 @@ graph LR
         Outcome --> Cancelled[🛑 cancelled]
         Outcome --> Aborted[🚫 aborted]
         Outcome --> Failed[❌ failed]
+        Outcome --> CF[🛡️ content_filtered]
+        Outcome --> Ref[🚫 refused]
+        Outcome --> Len[✂️ length_truncated]
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -28,7 +31,7 @@ graph LR
     class Run agent
     class Flag choice
     class Str,Completed,Outcome result
-    class Timeout,Cancelled,Aborted,Failed fail
+    class Timeout,Cancelled,Aborted,Failed,CF,Ref,Len fail
 ```
 
 <Note>
@@ -39,7 +42,7 @@ graph LR
 | **Import** | `from praisonaiagents import RunOutcome` | `from praisonaiagents import AgentRunOutcome` |
 | **Module** | `praisonaiagents.agent.run_outcome` | `praisonaiagents.run_outcome` |
 | **Field** | `reason` | `status` |
-| **Values** | `completed \| hard_timeout \| cancelled \| aborted \| failed` | `success \| failure \| timeout \| cancelled \| invalid_output` |
+| **Values** | `completed \| hard_timeout \| cancelled \| aborted \| failed \| content_filtered \| refused \| length_truncated` | `success \| failure \| timeout \| cancelled \| invalid_output` |
 | **Where it comes from** | `agent.run(..., return_outcome=True)` / `agent.astart(..., return_outcome=True)` | Task validation, handoff results |
 | **Purpose** | Host-facing terminal outcome for a whole run (bot/gateway dispatch) | Typed validation/handoff status (retry, invalid-output detection) |
 </Note>
@@ -132,7 +135,7 @@ sequenceDiagram
     end
 ```
 
-The five terminal reasons and the action each one signals:
+The eight terminal reasons and the action each one signals:
 
 | `reason` | Meaning | Typical host action |
 |---|---|---|
@@ -141,8 +144,13 @@ The five terminal reasons and the action each one signals:
 | `cancelled` | External `asyncio.CancelledError` **or** a domain supersede/interrupt error surfaced | Silently drop; never DLQ; never re-deliver |
 | `aborted` | Drain / shutdown-named error (host is shutting down) | Silently drop |
 | `failed` | Anything else — including a nested inner `asyncio.TimeoutError` | DLQ with `outcome.error` |
+| `content_filtered` | Provider's content filter blocked the response | Rephrase; adjust provider safety settings |
+| `refused` | Model declined to answer (safety refusal) | Rephrase or try a different model |
+| `length_truncated` | Response hit the model's output length limit | Re-run with a higher `max_tokens` |
 
-Precedence is **sticky**: a `hard_timeout` is never silently downgraded by a later cleanup error.
+The last three — `content_filtered`, `refused`, `length_truncated` — come from the LLM's `finish_reason` / `refusal` signal on the response, not from a raised exception. See [Provider block outcomes](#provider-block-outcomes).
+
+Precedence is **sticky**: a `hard_timeout` is never silently downgraded by a later cleanup error. A provider block/refusal/truncation outranks `failed` (so an actionable reason is not masked by a generic empty-result failure) but stays below `aborted` / `cancelled` / `hard_timeout` (host-level lifecycle signals win).
 
 ---
 
@@ -158,7 +166,11 @@ graph TB
     Q3 -->|Yes| Cancelled[🛑 cancelled]
     Q3 -->|No| Q4{Host draining / shutting down?}
     Q4 -->|Yes| Aborted[🚫 aborted]
-    Q4 -->|No| Failed[❌ failed]
+    Q4 -->|No| Q5{Model produced no usable text?}
+    Q5 -->|content_filter| CF[🛡️ content_filtered]
+    Q5 -->|refusal set| Ref[🚫 refused]
+    Q5 -->|length / max_tokens| Len[✂️ length_truncated]
+    Q5 -->|No| Failed[❌ failed]
     Nested[Nested inner asyncio.TimeoutError] --> Failed
 
     classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -167,12 +179,71 @@ graph TB
     classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
 
     class Start start
-    class Q1,Q2,Q3,Q4 choice
+    class Q1,Q2,Q3,Q4,Q5 choice
     class Completed ok
-    class Timeout,Cancelled,Aborted,Failed,Nested fail
+    class Timeout,Cancelled,Aborted,Failed,Nested,CF,Ref,Len fail
 ```
 
 A nested inner `asyncio.TimeoutError` (a tool or handoff that exhausted its own budget) resolves to `failed`, **not** `hard_timeout`. Only the run-level `timeout` budget produces `hard_timeout`.
+
+---
+
+## Provider block outcomes
+
+Three reasons come from the LLM's own response signal instead of an exception — so a run that ends without a usable answer is no longer collapsed into a silent empty `completed` or a generic `failed`.
+
+```mermaid
+graph LR
+    subgraph "Provider Block Outcomes"
+        Run[🤖 agent.run / astart] --> LLM[🧠 LLM call]
+        LLM --> Check{Provider signal?}
+        Check -->|finish_reason=content_filter| CF[🛡️ content_filtered]
+        Check -->|message.refusal set| Ref[🚫 refused]
+        Check -->|finish_reason=length| Len[✂️ length_truncated]
+        Check -->|stop / tool_calls| OK[✅ completed]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef choice fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef block fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Run agent
+    class LLM proc
+    class Check choice
+    class OK ok
+    class CF,Ref,Len block
+```
+
+The core classifies the response with `classify_finish_reason(finish_reason, refusal)`: a truthy `refusal` → `refused`; `finish_reason` containing `content_filter` → `content_filtered`; `length` / `max_tokens` / `*truncat*` → `length_truncated`; a normal `stop` / `tool_calls` / unknown → no block. The specific reason surfaces on both `RunOutcome.reason` and [`agent.last_stop_reason`](/features/max-steps#how-it-works).
+
+### Precedence ladder
+
+A provider block sits above `failed` but below the host-level lifecycle signals — so an actionable reason is never masked, yet a shutdown/cancel still wins.
+
+```mermaid
+graph TB
+    subgraph "Terminal Reason Precedence (sticky, higher wins)"
+        L0[completed<br/>0] --> L1[failed<br/>1]
+        L1 --> L2[content_filtered / refused / length_truncated<br/>2]
+        L2 --> L3[aborted<br/>3]
+        L3 --> L4[cancelled<br/>4]
+        L4 --> L5[hard_timeout<br/>5]
+    end
+
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fail fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef block fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef host fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class L0 ok
+    class L1 fail
+    class L2 block
+    class L3,L4,L5 host
+```
+
+A `max_steps` truncation is sticky and is **never** downgraded by a later provider block — a provider block only wins when the run did not already hit the step limit.
 
 ---
 
@@ -182,7 +253,7 @@ A nested inner `asyncio.TimeoutError` (a tool or handoff that exhausted its own 
 
 | Attribute | Type | Default | Description |
 |---|---|---|---|
-| `reason` | `TerminalReason` | required | One of `"completed" \| "hard_timeout" \| "cancelled" \| "aborted" \| "failed"` |
+| `reason` | `TerminalReason` | required | One of `"completed" \| "hard_timeout" \| "cancelled" \| "aborted" \| "failed" \| "content_filtered" \| "refused" \| "length_truncated"` |
 | `output` | `Optional[str]` | `None` | Partial or final text, if any |
 | `error` | `Optional[str]` | `None` | Redacted error message when `reason == "failed"` |
 | `succeeded` | `bool` (property) | — | `True` only when `reason == "completed"` |
@@ -196,7 +267,7 @@ Class methods:
 
 `from_exception` matches by type name: `hardtimeout`/`runtimeout`/`budgettimeout` → `hard_timeout`; `asyncio.CancelledError` or `supersed`/`interrupt`/`cancelled` → `cancelled`; `abort`/`drain`/`shutdown` → `aborted`; everything else → `failed` with `error=str(exc)`.
 
-`TerminalReason` is a `Literal["completed", "hard_timeout", "cancelled", "aborted", "failed"]` (with a `str` fallback on Python `<3.8`), exported from `praisonaiagents.agent`.
+`TerminalReason` is a `Literal["completed", "hard_timeout", "cancelled", "aborted", "failed", "content_filtered", "refused", "length_truncated"]` (with a `str` fallback on Python `<3.8`), exported from `praisonaiagents.agent`. The tuple `PROVIDER_BLOCK_REASONS = ("content_filtered", "refused", "length_truncated")` groups the three provider-block reasons.
 
 New kwargs on `run()` and `astart()`:
 
@@ -235,6 +306,18 @@ elif outcome.reason == "hard_timeout":
     escalate()
 elif outcome.reason in ("cancelled", "aborted"):
     pass  # do not retry
+```
+
+Branch on a provider block/refusal/truncation:
+
+```python
+outcome = agent.run(prompt, return_outcome=True)
+if outcome.reason == "content_filtered":
+    notify_user("The provider blocked that request. Try rephrasing.")
+elif outcome.reason == "refused":
+    notify_user("The model declined. Try a different phrasing or model.")
+elif outcome.reason == "length_truncated":
+    notify_user("Response was cut off — please increase max_tokens.")
 ```
 
 Manual normalisation in a wrapper that owns its own try/except:
