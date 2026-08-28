@@ -171,6 +171,44 @@ sequenceDiagram
     Controller-->>Button: true
 ```
 
+### A refused stop is retryable
+
+A `false` from the engine leaves the run alive and does **not** short-circuit the next tap.
+
+When the engine answers `cancel(runId) === false`, `stop()` clears `run.cancelling` and never calls `run.abort.abort()`. Two things follow: the reader stays attached to a run the engine says is still running, and `aborted` stays unset, so the **next** tap reaches the engine again rather than hitting the idempotence guard.
+
+```ts
+// controller.ts — abort ONLY when the engine confirms.
+const stopped = await deps.engine.cancel(run.runId);
+if (stopped) {
+  run.abort.abort();          // accepted: idempotent from here
+} else {
+  run.cancelling = undefined; // refused: retry re-asks the engine
+}
+return stopped;
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Controller
+    participant Engine
+    User->>Controller: stop()
+    Controller->>Engine: cancel(r1)
+    Engine-->>Controller: false (refused)
+    Controller-->>User: stopRefused notification
+    User->>Controller: stop() again
+    Controller->>Engine: cancel(r1)
+    Engine-->>Controller: true
+    Controller-->>User: no notification (success)
+```
+
+A second `true` reaches the user as silence — `stopNotice` defines an accepted stop as no notification. A second `false` shows the refusal again. Before this, the idempotence guard aborted the reader even on a refusal, so the retry short-circuited to `true` without asking the engine, and the run kept generating and billing while the user was told nothing.
+
+<Note>
+The two guarantees are a pair: an **accepted** stop is idempotent (a repeat tap does not re-ask the engine), and a **refused** stop is retryable (a repeat tap does re-ask). See [Stop is idempotent and race-safe](#stop-is-idempotent-and-race-safe) above.
+</Note>
+
 ### When Stop is refused
 
 The app tells you when a stop did not land, instead of going quiet as though it worked.
@@ -187,6 +225,10 @@ sequenceDiagram
     Engine-->>Controller: false (not live)
     Controller-->>User: stopRefused notification
 ```
+
+<Note>
+**New chat is a stop.** Tapping New chat calls `controller.stop()` before it clears the transcript, so starting a fresh conversation cancels any live run. See [New chat semantics](/features/mobile/overview#new-chat).
+</Note>
 
 <Note>
 A cancelled turn is never persisted, so it has no `end` and no `usage`, yet it stays on screen — which is why its index cannot be computed client-side.
@@ -209,8 +251,12 @@ Position holds only while exactly one approval is outstanding; the moment a seco
 The same `approvalId` on a later turn is a fresh request, never a repeat of the answered one. Switching chats also clears the pending prompts, so a different conversation cannot inherit the last one's approvals.
 </Accordion>
 
-<Accordion title="Stop is safe to call twice">
-The second tap reports success; the engine is not asked again for a run it already cancelled.
+<Accordion title="An accepted stop is safe to call twice">
+Once the engine confirms, the run is aborted and a second tap short-circuits to `true` without re-asking. The guard applies **only after the engine confirms**.
+</Accordion>
+
+<Accordion title="A refused stop is safe to retry">
+A `false` from the engine does not set `aborted`, so the next tap reaches the engine again instead of short-circuiting. Retrying a refused stop actually re-asks; a second acceptance is silent, a second refusal shows the notice again.
 </Accordion>
 
 <Accordion title="Overlapping stops share one cancel">
