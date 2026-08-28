@@ -59,6 +59,40 @@ An `approval_request` carries `approvalId`, `callId`, `name`, and `args`.
 
 The decision is sent back with `approvalId`. `callId` only says which tool row to attach the prompt to.
 
+<Note>
+If the `decide` call itself throws — a socket closed mid-send — the row renders as **failed** and carries the reason (e.g. `"socket closed"`). It is never quietly acknowledged as sent, because the engine may not have received the decision at all.
+</Note>
+
+---
+
+## Approvals are per turn
+
+The approval table is cleared at the start of every turn and again when `setChat()` switches conversations, so a new prompt is never confused with an answered one.
+
+An engine may number `approvalId` per run — the protocol only guarantees uniqueness within a single run. Reusing an id across turns once shadowed the new request behind the previous turn's answered entry: turn 1's prompt rendered as `sent/allow` with dead buttons, still carrying turn 0's `args`. A user could be shown `rm -rf /` as already-allowed because an earlier `ls` reused the id.
+
+```ts
+// At the start of each turn AND inside setChat(next):
+approvals = emptyApprovals;
+```
+
+The within-turn rule is unchanged: the same `approvalId` twice inside one run is still the engine repeating itself — one prompt, not two.
+
+```mermaid
+graph TB
+    T0[🧠 Turn 0 approvals] -->|turn 1 begins| Clear[🧹 approvals = empty]
+    Clear --> T1[📱 Turn 1: fresh table]
+    Switch[🔀 setChat next] --> Clear
+
+    classDef old fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef clear fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef new fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class T0,Switch old
+    class Clear clear
+    class T1 new
+```
+
 ---
 
 ## The Two-Approval Case
@@ -91,7 +125,9 @@ Bind each prompt to its row by `callId`, and send the decision back with `approv
 const stopped = await controller.stop();
 ```
 
-`stop` returns `true` when it cancelled a live run and `false` when there was nothing to cancel or the engine refused. Stop cancels the network request too: the controller aborts the same signal it handed to `fetch`, so a request already in flight is dropped rather than left generating tokens after you tapped the button.
+`stop` returns `true` when it cancelled a live run and `false` when there was nothing to cancel. Stop cancels the network request too: the controller aborts the same signal it handed to `fetch`, so a request already in flight is dropped rather than left generating tokens after you tapped the button.
+
+`stop()` captures the run when tapped. It no longer re-reads `live` after awaiting the engine, so tapping Stop just as the last token lands cannot throw a `TypeError` that blanks the whole screen when the queue is empty, nor cancel the queued follow-up instead of the finished run.
 
 ```mermaid
 sequenceDiagram
@@ -100,6 +136,7 @@ sequenceDiagram
     participant Adapter
     participant Engine
     User->>Controller: stop()
+    Controller->>Controller: capture the live run
     Controller->>Engine: cancel(r1)
     Engine-->>Controller: cancelled
     Controller->>Adapter: abort signal
@@ -109,11 +146,36 @@ sequenceDiagram
 
 If you switch apps or lock the phone mid-answer, the run is cancelled — you won't come back to a burning credit meter.
 
+### Stop is idempotent and race-safe
+
+Stop is safe to call more than once, and two overlapping stops share a single cancel.
+
+A second tap reports `true`, not a refusal: the controller short-circuits on an already-aborted run instead of asking the engine again. The background → dispose path calls `stop()` twice by design, so the second call must not read as a failure.
+
+Two stops that overlap — the background handler and the user's Stop button, say — both receive the same in-flight promise. The engine is asked exactly once, and both callers get the true result. This removes the false "the engine did not accept the stop" notice that once fired for a stop that did happen.
+
+Idempotence never invents a cancellation: `stop()` still returns `false` when there was nothing to stop.
+
+```mermaid
+sequenceDiagram
+    participant Background
+    participant Button as Stop button
+    participant Controller
+    participant Engine
+    Background->>Controller: stop()
+    Controller->>Engine: cancel(r1)
+    Button->>Controller: stop()
+    Controller-->>Button: same in-flight promise
+    Engine-->>Controller: cancelled
+    Controller-->>Background: true
+    Controller-->>Button: true
+```
+
 ### When Stop is refused
 
 The app tells you when a stop did not land, instead of going quiet as though it worked.
 
-When the engine refuses a stop — `controller.stop()` returns `false` because the run was not live, or the underlying stop call rejects — the user sees a notification carrying the `stopRefused` string ("The engine did not accept the stop. It may still be running."). A button that quietly confirms a cancellation that never happened is worse than one that reports it could not.
+When the engine genuinely refuses a stop — `controller.stop()` returns `false` because the run was not live, or the underlying stop call rejects — the user sees a notification carrying the `stopRefused` string ("The engine did not accept the stop. It may still be running."). A button that quietly confirms a cancellation that never happened is worse than one that reports it could not.
 
 ```mermaid
 sequenceDiagram
@@ -141,6 +203,18 @@ Position holds only while exactly one approval is outstanding; the moment a seco
 
 <Accordion title="Cancel by runId only">
 `cancel` returns `false` when the run was not live — a Stop button that confirms a cancellation that never happened is worse than one that reports it could not.
+</Accordion>
+
+<Accordion title="A new turn starts a new approval table">
+The same `approvalId` on a later turn is a fresh request, never a repeat of the answered one. Switching chats also clears the pending prompts, so a different conversation cannot inherit the last one's approvals.
+</Accordion>
+
+<Accordion title="Stop is safe to call twice">
+The second tap reports success; the engine is not asked again for a run it already cancelled.
+</Accordion>
+
+<Accordion title="Overlapping stops share one cancel">
+The background dispose and the Stop button both report the real outcome, so a real cancellation is never surfaced as a refusal.
 </Accordion>
 
 <Accordion title="Stop and flush on background">
