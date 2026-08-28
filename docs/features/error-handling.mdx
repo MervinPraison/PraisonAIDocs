@@ -159,19 +159,20 @@ from praisonaiagents.llm import LLMResponseError
 
 ## Tool Failure Behavior
 
-A tool failure now raises `ToolExecutionError` on the sync path, and returns an error dict to the model on the async path.
+On the sync path, a tool failure resolves down one of three branches:
+
+1. **Tool raises an exception** → the framework wraps it as `ToolExecutionError` and propagates it.
+2. **Tool returns `{"error": "..."}`** → the error dict is handed back to the LLM as a normal tool result, so the model can self-correct (new behavior since PR #4462).
+3. **Tool returns a retryable-transient / denial dict** → `ToolExecutionError` with `is_retryable=True`, or a short-circuit denial.
 
 ```mermaid
 graph TB
     subgraph "Tool failure — sync path"
         SReq[👤 chat request] --> SLLM[🤖 Model calls tool]
-        SLLM --> STool[🔧 Tool raises]
-        STool --> SRaise[🛑 ToolExecutionError propagates]
-    end
-    subgraph "Tool failure — async path"
-        AReq[👤 achat request] --> ALLM[🤖 Model calls tool]
-        ALLM --> ATool[🔧 Tool raises]
-        ATool --> ADict[📄 error dict returned to model]
+        SLLM --> STool{🔧 Tool result}
+        STool -->|raises exception| SRaise[🛑 ToolExecutionError propagates]
+        STool -->|returns error dict| SReturn[📄 Error dict returned to LLM<br/>LLM self-corrects]
+        STool -->|retryable / denied| SRetry[🔁 ToolExecutionError<br/>is_retryable / denial break]
     end
 
     classDef req fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -179,13 +180,22 @@ graph TB
     classDef err fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class SReq,AReq req
-    class SLLM,ALLM,STool,ATool proc
-    class SRaise err
-    class ADict ok
+    class SReq req
+    class SLLM,STool proc
+    class SRaise,SRetry err
+    class SReturn ok
 ```
 
-Wrap sync `chat()` / `start()` calls in `try / except ToolExecutionError`:
+<Note>
+**Behavior change (PraisonAI PR [#4462](https://github.com/MervinPraison/PraisonAI/pull/4462)).** A tool that returns `{"error": "..."}` no longer aborts the run — this was the convention already used by bundled tools like `execute_command`, `tavily_search`, and `exa_search`. Previously the framework raised `ToolExecutionError(is_retryable=False)` for any dict with a truthy `error` key, so an empty-command warning from `execute_command` or a missing-API-key message from a search tool would kill `agent.chat()` mid-turn. Now the LLM sees the error dict as a normal tool result and can self-correct (retry with a real command, ask the user for the missing key, etc.).
+
+Only three cases still raise / short-circuit on the sync path:
+- The tool **raised** an exception (framework-level failure).
+- The dict is a **denial** (`approval_denied`, `permission_denied`, `approval_error`, `policy_denied`, `guardrail_denied`).
+- The dict is a **retryable transient** (`_outer_timeout` on an idempotent tool, `circuit_open`, or a `_praison_retryable` marker outside the tool's retry policy).
+</Note>
+
+Wrap sync `chat()` / `start()` calls in `try / except ToolExecutionError` to catch a **raised** tool exception:
 
 ```python
 from praisonaiagents import Agent, tool, ToolExecutionError
@@ -203,11 +213,29 @@ except ToolExecutionError as e:
     print(f"Tool {e.tool_name} failed: {e.message}")
 ```
 
+A tool that **returns** an error dict (instead of raising) no longer aborts the run — the dict flows back to the model, which retries with corrected arguments:
+
+```python
+from praisonaiagents import Agent, tool
+
+@tool
+def fetch(url: str) -> dict:
+    """Fetch a URL — returns an error dict on bad input."""
+    if not url:
+        return {"error": "Empty URL", "stdout": "", "stderr": ""}
+    ...
+
+agent = Agent(instructions="Use fetch.", tools=[fetch])
+# The model calling fetch("") no longer aborts the run.
+# The error dict flows back to the model and it retries with a real URL.
+agent.start("Fetch example.com and summarise.")
+```
+
 <Warning>
-**Behavior change (fix in PraisonAI PR #4252):** On the sync path, a tool failure now raises `ToolExecutionError`. Previously the sync `Agent.chat()` silently returned `None` and, worse, the tool's error text was treated as an LLM error — so a tool message resembling a rate limit made the framework sleep and re-drive the model with no tool result, then return that hallucinated answer as a success. Callers checking `if agent.chat(...) is None:` should switch to catching the exception — `None` cannot distinguish a guardrail rejection from a tool failure anyway.
+**Behavior change (fix in PraisonAI PR #4252):** On the sync path, a tool that **raises** now raises `ToolExecutionError`. Previously the sync `Agent.chat()` silently returned `None` and, worse, the tool's error text was treated as an LLM error — so a tool message resembling a rate limit made the framework sleep and re-drive the model with no tool result, then return that hallucinated answer as a success. Callers checking `if agent.chat(...) is None:` should switch to catching the exception — `None` cannot distinguish a guardrail rejection from a tool failure anyway.
 </Warning>
 
-The async twin (`agent.achat()`) is unchanged: its executor returns an error dict rather than raising, so the two paths differ in how tool failures surface. See [Async Tool Safety](/features/async-tool-safety) for the async contract.
+Sync and async paths are aligned for plain tool-returned `{"error": ...}` dicts — both hand the error back to the LLM so it can retry with corrected arguments. The two paths still differ for **raised** exceptions: sync `chat()` raises `ToolExecutionError`; async `achat()` returns an error dict. See [Async Tool Safety](/features/async-tool-safety).
 
 ---
 
