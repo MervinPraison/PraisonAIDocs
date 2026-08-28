@@ -177,7 +177,9 @@ Bind each prompt to its row by `callId`, and send the decision back with `approv
 const stopped = await controller.stop();
 ```
 
-`stop` returns `true` when it cancelled a live run and `false` when there was nothing to cancel. Stop cancels the network request too: the controller aborts the same signal it handed to `fetch`, so a request already in flight is dropped rather than left generating tokens after you tapped the button.
+`stop` returns `true` when it cancelled a live run and `false` when there was nothing to cancel — including when the engine's cancel POST returns any non-200 status. Stop cancels the network request too: the controller aborts the same signal it handed to `fetch`, so a request already in flight is dropped rather than left generating tokens after you tapped the button.
+
+The same reader release covers **New chat**, **switching apps**, and **the phone locking mid-answer**: the consumer breaks out of the `for await` iterator, and the engine's `finally` calls `await reader.cancel()`, so the model stops generating and the socket is released. Before [#4579](https://github.com/MervinPraison/PraisonAI/pull/4579), only the request abort was covered — the response stream leaked and the model kept billing after you left.
 
 `stop()` captures the run when tapped. It no longer re-reads `live` after awaiting the engine, so tapping Stop just as the last token lands cannot throw a `TypeError` that blanks the whole screen when the queue is empty, nor cancel the queued follow-up instead of the finished run.
 
@@ -326,7 +328,11 @@ Position holds only while exactly one approval is outstanding; the moment a seco
 </Accordion>
 
 <Accordion title="Cancel by runId only">
-`cancel` returns `false` when the run was not live — a Stop button that confirms a cancellation that never happened is worse than one that reports it could not.
+`cancel` returns `false` when the run was not live, **and also when the engine's cancel POST returns any non-200 status** — a Stop button that confirms a cancellation that never happened is worse than one that reports it could not. The regression test `"a decision or cancel the engine did NOT accept is reported as refused"` iterates `[202, 400, 401, 403, 500, 502]` and asserts `cancel` returns `false` for each.
+</Accordion>
+
+<Accordion title="A decision the engine did not accept is false">
+`decide` returns `false` for a decision the engine did not accept, **including a non-200 response body** — not only an unknown or already-decided id. The `sending → sent` promotion in [Refused decisions stay refused](#refused-decisions-stay-refused) depends on it: a lying `true` once promoted the row past `sent`, so this transport-layer check is the other half of that guarantee. The same test above asserts `decide` returns `false` across `[202, 400, 401, 403, 500, 502]`, with `"a 200 with an ok body is accepted, so the refusal test is not vacuous"` as the companion.
 </Accordion>
 
 <Accordion title="A new turn starts a new approval table">
@@ -355,6 +361,14 @@ Backgrounding stops the run loop and flushes the transcript, because iOS may kil
 
 <Accordion title="A pending decision disables the row">
 The approval buttons disable themselves as soon as a decision is in flight and stay disabled while it is pending — the row is drawn with `disabled = !actionable`. A user hitting Allow twice on a shaky connection cannot send two decisions for the same approval.
+</Accordion>
+
+<Accordion title="Break out of the iterator to release the socket">
+The consumer's `break` — or a `return`, or a thrown exception — out of the `for await` loop is the cancellation channel; there is no separate `close()`. The engine's `finally` calls `await reader.cancel()`, so leaving the stream releases the reader and the model stops billing. The regression test `"leaving the stream early releases the socket"` asserts the underlying `ReadableStream`'s `cancel()` fires when the consumer `break`s after the first delta. See [Stop is idempotent and race-safe](#stop-is-idempotent-and-race-safe).
+</Accordion>
+
+<Accordion title="Before #4579, a refused stop or decision read as success">
+The engine's `postOk` did not check the status it received, so any non-200 — 202, 401, 500, 502 — reported success. As the survival note in [#4579](https://github.com/MervinPraison/PraisonAI/pull/4579) puts it: *"Every non-200 — 202, 401, 500, 502 — reports success. The UI announces a stop that never happened and marks an approval sent that the engine never received."* The fix adds `if (response.status !== 200) return false;`, pinned by `"a decision or cancel the engine did NOT accept is reported as refused"`.
 </Accordion>
 </AccordionGroup>
 
