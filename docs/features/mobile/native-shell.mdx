@@ -58,6 +58,10 @@ npm run test:rust   # → cd src-tauri && cargo test
 ```
 
 The Node cross-language contract test lives at `tools/shell-seam.test.mjs` and greps the same event strings out of both languages.
+
+<Note>
+The same `cargo test` and `cargo clippy -- -D warnings` run in CI on both `ubuntu-22.04` and `macos-15` via the `shell` job in `.github/workflows/mobile.yml`. Both platforms are covered deliberately: the crate is `cfg`-heavy — the back-gesture fallback is `#[cfg(target_os = "android")]` / `ios` / `not(mobile)` — and a `cfg` mistake compiles perfectly on whichever host you happened to try.
+</Note>
 </Step>
 </Steps>
 
@@ -73,7 +77,7 @@ Four events go native → web, one command comes web → native. Every string be
 | Native → Web | `keyboard-height` | `EVT_KEYBOARD` | Number (px) | **`0` is a value, not an absence.** Must fire *through* the show/hide transition, not only at endpoints — or the composer teleports while the keyboard slides |
 | Native → Web | `lifecycle` | `EVT_LIFECYCLE` | `"active" \| "inactive" \| "background"` | Unrecognised phase is dropped by TS, never defaulted (defaulting to `active` would resume the render loop while the app is suspended) |
 | Native → Web | `back-gesture` | `EVT_BACK` | *(no payload)* | The handler takes no argument |
-| Web → Native | `back_gesture_result` | `CMD_BACK_RESULT` | `{ handled: boolean }` | Answered via `bridge.invoke`; failures are swallowed — see arbitration below |
+| Web → Native | `back_gesture_result` | `CMD_BACK_RESULT` | `{ handled: boolean }` | Answered via `bridge.invoke`; failures are swallowed — see arbitration below (no capability entry — app commands via `invoke_handler` are always reachable) |
 
 <Warning>
 Tauri exposes two different event channels. TypeScript subscribes via `plugin:event|listen`, which is Tauri's **event registry**. Only `Emitter::emit` reaches it. A Tauri mobile *plugin* calling `Plugin.trigger` hits a **completely separate** channel — nothing would fire and there would be no error. Use `Emitter::emit` from `on_window_event` or command handlers; do not switch to `Plugin.trigger`.
@@ -83,7 +87,11 @@ Tauri exposes two different event channels. TypeScript subscribes via `plugin:ev
 The events do not fire yet in a production build. `on_window_event` in `lib.rs` is intentionally a stub in this shell ("no dead emit on desktop") — the contract and the arbitration are wired, the emit lines land once the mobile targets are initialised.
 </Note>
 
-The capability file `src-tauri/capabilities/default.json` grants the two permissions this seam needs: `core:event:default` (so the webview may subscribe) and `allow-back-gesture-result` (so it may answer). Without them Tauri rejects `plugin:event|listen` and the command silently.
+The capability file `src-tauri/capabilities/default.json` grants the one permission this seam needs: `core:event:default`, so the webview can subscribe via `plugin:event|listen`. The `back_gesture_result` command is deliberately **not** listed — an app command registered through `invoke_handler` is always reachable and has no ACL entry to grant; naming one that does not exist fails `tauri-build` before the crate compiles.
+
+<Warning>
+Do **not** add an `allow-back-gesture-result` (or similar `allow-<command_name>`) entry to `capabilities/default.json`. Only *plugin* commands have ACL entries; app commands registered via `invoke_handler` are always reachable, and naming a non-existent permission fails `tauri-build`.
+</Warning>
 
 ---
 
@@ -115,6 +123,16 @@ graph TB
 Three failure modes shape the `Gate` in `src-tauri/src/shell/back.rs`.
 
 1. **The answer may never come.** `bridge.invoke` on the TS side swallows every rejection into `null`, so silence is indistinguishable from success. Without a watchdog (`ANSWER_TIMEOUT_MS = 400`), a bundle that failed to load leaves a back button that does nothing *forever* — worse than one that exits.
+
+<Note>
+The floor of `ANSWER_TIMEOUT_MS` is enforced at **compile time** in `src-tauri/src/shell/back.rs`:
+
+```rust
+const _: () = assert!(ANSWER_TIMEOUT_MS >= 250);
+```
+
+Lowering it under 250 ms stops the crate compiling (`E0080`) rather than failing a test someone could skip. Too short a timeout falls back *while a slow handler is still deciding*, sending the app to the background for a back press the user's own UI was about to handle.
+</Note>
 2. **There is no correlation id.** The webview sends `{ handled }` and nothing else. Two presses close together produce two answers Rust cannot tell apart — the second could pop an activity the first decided to keep. **Dropping while pending is the only correct option available on this side.**
 3. **A late answer must not act twice.** If the watchdog fires and the app has backgrounded, an answer arriving after must be ignored, not sent back again. It is the bug this design is most likely to ship, and has its own test in `src-tauri/tests/back_gesture.rs`.
 
@@ -205,6 +223,10 @@ TypeScript drops an unknown phase silently — better to add the phase on both s
 
 <Accordion title="Do not use Plugin.trigger for shell events">
 The TypeScript subscribes to Tauri's event registry, which only `Emitter::emit` reaches. `Plugin.trigger` hits a separate channel and fails with no error.
+</Accordion>
+
+<Accordion title="Do not lower the answer-timeout below 250 ms">
+The floor is a compile-time assertion in `shell::back`, not a runtime test, so lowering it stops the crate compiling. Too short a timeout falls back while a slow handler is still deciding.
 </Accordion>
 
 <Accordion title="Keep the mobile_entry_point attribute on run()">
