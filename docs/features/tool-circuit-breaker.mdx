@@ -20,7 +20,7 @@ agent.start("Search quantum computing")  # circuit breaker protects automaticall
 ```
 
 <Note>
-**Sync and Async Parity**: Circuit breaker protection now applies uniformly to both sync and async tool execution paths. Previously, async calls bypassed circuit breaker checks.
+**Sync and Async Parity**: Circuit breaker protection applies uniformly to both sync and async tool execution paths as of [MervinPraison/PraisonAI#4533](https://github.com/MervinPraison/PraisonAI/pull/4533). The async path (`agent.achat()`, `agent.astart()`) short-circuits via `_circuit_breaker_precheck(...)` before invoking a tool and records the outcome via `_circuit_breaker_record(...)` after. Both a **raised exception** inside the tool and a **result dict carrying `error`** count as breaker failures — but approval / permission / policy / guardrail denials do not. Earlier releases skipped the breaker on `achat()`/`astart()`.
 </Note>
 
 <Note>
@@ -170,6 +170,8 @@ stateDiagram-v2
 | **OPEN** | Tool calls blocked - returns error dict |
 | **HALF_OPEN** | Recovery mode - limited probe calls allowed |
 
+The async path (`achat()` / `astart()`) performs the same OPEN → HALF_OPEN → CLOSED transitions through the shared helpers — `_circuit_breaker_precheck` runs the pre-check, `_circuit_breaker_record` records the outcome — so this diagram applies uniformly to `chat`/`start` and `achat`/`astart`.
+
 ---
 
 ## Configuration Options
@@ -214,11 +216,13 @@ graph TB
 
 Circuit breakers ignore certain error types to avoid false positives:
 
-- **Approval denied errors** - User permission issues don't indicate tool problems
-- **Permission denied errors** - Access control failures aren't tool failures  
-- **Approval process errors** - User workflow issues shouldn't trigger circuit breaking
+- `approval_denied` — user rejected the tool call
+- `permission_denied` — access control failure
+- `approval_error` — approval workflow error
+- `policy_denied` — policy engine deny
+- `guardrail_denied` — guardrail-blocked tool call
 
-These errors are handled normally by the agent without affecting circuit breaker state.
+These exclusions apply to **both the sync and async** execution paths. On the async path they're checked as keys on the result dict returned by the tool, matching the sync `_ToolFailure` wrapper's exclusions — so a denial never counts toward opening the breaker on either path.
 
 ---
 
@@ -227,6 +231,55 @@ These errors are handled normally by the agent without affecting circuit breaker
 Per-agent breakers are pruned from the global registry automatically when the `Agent` is garbage-collected — a `weakref.finalize` callback is registered when each breaker is created. This closes the CPython `id()`-reuse window without requiring `agent.close()` / `agent.aclose()` to be called explicitly.
 
 Calling `agent.close()` / `agent.aclose()` still triggers the same cleanup earlier and deterministically — recommended when you know the agent is done and want registry space reclaimed immediately.
+
+---
+
+## Async tools
+
+A user calling an unreliable async tool via `await agent.achat(...)` sees the breaker open after five raised exceptions (or five error-dict results); further calls short-circuit with a `circuit_open: True` error dict, terminating the async retry loop immediately.
+
+```python
+import asyncio
+from praisonaiagents import Agent, tool
+
+@tool
+async def flaky_upstream(query: str) -> str:
+    """Async tool that may raise on a bad upstream."""
+    raise RuntimeError("upstream 503")
+
+agent = Agent(name="Researcher", tools=[flaky_upstream])
+
+async def main():
+    # After 5 raised failures the breaker opens; the 6th call
+    # short-circuits with {"circuit_open": True} instead of retrying.
+    await agent.achat("Search quantum computing")
+
+asyncio.run(main())
+```
+
+Breakers are per Agent instance (`tool_{id(self)}_{function_name}`), so two agents sharing a tool name never share a breaker — an OPEN breaker on `agent_a` never blocks `agent_b`.
+
+```python
+import asyncio
+from praisonaiagents import Agent, tool
+
+@tool
+async def shared_search(query: str) -> str:
+    """Same tool name, two independent agents."""
+    return f"Results for: {query}"
+
+agent_a = Agent(name="A", tools=[shared_search])
+agent_b = Agent(name="B", tools=[shared_search])
+
+async def main():
+    # agent_a's breaker opening on shared_search never blocks agent_b.
+    await asyncio.gather(
+        agent_a.achat("Search topic A"),
+        agent_b.achat("Search topic B"),
+    )
+
+asyncio.run(main())
+```
 
 ---
 
@@ -312,6 +365,10 @@ Per-agent breakers are auto-pruned when the `Agent` is collected (via `weakref.f
 
 <Accordion title="Surface circuit_open to users">
 When handling `circuit_open: true` responses, provide clear user feedback about temporary tool unavailability and suggest retry timeframes or alternative approaches.
+</Accordion>
+
+<Accordion title="Async tools that raise still open the breaker">
+An async tool that raises (e.g. `RuntimeError("upstream 503")`) counts as a breaker failure just like an error-dict result — the async path records the failure inside its `except` block. Five raised failures in a row open the breaker so the sixth call short-circuits with `circuit_open: True` instead of hammering the flaky tool again.
 </Accordion>
 
 </AccordionGroup>
