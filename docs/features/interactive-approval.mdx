@@ -168,7 +168,7 @@ graph TB
 | Choice | Where it lives | Scope key | Survives restart? |
 |--------|----------------|-----------|-------------------|
 | `[o] once` | Nothing persisted | Cache key `(tool_name, sha256(args))` (existing per-call cache) | No |
-| `[s] session` | In-memory `ApprovalRegistry._session_scoped_targets` | `(agent_name, permission_target)` | **No** — vanishes when the process ends |
+| `[s] session` | In-memory `ApprovalRegistry._session_scoped_targets` | `(scope_id, permission_target)` — per Agent instance, not per display name | **No** — vanishes when the process ends |
 | `[a] always` | `approvals.json` via `PermissionManager` | Suggested pattern (e.g. `bash:git status *`) with `reusable_scope=True` | **Yes** |
 | `[n] no` | Nothing persisted | — | No |
 | `[d] deny & redirect` | **Nothing persisted.** `feedback` string is fed back to the agent as the denied tool's `error_msg` for the next turn. | — | No — feedback is one-turn only, never remembered across calls |
@@ -178,8 +178,35 @@ A nameless `always` grant degrades to `session`. An `always` grant without an `a
 </Note>
 
 <Note>
-`session` grants are keyed by `(agent_name, permission_target)` and live in an in-memory set. `clear_approved()` wipes them, and they are never written to `approvals.json`.
+`session` grants are keyed by `(scope_id, permission_target)` and live in an in-memory set. `clear_approved()` wipes them, and they are never written to `approvals.json`.
 </Note>
+
+### Per-instance scoping
+
+`[s] session` grants (and the in-context cache the fast path checks) are keyed **per Agent instance**, not per display name. Two `Agent()` objects that happen to share the same `name` — including two unnamed `Agent()` instances, which both default to the display name `"Agent"` — never inherit each other's session-scoped approvals.
+
+<Note>
+As of [MervinPraison/PraisonAI#4533](https://github.com/MervinPraison/PraisonAI/pull/4533), the registry keys session grants by a per-instance `scope_id` (falling back to `agent_name` when unavailable, for backward compatibility). Earlier releases keyed by the shared display name, so a `[s] this session` grant on one worker silently unlocked the tool for a distinct same-named worker.
+</Note>
+
+Name-keyed lookups — per-agent backend, risk level, `ask` rules, durable `[a] always` persistence — still use `agent_name`, so YAML rules and `approvals.json` entries scoped to `agent_name: worker` continue to match every `Agent(name="worker")` across runs.
+
+```mermaid
+graph TB
+    subgraph "Two same-named workers, one session grant"
+        H[👤 Human grants<br/>[s] session on Worker-1] --> W1[⚙️ Worker-1<br/>Agent name=Agent]
+        H -.->|before #4533<br/>silent leak| W2[⚙️ Worker-2<br/>Agent name=Agent]
+        H -->|since #4533<br/>never leaks| W1
+    end
+
+    classDef human fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef leak fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class H human
+    class W1 safe
+    class W2 leak
+```
 
 ## How the suggested pattern is derived
 
@@ -217,6 +244,28 @@ agent.start("Fix the broken tests in tests/unit")
 # First `bash:pytest tests/unit` call → prompt appears.
 # Press [s] once → every later `bash:pytest tests/unit` in this run is auto-approved.
 # Close the process → next run prompts again from scratch.
+```
+
+Pressing `[s]` on one worker never leaks to another same-named worker in the same process — session grants are keyed per Agent instance, so two `asyncio.gather(...)` agents both named `"Coder"` (or both unnamed) stay isolated.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+
+# Two unnamed workers — both default to name="Agent"
+worker_1 = Agent(instructions="Fix tests", approval=True)
+worker_2 = Agent(instructions="Run linters", approval=True)
+
+# Pressing [s] on worker_1's first pytest call NEVER auto-approves
+# worker_2's pytest calls in the same process. Session grants are
+# keyed per Agent instance since PR #4533.
+async def run_both():
+    await asyncio.gather(
+        worker_1.astart("Fix broken tests in tests/unit"),
+        worker_2.astart("Run ruff on src/"),
+    )
+
+asyncio.run(run_both())
 ```
 
 Press `[a]` instead when the grant should persist across runs.
@@ -486,6 +535,10 @@ Press `[a]` to write an allow-rule to `approvals.json` via `PermissionManager` (
 `[a]` uses the shared `suggest_scope_pattern` helper so the CLI, YAML `--allow`/`--deny`, and Python `PermissionManager` all scope identically. Compound commands (`&&`, `|`, `;`, `$(...)`) fall back to a **literal single-use** pattern so a persisted rule can only match the exact invocation you approved. For a blanket `<tool>:*` rule, author it directly with `praisonai permissions allow "bash:*"`.
 
 Session grants live in an in-memory `_session_scoped_targets` set and are cleared by `clear_approved()` at run teardown. Always grants persist across restarts and survive `clear_approved()`.
+
+<Note>
+`[a] always` grants are still keyed by `agent_name` in `approvals.json` — they must match across process restarts, and only the display name survives a restart. `[s] session` and the in-context cache are keyed per Agent instance (`scope_id`) so unnamed workers in one process never inherit each other's runtime approvals.
+</Note>
 
 <Tip>
 Tune the derived pattern with [Reusable Approval Scopes](/features/reusable-approval-scopes) — call `PermissionManager.suggest_scope_pattern(target)` for a custom UI, or hand-author `bash:git *` via `praisonai permissions allow`.
