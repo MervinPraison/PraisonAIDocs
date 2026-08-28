@@ -1,11 +1,11 @@
 ---
 title: "Locale, Direction & Segmentation"
 sidebarTitle: "i18n & A11y"
-description: "How the mobile UI decides text direction and splits sentences on hosts without full Intl support."
+description: "How the mobile UI decides text direction, splits sentences, and formats numbers, dates, and durations on hosts without full Intl support."
 icon: "globe"
 ---
 
-Both text direction and sentence splitting answer on every host, degrading to explicit tables when `Intl` has no data.
+Text direction, sentence splitting, and number/date/duration formatting all answer on every host, degrading to explicit fallbacks when `Intl` has no data — or when a stored locale reaches the UI as an underscore tag like `"en_US"`.
 
 ```mermaid
 graph LR
@@ -142,6 +142,103 @@ The seam guarantee is why a caller can hold back the last segment until it is fi
 
 ---
 
+## Number, date, and duration formatting
+
+Chat-list dates, message timestamps, tool-call durations, and transcript counts all come from `format-intl`, which asks `Intl` first and falls back to ASCII when a tag is refused.
+
+```mermaid
+graph LR
+    Fn["🏷️ formatFn(locale, …)"] --> Memo{"Intl constructor via memo()?"}
+    Memo -->|built| Primary["⚡ primary ICU output"]
+    Memo -->|threw / absent| Fallback["📖 ASCII fallback tables"]
+    Primary --> Out["✅ formatted string"]
+    Fallback --> Out
+
+    classDef fn fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef probe fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef primary fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef out fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Fn fn
+    class Memo probe
+    class Primary,Fallback primary
+    class Out out
+```
+
+Every formatter shares the pattern of `directionFromTables` and `fallbackSentences`: an `Intl` constructor is memoised behind a `try/catch`, and every entry point has a non-throwing answer.
+
+### Quick Start
+
+<Steps>
+<Step title="Format a number, a count, or a date">
+```ts
+import { formatNumber, formatCountLocalised, formatDate } from "praisonai-mobile/ui/i18n/format-intl";
+
+formatNumber("en", 1234.5);                   // "1,234.5"
+formatCountLocalised("ja", 15000);            // "1.5万"
+formatDate("en", 1_700_000_000_000, "UTC");   // "Nov 14, 2023"
+```
+`timeZone` is a required argument on `formatDate` — pass `null` for the host's zone, but it must be typed.
+</Step>
+
+<Step title="Format a relative or elapsed time">
+```ts
+import { formatRelativeLocalised, formatElapsedLocalised } from "praisonai-mobile/ui/i18n/format-intl";
+import { en } from "praisonai-mobile/ui/i18n/strings";
+
+const now = Date.now();
+
+formatRelativeLocalised("en", en, now - 10 * 60 * 1000, now, null); // "10 minutes ago"
+formatElapsedLocalised("en", en, 3720);                             // "1h 02m"
+formatElapsedLocalised("en", en, 5.25);                             // "5.3s"
+```
+`formatElapsedLocalised` takes `seconds: number | null`; `null`, negative, and `NaN` all render as `strings.unknownValue`.
+</Step>
+</Steps>
+
+### When does the fallback fire?
+
+```mermaid
+graph TB
+    Tag["🏷️ locale tag"] --> Q{"which case?"}
+    Q -->|"underscore, e.g. en_US"| BadTag["📖 Intl throws → ASCII fallback"]
+    Q -->|"Intl API missing (old WebView)"| NoApi["📖 constructor unavailable → ASCII fallback"]
+    Q -->|"valid BCP 47, e.g. en-US"| Valid["⚡ primary ICU output"]
+
+    classDef tag fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef probe fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef fb fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef out fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Tag tag
+    class Q probe
+    class BadTag,NoApi fb
+    class Valid out
+```
+
+The underscore case is the one the fallback exists to serve first: `new Intl.NumberFormat("en_US")` throws `RangeError`, and `locale.ts` accepts underscore tags as a valid stored preference.
+
+### Rules
+
+| Rule | Behaviour |
+|------|-----------|
+| Every entry point is total | An unparseable tag (`"en_US"`, empty, garbage) never throws — the function returns a well-formed ASCII fallback. |
+| `timeZone` is a required argument on `formatDate` | Pass `null` for the host's zone, but the argument must be typed. A defaulted zone is how a chat saved at 23:40 shows tomorrow's date. |
+| Unknown values render as `strings.unknownValue` | On `formatElapsedLocalised`, `null`, negative, and `NaN` seconds all render as unknown — not as `0s`. The engine not observing a call begin is not the same as the call returning instantly. |
+| Fallback outputs are ASCII and locale-independent | Number → `String(value)`; count → whole integer via `String(whole)`; date → ISO `YYYY-MM-DD` (`toISOString().slice(0, 10)`); padded → `padStart(2, "0")`; sub-10s duration → `toFixed(1)`; relative time → the localisable `Strings` table (`minutesAgo` / `hoursAgo` / `daysAgo`). |
+| `memo()` caches successes **and** failures | A bad tag costs one throw per process, not one per frame — safe in a streaming transcript row that re-formats on every publish. |
+| The primary path picks the right script | `Intl.NumberFormat` in Arabic may render Arabic-Indic digits; `formatPadded` never pads an Arabic-Indic number with an ASCII `"0"`. The fallback uses ASCII by design, but the primary path never mixes scripts. |
+
+<Note>
+**The `"en_US"` trigger.** Every `Intl` constructor throws `RangeError` on an underscore tag, and `locale.ts` accepts underscore tags as a valid stored preference (`tag.split(/[-_]/)`). So the fallback is not a hypothetical old-WebView path — it fires whenever a stored preference reaches the UI as `"en_US"` instead of `"en-US"`. That is the case the fallback exists to serve, first.
+</Note>
+
+<Note>
+**Determinism split with `format.ts`.** `ui/src/format.ts` emits ASCII and ISO deterministically and is what the package's own tests assert against; `format-intl.ts` is the path a renderer uses on top, and is additive — nothing in `format.ts` changes. Read this split before writing your own formatter; the header comment in `format-intl.ts` is the source of truth.
+</Note>
+
+---
+
 ## User interaction flow
 
 <Steps>
@@ -151,6 +248,10 @@ An Arabic user opens the app on a modern iOS WebView. `Intl.Locale.textInfo` ans
 
 <Step title="Older Android WebView — the tables answer">
 The same user opens the app on an older Android WebView with no `Intl.Locale.textInfo`. `directionFromTables("ar")` answers `"rtl"`, and the UI still mirrors correctly — the fallback is not a downgrade in behaviour.
+</Step>
+
+<Step title="Bad stored locale — the fallback answers">
+A user's stored preference is `"en_US"` (an underscore tag from an older settings write). `memo(...)` caches `null`, `formatDate` returns the ISO date, `formatElapsedLocalised` returns `"1h 02m"`, and the chat list still reads correctly. No row blanks; no timestamp goes missing.
 </Step>
 </Steps>
 
@@ -172,7 +273,7 @@ When the user starts a new chat, the shell empties the `polite` and `assertive` 
 </Accordion>
 
 <Accordion title="Never assume Intl is complete">
-Older Android WebViews ship without `Intl.Locale.textInfo` and `Intl.Segmenter`. `directionFromTables` and `fallbackSentences` are exported precisely so the degraded path is exercised, not left untested.
+Older Android WebViews ship without `Intl.Locale.textInfo` and `Intl.Segmenter`, so `directionFromTables` and `fallbackSentences` are exported precisely to exercise the degraded path. But the fallback is not only an old-WebView concern: every `Intl` constructor throws `RangeError` on an underscore tag, and `locale.ts` accepts `"en_US"` as a valid stored preference — so the number, date, and duration fallbacks fire in production the moment a stored locale reaches the UI with an underscore.
 </Accordion>
 
 <Accordion title="Hold the unterminated tail on a stream">
