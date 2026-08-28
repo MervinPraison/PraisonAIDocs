@@ -154,6 +154,77 @@ assert m.total_tokens == 1500  # input + output only, not 2700
 
 The `1500` is the provider's own reported total. The `cached_tokens` (800) sit inside the 1000 input tokens, and the `reasoning_tokens` (400) sit inside the 500 output tokens — summing all four would report `2700`, which is wrong.
 
+## Scoping to one team (concurrent instances)
+
+The `get_token_collector()` singleton is process-wide: every agent in every `PraisonAIAgents` instance writes into the same collector. Reading it directly gives you a **combined** total across the whole process.
+
+```mermaid
+graph LR
+    subgraph "Team A"
+        A1[🤖 A_researcher]
+        A2[🤖 A_writer]
+    end
+    subgraph "Team B"
+        B1[🤖 B_analyst]
+    end
+    A1 --> C[💾 TokenCollector<br/>process-wide]
+    A2 --> C
+    B1 --> C
+    C -->|filtered by team_a's names| VA[📊 team_a.get_token_usage_summary]
+    C -->|filtered by team_b's names| VB[📊 team_b.get_token_usage_summary]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef view fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A1,A2,B1 agent
+    class C store
+    class VA,VB view
+```
+
+Since PraisonAI PR [#4462](https://github.com/MervinPraison/PraisonAI/pull/4462), `PraisonAIAgents` exposes instance-scoped views that filter the singleton to the team's own agents — so two concurrent teams never see each other's spend.
+
+```python
+from praisonaiagents import Agent, PraisonAIAgents
+
+team_a = PraisonAIAgents(agents=[Agent(name="A_researcher"), Agent(name="A_writer")])
+team_b = PraisonAIAgents(agents=[Agent(name="B_analyst")])
+
+# Run both teams concurrently (or one after another)
+team_a.start()
+team_b.start()
+
+# Instance-scoped: only team_a's own agents
+print(team_a.get_token_usage_summary())
+# {'total_metrics': {...team_a only...}, 'by_agent': {'A_researcher': {...}, 'A_writer': {...}}, ...}
+
+# Instance-scoped: only team_b's own agents
+print(team_b.get_token_usage_summary())
+# {'total_metrics': {...team_b only...}, 'by_agent': {'B_analyst': {...}}, ...}
+
+# Global process-wide totals (unchanged behavior)
+from praisonaiagents.telemetry.token_collector import get_token_collector
+print(get_token_collector().get_session_summary())
+# {'total_metrics': {...team_a + team_b...}, ...}
+```
+
+The scoped methods:
+
+| Method | Scope | Fallback |
+|---|---|---|
+| `PraisonAIAgents.get_token_usage_summary()` | This team's agents only | Unfiltered summary if no named agents |
+| `PraisonAIAgents.get_detailed_token_report()` | This team's agents only (summary + recent interactions + cost estimate) | Unfiltered if no named agents |
+| `PraisonAIAgents.display_token_usage()` | This team's agents only (prints table) | Unfiltered if no named agents |
+| `get_token_collector().get_session_summary()` | Process-wide (all agents in the process) | — |
+
+<Note>
+**Scoping key = agent `name`.** Filtering matches `Agent.name` against the collector's `by_agent` map. Give each agent a unique `name` for accurate per-team accounting. Agents with `name=None` fall back to the unfiltered summary so an unnamed team still sees real numbers rather than zeros.
+</Note>
+
+<Note>
+**`total_interactions` and `by_model` are best-effort** in the scoped view. The collector caps its per-interaction log (`_max_recent`), so scoped `total_interactions` and `by_model` reflect only interactions still in that retained window. The token **totals** (`total_metrics`, `by_agent`) come from the full aggregate and stay exact.
+</Note>
+
 ## Common Patterns
 
 <AccordionGroup>
