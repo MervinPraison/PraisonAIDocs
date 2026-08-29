@@ -295,6 +295,44 @@ The message textarea's `aria-label` is `strings.composerLabel` — never `string
 
 When the user starts a new chat, the shell empties the `polite` and `assertive` live regions in addition to resetting the announcer state. Resetting the announcer decides what to *say* next; it does not empty the regions themselves — so without this clear, the previous conversation's answer lingered in the accessibility tree of an apparently empty chat. See [Overview → New chat](/features/mobile/overview#new-chat).
 
+### The sentence check runs at most once per `ANNOUNCE_INTERVAL_MS`, even when nothing new is spoken
+
+The screen-reader announcer holds back unfinished sentences (see [Sentence segmentation](#sentence-segmentation)) and rate-limits the segmentation check itself.
+
+```mermaid
+graph TB
+    Publish[📝 publish] --> InInterval{⏱️ inside interval?}
+    InInterval -->|yes| Skip[⏭️ skip — return same state]
+    InInterval -->|no| Check[🔍 segment + advance clock]
+    Check --> Completed{✅ sentence completed?}
+    Completed -->|yes| Speak[🗣️ say chunk]
+    Completed -->|no| NewState[💾 new state — clock advanced]
+    Speak --> NewState
+
+    classDef event fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef action fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef terminal fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Publish event
+    class InInterval,Completed decision
+    class Check,Speak action
+    class Skip,NewState terminal
+```
+
+Two cursors advance without necessarily producing speech:
+
+- `lastStreamAtMs` — records that the check ran, so the next publish inside the interval is skipped.
+- `spokenChars` — advances even when the completed prefix trims to an empty string, so the same completed prefix is not re-checked forever.
+
+Both are persisted across publishes. If either advances, the announcer returns a new state object; if nothing at all moves (74 out of every 75 publishes on a busy stream), the announcer returns the **same** state object by identity, so the caller can skip touching the live region entirely.
+
+Without these advances, a stretch where no sentence completes — a markdown table, a code block, a JSON dump, a bulleted list — used to leave the rate limit permanently open and re-segment the whole accumulated answer on every publish. Measured for 160 kB of unterminated text at the real publish cadence: 175 ms per publish (quadratic in answer length, ~700 ms of blocked main thread across one long answer) → 4.5 ms.
+
+The visible cost: a sentence that completes just after a check waits up to `ANNOUNCE_INTERVAL_MS` to be spoken. That is what the rate limit is for; when speech is flowing, behaviour is identical to before.
+
+The upstream side of this pipeline is the [SSE reader](/features/mobile/protocol#frame-buffering).
+
 ---
 
 ## Focus after a button goes `disabled`
