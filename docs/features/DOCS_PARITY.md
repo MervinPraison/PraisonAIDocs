@@ -18,10 +18,10 @@ This report compares **Python SDK feature categories** against **Python document
 | Category | Features | Docs | Lines |
 |----------|----------|------|-------|
 | ✅ AGUI | 1 | 2 | 511 |
-| ✅ Agent | 22 | 54 | 17350 |
+| ✅ Agent | 22 | 55 | 17522 |
 | ✅ Agent-to-Agent (A2A) | 1 | 7 | 2996 |
 | ✅ Agent-to-User (A2U) | 1 | 3 | 689 |
-| ✅ Approval | 1 | 6 | 3071 |
+| ✅ Approval | 1 | 7 | 3481 |
 | ✅ Audio | 2 | 12 | 1000 |
 | ✅ Auto Generation | 5 | 12 | 3747 |
 | ✅ Autonomy | 3 | 7 | 2790 |
@@ -60,8 +60,8 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Parallel Execution | 3 | 2 | 497 |
 | ✅ Planning | 6 | 7 | 1825 |
 | ✅ Plugins | 8 | 5 | 3120 |
-| ✅ Prompts | 2 | 9 | 1971 |
-| ✅ Providers | 1 | 56 | 7793 |
+| ✅ Prompts | 2 | 9 | 2011 |
+| ✅ Providers | 1 | 56 | 7895 |
 | ✅ Query | 1 | 2 | 736 |
 | ✅ RAG | 5 | 15 | 3118 |
 | ✅ Realtime | 2 | 5 | 668 |
@@ -75,10 +75,10 @@ This report compares **Python SDK feature categories** against **Python document
 | ✅ Tasks | 2 | 6 | 2897 |
 | ✅ Telemetry | 1 | 2 | 648 |
 | ✅ Templates | 1 | 8 | 1663 |
-| ✅ Tools | 12 | 144 | 43629 |
+| ✅ Tools | 12 | 145 | 43981 |
 | ✅ Tracing | 3 | 2 | 139 |
 | ✅ Vector Store | 1 | 12 | 1219 |
-| ✅ Video | 2 | 6 | 649 |
+| ✅ Video | 2 | 6 | 728 |
 | ✅ Vision | 2 | 1 | 329 |
 | ✅ Web | 3 | 9 | 2487 |
 | ✅ Workflows | 5 | 18 | 7406 |
@@ -87,7 +87,7 @@ This report compares **Python SDK feature categories** against **Python document
 
 These docs exist but don't match any implemented feature category:
 
-- ℹ️ Database (42 docs, 6973 lines)
+- ℹ️ Database (43 docs, 7248 lines)
 - ℹ️ Documents (1 docs, 798 lines)
 
 ---
