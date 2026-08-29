@@ -259,6 +259,74 @@ await agent.astart("Answer even during a provider outage")
 Async hooks are awaited (not fire-and-forget). The fallback retry does not proceed until the hook returns, so long-running notifiers should keep their work non-blocking or offload it.
 </Note>
 
+## Shared-Agent async safety
+
+On a shared `Agent`, a fallback on one turn does not affect the model, cost, or observability attribution of concurrent turns.
+
+Many users share a single `Agent` across `asyncio.gather` (see [Thread-Safe Agent State → Chat History](/features/thread-safety#chat-history)). Before this fix, a mid-fallback shared-state mutation could silently flip a concurrent turn to the fallback model — wrong cost, wrong logs, wrong hook payloads. Both paths now keep each turn on its own model.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonaiagents.config import LLMConfig
+
+agent = Agent(
+    instructions="You are helpful.",
+    model=LLMConfig(
+        model="gpt-4o",
+        fallback_models=["claude-3-5-sonnet"],
+    ),
+)
+
+async def main():
+    # Same Agent, two concurrent turns.
+    # If turn A hits a 503 and falls back to claude-3-5-sonnet,
+    # turn B still dispatches on gpt-4o with correct cost/observability.
+    await asyncio.gather(
+        agent.astart("Summarise today's news"),
+        agent.astart("Draft a follow-up email"),
+    )
+
+asyncio.run(main())
+```
+
+```mermaid
+sequenceDiagram
+    participant U1 as User (Turn A)
+    participant U2 as User (Turn B)
+    participant Agent as Shared Agent
+    participant Primary as gpt-4o
+    participant Fallback as claude-3-5-sonnet
+
+    U1->>Agent: prompt A
+    U2->>Agent: prompt B
+    par
+        Agent->>Primary: chat completion (turn A)
+        Primary-->>Agent: 503 unavailable
+        Note over Agent: build throwaway dispatcher<br/>bound to claude-3-5-sonnet
+        Agent->>Fallback: retry turn A (per-call dispatcher)
+        Fallback-->>Agent: reply A
+    and
+        Agent->>Primary: chat completion (turn B)
+        Note over Agent: shared self.llm / dispatcher untouched<br/>turn B keeps gpt-4o attribution
+        Primary-->>Agent: reply B
+    end
+    Agent-->>U1: reply A
+    Agent-->>U2: reply B
+```
+
+**Async path stays clean.** The fallback retry runs against a throwaway per-call dispatcher bound to the fallback model; the shared model state is never mutated, so a concurrent turn keeps dispatching on its original model even while this turn is suspended on an `await`. No lock is taken on the async path for ordinary turns — non-fallback turns stay fully concurrent.
+
+**Sync path stays clean.** The sync fallback still recurses through the full chat wrapper (which reads the current model for `BEFORE_LLM` hook attribution and budget), so it temporarily swaps the model. That mutate/restore window is now serialised by a lazily-created per-instance lock; only fallback turns contend on it — non-fallback turns never acquire it.
+
+<Note>
+**Custom-LLM caveat.** For custom-LLM agents, the async fallback path continues to use the shared dispatcher (the throwaway builder returns `None`), matching prior behaviour, because the custom client owns its own model.
+</Note>
+
+<Note>
+No new configuration or lock code is required on your side — share one `Agent` under `asyncio.gather` and both fallback and chat-history stay correct. Reference: PR [#4593](https://github.com/MervinPraison/PraisonAI/pull/4593), issue [#4592](https://github.com/MervinPraison/PraisonAI/issues/4592).
+</Note>
+
 ## Configuration Options
 
 Model Fallback is configured through `LLMConfig` — set `model` for the primary and `fallback_models` for the ordered backup chain.
@@ -298,6 +366,10 @@ graph TB
     class Q,Q2 question
     class Plain,Cross,Cost answer
 ```
+
+<Note>
+Sharing an `Agent` across concurrent turns? Both sync and async paths keep concurrent turns' model attribution correct — see [Shared-Agent async safety](#shared-agent-async-safety) above.
+</Note>
 
 <Note>
 Streaming, tool-iteration and reflection turns route through the same failover engine as plain single-shot calls (unified in [PraisonAI PR #2665](https://github.com/MervinPraison/PraisonAI/pull/2665)). You don't need a separate `fallback_models=` setting for streaming paths.
@@ -341,5 +413,11 @@ LiteLLM-style names (`anthropic/...`, `openai/...`) route credentials correctly 
 </Card>
 <Card title="Rate Limiter" icon="gauge" href="/features/rate-limiter">
   Throttle requests before they fail.
+</Card>
+<Card title="Thread-Safe Agent State" icon="lock" href="/features/thread-safety">
+  Share one Agent across concurrent turns safely.
+</Card>
+<Card title="Concurrency" icon="layer-group" href="/features/concurrency">
+  Run agents in parallel with asyncio.gather.
 </Card>
 </CardGroup>
