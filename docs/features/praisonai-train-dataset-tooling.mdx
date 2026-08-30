@@ -16,6 +16,8 @@ graph LR
         Raw --> QC[🧪 validate]
         Merge --> QC
         QC --> Clean[✅ Clean JSONL]
+        Trials[🧪 trials.json] --> FromTrials[♻️ data from-trials]
+        FromTrials --> Clean
         Clean --> Train[⚙️ praisonai-train llm]
     end
 
@@ -23,8 +25,8 @@ graph LR
     classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class Recipe input
-    class Teacher,Merge,QC,Train process
+    class Recipe,Trials input
+    class Teacher,Merge,QC,FromTrials,Train process
     class Raw,Clean result
 ```
 
@@ -596,6 +598,180 @@ Once imported, it participates in the next `score()` / `validate` run automatica
 
 ---
 
+## from-trials
+
+Export a scored trials report into a trainer-ready SFT dataset — keep the attempts that passed verification, drop the rest, and write a ShareGPT (or Alpaca) JSONL the `praisonai-train llm` trainer consumes unchanged.
+
+```mermaid
+graph LR
+    Trials[🧪 trials.json] --> Export[♻️ data from-trials]
+    Export --> Data[✅ train.jsonl]
+    Data --> LLM[⚙️ praisonai-train llm]
+    LLM --> Reverify[🔁 re-run trials]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Trials input
+    class Export,LLM,Reverify process
+    class Data result
+```
+
+`from-trials` closes the loop from verification to data generation: verify the agent, keep what passed (rejection sampling), fine-tune on it, then re-verify to measure the gain — one supported pipeline instead of a hand-rolled script. It is invoked under the `data` group as `praisonai-train data from-trials REPORT [OPTIONS]`.
+
+### Quick Start
+
+<Steps>
+<Step title="Export the passing attempts">
+
+Take a saved trials report and write the passing, tool-free attempts as a training dataset.
+
+```bash
+praisonai-train data from-trials trials.json -o data/train.jsonl
+```
+
+</Step>
+
+<Step title="Fine-tune on the exported dataset">
+
+Feed the JSONL straight into the trainer — no reshaping needed.
+
+```bash
+praisonai-train llm data/train.jsonl --model unsloth/gemma-2-2b-it-bnb-4bit
+```
+
+</Step>
+
+<Step title="Re-verify to measure the gain">
+
+Re-run the same trials on the fine-tuned model and compare pass rates.
+
+```bash
+praisonai-train agents --scenarios trials_cases.json
+```
+
+</Step>
+</Steps>
+
+### CLI flags
+
+| Flag | Short | Type | Default | Description |
+|------|-------|------|---------|-------------|
+| `REPORT` (positional) | — | path | **required** | Serialised trials-report JSON |
+| `--out` | `-o` | path | `{report_stem}.jsonl` | Output JSONL |
+| `--all` | — | flag | `false` | Include failed / unscored attempts (`only_passed=False`) |
+| `--include-saturated` | — | flag | `false` | Include all-pass / zero-pass cases (`frontier_only=False`) |
+| `--format` | — | `messages` \| `alpaca` | `messages` | `messages` = ShareGPT `{"conversations": [...]}`; `alpaca` = `{instruction, input, output}` |
+| `--qc` | — | flag | `false` | Run emitted rows through the same QC filter as `validate` (see [Export trials with QC](#export-trials-with-qc-from-trials-qc)) |
+
+### Behaviour worth knowing
+
+- **Selection discipline — every skip is counted, never silent.** Four filters run in order, each with its own counter:
+  - `score is None` → never a candidate (`skipped_unscored`; kept under `--all`, which sets `only_passed=False`).
+  - `only_passed=True` (default) → drop verifier-failed attempts (`skipped_failed`).
+  - `frontier_only=True` (default) → drop cases where `pass_rate == 0` or `pass_rate == 1` (`skipped_saturated`) — saturated cases add K near-duplicates of already-mastered behaviour, zero-pass cases have nothing to export.
+  - Tool-using runs excluded by default (`skipped_tool_runs`) — exporting only the final text of a run that used tools would train the model to answer *without* the tools it actually needed.
+- **Deterministic emission order** — case, then attempt, so output files are byte-reproducible.
+- **Exit code `1` on zero rows written** — with a stderr hint pointing at `--all` / `--include-saturated`, or to check that the report has passing tool-free attempts.
+- **Alpaca vs ShareGPT** — the (often sole) user prompt is **never dropped**. With a system turn, `instruction = system` and `input = "\n".join(all user turns)`; without a system turn, `instruction = first user turn` and `input = "\n".join(remaining user turns)`. Conversations are truncated at the final assistant turn; assistant content is the raw generated text.
+- **Pass-threshold handling** — resolved in a fixed order: an explicit `passed` boolean wins; otherwise the attempt's `score` is compared against its own threshold (`pass_threshold` / `threshold` / `min_score`), so `0.3` under a `pass_threshold: 0.5` counts as a failure; only when no threshold is carried does it fall back to `score > 0`.
+
+### Console output
+
+`from-trials` prints a summary block naming every counter, then the write and provenance paths.
+
+```text
+─── from-trials: trials.json ───
+  written=42 skipped_failed=7 skipped_tool_runs=3 skipped_no_text=0 skipped_unscored=2 skipped_saturated=15
+  wrote 42 rows -> data/train.jsonl
+  provenance -> data/train.jsonl.meta.json
+```
+
+### Output format
+
+**ShareGPT (`--format messages`, default)** — one JSON object per line; the trainer's `process_dataset` standardises it directly.
+
+```jsonl
+{"conversations":[{"role":"system","content":"..."},{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
+```
+
+**Alpaca (`--format alpaca`)** — flat instruction/input/output rows.
+
+```jsonl
+{"instruction":"...","input":"...","output":"..."}
+```
+
+### Python API — `export_trials()`
+
+Import the exporter and its summary dataclass from the friendly top-level namespace.
+
+```python
+from praisonai_train.data import export_trials, ExportSummary
+
+summary = export_trials(report, "data/train.jsonl")
+print(summary)   # written=42 skipped_failed=7 ...
+```
+
+Full signature:
+
+```python
+def export_trials(
+    report,                       # dict, object, or path to serialised report JSON
+    path,                         # destination .jsonl
+    *,
+    only_passed: bool = True,
+    frontier_only: bool = True,
+    format: str = "messages",     # "messages" | "alpaca"
+    qc: bool = False,
+    qc_cfg: dict | None = None,
+) -> ExportSummary
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `report` | `dict \| object \| str` | required | A serialised report, an in-memory report object, or a path — a path is loaded with `json.loads(Path(...).read_text())`; anything else is duck-typed as-is |
+| `path` | `str` | required | Destination `.jsonl`; a missing parent directory is created automatically |
+| `only_passed` | `bool` | `True` | Rejection sampling — drop verifier-failed attempts. `False` keeps failed / unscored (the `--all` flag) |
+| `frontier_only` | `bool` | `True` | Drop all-pass / zero-pass cases. `False` keeps them (the `--include-saturated` flag) |
+| `format` | `str` | `"messages"` | `"messages"` (ShareGPT) or `"alpaca"`. Any other value raises `ValueError` |
+| `qc` | `bool` | `False` | Run emitted rows through the `validate` QC filter (see [Export trials with QC](#export-trials-with-qc-from-trials-qc)) |
+| `qc_cfg` | `dict \| None` | `None` | QC overrides — e.g. re-enable a target-script check with `{"script_range": [...]}` |
+
+Returns an `ExportSummary` dataclass — six counter fields plus a `to_dict()` method and a CLI-friendly `__str__` that emits `written=X skipped_failed=Y ...`.
+
+| Field | Type | Counts |
+|-------|------|--------|
+| `written` | `int` | Rows emitted to the dataset |
+| `skipped_unscored` | `int` | Attempts with `score is None` (kept under `--all`) |
+| `skipped_failed` | `int` | Verifier-failed attempts dropped by `only_passed` |
+| `skipped_saturated` | `int` | Attempts in all-pass / zero-pass cases dropped by `frontier_only` |
+| `skipped_tool_runs` | `int` | Tool-using runs excluded by default |
+| `skipped_no_text` | `int` | Attempts with no assistant text to export |
+
+### Provenance sidecar
+
+Every run writes `{path}.jsonl.meta.json` alongside the dataset — every emitted row is traceable to its source case, attempt, and score.
+
+```json
+{
+  "package": "demo",
+  "source_report": "trials.json",
+  "options": {"only_passed": true, "frontier_only": true, "format": "messages", "qc": false},
+  "summary": {"written": 42, "skipped_failed": 7, "skipped_tool_runs": 3, "...": "..."},
+  "lines": [
+    {"case_id": "c1", "attempt_index": 0, "score": 0.92},
+    {"case_id": "c1", "attempt_index": 2, "score": 0.87}
+  ]
+}
+```
+
+<Warning>
+`only_passed=True` is **rejection sampling** — it amplifies behaviour the agent already produces and inherits any bias in the scorer/judge that decided a run "passed". It cannot teach behaviour the agent never exhibited; treat it as reinforcing verified wins, not as an oracle.
+</Warning>
+
+---
+
 ## Export trials with QC (`from-trials --qc`)
 
 Turn passing agent trials into a training corpus and quality-check them in one pass — `--qc` reuses the `validate` filter but auto-disables the target-script check, because agent trajectories are English by construction.
@@ -999,6 +1175,10 @@ Every axis-recipe row is stamped with `task_type` and `topic`, so downstream eva
 <Accordion title="Keep verify_translation_target on for translation datasets">
 It surfaces `wrong_target_script` — failed translations whose output is still in the source script. A naive purity filter keeps these silently because the wrong-script output still passes a same-script purity check.
 </Accordion>
+
+<Accordion title="Prefer from-trials over generate when you have real agent trajectories">
+`generate` synthesises rows from a teacher LLM; `from-trials` mines your own verified agent runs. When you already have a scored trials report, `praisonai-train data from-trials` keeps only the attempts that passed — reinforcing behaviour you measured rather than behaviour a teacher imagined. Treat it as rejection sampling: it amplifies verified wins, so it inherits the scorer's bias and cannot teach behaviour the agent never exhibited.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -1020,5 +1200,8 @@ It surfaces `wrong_target_script` — failed translations whose output is still 
 </Card>
 <Card title="Speed Benchmark" icon="gauge" href="/features/praisonai-train-benchmark">
   Rank deployments by generation speed — it reuses the same HTTP path as `generate`.
+</Card>
+<Card title="Trials Engine" icon="flask" href="/features/trials-engine">
+  Run K scored attempts per case, then feed the report into `from-trials`.
 </Card>
 </CardGroup>
