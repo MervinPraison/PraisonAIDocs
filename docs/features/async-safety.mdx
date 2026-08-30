@@ -30,8 +30,10 @@ graph LR
         L[⚡ Event Loop] --> W[🧵 Worker Thread]
         W --> K[📚 Knowledge search]
         W --> M[🧠 Memory write]
+        W --> G[🛡️ Guardrail validate]
         K --> R[✅ Loop stays responsive]
         M --> R
+        G --> R
     end
 
     classDef loop fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -39,7 +41,7 @@ graph LR
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
 
     class L loop
-    class W,K,M worker
+    class W,K,M,G worker
     class R ok
 ```
 
@@ -91,6 +93,33 @@ agents = PraisonAIAgents(
 asyncio.run(agents.astart())
 ```
 </Step>
+
+<Step title="Parallel agents with guardrails">
+An `asyncio.gather(...)` of agents where one carries a string guardrail runs in parallel — the guardrail's validation LLM call offloads to a worker thread instead of stalling the fan-out.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+
+agent1 = Agent(
+    name="Writer",
+    instructions="Write a short blurb.",
+    guardrail="Ensure the blurb makes no unverifiable claims.",
+)
+agent2 = Agent(
+    name="Summarizer",
+    instructions="Summarise the release notes.",
+)
+
+async def main():
+    await asyncio.gather(
+        agent1.astart("Blurb for the new dashboard"),
+        agent2.astart("Summarise v2.0 release notes"),
+    )
+
+asyncio.run(main())
+```
+</Step>
 </Steps>
 
 ---
@@ -123,8 +152,11 @@ sequenceDiagram
 |---|---|
 | `Knowledge.search` inside `Agent._achat_impl` | `asyncio.to_thread` |
 | `Task.store_in_memory` inside `Task.execute_callback` | `asyncio.to_thread` |
+| `_validate_with_guardrail` inside `Agent._aapply_guardrail_with_retry` and `_apply_task_guardrail` inside `Agents._aapply_task_guardrail` | `loop.run_in_executor` (with `copy_context_to_callable`) |
 
 Both were synchronous embedding + vector-store / DB calls that previously blocked the event loop for the whole coroutine lifetime. An `asyncio.gather(...)` fan-out would serialise on the slowest lookup or write instead of running concurrently. Offloading them to threads keeps the loop free.
+
+A string / `LLMGuardrail` output guardrail fires a blocking LLM call under the hood to validate the agent's output. On the async path this call is now offloaded via `loop.run_in_executor(...)`, so parallel tasks don't serialise on one task's guardrail round-trip ([PR #4469](https://github.com/MervinPraison/PraisonAI/pull/4469)). Contextvars are preserved across the offload with `copy_context_to_callable`, so trace emission and session context stay intact.
 
 <Note>
 This is transparent — there is no user-facing knob to opt out. You do not call anything new; parallel async tasks simply run in parallel.
@@ -160,6 +192,10 @@ Knowledge search and memory writes offload to threads, so a `gather(...)` of age
 
 <Accordion title="Make custom adapters thread-safe" icon="lock">
 Custom memory adapters used from async task callbacks receive writes from multiple worker threads. Guard mutating methods with a lock, as the built-in `InMemoryAdapter` does with an `RLock`.
+</Accordion>
+
+<Accordion title="Guardrails don't stall async fan-outs" icon="shield-halved">
+String / `LLMGuardrail` output and task guardrails offload their blocking LLM call to a worker thread on the async path, so an `asyncio.gather(...)` of agents that share a guardrail no longer serialises on one task's validation LLM round-trip. Custom guardrail objects that implement synchronous `validate_output` get the same offload for free.
 </Accordion>
 
 <Accordion title="Nothing to configure" icon="wand-magic-sparkles">
