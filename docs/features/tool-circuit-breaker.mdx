@@ -31,6 +31,10 @@ This tool-level circuit breaker is separate from the new [LLM idle-timeout circu
 **Per-agent scoping:** breakers are now keyed per agent instance (`tool_{id(self)}_{function_name}`), so two agents that expose same-named tools (e.g. `search`) no longer share one breaker — one agent's failures can't degrade the other. Per-agent breakers are auto-pruned from the registry when the `Agent` is garbage-collected (via `weakref.finalize`), so a reused instance id can't inherit a stale OPEN breaker — `agent.close()` / `aclose()` merely reclaims that space earlier.
 </Note>
 
+<Warning>
+**Retrieving a breaker by tool name alone no longer returns the runtime instance.** Because the registry key is now `tool_{id(agent)}_{function_name}`, calling `get_circuit_breaker("tool_my_tool")` builds a **fresh, disconnected** breaker — not the one protecting live calls. Use `get_circuit_breaker(f"tool_{id(agent)}_my_tool")`, or enumerate this agent's breakers with the [Observability](#common-patterns) pattern below. Cleanup is covered in [Agent Lifecycle Cleanup](/features/agent-lifecycle-cleanup).
+</Warning>
+
 
 
 The user triggers a flaky tool; repeated failures open the breaker so later calls fail fast instead of looping on errors.
@@ -108,9 +112,10 @@ from praisonaiagents.tools.circuit_breaker import (
     get_circuit_breaker, CircuitBreakerConfig, reset_all_circuit_breakers
 )
 
-# Tune circuit breaker for a specific tool
+# Register config for a specific tool BEFORE the first call.
+# Breakers are keyed per agent instance, so build the key from id(agent).
 breaker = get_circuit_breaker(
-    "tool_my_tool", 
+    f"tool_{id(agent)}_my_tool",
     CircuitBreakerConfig(
         failure_threshold=3,  # Open after 3 failures instead of 5
         recovery_timeout=30.0,  # Try again after 30s instead of 60s
@@ -234,7 +239,7 @@ These exclusions apply to **both the sync and async** execution paths. On the as
 
 Per-agent breakers are pruned from the global registry automatically when the `Agent` is garbage-collected — a `weakref.finalize` callback is registered when each breaker is created. This closes the CPython `id()`-reuse window without requiring `agent.close()` / `agent.aclose()` to be called explicitly.
 
-Calling `agent.close()` / `agent.aclose()` still triggers the same cleanup earlier and deterministically — recommended when you know the agent is done and want registry space reclaimed immediately.
+Calling `agent.close()` / `agent.aclose()` triggers `_cleanup_circuit_breakers()`, which removes every `tool_{id(agent)}_*` entry from the registry earlier and deterministically — keeping it bounded and preventing a reused id from inheriting a stale `OPEN` breaker. See [Agent Lifecycle Cleanup](/features/agent-lifecycle-cleanup) for the full teardown story.
 
 ---
 
@@ -292,25 +297,35 @@ asyncio.run(main())
 <Tabs>
 
 <Tab title="Observability">
-Monitor circuit breaker health and statistics for debugging.
+Enumerate the breakers that belong to a specific agent instance.
+
+```python
+from praisonaiagents.tools.circuit_breaker import _get_global_registry
+
+registry = _get_global_registry()
+prefix = f"tool_{id(agent)}_"
+
+for name in registry.list_services():
+    if name.startswith(prefix):
+        breaker = registry.get(name)
+        print(name, breaker.state, breaker.stats.failure_count)
+```
+
+Retrieving a single breaker by name works too — just build the per-agent key:
 
 ```python
 from praisonaiagents.tools.circuit_breaker import get_circuit_breaker
 
-# Get circuit breaker for a tool
-breaker = get_circuit_breaker("tool_my_tool")
-
-# Check current state and stats
+breaker = get_circuit_breaker(f"tool_{id(agent)}_my_tool")
 print(f"State: {breaker.state}")
 print(f"Failure count: {breaker.stats.failure_count}")
-print(f"Success count: {breaker.stats.success_count}")
 print(f"Total requests: {breaker.stats.total_requests}")
 print(f"Rejected requests: {breaker.stats.rejected_requests}")
 ```
 </Tab>
 
 <Tab title="Custom Config Per Tool">
-Apply different circuit breaker settings to different tools based on their reliability characteristics.
+Apply different settings per tool by registering the config **before** the agent runs the tool for the first time. The breaker is lazily created on first call using the config passed to `get_circuit_breaker`, so pre-registration under the per-agent key wins.
 
 ```python
 from praisonaiagents.tools.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig
@@ -320,14 +335,14 @@ strict_config = CircuitBreakerConfig(
     failure_threshold=2,    # Open quickly
     recovery_timeout=120.0,  # Wait longer before retry
 )
-api_breaker = get_circuit_breaker("tool_external_api", strict_config)
+api_breaker = get_circuit_breaker(f"tool_{id(agent)}_external_api", strict_config)
 
 # Lenient config for internal tools
 lenient_config = CircuitBreakerConfig(
     failure_threshold=10,   # Allow more failures
     recovery_timeout=30.0,  # Recover quickly
 )
-internal_breaker = get_circuit_breaker("tool_internal_db", lenient_config)
+internal_breaker = get_circuit_breaker(f"tool_{id(agent)}_internal_db", lenient_config)
 ```
 </Tab>
 
@@ -340,9 +355,9 @@ from praisonaiagents.tools.circuit_breaker import reset_all_circuit_breakers
 # Reset all breakers (useful for test cleanup or after deployment)
 reset_all_circuit_breakers()
 
-# Or reset individual breakers
+# Or reset individual breakers (use the per-agent key)
 from praisonaiagents.tools.circuit_breaker import get_circuit_breaker
-breaker = get_circuit_breaker("tool_my_tool")
+breaker = get_circuit_breaker(f"tool_{id(agent)}_my_tool")
 breaker.reset()
 ```
 </Tab>
