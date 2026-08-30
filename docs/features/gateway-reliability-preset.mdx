@@ -10,50 +10,83 @@ The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` 
 </Note>
 
 
+A `BotOS(agent=..., ...)` or `praisonai gateway start` with no `reliability=` argument is now safe by default — the gateway picks a bounded admission ceiling, a fair wait queue, strict outbound ordering, and a drain window sized to the bind (loopback → 5s, real interface → 15s). The `reliability=` preset is still there for callers who want to override that.
+
 ```python
 from praisonaiagents import Agent
+from praisonai_bot.bots.botos import BotOS
 
-agent = Agent(name="assistant", instructions="Be helpful.")
-# Reliability presets configure retries and timeouts around agent.start
-agent.start("Retry this if the network blips")
+agent = Agent(name="assistant", instructions="Help the user.")
+
+# Safe by default: admission ceiling + fair queue + drain, bind-aware.
+bot = BotOS(agent=agent, platforms=["telegram", "discord"])
+bot.start()
 ```
-`reliability` is a single posture switch on `BotOS`, gateway YAML, or the CLI that maps a profile name onto drain window, concurrency ceiling, and admission queue — without touching individual settings.
-
-The user deploys with a reliability preset; retries, timeouts, and drain behaviour apply automatically.
 
 ```mermaid
-graph LR
-    Cfg[⚙️ reliability=production] --> Res[🎛️ _reliability resolver]
-    Res --> Drain[⏳ drain 15 s]
-    Res --> Adm[🚦 admission ceiling]
-    Res --> Queue[📥 fair-wait queue]
-    Drain --> Gate[🌐 WebSocketGateway]
-    Adm --> Gate
-    Queue --> Gate
+graph TB
+    R{reliability=} -->|None| B{bind_host}
+    R -->|"production"| P[15s drain + admission + fair queue + strict]
+    R -->|"default"| D[5s drain, no admission, best-effort]
+    R -->|"off"| O[0s drain, no admission, best-effort]
+    B -->|loopback / localhost / 127.x / ::1| SL[5s drain + admission + fair queue + strict]
+    B -->|0.0.0.0 / real interface / hostname| SE[15s drain + admission + fair queue + strict]
 
-    classDef cfg fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef resolver fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef effect fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef gate fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef optout fill:#8B0000,stroke:#7C90A0,color:#fff
 
-    class Cfg cfg
-    class Res resolver
-    class Drain,Adm,Queue effect
-    class Gate gate
+    class R,B q
+    class SL,SE,P result
+    class D input
+    class O optout
 ```
+
+<Warning>
+Any code that passes **nothing** — `BotOS(agent=agent)` or `praisonai gateway start` with no `--reliability` — silently upgrades to the safe posture. Two behaviours change observably: a burst that used to fan out unboundedly now queues (or rejects when the queue is full), and a `SIGTERM`-then-kill loop now waits 5–15s for in-flight turns. To revert, pass `reliability="off"` (or `--reliability off`). Code that already passes `reliability="default"` keeps its exact current behaviour (PraisonAI #3438).
+</Warning>
 
 ## Quick Start
 
 <Steps>
-<Step title="Python — pass reliability= to BotOS">
+<Step title="Simplest — safe by default">
+
+No `reliability=` needed. The gateway resolves admission, a fair queue, strict ordering, and a bind-aware drain:
 
 ```python
 from praisonaiagents import Agent
-from praisonai.bots import BotOS
+from praisonai_bot.bots.botos import BotOS
 
 agent = Agent(name="assistant", instructions="Help the user.")
-bot = BotOS(agent=agent, platforms=["telegram", "discord"], reliability="production")
+
+# Safe by default: admission ceiling + fair queue + drain, bind-aware.
+bot = BotOS(agent=agent, platforms=["telegram", "discord"])
 bot.start()
+```
+
+</Step>
+
+<Step title="Force the full production window even on loopback">
+
+```python
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram", "discord"],
+    reliability="production",  # 15s drain regardless of bind
+)
+```
+
+</Step>
+
+<Step title="Explicit opt-out (revert to pre-#3438 immediate teardown)">
+
+```python
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram", "discord"],
+    reliability="off",  # no drain, no admission — you asked for it
+)
 ```
 
 </Step>
@@ -97,7 +130,7 @@ Explicit kwargs on `BotOS` always win over the preset:
 
 ```python
 from praisonaiagents import Agent
-from praisonai.bots import BotOS
+from praisonai_bot.bots.botos import BotOS
 
 agent = Agent(name="assistant", instructions="Help the user.")
 
@@ -117,31 +150,17 @@ bot.start()
 
 ## Profiles
 
-Three built-in profiles cover the most common deployment scenarios.
+Four distinct postures. The unset posture is bind-aware, so it appears twice.
 
-```mermaid
-graph TB
-    Q{Which profile?}
-    Q -->|production| P[🛡️ production\ndrain 15s · ceiling · queue]
-    Q -->|default / unset| D[⚡ default\ndrain 5s · no ceiling · pass-through]
-    Q -->|off| O[🔓 off\ndrain 0s · no ceiling · no backpressure]
+| Preset | Drain | Admission ceiling | Wait queue | Outbound ordering | When to use |
+|--------|-------|-------------------|------------|-------------------|-------------|
+| **Unset** (`None`, loopback bind) | 5 s | Yes (CPU-scaled) | Yes (bounded, fair) | `strict` | Local dev on `127.0.0.1` / `localhost` |
+| **Unset** (`None`, non-loopback bind) | 15 s | Yes (CPU-scaled) | Yes (bounded, fair) | `strict` | An actual deployment (`0.0.0.0`, real hostname) |
+| **`"production"`** | 15 s | Yes (CPU-scaled) | Yes (bounded, fair) | `strict` | Pin the production window regardless of bind |
+| **`"default"`** | 5 s | **No** | No | `best_effort` | Explicit legacy posture — the pre-#3438 shape |
+| **`"off"`** | 0 s | **No** | No | `best_effort` | Explicit opt-out — immediate teardown, no backpressure |
 
-    classDef prod fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef def fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef off fill:#F59E0B,stroke:#7C90A0,color:#fff
-
-    class P prod
-    class D def
-    class O off
-```
-
-| Profile | Drain window | Admission ceiling | Overflow behaviour | Outbound ordering |
-|---|---|---|---|---|
-| `production` | 15 s | CPU-scaled `max_concurrent_runs` | Bounded fair-wait queue (`overflow=queue`) | `strict` |
-| `default` / `None` (unset) | 5 s | none | pass-through | `best_effort` |
-| `off` | 0 s (immediate teardown) | none | today's no-backpressure behaviour | `best_effort` |
-
-The `production` preset enables strict per-conversation FIFO delivery on the outbox — see [Outbound Ordering](/features/outbound-ordering).
+The safe posture (unset) and `production` both enable strict per-conversation FIFO delivery on the outbox — see [Outbound Ordering](/features/outbound-ordering). `"default"` and `"off"` keep `best_effort` for backward compatibility.
 
 ---
 
@@ -178,10 +197,10 @@ The resolver `_reliability.py` converts the profile string into concrete values 
 ### Python
 
 ```python
-from praisonai.bots import BotOS
+from praisonai_bot.bots.botos import BotOS
 
-# Minimal
-bot = BotOS(agent=agent, platforms=["telegram"], reliability="production")
+# Minimal — safe by default, no reliability= needed
+bot = BotOS(agent=agent, platforms=["telegram"])
 
 # From a YAML config file (reads top-level `reliability:` or `gateway.reliability`)
 bot = BotOS.from_config("gateway.yaml")
@@ -215,17 +234,18 @@ praisonai gateway start --config gateway.yaml --reliability default
 
 ### Production deployment
 
+A non-loopback bind auto-selects the full production window — no `reliability=` argument needed:
+
 ```python
 from praisonaiagents import Agent
-from praisonai.bots import BotOS
+from praisonai_bot.bots.botos import BotOS
 
 agent = Agent(name="support", instructions="Answer customer questions.")
 bot = BotOS(
     agent=agent,
     platforms=["telegram", "discord", "slack"],
-    reliability="production",
 )
-bot.start()
+bot.start()  # bound to a real interface → 15s drain + admission + fair queue
 ```
 
 ### Extend the drain window for slow agents
@@ -271,9 +291,15 @@ reliability: off
 
 <AccordionGroup>
 
-<Accordion title="Use production in all deployed services">
+<Accordion title="Recommended: pass nothing — the unset posture is now production-safe">
 
-`production` composes drain + admission control together. Enabling them separately is error-prone — the preset guarantees a coherent configuration.
+On a non-loopback bind the unset posture is equivalent to `production` — same admission ceiling, fair queue, strict ordering, and 15 s drain. Most operators don't need to pass anything. Use `reliability="production"` only to pin the 15 s window even on a loopback bind.
+
+</Accordion>
+
+<Accordion title="I want the pre-3438 behaviour back">
+
+Pass `reliability="off"` for no drain and no admission, or `reliability="default"` for a 5 s drain with no admission ceiling. Neither is a recommended default — they exist for callers who explicitly want the pre-#3438 shape.
 
 </Accordion>
 

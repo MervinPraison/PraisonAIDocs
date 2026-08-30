@@ -11,50 +11,58 @@ The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` 
 
 <Note>This page covers the **gateway reliability preset** (drain + admission). For task/workflow retry (retry jitter, `workflow_timeout`, `fail_on_callback_error`), see [Reliability](/features/reliability).</Note>
 
-One parameter composing graceful drain and inbound admission control into a production-ready configuration — without touching individual knobs.
+You now get backpressure by default. Leaving `reliability` unset gives you a bounded admission ceiling, a fair wait queue, strict outbound ordering, and a drain window sized to the bind — no argument required.
 
 ```python
 from praisonaiagents import Agent
-from praisonai.bots import BotOS
+from praisonai_bot.bots.botos import BotOS
 
+# Safe by default: admission ceiling + fair queue + drain, bind-aware.
 BotOS(
     agent=Agent(name="SupportBot", instructions="Help users with support questions."),
     platforms=["telegram", "discord"],
-    reliability="production",
 )
 ```
 
 ```mermaid
-graph LR
-    subgraph "Reliability Preset"
-        P[production] --> D1[15s drain]
-        P --> A1[CPU-scaled admission]
-        P --> Q1[bounded queue 32]
-        D[default] --> D2[5s drain]
-        O[off] --> D3[0s drain]
-    end
-    classDef prod fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef def fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef off_ fill:#8B0000,stroke:#7C90A0,color:#fff
-    class P,D1,A1,Q1 prod
-    class D,D2 def
-    class O,D3 off_
+graph TB
+    R{reliability=} -->|None| B{bind_host}
+    R -->|"production"| P[15s drain + admission + fair queue + strict]
+    R -->|"default"| D[5s drain, no admission, best-effort]
+    R -->|"off"| O[0s drain, no admission, best-effort]
+    B -->|loopback / localhost / 127.x / ::1| SL[5s drain + admission + fair queue + strict]
+    B -->|0.0.0.0 / real interface / hostname| SE[15s drain + admission + fair queue + strict]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef optout fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class R,B q
+    class SL,SE,P result
+    class D input
+    class O optout
 ```
+
+<Warning>
+Operators who deliberately want no-admission / no-drain behaviour must now ask for it explicitly. Pass `reliability="off"` (immediate teardown, no backpressure) or `reliability="default"` (5s drain, no ceiling) — leaving the knob unset no longer gives you the pre-safe posture (PraisonAI #3438).
+</Warning>
 
 ## Quick Start
 
 <Steps>
 
-<Step title="Python (BotOS)">
+<Step title="Python (BotOS) — safe by default">
+
+No `reliability=` argument needed — the gateway resolves a bounded admission ceiling, a fair queue, strict ordering, and a bind-aware drain:
 
 ```python
 from praisonaiagents import Agent
-from praisonai.bots import BotOS
+from praisonai_bot.bots.botos import BotOS
 
 BotOS(
     agent=Agent(name="SupportBot", instructions="Help users."),
     platforms=["telegram", "discord"],
-    reliability="production",
 ).run()
 ```
 </Step>
@@ -97,15 +105,23 @@ praisonai gateway start --config gateway.yaml --reliability production
 
 ## Profiles
 
-| Profile | `drain_timeout` | `max_concurrent_runs` | `overflow_policy` | When to use |
-|---------|----------------|-----------------------|-------------------|-------------|
-| `"production"` | 15 s | CPU-scaled: `max(4, min(32, cpus × 4))` | `queue` (depth 32) | Production / staging / rolling deploys |
-| `"default"` / `None` | 5 s | unset (unbounded) | `reject` | Local dev with graceful restart |
-| `"off"` | 0 s | unset | `reject` | Legacy immediate-teardown / unit tests |
+Four distinct postures — the unset posture is bind-aware, so it appears twice.
+
+| Preset | Drain | Admission ceiling | Wait queue | Outbound ordering | When to use |
+|--------|-------|-------------------|------------|-------------------|-------------|
+| **Unset** (`reliability=None`, loopback bind) | 5 s | Yes (CPU-scaled) | Yes (bounded, fair) | `strict` | Local dev on `127.0.0.1` / `localhost` — safe by default |
+| **Unset** (`reliability=None`, non-loopback bind) | 15 s | Yes (CPU-scaled) | Yes (bounded, fair) | `strict` | An actual deployment (`0.0.0.0`, real hostname) — full production posture is auto-picked |
+| **`"production"`** (explicit) | 15 s | Yes (CPU-scaled) | Yes (bounded, fair) | `strict` | Explicitly ask for the production window regardless of bind |
+| **`"default"`** (explicit) | 5 s | **No** | No | `best-effort` | Legacy behaviour — you know what you're doing and want the pre-#3438 shape |
+| **`"off"`** | 0 s | **No** | No | `best-effort` | Explicit opt-out — immediate teardown, no backpressure. This is now the only way to get the pre-safe behaviour |
 
 <Note>
-`max_concurrent_runs` is calculated as `os.cpu_count() * 4`, clamped to the range [4, 32]. On a 4-core machine that's 16 concurrent turns; on an 8-core machine, 32. Unknown profile names fail fast with `ValueError`.
+`max_concurrent_runs` is CPU-scaled — `max(4, min(32, cpus × 4))`. On a 4-core machine that's 16 concurrent turns; on an 8-core machine, 32. The bounded fair queue uses `overflow_policy="queue"` in the safe posture. Unknown profile names fail fast with `ValueError`.
 </Note>
+
+<Warning>
+`reliability="default"` and `reliability=None` used to be aliases. As of PraisonAI #3438 they are **distinct**: `"default"` is the explicit legacy posture (5s drain, no ceiling, best-effort ordering), while `None` is the new safe-by-default posture. A running deployment that upgrades and passes nothing will silently gain admission, a fair queue, strict ordering, and a bind-aware drain.
+</Warning>
 
 ---
 
@@ -155,7 +171,7 @@ Example — preset sets drain to 15s, but explicit override wins:
 
 ```python
 from praisonaiagents import Agent
-from praisonai.bots import BotOS
+from praisonai_bot.bots.botos import BotOS
 
 BotOS(
     agent=Agent(name="SupportBot", instructions="Help users."),
@@ -169,21 +185,48 @@ BotOS(
 
 ## Which Profile Should I Pick?
 
+Most operators pick nothing — the unset posture is safe, and a non-loopback bind auto-selects the full production window.
+
 ```mermaid
 graph TB
-    Q1{Running in production<br/>or staging?}
-    Q1 -->|Yes| Prod[reliability=production]
-    Q1 -->|No| Q2{Need graceful restarts<br/>in local dev?}
-    Q2 -->|Yes| Dev["reliability=default (or None)"]
-    Q2 -->|No| Q3{Regression-testing<br/>immediate-teardown behaviour?}
-    Q3 -->|Yes| Off[reliability=off]
-    Q3 -->|No| Dev
+    Q1{Need a specific<br/>posture?}
+    Q1 -->|No — just run it| Unset["Leave reliability unset<br/>(safe by default, bind-aware)"]
+    Q1 -->|Force 15s drain on loopback too| Prod[reliability=production]
+    Q1 -->|Want pre-#3438 no-backpressure| Off[reliability=off]
+    Q1 -->|Want legacy 5s-drain-no-ceiling| Def[reliability=default]
 
     classDef pick fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef optout fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
 
-    class Prod,Dev,Off pick
-    class Q1,Q2,Q3 question
+    class Unset,Prod pick
+    class Off,Def optout
+    class Q1 question
+```
+
+---
+
+## What Changed on Restart
+
+Before #3442, running the gateway the obvious way gave a no-backpressure deployment that cut in-flight turns on restart. The unset posture now drains gracefully, sized to the bind.
+
+```mermaid
+sequenceDiagram
+    participant Op as Operator
+    participant Gw as Gateway
+    participant Ag as In-flight turn
+
+    Note over Op: Before #3442
+    Op->>Gw: praisonai gateway start (no reliability flag)
+    Gw-->>Op: (no admission, 5s drain)
+    Op->>Gw: rolling restart
+    Gw-->>Ag: SIGTERM — turn cut mid-response ❌
+
+    Note over Op: After #3442 (safe by default)
+    Op->>Gw: praisonai gateway start --host 0.0.0.0
+    Gw-->>Op: (admission ceiling + fair queue + 15s drain)
+    Op->>Gw: rolling restart
+    Gw-->>Ag: SIGTERM — drain window; turn completes ✅
 ```
 
 ---
@@ -205,22 +248,22 @@ Cross-instance Redis pub/sub is self-healing: on connection loss the adapter rec
 
 <AccordionGroup>
 
-<Accordion title="Start with production and only override what you measure">
-The preset values (15 s drain, CPU × 4 ceiling, 32-deep queue) are conservative defaults tuned for latency-bound LLM workloads. Only override a value after measuring that the default doesn't fit — e.g. a 99th-percentile turn time of 25 s warrants `drain_timeout=30`.
+<Accordion title="Pass nothing — the default is already safe">
+Leaving `reliability` unset gives you a bounded admission ceiling, a fair wait queue, strict ordering, and a bind-aware drain. On a non-loopback bind that resolves to the full production window automatically, so most deployments need no `reliability=` argument.
 </Accordion>
 
-<Accordion title="Use production for rolling deploys">
+<Accordion title="Force production to get the 15s window even on loopback">
 
-`reliability="production"` ensures in-flight conversations finish before a new version takes over. Pair with a process manager that sends `SIGTERM` on deploy.
+`reliability="production"` pins the 15 s drain regardless of bind. Use it when you test on `127.0.0.1` but want the same drain window a real deployment gets. Pair with a process manager that sends `SIGTERM` on deploy.
 </Accordion>
 
-<Accordion title="Keep default for development">
+<Accordion title="I want the pre-#3438 behaviour back">
 
-`reliability="default"` (or `None`) gives you a 5-second drain so you don't cut conversations mid-turn during `Ctrl+C`, without the admission overhead of production mode.
+Pass `reliability="off"` for immediate teardown with no admission, or `reliability="default"` for a 5 s drain with no ceiling. `off` also forces [`gateway.durable_runs`](/features/gateway-durable-runs) **off** — the explicit escape hatch to the zero-overhead path. Neither is a recommended default.
 </Accordion>
 
-<Accordion title="Keep off for backward-compat regression testing only">
-`reliability="off"` restores the pre-reliability behaviour (immediate cancel on SIGTERM, unbounded concurrency). It also forces [`gateway.durable_runs`](/features/gateway-durable-runs) **off** — the explicit escape hatch to the zero-overhead path. Use it only in tests — never deploy `off` to production.
+<Accordion title="Handle admission rejection and a slower restart when upgrading">
+Two behaviours change observably once the unset posture becomes safe: a burst that used to fan out unboundedly now queues (or rejects when the queue is full), and a `SIGTERM`-then-kill loop now waits 5–15 s for in-flight turns. Downstream code that assumed the gateway never says no, and deploy scripts that expected sub-second restarts, need to account for both.
 </Accordion>
 
 <Accordion title="Override individual knobs when needed">
