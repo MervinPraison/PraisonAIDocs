@@ -13,7 +13,7 @@ The gateway now ships in the `praisonai-bot` package. `praisonai serve gateway` 
 **Looking for the event-loop watchdog?** This page covers connection-level heartbeats that reap silent clients. To detect a **wedged asyncio loop** (the process is up but the loop isn't running), see [Event-Loop Watchdog](/features/gateway-loop-watchdog).
 </Note>
 
-Liveness closes half-open gateway connections by heartbeating over the wire and reaping any peer that misses too many beats.
+Liveness is on out-of-box: the gateway pings peers on an interval, refreshes activity on every inbound frame, and reaps any session — or any stalled handshake — that misses too many beats.
 
 ```mermaid
 graph LR
@@ -38,16 +38,14 @@ graph LR
 
 <Steps>
 
-<Step title="Enable liveness on an agent's gateway">
+<Step title="On by default">
 
 ```python
 from praisonaiagents import Agent
-from praisonaiagents.gateway import GatewayConfig, LivenessConfig
 from praisonai_bot.gateway import WebSocketGateway
 
-gateway = WebSocketGateway(
-    config=GatewayConfig(liveness=LivenessConfig(enabled=True))
-)
+# Liveness runs at the config defaults — no LivenessConfig needed.
+gateway = WebSocketGateway()
 gateway.register_agent(Agent(name="Support", instructions="Reply to users"))
 ```
 
@@ -57,37 +55,42 @@ gateway.register_agent(Agent(name="Support", instructions="Reply to users"))
 
 ```python
 from praisonaiagents.gateway import GatewayConfig, LivenessConfig
+from praisonai_bot.gateway import WebSocketGateway
 
-config = GatewayConfig(
-    liveness=LivenessConfig(
-        enabled=True,
-        interval_ms=15_000,
-        missed_beats_before_reap=3,
+gateway = WebSocketGateway(
+    config=GatewayConfig(
+        liveness=LivenessConfig(interval_ms=15_000, missed_beats_before_reap=3)
     )
 )
 ```
 
 </Step>
 
-<Step title="Or configure it in gateway.yaml">
+<Step title="Opt out with interval_ms=0">
 
-```yaml
-gateway:
-  liveness:
-    enabled: true
-    interval_ms: 15000
-    missed_beats_before_reap: 3
+```python
+from praisonaiagents.gateway import GatewayConfig, LivenessConfig
+from praisonai_bot.gateway import WebSocketGateway
+
+# The only supported way to fully disable liveness at the runtime.
+gateway = WebSocketGateway(
+    config=GatewayConfig(liveness=LivenessConfig(enabled=False, interval_ms=0))
+)
 ```
 
 </Step>
 
 </Steps>
 
+<Warning>
+`LivenessConfig(enabled=False)` alone does **not** disable liveness. The runtime overrides the config default and synthesises an enabled policy from the config's own window. Set `interval_ms=0` to fully opt out.
+</Warning>
+
 ---
 
 ## How It Works
 
-The gateway emits a `PING` on each interval; any inbound frame (a `PONG`, a peer `PING`, or a normal message) refreshes `last_activity`. A silent peer misses beats until the reaper closes it.
+The gateway emits a `PING` on each interval; any inbound frame (a `PONG`, a peer `PING`, or a normal message) refreshes activity. A silent peer misses beats until the reaper closes it.
 
 ```mermaid
 sequenceDiagram
@@ -113,11 +116,47 @@ sequenceDiagram
 |---|---|---|
 | `EventType.PING` / `EventType.PONG` | Protocol | Wire frame both peers agree on |
 | `LivenessPolicy.evaluate(last_activity, now)` | Core (pure) | Returns `KEEP` or `REAP` |
-| Gateway reaper task | Wrapper server | Emits `PING`, calls `evaluate`, closes with `LIVENESS_TIMEOUT` |
-| Client watchdog | Reference client | Sends `PING`, force-reconnects on silence |
+| `WebSocketGateway._liveness_loop` | Wrapper server | Emits `PING`, evaluates policy, closes reaped peers |
+| `WebSocketGateway._client_last_seen[client_id]` | Wrapper server | Per-connection fallback clock so sessionless peers still age out |
+| `WebSocketClient._heartbeat_loop` | Reference client | Sends `PING`, force-closes the socket after 2× silence for backoff/resume to reconnect |
 | `GatewayCloseCode.LIVENESS_TIMEOUT` | Protocol | Typed close code the client can recognise |
 
-A connection is reaped once `now > last_activity + interval_seconds × missed_beats_before_reap`. Setting `enabled=False` (the default) makes `evaluate` always return `KEEP`, so upgrading changes nothing.
+A connection is reaped once `now > last_activity + interval_seconds × missed_beats_before_reap`. Half-open peers with **no bound session yet** (a stalled pre-`hello`/`join` handshake) are evaluated against a per-connection `_client_last_seen` clock, so silent handshake sockets age out instead of leaking forever.
+
+The runtime is **on by default**: the config's `enabled=False` no longer disables it. Only `interval_ms=0` yields a disabled policy, after which the loop stays inert and nothing is reaped.
+
+---
+
+## Health Output
+
+`WebSocketGateway.health()` surfaces the reaper's state when the task is running:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `liveness.enabled` | `bool` | True while the reaper is emitting `PING` and evaluating |
+| `liveness.interval_ms` | `int` | Cadence being used (same value advertised as `heartbeat_ms`) |
+| `liveness.missed_beats_before_reap` | `int` | How many intervals of silence trigger a reap |
+| `liveness.reaped_connections` | `int` | Cumulative half-open peers closed with `LIVENESS_TIMEOUT` |
+
+```json
+"liveness": {
+  "enabled": true,
+  "interval_ms": 30000,
+  "missed_beats_before_reap": 2,
+  "reaped_connections": 4
+}
+```
+
+---
+
+## LIVENESS_TIMEOUT close code
+
+The reaped peer sees a WebSocket close with:
+
+- **Code:** `4002` (application-defined, private-use 4000–4999 range)
+- **Reason:** `"liveness_timeout"` (equal to `GatewayCloseCode.LIVENESS_TIMEOUT.value`)
+
+Custom clients should treat this as expected and reconnect. The reference client's heartbeat loop usually force-reconnects first — after `2 × heartbeat_ms` of silence it closes its own socket so the backoff/resume path re-establishes the connection before the server reaps it.
 
 ---
 
@@ -133,15 +172,16 @@ A connection is reaped once `now > last_activity + interval_seconds × missed_be
 
 ## Common Patterns
 
-Pick a cadence from the peer's network profile — the default is a no-op until you turn it on.
+Liveness runs at the defaults; pick a cadence from the peer's network profile, or opt out entirely with `interval_ms=0`.
 
 ```mermaid
 graph TB
-    Start{Do you see stuck<br/>'online' sessions?} -->|No| Off[enabled=False<br/>default, no-op]
+    Start{Tune the cadence?} -->|Keep defaults| Def[interval_ms=30000<br/>missed_beats=2]
     Start -->|Yes| Net{Peer network?}
-    Net -->|Mobile / NAT| Def[interval_ms=30000<br/>missed_beats=2]
+    Net -->|Mobile / NAT| Def
     Net -->|LAN / low-latency| Ag[interval_ms=5000<br/>missed_beats=2]
     Net -->|Mixed| Bal[interval_ms=15000<br/>missed_beats=3]
+    Start -->|Why disable?| Opt[Explicit opt-out<br/>interval_ms=0]
 
     classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef opt fill:#10B981,stroke:#7C90A0,color:#fff
@@ -149,32 +189,38 @@ graph TB
 
     class Start,Net q
     class Def,Ag,Bal opt
-    class Off off
+    class Opt off
 ```
 
-### Disabled (default)
+### Out-of-box defaults
 
 ```python
-from praisonaiagents.gateway import GatewayConfig
+from praisonai_bot.gateway import WebSocketGateway
 
-config = GatewayConfig()  # liveness disabled, behaviour unchanged
-```
-
-### Mobile / NAT peers
-
-```python
-from praisonaiagents.gateway import GatewayConfig, LivenessConfig
-
-config = GatewayConfig(liveness=LivenessConfig(enabled=True))  # 30s × 2 beats
+gateway = WebSocketGateway()  # liveness on: 30s × 2 beats
 ```
 
 ### Aggressive reaping for high-turnover realtime
 
 ```python
 from praisonaiagents.gateway import GatewayConfig, LivenessConfig
+from praisonai_bot.gateway import WebSocketGateway
 
-config = GatewayConfig(
-    liveness=LivenessConfig(enabled=True, interval_ms=5_000, missed_beats_before_reap=2)
+gateway = WebSocketGateway(
+    config=GatewayConfig(
+        liveness=LivenessConfig(interval_ms=5_000, missed_beats_before_reap=2)
+    )
+)
+```
+
+### Fully disabled
+
+```python
+from praisonaiagents.gateway import GatewayConfig, LivenessConfig
+from praisonai_bot.gateway import WebSocketGateway
+
+gateway = WebSocketGateway(
+    config=GatewayConfig(liveness=LivenessConfig(enabled=False, interval_ms=0))
 )
 ```
 
@@ -184,16 +230,20 @@ config = GatewayConfig(
 
 <AccordionGroup>
 
-<Accordion title="Leave it off until presence lies">
-Default is `enabled=False` — behaviour is unchanged. Only enable it when presence stays online after a peer vanishes.
+<Accordion title="Only opt out with interval_ms=0">
+`enabled=False` alone does not disable liveness — the runtime overrides it and synthesises an enabled policy from the config's window. To fully turn liveness off, set `interval_ms=0`, which yields a disabled policy and keeps the reaper loop inert.
+</Accordion>
+
+<Accordion title="Alert on liveness.reaped_connections">
+`health()` exposes a cumulative `liveness.reaped_connections` counter. A sudden burst of reaps signals an upstream network problem (flaky peers, NAT timeouts, or a proxy dropping idle sockets) — watch the rate, not just the total.
 </Accordion>
 
 <Accordion title="Honour the advertised interval on custom clients">
-The server advertises `heartbeat_ms`; the reference client's watchdog trips at ~2× that. If you build your own client, honour the advertised value so both sides derive the same window from `reap_deadline` / `interval_seconds`.
+The server advertises `heartbeat_ms` in `hello_ok`; when liveness is enabled (the default) this equals the policy's `interval_ms`. The reference client already runs `_heartbeat_loop`: it pings every interval and force-closes the socket after `2 × heartbeat_ms` of silence so backoff/resume reconnects. Custom clients should derive the same 2× silence window from the advertised value — miss it and the server closes you with `4002`.
 </Accordion>
 
 <Accordion title="Treat LIVENESS_TIMEOUT as expected">
-Treat this close as expected. A reaped peer sees `GatewayCloseCode.LIVENESS_TIMEOUT` (value `"liveness_timeout"`) in the WebSocket close reason. Match on it to reconnect and resume — don't surface it as a fatal error to the user.
+A reaped peer sees `GatewayCloseCode.LIVENESS_TIMEOUT` (value `"liveness_timeout"`, close code `4002`) in the WebSocket close reason. Match on it to reconnect and resume — don't surface it as a fatal error to the user.
 </Accordion>
 
 </AccordionGroup>
@@ -203,14 +253,14 @@ Treat this close as expected. A reaped peer sees `GatewayCloseCode.LIVENESS_TIME
 ## Related
 
 <CardGroup cols={2}>
+<Card title="Doctor Plugins" icon="stethoscope" href="/features/gateway-doctor-plugins">
+  Surfaces liveness state in gateway diagnostics
+</Card>
 <Card title="Reliability Preset" icon="shield-check" href="/features/gateway-reliability">
   Related resilience knobs
 </Card>
 <Card title="Session Continuity" icon="link" href="/features/gateway-session-continuity">
   What survives a reap
-</Card>
-<Card title="Hot-Reload Observability" icon="rotate" href="/features/gateway-hot-reload#observability">
-  Reload outcome, watcher liveness, and config drift in `health()`
 </Card>
 <Card title="Event-Loop Watchdog" icon="stethoscope" href="/features/gateway-loop-watchdog">
   Detect a wedged asyncio loop (not just a silent connection)
