@@ -5,7 +5,7 @@ description: "Safety mechanisms now apply to async tool execution paths"
 icon: "shield-check"
 ---
 
-Async tool calls in `agent.achat()` now route through the same safety mechanisms as sync execution, including approval checks, timeouts, and **Loop Guard's doom-loop / no-progress protection** (PR #4005). The sync-only `execute_tool_with_circuit_breaker` wrapper is not reused on the async path (it uses `time.sleep`); circuit-breaker state tracked elsewhere still applies.
+Async tool calls in `agent.achat()` now route through the same safety mechanisms as sync execution, including approval checks, timeouts, and **Loop Guard's doom-loop / no-progress protection** (PR #4005). Each async tool invocation now also runs through `CircuitBreaker.acall(...)` — event-loop safe, using the same per-agent breaker name (`tool_{id(self)}_{function_name}`) and `weakref.finalize` cleanup as the sync path ([PR #4469](https://github.com/MervinPraison/PraisonAI/pull/4469)).
 
 ```python
 from praisonaiagents import Agent
@@ -117,7 +117,7 @@ sequenceDiagram
 |--------------|-----------|------------|
 | **Approval checks** | ✅ | ✅ |
 | **Argument type casting** | ✅ | ✅ |
-| **Circuit breaker** | ✅ | ✅ |
+| **Circuit breaker** | ✅ | ✅ (parity restored in PR #4469)[^cb-async] |
 | **Tool timeout** | ✅ | ✅ |
 | **Doom-loop tracking** | ✅ | ✅ |
 | **Trace events** | ✅ | ✅ |
@@ -127,6 +127,8 @@ sequenceDiagram
 | **`restart_safe=False` / `.idempotent = False` veto** | ✅ | ✅ (parity restored in PR #4299) |
 
 [^parity]: The async column was broken before PR #4141 — a raised exception was retried zero times regardless of `RetryPolicy`. See [Tool Retry Policy → Sync / async parity](/features/tool-retry-policy).
+
+[^cb-async]: The async column was aspirational before [PR #4469](https://github.com/MervinPraison/PraisonAI/pull/4469) — async tool calls bypassed the breaker entirely. The async path now wraps each invocation in `CircuitBreaker.acall(...)`, so five consecutive failures open the breaker just like sync. See [Circuit Breaker Protection](#circuit-breaker-protection).
 
 **Architecture**: The unified async dispatcher now calls `execute_tool_async` for tool invocations, so long-running tools no longer block the event loop.
 
@@ -154,7 +156,7 @@ async def safe_execution():
 ```
 
 ### Circuit Breaker Protection
-Tool failure rates are tracked across async calls:
+Every async tool call runs through `CircuitBreaker.acall(...)` — the same per-agent / per-tool breaker as sync (`tool_{id(self)}_{function_name}`), with the same `failure_threshold=5`, `recovery_timeout=60.0`, and `graceful_degradation=True` defaults ([PR #4469](https://github.com/MervinPraison/PraisonAI/pull/4469)).
 
 ```python
 from praisonaiagents import Agent
@@ -167,6 +169,54 @@ agent = Agent(
 
 # Failed async calls contribute to circuit breaker state
 await agent.achat("Call unreliable API")  # May be blocked if failure rate is high
+```
+
+**Two kinds of failures count toward the breaker on the async path:**
+
+1. A **raised exception** inside the tool.
+2. A tool **result dict carrying `error`** — surfaced to the breaker through a `_ToolFailure` sentinel so the dict is preserved.
+
+Approval / permission / policy / guardrail denials **never** count as failures — the async path excludes the same keys the sync `_ToolFailure` wrapper does: `approval_denied`, `permission_denied`, `approval_error`, `policy_denied`, `guardrail_denied`.
+
+When the breaker is open, `CircuitBreaker.acall(...)` raises `CircuitBreakerException` and the async path returns:
+
+```python
+{
+    "error": "Tool 'X' circuit breaker open - too many recent failures",
+    "circuit_open": True,
+    "agent_name": "...",
+    "session_id": "...",
+    "remediation": "Wait for recovery_timeout (60s) or investigate recent tool failures.",
+}
+```
+
+The `circuit_open: True` flag activates the async retry-skip, so retries stop immediately instead of hammering the open breaker. Loop Guard also records the rejection, so open-circuit rejections still count toward its BLOCK/HALT thresholds.
+
+<Note>
+If the `circuit_breaker` module cannot be imported (trimmed builds), the async path falls back to direct invocation — tools still run, just without breaker protection.
+</Note>
+
+A repeatedly-failing async tool opens the breaker after 5 failures; the 6th call short-circuits:
+
+```python
+import asyncio
+from praisonaiagents import Agent, tool
+
+@tool
+async def flaky_upstream(query: str) -> str:
+    """Async tool that keeps failing on a bad upstream."""
+    raise RuntimeError("upstream 503")
+
+agent = Agent(name="Researcher", tools=[flaky_upstream])
+
+async def main():
+    # First 5 calls raise and count as failures; the breaker opens.
+    # The 6th call short-circuits with {"circuit_open": True}, so the
+    # async retry loop terminates immediately instead of retrying.
+    result = await agent.achat("Query the upstream repeatedly")
+    print(result)
+
+asyncio.run(main())
 ```
 
 ## Loop Guard on the async path
@@ -375,12 +425,14 @@ No code changes required - async tool safety is automatically enabled:
 ```python
 # Previously: approval, circuit breaker, etc. were skipped
 await agent.achat("Use dangerous tool")  # No approval prompt
+# Async tool calls bypassed the circuit breaker even after 5 consecutive failures
 ```
 
 **After:** Async calls use full safety pipeline
 ```python 
 # Now: full safety pipeline including approval
 await agent.achat("Use dangerous tool")  # Approval prompt appears
+# Async tool calls open the breaker after 5 failures and short-circuit, same as sync (PR #4469)
 ```
 
 ---
