@@ -153,21 +153,80 @@ sequenceDiagram
     end
 ```
 
-A hook that **raises or times out** now counts as `Deny`, not `Allow`. Every hook lifecycle path returns `HookResult(decision="deny", reason=...)` on error — a crashing `BEFORE_TOOL` gate no longer lets the tool call through by accident.
+A hook that **raises**, **times out**, has **no callable** (a `FunctionHook` whose `func is None`), or — for **command hooks** — exits with an **unexpected exit code** (anything other than `0` = allow or `2` = blocking; e.g. `127` command-not-found, `126` not-executable) now counts as `Deny`, not `Allow`. This applies even when the command already printed `{"decision": "allow"}` on stdout — a gating hook that crashes after emitting allow-JSON has not actually approved the call, so the runner denies it. Every hook lifecycle path returns `HookResult(decision="deny", reason=...)` on error — a broken `BEFORE_TOOL` gate no longer lets the tool call through by accident.
 
 ```mermaid
-graph LR
-    A[Hook fires] --> B{Raised or<br/>timed out?}
-    B -->|Yes| D[🚫 decision=deny<br/>fail closed]
-    B -->|No| C[✅ hook return value applies]
+graph TB
+    A[Hook fires] --> B{Function hook<br/>with func=None?}
+    B -->|Yes| D[🚫 deny — no callable]
+    B -->|No| C{Raised or<br/>timed out?}
+    C -->|Yes| E[🚫 deny — error/timeout]
+    C -->|No| F{Command hook<br/>exit code}
+    F -->|0| G[✅ allow<br/>parse JSON]
+    F -->|2| H[🚫 deny — blocking]
+    F -->|other<br/>127, 126, ...| I[🚫 deny — unexpected exit]
+    G --> J{JSON says allow<br/>+ unexpected exit?}
+    J -->|Yes| K[🚫 deny — allow-JSON<br/>then unexpected exit]
+    J -->|No| L[✅ decision from JSON]
 
     classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef allow fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class A,B question
-    class D deny
-    class C allow
+    class A,B,C,F,J question
+    class D,E,H,I,K deny
+    class G,L allow
+```
+
+### Command Hook Exit Codes
+
+A shell-command hook communicates its verdict through **both** its exit code and its stdout JSON — the runner requires them to agree on `allow`.
+
+| Exit code | Decision | Notes |
+|-----------|----------|-------|
+| `0` | `allow` | JSON on stdout (if any) is honoured — `decision`, `reason`, `modified_input`, `additional_context`. Absence of JSON is treated as allow. |
+| `2` | `deny` | Blocking sentinel. `stderr` (or `stdout`) becomes `reason`. Explicit deny-JSON is still honoured. |
+| Any other non-zero (`127`, `126`, `1`, `137`, …) | `deny` | Hook did not render a trustworthy verdict. `reason` names the exit code and the captured stderr/stdout. `allow`-JSON on stdout does **not** override this. |
+| Timed out (killed) | `deny` | Same reason format; matches the exception/timeout path. |
+
+```python
+# Fail closed on a missing shell script
+from praisonaiagents.hooks import HookRunner, HookRegistry
+
+runner = HookRunner(HookRegistry(), cwd="/tmp")
+
+# What happens when a command hook script is not on PATH
+result = runner._parse_command_output(stdout="", stderr="not found", exit_code=127)
+assert result.decision == "deny"
+assert "127" in result.reason  # "Hook exited with unexpected code 127: not found"
+```
+
+```python
+# Fail closed on allow-JSON + unexpected exit — the allow is discarded
+result = runner._parse_command_output(
+    stdout='{"decision": "allow"}', stderr="", exit_code=127
+)
+assert result.decision == "deny"
+assert "127" in result.reason
+```
+
+```python
+# Explicit deny-JSON still preserved even on unexpected exit
+result = runner._parse_command_output(
+    stdout='{"decision": "deny", "reason": "policy"}', stderr="", exit_code=127
+)
+assert result.decision == "deny"
+assert result.reason == "policy"  # reason from JSON is respected
+```
+
+```python
+# FunctionHook with func=None fails closed
+from praisonaiagents.hooks import FunctionHook, HookEvent
+
+hook = FunctionHook(id="broken", name="broken", event=HookEvent.BEFORE_TOOL, func=None)
+# When executed, the runner now returns:
+#   output=HookResult(decision="deny", reason="Hook 'broken' has no callable")
+# so is_blocked() returns True and the tool is refused.
 ```
 
 ### Sequential vs Parallel Hooks
@@ -473,8 +532,15 @@ See [Redact / Block Tool Output](/features/redact-tool-output) for the plugin-st
   <Accordion title="Sequential for rewriters, parallel for observers">
     Parallel is the default and is faster. Only mark a hook `sequential=True` when it needs to mutate the payload via `modified_input`.
   </Accordion>
-  <Accordion title="Hooks fail closed on exception or timeout">
-    A `BEFORE_TOOL` (or any) hook that raises or times out now returns `HookResult(decision="deny", reason=...)` — the tool does **not** execute. This matches `GuardrailChain` and closes a silent-pass-through where a buggy security hook used to allow the call through. Set `agent._strict_hooks = True` in tests to also surface the underlying exception, not just the deny.
+  <Accordion title="Hooks fail closed on error, timeout, missing callable, or unexpected exit">
+    A `BEFORE_TOOL` (or any) hook fails closed — returns `HookResult(decision="deny", reason=...)` and the tool does **not** execute — on any of four triggers:
+
+    - **Raises** an exception.
+    - **Times out**.
+    - Has **no callable** — a `FunctionHook` whose `func is None` denies with `"Hook '<name>' has no callable"`.
+    - For **command hooks**, exits with an **unexpected exit code** — anything other than `0` (allow) or `2` (blocking), e.g. `127` command-not-found or `126` not-executable. `allow`-JSON printed on stdout before the crash is discarded; explicit `deny`-JSON keeps its `reason`.
+
+    This matches `GuardrailChain` and closes a silent pass-through where a buggy security hook used to allow the call through. Whenever any trigger fires on `BEFORE_TOOL`, the viewer sees `"Execution of {tool_name} was blocked by security policy."` Set `agent._strict_hooks = True` in tests to also surface the underlying exception, not just the deny.
   </Accordion>
   <Accordion title="Tool errors don't fail closed — hooks do">
     Tool failures are tolerated: a tool that raises or returns a non-JSON result is fed back to the model as `{"error": ...}` / `{"result": ...}` and the run continues. Hooks are the opposite — a raising or timed-out hook denies the call. Keep security gates in hooks, not in tool bodies.
