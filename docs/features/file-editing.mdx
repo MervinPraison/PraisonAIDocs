@@ -174,7 +174,7 @@ sequenceDiagram
 | **list_files** | Low | No | Directory listings |
 | **edit_file** | High | Recommended | Precise find-and-replace; **automatic per-file lock + staleness guard**; `force=True` to override |
 | **write_file** | High | Recommended | Create/overwrite; **automatic per-file lock + staleness guard on existing files**; `force=True` to override |
-| **apply_patch** | High | Recommended | Atomic multi-file Add/Update/Delete with rollback; **per-path locks across the whole patch**; staleness guard on Update **and** Delete; `force=True` to override |
+| **apply_patch** | High | Recommended | Atomic multi-file Add/Update/Delete/Move with rollback; **per-path locks across the whole patch (both endpoints of a Move)**; staleness guard on Update, Delete **and Move**; `force=True` to override |
 
 <Warning>
 Two modules export `read_file` with different signatures:
@@ -280,7 +280,7 @@ from praisonaiagents.tools.file_tools import FileTools
 # 1. Intentional blind edit
 edit_file("rollback.txt", "v2", "v1", force=True)
 
-# 2. Force an entire patch (overrides Update & Delete staleness; per-file lock still applies)
+# 2. Force an entire patch (overrides Update, Delete & Move staleness; per-file lock still applies)
 apply_patch(patch_text, force=True)
 
 # 3. Force a blind write through FileTools
@@ -356,7 +356,7 @@ edit_file(
 
 ## Multi-file Patches with `apply_patch`
 
-`apply_patch` lets an agent Add, Update, and Delete multiple files in a single atomic call — all changes succeed together or none are committed.
+`apply_patch` lets an agent Add, Update, Delete, and Move/rename multiple files in a single atomic call — all changes succeed together or none are committed.
 
 ```mermaid
 graph TB
@@ -365,14 +365,16 @@ graph TB
     A1 -->|Yes, one change| E[edit_file]
     A1 -->|Yes, multiple changes| EM[apply_patch with one Update]
     A1 -->|Multiple files| AP[apply_patch]
+    A1 -->|Rename with or without edits| MV[apply_patch with *** Move File]
     AP --> R[All-or-nothing atomic]
+    MV --> R
 
     classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef tool fill:#10B981,stroke:#7C90A0,color:#fff
     classDef note fill:#F59E0B,stroke:#7C90A0,color:#fff
 
     class Q,A1 q
-    class E,EM,AP tool
+    class E,EM,AP,MV tool
     class R note
 ```
 
@@ -425,8 +427,11 @@ print(result)  # "Success: Applied patch to 3 file(s) ... <combined diff>"
 | `*** Add File: <path>` | Full file content lines until next header | Create a new file (errors if path already exists) |
 | `*** Update File: <path>` | One or more `@@` hunks (`<old>\n===\n<new>`) | Modify file using fuzzy ladder for each hunk |
 | `*** Delete File: <path>` | (no body) | Remove file (errors if path missing) |
+| `*** Move File: <old> -> <new>` | Optional `@@` hunks (`<old>\n===\n<new>`) | Rename a file (and optionally edit it in the same atomic op); errors if source missing or destination exists |
 
 Optional sentinels `*** Begin Patch` / `*** End Patch` are accepted and stripped.
+
+The `Move File` split is on the literal `" -> "` (space on both sides), so paths containing `->` without surrounding spaces are unaffected. Both source and destination must be non-empty and resolve to different paths.
 
 **Update hunk syntax:**
 
@@ -443,6 +448,60 @@ Optional sentinels `*** Begin Patch` / `*** End Patch` are accepted and stripped
 ```
 
 Each `@@` hunk runs through the same fuzzy ladder as `edit_file`, so whitespace/indentation drift in the old block is tolerated.
+
+**Move hunk syntax:**
+
+Rename only — the header stands on its own line:
+
+```
+*** Move File: src/user.py -> src/account.py
+```
+
+Rename and edit in one atomic op — add one or more `@@` hunks after the header:
+
+```
+*** Move File: src/user.py -> src/account.py
+@@
+class User:
+===
+class Account:
+```
+
+Move hunks run through the same fuzzy ladder as `Update`, and BOM/CRLF are preserved from the source.
+
+<Steps>
+<Step title="Agent rename-and-edit in one op">
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Refactor Agent",
+    instructions="Rename files with apply_patch's Move File; combine with @@ hunks to edit in the same op.",
+    tools=["read_file", "apply_patch", "edit_file"],
+)
+
+agent.start("Rename src/user.py to src/account.py and swap `class User` for `class Account`.")
+```
+
+</Step>
+
+<Step title="Direct SDK use">
+
+```python
+from praisonaiagents.tools.edit_tools import apply_patch
+
+result = apply_patch("""*** Move File: src/user.py -> src/account.py
+@@
+class User:
+===
+class Account:
+""")
+print(result)  # "Renamed src/user.py -> src/account.py\n<diff>"
+```
+
+</Step>
+</Steps>
 
 ### Atomicity Guarantees
 
@@ -473,6 +532,28 @@ sequenceDiagram
 | BOM preservation | UTF-8 BOM detected on Update is reapplied on write |
 | Line-ending preservation | CRLF files stay CRLF, LF files stay LF (matches `edit_file`) |
 | UTF-16 rejection | Update on a UTF-16 file fails with a clear error |
+| Move is atomic | The destination is written first, then the source renamed aside — either both land or neither does, and the source is restored on any later failure |
+| Move preserves BOM / line endings | Same as Update — UTF-8 BOM and CRLF/LF are carried over from the source |
+| Cross-op destination conflicts fail up front | Two operations producing the same destination are rejected in validate; nothing is committed |
+| Staging never clobbers a sibling | A pre-existing file at the default `.praison_patch_tmp` staging name is stepped around instead of truncated or deleted |
+
+**Move commit flow:**
+
+```mermaid
+sequenceDiagram
+    participant AP as ✏️ apply_patch
+    participant FS as 📁 Filesystem
+
+    AP->>FS: Write destination (staged temp → os.replace)
+    AP->>FS: Rename source aside (backup)
+    alt Both steps succeed
+        FS-->>AP: ✅ Renamed src -> dst
+    else Later failure
+        AP->>FS: Drop destination
+        AP->>FS: Restore source + re-arm staleness guard
+        FS-->>AP: Rolled back
+    end
+```
 
 ### `apply_patch` Error Messages
 
@@ -489,6 +570,18 @@ sequenceDiagram
 | UTF-16 file | `Error: Cannot update '<path>': UTF-16 encoding is not supported. Please convert the file to UTF-8.` |
 | Automatic staleness — Update | `Error: Cannot update '{path}': file changed since it was read - re-read before editing (or pass force=True to override).` |
 | Automatic staleness — Delete | `Error: Cannot delete '{path}': file changed since it was read - re-read before editing (or pass force=True to override).` |
+| Malformed `Move File` header (no `-> `) | `Error: Invalid patch: Malformed Move File header (expected '<old> -> <new>'): '<payload>'` |
+| Empty source or destination in `Move File` header | `Error: Invalid patch: Malformed Move File header (empty source or destination): '<payload>'` |
+| Move source and destination are the same | `Error: Cannot move '<src>' to '<dst>': source and destination are the same path` |
+| Move source missing | `Error: Cannot move '<src>': file not found` |
+| Move destination already exists | `Error: Cannot move '<src>' to '<dst>': destination already exists` |
+| Empty hunk old-block in a Move | `Error: Empty hunk in move for '<src>'` |
+| Hunk not found in a Move | `Error: Hunk not found in '<src>': '<preview>'` |
+| Ambiguous hunk in a Move | `Error: Ambiguous hunk in '<src>': '<preview>' matches N locations` |
+| Cross-op conflict on same destination | `Error: Conflicting operations target the same path '<dst>' (also produced by '<earlier op display>')` |
+| Automatic staleness — Move | `Error: Cannot move '<src>': file changed since it was read - re-read before editing (or pass force=True to override).` |
+| Undecodable source on Move | `Error: Cannot move '<src>': <decode error>` |
+| Move success line | `Renamed <src> -> <dst>\n<diff><diagnostics>` |
 | Success | `Success: Applied patch to N file(s)\n\n<combined diff>` |
 
 ---
@@ -692,7 +785,7 @@ edit_tools = create_edit_tools(
 | Function | Args | Returns | Notes |
 |----------|------|---------|-------|
 | `edit_file` | `filepath`, `old_string`, `new_string`, `replace_all=False`, `expected_hash=None`, `force=False` | `str` | High-risk; fuzzy ladder + fails on ambiguous match unless `replace_all=True`; **automatic per-file lock + staleness guard** |
-| `apply_patch` | `patch: str`, `force=False` | `str` | High-risk; atomic multi-file Add/Update/Delete with rollback; **per-path locks + staleness guard on Update and Delete** |
+| `apply_patch` | `patch: str`, `force=False` | `str` | High-risk; atomic multi-file Add/Update/Delete/Move with rollback; **per-path locks (both endpoints of a Move) + staleness guard on Update, Delete and Move** |
 | `read_file` *(edit_tools)* | `filepath` | `Tuple[str, str]` | `(content, sha256_hex)`; **records hash into shared registry** |
 | `read_file` *(file_tools)* | `filepath`, `encoding='utf-8'` | `str` | Simple read; **also records hash into shared registry** |
 | `search_files` | `directory`, `pattern`, `file_pattern='*'` | JSON string | Case-insensitive substring search |
@@ -835,11 +928,13 @@ result = edit_file("config.py", "DEBUG = False", "DEBUG = True", expected_hash=h
 
 ### Atomic Multi-file Rename
 
+Move the file and fix its importer in one lossless, atomic op — no need to restate the file body:
+
 ```python
 from praisonaiagents.tools.edit_tools import apply_patch
 
 result = apply_patch("""*** Begin Patch
-*** Update File: src/auth.py
+*** Move File: src/auth.py -> src/account.py
 @@
 class UserService:
 ===
@@ -848,10 +943,12 @@ class AccountService:
 @@
 from src.auth import UserService
 ===
-from src.auth import AccountService
+from src.account import AccountService
 *** End Patch
 """)
 ```
+
+Without `Move File`, the same rename needs a `Delete + Add` pair that restates the whole file body — heavier and not lossless.
 
 ---
 
@@ -888,6 +985,10 @@ CRLF files stay CRLF, LF files stay LF, UTF-8 BOM is preserved. UTF-16 files are
 
 <Accordion title="Use apply_patch for multi-file changes">
 Use `apply_patch` when changes span multiple files and must succeed/fail together (rename, refactor, dependency bump). Use `edit_file` when changing one file in one place — it returns a focused diff and avoids patch syntax overhead.
+</Accordion>
+
+<Accordion title="Prefer Move File over Delete+Add for renames">
+`*** Move File: <old> -> <new>` is atomic, race-safe on both endpoints, and preserves BOM/CRLF — without re-sending the file body. Combine it with `@@` hunks to rename and edit in one operation, instead of a heavier `Delete + Add` pair that restates the whole file.
 </Accordion>
 
 <Accordion title="Patch hunk format is not unified diff">
