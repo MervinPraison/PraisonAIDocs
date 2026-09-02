@@ -91,8 +91,8 @@ sequenceDiagram
 
 | Surface | Method + Path | Notes |
 |---------|---------------|-------|
-| OpenAI chat | `POST /v1/chat/completions` | SSE streaming supported (`stream: true`) |
-| OpenAI responses | `POST /v1/responses` | Accepts string or messages-style `input` |
+| OpenAI chat | `POST /v1/chat/completions` | SSE streaming supported (`stream: true`); real `usage` returned; opt-in streamed usage via `stream_options.include_usage` |
+| OpenAI responses | `POST /v1/responses` | Accepts string or messages-style `input`; returns `usage` in Responses-native shape |
 | OpenAI models | `GET /v1/models` | Lists gateway-registered agent IDs |
 | MCP JSON-RPC | `POST /mcp` | Methods: `initialize`, `tools/list`, `tools/call` |
 
@@ -108,6 +108,63 @@ reply = client.chat.completions.create(
 )
 print(reply.choices[0].message.content)
 ```
+
+---
+
+## Token Usage
+
+Every response reports real per-turn token counts from the agent's LLM instance.
+
+```mermaid
+graph LR
+    Req[📨 Request] --> Turn[🤖 Agent turn]
+    Turn --> Snap[📸 Snapshot<br/>last_token_metrics]
+    Snap --> Usage[✅ usage block]
+
+    classDef req fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef turn fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef snap fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef usage fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Req req
+    class Turn turn
+    class Snap snap
+    class Usage usage
+```
+
+Each surface reports usage in its own OpenAI-native shape:
+
+| Surface | `usage` shape |
+|---------|---------------|
+| `/v1/chat/completions` | `{prompt_tokens, completion_tokens, total_tokens}` (OpenAI Chat Completions) |
+| `/v1/responses` | `{input_tokens, output_tokens, total_tokens}` (OpenAI Responses-native) |
+
+When an agent exposes no LLM metrics, `usage` falls back to zeros in the correct spec shape, so clients never need to special-case a missing block.
+
+### Streaming Usage
+
+Opt in with `stream_options.include_usage: true` to receive a streamed `usage` chunk — the same contract OpenAI's own API uses.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="gateway-token")
+stream = client.chat.completions.create(
+    model="assistant",
+    messages=[{"role": "user", "content": "Hello"}],
+    stream=True,
+    stream_options={"include_usage": True},
+)
+for chunk in stream:
+    if chunk.usage:
+        print(chunk.usage)  # final chunk: real prompt/completion/total tokens
+```
+
+The `usage`-only chunk is emitted right before `data: [DONE]`. Without `include_usage`, the stream frames are unchanged and no extra chunk is sent.
+
+<Note>
+Streaming is still buffered: content is delivered once the full turn completes, so time-to-first-content matches non-streaming. Only the trailing `usage` chunk is new — this is not incremental token streaming.
+</Note>
 
 ---
 
@@ -184,6 +241,14 @@ Pass an `OpenAI-Session` or `X-Session-Id` header to reuse one agent session acr
 
 <Accordion title="Introspect surfaces with /info">
 `GET /info` returns an `api` field listing enabled surfaces, so tooling can confirm what a gateway exposes before dispatching.
+</Accordion>
+
+<Accordion title="Enable streamed usage for cost accounting">
+Pass `stream_options={"include_usage": True}` when using `stream=True` if your client tracks cost per response. The extra chunk arrives right before `[DONE]` and carries real per-turn totals.
+</Accordion>
+
+<Accordion title="Usage is per-turn, even under concurrent sessions">
+The gateway snapshots the agent's per-turn token metrics in the same execution context that produced the reply, so a `usage` field returned to one caller cannot be corrupted by a concurrent turn on the same shared agent. No configuration required.
 </Accordion>
 </AccordionGroup>
 
