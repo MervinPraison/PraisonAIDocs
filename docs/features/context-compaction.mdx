@@ -104,27 +104,37 @@ agent = Agent(
 
 ## Anti-Thrashing Protection
 
-Prevents endless compaction cycles in long-running agents by tracking savings effectiveness and giving up when returns diminish.
+Prevents endless compaction cycles in long-running agents by tracking savings effectiveness and giving up when returns diminish — while still re-testing the verdict once the conversation grows materially past where the guard latched, so a long session's compactor never disables itself permanently.
+
+<Note>
+As of PraisonAI [#4679](https://github.com/MervinPraison/PraisonAI/pull/4679), the anti-thrashing guard is periodically re-tested after conversations grow. In earlier versions a compactor that hit the streak cap stopped compacting permanently for the rest of the session.
+</Note>
 
 ```mermaid
 sequenceDiagram
     participant Agent
     participant Compactor
     participant AntiThresh
-    
+
     Agent->>Compactor: needs_compaction()
     Compactor->>AntiThresh: Check savings streak
-    AntiThresh->>AntiThresh: Count < max_consecutive_low_savings?
-    AntiThresh-->>Compactor: Continue or abort
-    
-    Note over AntiThresh: Savings < min_savings_pct → streak++
-    Note over AntiThresh: Good savings → streak = 0
-    
-    alt Streak too high
-        Compactor-->>Agent: Skip compaction (thrashing)
-    else Continue
+    AntiThresh->>AntiThresh: streak < max_consecutive_low_savings?
+
+    alt Streak below cap
+        AntiThresh-->>Compactor: Continue
         Compactor->>Compactor: Perform compaction
         Compactor-->>Agent: Return compacted messages
+    else Streak at cap
+        AntiThresh->>AntiThresh: tokens ≥ 1.25 × tokens_when_latched?
+        alt Grown past retry threshold
+            AntiThresh->>AntiThresh: Reset streak + latched-size
+            AntiThresh-->>Compactor: Release guard, continue
+            Compactor->>Compactor: Perform compaction
+            Compactor-->>Agent: Return compacted messages
+        else Not enough growth
+            AntiThresh-->>Compactor: Skip (thrashing)
+            Compactor-->>Agent: was_skipped_due_to_low_savings = True
+        end
     end
 ```
 
@@ -163,7 +173,12 @@ agent = Agent(
 1. **Savings Tracking**: Each compaction calculates `(original_tokens - compacted_tokens) / original_tokens * 100`
 2. **Streak Counter**: Increments when savings < `min_savings_pct`, resets on good savings
 3. **Circuit Breaker**: Stops compaction when `streak >= max_consecutive_low_savings`
-4. **Reset Trigger**: New messages arriving resets the protection state
+4. **Reset on successful compaction**: When a compaction pass achieves ≥ `min_savings_pct` savings, the streak clears immediately.
+5. **Growth-based release**: If the streak reaches the cap and stays there, the guard remembers the token count it gave up at. Once the conversation grows to ≥ **125%** of that size, the guard releases and the compactor retries with a fresh budget.
+
+<Note>
+The retry-growth factor is fixed at **25%** and is not exposed as a config option. This is deliberate: it is the trade-off between silent context growth (no release) and re-running the summariser every turn (thrashing). If you need a different trade-off, tune `min_savings_pct` and `max_consecutive_low_savings` — the release fires relative to the token count at the moment those thresholds were hit.
+</Note>
 
 ### Configuration Options
 
