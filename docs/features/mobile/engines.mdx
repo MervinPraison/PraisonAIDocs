@@ -95,6 +95,29 @@ export interface EngineChoice {
 ```
 </Step>
 
+<Step title="selectEngine returns notReady on a retryable probe">
+The success branch carries an optional `notReady`, set only for a **retryable** unreadiness. A permanent unreadiness (`version_mismatch`) takes the failure branch and disposes the engine.
+
+```ts
+export type EngineSelection =
+  | {
+      readonly ok: true;
+      readonly engine: AgentEnginePort;
+      /** The engine was selected but is not answering yet. Set only for a
+       *  RETRYABLE unreadiness -- a permanent one refuses instead. */
+      readonly notReady?: { readonly reason: string; readonly detail: string };
+    }
+  | {
+      readonly ok: false;
+      readonly reason: "unknown_engine" | "protocol_mismatch" | Extract<Readiness, { ready: false }>["reason"];
+      readonly detail: string;
+      /** Only a probe failure sets this: a transport error may resolve on a
+       *  retry, a version mismatch never will. */
+      readonly retryable?: boolean;
+    };
+```
+</Step>
+
 <Step title="enginesFor wires a probe and passes persistence to in-process only">
 The remote-http choice supplies a `probe`; the remote engine deliberately does not receive `persistence`. `baseUrl` is computed **once** and shared between `create` and `probe`, so the probe hits the same address the user configured.
 
@@ -202,11 +225,11 @@ After the 200 passes, `classify` in `engines/src/remote-http/readiness.ts` judge
 A missing `ok` must never be mistaken for a present healthy one: `{ok: "true"}` (a string) and a body with no `ok` at all are both refused. The paired positive case — `body.ok === true` — is what stops the predicate degenerating to "refuse everything".
 
 <Note>
-**Unhealthy is retryable.** An `unhealthy` verdict carries `retryable: true`. An engine still binding its socket must remain worth polling; declaring it permanently dead strands the user until they restart the app. Pinned by `"an unhealthy engine is worth retrying"`, with `"a healthy engine IS ready - the pair"` as its companion.
+**Unhealthy is retryable — and retryable now boots the app.** An `unhealthy` verdict carries `retryable: true`. Since PR #4672 that no longer means "poll from a crash screen": `selectEngine` returns `ok: true` with the engine attached and a `notReady` field, so the app **boots** and shows a warning instead of refusing. Only `version_mismatch` still refuses boot. Pinned by `"an unhealthy engine is worth retrying"`, with `"a healthy engine IS ready - the pair"` as its companion. See [Boot Failures → An unreachable engine boots with a warning](/features/mobile/boot-failures#an-unreachable-engine-boots-with-a-warning).
 </Note>
 
 <Note>
-**The probe now actually runs at boot.** These readiness rules are no longer hypothetical: `enginesFor` wires `probe: () => probeHealth(deps.http, baseUrl)` on the remote-http choice, and `selectEngine` calls it before the engine is offered. A `200 {"ok": false}`, a non-200, or an unreachable engine is refused at boot with a named reason — see [Boot Failures → Boot-time health probe](/features/mobile/boot-failures#boot-time-health-probe).
+**The probe now actually runs at boot.** These readiness rules are no longer hypothetical: `enginesFor` wires `probe: () => probeHealth(deps.http, baseUrl)` on the remote-http choice, and `selectEngine` calls it before the engine is offered. A `200 {"ok": false}`, a non-200, or an unreachable engine is handled at boot with a named reason — a permanent one refuses boot, a retryable one boots the app with a warning. See [Boot Failures → Boot-time health probe](/features/mobile/boot-failures#boot-time-health-probe).
 </Note>
 
 ### Probe timeout
@@ -227,13 +250,14 @@ A single `AbortController` covers both the request **and** the body read, so an 
 
 A probe opens a socket, so it must not run for an engine this build cannot even speak to. The checks run in order, cheapest first.
 
-| Step | Check | Failure |
+| Step | Check | Outcome |
 |------|-------|---------|
-| 1 | Is `id` known? | `unknown_engine` |
-| 2 | Does `protocolVersion` match? | `protocol_mismatch` |
-| 3 | Does the probe (if any) return `ready: true`? | `unhealthy` / `http_status` / `malformed` / `transport` / `version_mismatch` — engine is disposed |
+| 1 | Is `id` known? | Fails: `unknown_engine` |
+| 2 | Does `protocolVersion` match? | Fails: `protocol_mismatch` |
+| 3a | Probe returns `ready: false, retryable: false` | Fails: `version_mismatch`. **Engine disposed.** |
+| 3b | Probe returns `ready: false, retryable: true` | Succeeds with `notReady` attached. **Engine kept** — it's the one the app will use. |
 
-That step 3 does not run when step 2 fails is pinned by `"selectEngine runs the probe only after the protocol check passes"`.
+That step 3 does not run when step 2 fails is pinned by `"selectEngine runs the probe only after the protocol check passes"`. The split at step 3 mirrors `readiness.retryable`: a permanent unreadiness disposes and refuses, a retryable one keeps the engine and returns `ok: true`.
 
 <Warning>
 **The verdict `reason` is load-bearing, not just `ready`.** Readers of `classify()` route the UI on `reason: "unhealthy"` versus `reason: "version_mismatch"` — the two lead to different recovery arms (retry vs. a version-mismatch boot failure). Asserting only `ready` is what let a test hold for the wrong reason in [#4606](https://github.com/MervinPraison/PraisonAI/pull/4606); always assert the reason too. Pinned by `"a missing ok field is not read as healthy"`. The `unhealthy → retry` recovery arm is described in [Errors & Recovery](/features/mobile/errors-and-recovery).
@@ -535,6 +559,10 @@ The consumer's `break`, `return`, or exception out of the `for await` loop is th
 The dynamic import can reject at run time — the shipping webview bundles only `dist/`, so praisonai-ts is not on disk ([#4437](https://github.com/MervinPraison/PraisonAI/issues/4437)). When it does, the failure surfaces as a single `error` event through the run loop, never as an unhandled rejection. `create()` itself succeeds because it wires the factory, not the module. Pinned by `"the in-process engine, when its module cannot load, fails RECOVERABLY"` in `app/src/main.test.ts`.
 </Accordion>
 
+<Accordion title="A retryably unready engine boots the app, not the crash screen">
+A retryable probe failure (`unhealthy`, `http_status`, `malformed`, `transport`) returns `ok: true` with a `notReady` field — the engine is kept and the app starts. Only `version_mismatch` refuses boot. On a phone with no desktop engine to reach, the old hard gate meant the app never opened and the user could not fix the address, because Settings lives inside the app that would not start. Waiting cannot fix a version mismatch, but it does fix a socket still binding. Pinned by the boot and selection tests in `app/src/boot.test.ts` and `app/src/engines.ts`. See [Boot Failures](/features/mobile/boot-failures#an-unreachable-engine-boots-with-a-warning).
+</Accordion>
+
 <Accordion title="A run given an already-aborted signal produces no answer">
 When the caller passes an `AbortSignal` whose `.aborted` is already `true` — the dispose-then-new-run path, and Stop-immediately-followed-by-Send — the engine aborts its own controller **before** subscribing, so no `delta` events are emitted and nothing is persisted. Before this fix, the code path attached `addEventListener("abort")` after the fact, which never fires for a signal that went down before the listener was attached; the run streamed to completion and persisted an answer the UI had already discarded. Pinned by `"a run started with an ALREADY-aborted signal produces no answer"`, with `"a run with a live signal still streams, so the abort test is not vacuous"` as the companion. See [Approvals & Cancellation](/features/mobile/approvals-and-cancellation) for the Stop-then-Send route into the same signal.
 </Accordion>
@@ -564,6 +592,6 @@ The 11 events every engine speaks.
 Where a refused frame lands via onIgnored.
 </Card>
 <Card title="Boot Failures" icon="bug" href="/features/mobile/boot-failures">
-Where a failed probe becomes a named, retryable boot failure.
+Where a retryable probe boots the app with a warning, and a permanent one refuses.
 </Card>
 </CardGroup>
