@@ -332,36 +332,53 @@ If the periodic tick is not wired, only the byte cap can flush — so a 130-char
 
 ## The Publish Gate
 
-A second pacing mechanism, the publish gate, is wired into the controller but almost never runs at real streaming speeds.
+The publish gate is the pipeline's single backpressure authority: it skips a paint while the renderer is still catching up, then releases the stranded text once it can keep up.
 
-`core/src/pacing/publish-gate.ts` is a verbatim port of the desktop's stream-pacing, with two constants tightened for mobile.
+`core/src/pacing/publish-gate.ts` is a port of the desktop's stream-pacing, with two constants tightened for mobile.
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `MAX_HELD_CHARS` | `96` | Characters allowed to accumulate before the gate opens a paint. |
-| `UNPAINTED_REOPEN_MS` | `200` | How long the gate holds before forcing a paint anyway. |
+| `MAX_HELD_CHARS` | `96` | Characters allowed to accumulate behind a closed gate before it forces a paint. |
+| `UNPAINTED_REOPEN_MS` | `200` | How long the gate stays shut before it reopens on its own. |
 
-The gate is called — `controller.ts` runs `if (frames.length > 0 && gate(streamed)) publish()` — but the coalescer's flush tick drains the buffer every `maxDelayMs` first, so `push()` usually returns `[]` by the time a delta arrives and the gate is never consulted. The tick's own publish is ungated by design, because that frame exists precisely when nothing has painted recently.
+`gate(streamed)` returns `true` when the gate is OPEN. It opens on its first call and reopens on a frame callback or after `UNPAINTED_REOPEN_MS` with no paint, so a tick after a quiet period always paints immediately. The only tick it skips is one that fires just after a paint, while the renderer is still catching up — that skip is the backpressure the pipeline previously lacked.
 
-Driving the real controller with a virtual clock and counting whether the gate is consulted even once shows it only fires at very high token rates:
+Three paths reach the gate, and two escapes bypass it on purpose:
 
-| tokens/sec | publishes for 2000 tokens | gate consulted |
-|-----------:|--------------------------:|:---------------|
-| 20 | 2004 | no |
-| 60 | 2004 | no |
-| 150 | 670 | no |
-| 400 | 289 | no |
-| 1600 | 80 | no |
-| 3200 | 42 | YES |
-| 8000 | 42 | YES |
+| Path | Wiring | Gated? |
+|------|--------|--------|
+| Per-event (a delta the coalescer paints) | `if (frames.length > 0 && gate(streamed)) publish()` | Yes |
+| Flush tick (the fix) | `if (gate(streamed)) publish()` | Yes |
+| Structured event (`start`, `end`, `tool-call`, …) | publishes the whole transcript, sets `paintedChars = streamed` | **No — by design** |
+| Final `finally`-publish | always publishes at stream end | **No — by design** |
 
-The threshold is where 256 bytes land inside a single 16ms window. Real model streaming runs 20–150 tokens/sec, so the gate is unreachable in practice.
+Before the wiring, the flush tick published unconditionally and the coalescer drained the buffer every `maxDelayMs`, so `push()` returned `[]` and the per-event gate was consulted only above ~3200 tokens/sec — unreachable at real streaming speed (20–150 tokens/sec). After the wiring, the gate is consulted on every tick after the first paint, so both constants are load-bearing.
 
-<Note>
-This is not a current defect. Paints stay bounded by time (20–38/sec observed) and per-publish view work stays under 9% of a frame even in the worst measured case. It is documented because two things follow: there is no backpressure path — the gate is the mechanism that would notice the renderer falling behind, and it never runs — and a module with its own tuned constants that never executes reads as load-bearing to the next person who changes pacing.
-</Note>
+### How backpressure now works
 
-The resolution is a design decision: wire the tick's publish through the gate, or delete the module and its constants. Do not leave it looking wired.
+Under load the gate skips a tick's paint; when it reopens — via `requestFrame` or after `UNPAINTED_REOPEN_MS` — a catch-up tick paints whatever the rejected tick had drained onto the transcript but left unpainted. `MAX_HELD_CHARS` bounds how far the paint can fall behind `streamed`, and the ungated `finally`-publish guarantees the tail always lands, so a closed gate can never swallow the end of an answer.
+
+### Stranded progress and catch-up
+
+A tick drains the coalescer *before* the gate is consulted, so text from a rejected tick is already gone from the coalescer — it lives on the transcript but is not yet painted. If the stream then pauses, no later tick sees pending text and the gate reopening does not itself publish. The controller tracks `paintedChars`; on a tick that finds nothing new to drain, if `streamed > paintedChars` and the gate has reopened, it publishes that stranded progress. Streamed text that arrives just before a pause therefore paints mid-pause, not only when the turn ends.
+
+```mermaid
+sequenceDiagram
+    participant Tick as Flush tick
+    participant Gate as Publish gate
+    participant Transcript
+    participant Paint
+
+    Tick->>Gate: gate(streamed) — open
+    Gate-->>Paint: publish (paintedChars = streamed)
+    Tick->>Gate: gate(streamed) — closed (backpressure)
+    Gate-->>Transcript: text drained, left unpainted
+    Note over Gate: reopens after UNPAINTED_REOPEN_MS
+    Tick->>Gate: catch-up tick — streamed > paintedChars
+    Gate-->>Paint: publish stranded text
+```
+
+Two tests pin this behaviour: `the flush tick paints through the publish gate, so backpressure bounds it` drives 40 ticks with no frame release and sees a handful of paints, not one per tick (the ungated tick gave 45 paints for 40 ticks and failed the bound); `text drained by a rejected tick is still painted when the stream pauses` confirms a rejected tick's text paints mid-pause once `UNPAINTED_REOPEN_MS` fires, not only at `end`.
 
 ---
 
