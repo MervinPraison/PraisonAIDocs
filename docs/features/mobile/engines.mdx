@@ -99,6 +99,23 @@ export function enginesFor(deps: RegistryDeps): readonly EngineChoice[] {
 `AppDeps.engines` is a factory `(persistence) => EngineChoice[]`. The composition root builds it from the session, so an engine cannot exist without the store it writes through.
 </Step>
 
+<Step title="The shipping composition root wires it">
+`appEngines` supplies `createInProcess` to `enginesFor`, so the in-process engine is on offer. The remote engine stays first, so the default keeps working with nothing configured.
+
+```ts
+import { appEngines } from "praisonai-mobile/app/main";
+
+const choices = appEngines({
+  settings,
+  http: platform.http,
+  persistence,
+  onIgnored: (reason, detail) => sink.note(reason, detail),
+});
+// choices.map(c => c.id) → ["remote-http", "praisonai-ts"]
+```
+Pinned by `"the real composition root offers the in-process engine"` in `app/src/main.test.ts`.
+</Step>
+
 <Step title="Run a turn">
 ```ts
 for await (const event of engine.run(request, signal)) {
@@ -189,7 +206,7 @@ Two engines, two owners of the write.
 The remote engine deliberately does not take persistence: the server it connects to owns the write and is the only thing that can report authoritative indices for its own store.
 
 <Note>
-A picker omits an engine whose prerequisites are absent rather than offering it and then failing. `createInProcess` is optional — when it is not supplied, only the remote engine is offered.
+A picker omits an engine whose prerequisites are absent rather than offering it and then failing. `createInProcess` is optional — when it is not supplied, only the remote engine is offered. The shipping composition root **does** supply it, via `appEngines`, so `enginesFor` returns both engines in real builds — even though only `remote-http` sits in `SETTING_DEFS.engineId.choices` (the picker). Pinned by `"the real composition root offers the in-process engine"` in `app/src/main.test.ts`.
 </Note>
 
 ---
@@ -321,6 +338,25 @@ Three implementations pass the same conformance suite, which is what makes "swap
 | `remote-http` | `engines/src/remote-http` | A PraisonAI engine over HTTP + SSE. |
 | scripted fake | `testing/` | Nothing — replays canned events for tests. |
 
+### Lazy, Runtime-Computed Import
+
+The in-process engine's `createAgent` factory loads praisonai's `Agent` through a runtime-computed dynamic import.
+
+```ts
+const specifier = ["..", "..", "..", "praisonai-ts", "src", "agent", "simple.ts"].join("/");
+let mod: { Agent: PraisonAgentModule };
+try {
+  mod = (await import(specifier)) as { Agent: PraisonAgentModule };
+} catch (cause) {
+  throw new Error(
+    "the in-process engine is unavailable in this build: praisonai-ts could not be loaded",
+    { cause },
+  );
+}
+```
+
+A **computed** specifier keeps `tsc` from following the upstream graph (which does not typecheck under this strict config) and keeps `esbuild` from bundling its import-time-fatal builtins ([#4437](https://github.com/MervinPraison/PraisonAI/issues/4437)). The mobile bundle stays **48.9 kB, 0 external, 0 fatal builtins**.
+
 ---
 
 ## Conformance
@@ -374,6 +410,10 @@ graph TB
     class Start q
     class HTTP,TS,Fake pick
 ```
+
+<Note>
+Today only `remote-http` appears in the picker (`SETTING_DEFS.engineId.choices`). The in-process engine is offered by the factory list but is not yet a legal `engineId` setting value. In a build that ships praisonai-ts on disk, `engineId: "praisonai-ts"` can be selected programmatically; the picker gains it once [#4435](https://github.com/MervinPraison/PraisonAI/issues/4435) + [#4437](https://github.com/MervinPraison/PraisonAI/issues/4437) land.
+</Note>
 
 ---
 
@@ -434,6 +474,10 @@ Declaring a gap in the `unsupported` map is honest; faking it hides a defect the
 
 <Accordion title="Break out of the iterator to release the socket">
 The consumer's `break`, `return`, or exception out of the `for await` loop is the cancellation channel — there is no separate `close()`. The engine's `finally` calls `await reader.cancel()`, so leaving the stream releases the reader and the model stops billing. The regression `"leaving the stream early releases the socket"` asserts the underlying `ReadableStream`'s `cancel()` fires when the consumer `break`s after the first delta. See [Stop is idempotent and race-safe](/features/mobile/approvals-and-cancellation#stop-is-idempotent-and-race-safe).
+</Accordion>
+
+<Accordion title="An unloadable in-process engine fails RECOVERABLY, not opaquely">
+The dynamic import can reject at run time — the shipping webview bundles only `dist/`, so praisonai-ts is not on disk ([#4437](https://github.com/MervinPraison/PraisonAI/issues/4437)). When it does, the failure surfaces as a single `error` event through the run loop, never as an unhandled rejection. `create()` itself succeeds because it wires the factory, not the module. Pinned by `"the in-process engine, when its module cannot load, fails RECOVERABLY"` in `app/src/main.test.ts`.
 </Accordion>
 
 <Accordion title="A run given an already-aborted signal produces no answer">
