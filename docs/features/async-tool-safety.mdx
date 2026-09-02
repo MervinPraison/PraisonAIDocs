@@ -7,6 +7,11 @@ icon: "shield-check"
 
 Async tool calls in `agent.achat()` now route through the same safety mechanisms as sync execution, including approval checks, timeouts, and **Loop Guard's doom-loop / no-progress protection** (PR #4005). Each async tool invocation now also runs through `CircuitBreaker.acall(...)` — event-loop safe, using the same per-agent breaker name (`tool_{id(self)}_{function_name}`) and `weakref.finalize` cleanup as the sync path ([PR #4469](https://github.com/MervinPraison/PraisonAI/pull/4469)).
 
+Two more sync/async parity gaps closed in [PR #4634](https://github.com/MervinPraison/PraisonAI/pull/4634):
+
+- **MCP tool resolution** — `MCP` instances passed via `tools=` are now resolved on `achat()`, and MCP transport / timeout failures (`"Error: MCP tool call timed out after Ns"`, `"Error: MCP initialization timed out after Ns"`) are normalized to the same `{"error": …, "timeout": True}` dict shape used on the sync path.
+- **Tool-name self-repair** — a case / separator hallucination (e.g. `WebSearch` for `web_search`) is quietly re-matched on `achat()` too. A genuine miss now returns the same corrective error dict with `available_tools` and a closest-match suggestion.
+
 ```python
 from praisonaiagents import Agent
 
@@ -125,10 +130,18 @@ sequenceDiagram
 | **Error wrapping** | ✅ | ✅ |
 | **Tool retry policy for raised exceptions** | ✅ | ✅ [^parity] |
 | **`restart_safe=False` / `.idempotent = False` veto** | ✅ | ✅ (parity restored in PR #4299) |
+| **MCP tool resolution** | ✅ | ✅ (parity restored in PR #4634)[^mcp-async] |
+| **MCP timeout normalization** (`{"error": …, "timeout": True}`) | ✅ | ✅ (parity restored in PR #4634)[^mcp-async] |
+| **Tool-name self-repair** (`WebSearch` → `web_search`) | ✅ | ✅ (parity restored in PR #4634)[^selfrepair-async] |
+| **Corrective error dict with `available_tools` on a miss** | ✅ | ✅ (parity restored in PR #4634)[^selfrepair-async] |
 
 [^parity]: The async column was broken before PR #4141 — a raised exception was retried zero times regardless of `RetryPolicy`. See [Tool Retry Policy → Sync / async parity](/features/tool-retry-policy).
 
 [^cb-async]: The async column was aspirational before [PR #4469](https://github.com/MervinPraison/PraisonAI/pull/4469) — async tool calls bypassed the breaker entirely. The async path now wraps each invocation in `CircuitBreaker.acall(...)`, so five consecutive failures open the breaker just like sync. See [Circuit Breaker Protection](#circuit-breaker-protection).
+
+[^mcp-async]: Before [PR #4634](https://github.com/MervinPraison/PraisonAI/pull/4634) the async path did not consult MCP at all — `MCP` instances in `tools=` hard-failed with `"Function ... not found in tools"` on `achat()`, and MCP transport / timeout failures were handed to the model as bare `"Error: …"` strings that looked like successful results. Both are now at sync parity via the shared `_resolve_mcp_tool_result` / `_normalize_mcp_result` helpers.
+
+[^selfrepair-async]: Before PR #4634 the async path hard-failed on a slightly wrong tool name and returned only `"Function ... not found in tools"`. It now runs the same case / separator-insensitive re-match as the sync path and, on a genuine miss, returns the same corrective error dict (`{"error": "...", "available_tools": [...]}`) so the model can retry with a valid name.
 
 **Architecture**: The unified async dispatcher now calls `execute_tool_async` for tool invocations, so long-running tools no longer block the event loop.
 
@@ -217,6 +230,32 @@ async def main():
     print(result)
 
 asyncio.run(main())
+```
+
+### MCP + Name Self-Repair Parity
+
+MCP tools and hallucinated tool names now resolve identically on `achat()` and `chat()` (PR #4634).
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.mcp import MCP
+
+agent = Agent(
+    name="MCP Agent",
+    instructions="Use the MCP server tools to answer.",
+    tools=MCP("npx -y @modelcontextprotocol/server-filesystem /tmp"),
+)
+
+# Before PR #4634: hard-failed with "Function read_file not found in tools".
+# Now: resolves through the MCP runner and returns the file contents.
+result = await agent.achat("What is in /tmp/notes.txt?")
+```
+
+```python
+# Model emits 'WebSearch' but the tool is named 'web_search'.
+# Before PR #4634: async path hard-failed; sync path quietly re-matched.
+# Now: async path re-matches too and calls web_search(...) as intended.
+await agent.achat("Search the web for the latest fusion news.")
 ```
 
 ## Loop Guard on the async path
