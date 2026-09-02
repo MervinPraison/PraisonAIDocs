@@ -276,6 +276,31 @@ registry.register_function(
 Registering a mutating hook without `sequential=True` looks correct but silently no-ops — the runner runs it in parallel with sibling hooks, so its `modified_input` is discarded. As of PraisonAI [PR #4034](https://github.com/MervinPraison/PraisonAI/pull/4034) the runtime **logs a warning** when a parallel hook returns a non-empty `modified_input`: `"Parallel hook '<name>' returned modified_input which is discarded; register it with sequential=True to apply it."` Watch your logs when adopting a new mutating hook.
 </Warning>
 
+### Thread Safety
+
+`HookRegistry` guards its per-event hook lists with a re-entrant lock, so `register` / `unregister` / `clear` / `enable_hook` / `disable_hook` and `get_hooks` are safe under concurrent access from multiple threads. `get_hooks` snapshots the list under the lock before filtering, so a concurrent `unregister` / `clear` on another thread can no longer raise `RuntimeError: list changed size during iteration` or skip / duplicate a hook mid-iteration. The lock is an `RLock`, so a hook callback that registers or unregisters other hooks (a legitimate re-entrant pattern) still works.
+
+This matters most for the process-wide default registry (the one you get via `get_default_registry()` or the module-level `add_hook`-style helpers) — it is shared across every agent in the process, so plugins registering hooks at import time can race an agent iterating hooks on another thread. As of [PraisonAI PR #4634](https://github.com/MervinPraison/PraisonAI/pull/4634) that race is fixed.
+
+```python
+from praisonaiagents.hooks import HookRegistry, HookEvent
+import threading
+
+registry = HookRegistry()
+
+# Safe to register / unregister from any thread while another thread reads:
+def worker():
+    hook_id = registry.register_function(
+        event=HookEvent.BEFORE_TOOL,
+        func=lambda data: data,
+        name="my.hook",
+    )                                              # under RLock
+    registry.get_hooks(HookEvent.BEFORE_TOOL)      # snapshots under RLock
+    registry.unregister(hook_id)                   # under RLock
+
+threading.Thread(target=worker).start()
+```
+
 ### Available Hook Events
 
 The events most agents will ever need are the agent / tool / LLM / error / session ones — start here.
