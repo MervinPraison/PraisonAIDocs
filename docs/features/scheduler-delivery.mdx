@@ -874,34 +874,41 @@ A [Scheduler Monitor](/features/scheduler-monitor) job that finds its watched so
 
 ## Reading the outcome from stats {#delivery-outcomes}
 
-Every scheduled run lands in exactly one of four delivery outcomes, and each outcome bumps its **own** counter — `delivered_deliveries` or `undelivered_deliveries` — read from `scheduler.get_stats()`.
+Every scheduled run resolves to one of four typed outcomes — a failed delivery is no longer reported as a silent success ([PraisonAI PR #4476](https://github.com/MervinPraison/PraisonAI/pull/4476), [issue #4454](https://github.com/MervinPraison/PraisonAI/issues/4454)). Each outcome bumps its **own** counter — `delivered_deliveries` or `undelivered_deliveries` — read from `scheduler.get_stats()`.
 
 ```mermaid
-graph LR
-    Run[⏰ Scheduled run] --> Outcome{Delivery outcome}
-    Outcome -->|Router accepted| Delivered[✅ DELIVERED<br/>delivered_deliveries +1]
-    Outcome -->|Router said no / raised| Undelivered[🟥 UNDELIVERED<br/>undelivered_deliveries +1]
-    Outcome -->|NO_REPLY / SILENT| Suppressed[🟡 SUPPRESSED<br/>0 / 0]
-    Outcome -->|No deliver= target| NotConfigured[🟦 NOT_CONFIGURED<br/>0 / 0]
+graph TB
+    Run[⏰ Scheduled run] --> Configured{deliver= set?}
+    Configured -->|No| NotConfigured[NOT_CONFIGURED]
+    Configured -->|Yes| Silent{Whole output is<br/>NO_REPLY / SILENT?}
+    Silent -->|Yes| Suppressed[SUPPRESSED]
+    Silent -->|No| Sent{Router accepted?}
+    Sent -->|Yes| Delivered[DELIVERED]
+    Sent -->|No| Undelivered[UNDELIVERED]
 
-    classDef run fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    NotConfigured --> Success[✅ on_success]
+    Suppressed --> Success
+    Delivered --> Success
+    Undelivered --> Failure[🟥 on_failure]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef delivered fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef undelivered fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef suppressed fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef notconfig fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef notconfigured fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef undelivered fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef run fill:#189AB4,stroke:#7C90A0,color:#fff
 
-    class Run run
-    class Outcome q
+    class Run,Success run
+    class Configured,Silent,Sent question
     class Delivered delivered
-    class Undelivered undelivered
     class Suppressed suppressed
-    class NotConfigured notconfig
+    class NotConfigured notconfigured
+    class Undelivered,Failure undelivered
 ```
 
 `delivered_deliveries` and `undelivered_deliveries` are **explicit** counters — a run only bumps the counter for its own outcome, never inferred by subtracting one from the other. `SUPPRESSED` (intentional silence) and `NOT_CONFIGURED` (no `deliver=` target) runs contribute **zero** to *both*, so an alert like `delivered_deliveries + undelivered_deliveries < successful_executions` is a real signal of quiet or unconfigured runs, not a bug.
 
-The typed `DeliveryOutcome` (importable from `praisonai.scheduler._base_scheduler`) has a `.undelivered` convenience property that returns `True` only for `UNDELIVERED`.
+The `DeliveryOutcome` enum is importable from `praisonai.scheduler._base_scheduler` and has a `.undelivered` convenience property that returns `True` only for `UNDELIVERED`.
 
 ### Per-outcome counter table
 
@@ -921,21 +928,44 @@ delivered_deliveries + undelivered_deliveries ≤ successful_executions
 
 The gap is exactly the `SUPPRESSED` + `NOT_CONFIGURED` runs — successful executions that were never meant to reach a chat target.
 
+### Quick Start
+
+`on_success` and `on_failure` now split cleanly — a delivery failure flips the run to `on_failure`.
+
 ### Monitoring recipe
 
 ```python
 from praisonaiagents import Agent
 from praisonai.scheduler import AgentScheduler
 
-agent = Agent(name="Brief", instructions="Summarise the morning news")
-scheduler = AgentScheduler(agent, task="Morning brief", deliver="telegram:123456")
+def delivered(result):
+    print("Reached the user:", result)
 
+def undelivered(reason):
+    print("Never reached the user:", reason)  # fires on delivery failure
+
+agent = Agent(name="Brief", instructions="Summarise the morning news")
+scheduler = AgentScheduler(
+    agent,
+    task="Morning brief",
+    deliver="telegram:123456",
+    on_success=delivered,
+    on_failure=undelivered,
+)
+scheduler.start("hourly")
+```
+
+### Reading the outcome from stats
+
+```python
 stats = scheduler.get_stats()
 attempted     = stats["delivered_deliveries"] + stats["undelivered_deliveries"]
 quiet_runs    = stats["successful_executions"] - attempted   # SUPPRESSED + NOT_CONFIGURED
 delivery_rate = (
     stats["delivered_deliveries"] / attempted * 100 if attempted else None
 )
+print(stats["delivered_deliveries"])    # runs that reached the target
+print(stats["undelivered_deliveries"])  # runs whose delivery failed — surfaced, never silent
 ```
 
 `undelivered_deliveries` counts runs the *executor* completed but *delivery* dropped — you can have `successful_executions == total_executions` and still see a non-zero `undelivered_deliveries`.
@@ -946,9 +976,18 @@ delivery_rate = (
 A scheduled `UNDELIVERED` run best-effort fires the existing `HookEvent.MESSAGE_UNDELIVERED` on the agent's attached hook runner. The event payload is built via `MessageUndeliveredInput` — it includes the agent name, the resolved platform + channel_id, the run's text, and `error="scheduled result could not be delivered"`. This reuses the existing seam — no new protocol or setup. It fires only when a hook runner is attached to the agent and never raises. See [Undelivered Messages](/features/undelivered-messages) and [Intentional Silence](/features/bot-intentional-silence).
 </Note>
 
+### What did *not* change
+
 <Note>
-**What did *not* change.** [PraisonAI PR #4464](https://github.com/MervinPraison/PraisonAI/pull/4464) adds **no** new stat, knob, or protocol — it only makes the two existing counters explicit (initialised to `0` on every scheduler instance, bumped only for their own outcome) and pins their per-outcome semantics with regression tests. The invariant above holds for both the sync and async scheduler and will continue to.
+[PraisonAI PR #4464](https://github.com/MervinPraison/PraisonAI/pull/4464) adds **no** new stat, knob, or protocol — it only makes the two existing counters explicit (initialised to `0` on every scheduler instance, bumped only for their own outcome) and pins their per-outcome semantics with regression tests. Specifically:
+- No new user-facing configuration parameters.
+- No durable `OutboundQueue`. No retry queue.
+- No new hook protocol — the `MESSAGE_UNDELIVERED` hook already existed; this only starts firing it from the lightweight scheduler path.
+- Intentional silence still suppresses delivery and is *not* counted as `undelivered`.
+
+The invariant above holds for both the sync and async scheduler and will continue to.
 </Note>
+
 ---
 
 ## Creation-time validation and preview
