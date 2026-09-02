@@ -6,50 +6,42 @@ icon: "puzzle-piece"
 ---
 
 ```python
-from praisonaiagents import Agent
+from praisonai.integrations import ClaudeCodeIntegration
 
-agent = Agent(name="registry-agent", instructions="Manage integrations via the registry.")
-agent.start("List all registered integrations and their status.")
+integration = ClaudeCodeIntegration(workspace="/path/to/project")
+result = await integration.execute("Refactor this module")
 ```
 
-The user installs a third-party package; entry points register CLI and agent backends in one registry.
-
-Third-party discovery via the `praisonai.integrations` entry-point group is fully supported from [PraisonAI PR #4154](https://github.com/MervinPraison/PraisonAI/pull/4154) (2026-08-20) onwards; on earlier releases the group was silently ignored and only runtime registration (below) worked.
+Import any built-in or plugin-registered integration straight from `praisonai.integrations` — a static export map serves built-ins, and the `praisonai.integrations` entry-point group adds third-party names.
 
 <Note>
-**Built-in names always win over entry-point plugins.** Since [PraisonAI PR
-#4176](https://github.com/MervinPraison/PraisonAI/pull/4176), this guard lives
-in the base `PluginRegistry` — not per-registry — so `IntegrationRegistry` and
-every other registry on this site enforce it automatically. The registry skips
-any entry point whose name (case-insensitive) matches a shipped built-in, keeps
-the built-in, and logs a `DEBUG` line. Runtime `register(...)` is the only way to
-deliberately override a built-in. See [Plugin Precedence](/features/plugin-precedence)
-for the full rule across every registry.
+**Rewritten for [PraisonAI PR #4651](https://github.com/MervinPraison/PraisonAI/pull/4651).** The old `IntegrationRegistry` class, `get_integrations_registry()`, `INTEGRATIONS_REGISTRY`, and `.get_by_attr()` were **removed**. The public surface is now a static `name -> "module:attr"` map plus an entry-point lookup, both inside `praisonai/integrations/__init__.py`. Importing every built-in name and every plugin name works exactly as before — only the internal registry machinery changed. See [Migration](#migration-from-the-old-registry).
 </Note>
 
-Integration Registry enables third-party developers to add custom CLI tools, managed agents, and agent backends to PraisonAI through a centralized plugin system.
+Integration Registry lets third-party developers add custom CLI tools, managed agents, and agent backends to PraisonAI, importable from a single module.
 
 ```mermaid
 graph LR
     A[📦 Third-party Package] --> B[🔌 Entry Point\npraisonai.integrations]
-    B --> C[📝 IntegrationRegistry]
-    C --> D[📥 from praisonai.integrations import MyThing]
+    C[📥 from praisonai.integrations import X] --> D{🗺️ _STATIC_EXPORTS?}
+    D -->|hit| E[✅ built-in class]
+    D -->|miss| B
+    B --> F[✅ plugin class]
 
     classDef package fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef entrypoint fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef registry fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef map fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef import fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class A package
+    class A,C package
     class B entrypoint
-    class C registry
-    class D import
-
+    class D map
+    class E,F import
 ```
 
 ## Choose Your Registration Path
 
-Pick a registration path based on how the integration ships.
+Pick a path based on how the integration ships.
 
 ```mermaid
 graph TB
@@ -57,12 +49,12 @@ graph TB
     Q1 -->|Yes| Builtin[Use built-in name<br/>e.g. ClaudeCodeIntegration]
     Q1 -->|No| Q2{Distributed via pip?}
     Q2 -->|Yes| Plugin[Add entry point<br/>praisonai.integrations]
-    Q2 -->|No, same process| Runtime[register_lazy at startup]
+    Q2 -->|No, typed backend| Typed[Use ExternalAgentRegistry<br/>or ManagedBackendRegistry]
 
     classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef done fill:#10B981,stroke:#7C90A0,color:#fff
     class Start,Q1,Q2 q
-    class Builtin,Plugin,Runtime done
+    class Builtin,Plugin,Typed done
 ```
 
 ---
@@ -75,22 +67,6 @@ graph TB
 from praisonai.integrations import ClaudeCodeIntegration
 
 integration = ClaudeCodeIntegration(workspace="/path/to/project")
-```
-</Step>
-
-<Step title="Register at runtime">
-```python
-# Preferred (lazy — no registry built until first call)
-from praisonai.integrations._unified_registry import get_integrations_registry
-
-def _my_loader():
-    from my_pkg.integration import MyIntegration
-    return MyIntegration
-
-get_integrations_registry().register_lazy("MyIntegration", _my_loader, aliases=["my"])
-
-# Now this works:
-from praisonai.integrations import MyIntegration
 ```
 </Step>
 
@@ -107,16 +83,12 @@ from praisonai.integrations import acme
 integration = acme(workspace="/path/to/project")
 ```
 
-The left-hand side (`acme`) is the name users import; the right-hand side is the dotted path to the class. Names collide case-insensitively with built-ins, and built-ins always win.
+The left-hand side (`acme`) is the name users import; the right-hand side is the dotted path to the class. Names that collide with a built-in are ignored — built-ins always win.
 </Step>
 </Steps>
 
 <Warning>
-On PraisonAI releases prior to PR #4154 (merged 2026-08-20), entry-point-based
-plugins were discovered and then silently discarded — `from praisonai.integrations
-import my_plugin` raised `AttributeError` even when the plugin was correctly
-installed. If entry-point discovery seems to do nothing, upgrade to a release
-that includes PR #4154. Runtime `register_lazy(...)` registration always worked.
+Third-party discovery via the `praisonai.integrations` entry-point group requires [PraisonAI PR #4154](https://github.com/MervinPraison/PraisonAI/pull/4154) (2026-08-20) or later. On earlier releases the group was silently ignored — `from praisonai.integrations import my_plugin` raised `AttributeError`. If discovery seems to do nothing, upgrade.
 </Warning>
 
 ---
@@ -127,108 +99,132 @@ that includes PR #4154. Runtime `register_lazy(...)` registration always worked.
 sequenceDiagram
     participant User
     participant Mod as praisonai.integrations
-    participant Reg as get_integrations_registry()
-    participant Loader
+    participant Map as _STATIC_EXPORTS
+    participant EP as praisonai.integrations entry points
 
-    User->>Mod: from praisonai.integrations import MyIntegration
-    Mod->>Reg: get_by_attr(__name__, "MyIntegration")
-    Reg->>Loader: lazy load (entry point or registered loader)
-    Loader-->>Reg: MyIntegration class
-    Reg-->>Mod: MyIntegration
-    Mod-->>User: MyIntegration
+    User->>Mod: from praisonai.integrations import X
+    Mod->>Map: X in static map?
+    alt built-in hit
+        Map-->>Mod: lazy import "module:attr"
+        Mod-->>User: X
+    else miss
+        Mod->>EP: entry point named X?
+        alt plugin found
+            EP-->>Mod: ep.load()
+            Mod-->>User: X
+        else none
+            Mod-->>User: AttributeError
+        end
+    end
 ```
 
-- Third-party plugins in the `praisonai.integrations` entry-point group are discovered once, lazily, the first time anything imports from `praisonai.integrations`.
-- Discovery only stores each plugin's loader; no third-party code runs until you actually import that name.
-- Built-in integrations take precedence on name collisions — as of PR #4176 the base `PluginRegistry` skips any colliding entry point and keeps the built-in (a `DEBUG` line notes the collision), so you cannot silently override a built-in by shipping a plugin with the same name.
-- `from praisonai.integrations import <name>` raises `AttributeError` for unknown names (native Python behaviour); `.resolve("<name>")` on the registry raises `ValueError`.
+- `__getattr__` on `praisonai.integrations` first checks the static `_STATIC_EXPORTS` map (`name -> "module:attr"`), lazily importing the owning module on first access.
+- If the name isn't a built-in, it's looked up in the `praisonai.integrations` entry-point group and `ep.load()`-ed.
+- Unknown names raise `AttributeError` (native Python behaviour).
+- Dunder / underscore-prefixed submodule names (e.g. `from praisonai.integrations import base`) fall through to normal import machinery.
 
 ### Precedence
 
-Registration sources resolve in a fixed order when names collide.
+Built-ins always win because they are served by `_STATIC_EXPORTS` **before** the entry-point lookup runs. A plugin may only *add* names, never replace a shipped one.
 
-| Source | When registered | On name collision |
+| Source | When resolved | On name collision |
 |---|---|---|
-| Third-party entry-point plugin | On first registry access | Skipped; built-in kept (`DEBUG` log) |
-| Built-in integration | Registered on construction | Wins over plugin |
-| `register_lazy(...)` / `register(...)` at runtime | Whenever the caller invokes it | Last write wins (can override a built-in) |
-
-Built-ins can never be silently shadowed by a same-named entry-point plugin. Since PR #4176 the base `PluginRegistry` skips the colliding entry point during discovery and keeps the built-in — runtime `register(...)` remains the deliberate override path.
+| Built-in (`_STATIC_EXPORTS`) | Checked first in `__getattr__` | Wins — plugin never consulted |
+| Third-party entry-point plugin | Only if no static-map hit | Cannot shadow a built-in |
 
 ---
 
-## Configuration / API
+## Available built-in names
 
-| Method | Parameters | Description |
-|---|---|---|
-| `get_integrations_registry()` | → `IntegrationRegistry` | Return the process-default registry, building it lazily on first call (thread-safe) |
-| `INTEGRATIONS_REGISTRY.register_lazy(name, loader, *, aliases=None)` | `name: str`, `loader: () -> Any`, `aliases: list[str] \| None` | Register a lazily-loaded integration |
-| `INTEGRATIONS_REGISTRY.resolve(name)` | `name: str` → `Any` | Materialize an integration; `ValueError` if unknown |
-| `get_by_attr(module, attr)` | `module: str`, `attr: str` → `Any` | Same as `resolve` but raises `AttributeError`; used by `praisonai.integrations.__getattr__` so `from praisonai.integrations import <name>` gets the right error type on typos |
-
-<Note>
-`INTEGRATIONS_REGISTRY` remains available as a module-level name for backward compatibility — the first access triggers construction. Use `get_integrations_registry()` in new code to make the lazy build explicit. Underscore-prefixed submodule names (for example `from praisonai.integrations import _unified_registry`) now import normally instead of triggering registry construction.
-</Note>
-
----
-
-## Built-in Integrations
-
-The registry includes these built-in integrations with lazy loading:
+Every key below imports directly: `from praisonai.integrations import <name>`.
 
 ### CLI Tools
-- `ClaudeCodeIntegration` — Claude Code CLI integration
-- `GeminiCLIIntegration` — Gemini CLI tools
-- `CodexCLIIntegration` — Codex CLI interface  
-- `CursorCLIIntegration` — Cursor CLI integration
-- `BaseCLIIntegration` — Base class for CLI tools
+- `BaseCLIIntegration` — base class for CLI tools
 - `CLIExecutionError` — CLI execution error class
+- `get_available_integrations` — list available integrations
+- `ClaudeCodeIntegration` — Claude Code CLI
+- `GeminiCLIIntegration` — Gemini CLI
+- `CodexCLIIntegration` — Codex CLI
+- `CursorCLIIntegration` — Cursor CLI
 
 ### Managed Agents
-- `ManagedAgent` (alias: `ManagedAgentIntegration`) — Managed agent interface
-- `AnthropicManagedAgent` — Anthropic-specific managed agent
-- `ManagedConfig` (alias: `ManagedBackendConfig`) — Managed agent configuration
+- `ManagedAgent` (alias `ManagedAgentIntegration`) — managed agent interface
+- `AnthropicManagedAgent` — Anthropic managed agent
+- `ManagedConfig` (alias `ManagedBackendConfig`) — managed agent configuration
 
-### Local & Sandboxed Agents  
-- `LocalManagedAgent` — Local managed agent
-- `LocalManagedConfig` — Local agent configuration
-- `SandboxedAgent` — Sandboxed agent execution
-- `SandboxedAgentConfig` — Sandboxed agent configuration
+### Local & Sandboxed Agents
+- `LocalManagedAgent` — local managed agent
+- `LocalManagedConfig` — local agent configuration
+- `SandboxedAgent` — sandboxed agent execution
+- `SandboxedAgentConfig` — sandboxed agent configuration
 
 ### Agent Backends
-- `HostedAgent` — Hosted agent backend
-- `HostedAgentConfig` — Hosted agent configuration
-- `LocalAgent` — Local agent backend
-- `LocalAgentConfig` — Local agent configuration
+- `HostedAgent` — hosted agent backend
+- `HostedAgentConfig` — hosted agent configuration
+- `LocalAgent` — local agent backend
+- `LocalAgentConfig` — local agent configuration
 
 ### Registry Functions
-- `get_available_integrations` — List available integrations
-- `ExternalAgentRegistry` — External agent registry
-- `get_registry` — Get integration registry
-- `register_integration` — Register new integration
-- `create_integration` — Create integration instance
-- `list_external_agents` — Usable `--external-agent` short names (built-ins + plugins)
-- `external_agent_catalog` — Presentation metadata per external agent (`cls`, `label`, `cli`, `install`)
+- `ExternalAgentRegistry` — external agent registry (typed source of truth for `--external-agent`)
+- `get_registry` — get the external-agent registry
+- `register_integration` — register a new integration
+- `create_integration` — create an integration instance
 
 <Note>
-`list_external_agents` and `external_agent_catalog` cover the `praisonai.external_agents` entry-point group (short-name `--external-agent` choices and UI toggles), **not** the `praisonai.integrations` group documented on this page. A listed name is always a usable name — see [Single source of truth](/features/external-cli-integrations#single-source-of-truth).
+`list_external_agents` and `external_agent_catalog` cover the separate `praisonai.external_agents` entry-point group (short-name `--external-agent` choices and UI toggles), **not** the `praisonai.integrations` group documented here. See [Single source of truth](/features/external-cli-integrations#single-source-of-truth).
 </Note>
+
+---
+
+## Typed backend registries
+
+The two typed registries are unchanged by #4651 and remain the sources of truth for their surfaces:
+
+| Registry | Surface it drives |
+|---|---|
+| `ExternalAgentRegistry` | the `--external-agent` CLI short names |
+| `ManagedBackendRegistry` | the `run_on=` kwarg |
+
+Use these when you need typed enumeration of backends rather than plain module importability.
+
+---
+
+## Migration from the old registry
+
+The internal registry surfaces removed in [PR #4651](https://github.com/MervinPraison/PraisonAI/pull/4651) no longer exist. Update any code that touched them:
+
+| Removed | Replacement |
+|---|---|
+| `from praisonai.integrations._unified_registry import get_integrations_registry` | `from praisonai.integrations import <name>` (still works for every built-in and plugin) |
+| `INTEGRATIONS_REGISTRY` module attribute | none — import the name you need directly |
+| `IntegrationRegistry` class | none — built-ins served by `_STATIC_EXPORTS`, plugins via the entry-point group |
+| `registry.get_by_attr(module, attr)` | `getattr(praisonai.integrations, attr)` / a normal `import` |
+| Typed backend enumeration | `ExternalAgentRegistry` / `ManagedBackendRegistry` |
+
+```python
+# ❌ Before (removed)
+from praisonai.integrations._unified_registry import get_integrations_registry
+cls = get_integrations_registry().get_by_attr(__name__, "ClaudeCodeIntegration")
+
+# ✅ After
+from praisonai.integrations import ClaudeCodeIntegration
+```
 
 ---
 
 ## Advanced Usage
 
-### Adding a New Built-in Backend
+### Adding a new built-in backend
 
-Built-in CLI backends (Claude Code, Gemini, Codex, Cursor) are registered from a single canonical module: `praisonai/integrations/_cli_loaders.py`. It exports `CLASS_NAME_LOADERS` (class-name → loader) used by `IntegrationRegistry`, and `BUILTIN_INTEGRATIONS` (short-alias → loader) used by `ExternalAgentRegistry`. Register a new built-in backend in one place and both registry surfaces pick it up.
+Built-in CLI backends (Claude Code, Gemini, Codex, Cursor) are registered from a single canonical module: `praisonai/integrations/_cli_loaders.py`. It exports `BUILTIN_INTEGRATIONS` (short-alias → loader) used by `ExternalAgentRegistry`. Register a new built-in there and add the class to `_STATIC_EXPORTS` in `praisonai/integrations/__init__.py` to make it importable.
 
 <Note>
-This is the **in-tree** path. To ship a `--external-agent` short name and UI toggle **out-of-tree** — pip-installable, no PraisonAI code changes — publish to the `praisonai.external_agents` entry-point group instead. See [Register a custom external agent](/features/external-cli-integrations#register-a-custom-external-agent). Note `praisonai.external_agents` (short-name `--external-agent` + UI toggles) is a different group from `praisonai.integrations` (module importability) documented on this page.
+This is the **in-tree** path. To ship a `--external-agent` short name and UI toggle **out-of-tree** — pip-installable, no PraisonAI code changes — publish to the `praisonai.external_agents` entry-point group instead. See [Register a custom external agent](/features/external-cli-integrations#register-a-custom-external-agent). That group is distinct from `praisonai.integrations` (module importability) documented here.
 </Note>
 
-### Build Your Own Namespace
+### Build your own namespace
 
-Use `create_lazy_getattr(registry)` from `praisonai._registry` for plugin authors who want to give their own package the same lazy-loading + entry-point dispatch behaviour:
+Use `create_lazy_getattr(registry)` from `praisonai._registry` to give your own package the same lazy-loading + entry-point dispatch behaviour:
 
 ```python
 # my_pkg/__init__.py
@@ -238,104 +234,35 @@ _REG = PluginRegistry(entry_point_group="my_pkg.plugins")
 __getattr__ = create_lazy_getattr(_REG)
 ```
 
----
-
-## Common Patterns
-
-<AccordionGroup>
-<Accordion title="Override a Built-in">
-```python
-from praisonai.integrations._unified_registry import get_integrations_registry
-
-def _my_loader():
-    from my_pkg import MyClaudeCodeIntegration
-    return MyClaudeCodeIntegration
-
-# Override built-in
-get_integrations_registry().register_lazy("ClaudeCodeIntegration", _my_loader)
-```
-
-Last-write-wins on the canonical name.
-</Accordion>
-
-<Accordion title="Multiple Aliases">
-```python
-get_integrations_registry().register_lazy(
-    "MyIntegration", 
-    _loader, 
-    aliases=["my", "mi", "custom"]
-)
-```
-
-Both the alias and the canonical name resolve.
-</Accordion>
-
-<Accordion title="Multi-tenant Isolation">
-```python
-from praisonai.integrations._unified_registry import IntegrationRegistry
-
-# Per-tenant registry (not the singleton)
-tenant_registry = IntegrationRegistry()
-tenant_registry.register_lazy("TenantTool", _loader)
-```
-
-Construct your own `IntegrationRegistry()` for per-tenant registration that doesn't leak.
-</Accordion>
-</AccordionGroup>
+`PluginRegistry.has(name) -> bool` (added in #4651) is a cheap, load-free membership check you can use before triggering a lazy import.
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Always Use Lazy Loading">
-Always use a `_loader` function, never import the integration at module top-level — that defeats the lazy-loading:
+<Accordion title="Import from the package root, not submodules">
+Use the public surface so you get built-in-vs-plugin resolution:
 
 ```python
 # ✅ Good
-def _my_loader():
-    from my_pkg.integration import MyIntegration
-    return MyIntegration
-
-# ❌ Bad - imports at module level
-from my_pkg.integration import MyIntegration
-def _my_loader():
-    return MyIntegration
-```
-</Accordion>
-
-<Accordion title="Use Canonical Names">
-Names are case-insensitive; pick the canonical form (matching the class name) for the registration key:
-
-```python
-# ✅ Good - matches class name
-get_integrations_registry().register_lazy("MyIntegration", _loader)
-
-# ❌ Confusing - different case
-get_integrations_registry().register_lazy("myintegration", _loader)
-```
-</Accordion>
-
-<Accordion title="Avoid Internal Imports">
-Don't bypass the registry to import internal integration modules directly — those paths are not part of the public API:
-
-```python
-# ✅ Good - use the public API
 from praisonai.integrations import ClaudeCodeIntegration
 
-# ❌ Bad - internal import path
+# ❌ Bad — internal module path, not the public API
 from praisonai.integrations.claude_code import ClaudeCodeIntegration
 ```
 </Accordion>
 
-<Accordion title="Never Reuse a Built-in Name">
-Built-ins always win on name collisions. Since [PR #4176](https://github.com/MervinPraison/PraisonAI/pull/4176)
-this rule is enforced in the base `PluginRegistry`, so it holds for every
-registry — not just this one. If you ship a plugin under an existing built-in
-name, the entry point is skipped and users get the built-in (a `DEBUG` line
-notes the collision) — pick a name unique to your package. Names are compared
-case-insensitively, so `ClaudeCodeIntegration`, `claudecodeintegration`, and
-`CLAUDECODEINTEGRATION` are the same key. See [Plugin Precedence](/features/plugin-precedence).
+<Accordion title="Never reuse a built-in name">
+Built-ins are served by `_STATIC_EXPORTS` before the entry-point lookup runs, so a plugin sharing a built-in name is never reached. Pick a name unique to your package.
+</Accordion>
+
+<Accordion title="Prefer typed registries for enumeration">
+When you need to *list* backends (not just import one), use `ExternalAgentRegistry` / `ManagedBackendRegistry` — they own the `--external-agent` and `run_on=` surfaces.
+</Accordion>
+
+<Accordion title="Upgrade for entry-point discovery">
+Plugin discovery needs PR #4154 or later. On older releases, only built-ins resolve.
 </Accordion>
 </AccordionGroup>
 
@@ -344,10 +271,10 @@ case-insensitively, so `ClaudeCodeIntegration`, `claudecodeintegration`, and
 ## Related
 
 <CardGroup cols={2}>
+<Card title="Model Provider Plugins" icon="plug" href="/features/model-provider-plugins">
+  Same static-map + entry-point + built-ins-win pattern for model → provider
+</Card>
 <Card title="Framework Adapter Plugins" icon="plug" href="/features/framework-adapter-plugins">
   Plugin system for multi-agent frameworks
-</Card>
-<Card title="Persistence Backend Plugins" icon="database" href="/features/persistence-backend-plugins">
-  Add custom storage backends
 </Card>
 </CardGroup>
