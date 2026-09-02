@@ -9,21 +9,24 @@ The Settings screen edits the live settings store on the device, and its `baseUr
 
 ```mermaid
 graph LR
-    Field[📝 Field change] --> Validate{🔍 validateInput}
-    Validate -->|null| Reset[↩️ Reset to stored]
+    Field[📝 Field change] --> Intent[🧾 set-setting intent]
+    Intent --> Validate{🔍 validateInput}
+    Validate -->|null| Refuse[🚨 Refused + alert]
     Validate -->|value| Set[💾 facade.set]
-    Set -->|false| Reset
-    Set -->|throws| Rollback[⚠️ Rollback + reset]
-    Set -->|true| Notify[📣 Notify + repaint]
+    Set -->|false| Refuse
+    Set -->|throws| Rollback[⚠️ Rollback + refuse]
+    Set -->|true| Notify[📣 Notify + clear alert + repaint]
 
     classDef field fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef intent fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef check fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef reset fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef refuse fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Field field
+    class Intent intent
     class Validate,Set check
-    class Reset,Rollback reset
+    class Refuse,Rollback refuse
     class Notify ok
 ```
 
@@ -46,8 +49,8 @@ http://10.0.0.7:9000
 The write commits on `change`, not per keystroke. On blur or Enter the value is validated, then persisted through `facade.set`.
 </Step>
 
-<Step title="Relaunch">
-The app boots against the new address. A persisted `baseUrl` is read by `enginesFor` at boot and outranks the compiled-in default.
+<Step title="Send the next message">
+No relaunch. The next `/chat` and `/health` request resolves `baseUrl` fresh from the store, so the very next message reaches the address you just typed. Any turn already streaming stays pinned to the address it started at — its `/cancel` and `/approve` still land on the engine that issued the run.
 </Step>
 </Steps>
 
@@ -91,14 +94,64 @@ The four input paths and their outcomes:
 
 ---
 
+## How a refusal is spoken
+
+A refused value is said, not silently undone.
+
+Each row carries a `role="alert"` node from first paint — empty and `hidden` — so an assertive announcement is picked up reliably by screen readers. An alert region inserted at the moment it has something to say is announced unreliably by every screen reader, so the node exists from the start and only its text changes.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Field
+    participant intentFrom
+    participant validateInput
+    participant Alert as role="alert" + assertive region
+
+    User->>Field: type + blur/Enter
+    Field->>intentFrom: set-setting {key, raw}
+    intentFrom->>validateInput: validateInput(def, raw)
+    validateInput-->>intentFrom: null | value
+    intentFrom->>Alert: settingRejected(label)
+    Alert-->>User: "Engine address was not changed: that value was refused."
+```
+
+The message is the labeled i18n string `settingRejected(label)` — `"Engine address was not changed: that value was refused."` — not a generic `"Invalid value"`. It names the setting because the field may already have scrolled off, and it is set on both the inline `role="alert"` node **and** the assertive live region, so the user hears it interrupt rather than wait behind queued status ticks.
+
+<Note>
+**Only the refused key's message is touched.** A successful write on one key clears its own message and leaves another key's refusal standing. Clearing every note would wipe a refusal the user has not read off a different setting; leaving them all would keep accusing a write that has since succeeded. The guard is `if (errorFor !== key) continue;` in `syncSettings`.
+</Note>
+
+---
+
+## How the change reaches the store
+
+Committing a field is an intent, decoded on the app root — never a per-field listener.
+
+The control emits `{ kind: "set-setting"; key; raw }` (`app/src/intents.ts`). One `change` listener sits on the app root and decodes the target's `Actionable` chain through `intentFrom(chain)`: a `data-action="set-setting"` element carrying `data-setting-key="..."` **and** an `Actionable.value`.
+
+```ts
+// app/src/main.ts — the input carries only data, no listener.
+control.dataset["action"] = "set-setting";
+control.dataset["settingKey"] = def.key; // e.g. "baseUrl"
+```
+
+`Actionable.value` is absent on every non-field element on purpose: absence means "not a field", never "cleared". A `<div>` row, a `<span>` label, or a section heading has no `value`, so a stray tap on a row background cannot decode into a `set-setting` with an empty `raw` and wipe the engine address. Both the key and the value are required — a missing key is refused (the store would refuse `""` silently), and a missing value means the element is not a field at all.
+
+<Note>
+The settings screen is rebuilt on every visit, so a listener attached to a field would belong to a node thrown away on the next navigation. Delegating on the root — like every tap — is what keeps the commit path alive across navigations.
+</Note>
+
+---
+
 ## Configuration Options
 
 `SETTING_DEFS` ships exactly two editable settings today (source: `app/src/registry.ts`).
 
 | Key | Type | Default | Control | Notes |
 |-----|------|---------|---------|-------|
-| `engineId` | `string` (choice) | `remote-http` | `<select>` | Choices come from `SETTING_DEFS.engineId.choices` — the picker lists **both** `remote-http` and `praisonai-ts` in shipping builds, since the in-process engine ships as a lazy chunk. The `Default` column is the setting's stored fallback; the *first-launch* default is platform-aware (`defaultEngineIdFor(kind)` — tauri → `praisonai-ts`, web → `remote-http`). See [Engines → First-Launch Default](/features/mobile/engines#first-launch-default). |
-| `baseUrl` | `string` | `http://127.0.0.1:8765` | `<input type="text">` | Read by `enginesFor` at boot; trailing slashes are stripped when building the request URL. Changing it is the recovery for an unreachable engine. |
+| `engineId` | `string` (choice) | `remote-http` | `<select>` | Choices come from `SETTING_DEFS.engineId.choices`. The picker lists only `remote-http` in shipping builds. |
+| `baseUrl` | `string` | `http://127.0.0.1:8765` | `<input type="text">` | Resolved per request by `enginesFor` — the next `/chat` and `/health` go to the current stored value. Trailing slashes are stripped per resolution. Changing it is the recovery for an unreachable engine. |
 
 <Note>
 The store's coercion and validation machinery stays intact for any future setting, but only `engineId` and `baseUrl` are read by the shipping app today. See [Storage & Secrets → Shipped defaults are valid](/features/mobile/storage-and-secrets).
@@ -113,7 +166,8 @@ The store's coercion and validation machinery stays intact for any future settin
 ```ts
 // The user edits the Engine address field; the screen calls, in effect:
 await settings.set("baseUrl", "http://10.0.0.7:9000");
-// Persisted. enginesFor reads it at the next boot and the app reaches the engine.
+// Persisted. The next /chat and /health request resolves baseUrl fresh — the
+// change is live on the next message, not the next launch.
 ```
 
 **A refused change never shows a phantom value** — a value the store rejects snaps the field back.
@@ -138,8 +192,12 @@ try {
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Refuse at the field, not in the store">
-`validateInput` runs before `set`, so an invalid input is rejected at the input rather than accepted into the UI and dropped by `set`. The screen never offers a value the store then silently refuses.
+<Accordion title="A refusal is refused, and said">
+`validateInput` runs before `set`, so an invalid input is rejected before it reaches the store. And the refusal is not silent: `settingRejected(label)` is written to the field's `role="alert"` node and the assertive live region, so a typo on the recovery screen no longer looks like the tap did not register.
+</Accordion>
+
+<Accordion title="A change reaches the store as an intent, not a per-field listener">
+Committing a field emits `{ kind: "set-setting"; key; raw }`, decoded by one root-delegated `change` handler through `intentFrom`. `Actionable.value` is absent on non-field elements on purpose — absence means "not a field", never "cleared" — so a stray tap on a row background cannot wipe the engine address.
 </Accordion>
 
 <Accordion title="Persist commits on blur/Enter">
@@ -171,5 +229,8 @@ The field resets to `settings.get(key) ?? def.default`, so a value that never pe
 </Card>
 <Card title="Boot Failures" icon="bug" href="/features/mobile/boot-failures">
   The warning notice a phone sees before editing the address.
+</Card>
+<Card title="i18n & A11y" icon="globe" href="/features/mobile/i18n-and-a11y#how-a-refusal-is-spoken">
+  Why `settingRejected` is announced assertively.
 </Card>
 </CardGroup>

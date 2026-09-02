@@ -119,16 +119,21 @@ export type EngineSelection =
 </Step>
 
 <Step title="enginesFor wires a probe and passes persistence to in-process only">
-The remote-http choice supplies a `probe`; the remote engine deliberately does not receive `persistence`. `baseUrl` is computed **once** and shared between `create` and `probe`, so the probe hits the same address the user configured.
+The remote-http choice supplies a `probe`; the remote engine deliberately does not receive `persistence`. `baseUrl` is a **resolver**, not a captured string — read at the moment it is used, so a Settings edit is live on the next `/chat` and `/health`.
 
 ```ts
 export function enginesFor(deps: RegistryDeps): readonly EngineChoice[] {
-  const baseUrl = stringSetting(deps.settings, "baseUrl", "http://127.0.0.1:8765").replace(/\/+$/, "");
+  // A RESOLVER, not a captured string: read at the moment it's used, so a
+  // Settings edit is live on the next /chat and /health.
+  const baseUrl = (): string =>
+    stringSetting(deps.settings, "baseUrl", "http://127.0.0.1:8765").replace(/\/+$/, "");
   const choices: EngineChoice[] = [
     {
       id: ENGINE_REMOTE_HTTP,
       create: () => createRemoteHttpEngine({ baseUrl, http: deps.http, id: ENGINE_REMOTE_HTTP }),
-      probe: () => probeHealth(deps.http, baseUrl),
+      // Called, not captured — probing the address the user just replaced
+      // reports a failure about a machine nobody is talking to.
+      probe: () => probeHealth(deps.http, baseUrl()),
     },
   ];
   // in-process engine (no probe — it IS the device)
@@ -140,7 +145,7 @@ export function enginesFor(deps: RegistryDeps): readonly EngineChoice[] {
 }
 ```
 
-Sharing the single `baseUrl` is pinned by `"enginesFor's probe targets the configured engine address"`.
+The resolver is passed to `createRemoteHttpEngine` and the probe is `probeHealth(deps.http, baseUrl())` — invoked, not captured. Pinned by the resolver tests in `registry.test.ts` and `engine.test.ts`.
 </Step>
 
 <Step title="Build engines from the session">
@@ -200,13 +205,55 @@ Without `onIgnored`, decoder refusals are invisible — a truncated answer repor
 
 | Option | Type | Purpose |
 |--------|------|---------|
-| `baseUrl` | `string` | Engine base URL. Any number of trailing slashes are stripped before the path is appended, so `http://host`, `http://host/`, `http://host//`, and `http://host///` all POST to `http://host/chat`. Pinned by `"a base URL with several trailing slashes still builds one clean path"`. |
+| `baseUrl` | `string \| (() => string)` | Engine base URL, or a resolver read per request. A plain string still works and still means "this one, forever"; a resolver is re-read on each `/chat`, `/cancel`, `/approve`, and `/health`, so a Settings edit is live on the next message. Any number of trailing slashes are stripped **per resolution** before the path is appended, so `http://host`, `http://host/`, `http://host//`, and `http://host///` all POST to `http://host/chat`. Pinned by `"a base URL with several trailing slashes still builds one clean path"`. |
 | `http` | `HttpPort` | All I/O goes through this port — no `fetch` in the engine. |
 | `token` | `string` | Optional bearer token; loopback is unauthenticated, off-device must not be. |
 | `onIgnored` | `(reason, detail) => void` | Called for every frame the decoder **refused**. Wired to `dropSink.note` by the composition root. |
 | `id` | `string` | Optional engine id; defaults to `"remote-http"`. |
 
 `ControllerDeps.dropSink` is the other end of the same seam: what the engine refuses becomes a dropped row on the turn it belonged to. See [Dropped Events](/features/mobile/dropped-events).
+
+### The address is resolved per request
+
+The engine is built once at boot and held for the session, so a captured `baseUrl` string strands a phone that cannot reach its default engine — the only recovery is force-quitting the app. A resolver reads the address at the moment it is used, so the next `/chat` and `/health` go wherever Settings says right now.
+
+```ts
+// engine.ts — resolved per call, never captured.
+const base = (): string =>
+  (typeof options.baseUrl === "string" ? options.baseUrl : options.baseUrl()).replace(/\/+$/, "");
+```
+
+Trailing slashes are stripped **per resolution**, not at the caller: the resolver's answer is not seen until the string is used, and `${base}/chat` against `http://host/` produces `//chat` — which some servers 404 and others redirect, losing the POST body.
+
+Rebuilding the whole engine on a Settings change was the alternative and a much larger one: `createRunController` takes the engine at construction with no seam to swap it, so following the setting that way means rebuilding the controller mid-session and dropping the turn in flight. A resolver costs one call per request and no signature above it.
+
+### Cancel and Approve are pinned to the origin the run was born at
+
+A resolver means `base()` can move between calls — that is the point — but a run's `/cancel` and an approval's `/approve` are addressed by an id the **originating** engine minted. Two maps pin the control requests to where the run started:
+
+| Map | Records | Read by |
+|-----|---------|---------|
+| `runBase: Map<runId, string>` | the resolved origin at the start of `run(...)` | `cancel(runId)` — `runBase.get(runId) ?? base()` |
+| `approvalBase: Map<approvalId, string>` | the origin when an `approval_request` arrives | `decide(approvalId, choice)` — `approvalBase.get(approvalId) ?? base()` |
+
+The origin is resolved once, at the top of `run(...)`, and remembered for that run's control requests. The live resolver is only a fallback for an id this instance never saw — a resumed app that reconnected.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Engine
+    participant Old as Engine A (run origin)
+    participant New as Engine B (edited address)
+
+    User->>Engine: run(runId) — origin pinned to A
+    User->>Engine: Settings edit → base() now B
+    User->>Engine: cancel(runId)
+    Engine->>Old: /cancel to A (runBase.get)
+    Old-->>Engine: ok:true — run stopped
+    Note over New: B never issued runId; a /cancel there 404s
+```
+
+Without pinning, a Settings edit mid-turn would send `/cancel` to an engine that never issued the `runId`, `postOk` would 404, `cancel` would return `false`, and `controller.ts` would leave the original engine generating (and billing) while the user believes they hit Stop.
 
 <Note>
 **Readiness is strictly HTTP 200.** The remote-HTTP engine's readiness probe treats any non-200 status as an `http_status` failure — including sub-200 responses (100, 101, 199) that would otherwise fall through to body classification. A websocket upgrade or a `100 Continue` from a misconfigured proxy can no longer be reported as `ready: true` and then offered as a usable engine whose every request fails. Pinned by `"any status that is not exactly 200 is an http_status failure"`.
@@ -229,7 +276,7 @@ A missing `ok` must never be mistaken for a present healthy one: `{ok: "true"}` 
 </Note>
 
 <Note>
-**The probe now actually runs at boot.** These readiness rules are no longer hypothetical: `enginesFor` wires `probe: () => probeHealth(deps.http, baseUrl)` on the remote-http choice, and `selectEngine` calls it before the engine is offered. A `200 {"ok": false}`, a non-200, or an unreachable engine is handled at boot with a named reason — a permanent one refuses boot, a retryable one boots the app with a warning. See [Boot Failures → Boot-time health probe](/features/mobile/boot-failures#boot-time-health-probe).
+**The probe now actually runs at boot.** These readiness rules are no longer hypothetical: `enginesFor` wires `probe: () => probeHealth(deps.http, baseUrl())` on the remote-http choice — `baseUrl` invoked, not captured — and `selectEngine` calls it before the engine is offered. A `200 {"ok": false}`, a non-200, or an unreachable engine is handled at boot with a named reason — a permanent one refuses boot, a retryable one boots the app with a warning. See [Boot Failures → Boot-time health probe](/features/mobile/boot-failures#boot-time-health-probe).
 </Note>
 
 ### Probe timeout
