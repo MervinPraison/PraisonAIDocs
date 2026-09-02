@@ -1,0 +1,185 @@
+---
+title: "Shipping to iOS and Android"
+sidebarTitle: "Shipping to Stores"
+description: "The four things that must line up before Play or App Store Connect will accept the mobile app"
+icon: "mobile-screen-button"
+---
+
+Four things must agree before a store accepts a build: the engine has to be reachable, the bundle has to parse on the oldest WebView you support, the version and build number have to be monotonic, and the crate has to type-check for the phone.
+
+```mermaid
+graph LR
+  subgraph "Ship path"
+    Engine[📡 Engine reachable<br/>CSP allows the host] --> Bundle[📦 Bundle parses<br/>on the WebView floor]
+    Bundle --> Version[🔢 Monotonic<br/>version + build]
+    Version --> Sign[🔏 Store signing]
+    Sign --> Upload[🚀 Play / App Store]
+  end
+
+  classDef reach fill:#189AB4,stroke:#7C90A0,color:#fff
+  classDef parse fill:#F59E0B,stroke:#7C90A0,color:#fff
+  classDef version fill:#6366F1,stroke:#7C90A0,color:#fff
+  classDef sign fill:#8B0000,stroke:#7C90A0,color:#fff
+  classDef ship fill:#10B981,stroke:#7C90A0,color:#fff
+
+  class Engine reach
+  class Bundle parse
+  class Version version
+  class Sign sign
+  class Upload ship
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Build the webview and run cross-check">
+Build the webview, then initialise the platform projects so the crate can be checked for a phone.
+
+```bash
+cd src/praisonai-mobile
+npm ci && npm run build
+npm run tauri android init
+npm run tauri ios init
+```
+
+`gen/apple` and `gen/android` are generated here and are **not** committed. The two schema files under `gen/schemas/` (`android-schema.json`, `mobile-schema.json`) and `src-tauri/Cargo.lock` are.
+</Step>
+
+<Step title="Stamp the release">
+Write the version and a monotonic build number into `tauri.conf.json` before the store build runs.
+
+```bash
+node tools/set-release-version.mjs v1.2.3 "$GITHUB_RUN_NUMBER"
+```
+
+This writes `version`, `bundle.android.versionCode`, and `bundle.iOS.buildNumber`.
+</Step>
+</Steps>
+
+---
+
+## The engine must be reachable — CSP
+
+A webview enforces `connect-src` on `fetch`, and the engine's `baseUrl` is a host the user sets — so a too-tight `connect-src` blocks every remote engine before a packet leaves.
+
+| Directive | Shipped value |
+|---|---|
+| `default-src` | `'self'` |
+| `script-src` | `'self'` |
+| `style-src` | `'self' 'unsafe-inline'` |
+| `img-src` | `'self' data: blob:` |
+| `font-src` | `'self' data:` |
+| `connect-src` | `'self' ipc: http://ipc.localhost https: http://127.0.0.1:* http://localhost:*` |
+
+The exact CSP shipped in `src-tauri/tauri.conf.json`:
+
+```
+default-src 'self';
+script-src 'self';
+style-src 'self' 'unsafe-inline';
+img-src 'self' data: blob:;
+font-src 'self' data:;
+connect-src 'self' ipc: http://ipc.localhost https: http://127.0.0.1:* http://localhost:*
+```
+
+The old `connect-src 'self' ipc: http://ipc.localhost` permitted no engine at all — including the shipped loopback default `http://127.0.0.1:8765`. On a phone the engine is across a network, so `https:` is now permitted too.
+
+<Warning>
+**`script-src` stays closed on purpose.** A model can return arbitrary text and a tool result is attacker-shaped in the ordinary case; `script-src 'self'` is what stops that becoming code in the app's origin. Widening `connect-src` must never widen `script-src`. Both halves are pinned by `tools/tauri-conf.test.mjs` — "the CSP still refuses remote SCRIPTS -- the pair".
+</Warning>
+
+---
+
+## The bundle must parse on the floor
+
+The esbuild target is derived from the platform minimum the app declares, not chosen independently.
+
+| `minSdkVersion` | WebView floor |
+|---|---|
+| `26` (Android 8.0) | `chrome58` |
+| `30` (Android 11) | `chrome87` |
+| `33` (Android 13) | `chrome108` |
+
+`minSdkVersion: 26` implies `chrome58` because Android's WebView updates through Play, but AOSP, Play-less, and long-offline devices keep whatever they shipped with — exactly the population a floor exists to protect. The bundle targets `["safari16", "chrome58"]` and the table lives as `ANDROID_WEBVIEW_FLOOR` in `tools/bundle.mjs`. Lowering the floor cost 5.2 kB of the 400 kB budget, measured.
+
+<Warning>
+Bumping `minSdkVersion` in `tauri.conf.json` also bumps the bundle target. `tools/bundle-target.test.mjs` fails until both agree — it pins Chrome ↔ `minSdkVersion`, Safari ↔ the iOS minimum, and asserts the shipped bundle contains no `?.`, `??`, `??=`, `||=`, or `&&=`.
+</Warning>
+
+The bundle gate also flags **unresolved bare imports** — packages that are not Node builtins and that esbuild could not resolve. A webview has no module resolver, so `import "openai"` in the shipped file dies at import time with the same blank screen as a static Node builtin.
+
+---
+
+## Version + monotonic build number
+
+Semver alone cannot serve both stores, so `tools/set-release-version.mjs` writes a strictly increasing build number alongside the version.
+
+Play rejects a re-used `versionCode`; App Store Connect rejects a duplicate `CFBundleVersion` within the same `CFBundleShortVersionString`. A re-upload of the same version after a rejection needs a higher number — which is precisely when a release is most likely to need one.
+
+```ts
+import { releaseVersion, buildNumber, setReleaseVersion } from "praisonai-mobile/tools/set-release-version";
+
+releaseVersion("v1.2.3");   // "1.2.3" — strips the v, strict semver
+buildNumber("42");           // 42 — positive integer
+setReleaseVersion("v1.2.3", "42"); // writes version + versionCode + buildNumber
+```
+
+CI passes `github.run_number` for the build number, because it only ever increases for a repository.
+
+<Note>
+`tauri.conf.json` is the single source the bundler reads — deliberately not synced with `package.json` or `Cargo.toml`, matching the desktop package's decision after #4527.
+</Note>
+
+---
+
+## Cross-check in CI
+
+Host `cargo check` never expands the mobile `cfg`, so a `cross-check` matrix in `.github/workflows/mobile.yml` runs `cargo check --lib` against real phone targets.
+
+The `shell` job runs on host targets, so `#[cfg_attr(mobile, tauri::mobile_entry_point)]` and the `#[cfg(target_os = "android"/"ios")]` arms in `commands.rs` expanded zero times. `cargo check` type-checks and macro-expands under the mobile `cfg` and needs no NDK or Xcode project — measured at 18 s for the Android target.
+
+| Target | Runner |
+|---|---|
+| `aarch64-linux-android` | `ubuntu-22.04` |
+| `aarch64-apple-ios` | `macos-15` |
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Do not widen script-src to fix an unreachable engine">
+An engine that cannot be reached is a `connect-src` problem — widen that instead. `script-src` closed is what keeps model output from becoming code in the app's origin.
+</Accordion>
+
+<Accordion title="Bump minSdkVersion and the bundle target together">
+The two are two numbers in two files that must agree. `bundle-target.test.mjs` fails until the WebView floor matches the declared `minSdkVersion`.
+</Accordion>
+
+<Accordion title="Never hand-pick a versionCode">
+Use `github.run_number`, or another counter that only increases. A hand-picked number that repeats is rejected by the store on the second upload.
+</Accordion>
+
+<Accordion title="Commit only the schemas and Cargo.lock, not the platform projects">
+Commit `gen/schemas/*.json` and `src-tauri/Cargo.lock`. Do not commit `gen/apple` or `gen/android` — Tauri regenerates those on `init`.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Native Shell" icon="mobile-button" href="/features/mobile/native-shell">
+  The Tauri events, the back-gesture arbitration, and the platform floors.
+</Card>
+<Card title="Shell & Adapters" icon="mobile-screen" href="/features/mobile/shell-and-adapters">
+  The two-source keyboard model and the trimmed-forward link rule.
+</Card>
+<Card title="Composer" icon="keyboard" href="/features/mobile/composer-behavior">
+  The layout invariants that keep the composer clear of the keyboard.
+</Card>
+<Card title="Architecture" icon="sitemap" href="/features/mobile/architecture">
+  Boot order and where the shell is injected.
+</Card>
+</CardGroup>
