@@ -1,46 +1,46 @@
 ---
 title: "Fine-Tuning"
 sidebarTitle: "Fine-Tuning"
-description: "Train a model from the Desktop app and load the checkpoint back in"
+description: "Train a model from the Desktop app and load the checkpoint into your agent"
 icon: "list-check"
 ---
 
-Fine-tune a model from the Desktop app: pick a method and a dataset, watch the loss live, and load the checkpoint straight back into chat.
+Fine-tune a model in the Desktop app, then point your agent at the checkpoint it produced.
 
 ```python
 from praisonaiagents import Agent
 
-# A fine-tune produces a checkpoint on disk. Point an agent at it and chat.
 agent = Agent(
     name="Assistant",
     instructions="You are a helpful assistant.",
-    llm="./runs/run-1/checkpoint",
+    llm="./runs/run-1/checkpoint",  # the checkpoint your fine-tune produced
 )
-agent.start("You now answer in my house style")
+# Train in the Desktop app, then load the result like any other model.
+agent.start("Answer in the style I trained you on")
 ```
 
 ```mermaid
 graph LR
-    You[👤 You] --> Form[📝 Training Form]
-    Form --> Start[🚀 /train/start]
-    Start --> Proc[🔧 Training Subprocess]
-    Proc --> SSE[📈 Progress SSE]
-    SSE --> Ckpt[✅ Checkpoint]
+    User[👤 You] --> Form[📋 Training Form]
+    Form --> Start[🚀 POST /train/start]
+    Start --> Proc[⚙️ Training Subprocess]
+    Proc --> Progress[📈 Progress Stream]
+    Progress --> Checkpoint[✅ Checkpoint]
 
-    classDef you fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef form fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef step fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef out fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class You you
+    class User user
     class Form form
     class Start,Proc proc
-    class SSE step
-    class Ckpt done
+    class Progress step
+    class Checkpoint out
 ```
 
-A training run is a subsystem, not a single request: it survives the window closing and the engine restarting, keeps a ring buffer of progress you can reconnect to, and derives its status from the subprocess itself — so a client that missed the ending still learns how it ended.
+The app runs one training job at a time — two fine-tunes on one GPU do not co-exist — and the job survives closing the window, so you can reconnect and keep watching.
 
 <Note>
 On Windows this required PraisonAI [#4515](https://github.com/MervinPraison/PraisonAI/pull/4515); earlier releases killed the trainer on every relaunch.
@@ -57,16 +57,16 @@ Quit-safety on macOS and Linux (the trainer dies with the engine on **Quit**, no
 ## Quick Start
 
 <Steps>
-<Step title="Fill in the training form">
-Choose a base model, a dataset, and a method. The form collects the config; the engine writes it to `runs/<run-id>/config.yaml`.
+<Step title="Open the Fine-Tuning tab">
+Pick a method, a base model, and a dataset. The form collects everything the engine needs to start a run.
 </Step>
 
 <Step title="Start the run">
-The app posts to `/train/start`. Invalid configs are rejected **before** any model download begins, so you find out in seconds, not after a multi-gigabyte pull.
+The app posts your config to `/train/start`. Invalid configs are rejected immediately, before any model download begins.
 </Step>
 
-<Step title="Watch progress">
-The loss chart and log stream live from the run. Closing the lid doesn't lose it — reconnecting replays from where you left off.
+<Step title="Watch progress and stop when needed">
+Loss, step, and log lines stream live. **Stop** ends the run and releases the GPU. The checkpoint stays on disk under the run's directory.
 </Step>
 
 <Step title="Load the checkpoint">
@@ -78,103 +78,130 @@ When the run reports `done`, point an agent's `llm=` at the checkpoint directory
 
 ## Supported Methods
 
-Pick a method by what your dataset looks like. Each method needs specific columns, checked when the run starts.
+The form supports these training methods. GRPO is validated but cannot be launched from the UI form — it needs `reward_funcs`, which the form does not collect, so run it from the command line.
 
 | Method | Required dataset columns |
 |--------|--------------------------|
-| **SFT** | Any (falls back to the default dataset) |
-| **CPT** | `text` |
-| **DPO** | `prompt`, `chosen`, `rejected` |
-| **ORPO** | `prompt`, `chosen`, `rejected` |
-| **CPO** | `prompt`, `chosen`, `rejected` |
-| **KTO** | `prompt`, `completion`, `label` |
-| **Reward** | `chosen`, `rejected` |
+| `sft` | any (falls back to the default dataset) |
+| `cpt` | `text` |
+| `dpo` | `prompt`, `chosen`, `rejected` |
+| `orpo` | `prompt`, `chosen`, `rejected` |
+| `cpo` | `prompt`, `chosen`, `rejected` |
+| `kto` | `prompt`, `completion`, `label` |
+| `reward` | `chosen`, `rejected` |
+| `grpo` | needs `reward_funcs` — **CLI only** |
 
 <Note>
-**GRPO is not configurable from the UI form.** It needs `reward_funcs`, which the form doesn't collect — the engine rejects a GRPO start with a message telling you to run it from the command line instead.
+Column requirements come from the dataset's contents, so the app names them in the per-method hint rather than checking them up front. The trainer still enforces them.
 </Note>
+
+---
+
+## How It Works
+
+The engine writes your config, spawns a training subprocess in its own process group, and follows its output.
+
+```mermaid
+sequenceDiagram
+    participant UI as 📋 UI Form
+    participant Engine as 🧠 Engine
+    participant Trainer as ⚙️ Trainer
+
+    UI->>Engine: POST /train/start (config)
+    Engine->>Engine: preflight — reject bad config (400)
+    Engine->>Trainer: spawn (own process group)
+    Trainer-->>Engine: log lines, loss, step
+    UI->>Engine: GET /train/progress?run=…&cursor=N
+    Engine-->>UI: replay from cursor, then follow
+    UI->>Engine: POST /train/stop/{run_id}
+    Engine->>Trainer: kill tree, release GPU
+```
 
 ---
 
 ## Run IDs
 
-A run id becomes a directory name, so it must be unique — and uniqueness is **case-insensitive**.
+Each run becomes a directory, so run ids are unique **case-insensitively** — `run-x` and `RUN-X` are the same run because macOS and Windows filesystems fold case. Auto-generated ids append a numeric suffix, so two starts inside the same second no longer collide.
 
-macOS and Windows filesystems fold case, so `run-x` and `RUN-X` would share one directory and overwrite each other's config and log. The engine compares ids with `casefold()` against both the run history and the filesystem, and refuses a collision. Auto-generated ids used to resolve to the second, so two starts in the same second collided; a numeric suffix (`run-1724759100-2`) now prevents that.
+| Rule | Behaviour |
+|------|-----------|
+| Case | Ids are compared with `casefold()` — `run-x` collides with `RUN-X` |
+| Same second | Auto-ids get a `-2`, `-3`… suffix instead of overwriting |
+| Format | 1–64 characters of letters, digits, dot, dash, or underscore, starting alphanumeric |
+
+Starting a run with an id that already exists returns `400 Bad Request`.
 
 <Warning>
-A run id must be 1–64 characters of letters, digits, dot, dash, or underscore, starting alphanumeric. Reserved Windows device names (`CON`, `PRN`, `COM1`…) and trailing dots are refused.
+Reserved Windows device names (`CON`, `PRN`, `COM1`…) and trailing dots are refused.
 </Warning>
 
 ---
 
 ## Stop Semantics
 
-The **Stop** button posts to `/train/stop/{run_id}`, not a bare `/train/stop`.
+The **Stop** button posts to `/train/stop/{run_id}`, naming the run to cancel — so a stale tab cannot cancel a newer run.
 
-```mermaid
-sequenceDiagram
-    participant UI as 🖥️ UI
-    participant Engine as 🧠 Engine
-    participant Trainer as 🔧 Trainer + children
+| Platform | How the trainer is killed |
+|----------|---------------------------|
+| macOS / Linux | The process group is signalled, killing the trainer and everything it spawned |
+| Windows | `taskkill /T /F` walks the child tree |
 
-    UI->>Engine: POST /train/stop/{run_id}
-    Engine->>Engine: run_id matches the live run?
-    Engine->>Trainer: kill the whole process group
-    Trainer-->>Engine: exited, GPU released
-    Engine-->>UI: {ok: true}
-```
-
-Because the id is checked against the live run, a **stale tab cannot cancel a newer run** — stopping the wrong job is refused with a 409. The kill releases the GPU on every platform: `taskkill /T /F` on Windows (a console-less child can't be signalled politely), and a process-group kill on macOS and Linux, so anything the trainer spawned dies with it. Quitting the app takes the run down with it too — the engine's exit handler runs the same process-group kill before it exits, so the GPU is released whether you press **Stop** or close the window ([PraisonAI #4508](https://github.com/MervinPraison/PraisonAI/pull/4508), macOS/Linux; Windows was already correct).
+The GPU is released in every case. Stopping a run this engine did not spawn (adopted after a restart) signals the recorded pid's group.
 
 ---
 
 ## History & Retention
 
-Finished runs stay listed, but bounded — the full log file on disk is always the complete record.
+Finished runs stay in memory so the history pane can show them, within bounded caps. The full log file stays on disk.
 
 | Cap | Value | What it bounds |
 |-----|-------|----------------|
-| `MAX_HISTORY` | `50` | Finished runs kept in the history pane |
-| `MAX_METRICS` | `5000` | Loss/metric points kept in memory per run |
-| — | full log | `runs/<run-id>/train.log` is never truncated |
+| `MAX_HISTORY` | `50` | Finished runs listed in history |
+| `MAX_METRICS` | `5000` | Loss/metric points kept per run |
 
-Only **one run at a time**: two fine-tunes on one GPU OOM, so `start` refuses while a run is live (409) rather than queueing.
+<Note>
+`train.log` in each run directory is the complete record. The in-memory metric series is a tail for the chart, not an archive.
+</Note>
 
 ---
 
-## Preflight Rejection
+## Preflight Validation
 
-Configs that can't work are rejected before anything downloads.
+Invalid configs are rejected before a single byte is downloaded, so you learn about a mistake in seconds rather than after a multi-gigabyte model load.
 
-| Check | Response |
-|-------|----------|
-| Missing `model_name` or `dataset` | `400 Bad Request` |
-| GRPO without `reward_funcs` | `400 Bad Request` |
-| A run already live | `409 Conflict` |
-| Unwritable runs directory | `500` with a real message |
-
-Everything checkable from the config alone is checked up front, so you never wait an hour for a multi-gigabyte model to load only to be told your config was never going to work.
+| Response | Cause |
+|----------|-------|
+| `400 Bad Request` | Missing `model_name` or `dataset`, GRPO without `reward_funcs`, or a rejected run id |
+| `409 Conflict` | A run is already live — one GPU runs one job |
+| `500` | The runs directory could not be created |
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Name your runs">
+An explicit run id makes the checkpoint directory predictable. Remember ids are case-insensitive — `Exp-1` and `exp-1` are the same run.
+</Accordion>
+
+<Accordion title="Run GRPO from the command line">
+GRPO needs `reward_funcs`, which the form cannot collect. Launch it with `praisonai train` instead and watch it from the same engine.
+</Accordion>
+
 <Accordion title="Keep the trainer in its own environment">
 `praisonai-train` pulls torch and unsloth, which you may keep in a separate CUDA-matched venv. Set `PRAISONAI_TRAIN_CMD` to choose the interpreter — `--config <path>` is always appended, so the override picks the interpreter, not the contract.
 </Accordion>
 
-<Accordion title="Name your runs">
-Provide a `run_id` you'll recognise instead of the auto-generated `run-<timestamp>`. Remember ids are compared case-insensitively, so `Nightly` and `nightly` are the same run.
+<Accordion title="Reconnect, don't restart">
+Progress is a ring buffer replayed from a cursor and the run's state is written to `runs/<run-id>/run.json` at every transition. Close the window and reopening the run replays what you missed. A run whose child process is still alive after an engine restart reappears as `running` and Stop still reaches it.
 </Accordion>
 
-<Accordion title="Reconnect, don't restart — even after the engine restarts">
-Progress is a ring buffer replayed from a cursor, and the run's state is written to `runs/<run-id>/run.json` at every transition. Close the window and reopening the run replays what you missed. Kill the engine (or crash it) and the next boot reads that state file back: a run whose child process is still alive reappears in history as `running` and Stop still reaches it; an interrupted run whose pid is gone reads as `failed`, not missing. Either way, a second fine-tune while an old one is still live is still refused — the single-GPU guard survives the restart.
+<Accordion title="Keep the log file for the full record">
+The chart shows only recent metrics. For the complete series, read `train.log` in the run directory.
 </Accordion>
 
-<Accordion title="Match the method to your columns">
-Pick the method whose required columns your dataset already has. A mismatch is caught, but you'll save a round trip by checking the table above first.
+<Accordion title="Stop from the run's own tab">
+Stop names the run it cancels, so a stale tab is refused. Trigger Stop from the tab showing the run you actually want to end.
 </Accordion>
 </AccordionGroup>
 
@@ -183,10 +210,16 @@ Pick the method whose required columns your dataset already has. A mismatch is c
 ## Related
 
 <CardGroup cols={2}>
-<Card title="Chat & Streaming" icon="comments" href="/features/desktop/chat">
-Chat with your fine-tuned checkpoint
-</Card>
 <Card title="Engine API" icon="plug" href="/features/desktop/api">
-The `/train/*` HTTP routes in full
+The `/train/*` routes and their status codes
+</Card>
+<Card title="Settings Reference" icon="sliders" href="/features/desktop/settings">
+Model, sampling, and safety fields
+</Card>
+<Card title="Chat & Streaming" icon="comments" href="/features/desktop/chat">
+Talk to your fine-tuned model
+</Card>
+<Card title="Models & API Keys" icon="key" href="/features/desktop/models">
+Point the app at a local checkpoint
 </Card>
 </CardGroup>

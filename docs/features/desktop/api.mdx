@@ -1,56 +1,58 @@
 ---
 title: "Engine API"
 sidebarTitle: "Engine API"
-description: "The local HTTP surface the Desktop app talks to on 127.0.0.1"
+description: "The loopback HTTP surface the Desktop engine exposes on 127.0.0.1"
 icon: "plug"
 ---
 
-The Desktop engine is a small HTTP server on loopback — document it here if you're wiring an alternate UI or an integration.
+The Desktop engine is a small HTTP server on `127.0.0.1` — the same surface the app uses, stable enough to wire an alternate UI or an integration against.
 
 ```python
 from praisonaiagents import Agent
 
-# The engine wraps this agent. Everything below is how a UI talks to it.
 agent = Agent(
-    name="PraisonAI",
+    name="Assistant",
     instructions="You are a helpful assistant.",
 )
+# The Desktop app talks to an engine exactly like this one over 127.0.0.1.
 agent.start("Hello")
 ```
 
 ```mermaid
 graph LR
-    Client[🌐 Any local client] --> Health[GET /health]
-    Client --> Chat[POST /chat]
-    Client --> Train[POST /train/start]
-    Health --> Engine[🧠 Engine 127.0.0.1]
-    Chat --> Engine
-    Train --> Engine
+    Client[🌐 Client] --> Loop[🔒 127.0.0.1:PORT]
+    Loop --> Chat[💬 /chat]
+    Loop --> Train[⚙️ /train/*]
+    Loop --> Health[❤️ /health]
 
     classDef client fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef route fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef engine fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef loop fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef route fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Client client
-    class Health,Chat,Train route
-    class Engine engine
+    class Loop loop
+    class Chat,Train,Health route
 ```
 
-The engine binds to `127.0.0.1` only — **nothing leaves your machine** unless the model provider does. There is no auth because there is no remote surface: the loopback socket is the boundary.
+Every endpoint binds to `127.0.0.1` only — nothing leaves your machine unless the model itself does.
 
 ## Quick Start
 
 <Steps>
 <Step title="Find the port">
-The shell prints `PRAISONAI_PORT=<port>` on startup and writes it to the lockfile. Every route below is served from `http://127.0.0.1:<port>`.
+The app prints `engine :PORT` when the engine is healthy. That is the loopback port every route below uses.
 </Step>
 
-<Step title="Probe health">
-`GET /health` returns `{ok, version, data_dir}` — the version confirms it's the engine and not something else on the port.
+<Step title="Probe /health">
+`GET /health` confirms the engine is up and returns the true data directory.
+
+```bash
+curl http://127.0.0.1:PORT/health
+```
 </Step>
 
-<Step title="Stream a chat">
-`POST /chat` returns a Server-Sent Events stream. See [Chat & Streaming](/features/desktop/chat) for the event vocabulary.
+<Step title="Call a route">
+Every response is JSON except `/chat` (SSE) and `/train/progress` (SSE).
 </Step>
 </Steps>
 
@@ -60,68 +62,85 @@ The shell prints `PRAISONAI_PORT=<port>` on startup and writes it to the lockfil
 
 | Route | Purpose |
 |-------|---------|
-| `GET /health` | Liveness. Returns `ok`, `version`, and `data_dir` (the real data folder, honouring overrides). |
-| `POST /chat` | SSE token stream. Covered in [Chat & Streaming](/features/desktop/chat). |
-| `POST /approve/{approval_id}` | Approve or deny a pending tool call. Body `{choice}`; a missing body means deny. |
-| `POST /mcp`, `GET /mcp` | List and manage MCP servers (`add` / `remove` / `toggle`). |
-| `GET /search?q=` | Full-text search across transcripts. |
-| `POST /fork/{cid}/{idx}` | Copy a transcript up to message `idx` into a new chat. |
-| `DELETE /messages/{cid}/{idx}` | Drop one exchange (a user turn and its reply). |
-| `POST /project/{cid}` | Set a conversation's project tag. |
-| `DELETE /chats/{cid}` | Delete a conversation. Reports the delete that actually happened: `200 {"ok": true}` on success (a missing file also counts, since `unlink(missing_ok=True)` succeeds), `400 {"ok": false, "error": …}` on an id that reduces to nothing (e.g. `/chats/..`), and `500 {"ok": false, "error": …}` on an `OSError` from `unlink()` (read-only or permission-changed data dir, a directory blocking the file, a synced folder mid-conflict). Answering `200` for every case is how a conversation closed on screen and reappeared in the sidebar on refresh. |
-| `POST /train/start` | Start a fine-tune. `400` on an invalid method or column set. The single-GPU guard survives an engine restart: an adopted live run still counts, so a second start after a restart is refused with `409` rather than silently starting a second trainer beside the live one. |
-| `POST /train/stop/{run_id}` | Stop a run. Stale-tab safe: stopping a run other than the live one is refused. An adopted run from a previous engine process is stopped through its persisted pid — the process group is signalled on POSIX (`killpg`) and the tree walked on Windows (`taskkill /T`). Quitting the engine runs the same kill before it exits, so the GPU is released whether the caller sends **Stop** or the engine receives **SIGTERM** (macOS/Linux only; Windows was already correct via `taskkill /T`). |
-| `GET /train/progress?run=…&cursor=N` | SSE replay-then-follow. `400` on a malformed cursor. |
-| `GET /train/status` | The live run plus its recent metrics. |
-| `GET /train/runs` | Finished-run history (bounded — see caps below). Runs from previous engine processes are included: a live run reappears as `running` (its child process is adopted), an interrupted run reads as `failed`, a finished run reads as `done`. |
+| `GET /health` | Includes `data_dir`, `version`, `shell_version`, and `agents_version` |
+| `POST /chat` | SSE stream (covered in [Chat & Streaming](/features/desktop/chat)) |
+| `POST /approve/{approval_id}` | Approve or deny a pending tool call; missing body means deny |
+| `GET /mcp`, `POST /mcp` | List and manage MCP servers |
+| `GET /search?q=` | Full-text search across transcripts |
+| `POST /fork/{cid}/{idx}` | Fork a conversation at a message |
+| `DELETE /messages/{cid}/{idx}` | Delete a message |
+| `POST /project/{cid}` | Assign a conversation to a project |
+| `DELETE /chats/{cid}` | Delete a conversation |
+| `POST /train/start` | Start a fine-tune; `400` on invalid method or column set |
+| `POST /train/stop/{run_id}` | Kill the named run; stale-tab safe |
+| `GET /train/progress?run=…&cursor=N` | Replay from a cursor then follow; `400` on a malformed cursor |
+| `GET /train/status` | The live run and a tail of its metrics |
+| `GET /train/runs` | Finished runs, bounded to the last 50 |
 
 ---
 
 ## Status Codes
 
-The engine returns real codes so a client can act, rather than dropping the connection.
+The engine returns a status that matches the cause, so a client shows the right thing instead of a bare drop.
 
-| Code | When |
-|------|------|
-| `400` | Bad input — invalid training config, `?cursor=abc` on `/train/progress`, or an id that reduces to nothing on `DELETE /chats/`. |
-| `404` | No such conversation, message, version, or run. |
-| `409` | A conflict — a training run is already live, or a stop named the wrong run. |
-| `500` | A real server error, such as an unwritable runs directory, or an `OSError` from `unlink()` on `DELETE /chats/` (read-only data dir, a directory blocking the file, a synced folder mid-conflict). |
-
-<Note>
-A malformed `/train/progress?cursor=abc` used to drop the connection with no response. It now returns `400 Bad Request` with `{"error": "cursor must be an integer"}`.
-</Note>
+| Code | Meaning |
+|------|---------|
+| `200` | Success |
+| `400` | Bad request — missing fields, malformed `/train/progress?cursor=`, or a rejected run id |
+| `404` | No such run, chat, or pending approval |
+| `409` | A training run is already live — one GPU runs one job |
+| `500` | The runs directory could not be created |
 
 <Note>
-`DELETE /chats/{cid}` used to answer `200 {"ok": true}` for every case, including permission errors and malformed ids. It now returns `400` or `500` with `{"ok": false, "error": …}` so a UI can react instead of blanking the transcript against a delete that never happened.
+`/train/progress` with a malformed `cursor` now returns `400 Bad Request`. It used to drop the connection with no response at all.
 </Note>
 
 ---
 
-## Bounded Deques
+## Bounded Responses
 
-The training routes read from bounded in-memory buffers; the on-disk log is always the full record.
+The training routes read from bounded buffers, so a long-running engine cannot grow without limit.
 
-| Buffer | Cap | Served by |
-|--------|-----|-----------|
-| Run history | `MAX_HISTORY=50` | `GET /train/runs` |
-| Metric series (per run) | `MAX_METRICS=5000` | `GET /train/status` (last 500) |
+| Route | Bound |
+|-------|-------|
+| `GET /train/runs` | Last 50 finished runs (`MAX_HISTORY=50`) |
+| `GET /train/status` | Up to the last 500 metric points; the series itself is capped at `MAX_METRICS=5000` |
+
+---
+
+## The /health Response
+
+`/health` reports the true data directory, honouring `PRAISONAI_DESKTOP_HOME`, `XDG_DATA_HOME`, and `APPDATA` — so the app can copy the real path rather than reproduce a default.
+
+```json
+{
+  "ok": true,
+  "version": 2,
+  "shell_version": "unknown",
+  "agents_version": "1.7.2",
+  "data_dir": "/Users/you/Library/Application Support/PraisonAI"
+}
+```
 
 ---
 
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Read the port, don't guess it">
-The kernel assigns a free port at bind time. Read it from the `PRAISONAI_PORT=` line or the lockfile — never hardcode one.
+<Accordion title="Read data_dir from /health, not the default">
+The path can be overridden by an environment variable. Ask `/health` for `data_dir` instead of assuming the platform default.
 </Accordion>
 
-<Accordion title="Confirm the version on /health">
-`version` distinguishes the engine from anything else that answers on the port. Check it before trusting the rest of the surface.
+<Accordion title="Stop by run id">
+`POST /train/stop/{run_id}` names the run to cancel, so a stale client cannot cancel a newer run. Always include the id.
 </Accordion>
 
-<Accordion title="Reconnect training with a cursor">
-`/train/progress` replays from `cursor` then follows. Store the last cursor you saw so a reconnect resumes exactly where it left off.
+<Accordion title="Reconnect with a cursor">
+`GET /train/progress` replays from `cursor=N`, so a dropped connection resumes without missing events. A malformed cursor returns `400`.
+</Accordion>
+
+<Accordion title="Treat a missing approval body as deny">
+`POST /approve/{approval_id}` defaults to deny when the body is absent or malformed — never rely on an empty body to allow.
 </Accordion>
 </AccordionGroup>
 
@@ -131,9 +150,15 @@ The kernel assigns a free port at bind time. Read it from the `PRAISONAI_PORT=` 
 
 <CardGroup cols={2}>
 <Card title="Fine-Tuning" icon="list-check" href="/features/desktop/fine-tune">
-The training subsystem the `/train/*` routes drive
+The `/train/*` routes in context
+</Card>
+<Card title="Environment Variables" icon="key" href="/features/desktop/environment-variables">
+What shifts `data_dir` and the secret store
+</Card>
+<Card title="Chat & Streaming" icon="comments" href="/features/desktop/chat">
+The `/chat` SSE stream
 </Card>
 <Card title="Data & Privacy" icon="lock" href="/features/desktop/data">
-Why the loopback socket is the whole boundary
+Why everything stays on loopback
 </Card>
 </CardGroup>
