@@ -5,29 +5,38 @@ description: "What each BootResult.reason renders on the crash screen, and when 
 icon: "bug"
 ---
 
-`createApp` returns a typed `BootResult`. A failure is a named `{ ok: false, reason, detail }`, and `mount()` renders it on the crash screen instead of leaving a blank or dead app. Every anticipated failure has a reason; a *thrown* failure is caught and given one too. A failure from a boot-time health probe also carries a `retryable` flag, so a caller can poll a still-starting engine instead of giving up.
+`createApp` returns a typed `BootResult`. A **permanent** failure is a named `{ ok: false, reason, detail }`, and `mount()` renders it on the crash screen. A **retryable** unreadiness no longer stops boot: the app starts, and the success branch carries a `notReady` field so the caller can say the engine is not answering yet. A *thrown* failure is still caught and named too.
 
 ```ts
 import { createApp, type BootResult } from "praisonai-mobile/app/boot";
 
 const booted: BootResult = await createApp(deps);
 if (!booted.ok) {
-  renderFatal(root, strings.bootFailed(booted.detail)); // reason + real detail
+  renderFatal(root, strings.bootFailed(booted.detail)); // permanent failure
+} else if (booted.notReady) {
+  render(strings.engineNotReady(booted.notReady.detail)); // booted, but warn
 }
 ```
 
-The failure branch carries an optional `retryable`, set only when a health probe refused an engine that might answer on a retry.
+Only a permanent unreadiness (`version_mismatch`) reaches the failure branch. A retryable unreadiness — a still-starting engine, an unreachable phone-to-desktop socket — is delivered as a *usable app plus an attached warning*, not a refusal.
 
 ```ts
 export type BootResult =
-  | { readonly ok: true; readonly app: App }
+  | {
+      readonly ok: true;
+      readonly app: App;
+      /** The app started, but the engine is not answering yet. A caller must
+       *  SAY so -- silently booting into an engine that cannot reply is how a
+       *  first message fails with no explanation. */
+      readonly notReady?: { readonly reason: string; readonly detail: string };
+    }
   | {
       readonly ok: false;
       readonly reason: string;
       readonly detail: string;
-      /** Set only when the failure came from a health probe that might
-       *  succeed on a retry -- a still-starting engine, a transient
-       *  transport error. A permanent refusal leaves it unset. */
+      /** Set when the failure is a health probe that might succeed on a retry.
+       *  In normal flow this is effectively always unset now -- retryable
+       *  outcomes take the SUCCESS branch with `notReady` instead. */
       readonly retryable?: boolean;
     };
 ```
@@ -35,20 +44,23 @@ export type BootResult =
 ```mermaid
 graph TB
     Create[🏭 createApp] --> Ok{ok?}
-    Ok -->|true| Mount[🖼️ mount the app]
+    Ok -->|"true, no notReady"| Mount[🖼️ mount clean]
+    Ok -->|"true, notReady set"| Warn[⚠️ mount + warning notice]
     Ok -->|false| Fatal[💥 crash screen]
-    Throw[⚠️ throw] --> BootOrFail[🛡️ bootOrFail]
+    Throw[💣 throw] --> BootOrFail[🛡️ bootOrFail]
     BootOrFail --> Fatal
 
     classDef create fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef branch fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef fail fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
 
     class Create create
     class Ok branch
     class Mount ok
-    class Throw,BootOrFail fail
+    class Warn warn
+    class Throw,BootOrFail warn
     class Fatal fail
 ```
 
@@ -66,14 +78,23 @@ if (!booted.ok) {
 ```
 </Step>
 
-<Step title="Handle a retryable boot failure">
-A health-probe failure with `retryable: true` — a still-starting engine or a transient transport error — is worth polling with backoff before giving up. A permanent refusal (a version mismatch) leaves `retryable` unset.
+<Step title="Handle an engine that isn't answering yet">
+A retryable unreadiness — a still-starting engine, an unreachable remote — no longer reaches the `!booted.ok` branch. The app booted; `booted.notReady` carries the reason so you can say so. Sending later retries it.
 
 ```ts
-if (!booted.ok && booted.retryable === true) {
-  // A still-starting engine or a transient transport error.
-  // Poll with backoff before giving up; a permanent refusal leaves retryable unset.
-  await schedulePoll(() => createApp(deps));
+if (booted.ok && booted.notReady) {
+  // The app is up. Say the engine is not ready; sending will retry.
+  render(strings.engineNotReady(booted.notReady.detail));
+}
+```
+</Step>
+
+<Step title="A permanent failure still stops boot">
+A `version_mismatch` — a build that cannot speak the server's protocol — never fixes itself on a retry, so it stays on the failure branch and reaches the crash screen.
+
+```ts
+if (!booted.ok && booted.reason === "version_mismatch") {
+  renderFatal(root, strings.bootFailed(booted.detail)); // waiting cannot help
 }
 ```
 </Step>
@@ -103,30 +124,39 @@ The fatal screen carries three properties, each pinned by a test.
 
 ---
 
-## Every `BootResult.reason`
+## Where each reason surfaces
 
-| `reason` | Source | When it fires | `retryable` |
-|----------|--------|---------------|-------------|
-| `unknown_engine` | `selectEngine` — no engine with that id, or an engine reporting a different id than it registered under | A settings `engineId` naming an engine that is not built | unset |
-| `protocol_mismatch` | `selectEngine` — the engine speaks a different `PROTOCOL_VERSION` than this build | An engine adapter upgraded out of step with the app | unset |
-| `storage_unavailable` | `bootOrFail` — a throw from `createApp`, caught and named | `SecurityError` (site data blocked) or `QuotaExceededError` at `settingsStore.load()` | unset |
-| `unhealthy` | `selectEngine` — probe classified a `200 {"ok": false}` response | Remote engine is up but reporting itself not ready (still binding, dependency down) | **`true`** |
-| `http_status` | `selectEngine` — probe got a non-200 (including 404, 5xx, and any sub-200) | Wrong `baseUrl`, endpoint not routed, proxy misconfigured | **`true`** |
-| `malformed` | `selectEngine` — probe reached something whose body is not our engine's shape | A captive portal, a proxy error page, a different service on the port | **`true`** |
-| `transport` | `selectEngine` — probe request or body read threw, aborted, or timed out after `PROBE_TIMEOUT_MS` (5s) | Engine unreachable, still binding its socket, or a hanging endpoint / black-hole proxy | **`true`** |
-| `version_mismatch` | `selectEngine` — probe response reported a `version` this build cannot speak | Server upgraded incompatibly | unset |
+Probe reasons split by whether a retry can help. Permanent ones refuse boot; retryable ones boot the app and attach `notReady`.
+
+### Permanent boot failures — surface via `!booted.ok`
+
+| `reason` | Source | When it fires |
+|----------|--------|---------------|
+| `unknown_engine` | `selectEngine` — no engine with that id, or an engine reporting a different id than it registered under | A settings `engineId` naming an engine that is not built |
+| `protocol_mismatch` | `selectEngine` — the engine speaks a different `PROTOCOL_VERSION` than this build | An engine adapter upgraded out of step with the app |
+| `storage_unavailable` | `bootOrFail` — a throw from `createApp`, caught and named | `SecurityError` (site data blocked) or `QuotaExceededError` at `settingsStore.load()` |
+| `version_mismatch` | `selectEngine` — probe response reported a `version` this build cannot speak | Server upgraded incompatibly — waiting cannot fix it |
+
+### Retryable unreadiness — surface via `booted.ok === true` with `booted.notReady`
+
+| `booted.notReady.reason` | Source | When it fires |
+|--------------------------|--------|---------------|
+| `unhealthy` | `selectEngine` — probe classified a `200 {"ok": false}` response | Remote engine is up but reporting itself not ready (still binding, dependency down) |
+| `http_status` | `selectEngine` — probe got a non-200 (including 404, 5xx, and any sub-200) | Wrong `baseUrl`, endpoint not routed, proxy misconfigured |
+| `malformed` | `selectEngine` — probe reached something whose body is not our engine's shape | A captive portal, a proxy error page, a different service on the port |
+| `transport` | `selectEngine` — probe request or body read threw, aborted, or timed out after `PROBE_TIMEOUT_MS` (5s) | Engine unreachable, still binding its socket, or a hanging endpoint / black-hole proxy |
 
 <Note>
-`unknown_engine` and `protocol_mismatch` are the two failures `selectEngine` *anticipates* without any I/O. The five probe reasons (`unhealthy`, `http_status`, `malformed`, `transport`, `version_mismatch`) come from the health probe running at selection. `storage_unavailable` is different in kind: it is a **throw** the boot never expected, turned into the same shape by `bootOrFail` so it renders the same way.
+`retryable` on the failure branch is now effectively always `false` (or unset), because retryable outcomes take the **success** branch with `notReady`. `unknown_engine` and `protocol_mismatch` are the two failures `selectEngine` *anticipates* without any I/O; `version_mismatch` is the one probe reason still permanent. `storage_unavailable` is different in kind: it is a **throw** the boot never expected, turned into the same shape by `bootOrFail` so it renders the same way.
 </Note>
 
 ---
 
 ## Boot-time health probe
 
-When an `EngineChoice` supplies a `probe`, `selectEngine` runs it *after* the cheap protocol check and refuses the engine here — with a named reason — rather than letting the failure surface as a mid-turn transport error on the user's first message.
+When an `EngineChoice` supplies a `probe`, `selectEngine` runs it *after* the cheap protocol check. A **retryable** probe result flows into the success branch with `notReady` and the engine is **kept**; only a **permanent** probe result flows into failure and disposes the engine.
 
-The probe reasons split on whether a retry can help. `unhealthy`, `http_status`, `malformed`, and `transport` all carry `retryable: true`: a still-starting engine, a transient socket error, or a proxy still routing is worth polling. Only `version_mismatch` is permanent — a build that cannot speak the server's protocol will not fix itself on a retry, so it leaves `retryable` unset.
+The probe reasons split on whether a retry can help. `unhealthy`, `http_status`, `malformed`, and `transport` all carry `retryable: true` — the engine is still handed to the app so a retry costs one tap, and the app renders a warning. Only `version_mismatch` is permanent and refuses boot with the engine disposed.
 
 ```mermaid
 graph TB
@@ -138,25 +168,60 @@ graph TB
     HasProbe -->|No| Ok[✅ engine offered]
     HasProbe -->|Yes| Ready{🔍 probe ready?}
     Ready -->|Yes| Ok
-    Ready -->|No| Refused[❌ unhealthy / http_status / malformed / transport / version_mismatch + retryable]
+    Ready -->|"No, retryable"| Attach[⚠️ ok:true + notReady — engine KEPT]
+    Ready -->|"No, permanent"| Refused[❌ version_mismatch]
     Refused --> Dispose[🧹 engine.dispose #40;no leaked socket#41;]
 
     classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef branch fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef fail fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef clean fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class Start start
     class Known,Proto,HasProbe,Ready branch
     class Ok ok
+    class Attach warn
     class Unknown,Mismatch,Refused fail
     class Dispose clean
 ```
 
 <Note>
-A refused probe **disposes** the engine before returning, exactly as a protocol mismatch does. The probe opened a socket to ask the question; leaving that engine holding it is a leak that only shows up as a second failure.
+A **permanently** refused probe (`version_mismatch`) disposes the engine before returning, exactly as a protocol mismatch does — the probe opened a socket, and leaving the engine holding it is a leak. A **retryably** refused probe **keeps** the engine, because it is the one the app will use once the remote comes up; disposing it would leave the app holding a dead engine it can never retry through.
 </Note>
+
+---
+
+## An unreachable engine boots with a warning
+
+Before PR #4672 a missing `/health` handler took the whole app down; now the app opens and points the user at Settings.
+
+```
+before:  no /health handler  →  "PraisonAI could not start: 404"   (dead app, no way in)
+after:   no /health handler  →  App opens; a warning row says the engine is not
+                                answering yet; the user can reach Settings.
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant App as Mobile App
+    participant Probe as Health Probe
+    participant Engine
+
+    User->>App: Launch app
+    App->>Probe: probeHealth(baseUrl)
+    Probe--xEngine: (unreachable)
+    Probe-->>App: { ready: false, reason: "transport", retryable: true }
+    App->>App: mount() + render "engine not answering" notice
+    App-->>User: App opens with warning banner
+    User->>App: Open Settings, fix baseUrl
+    User->>App: Type message, tap Send
+    App->>Engine: retry with new baseUrl
+    Engine-->>App: streams answer
+    App-->>User: answer in transcript
+```
 
 ---
 
