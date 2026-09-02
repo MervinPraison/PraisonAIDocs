@@ -249,6 +249,58 @@ For local development without a real AgentMail webhook, set `PRAISONAI_INSECURE_
 
 ---
 
+## Duplicate protection on retries
+
+`AgentMailBot` derives one stable AgentMail `Idempotency-Key` per outbound send and reuses it across every retry (the outbound resilience layer retries up to 3× by default). If a send succeeds on AgentMail but the client times out, the retry is deduplicated at the provider — the recipient gets exactly one email.
+
+```python
+import os
+import asyncio
+from praisonai.bots import AgentMailBot
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", instructions="Reply concisely")
+bot = AgentMailBot(token=os.getenv("AGENTMAIL_API_KEY"), agent=agent)
+
+# Default: a UUID is auto-generated per logical send
+asyncio.run(bot.send_message(
+    channel_id="user@example.com",
+    content={"subject": "Hi", "body": "hello"},
+))
+```
+
+Pass your own key when you need deterministic replay across process restarts — for example a key derived from a durable job or webhook id:
+
+```python
+# Advanced: reuse a stable key so a re-send is dedup'd by AgentMail
+await bot.send_message(
+    channel_id="user@example.com",
+    content={"subject": "Order confirmation", "body": "..."},
+    idempotency_key=f"order-{order_id}",   # 1–256 chars, honoured by AgentMail for 24h
+)
+```
+
+```mermaid
+sequenceDiagram
+    participant Agent as 🤖 Agent
+    participant Bot as 📧 AgentMailBot
+    participant AM as ☁️ AgentMail
+
+    Agent->>Bot: send_message(...)
+    Note over Bot: derive ONE Idempotency-Key
+    Bot->>AM: messages.send (Idempotency-Key: K)
+    AM--xBot: timeout (email already accepted)
+    Bot->>AM: retry (same Idempotency-Key: K)
+    AM-->>Bot: 200 (deduplicated — no second email)
+    Bot-->>Agent: BotMessage
+```
+
+<Note>
+The key is forwarded to AgentMail via the `Idempotency-Key` header. AgentMail honours it for 24 hours. Reuse the same key within that window to guarantee the send is dedup'd.
+</Note>
+
+---
+
 ## Inbox Lifecycle Management
 
 AgentMailBot implements the `EmailProtocol` from the core SDK, enabling programmatic inbox creation:
@@ -371,6 +423,16 @@ Both `EmailBot` and `AgentMailBot` share these capabilities:
 | `webhook_path` | `str` | `"/webhook"` | Webhook endpoint path |
 | `webhook_port` | `int` | `8080` | Webhook server port |
 | `polling_interval` | `float` | `1.0` | Seconds between polls |
+
+### `send_message` Options (AgentMail)
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `channel_id` | `str` | — | Recipient email address |
+| `content` | `str \| dict` | — | Body string, or `{"subject": ..., "body": ...}` |
+| `reply_to` | `str \| None` | `None` | Message-ID to reply to |
+| `thread_id` | `str \| None` | `None` | Thread ID for conversation tracking |
+| `idempotency_key` | `str \| None` | auto-generated UUID | Stable key forwarded as AgentMail's `Idempotency-Key` header. The same value is reused across retries of one logical send, so a timeout-after-send never duplicates the email. 1–256 chars; 24h key lifetime per AgentMail. |
 
 ---
 
