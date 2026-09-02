@@ -29,6 +29,12 @@ graph LR
 
 ## Quick Start
 
+The `redis` backend needs the async Redis client:
+
+```bash
+pip install "praisonai-bot[redis]"   # or: pip install redis
+```
+
 <Steps>
 
 <Step title="Single replica — already correct, no config">
@@ -47,7 +53,7 @@ WebSocketGateway(agent=agent).start()   # turn_lock backend defaults to "local"
 
 <Step title="Multiple replicas — switch the backend to redis">
 
-Scaling to `replicas > 1` needs a distributed lease so two pods can't run one session's turns at once.
+Two or more gateway processes sharing a session need a distributed lease so two pods can't run one session's turns at once.
 
 ```python
 from praisonaiagents import Agent
@@ -74,7 +80,7 @@ gateway:
   turn_lock:
     backend: redis   # local | redis
     ttl: 60          # lease TTL in seconds
-    # url: redis://...   # optional; falls back to gateway's RedisConfig
+    # url: redis://...   # optional; overrides the gateway's RedisConfig
 ```
 
 </Step>
@@ -85,34 +91,88 @@ gateway:
 
 ## How It Works
 
-The gateway holds a lease keyed on the resolved session id for the whole turn; a second replica blocks until the first releases, and a crashed holder's lease expires after `ttl` so a healthy session is never wedged.
+The lock is `LockMap`-compatible: one `.get(session_id)` call returns an async context manager that holds a cluster-wide lease for the whole `async with` block, and a crashed holder's lease expires after `ttl` so a healthy session is never wedged.
 
 ```mermaid
 sequenceDiagram
     participant A as Replica A
     participant B as Replica B
-    participant Lease as Turn Lease<br/>(session:alice)
+    participant Redis as Redis<br/>(lease: session:alice)
 
-    A->>Lease: acquire(key, owner=A, ttl)
-    Lease-->>A: TurnLeaseToken
-    Note over A: Turn 1 runs on shared transcript
-    B->>Lease: acquire(key, owner=B, ttl)
-    Note over B: blocks — lease held by A
-    A->>Lease: release(token)
-    Lease-->>B: TurnLeaseToken
+    A->>Redis: SET NX PX (owner=A, ttl)
+    Redis-->>A: OK — lease acquired
+    Note over A: Turn 1 runs; lease renews at ~ttl/3
+    B->>Redis: SET NX PX (owner=B, ttl)
+    Redis-->>B: nil — held by A (polls until free)
+    A->>Redis: compare-and-del(owner=A)
+    Redis-->>A: released
+    B->>Redis: SET NX PX (owner=B, ttl)
+    Redis-->>B: OK — lease acquired
     Note over B: Turn 2 runs in order
 
-    Note over A,Lease: A crashes mid-turn?<br/>lease expires after ttl → B proceeds (fail-open)
+    Note over A,Redis: A crashes mid-turn?<br/>renewal stops → lease expires after ttl → B proceeds (fail-open)
 ```
 
 | Piece | Owner | Role |
 |---|---|---|
-| `TurnLockConfig` | Core config | Selects `local` or `redis`; wired as `turn_lock=…` |
-| `TurnLockProtocol` | Core (pure) | Async `acquire` / `release` / `hold` contract |
-| `LocalTurnLock` | Core (pure) | In-process default — today's `asyncio.Lock`, byte-for-byte |
-| `TurnLeaseToken` | Core (pure) | Opaque `key` / `owner` / `expires_at` handle for identity-checked release |
+| `TurnLockConfig` | Core (`praisonaiagents.gateway`) | Selects `local` or `redis`; wired as `turn_lock=…` on `GatewayConfig` |
+| `build_turn_lock` | Wrapper (`praisonai_bot.bots._redis_turn_lock`) | Factory that picks the backend from `TurnLockConfig` + the gateway's `RedisConfig`; fails **open** to a local lock (and records a degraded entry) if Redis is unreachable |
+| `RedisTurnLock` | Wrapper (`praisonai_bot.bots._redis_turn_lock`) | Distributed, `LockMap`-compatible lock — `.get(key)` returns an async context manager holding a cluster-wide lease keyed on the resolved session id. Auto-renews at ~`ttl/3`; releases with an owner-checked compare-and-del |
+| `LockMap` (default) | Wrapper (`praisonai_bot._lockmap`) | In-process default — today's `asyncio.Lock`, byte-for-byte |
 
-Release is identity-checked and idempotent: only the exact token handed out may release the lease, so a stale token never frees another owner's turn.
+Release is owner-checked and idempotent: only the exact owner token that claimed the lease may release it, so an expired or reclaimed lease is a harmless no-op, never another replica's lease.
+
+---
+
+## Fail-open on Redis outage
+
+A live turn is never blocked by Redis being down — the lock degrades to a local `asyncio.Lock` for that turn and records a degraded capability you find later.
+
+```mermaid
+graph LR
+    Turn[📥 Inbound turn] --> Try{Redis<br/>reachable?}
+    Try -->|yes| Cluster[🔒 Cluster-wide lease<br/>SET NX PX]
+    Try -->|no| Local[🔒 Local asyncio.Lock<br/>+ record degraded capability]
+    Cluster --> Run[🤖 Turn runs]
+    Local --> Run
+
+    classDef inbound fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef degraded fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef run fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Turn inbound
+    class Try q
+    class Cluster ok
+    class Local degraded
+    class Run run
+```
+
+<Warning>
+A live turn is never blocked by Redis being down; you find out via `praisonai gateway doctor`.
+</Warning>
+
+While degraded, turns serialise per-process only (cross-replica ordering pauses until Redis recovers). The lock records a degraded capability entry (`owner_kind="capability"`, `owner_id="turn_lock:redis"`) and clears it automatically on the first successful reconnect.
+
+---
+
+## Health & observability
+
+The fail-open behaviour surfaces through the same tools that report every other degraded gateway capability.
+
+- `praisonai gateway doctor` — lists the `capability` / `turn_lock:redis` degraded owner with a redacted reason.
+- Gateway `health()` / `/health` — the same degraded entry, machine-readable.
+- Logs — a `WARNING: Distributed turn lock degraded to local-only (Redis unavailable): …` on the first outage.
+
+<CardGroup cols={2}>
+<Card title="Extensible Doctor" icon="plug" href="/features/extensible-doctor">
+  How `praisonai gateway doctor` reports degraded capabilities.
+</Card>
+<Card title="Gateway Liveness" icon="heart-pulse" href="/features/gateway-liveness">
+  Companion health signal — reap half-open connections.
+</Card>
+</CardGroup>
 
 ---
 
@@ -123,25 +183,34 @@ Release is identity-checked and idempotent: only the exact token handed out may 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `backend` | `str` | `"local"` | `"local"` (in-process `asyncio.Lock`) or `"redis"` (distributed lease, cluster-wide serialisation). Any other value raises `ValueError`. |
-| `ttl` | `float` | `60.0` | Lease TTL in seconds for a distributed backend — how long a crashed holder's lease survives before it is reclaimable. Inert for `"local"`. Rejects `<= 0` and `NaN`. |
-| `url` | `Optional[str]` | `None` | Optional Redis URL for the `"redis"` backend. When omitted the distributed lock reuses the gateway's configured `RedisConfig`. Redacted (`"***"`) in `to_dict()`. |
+| `ttl` | `float` | `60.0` | Lease TTL in seconds for the `"redis"` backend — how long a crashed holder's lease survives before it is reclaimable. The lease auto-renews at ~`ttl/3` while a turn runs. Inert for `"local"`. Rejects `<= 0`. |
+| `url` | `Optional[str]` | `None` | Optional Redis URL for the `"redis"` backend. When set, overrides `RedisConfig`; when omitted, reuses the gateway's `RedisConfig`. Redacted (`"***"`) in `to_dict()`. |
 
 The `enabled` property returns `True` only when a distributed backend is selected (`backend != "local"`).
 
-<Card icon="code" href="/sdk/reference/praisonaiagents/modules/feature_configs">
-  Full field, type, and default reference for `TurnLockConfig`, `TurnLockProtocol`, `LocalTurnLock`, and `TurnLeaseToken`
+<Note>
+Lease keys are namespaced as `{RedisConfig.prefix}turnlock:{session_id}`, defaulting to `praison:turnlock:` when no prefix is set. Operators sharing one Redis across environments should set distinct `RedisConfig.prefix` values so leases never collide.
+</Note>
+
+<CardGroup cols={2}>
+<Card title="TurnLockConfig Reference" icon="code" href="/sdk/reference/praisonaiagents/classes/TurnLockConfig">
+  Full field, type, and default reference for `TurnLockConfig`.
 </Card>
+<Card title="GatewayConfig Reference" icon="code" href="/sdk/reference/praisonaiagents/classes/GatewayConfig">
+  The parent config that wires `turn_lock` into the gateway.
+</Card>
+</CardGroup>
 
 ---
 
 ## When to Enable
 
-Match the backend to your replica count.
+Enable `redis` whenever more than one gateway process can share a session — replica count alone decides it.
 
 ```mermaid
 graph TB
-    Start{How many gateway<br/>replicas?} -->|replicas == 1| Local[backend='local'<br/>default, no config]
-    Start -->|replicas > 1| Redis[backend='redis'<br/>cluster-wide lease]
+    Start{More than one<br/>gateway process<br/>sharing a session?} -->|no| Local[backend='local'<br/>default, no config]
+    Start -->|yes — replicas &gt; 1<br/>or multi-instance| Redis[backend='redis'<br/>cluster-wide lease]
 
     classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef off fill:#7C90A0,stroke:#7C90A0,color:#fff
@@ -152,11 +221,13 @@ graph TB
     class Redis opt
 ```
 
+You need `backend: 'redis'` whenever more than one gateway process shares a session — with **or** without an identity resolver. A single-adapter deployment with `replicas > 1` still wires the distributed backend.
+
 ---
 
 ## Backward Compatibility
 
-`local` is the default and reproduces today's in-process `asyncio.Lock` byte-for-byte — single-replica deployments are unchanged and the core protocol adds no new dependency.
+`local` is the default and reproduces today's in-process `asyncio.Lock` byte-for-byte — single-replica deployments are unchanged and add no new dependency.
 
 ---
 
@@ -164,16 +235,16 @@ graph TB
 
 <AccordionGroup>
 
-<Accordion title="Size ttl to outlast your slowest turn">
-The lease must survive the longest legitimate turn, or a slow turn's lease expires and a second replica starts a concurrent turn. Keep it short enough that a crashed replica unblocks quickly — the default `60.0` suits most turns.
+<Accordion title="Size ttl to survive one Redis blip; renewal covers long turns">
+The lease auto-renews at ~`ttl/3` while a turn runs, so a turn longer than `ttl` never lets another replica claim the same session. Size `ttl` to survive a brief Redis blip, not your slowest turn — the default `60.0` suits most deployments.
 </Accordion>
 
 <Accordion title="Reuse the gateway's RedisConfig unless you need a separate store">
-Leave `url` unset and the distributed lock reuses the gateway's configured `RedisConfig`. Set `url` only when the lock lives on a different Redis than push/delivery.
+Leave `url` unset and the distributed lock reuses the gateway's configured `RedisConfig`. Set `url` only when the lock lives on a different Redis than push/delivery — when both are set, `url` wins.
 </Accordion>
 
-<Accordion title="Monitor lease expiries">
-A lease that expires mid-turn means `ttl` is too short for real traffic. Watch for expiry-then-reacquire on the same session and raise `ttl` if you see it.
+<Accordion title="Watch the doctor for a degraded turn lock">
+On a Redis outage the lock fails open and records a `turn_lock:redis` degraded capability. Check `praisonai gateway doctor` or `/health` — a persistent entry means cross-replica ordering is paused until Redis recovers.
 </Accordion>
 
 <Accordion title="Enable it before you scale, not after">
@@ -187,6 +258,12 @@ Flip `backend='redis'` before raising `replicaCount`. Scaling first leaves a win
 ## Related
 
 <CardGroup cols={2}>
+<Card title="Gateway Durability" icon="database" href="/features/gateway-durability">
+  The wider "never lose or double-run a turn" story this fits into.
+</Card>
+<Card title="Gateway Degraded Channels" icon="triangle-alert" href="/features/gateway-degraded-channels">
+  The symmetric fail-open pattern for a degraded delivery channel.
+</Card>
 <Card title="Cross-Platform Sessions" icon="users" href="/features/cross-platform-mirror">
   The in-process turn lock this extends across replicas.
 </Card>
@@ -195,9 +272,6 @@ Flip `backend='redis'` before raising `replicaCount`. Scaling first leaves a win
 </Card>
 <Card title="Gateway Admission Control" icon="gauge-high" href="/features/gateway-admission-control">
   Sibling robustness knob — concurrency ceiling and backpressure.
-</Card>
-<Card title="Gateway Liveness" icon="heart-pulse" href="/features/gateway-liveness">
-  Sibling robustness knob — reap half-open connections.
 </Card>
 <Card title="Gateway Turn Executor" icon="shield" href="/features/gateway-turn-executor">
   Sibling robustness knob — place a session's turn on its own worker.
