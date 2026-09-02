@@ -78,14 +78,37 @@ export interface RegistryDeps {
 ```
 </Step>
 
-<Step title="enginesFor passes persistence to the in-process engine only">
-The remote engine deliberately does not receive it.
+<Step title="An EngineChoice can carry a probe">
+`create` builds the engine; the optional `probe` answers whether the thing it talks to is ready. The in-process engine has no remote to probe, so it supplies none.
+
+```ts
+export interface EngineChoice {
+  readonly id: string;
+  readonly create: () => AgentEnginePort | Promise<AgentEnginePort>;
+  /** Is the thing this engine talks to actually ready to answer?
+   *  Optional — the in-process engine has no remote to probe. When
+   *  present it runs at selection, so a remote that answers 200 with
+   *  `{"ok": false}` is refused at boot with a name rather than
+   *  surfacing as a transport error mid-turn. */
+  readonly probe?: () => Promise<Readiness>;
+}
+```
+</Step>
+
+<Step title="enginesFor wires a probe and passes persistence to in-process only">
+The remote-http choice supplies a `probe`; the remote engine deliberately does not receive `persistence`. `baseUrl` is computed **once** and shared between `create` and `probe`, so the probe hits the same address the user configured.
 
 ```ts
 export function enginesFor(deps: RegistryDeps): readonly EngineChoice[] {
+  const baseUrl = stringSetting(deps.settings, "baseUrl", "http://127.0.0.1:8765").replace(/\/+$/, "");
   const choices: EngineChoice[] = [
-    { id: ENGINE_REMOTE_HTTP, create: () => createRemoteHttpEngine({ ... }) },
+    {
+      id: ENGINE_REMOTE_HTTP,
+      create: () => createRemoteHttpEngine({ baseUrl, http: deps.http, id: ENGINE_REMOTE_HTTP }),
+      probe: () => probeHealth(deps.http, baseUrl),
+    },
   ];
+  // in-process engine (no probe — it IS the device)
   if (deps.createInProcess !== undefined) {
     const build = deps.createInProcess;
     choices.push({ id: ENGINE_PRAISONAI_TS, create: () => build(deps.persistence) });
@@ -93,6 +116,8 @@ export function enginesFor(deps: RegistryDeps): readonly EngineChoice[] {
   return choices;
 }
 ```
+
+Sharing the single `baseUrl` is pinned by `"enginesFor's probe targets the configured engine address"`.
 </Step>
 
 <Step title="Build engines from the session">
@@ -179,6 +204,36 @@ A missing `ok` must never be mistaken for a present healthy one: `{ok: "true"}` 
 <Note>
 **Unhealthy is retryable.** An `unhealthy` verdict carries `retryable: true`. An engine still binding its socket must remain worth polling; declaring it permanently dead strands the user until they restart the app. Pinned by `"an unhealthy engine is worth retrying"`, with `"a healthy engine IS ready - the pair"` as its companion.
 </Note>
+
+<Note>
+**The probe now actually runs at boot.** These readiness rules are no longer hypothetical: `enginesFor` wires `probe: () => probeHealth(deps.http, baseUrl)` on the remote-http choice, and `selectEngine` calls it before the engine is offered. A `200 {"ok": false}`, a non-200, or an unreachable engine is refused at boot with a named reason — see [Boot Failures → Boot-time health probe](/features/mobile/boot-failures#boot-time-health-probe).
+</Note>
+
+### Probe timeout
+
+The probe runs *before* the app mounts, so a request or body read that never completes must abort on a deadline rather than pin `createApp` on a blank screen.
+
+```ts
+export const PROBE_TIMEOUT_MS = 5000;
+
+// Bounded by timeoutMs; a request or body read that never completes
+// aborts on the deadline and classifies as retryable transport.
+await probeHealth(http, baseUrl, token, PROBE_TIMEOUT_MS);
+```
+
+A single `AbortController` covers both the request **and** the body read, so an endpoint that accepts the socket but never sends the response — a still-binding engine, a black-hole proxy — aborts on the deadline. A timeout classifies as retryable `transport`, exactly the case worth polling.
+
+### Order of checks in `selectEngine`
+
+A probe opens a socket, so it must not run for an engine this build cannot even speak to. The checks run in order, cheapest first.
+
+| Step | Check | Failure |
+|------|-------|---------|
+| 1 | Is `id` known? | `unknown_engine` |
+| 2 | Does `protocolVersion` match? | `protocol_mismatch` |
+| 3 | Does the probe (if any) return `ready: true`? | `unhealthy` / `http_status` / `malformed` / `transport` / `version_mismatch` — engine is disposed |
+
+That step 3 does not run when step 2 fails is pinned by `"selectEngine runs the probe only after the protocol check passes"`.
 
 <Warning>
 **The verdict `reason` is load-bearing, not just `ready`.** Readers of `classify()` route the UI on `reason: "unhealthy"` versus `reason: "version_mismatch"` — the two lead to different recovery arms (retry vs. a version-mismatch boot failure). Asserting only `ready` is what let a test hold for the wrong reason in [#4606](https://github.com/MervinPraison/PraisonAI/pull/4606); always assert the reason too. Pinned by `"a missing ok field is not read as healthy"`. The `unhealthy → retry` recovery arm is described in [Errors & Recovery](/features/mobile/errors-and-recovery).
@@ -507,5 +562,8 @@ The 11 events every engine speaks.
 </Card>
 <Card title="Dropped Events" icon="triangle-exclamation" href="/features/mobile/dropped-events">
 Where a refused frame lands via onIgnored.
+</Card>
+<Card title="Boot Failures" icon="bug" href="/features/mobile/boot-failures">
+Where a failed probe becomes a named, retryable boot failure.
 </Card>
 </CardGroup>
