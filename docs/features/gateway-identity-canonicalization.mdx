@@ -55,7 +55,52 @@ class MyPlatformCanonicalizer:
 assert isinstance(MyPlatformCanonicalizer(), IdentityCanonicalizerProtocol)
 ```
 </Step>
+
+<Step title="Wire it into the session for any platform">
+Canonicalization runs at the **general** session-key path (`BotSessionManager._storage_key()`), so every platform benefits — not just WhatsApp. Inject a canonicalizer at runtime through `GatewayRuntimeSeams`.
+
+```python
+from praisonaiagents.bots import GatewayRuntimeSeams
+from praisonai_bot.bots._session import BotSessionManager
+
+session = BotSessionManager(platform="myplatform")
+session.attach_gateway_runtime(
+    GatewayRuntimeSeams(identity_canonicalizer=MyPlatformCanonicalizer())
+)
+```
+</Step>
+
+<Step title="Use the adapter as its own canonicalizer">
+`BasePlatformAdapter` now ships a default `canonicalize()` (identity function), so any adapter structurally **is** an `IdentityCanonicalizerProtocol`. Override it to reconcile alias formats, then hand the adapter itself to `identity_canonicalizer=`.
+
+```python
+from praisonaiagents.bots import BasePlatformAdapter
+from praisonaiagents.gateway import IdentityCanonicalizerProtocol
+from praisonai_bot.bots._session import BotSessionManager
+
+
+class MyPlatformAdapter(BasePlatformAdapter):
+    def canonicalize(self, platform: str, raw_user_id: str) -> str:
+        # override to reconcile alias formats; default is identity
+        return self._alias_map.get(raw_user_id, raw_user_id)
+
+
+# A vanilla BasePlatformAdapter subclass is already a valid canonicalizer.
+adapter = MyPlatformAdapter()
+assert isinstance(adapter, IdentityCanonicalizerProtocol)
+
+# Pass the adapter itself where the protocol is accepted.
+session = BotSessionManager(
+    platform="myplatform",
+    identity_canonicalizer=adapter,
+)
+```
+</Step>
 </Steps>
+
+<Note>
+When no `identity_canonicalizer` is wired, behaviour is byte-for-byte unchanged — the raw platform id keys the session exactly as before.
+</Note>
 
 ---
 
@@ -82,6 +127,26 @@ The contract is deliberately small and safe:
 - **Deterministic.** The same input always maps to the same output.
 - **Fail-open.** An unknown address returns unchanged, so a missing mapping is never worse than passing the raw id through. With no canonicalizer registered, resolution is unchanged.
 - **First in line.** It runs before any key is derived, so the allowlist and session see the reconciled id — not the raw one.
+
+### Order of operations in `_storage_key()`
+
+The session-key path stabilises the id first, then resolves it:
+
+1. `canonical_user_id = self._canonical_user_id(user_id)` — runs first, fail-open on error/empty.
+2. `base = identity_resolver.resolve(platform, canonical_user_id)` — runs on the stabilised id.
+3. `base` becomes the session key.
+
+```mermaid
+sequenceDiagram
+    participant Wire as Platform wire
+    participant Canon as identity_canonicalizer
+    participant Resolver as identity_resolver
+    participant Key as _storage_key
+
+    Wire->>Canon: canonicalize(platform, raw_user_id)
+    Canon-->>Resolver: canonical_user_id (fail-open on error)
+    Resolver-->>Key: unified session id
+```
 
 ### WhatsApp implementation
 
@@ -112,6 +177,34 @@ from praisonaiagents.gateway import IdentityCanonicalizerProtocol
 | `canonicalize` | `canonicalize(platform: str, raw_user_id: str) -> str` | Deterministic; MUST return `raw_user_id` unchanged when no reconciliation is known (fail-open). |
 
 `IdentityCanonicalizerProtocol` is a `@runtime_checkable` `Protocol`, so any object with a matching `canonicalize` method satisfies `isinstance(...)` without subclassing.
+
+`BasePlatformAdapter` now provides a default `canonicalize()` that returns the raw id unchanged (identity function). Any subclass therefore satisfies the protocol without an override — override only to add real reconciliation.
+
+---
+
+## Wiring
+
+Two entry points on `BotSessionManager` inject a canonicalizer.
+
+| Entry point | Call | When |
+|-------------|------|------|
+| Constructor arg | `BotSessionManager(..., identity_canonicalizer=...)` | Wire at build time. |
+| Runtime injection | `mgr.attach_gateway_runtime(GatewayRuntimeSeams(identity_canonicalizer=...))` | Wire (or replace) at runtime. |
+
+When both a canonicalizer and an `identity_resolver` are wired, the canonicalizer **always runs first** — the resolver sees the stabilised id.
+
+**Fail-open contract:** any exception or empty result (`""`, `None`, or a non-string) falls back to the raw id. The failure is logged at `warning` level and never breaks session keying.
+
+```python
+from praisonaiagents.bots import GatewayRuntimeSeams
+from praisonai_bot.bots._session import BotSessionManager
+
+# Constructor
+session = BotSessionManager(platform="myplatform", identity_canonicalizer=canon)
+
+# Runtime
+session.attach_gateway_runtime(GatewayRuntimeSeams(identity_canonicalizer=canon))
+```
 
 ---
 
@@ -176,6 +269,10 @@ Validate the shape of both addresses before storing a mapping. Reject group, cro
 
 <Accordion title="Keep canonicalize deterministic">
 The same raw id must always map to the same canonical id within a process. Non-deterministic output splits sessions and breaks allowlist matches.
+</Accordion>
+
+<Accordion title="The adapter is a canonicalizer by default">
+Because `BasePlatformAdapter.canonicalize()` exists, hand the adapter itself to `identity_canonicalizer=` instead of writing a separate class — do this when the alias mapping already lives on the adapter.
 </Accordion>
 </AccordionGroup>
 
