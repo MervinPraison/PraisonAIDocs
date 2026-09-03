@@ -143,6 +143,171 @@ Each language maps to a default server, its file extensions, and the root marker
 
 ---
 
+## Adding or Overriding a Language Server
+
+Register a new language or swap a built-in server by passing `servers=` — no package source edits needed.
+
+```python
+import asyncio
+from praisonaiagents.lsp import LSPClient
+
+# Register Java once; the LSP layer honours the extension, root markers,
+# install hint, and initialization options from this entry.
+JAVA_SERVERS = {
+    "java": {
+        "command": "jdtls",
+        "args": ["--stdio"],
+        "extensions": [".java"],
+        "root_markers": ["pom.xml", ".git"],
+        "install_hint": "install eclipse.jdt.ls",
+    }
+}
+
+client = LSPClient(language="java", servers=JAVA_SERVERS)
+started = asyncio.run(client.start())
+if not started:
+    print(client.last_error)
+    # "language server `jdtls` not found on PATH; install with `install eclipse.jdt.ls`"
+```
+
+<Note>
+The `Agent(tools=[lsp_*])` path spawns its own `LSPClient` and does **not** forward a `servers=` mapping today. Register custom languages with the direct-client pattern shown here — `LSPClient(language=..., servers=...)`.
+</Note>
+
+```mermaid
+graph TB
+    Req[Agent asks for language X] --> Merge[resolve_servers - merge user over DEFAULT_SERVERS]
+    Merge --> Q{X in merged registry?}
+    Q -->|Yes, built-in| BuiltIn[Use DEFAULT_SERVERS entry]
+    Q -->|Yes, user override| Over[Use user entry - args dropped if command replaced]
+    Q -->|Yes, new language| New[Use user entry as-is]
+    Q -->|No| Raise[ValueError: No default server for language X]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Req input
+    class Merge,Q process
+    class BuiltIn,Over,New ok
+    class Raise warn
+```
+
+### Four Ways to Configure
+
+<Tabs>
+<Tab title="Add a language">
+
+```python
+from praisonaiagents.lsp import LSPClient
+
+LSPClient(language="java", servers={
+    "java": {
+        "command": "jdtls",
+        "args": ["--stdio"],
+        "extensions": [".java"],
+        "root_markers": ["pom.xml"],
+    }
+})
+```
+
+</Tab>
+<Tab title="Override a built-in">
+
+```python
+from praisonaiagents.lsp import LSPClient
+
+# Swap the Python server for Pyright.
+LSPClient(language="python", servers={
+    "python": {"command": "pyright-langserver", "args": ["--stdio"]}
+})
+# Extensions, root markers, and install hint fall back to the built-in `python` row.
+```
+
+</Tab>
+<Tab title="With init options">
+
+```python
+from praisonaiagents.lsp import LSPClient
+
+# `initialization_options` are picked up automatically when you don't pass your own.
+LSPClient(language="java", servers={
+    "java": {
+        "command": "jdtls",
+        "args": ["--stdio"],
+        "extensions": [".java"],
+        "root_markers": ["pom.xml"],
+        "initialization_options": {"bundles": []},
+    }
+})
+```
+
+</Tab>
+<Tab title="Compose the registry">
+
+```python
+from praisonaiagents.lsp import resolve_servers
+
+merged = resolve_servers({
+    "java": {"command": "jdtls", "args": ["--stdio"], "extensions": [".java"]}
+})
+merged["python"]["command"]   # → "pylsp"   (built-in kept)
+merged["java"]["command"]     # → "jdtls"   (added)
+```
+
+</Tab>
+</Tabs>
+
+### How the Merge Works
+
+User entries override built-ins per language key; unset fields fall back to the built-in row.
+
+| Scenario | What the merge does |
+|---|---|
+| No user config (`None` or `{}`) | Returns `DEFAULT_SERVERS` unchanged (identity return) |
+| New language key (e.g. `"java"`) | Added to the merged registry; built-ins untouched |
+| Same key, `command` differs, no `args` given | Built-in `args` are dropped (never leaked to a replacement binary) |
+| Same key, `command` same, other fields changed | Built-in `args` retained; other fields updated |
+| Non-dict user entry (`{"bogus": "not-a-dict"}`) | Silently ignored |
+
+`DEFAULT_SERVERS` is never mutated by a merge — `resolve_servers({...})` always returns a fresh dict.
+
+### Which Configuration Style?
+
+```mermaid
+graph TB
+    Start[I need a different server] --> Q1{Language shipped by default?}
+    Q1 -->|No, brand new| Add[Add a new key with servers=]
+    Q1 -->|Yes, wrong binary| Q2{Keep the built-in metadata?}
+    Q2 -->|Yes, just swap command| Over[Override command only - args reset]
+    Q2 -->|No, full control| Full[Provide command, args, extensions, root_markers]
+    Start --> Q3{Need the merged dict directly?}
+    Q3 -->|Yes| Compose[Call resolve_servers to inspect]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef choice fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1,Q2,Q3 choice
+    class Add,Over,Full,Compose result
+```
+
+### User Interaction Flow
+
+A registered language behaves exactly like a built-in one.
+
+> **User:** "Where is `AuthService.login` defined in this Maven repo?"
+>
+> **Agent** uses a Java LSP client registered via `servers=`, which finds the nearest `pom.xml` for the root and queries `jdtls`.
+>
+> **Tool returns:** `src/main/java/com/acme/AuthService.java:42:5`
+>
+> **Agent replies:** "`AuthService.login` is defined in `src/main/java/com/acme/AuthService.java` at line 42."
+
+---
+
 ## Which Helper Should I Use?
 
 ```mermaid
@@ -172,12 +337,13 @@ These are pure helpers plus one new keyword and one new attribute on `LSPClient`
 
 | Symbol | Kind | Import path | Returns | Notes |
 |---|---|---|---|---|
-| `detect_language(file_path)` | function | `from praisonaiagents.lsp import detect_language` | `Optional[str]` | Case-insensitive extension lookup; `None` for unknown extensions |
-| `detect_root_uri(file_path, language=None)` | function | `from praisonaiagents.lsp import detect_root_uri` | `Optional[str]` | Walks up from the file; nearest matching marker wins; `None` if none found |
-| `probe(language)` | function | `from praisonaiagents.lsp import probe` | `Tuple[bool, Optional[str], Optional[str]]` | `(available, command, install_hint)` |
+| `detect_language(file_path, servers=None)` | function | `from praisonaiagents.lsp import detect_language` | `Optional[str]` | Case-insensitive extension lookup; honours custom extensions from `servers`; `None` for unknown extensions |
+| `detect_root_uri(file_path, language=None, servers=None)` | function | `from praisonaiagents.lsp import detect_root_uri` | `Optional[str]` | Walks up from the file; honours custom root markers from `servers`; nearest match wins; `None` if none found |
+| `probe(language, servers=None)` | function | `from praisonaiagents.lsp import probe` | `Tuple[bool, Optional[str], Optional[str]]` | `(available, command, install_hint)`; honours custom install hints from `servers` |
+| `resolve_servers(user_servers=None)` | function | `from praisonaiagents.lsp import resolve_servers` | `Dict[str, Dict]` | Merges user servers over `DEFAULT_SERVERS`; identity return when input is falsy |
 | `path_to_uri(path)` | function | `from praisonaiagents.lsp.config import path_to_uri` | `str` | Percent-encodes spaces, `#`, and other reserved characters |
 | `DEFAULT_SERVERS` | constant | `from praisonaiagents.lsp import DEFAULT_SERVERS` | `Dict[str, Dict]` | Rows contain `command`, `args`, `extensions`, `root_markers`, `install_hint` |
-| `LSPClient(..., workspace_file=None)` | class | `from praisonaiagents.lsp import LSPClient` | — | When `root_uri` is not given, root is auto-detected from `workspace_file` |
+| `LSPClient(..., workspace_file=None, servers=None)` | class | `from praisonaiagents.lsp import LSPClient` | — | Root auto-detected from `workspace_file`; `servers=` threads a custom registry through detect / probe / start |
 | `LSPClient.last_error` | attribute | (on any client) | `Optional[str]` | Structured "not found on PATH" message; `None` on success |
 
 ---
@@ -236,6 +402,21 @@ Error text like `install with \`...\`` is for humans. For machine-readable data,
 <Accordion title="Treat the 'not found on PATH' note as a call to action">
 
 The `edit_tools` note appears once per language per run. When you see it, install the server rather than ignore the diagnostic signal for the rest of the session.
+
+</Accordion>
+<Accordion title="Pin the server your team uses">
+
+Define a `servers=` mapping in your project bootstrap and pass it to every `LSPClient`, so contributors get the same server without installing an alternative. New teammates inherit the choice instead of debugging a mismatch.
+
+</Accordion>
+<Accordion title="Set install_hint for internal tooling">
+
+When you register a private or in-house server, include `install_hint`. It flows into `client.last_error` so a teammate missing the binary sees exactly how to install it.
+
+</Accordion>
+<Accordion title="Provide initialization_options in the registry">
+
+Put server-specific tuning in the registry entry's `initialization_options`. It is auto-picked when the caller didn't set its own — cleaner than passing the same options to every client.
 
 </Accordion>
 </AccordionGroup>
