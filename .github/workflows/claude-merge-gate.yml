@@ -1,7 +1,6 @@
 name: Claude PR Merge Gate
 
-# Read-only Claude assesses merge readiness; GH_TOKEN merges (no @claude, no gh pr review).
-# Does not overlap with merge-conflict-claude.yml or auto-pr-comment @claude chains.
+# App installation token for API calls; separate rate limit from user PAT.
 
 on:
   schedule:
@@ -36,7 +35,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
   MAX_CANDIDATES: 8
   DISPATCH_PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.client_payload.pr_number || '' }}
 
@@ -55,26 +53,28 @@ jobs:
       pull-requests: read
       issues: read
       actions: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Dispatch merge gate when PR pipeline is ready
         uses: actions/github-script@v7
-        env:
-          PAT: ${{ secrets.GH_TOKEN }}
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const path = require('path');
             const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
             const wr = context.payload.workflow_run;
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-
-            if (!process.env.PAT) {
-              core.setFailed('GH_TOKEN secret is required for merge gate auto-dispatch (needs repo + workflow scope).');
-              return;
-            }
 
             if (wr.conclusion !== 'success') {
               core.info(`Skip dispatch: ${wr.name} conclusion=${wr.conclusion}`);
@@ -104,6 +104,10 @@ jobs:
               return;
             }
 
+            if (await mergeGate.shouldSkipMergeGateDispatch(github, owner, repo, prNumber, core)) {
+              return;
+            }
+
             await github.rest.repos.createDispatchEvent({
               owner,
               repo,
@@ -120,17 +124,26 @@ jobs:
       pull-requests: read
       issues: write
       actions: read
+      id-token: write
     outputs:
       matrix: ${{ steps.scan.outputs.matrix }}
       has_candidates: ${{ steps.scan.outputs.has_candidates }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
       - name: Scan open PRs for merge gate eligibility
         id: scan
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const path = require('path');
             const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
@@ -184,14 +197,21 @@ jobs:
                 '**Actions:** wait for CI and the Claude review chain, or add label `needs-manual-review` and merge manually.',
                 '**Opt out:** label `no-auto-merge`.',
               ].join('\n');
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: skipped[0].pr, body,
-              });
+              const ctx = await mergeGate.loadPrContext(github, owner, repo, skipped[0].pr);
+              if (!mergeGate.hasRecentMergeGateScanComment(ctx.comments)) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: skipped[0].pr, body,
+                });
+              }
             } else if (inputPr && candidates.length === 1) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: candidates[0].pr_number,
-                body: '**Merge gate scan** — eligible for assessment. Claude merge gate will assess and may auto-merge on an APPROVE verdict.',
-              });
+              const prNum = candidates[0].pr_number;
+              const ctx = await mergeGate.loadPrContext(github, owner, repo, prNum);
+              if (!mergeGate.hasRecentMergeGateScanComment(ctx.comments)) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNum,
+                  body: '**Merge gate scan** — eligible for assessment. Claude merge gate will assess and may auto-merge on an APPROVE verdict.',
+                });
+              }
             }
 
   claude-assess:
@@ -226,7 +246,7 @@ jobs:
         id: mark_active
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             core.setOutput('started_at', new Date().toISOString());
             await github.rest.issues.addLabels({
@@ -298,7 +318,7 @@ jobs:
         id: fallback_verdict
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const mergeGate = require('/tmp/merge-gate.js');
             const owner = context.repo.owner;
@@ -339,7 +359,7 @@ jobs:
         id: verdict
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const mergeGate = require('/tmp/merge-gate.js');
             const comments = await mergeGate.listAllComments(
@@ -351,13 +371,15 @@ jobs:
             const minCreatedAt = new Date(Date.now() - 25 * 60 * 1000).toISOString();
             const verdict = mergeGate.findMergeGateVerdict(comments, minCreatedAt, ctx.headPushedAt);
             core.setOutput('verdict', verdict || 'NONE');
-            if (!verdict) core.warning('No recent MERGE_GATE_VERDICT comment found after assessment');
+            if (!verdict) {
+              core.setFailed('No MERGE_GATE_VERDICT after Claude assess and fallback');
+            }
 
       - name: Remove merge gate active label
         if: always()
         uses: actions/github-script@v7
         with:
-          github-token: ${{ env.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const prNumber = ${{ matrix.pr_number }};
             try {
@@ -371,10 +393,6 @@ jobs:
             } catch (e) {
               core.info(`Label claude-merge-gate-active already removed or missing on PR #${prNumber}`);
             }
-
-      - name: Fail job if assessment failed
-        if: steps.assess.outcome == 'failure'
-        run: exit 1
 
   merge-only:
     needs: [scan-candidates, claude-assess]
@@ -391,8 +409,17 @@ jobs:
       pull-requests: write
       issues: write
       actions: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CLAUDE_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
 
       - name: Re-check gates and merge
         uses: actions/github-script@v7
@@ -400,7 +427,7 @@ jobs:
           MERGE_METHOD: ${{ github.event.inputs.merge_method || 'merge' }}
           SCAN_HEAD_SHA: ${{ matrix.head_sha }}
         with:
-          github-token: ${{ env.GH_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const path = require('path');
             const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));

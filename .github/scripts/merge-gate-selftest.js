@@ -198,8 +198,13 @@ assert('conflict trigger reduce with empty', [].length === 0);
 // Cooldown: FINAL current on HEAD should not block merge gate
 const finalCompleteComments = [
   { user: { login: 'MervinPraison' }, body: '@claude FINAL architecture reviewer', created_at: '2026-07-03T10:00:00Z' },
+  { user: { login: 'praisonai-triage-agent[bot]' }, body: 'Claude finished', created_at: '2026-07-03T10:04:00Z' },
 ];
-assert('final complete on head when not stale', mg.finalClaudeCompletedOnSha(finalCompleteComments, '2026-07-03T10:00:30Z'));
+assert('final complete on head when Claude finished', mg.finalClaudeCompletedOnSha(finalCompleteComments, '2026-07-03T10:00:30Z'));
+assert('final trigger alone is not complete', !mg.finalClaudeCompletedOnSha(
+  [{ user: { login: 'MervinPraison' }, body: '@claude FINAL architecture reviewer', created_at: '2026-07-03T10:00:00Z' }],
+  '2026-07-03T10:00:30Z'
+));
 assert('final not complete when head after final without re-trigger', !mg.finalClaudeCompletedOnSha(finalCompleteComments, '2026-07-03T10:07:00Z'));
 
 // Claude run scoping — other PR branches must not block
@@ -302,4 +307,41 @@ assert('ignores cancelled scan-conflicts', mg.isIgnorableStaleCheckRun('scan-con
 assert('ignores failed pipeline-sync infra', mg.isIgnorableStaleCheckRun('pipeline-sync', 'failure'));
 assert('does not ignore mintlify failure', !mg.isIgnorableStaleCheckRun('Mintlify Deployment', 'failure'));
 
-process.exit(failed ? 1 : 0);
+assert('dispatch blocked when merge gate active', mg.mergeGateDispatchBlockedReason({
+  labels: ['claude-merge-gate-active'],
+  pendingRuns: 0,
+}) === 'merge gate already active on PR');
+assert('dispatch blocked when queue saturated', mg.mergeGateDispatchBlockedReason({
+  labels: [],
+  pendingRuns: 3,
+})?.includes('already queued or in progress'));
+assert('dispatch allowed when queue below cap', mg.mergeGateDispatchBlockedReason({
+  labels: [],
+  pendingRuns: 2,
+}) == null);
+assert('workflow_run probes excluded from pending count', mg.countSubstantiveMergeGateRuns([
+  { event: 'workflow_dispatch' },
+  { event: 'workflow_run' },
+]) === 1);
+assert('rate limit threshold is 200', mg.MIN_CORE_RATE_LIMIT_REMAINING === 200);
+
+(async () => {
+  const skipLow = await mg.shouldSkipMergeGateDispatch(
+    {
+      rest: {
+        rateLimit: {
+          get: async () => ({ data: { resources: { core: { remaining: 50 } } } }),
+        },
+      },
+    },
+    'owner',
+    'repo',
+    1,
+    { info: () => {} }
+  );
+  assert('rate limit low skips dispatch', skipLow === true);
+  process.exit(failed ? 1 : 0);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
