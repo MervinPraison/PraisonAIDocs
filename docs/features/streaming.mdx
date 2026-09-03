@@ -170,7 +170,17 @@ The fallback contract:
 | `stream=True` in kwargs | Stripped — fallback is always non-streaming. |
 | `max_tokens`, `top_p`, and anything else the concrete `chat()` doesn't declare | Filtered out via `inspect.signature(self.chat)` so `chat()` never raises `TypeError`. Subclasses that declare `**kwargs` receive everything. |
 | The original streaming exception | Preserved as `exc.__cause__` on any raised fallback error. |
-| Double fallback | Prevented — the outer `except` in `_start_stream_impl` re-raises when the inner fallback already ran. |
+| Double fallback | Prevented — the fallback method sets `_praisonai_stream_fallback_exhausted = True` on any raised exception, and the outer `except` in `_start_stream_impl` re-raises rather than running the fallback a second time. |
+
+### Internal helpers
+
+One private helper on `ChatMixin` implements the contract above and is what the regression tests drive directly.
+
+| Helper | Role |
+|---|---|
+| `ChatMixin._stream_fallback_chat(prompt, kwargs, streaming_error)` | Introspects `inspect.signature(self.chat)` to keep only the kwargs the concrete `chat()` declares, always forces `stream=False`, then calls `self.chat(prompt, ...)`. On fallback failure it re-raises `from streaming_error` and sets `_praisonai_stream_fallback_exhausted = True` on the raised exception. Subclasses whose `chat()` declares `**kwargs` receive everything. |
+
+This is internal — do not import it from application code. It is named here so debug traces are readable and so subclasses that override `chat()` know that adding parameters to the override signature automatically opts those parameters into the fallback.
 
 Debugging a failed fallback:
 
@@ -190,7 +200,7 @@ except Exception as e:
 ```
 
 <Note>
-Before PraisonAI PR [#4731](https://github.com/MervinPraison/PraisonAI/pull/4731) (issue [#4719](https://github.com/MervinPraison/PraisonAI/issues/4719)) the fallback forwarded `start()`'s raw kwargs unchanged, so `stream=True` reached the sync adapter and `max_tokens` raised `TypeError` before any request was made. Callers on the desktop (which passes `max_tokens` on every turn) saw the `TypeError` with the original streaming error buried two `__context__` levels deep. Since #4731, the fallback filters kwargs, forces `stream=False`, and chains the original cause via `raise ... from streaming_error`.
+Before PraisonAI PRs [#4731](https://github.com/MervinPraison/PraisonAI/pull/4731) and [#4734](https://github.com/MervinPraison/PraisonAI/pull/4734) (issue [#4719](https://github.com/MervinPraison/PraisonAI/issues/4719)) the fallback forwarded `start()`'s raw kwargs unchanged, so `stream=True` reached the sync adapter and `max_tokens` raised `TypeError` before any request was made. Callers on the desktop (which passes `max_tokens` on every turn) saw the `TypeError` with the original streaming error buried two `__context__` levels deep. Since these PRs, the fallback filters kwargs, forces `stream=False`, chains the original cause via `raise ... from streaming_error`, and marks the raised exception exhausted so the outer handler does not run the fallback again. The executable spec lives in `src/praisonai-agents/tests/test_streaming_fallback_kwargs.py`.
 </Note>
 
 ---
@@ -868,7 +878,7 @@ The follow-up LLM call (the one that synthesizes tool results into a final answe
 
 ### "Streaming is not supported in sync OpenAIAdapter" / Deepseek multi-agent crash
 
-Fixed with single-agent smart-fallback in PR #1734. Since [PR #4731](https://github.com/MervinPraison/PraisonAI/pull/4731) the fallback also filters kwargs (`max_tokens`, `top_p`, and anything else `chat()` doesn't declare) and chains the original streaming exception via `raise ... from streaming_error`. If you were previously catching `TypeError: chat() got an unexpected keyword argument 'max_tokens'` as a proxy for "streaming failed", switch to inspecting `exc.__cause__` instead — the real cause is now preserved. For multi-agent teams that use sync-only providers, explicitly disable streaming with `output=["verbose", {"stream": False}]` or similar. See [Multi-Agent Output](/features/multi-agent-output) for configuration options.
+Fixed with single-agent smart-fallback in PR #1734. Since [PR #4731](https://github.com/MervinPraison/PraisonAI/pull/4731) the fallback filters kwargs (`max_tokens`, `top_p`, and anything else `chat()` doesn't declare) and chains the original streaming exception via `raise ... from streaming_error`; [PR #4734](https://github.com/MervinPraison/PraisonAI/pull/4734) factored the whole fallback into `ChatMixin._stream_fallback_chat` (signature-driven, so it is robust to future `chat()` changes) and added the `_praisonai_stream_fallback_exhausted` sentinel so the outer handler does not run the fallback twice. If you were previously catching `TypeError: chat() got an unexpected keyword argument 'max_tokens'` as a proxy for "streaming failed", switch to inspecting `exc.__cause__` instead — the real cause is now preserved. For multi-agent teams that use sync-only providers, explicitly disable streaming with `output=["verbose", {"stream": False}]` or similar. See [Multi-Agent Output](/features/multi-agent-output) for configuration options.
 
 ### Routed Claude / Gemini crash on the async path
 
