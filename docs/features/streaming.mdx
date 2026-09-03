@@ -53,7 +53,7 @@ agent = Agent(instructions="You are a helpful assistant")
 agent.start("Write a short story")
 ```
 
-By default the SDK tries streaming first and silently falls back to non-streaming if your provider's sync client doesn't support it — multi-agent workflows on providers like Deepseek now Just Work.
+By default the SDK tries streaming first and silently falls back to non-streaming if your provider's sync client doesn't support it — multi-agent workflows on providers like Deepseek now Just Work. Sampling knobs you pass (`max_tokens`, `top_p`, `temperature`) are honoured whether the streaming attempt or the fallback runs, and if streaming raises the SDK surfaces the original cause on the error's `__cause__` — you won't lose the real error to a fallback `TypeError`.
 </Step>
 
 <Step title="Force Streaming">
@@ -123,6 +123,75 @@ Leave a key out and it never reaches the provider — the provider's own default
 <Tip>
 Keep `max_tokens` small for interactive UIs to bound latency and cost.
 </Tip>
+
+---
+
+## What happens when streaming fails
+
+Streaming can fail mid-flight — a context-length overflow, a provider hiccup, a sync adapter that refuses to stream — and when it does, `start(stream=True)` and `iter_stream()` fall back to a single non-streaming `chat()` call so your caller still gets an answer.
+
+```mermaid
+sequenceDiagram
+    participant U as Your code
+    participant S as start(stream=True)
+    participant SC as streaming client
+    participant C as chat() fallback
+    participant P as provider
+
+    U->>S: start("...", stream=True, max_tokens=5)
+    S->>SC: streamed request
+    SC-->>S: RuntimeError("context too long")
+    S->>S: strip stream=True<br/>keep only kwargs chat() accepts
+    S->>C: chat("...", ...filtered kwargs..., stream=False)
+    C->>P: non-streamed request
+    P-->>C: full answer
+    C-->>S: answer
+    S-->>U: yielded as one block
+
+    Note over S,C: If chat() also raises,<br/>the raised exception's __cause__<br/>is the original streaming error.
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef client fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef provider fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class U user
+    class S process
+    class SC client
+    class C agent
+    class P provider
+```
+
+The fallback contract:
+
+| Behaviour | What the SDK does |
+|---|---|
+| `stream=True` in kwargs | Stripped — fallback is always non-streaming. |
+| `max_tokens`, `top_p`, and anything else the concrete `chat()` doesn't declare | Filtered out via `inspect.signature(self.chat)` so `chat()` never raises `TypeError`. Subclasses that declare `**kwargs` receive everything. |
+| The original streaming exception | Preserved as `exc.__cause__` on any raised fallback error. |
+| Double fallback | Prevented — the outer `except` in `_start_stream_impl` re-raises when the inner fallback already ran. |
+
+Debugging a failed fallback:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="You are a helpful assistant")
+
+try:
+    for chunk in agent.start("Very long prompt...", stream=True, max_tokens=5):
+        print(chunk, end="", flush=True)
+except Exception as e:
+    # The fallback error itself
+    print(f"Fallback failed: {e!r}")
+    # The real streaming cause — pre-#4731 this was None
+    print(f"Original streaming error: {e.__cause__!r}")
+```
+
+<Note>
+Before PraisonAI PR [#4731](https://github.com/MervinPraison/PraisonAI/pull/4731) (issue [#4719](https://github.com/MervinPraison/PraisonAI/issues/4719)) the fallback forwarded `start()`'s raw kwargs unchanged, so `stream=True` reached the sync adapter and `max_tokens` raised `TypeError` before any request was made. Callers on the desktop (which passes `max_tokens` on every turn) saw the `TypeError` with the original streaming error buried two `__context__` levels deep. Since #4731, the fallback filters kwargs, forces `stream=False`, and chains the original cause via `raise ... from streaming_error`.
+</Note>
 
 ---
 
@@ -771,7 +840,7 @@ The follow-up LLM call (the one that synthesizes tool results into a final answe
 
 ### "Streaming is not supported in sync OpenAIAdapter" / Deepseek multi-agent crash
 
-Fixed with single-agent smart-fallback in PR #1734. For multi-agent teams that use sync-only providers, explicitly disable streaming with `output=["verbose", {"stream": False}]` or similar. See [Multi-Agent Output](/features/multi-agent-output) for configuration options.
+Fixed with single-agent smart-fallback in PR #1734. Since [PR #4731](https://github.com/MervinPraison/PraisonAI/pull/4731) the fallback also filters kwargs (`max_tokens`, `top_p`, and anything else `chat()` doesn't declare) and chains the original streaming exception via `raise ... from streaming_error`. If you were previously catching `TypeError: chat() got an unexpected keyword argument 'max_tokens'` as a proxy for "streaming failed", switch to inspecting `exc.__cause__` instead — the real cause is now preserved. For multi-agent teams that use sync-only providers, explicitly disable streaming with `output=["verbose", {"stream": False}]` or similar. See [Multi-Agent Output](/features/multi-agent-output) for configuration options.
 
 ### Routed Claude / Gemini crash on the async path
 
