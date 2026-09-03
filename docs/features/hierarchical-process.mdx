@@ -34,6 +34,10 @@ graph LR
 **Since PraisonAI PR #3790**, the hierarchical process correctly excludes the manager task from delegation candidates and blocks self-delegation. Earlier releases could allow the manager to delegate a subtask back to itself and could surface the manager's generic response as the final result. No API change — existing `process="hierarchical"` code benefits automatically.
 </Note>
 
+<Note>
+**Since PraisonAI PR #4739**, the hierarchical loop only counts a task on its first transition to `completed` (keyed by `counted_task_ids`), and excludes every synthetic `manager_task` from prior runs of the same team (tracked in `Process._synthetic_manager_task_ids`). Existing `process="hierarchical"` code benefits automatically — no API change.
+</Note>
+
 ## Quick Start
 
 <Steps>
@@ -177,6 +181,63 @@ Prior to PraisonAI PR [#3678](https://github.com/MervinPraison/praisonai/pull/36
 
 ---
 
+## Re-running the same team
+
+Calling `team.start()` a second time — or starting a team where some tasks are already `status == "completed"` — now completes correctly instead of looping until `MAX_INVALID_SELECTIONS` or silently returning early.
+
+Two fixes make this safe:
+
+- **Stale managers excluded.** Every synthetic `manager_task` the process injects is tracked in `Process._synthetic_manager_task_ids`. On a second run, the previous run's manager (which the SDK never removes from `self.tasks`) is excluded from `total_tasks`, rejected as a delegation target by id, and left out of the delegable-ids re-prompt.
+- **Counter seeded.** `completed_count` is seeded from tasks already `status == "completed"` before the run starts, so pre-completed tasks are counted once via `counted_task_ids` and the loop can reach completion.
+
+```mermaid
+graph TB
+    subgraph "Run 1"
+        R1[👤 team.start] --> R1T[🤖 both tasks execute]
+        R1T --> R1S[📋 self.tasks: 1 completed task<br/>+ 1 synthetic manager]
+    end
+    subgraph "Run 2"
+        R2[👤 team.start] --> R2X[🔀 exclude stale manager<br/>seed completed_count]
+        R2X --> R2D[✅ only remaining real work runs]
+    end
+    R1S --> R2
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef work fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class R1,R2 user
+    class R1T work
+    class R2X gate
+    class R1S,R2D done
+```
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+
+researcher = Agent(name="researcher", role="Research topics")
+writer = Agent(name="writer", role="Write content")
+
+research = Task(name="research", description="Research AI trends", agent=researcher)
+write = Task(name="write", description="Write article about AI trends", agent=writer)
+
+team = PraisonAIAgents(
+    agents=[researcher, writer],
+    tasks=[research, write],
+    process="hierarchical",
+    manager_llm="gpt-4o-mini",
+)
+team.start()   # first run — both tasks execute
+team.start()   # second run — completes immediately, no phantom loop
+```
+
+<Note>
+Since PraisonAI PR #4739, re-running a `PraisonAIAgents(process='hierarchical')` team is safe: stale synthetic managers from prior runs are excluded from `total_tasks` and rejected as delegation targets, and pre-completed tasks are counted once via `counted_task_ids`. Previously a second `team.start()` could loop until `MAX_INVALID_SELECTIONS` or silently return early.
+</Note>
+
+---
+
 ## The Manager's Schema
 
 The manager returns a fixed three-field object every delegation turn.
@@ -211,10 +272,19 @@ sequenceDiagram
 | Manager returns an id not in the tasks list | Rejected; same re-prompt path. |
 | Manager keeps returning invalid ids | After `MAX_INVALID_SELECTIONS = 3` attempts the workflow aborts and logs an error. |
 | A user Task is named `"manager_task"` | Delegable as normal — the synthetic task is matched by id, not name. |
+| Manager re-selects an already-completed `task_id` | Logged (`"Manager re-selected already-completed task {id}; ignoring re-selection."`), not re-executed, and not counted twice. Loop keeps going. |
 
 <Note>
 Before PraisonAI PR [#3706](https://github.com/MervinPraison/PraisonAI/pull/3706), `ManagerInstructions.task_id` was described as "1-based" while runtime ids are 0-based, and validation only checked membership in `self.tasks` — which let the manager delegate to itself and the real user task never ran. If you built a workaround (renaming tasks, wrapping the manager, patching `response_format`), you can remove it now.
 </Note>
+
+### Re-selecting an already-completed task
+
+A manager re-selecting a completed `task_id` is now logged and ignored — `completed_count` advances only on a task's first transition to `completed`, keyed by `counted_task_ids`.
+
+Before PR #4739 the loop incremented `completed_count` on every status check for a selected task, so a re-selected completed task inflated the counter and let the loop exit while genuinely unexecuted tasks were still `"not started"`. Now the counter only advances inside the execution branch, so re-selection is safe.
+
+Run with `output="verbose"` to see the warning line on every re-selection — the correct signal to tighten the manager prompt or add task-completion hints.
 
 ---
 
@@ -351,6 +421,10 @@ The framework already asks for the strict `ManagerInstructions` schema and OpenA
 
 <Accordion title="output=&quot;verbose&quot; shows delegation turns">
 When debugging why the manager stops early, run with `output="verbose"` and read the `{task_id, agent_name, action}` payloads emitted on each turn.
+</Accordion>
+
+<Accordion title="Re-running a team is idempotent">
+A second `team.start()` on an already-completed team returns immediately. Marking individual tasks `"not started"` and re-running will re-execute only those. Do not manually delete the synthetic `manager_task` from `self.tasks` — the SDK now tracks and excludes it automatically.
 </Accordion>
 </AccordionGroup>
 
