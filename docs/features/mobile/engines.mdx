@@ -282,8 +282,11 @@ graph TB
     Start[🚀 First launch] --> Persisted{💾 engineId persisted?}
     Persisted -->|Yes| Use[✅ Use persisted engineId]
     Persisted -->|No| Default[🏭 defaultEngineIdFor#40;platform.kind#41;]
-    Default --> Today[remote-http #40;every platform, for now#41;]
-    Today --> Boot[🖼️ mount uses this as engineId]
+    Default --> Kind{📱 platform.kind}
+    Kind -->|tauri| InProc[praisonai-ts #40;in-process#41;]
+    Kind -->|web| Remote[remote-http]
+    InProc --> Boot[🖼️ mount uses this as engineId]
+    Remote --> Boot
 
     classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef branch fill:#F59E0B,stroke:#7C90A0,color:#fff
@@ -295,37 +298,35 @@ graph TB
     class Persisted branch
     class Use ok
     class Default fn
-    class Today pick
+    class Kind branch
+    class InProc pick
+    class Remote pick
     class Boot ok
 ```
 
 The first-launch default is not the only engine the app ever uses: a persisted `engineId` still wins, and the [Settings Screen](/features/mobile/settings-screen) is what persists a change to it.
 
-Today the function returns `remote-http` for both `"tauri"` and `"web"`, pinned by `"every platform's first-launch default is the remote engine, for now"` in `app/src/main.test.ts`.
+The function splits by platform: `"tauri"` defaults to the in-process engine, `"web"` to remote. Pinned by `"a device's first-launch default is the in-process engine; the web's is remote"` in `app/src/main.test.ts`.
 
 ```ts
 import { defaultEngineIdFor } from "praisonai-mobile/app/main";
 
-defaultEngineIdFor("tauri"); // "remote-http"
-defaultEngineIdFor("web");   // "remote-http"
+defaultEngineIdFor("tauri"); // "praisonai-ts"  — a device runs in-process
+defaultEngineIdFor("web");   // "remote-http"   — a browser tab has a server
 
 // mount() calls it once, at boot, when no engineId is persisted.
 // A persisted engineId always wins over this default.
 ```
 
-The tempting device default — in-process on a phone — is wrong today for two independent reasons.
+A device defaults in-process because a phone cannot reach `http://127.0.0.1:8765`, and the cleartext loopback address is refused by iOS ATS and Android besides — so a remote default was a first prompt that failed with a status code. The in-process engine now ships as a lazily-fetched chunk beside `app.js` (see [How the engine reaches the app](#how-the-engine-reaches-the-app)), so it is the one choice that works with nothing configured — up to the model itself, which still needs a key the app has no setting for yet (see [The known API-key gap](#the-known-api-key-gap)).
 
-The in-process engine's module is ABSENT from the shipping webview. `build-webview.mjs` bundles only `dist/app.js`; the engine reaches praisonai-ts through a runtime-computed dynamic import deliberately left outside that bundle ([#4437](https://github.com/MervinPraison/PraisonAI/issues/4437)). Defaulting to it would swap the *"engine not answering"* warning (which names Settings as the fix) for a first prompt that fails *"the in-process engine is unavailable in this build"* with **no** recovery — the exact brick `registry.ts` keeps the engine out of `SETTING_DEFS.engineId.choices` to avoid.
-
-`Platform["kind"]` is only `"tauri" | "web"`, and **desktop** Tauri (`cargo tauri dev`) reports `"tauri"` too. So a `kind === "tauri"` default would flip the desktop/dev flow away from the remote engine it exists for, with no way to tell a phone from a laptop.
+The web keeps the remote engine: a browser tab has a server to talk to, and no reason to fetch ~1.4 MB of engine before first paint.
 
 <Warning>
-**A `kind === "tauri"` default would also strand desktop Tauri.** `Platform["kind"]` cannot tell `cargo tauri dev` on a laptop from a Tauri build on a phone — both report `"tauri"`. A future device-vs-desktop split needs its own signal, not `kind`.
+**Desktop Tauri counts as a device.** `Platform["kind"]` is only `"tauri" | "web"`, so `cargo tauri dev` on a laptop reports `"tauri"` exactly as a phone does — and both start in-process. The shipped design accepts this trade: a developer with a server running switches to `remote-http` in [Settings](/features/mobile/settings-screen), and the persisted `engineId` wins over this default (`chosenStringOr` in `boot.ts`), so it only ever decides the very first launch.
 </Warning>
 
-The seam still exists so a test drives it directly rather than asserting an expression appears in `mount` (mirrors `stopNotice` and `appEngines`, the house rule), and so the day a device can be told apart AND the in-process engine ships inside the webview, the change is one function body — not a change to `mount()`.
-
-Once [#4437](https://github.com/MervinPraison/PraisonAI/issues/4437) ships praisonai-ts inside the webview and a device is distinguishable from a desktop Tauri build, this function will return the in-process engine on device. Removing the intermediate hop over `http://127.0.0.1:8765` also removes the iOS ATS / Android `usesCleartextTraffic` exception on the default path (see [Errors & Recovery](/features/mobile/errors-and-recovery)).
+The seam is a function a test drives directly rather than an expression asserted to appear in `mount` (mirrors `stopNotice` and `appEngines`, the house rule). Defaulting a device to in-process removes the intermediate hop over `http://127.0.0.1:8765` and the iOS ATS / Android `usesCleartextTraffic` exception on the default path (see [Errors & Recovery](/features/mobile/errors-and-recovery)).
 
 <Note>
 **The persisted engineId wins.** `chosenStringOr` in `boot.ts` prefers the persisted `engineId` over this default, so `defaultEngineIdFor` only decides the very first launch after install (or after a settings clear). The [Settings Screen](/features/mobile/settings-screen) is where a user overrides both `engineId` (from `SETTING_DEFS.engineId.choices`) and `baseUrl` on-device. See [Storage & Secrets](/features/mobile/storage-and-secrets).
@@ -345,7 +346,7 @@ Two engines, two owners of the write.
 The remote engine deliberately does not take persistence: the server it connects to owns the write and is the only thing that can report authoritative indices for its own store.
 
 <Note>
-A picker omits an engine whose prerequisites are absent rather than offering it and then failing. `createInProcess` is optional — when it is not supplied, only the remote engine is offered. The shipping composition root **does** supply it, via `appEngines`, so `enginesFor` returns both engines in real builds — even though only `remote-http` sits in `SETTING_DEFS.engineId.choices` (the picker). Pinned by `"the real composition root offers the in-process engine"` in `app/src/main.test.ts`.
+A picker omits an engine whose prerequisites are absent rather than offering it and then failing. `createInProcess` is optional — when it is not supplied, only the remote engine is offered. The shipping composition root **does** supply it, via `appEngines`, so `enginesFor` returns both engines in real builds, and **both** `remote-http` and `praisonai-ts` sit in `SETTING_DEFS.engineId.choices` (the picker). The engine ships as a chunk beside `app.js`, so the picker offers a choice the shipping build can construct — the reason `registry.test.ts` compares `choices` against the composition `main.ts` actually mounts. Pinned by `"the real composition root offers the in-process engine"` in `app/src/main.test.ts`.
 </Note>
 
 ---
@@ -477,24 +478,56 @@ Three implementations pass the same conformance suite, which is what makes "swap
 | `remote-http` | `engines/src/remote-http` | A PraisonAI engine over HTTP + SSE. |
 | scripted fake | `testing/` | Nothing — replays canned events for tests. |
 
-### Lazy, Runtime-Computed Import
+### How the engine reaches the app
 
-The in-process engine's `createAgent` factory loads praisonai's `Agent` through a runtime-computed dynamic import.
+The in-process engine loads praisonai's `Agent` through a single **literal** dynamic import, in `engines/src/praisonai-ts/load-agent.ts`:
 
 ```ts
-const specifier = ["..", "..", "..", "praisonai-ts", "src", "agent", "simple.ts"].join("/");
-let mod: { Agent: PraisonAgentModule };
-try {
-  mod = (await import(specifier)) as { Agent: PraisonAgentModule };
-} catch (cause) {
-  throw new Error(
-    "the in-process engine is unavailable in this build: praisonai-ts could not be loaded",
-    { cause },
-  );
+export async function loadPraisonAgent(): Promise<PraisonAgentModule> {
+  try {
+    const mod = (await import("praisonai/mobile")) as unknown as { Agent: PraisonAgentModule };
+    return mod.Agent;
+  } catch (cause) {
+    throw new Error(
+      "the in-process engine is unavailable in this build: praisonai could not be loaded",
+      { cause },
+    );
+  }
 }
 ```
 
-A **computed** specifier keeps `tsc` from following the upstream graph (which does not typecheck under this strict config) and keeps `esbuild` from bundling its import-time-fatal builtins ([#4437](https://github.com/MervinPraison/PraisonAI/issues/4437)). The mobile bundle stays **48.9 kB, 0 external, 0 fatal builtins**.
+Three facts make this the shipped seam:
+
+- **The specifier is a literal.** esbuild can only put a module in its own lazily-fetched chunk if it can see which module it is; the runtime-computed path this used to be was opaque, so the engine either came along eagerly or, as an external, not at all. The literal is what turns it into a chunk.
+- **`praisonai/mobile`, not `praisonai`.** The default entry re-exports the CLI, the MCP server and the knowledge store, whose Node builtins are import-time fatal in a webview. `/mobile` is the package's webview-safe allowlist entry.
+- **One file may name it.** `tools/boundaries.json` allows the string `praisonai` only from `engines/src/praisonai-ts` — the agent-framework seam. Making the import literal did not cost that rule; `load-agent.ts` is the one place it lives.
+
+### The shell and lazy split
+
+The build emits two populations of chunk, paid for at different moments, so `tools/bundle.mjs` carries two budgets:
+
+| Budget | Covers | Ceiling | Measured at the `chrome58` floor |
+|--------|--------|---------|----------------------------------|
+| `SHELL_BUDGET_BYTES` | the entry chunk + its **static** import graph — fetched and parsed before the first frame, on every cold start | **400 kB** | **66.6 kB** (`app.js` 65.9 kB + esbuild's 0.6 kB interop helper) |
+| `LAZY_BUDGET_BYTES` | everything reachable only through `import()` — the engine and the provider stack under it | **1600 kB** | **1459.6 kB** across 16 chunks (zod 426 kB, `ai` 276 kB, @ai-sdk/openai 166 kB, @ai-sdk/google 142 kB, openai 102 kB, praisonai 79 kB) plus ~100 kB of chrome58 lowering |
+
+They are two budgets, not one in disguise: `bundle.test.mjs` proves each can fail on its own, and `depgraph.test.mjs` pins both values so neither can be widened without a failing test.
+
+<Warning>
+**`supported: { "dynamic-import": true }` is load-bearing.** Left to its own table at a `chrome58` target, esbuild **lowers** `import()` to a static import wrapped in a promise — the split silently collapses and the whole engine lands in the shell (measured: **1486.8 kB** shell, **0** lazy, which fails the shell budget). `bundle()` overrides the target to keep `import()` intact. `SPLIT_MIN_CHROME = chrome63` records the first Chrome where esbuild leaves `import()` alone — the shipped page's true floor — measured one below and at in `bundle-target.test.mjs`. `ANDROID_WEBVIEW_FLOOR` records nothing between API 26 (chrome58) and 30 (chrome87); whether `minSdkVersion` should move is recorded in `bundle.mjs`, not decided there.
+</Warning>
+
+### Consumer-first bare-import resolution
+
+`bundle.mjs` resolves every bare import **from this package first, from the importer second**. Peers are the consumer's to provide: praisonai lists `ai` and `@ai-sdk/*` as optional peers, this package declares them, and a registry install hoists them beside praisonai. Through the `file:` link (below) Node's real-path resolution looks in `../praisonai-ts/node_modules` instead and cannot see them — `@ai-sdk/cohere`, which praisonai imports and never declares, came back **unresolved**, measured. Consumer-first is the layout a registry install produces without depending on hoisting, and keeps `zod` and `@ai-sdk/provider-utils` to one copy. praisonai's own dependencies (`openai`, and the rest) are not here and fall through to its `node_modules`, as they should.
+
+### Development consumes praisonai through a file link
+
+`package.json` links `praisonai` as `file:../praisonai-ts`, not a pinned version, so the engine the app ships is the one from the same monorepo commit. The fix that makes the engine buildable below chrome89 — praisonai-ts [#4720](https://github.com/MervinPraison/PraisonAI/pull/4720), which removed a top-level `await` from praisonai-ts's esm shim on the mobile graph — is in the sibling package and reaches the app through this link. `.github/workflows/mobile.yml` watches `src/praisonai-ts/{src,scripts}/**` and `package.json`, and every job builds praisonai-ts (`npm install --legacy-peer-deps && npm run build`) before `npm ci` in the mobile package. Editing praisonai-ts and mobile in the same PR is therefore one build, not a publish-and-bump.
+
+### The known API-key gap
+
+A device can boot into the in-process engine and reach a first turn today — but the registry declares **no API-key setting**, so that turn reaches the model layer and fails **recoverably**: a named `error` row, not a crash. The end-to-end mount test uses a scripted `Agent` for exactly that reason. A key setting is a tracked follow-up; until it lands, the in-process engine boots and answers only where a key reaches the model by another route.
 
 ---
 
@@ -551,7 +584,7 @@ graph TB
 ```
 
 <Note>
-Today only `remote-http` appears in the picker (`SETTING_DEFS.engineId.choices`). The in-process engine is offered by the factory list but is not yet a legal `engineId` setting value. In a build that ships praisonai-ts on disk, `engineId: "praisonai-ts"` can be selected programmatically; the picker gains it once [#4435](https://github.com/MervinPraison/PraisonAI/issues/4435) + [#4437](https://github.com/MervinPraison/PraisonAI/issues/4437) land. The first-launch default (`defaultEngineIdFor`) also returns `remote-http` on every platform for now, for the same reason: a device would boot into an engine whose module is not on disk. See [First-Launch Default](#first-launch-default).
+Both engines now appear in the picker (`SETTING_DEFS.engineId.choices` is `[remote-http, praisonai-ts]`), because the in-process engine ships as a lazy chunk the shipping build can construct. On a Tauri build the in-process engine is also the first-launch default (`defaultEngineIdFor("tauri") === "praisonai-ts"`); `remote-http` stays available and is the sensible pick for the desktop dev flow, where a server is running and tool/approval rows are useful to watch. See [First-Launch Default](#first-launch-default).
 </Note>
 
 ---
@@ -615,8 +648,8 @@ Declaring a gap in the `unsupported` map is honest; faking it hides a defect the
 The consumer's `break`, `return`, or exception out of the `for await` loop is the cancellation channel — there is no separate `close()`. The engine's `finally` calls `await reader.cancel()`, so leaving the stream releases the reader and the model stops billing. The regression `"leaving the stream early releases the socket"` asserts the underlying `ReadableStream`'s `cancel()` fires when the consumer `break`s after the first delta. See [Stop is idempotent and race-safe](/features/mobile/approvals-and-cancellation#stop-is-idempotent-and-race-safe).
 </Accordion>
 
-<Accordion title="An unloadable in-process engine fails RECOVERABLY, not opaquely">
-The dynamic import can reject at run time — the shipping webview bundles only `dist/`, so praisonai-ts is not on disk ([#4437](https://github.com/MervinPraison/PraisonAI/issues/4437)). When it does, the failure surfaces as a single `error` event through the run loop, never as an unhandled rejection. `create()` itself succeeds because it wires the factory, not the module. Pinned by `"the in-process engine, when its module cannot load, fails RECOVERABLY"` in `app/src/main.test.ts`.
+<Accordion title="A failed engine-chunk fetch fails RECOVERABLY, not opaquely">
+The engine reaches praisonai through a lazily-fetched chunk, and a fetch can fail — a flaky connection, a build that left the engine out, a hashed file the page no longer matches. When it does, the failure arrives as a single `error` event through the run loop — a named row with the standard Retry affordance — never as an unhandled rejection. `create()` itself succeeds because it wires the factory, not the chunk; the `loadPraisonAgent` guard turns the rejected `import("praisonai/mobile")` into that recoverable event. Pinned by `"the in-process engine, when its chunk cannot load, fails RECOVERABLY"` in `app/src/main.test.ts`, which injects a failing loader through the `appEngines` seam. The separate first-turn gap for want of a key is [The known API-key gap](#the-known-api-key-gap).
 </Accordion>
 
 <Accordion title="A retryably unready engine boots the app, not the crash screen">
