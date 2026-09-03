@@ -360,6 +360,141 @@ The bug this replaces appended stored messages as raw `<p>` nodes **outside** `r
 
 ---
 
+## The model actually gets the conversation
+
+Before PR #4816 the app stored a conversation, rendered it, and showed the model **none** of it — the follow-up now resolves against the prior turn.
+
+```mermaid
+graph LR
+    Session[💾 Session.current] --> HistoryFor[📜 historyFor]
+    HistoryFor --> Truncate[✂️ truncateHistory<br/>24,000 chars]
+    Truncate --> SetHistory[♻️ Agent.setHistory]
+    SetHistory --> Stream[⚡ streamEvents#40;prompt#41;]
+    Stream --> Answer[✅ streamed answer]
+
+    classDef store fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Session store
+    class HistoryFor,Truncate process
+    class SetHistory,Stream agent
+    class Answer result
+```
+
+Ask the capital of France, get "Paris." Then ask "And its population?" — before the fix that second question reached the provider with no subject, so the honest reply was a request for clarification. After the fix the engine restores the prior turn onto the agent first, so the follow-up is answerable.
+
+### Restore happens on every turn
+
+The engine builds a **fresh agent per turn** — the model and the API key come from settings and can change between messages — so upstream's own accumulation across `streamEvents` calls dies with each agent. `Agent.setHistory` is therefore called before **every** stream, the first turn included, so the empty conversation is not a separate code path.
+
+```ts
+// engine.ts — restore before the prompt is sent, unconditionally.
+agent.setHistory(
+  truncateHistory(options.history.messages(), options.historyBudget ?? HISTORY_CHAR_BUDGET)
+    .messages,
+);
+
+for await (const event of agent.streamEvents(request.prompt, { signal })) {
+  // …stream the new turn…
+}
+```
+
+Only **completed** prior turns are replayed. The current turn's prompt travels as `RunRequest.prompt`, never duplicated into history — a model asked the same question twice in one request answers the wrong one about half the time.
+
+### History is read from the session store, not an in-process buffer
+
+`historyFor(session)` reads the same `current()` chat the transcript scrolls through, so a **reopened** conversation carries its memory: the messages a user scrolls back through and the messages the next turn remembers are one array.
+
+```ts
+// session.ts — the read-side projection, the mirror of persistenceFor.
+export function historyFor(session: Session): { messages(): readonly HistoryMessage[] } {
+  return {
+    messages: () =>
+      (session.current()?.messages ?? []).map((m) => ({ role: m.role, content: m.content })),
+  };
+}
+```
+
+A history buffered in-process would pass the multi-turn case and fail every relaunch — the case a phone hits daily, because a phone kills backgrounded apps.
+
+```mermaid
+%%{init: {'themeVariables': {'actorBkg':'#8B0000','actorTextColor':'#fff','actorBorder':'#7C90A0'}}}%%
+sequenceDiagram
+    participant User
+    participant App as App (session store)
+    participant Engine
+    participant Agent
+    participant Model
+
+    User->>Engine: "What is the capital of France?"
+    Engine->>Agent: setHistory([]) — first turn, empty
+    Agent->>Model: streamEvents(prompt)
+    Model-->>User: "Paris."
+    Engine->>App: record(prompt, "Paris.")
+    User->>Engine: "And its population?"
+    Engine->>App: historyFor(session).messages()
+    App-->>Engine: [user "…capital…", assistant "Paris."]
+    Engine->>Engine: truncateHistory(24,000)
+    Engine->>Agent: setHistory(prior turns)
+    Agent->>Model: streamEvents("And its population?")
+    Model-->>User: "About 2.1 million."
+```
+
+### The 24,000-character truncation budget
+
+A long conversation eventually outgrows any context window, so `truncateHistory` bounds the restored history to `HISTORY_CHAR_BUDGET` — 24,000 characters, roughly the last ~6,000 tokens.
+
+```ts
+import { HISTORY_CHAR_BUDGET } from "praisonai-mobile/core/chat/history";
+
+HISTORY_CHAR_BUDGET; // 24_000 — an order of magnitude under gpt-4o-mini's window
+```
+
+Three deliberate rules, each pinned by a mutation test that names the failure it prevents:
+
+| Rule | What it does | Failure it prevents |
+|------|--------------|---------------------|
+| **Keep the recent end** | Walks newest → oldest, taking messages while cumulative `content.length` fits | Dropping the recent end leaves "and its population?" unanswerable |
+| **Stop, don't skip** | Stops at the first message that does not fit and does not resume | Skipping a large message to fit an older one reorders the conversation around a hole |
+| **Drop a leading assistant** | If the kept history would begin with an assistant message, drop it | An answer with no question above it reads to the model as something it asserted unprompted |
+
+```mermaid
+graph TB
+    Start[📜 messages] --> Walk[⬅️ walk newest to oldest]
+    Walk --> Fit{used + cost > budget?}
+    Fit -->|no| Keep[✅ keep, add cost]
+    Keep --> Walk
+    Fit -->|yes| Stop[🛑 stop the walk]
+    Stop --> Lead{leading msg is assistant?}
+    Lead -->|yes| Drop[✂️ drop it]
+    Lead -->|no| Done[✅ oldest-first history]
+    Drop --> Done
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef branch fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Walk,Keep,Stop,Drop process
+    class Fit,Lead branch
+    class Done done
+```
+
+The budget counts **characters, not tokens**: tokenizing would pull a model-specific tokenizer into a webview bundle. It is deliberately an unexposed constant, not a setting — a setting invites a value that is wrong for whichever model the user later picks, and the provider 400 mid-answer that produces is exactly what the budget exists to make impossible.
+
+<Warning>
+**Truncation is not surfaced in the UI — a known-open gap.** When it fires, the transcript on screen is **unchanged and complete**: nothing is deleted, and scrolling back still shows every message. But the model stops being able to refer to the oldest turns, and **the user is not told**. Protocol v2 has no event for "context was trimmed" and adding one is a protocol bump, so this is recorded rather than half-done. `truncateHistory` already returns `dropped`, so the value a future notice would carry exists — nothing consumes it yet.
+</Warning>
+
+<Note>
+**Only the in-process engine restores.** `praisonai-ts` gets `historyFor(session)` and replays locally; `remote-http` deliberately does **not**. It POSTs `chat_id` to a server that keeps its own history for that id, so sending client-side history there would send every prior turn twice — once from the client, once from the server's store. A doubled conversation is worse than a missing one: silent, growing, and it makes the model contradict itself. A chat answered by the remote engine therefore leaves the local session empty and has no local history to restore.
+</Note>
+
+---
+
 ## Common Patterns
 
 A reopened chat and a fresh one share the same publish path — only `history` differs.
@@ -393,6 +528,10 @@ Reopened messages are real `Row`s seeded with `reconcile(emptyRender, history)`,
 
 <Accordion title="Give history rows a namespaced id">
 The `history:{index}:{role}` prefix keeps restored rows stable across re-open and out of collision range of a live turn's `text:N` ids.
+</Accordion>
+
+<Accordion title="Restore the conversation onto the model every turn">
+A fresh agent is built per turn, so `Agent.setHistory(truncateHistory(historyFor(session).messages()))` runs before every stream — the first, empty turn included. Reading from the session store rather than an in-process buffer is what makes a relaunched chat still remember its own turns.
 </Accordion>
 </AccordionGroup>
 
