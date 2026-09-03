@@ -242,7 +242,7 @@ Only these nine options are exposed through the CLI. The full `HookConfig` (HMAC
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `store_backend` | `str` | `"sqlite"` | `"sqlite"` (default, durable) — `"memory"` (per-process, zero-dep, opt-in for tests / ephemeral runs) or `"sqlite"` (durable, survives restart). Unset means `"sqlite"` ([Issue #4339](https://github.com/MervinPraison/PraisonAI/issues/4339)). Unknown values fall back to `"memory"` with a debug log. |
+| `store_backend` | `str` | `"sqlite"` | `"sqlite"` (default, durable, survives restart) — `"memory"` (per-process, zero-dep, opt-in for tests / ephemeral runs) — `"redis"` (accepts the multi-replica intent; **currently falls back to durable SQLite** and records a degraded fact — no cross-replica Redis backend is implemented yet in the wrapper). Unset means `"sqlite"` ([Issue #4339](https://github.com/MervinPraison/PraisonAI/issues/4339)). A genuinely unknown value (e.g. `"totally-unknown"`) falls back to `"memory"` with a debug log. |
 
 Also accepted as siblings when `hooks:` is a list:
 
@@ -336,24 +336,33 @@ hooks:
 |---------|-------------------|--------------------------|--------------|-------------|
 | `sqlite` (default) | ✅ | ✅ (when the DB file is shared) | stdlib `sqlite3` only | Production, any provider with retries, multi-replica |
 | `memory` | ❌ | ❌ | none | Tests / ephemeral runs (explicit opt-out) |
+| `redis` | ✅ (falls back to durable SQLite) | ⚠️ Only when the SQLite state file is shared — **not** a genuine cross-replica Redis dedup; a degraded fact is recorded | none (fallback path) | Signals multi-replica intent; today it downgrades to SQLite with a `durability:idempotency` degraded fact until the Redis backend ships. See [Multi-replica gateways](#multi-replica-gateways-and-store_backend-redis). |
 
 ```mermaid
 graph TB
     subgraph "Dedup Store Backend"
         M[💾 In-Memory<br/>per-process<br/>lost on restart]
         S[🗄️ SQLite default<br/>~/.praisonai/state/hook_idempotency.sqlite<br/>survives restart · shareable across replicas]
+        R[⚙️ store_backend: redis<br/>multi-replica intent]
+        Deg[⚠️ durability:idempotency degraded fact<br/>&quot;running per-replica&quot;]
     end
     Choose{Tests / ephemeral only?}
     Choose -->|Yes, opt out| M
     Choose -->|No — default| S
+    R -->|no Redis backend yet<br/>falls back| S
+    R --> Deg
 
     classDef choice fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef mem fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef sql fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef redis fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
 
     class Choose choice
     class M mem
     class S sql
+    class R redis
+    class Deg warn
 ```
 
 **Storage details (SQLite):**
@@ -364,10 +373,85 @@ graph TB
 - Bounded: max `10,000` recorded entries + `24h` TTL, pruned lazily on `reserve`.
 - **Crash recovery:** a durable `inflight` reservation whose run neither recorded nor released it (only cause: a process crash *during* the hook) is reclaimable after a `15 min` `inflight_lease_seconds` lease, so the provider's post-restart retry re-runs instead of being deduplicated for the full TTL. `recorded` keys are never touched by the lease.
 - On any failure to build the SQLite store, the gateway falls back to in-memory so inbound delivery keeps working (a warning is logged). On fallback it also **records a durability-degraded fact** (`owner_kind="gateway"`, `owner_id="durability:idempotency"`) — visible in `praisonai gateway status` and `health()["degraded_owners"]` with `retry_hint="praisonai gateway doctor --fix"`. The reason is redacted (the raw store path stays in the log). The fact **clears automatically** the moment the durable store comes up (fresh start or hot-reload). See [Gateway State Durability](/features/gateway-durability) and [Degraded Capabilities](/features/gateway-degraded-capabilities).
+- Selecting `"redis"` is honoured as *intent*, not as a working cross-replica backend. The wrapper falls back to the durable SQLite store, logs a `warning` (path-redacted), and records `durability:idempotency` with reason `"redis idempotency backend not available (running per-replica)"`. If the SQLite fallback *also* fails, the more severe `"...unavailable (running in-memory)"` fact wins — the milder "per-replica" reason never masks the loss of restart durability. Cross-restart dedup still holds; cross-replica dedup holds **only** when replicas share the same SQLite state file. See [Multi-replica gateways](#multi-replica-gateways-and-store_backend-redis).
 
 <Note>
-For a custom store, implement `IdempotencyStoreProtocol` and inject it — the memory and SQLite backends are the two built-ins.
+For a custom store, implement `IdempotencyStoreProtocol` and inject it — the memory and SQLite backends are the two built-ins. See the [`IdempotencyStoreProtocol` reference](/docs/sdk/reference/praisonaiagents/classes/IdempotencyStoreProtocol).
 </Note>
+
+### Multi-replica gateways and `store_backend: redis`
+
+Operators running multiple gateway replicas often set `store_backend: redis` to mirror the [`RedisTurnLock`](/features/gateway-turn-lock) and get cross-replica dedup — but no Redis idempotency backend is implemented in the wrapper yet.
+
+What the wrapper does today when you set `"redis"`:
+
+- Falls back to the **durable SQLite** store, so dedup still survives restart and is cross-replica when the state file is shared.
+- Records a `durability:idempotency` degraded fact with reason `"redis idempotency backend not available (running per-replica)"`.
+- Emits an operator-facing `warning` log (path-redacted).
+- Keeps the more severe `"...unavailable (running in-memory)"` fact if the SQLite fallback *also* fails.
+
+<Warning>
+If a message is fanned out to two replicas that do **not** share the SQLite state file, the agent turn can run twice — duplicate replies, duplicate tool side effects, duplicate billing. The green surface you see without checking `health()` hides this.
+</Warning>
+
+Check the downgrade with any of:
+
+```bash
+praisonai gateway status
+praisonai gateway doctor
+```
+
+Or read `health()["degraded_owners"]` in-process.
+
+```yaml
+# Multi-replica gateway that wants cross-replica dedup.
+# Today (until the Redis idempotency backend ships) this falls back to durable
+# SQLite and records a `durability:idempotency` degraded fact — visible in
+# `praisonai gateway status` and `health()["degraded_owners"]`.
+hooks:
+  idempotency:
+    store_backend: redis
+  hooks:
+    - path: gmail
+      agent: assistant
+```
+
+The resulting `health()` snippet:
+
+```json
+{
+  "degraded_owners": [
+    {
+      "owner_kind": "gateway",
+      "owner_id": "durability:idempotency",
+      "reason": "redis idempotency backend not available (running per-replica)",
+      "retry_hint": "praisonai gateway doctor --fix"
+    }
+  ]
+}
+```
+
+```mermaid
+graph TB
+    subgraph "store_backend: redis (today)"
+        Op[⚙️ Operator sets store_backend: redis] --> Try{🔍 Redis backend<br/>implemented?}
+        Try -->|No — not yet| SQ[🗄️ Durable SQLite fallback<br/>cross-restart · cross-replica<br/>only if state file shared]
+        SQ --> Deg[⚠️ record_durability_degraded<br/>durability:idempotency<br/>&quot;running per-replica&quot;]
+        Deg --> Health[🩺 health.degraded_owners]
+    end
+
+    classDef op fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef store fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Op op
+    class Try check
+    class SQ store
+    class Deg,Health warn
+```
+
+**Workaround until a real Redis backend ships:** share the SQLite state directory across replicas (so the durable dedup key is common to all replicas), or run a single replica for ingress.
 
 **Hot-reload:** flipping `store_backend` via `reload_config` rebuilds the store lazily on the next `reserve`. See [Gateway Hot-Reload](/features/gateway-hot-reload).
 
