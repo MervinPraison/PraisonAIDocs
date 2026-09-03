@@ -45,7 +45,7 @@ The fixture spawns the real contract against a deliberately broken adapter, one 
 node adapters/src/conformance/contract-fixture.ts <mode>
 ```
 
-The ten break modes plus the `none` control:
+The break modes plus the `none` control:
 
 ```
 secrets_slot_only
@@ -53,6 +53,8 @@ secrets_empty_is_absent
 storage_missing_is_undefined
 storage_namespaces_collide
 storage_empty_is_absent
+storage_torn_write
+storage_forgets_on_relaunch
 time_every_fires_once
 time_clear_does_nothing
 time_unsubscribe_does_nothing
@@ -63,7 +65,7 @@ none
 </Step>
 
 <Step title="Check the floor and the control">
-`contracts.test.ts` counts passing cases from a real `none` run and asserts a floor per contract: secrets ≥ 9, storage ≥ 11, time ≥ 8, shell ≥ 35. The `none` control must pass green, so a fixture that failed for an unrelated reason cannot masquerade as proof.
+`contracts.test.ts` counts passing cases from a real `none` run and asserts a floor per contract: secrets ≥ 9, storage ≥ 15, time ≥ 8, shell ≥ 35. The `none` control must pass green, so a fixture that failed for an unrelated reason cannot masquerade as proof.
 </Step>
 
 <Step title="Wire the assertion ledger">
@@ -216,7 +218,7 @@ See [Shell & Adapters → The two-source keyboard model](/features/mobile/shell-
 
 ---
 
-## The Ten Break Modes
+## The Break Modes
 
 Each mode breaks an adapter in one named way, and the matching contract case must go red by name. Two of the modes are shell modes — the shell contract now spawns its own break modes, on top of the case-count floor that still complements them.
 
@@ -227,6 +229,8 @@ Each mode breaks an adapter in one named way, and the matching contract case mus
 | `storage_missing_is_undefined` | `a missing key reads as null, never undefined` |
 | `storage_namespaces_collide` | `namespaces are isolated` |
 | `storage_empty_is_absent` | `an empty string is a value, not an absence` |
+| `storage_torn_write` | `a concurrent read never sees a torn value` |
+| `storage_forgets_on_relaunch` | `a written value survives a relaunch` |
 | `time_every_fires_once` | `every() repeats, rather than firing once` |
 | `time_clear_does_nothing` | `a cleared timer does not fire` |
 | `time_unsubscribe_does_nothing` | `the unsubscribe actually stops it` |
@@ -237,6 +241,39 @@ A `none` control runs unbroken, so a fixture that failed for an unrelated reason
 
 ---
 
+## The storage contract now has atomicity and relaunch cases
+
+The two new storage break modes have teeth because the contract itself grew two new dimensions (`adapters/src/conformance/storage-contract.ts`):
+
+| Break mode | What it does | The case it must redden |
+|---|---|---|
+| `storage_torn_write` | Truncate → yield → fill — exactly what `fs::write` does | `a concurrent read never sees a torn value` |
+| `storage_forgets_on_relaunch` | The store loses all data across a "relaunch" | `a written value survives a relaunch` |
+
+- **Atomicity.** Concurrent writers against a live reader; every observation must be a whole payload or absent, never a prefix. This is what a durable adapter must pass to be **drop-in for the web adapter**. A control assertion requires the reader to have observed *something* — a reader that saw nothing would report no tearing while proving nothing.
+- **Relaunch.** Three cases — a value, the chat list, and a deletion each survive a **second port over the same backing store**, supplied by an optional `reopen`. A store that persisted writes but forgot deletes would resurrect a conversation the user deliberately removed, which is worse than losing one. This is what a durable adapter must pass to be **durable**. The in-memory fake does not claim durability, so it is not asked to reopen.
+
+The ledger count follows `time-contract.ts`'s conditional-branch precedent: `EXPECTED_ASSERTIONS = 17`, plus `DURABLE_ASSERTIONS = 3` **when the adapter supplies `reopen`** — `17 + 3 when durable`, up from `15`. A contract cannot quietly shrink: the last case asserts the exact total and reddens by name if an assertion is deleted.
+
+<Note>
+The three relaunch cases are why the `crash-recovery.test.ts` relaunch proof one layer up means anything — they decide, at the adapter level, that "Your conversations are saved" is not a lie. See [Chat Recovery → What a relaunch preserves](/features/mobile/chat-recovery#what-a-relaunch-preserves).
+</Note>
+
+---
+
+## The Tauri storage adapter {#the-tauri-storage-adapter}
+
+`createTauriStorage` is run against the **same** `StoragePort` conformance contract as the web adapter, through a **strict** stand-in host that throws on an unknown command or a missing argument. That proves the *adapter* — command names, argument names, reply handling, namespacing — and **not** that the filesystem is atomic. The filesystem is `store.rs`'s own tests, where there is a real disk to interrupt.
+
+| Proved by the contract (a stubbed strict host) | Proved by `store.rs` tests (a real disk) |
+|---|---|
+| A written value reads back exactly; `listIds` returns only its own namespace | The four-step atomic write path, torn-write behaviour, relaunch durability |
+| The five command names and argument names agree across the seam (`tools/storage-seam.test.mjs`) | Id encoding, namespace allowlist, case-insensitive-filesystem safety |
+
+A native host stores chats in the **native** store, not `localStorage` — pinned by `a native host stores chats in the NATIVE store, not localStorage`, and by the paired `tauri storage: a written value reads back exactly` with `listIds returns only its own namespace`.
+
+---
+
 ## The Shrink Floor
 
 A case with no break mode could still be deleted, so `contracts.test.ts` counts passing cases from a **real** run of the fixture — not a regex over source text — and asserts a floor.
@@ -244,15 +281,15 @@ A case with no break mode could still be deleted, so `contracts.test.ts` counts 
 | contract | floor |
 |---|---|
 | secrets | ≥ 9 cases |
-| storage | ≥ 11 cases |
+| storage | ≥ 15 cases |
 | time | ≥ 8 cases |
 | shell | ≥ 35 cases |
 
 Raise these numbers when you add cases. A drop means a contract lost coverage, and that is exactly the event worth a red build. Re-derive each per-contract floor from a real `none` run rather than adding by hand — a new break mode targets an existing case in some contracts and a fresh case in others.
 
-A separate guard pins the break-mode table itself: `ADAPTER_BREAKS.length >= 13`, raised from `>= 9` when the four new modes landed. This counts break-mode rows, not passing cases per contract, so it moves independently of the per-contract floors above.
+A separate guard pins the break-mode table itself: `ADAPTER_BREAKS.length >= 15`, raised as new modes land (`>= 13` before the two storage durability modes). This counts break-mode rows, not passing cases per contract, so it moves independently of the per-contract floors above.
 
-The shell contract now carries its own spawned break modes (`shell_scheme_case_sensitive`, `shell_negative_insets`) as well as this case-count floor, so the [Ten Break Modes](#the-ten-break-modes) table above covers every contract, shell included.
+The shell contract now carries its own spawned break modes (`shell_scheme_case_sensitive`, `shell_negative_insets`) as well as this case-count floor, so the [Break Modes](#the-break-modes) table above covers every contract, shell included.
 
 <Warning>
 Node 22 emits TAP when stdout is a pipe; Node 24 emits the spec reporter. The fixture is spawned with `--test-reporter=tap` so a test grepping for `not ok` behaves the same on both.
@@ -269,11 +306,11 @@ Each `describeXContract` takes its own `ledger()` and uses `counting.assert` in 
 | contract | expected assertions | notes |
 |---|---|---|
 | secrets | 16 | — |
-| storage | 15 | — |
+| storage | 17 (+ 3 when durable) | A durable adapter (one that supplies `reopen`) adds three relaunch assertions: a value, the chat list, and a deletion each survive a second port |
 | time    | 8 (+ 2 real-clock) | Real-clock adapters add two: `nowMs !== epochMs`-shaped cases |
 | shell   | 69 | — |
 
-The time contract's `realClock` branch adds two assertions, so it checks `EXPECTED_ASSERTIONS + (realClock ? REAL_CLOCK_ASSERTIONS : 0)` where `REAL_CLOCK_ASSERTIONS = 2`.
+Two contracts branch on a capability. The time contract's `realClock` branch adds two assertions (`REAL_CLOCK_ASSERTIONS = 2`); the storage contract's durable branch adds three (`DURABLE_ASSERTIONS = 3`), each checking `EXPECTED_ASSERTIONS + (capable ? EXTRA : 0)`.
 
 ### The ledger defends itself
 
