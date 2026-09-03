@@ -3511,7 +3511,7 @@ class WebSocketGateway:
 
     @staticmethod
     async def _dispatch_agent_turn(
-        agent: Any, content: str, interrupt: Any = None
+        agent: Any, content: str, interrupt: Any = None, on_complete: Any = None
     ) -> Any:
         """Execute a single agent turn.
 
@@ -3530,12 +3530,31 @@ class WebSocketGateway:
         controller would let one session's abort/timeout interrupt another. A
         legacy fallback stamps ``agent.interrupt_controller`` only for agents
         whose entry point does not accept ``cancel_token``.
+
+        Issue #4656: ``on_complete(agent)`` — when supplied — is invoked
+        **synchronously in the same execution context that produced the turn's
+        result, before that context is handed back to the loop**. For a
+        sync-only agent this runs *inside the worker thread* right after
+        ``agent.chat`` returns, so per-turn state the agent stores on shared,
+        mutable attributes (e.g. ``llm.last_token_metrics``) is snapshotted for
+        *this* turn before any concurrent turn — on another worker thread or a
+        later event-loop tick — can overwrite it. This closes the cross-request
+        usage-misattribution race for the sync ``chat`` fallback (Greptile/Qodo
+        P1). The callback must be non-blocking and must not raise; its return
+        value is ignored.
         """
         _kw = {"cancel_token": interrupt} if interrupt is not None else {}
 
+        def _snapshot() -> None:
+            if on_complete is not None:
+                try:
+                    on_complete(agent)
+                except Exception:
+                    pass
+
         async def _call_async(fn: Any) -> Any:
             try:
-                return await fn(content, **_kw)
+                result = await fn(content, **_kw)
             except TypeError:
                 if not _kw:
                     raise
@@ -3543,7 +3562,11 @@ class WebSocketGateway:
                 # attribute for this turn (best-effort, non-isolated).
                 if hasattr(agent, "interrupt_controller"):
                     agent.interrupt_controller = interrupt
-                return await fn(content)
+                result = await fn(content)
+            # No ``await`` between the turn completing and the snapshot: the
+            # single-threaded loop cannot run another turn in between.
+            _snapshot()
+            return result
 
         for _name in ("arun", "achat"):
             _fn = getattr(agent, _name, None)
@@ -3554,13 +3577,18 @@ class WebSocketGateway:
 
         def _call_sync() -> Any:
             try:
-                return agent.chat(content, **_kw)
+                result = agent.chat(content, **_kw)
             except TypeError:
                 if not _kw:
                     raise
                 if hasattr(agent, "interrupt_controller"):
                     agent.interrupt_controller = interrupt
-                return agent.chat(content)
+                result = agent.chat(content)
+            # Snapshot in *this* worker thread, immediately after the turn
+            # produced its result, before the thread returns to the pool and a
+            # concurrent turn can overwrite the agent's shared metrics.
+            _snapshot()
+            return result
 
         return await loop.run_in_executor(None, _call_sync)
 
@@ -7518,6 +7546,33 @@ class WebSocketGateway:
         elif hasattr(bot, "_identity_resolver"):
             bot._identity_resolver = resolver
 
+    def _build_turn_lock_map(self) -> Any:
+        """Build the gateway's per-turn lock backend from config (Issue #4655).
+
+        Honours ``gateway.turn_lock.backend``: the default ``"local"`` returns a
+        plain in-process ``LockMap`` (today's behaviour, byte-for-byte), while
+        ``"redis"`` returns a ``RedisTurnLock`` reusing the push ``RedisConfig``
+        so turns serialise cluster-wide across replicas. Construction fails open
+        (local fallback + a degraded record) so an outage never wedges startup.
+        """
+        cfg = getattr(self, "config", None)
+        turn_lock = getattr(cfg, "turn_lock", None)
+        push = getattr(cfg, "push", None)
+        redis_config = getattr(push, "redis", None)
+        try:
+            from ..bots._redis_turn_lock import build_turn_lock
+
+            return build_turn_lock(
+                turn_lock,
+                redis_config,
+                degraded_registry=getattr(self, "_degraded_registry", None),
+            )
+        except Exception as e:  # pragma: no cover - defensive: never block startup
+            logger.warning("Failed to build turn lock backend: %s", e)
+            from .._lockmap import LockMap
+
+            return LockMap()
+
     def _stamp_turn_lock_map(self, bot: Any) -> None:
         """Share one per-turn ``LockMap`` with a channel bot (Issue #3232).
 
@@ -7538,12 +7593,19 @@ class WebSocketGateway:
         ``start_channels`` and ``_start_single_channel`` (hot-reload) so a
         restarted channel keeps sharing the same lock map.
         """
-        if getattr(self, "_identity_resolver", None) is None:
+        # A local backend only unifies distinct channels onto one session when an
+        # identity resolver is configured (Issue #3232), so without a resolver it
+        # stays a no-op and each channel keeps its own map (today's behaviour). A
+        # distributed (``redis``) backend, however, must serialise across replicas
+        # of even a *single* channel, so it is wired unconditionally (Issue #4655).
+        cfg = getattr(self, "config", None)
+        turn_lock_cfg = getattr(cfg, "turn_lock", None)
+        distributed = bool(getattr(turn_lock_cfg, "enabled", False))
+        if getattr(self, "_identity_resolver", None) is None and not distributed:
             return
         lock_map = getattr(self, "_turn_lock_map", None)
         if lock_map is None:
-            from .._lockmap import LockMap
-            lock_map = LockMap()
+            lock_map = self._build_turn_lock_map()
             self._turn_lock_map = lock_map
         sess = (
             getattr(bot, "_session", None)

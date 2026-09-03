@@ -13,10 +13,17 @@ Supported formats:
     "*/10s"                   → every 10s
     "3600"                    → every 3600s (raw seconds)
     "cron:0 7 * * *"          → cron expression
-    "at:2026-03-01T09:00:00"  → one-shot ISO timestamp
+    "at:2026-03-01T09:00:00"  → one-shot ISO timestamp (naive = wall clock in
+                                the schedule tz / PRAISONAI_SCHEDULE_TIMEZONE /
+                                the local zone; stored with that zone attached)
     "in 20 minutes"           → one-shot ~20min from now
+    "at 9am"                  → one-shot next 09:00
+    "every day at 9am"        → daily at 09:00 (cron)
+    "weekdays at 9am"         → Mon-Fri at 09:00 (cron)
+    "every monday 9am"        → day-of-week at clock time (cron)
 """
 
+import os
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -44,6 +51,140 @@ _UNIT_MULTIPLIER = {
     "h": 3600, "hr": 3600, "hour": 3600, "hours": 3600,
 }
 
+# Day-of-week names → cron day field (0 or 7 = Sunday). Aliases map to ranges.
+_NL_DOW = {
+    "sunday": "0", "sun": "0",
+    "monday": "1", "mon": "1",
+    "tuesday": "2", "tue": "2", "tues": "2",
+    "wednesday": "3", "wed": "3",
+    "thursday": "4", "thu": "4", "thur": "4", "thurs": "4",
+    "friday": "5", "fri": "5",
+    "saturday": "6", "sat": "6",
+    "weekday": "1-5", "weekdays": "1-5",
+    "weekend": "0,6", "weekends": "0,6",
+}
+
+# Clock time, e.g. "9am", "9:30pm", "17:00", "9 am".
+_CLOCK_RE = re.compile(
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?",
+    re.IGNORECASE,
+)
+
+
+def _parse_clock(text: str):
+    """Parse a clock-time fragment into ``(hour, minute)`` or ``None``."""
+    m = _CLOCK_RE.fullmatch(text.strip())
+    if not m:
+        return None
+    hour = int(m.group("hour"))
+    minute = int(m.group("minute") or 0)
+    ampm = (m.group("ampm") or "").lower()
+    if ampm:
+        if hour < 1 or hour > 12:
+            return None
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def _natural_to_cron(expr: str):
+    """Convert a natural-language schedule to a 5-field cron string.
+
+    Returns the cron string for recurring day-of-week / daily clock times,
+    or ``None`` when the expression is not a recurring NL form (callers then
+    fall through to the one-shot / interval / cron paths).
+    """
+    lower = expr.lower().strip()
+    lower = re.sub(r"^every\s+", "", lower)
+    lower = re.sub(r"(?:^|\s)(?:at|on)\s+", " ", lower)
+    lower = re.sub(r"\s+", " ", lower).strip()
+    if not lower:
+        return None
+
+    # Drop filler words that carry no scheduling meaning once "every"/"at"/"on"
+    # have been stripped ("every day at 9am" -> daily; "each morning" unsupported).
+    _FILLER = {"day", "daily", "the", "of", "a"}
+    tokens = [t for t in lower.split(" ") if t and t not in _FILLER]
+    dow_parts = []
+    clock = None
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        # A comma-joined list of day names, e.g. "mon,wed,fri".
+        if "," in tok and all(d in _NL_DOW for d in tok.split(",") if d):
+            for d in tok.split(","):
+                if d:
+                    dow_parts.append(_NL_DOW[d])
+            i += 1
+            continue
+        if tok in _NL_DOW:
+            dow_parts.append(_NL_DOW[tok])
+            i += 1
+            continue
+        # Otherwise attempt a clock time, possibly split across two tokens
+        # ("9 am", "9:30 pm").
+        joined = tok
+        if i + 1 < len(tokens) and tokens[i + 1] in ("am", "pm"):
+            joined = tok + tokens[i + 1]
+            i += 1
+        parsed = _parse_clock(joined)
+        if parsed is None:
+            return None
+        if clock is not None:
+            return None
+        clock = parsed
+        i += 1
+
+    if clock is None:
+        return None
+    hour, minute = clock
+    dow = ",".join(dow_parts) if dow_parts else "*"
+    return f"{minute} {hour} * * {dow}"
+
+
+def _clock_to_next_at(hour: int, minute: int, tz: str | None) -> str:
+    """Return the next ISO timestamp for the given clock time (one-shot).
+
+    The clock time is a wall-clock reading in the schedule's zone -- the
+    explicit ``tz``, else ``PRAISONAI_SCHEDULE_TIMEZONE``, else the system's
+    local zone -- so ``at 9am`` typed in London fires at 09:00 London time,
+    not 09:00 UTC. The result is always timezone-aware, so ``is_due()`` never
+    has to guess which zone the person meant.
+    """
+    from .due import localize_wall_clock, resolve_schedule_timezone
+
+    name = tz or os.environ.get("PRAISONAI_SCHEDULE_TIMEZONE")
+    now = datetime.now(resolve_schedule_timezone(name)) if name else datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    # Re-localise a naive (local-zone) target so its offset is the one in
+    # force on the target date, not the one in force right now (DST edges).
+    return localize_wall_clock(target, tz).isoformat()
+
+
+def _cron_schedule(cron_expr: str, tz: str | None) -> Schedule:
+    """Build a cron Schedule, refusing if nothing can evaluate it.
+
+    ``is_due()`` returns False for a cron job when ``croniter`` is missing --
+    a log line, no error, a job that never runs. A schedule the runtime
+    cannot evaluate must be rejected here, where the user can still see the
+    answer, not accepted and ignored. Every natural-language recurring form
+    ("every day at 9am") arrives through this path.
+    """
+    try:
+        import croniter  # noqa: F401  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise ValueError(
+            f"Schedule {cron_expr!r} needs the cron engine, which is not "
+            "installed. Install with: pip install croniter"
+        ) from exc
+    return Schedule(kind="cron", cron_expr=cron_expr, tz=tz)
+
 
 def parse_schedule(expr: str, tz: str | None = None) -> Schedule:
     """Parse a schedule expression string into a ``Schedule`` object.
@@ -68,13 +209,23 @@ def parse_schedule(expr: str, tz: str | None = None) -> Schedule:
         cron_expr = expr[5:].strip()
         if not cron_expr:
             raise ValueError("Empty cron expression after 'cron:' prefix")
-        return Schedule(kind="cron", cron_expr=cron_expr, tz=tz)
+        return _cron_schedule(cron_expr, tz)
 
-    # At prefix (ISO timestamp)
+    # At prefix (ISO timestamp). A naive timestamp is the user's wall clock:
+    # stamp it with the schedule tz / PRAISONAI_SCHEDULE_TIMEZONE / local zone
+    # now, so the stored value names an unambiguous instant and is_due() never
+    # has to guess. An explicit offset in the string is kept as written.
     if lower.startswith("at:"):
         at_str = expr[3:].strip()
         if not at_str:
             raise ValueError("Empty timestamp after 'at:' prefix")
+        try:
+            parsed = datetime.fromisoformat(at_str)
+        except ValueError:
+            parsed = None  # unparseable: stored verbatim, is_due() logs it
+        if parsed is not None:
+            from .due import localize_wall_clock
+            at_str = localize_wall_clock(parsed, tz).isoformat()
         return Schedule(kind="at", at=at_str, tz=tz)
 
     # Interval pattern: */30m, */6h, */10s
@@ -102,7 +253,25 @@ def parse_schedule(expr: str, tz: str | None = None) -> Schedule:
     except ValueError:
         pass
 
+    # Natural-language clock-time / day-of-week expressions:
+    #   "at 9am"            → one-shot next 09:00
+    #   "every day at 9am"  → daily at 09:00 (cron)
+    #   "weekdays at 9am"   → Mon-Fri at 09:00 (cron)
+    #   "every monday 9am"  → day-of-week at clock time (cron)
+    # A bare clock time with no day / "every" is treated as a one-shot; any
+    # recurring form ("every ...", "daily ...", a day-of-week) maps to cron.
+    cron_expr = _natural_to_cron(expr)
+    if cron_expr is not None:
+        has_dow = cron_expr.rsplit(" ", 1)[-1] != "*"
+        recurring = has_dow or bool(re.match(r"(?i)^\s*(every|daily|each)\b", expr))
+        if recurring:
+            return _cron_schedule(cron_expr, tz)
+        minute, hour = cron_expr.split(" ")[:2]
+        at = _clock_to_next_at(int(hour), int(minute), tz)
+        return Schedule(kind="at", at=at, tz=tz)
+
     raise ValueError(
         f"Unrecognised schedule expression: {expr!r}. "
-        "Use 'hourly', 'daily', '*/30m', 'cron:EXPR', 'at:ISO', or 'in N minutes'."
+        "Use 'hourly', 'daily', '*/30m', 'cron:EXPR', 'at:ISO', 'in N minutes', "
+        "'at 9am', 'every day at 9am', 'weekdays at 9am', or 'every monday 9am'."
     )

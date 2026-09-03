@@ -4423,15 +4423,46 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         # Execute batch and add results to conversation
                         # (forward optional per-tool timeout)
+                        # ``time`` is re-imported locally further down this
+                        # function, which makes the module-level name unbound
+                        # here; use a distinct alias.
+                        from time import perf_counter as _perf_counter
+                        _batch_started = _perf_counter()
                         tool_results = executor.execute_batch(
                             tool_calls_batch, execute_tool_fn,
                             timeout_ms=self.tool_timeout_ms,
                         )
+                        _batch_elapsed = _perf_counter() - _batch_started
                         
                         for tool_result in tool_results:
                             # Register any deferred handle so its eventual
                             # background result is re-injected, not lost.
                             self._register_deferred_if_any(tool_result)
+                            # Fire the 'tool_call' display callback exactly as
+                            # the non-streaming loop does, so streaming UIs
+                            # see tool activity (Issue #4716). Best-effort: a
+                            # callback error must never break the stream.
+                            try:
+                                if tool_result.result is None:
+                                    _result_str = None
+                                else:
+                                    try:
+                                        _result_str = json.dumps(tool_result.result)
+                                    except (TypeError, ValueError):
+                                        _result_str = str(tool_result.result)
+                                _get_display_functions()['execute_sync_callback'](
+                                    'tool_call',
+                                    message=f"Calling function: {tool_result.function_name}",
+                                    tool_name=tool_result.function_name,
+                                    tool_input=tool_result.arguments,
+                                    tool_output=_result_str[:200] if _result_str else None,
+                                    # Only the batch is timed; per-tool timing
+                                    # is not available from the executor.
+                                    elapsed_time=_batch_elapsed if len(tool_results) == 1 else None,
+                                    success=tool_result.error is None,
+                                )
+                            except Exception as _cb_error:
+                                logging.debug(f"tool_call callback failed for '{tool_result.function_name}': {_cb_error}")
                             if tool_result.error is None:
                                 # Successful execution
                                 tool_message = self._create_tool_message(
@@ -4580,6 +4611,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         execute_tool_fn: Optional[Callable] = None,
         max_tool_calls_per_turn: int = 10,  # Loop guardrails
         stream: bool = True,
+        parallel_tool_calls: bool = False,
         **kwargs
     ) -> str:
         """Async version of get_response with identical functionality."""
@@ -4605,6 +4637,36 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         msgs.append({"role": "user", "content": f"[steering] {note}"})
             except Exception as _steer_err:
                 logging.debug(f"Steering drain failed (ignored): {_steer_err}")
+
+        async def _dispatch_tool_batch(dispatch_specs, iteration_index):
+            """Run a batch of (function_name, arguments, tool_call_id) dispatches.
+
+            When ``parallel_tool_calls`` is set, the independent tool coroutines
+            are awaited concurrently via ``asyncio.gather`` (mirroring the sync
+            path's ``create_tool_call_executor(parallel=True)``); otherwise they
+            run one-at-a-time. Results are always returned in the original call
+            order so the existing message-building loop stays unchanged.
+            """
+            if parallel_tool_calls and len(dispatch_specs) > 1:
+                # return_exceptions=True so a single failing tool does not cancel
+                # its still-in-flight siblings and orphan their coroutines (the
+                # exact leak class this PR fixes). We then re-raise the first
+                # error after every sibling has settled, preserving the
+                # sequential path's fail-fast propagation semantics.
+                gathered = await asyncio.gather(*(
+                    _dispatch_async_tool(execute_tool_fn, fn, args, tc_id, iteration_index)
+                    for (fn, args, tc_id) in dispatch_specs
+                ), return_exceptions=True)
+                for item in gathered:
+                    if isinstance(item, BaseException):
+                        raise item
+                return gathered
+            results = []
+            for (fn, args, tc_id) in dispatch_specs:
+                results.append(await _dispatch_async_tool(
+                    execute_tool_fn, fn, args, tc_id, iteration_index
+                ))
+            return results
 
         try:
             import litellm
@@ -4789,6 +4851,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             tool_calls = tool_calls[:remaining_calls]
                             logging.warning(f"Limiting batch to {remaining_calls} tool calls to stay within limit of {max_tool_calls_per_turn}.")
                         
+                        # Pre-resolve each tool call, then dispatch the valid ones
+                        # as a batch (concurrently when parallel_tool_calls is set).
+                        _parsed_calls = []
+                        _dispatch_specs = []
                         for tool_call in tool_calls:
                             function_name, arguments, tool_call_id = self._extract_tool_call_info(tool_call)
                             if self._tool_arguments_parse_failed(arguments):
@@ -4796,13 +4862,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 messages.append(self._tool_parse_error_message(function_name, tool_call_id))
                                 continue
                             logging.debug(f"[RESPONSES_API_ASYNC] Executing tool {function_name}")
-                            tool_result = await _dispatch_async_tool(
-                                execute_tool_fn,
-                                function_name,
-                                arguments,
-                                tool_call_id,
-                                iteration_count,
-                            )
+                            _parsed_calls.append((function_name, arguments, tool_call_id))
+                            _dispatch_specs.append((function_name, arguments, tool_call_id))
+                        _batch_results = await _dispatch_tool_batch(_dispatch_specs, iteration_count)
+                        for (function_name, arguments, tool_call_id), tool_result in zip(_parsed_calls, _batch_results):
                             tool_call_count += 1  # Increment tool call counter for guardrails
                             accumulated_tool_results.append(tool_result)
 
@@ -5041,6 +5104,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # flushed only AFTER every tool reply for this assistant
                     # turn, keeping all tool replies consecutive (provider contract).
                     _deferred_media_followups: List[Dict[str, Any]] = []
+                    # First pass: parse/validate every call and record a plan so
+                    # the valid dispatches can be batched (concurrently when
+                    # parallel_tool_calls is set) while preserving call order.
+                    _call_plan = []  # ('error', msg) | ('call', fn, args, tc_id)
+                    _dispatch_specs = []
                     for tool_call in tool_calls:
                         # Handle both object and dict access patterns
                         is_ollama = self._is_ollama_provider()
@@ -5048,20 +5116,24 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
                         if self._tool_arguments_parse_failed(arguments):
                             # Do NOT dispatch with {}: surface a retryable error.
-                            messages.append(self._tool_parse_error_message(function_name, tool_call_id))
+                            _call_plan.append(('error', self._tool_parse_error_message(function_name, tool_call_id)))
                             continue
 
                         # Validate and filter arguments for Ollama provider
                         if is_ollama and tools:
                             arguments = self._validate_and_filter_ollama_arguments(function_name, arguments, tools)
 
-                        tool_result = await _dispatch_async_tool(
-                            execute_tool_fn,
-                            function_name,
-                            arguments,
-                            tool_call_id,
-                            iteration_count,
-                        )
+                        _call_plan.append(('call', function_name, arguments, tool_call_id))
+                        _dispatch_specs.append((function_name, arguments, tool_call_id))
+
+                    _batch_results = await _dispatch_tool_batch(_dispatch_specs, iteration_count)
+                    _result_iter = iter(_batch_results)
+                    for _plan in _call_plan:
+                        if _plan[0] == 'error':
+                            messages.append(_plan[1])
+                            continue
+                        _, function_name, arguments, tool_call_id = _plan
+                        tool_result = next(_result_iter)
                         tool_call_count += 1  # Increment tool call counter for guardrails
                         tool_results.append(tool_result)  # Store the result
                         accumulated_tool_results.append(tool_result)  # Accumulate across iterations
@@ -5746,10 +5818,39 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         """Set the current agent name for token tracking."""
         self.current_agent_name = agent_name
 
+    def _resolve_openai_compatible_model(self) -> str:
+        """Route a bare model name through the OpenAI-compatible client.
+
+        When a custom ``base_url`` is set but the model has no ``provider/``
+        prefix (e.g. ``deepseek-v4-flash`` against an OpenAI-compatible host),
+        LiteLLM cannot infer a provider and raises "LLM Provider NOT provided".
+        Prefixing ``openai/`` makes LiteLLM use its OpenAI Chat Completions
+        client against the supplied ``base_url``. Anthropic/Gemini/Ollama models
+        are left untouched so their native adapters still apply.
+
+        The effective base_url is either the instance ``base_url`` or one
+        injected by a subscription auth provider (e.g. qwen-cli/codex resolve a
+        Chat-Completions host at request time). Both paths need routing so a
+        bare model under subscription auth does not reach LiteLLM unprefixed.
+        """
+        model = self.model
+        if not isinstance(model, str) or "/" in model:
+            return model
+        effective_base_url = self.base_url
+        if not effective_base_url:
+            creds = self._resolve_subscription_creds()
+            if creds and getattr(creds, "base_url", None):
+                effective_base_url = creds.base_url
+        if not effective_base_url:
+            return model
+        if self._detect_provider() != "openai":
+            return model
+        return f"openai/{model}"
+
     def _build_completion_params(self, **override_params) -> Dict[str, Any]:
         """Build parameters for litellm completion calls with all necessary config"""
         params = {
-            "model": self.model,
+            "model": self._resolve_openai_compatible_model(),
         }
         
         # Add optional parameters if they exist
@@ -6061,7 +6162,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
           - tools → ``tools`` (Responses API uses same function schema)
           - temperature, max_tokens, etc. → direct pass-through
         """
-        params: Dict[str, Any] = {"model": self.model}
+        params: Dict[str, Any] = {"model": self._resolve_openai_compatible_model()}
 
         # ── Extract system instructions ─────────────────────────────────
         instructions = None
