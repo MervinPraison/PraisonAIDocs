@@ -6,18 +6,26 @@ icon: "shield-check"
 ---
 
 ```python
-from praisonaiagents.background.job_manager import BackgroundJobManager
+from praisonaiagents import Agent
 
-# Your app supplies a store that implements the BackgroundJobStore protocol
-manager = BackgroundJobManager(store=my_store)
+# Background subagent deliver-back — durable out of the box.
+# If the process restarts mid-job, the deliver-back is replayed on
+# the next boot from <PRAISONAI_HOME>/background_jobs.db.
+agent = Agent(
+    name="Researcher",
+    instructions="Do long-running research and hand back a summary.",
+)
 
-# Once at startup, after wiring the deliver-back handler:
-counts = manager.reconcile_on_start(redeliver=on_job_complete)
+result_id = agent.spawn_subagent(
+    task="Summarise the last week of arXiv AI papers",
+    background=True,
+    deliver="chat",
+)
 ```
 
 Durable background jobs persist every state transition so a crash mid-job no longer silently drops the work or the promised deliver-back — orphans become a queryable `LOST` state and undelivered results are replayed on the next boot.
 
-Durability is opt-in: leave `store=None` (the default) for pure in-memory behaviour with zero overhead; supply a store and jobs survive a restart.
+Durability is **on by default**: the shared manager returned by `get_job_manager()` — the same one the chat `/tasks` command and background subagent deliver-backs use — automatically persists to `<runs_dir>/background_jobs.db` and reconciles on boot. Opt out with `PRAISONAI_BACKGROUND_JOB_STORE=0` for the prior pure in-memory behaviour.
 
 ```mermaid
 graph LR
@@ -43,23 +51,60 @@ graph LR
     class Crash,Lost warn
 ```
 
+Three ways to reach durability — pick the row that matches your setup.
+
+```mermaid
+graph TB
+    Start[👤 Need background jobs?] --> Q1{Using<br/>get_job_manager?}
+    Q1 -->|Yes ✅| Default[💾 Durable by default<br/>SqliteBackgroundJobStore<br/>at &lt;runs_dir&gt;/background_jobs.db]
+    Q1 -->|No, custom manager| Q2{Need durability?}
+    Q2 -->|Yes| Custom[🧩 Pass store=SqliteBackgroundJobStore&#40;&#41;<br/>or your own BackgroundJobStore]
+    Q2 -->|No| Mem[⚡ store=None — in-memory only]
+    Default --> OptOut[🔌 Opt out:<br/>PRAISONAI_BACKGROUND_JOB_STORE=0]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef path fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef alt fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1,Q2 question
+    class Default,Custom path
+    class Mem alt
+    class OptOut config
+```
+
 ## Quick Start
 
 <Steps>
-<Step title="Enable persistence (opt-in)">
+<Step title="You already have durability">
 
-Pass a `store=` that implements the `BackgroundJobStore` protocol. Every job transition is now persisted:
+The shared manager returned by `get_job_manager()` is already backed by `SqliteBackgroundJobStore` and has already reconciled orphaned jobs on first construction — zero code, zero setup:
 
 ```python
+from praisonaiagents.background.job_manager import get_job_manager
+
+manager = get_job_manager()  # already backed by SqliteBackgroundJobStore
+                             # already ran reconcile_on_start() once
+```
+</Step>
+
+<Step title="Enable persistence on a custom manager">
+
+Building your own `BackgroundJobManager`? Pass `store=SqliteBackgroundJobStore()` (or any store implementing the `BackgroundJobStore` protocol). Every job transition is now persisted:
+
+```python
+from praisonaiagents.background import SqliteBackgroundJobStore
 from praisonaiagents.background.job_manager import BackgroundJobManager
 
-manager = BackgroundJobManager(store=my_store)
+manager = BackgroundJobManager(store=SqliteBackgroundJobStore())
 ```
 </Step>
 
 <Step title="Reconcile on startup">
 
-Call `reconcile_on_start()` once at boot, after wiring the deliver-back handler:
+`get_job_manager()` already ran this once. On a custom manager, call `reconcile_on_start()` once at boot, after wiring the deliver-back handler:
 
 ```python
 counts = manager.reconcile_on_start(redeliver=on_job_complete)
@@ -150,7 +195,7 @@ graph TB
 
 ## The BackgroundJobStore Protocol
 
-Implement this `@runtime_checkable` protocol to plug in your own durable store. A concrete SQLite implementation lives in the wrapper/bot layer alongside the other durable stores (`OutboundQueue`, DLQ, approvals).
+Implement this `@runtime_checkable` protocol to plug in your own durable store. A concrete SQLite implementation — `SqliteBackgroundJobStore` — now ships in core (`praisonaiagents.background`) and backs `get_job_manager()` by default; you only implement the protocol yourself for a non-SQLite backend.
 
 ```python
 from typing import Protocol, runtime_checkable, Optional, List
@@ -173,14 +218,66 @@ class BackgroundJobStore(Protocol):
 
 ---
 
+## Built-in SqliteBackgroundJobStore
+
+`SqliteBackgroundJobStore` is the concrete, stdlib-only store that backs `get_job_manager()` by default. Import it, or omit `db_path` to use the default location:
+
+```python
+from praisonaiagents.background import SqliteBackgroundJobStore
+
+# Default location: <runs_dir>/background_jobs.db (honours PRAISONAI_HOME)
+store = SqliteBackgroundJobStore()
+
+# In-memory database for tests
+test_store = SqliteBackgroundJobStore(db_path=":memory:")
+```
+
+| Aspect | Detail |
+|--------|--------|
+| Import | `from praisonaiagents.background import SqliteBackgroundJobStore` (or `from praisonaiagents.background.sqlite_store import SqliteBackgroundJobStore`) |
+| Constructor | `SqliteBackgroundJobStore(db_path: Optional[str] = None)` |
+| Default DB path | `<runs_dir>/background_jobs.db` — under `PRAISONAI_HOME`, alongside the run ledger and event log |
+| Tests | Pass `db_path=":memory:"` |
+| Extra method | `close()` closes the underlying connection |
+
+### Schema
+
+A single `background_jobs` table with an index on `status`:
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `job_id` | `TEXT` | Primary key |
+| `status` | `TEXT` | `pending` / `running` / `completed` / `failed` / `cancelled` / `lost` |
+| `created_at` | `REAL` | Spawn timestamp |
+| `started_at` | `REAL` | Nullable |
+| `completed_at` | `REAL` | Nullable |
+| `result` | `TEXT` | JSON-serialised job result |
+| `error` | `TEXT` | Nullable error string |
+| `origin` | `TEXT` | JSON-serialised deliver-back context |
+| `delivered` | `INTEGER` | `0`/`1` — deliver-back fired |
+
+Index: `idx_background_jobs_status` on `status`.
+
+### Thread-safety & durability posture
+
+A single re-entrant lock guards one shared connection opened `check_same_thread=False` — safe to share across the runner's worker threads. Durability matches its siblings `SQLiteRunLedger` and `SqliteEventLog`: WAL journal mode, `busy_timeout=5000`, `synchronous=NORMAL`.
+
+---
+
 ## Configuration
 
 | Symbol | Type | Default | Description |
 |--------|------|---------|-------------|
-| `store` | `Optional[BackgroundJobStore]` | `None` | Keyword-only. Enable persistence when supplied; pure in-memory when `None` |
+| `store` | `Optional[BackgroundJobStore]` | `None` | Keyword-only. Enable persistence when supplied; pure in-memory when `None`. `get_job_manager()` supplies a `SqliteBackgroundJobStore` automatically |
 | `JobStatus.LOST` | enum value | — | Terminal state for `RUNNING`/`PENDING` jobs interrupted by a crash |
 | `JobInfo.delivered` | `bool` | `False` | Whether the deliver-back to `origin` has fired |
 | `reconcile_on_start` | method | — | `reconcile_on_start(redeliver=None) -> Dict[str, int]` |
+
+### Environment variable
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `PRAISONAI_BACKGROUND_JOB_STORE` | `1` (on) | Set to `0` / `false` to force the shared `get_job_manager()` back to pure in-memory (no store attached, no reconcile). |
 
 ### Reconciliation counts
 
@@ -222,9 +319,9 @@ Run it once at boot, after all deliver-back handlers are wired — mirroring how
 `upsert()` is called from `BackgroundJobManager`'s worker threads. Guard shared state (or use a per-thread connection) so concurrent transitions don't corrupt the store.
 </Accordion>
 
-<Accordion title="Leave store=None when you don't need durability">
+<Accordion title="Opt out with the env var if you truly want in-memory">
 
-Persistence is opt-in. Omitting `store=` keeps the runner pure in-memory with zero overhead and unchanged behaviour — only reach for a store when surviving crashes matters.
+For the shared `get_job_manager()` the escape hatch is the environment variable, not the constructor kwarg — set `PRAISONAI_BACKGROUND_JOB_STORE=0` to get pure in-memory behaviour (no store, no reconcile). When you construct `BackgroundJobManager` yourself, omitting `store=` keeps that manager in-memory with zero overhead.
 </Accordion>
 </AccordionGroup>
 
