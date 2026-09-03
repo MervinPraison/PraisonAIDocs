@@ -49,6 +49,8 @@ Call `time.nowMs()` for delay budgets and elapsed measurements. Call `time.epoch
 const startedAt = time.nowMs();      // monotonic: for durations
 const writtenAt = time.epochMs();    // wall clock: for records
 ```
+
+This is what production now does — `deps.now` is not passed on the real device path, so `time.epochMs()` runs.
 </Step>
 
 <Step title="Poll or paint through a scheduler">
@@ -109,6 +111,24 @@ graph TB
 
 When the phone's clock is corrected mid-turn — a common event on a wake from sleep — a wall-clock elapsed measurement can jump backwards. The publish gate's `MAX_HELD_CHARS` and the coalescer's `maxDelayMs` are both measured against `nowMs`, so pacing stays sane through a correction. Records that need to be sortable across devices use `epochMs`.
 
+### The app now reads the port, not `Date.now()`
+
+`main.ts` now reads the wall clock through `TimePort.epochMs` and paces the announcer with the monotonic `nowMs` — until this landed the shipping app read `Date.now()` for both, and `TimePort.epochMs` was implemented, conformance-tested, and had **zero callers**.
+
+Every wall-clock read in `main.ts` was `Date.now()`: the chat record's `updated`, the chats-screen "now" argument to `buildChatList`, and — crucially — the `nowMs` passed to the screen-reader announcer.
+
+```ts
+// main.ts — the wall clock resolves through the port on the real device path.
+const writtenAt = nowEpochMs();       // platform.time.epochMs() in production
+const paced = announce(state, chunk, platform.time.nowMs()); // monotonic
+```
+
+The announcer's rate-limit `nowMs - lastStreamAtMs >= ANNOUNCE_INTERVAL_MS` is an **elapsed** comparison — exactly the conflation `core/src/ports/time.ts` says in as many words must not be fed a wall clock: *"Conflating them is how a clock correction mid-stream makes a coalescer wait forever."*
+
+<Warning>
+Feeding `Date.now()` into the announcer's elapsed comparison means a backwards NTP correction mid-answer silences every further streaming announcement until real time catches up with the pre-correction reading — a screen-reader user simply stops being told what the model is saying. The fix: wall clock comes from `nowEpochMs()` (which resolves to `platform.time.epochMs()` in production, or `deps.now` when passed in tests), and the announcer's `nowMs` is `platform.time.nowMs()`.
+</Warning>
+
 ---
 
 ## Executable Specification
@@ -125,6 +145,8 @@ The port's first conformance suite runs the same cases against the fake clock an
 | `an uncleared timer does fire` | The pair to the previous case; guards a `setTimer` that never fires and disables the gate's only escape from a stalled renderer. |
 | `requestFrame runs its callback` | The callback runs within a normal wait. Backed by `requestAnimationFrame` in the web adapter. |
 | `schedulers are independent` | Clearing one scheduler's timer must not clear another's. Enforces the "one per run" rule. |
+| `the WALL CLOCK is read through TimePort.epochMs, not Date.now` | A `Platform` whose `epochMs` returns a fixed value stamps that value on the chat record. The production path is exercised — no `now` dep is passed. |
+| `streaming announcements are paced by the MONOTONIC clock, not the wall clock` | A monotonic clock that advances during a stream that never ends still lets both finished sentences reach the polite live region — a wall-clock `Date.now()` there rate-limits the second announcement out. |
 
 <Note>
 The fake and the real adapter run the **same** cases. `every`'s period was found discarded in the fake in two separate rounds; a test that only ever drives the fake cannot see it a third time.
