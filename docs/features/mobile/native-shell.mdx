@@ -73,26 +73,42 @@ Four events go native → web, one command comes web → native. Every string be
 
 | Direction | Name (string literal) | Rust constant | Payload | Notes |
 |---|---|---|---|---|
-| Native → Web | `safe-area-changed` | `EVT_SAFE_AREA` | Insets object. **A payload carrying even one edge is applied, not discarded.** A payload with *no* edges at all = "re-read the CSS" (not "every inset is zero"). | Consumed by `coerceInsets` in `adapters/src/tauri/shell.ts` |
+| Native → Web | `safe-area-changed` | `EVT_SAFE_AREA` | Insets object. **A payload carrying even one edge is applied, not discarded.** A payload with *no* edges at all = "re-read the CSS" (not "every inset is zero"). Now emitted on `Resized` and `ScaleFactorChanged` with a **deliberately empty payload** — Tauri does not expose the insets, so the WebView re-reads the CSS `env()` variables it has already recomputed. | Consumed by `coerceInsets` in `adapters/src/tauri/shell.ts` |
 | Native → Web | `keyboard-height` | `EVT_KEYBOARD` | Number (px) | **`0` is a value, not an absence.** Must fire *through* the show/hide transition, not only at endpoints — or the composer teleports while the keyboard slides |
 | Native → Web | `lifecycle` | `EVT_LIFECYCLE` | `"active" \| "inactive" \| "background"` | Unrecognised phase is dropped by TS, never defaulted (defaulting to `active` would resume the render loop while the app is suspended) |
 | Native → Web | `back-gesture` | `EVT_BACK` | *(no payload)* | The handler takes no argument |
 | Web → Native | `back_gesture_result` | `CMD_BACK_RESULT` | `{ handled: boolean }` | Answered via `bridge.invoke`; failures are swallowed — see arbitration below (no capability entry — app commands via `invoke_handler` are always reachable) |
 
-The Tauri shell now falls back to `visualViewport` when the native `keyboard-height` event has not fired yet, and hands over to native the moment one arrives. On a device where `on_window_event` is still a stub, the composer still tracks the keyboard through the viewport reader. See [Shell & Adapters → The two-source keyboard model](/features/mobile/shell-and-adapters#the-two-source-keyboard-model).
+The Tauri shell now falls back to `visualViewport` when the native `keyboard-height` event has not fired yet, and hands over to native the moment one arrives. The `on_window_event` handler now emits `lifecycle` and `safe-area-changed` on device; only `keyboard-height` is still not natively emitted, so the composer continues to track it through the viewport reader. See [Shell & Adapters → The two-source keyboard model](/features/mobile/shell-and-adapters#the-two-source-keyboard-model).
 
 <Warning>
 Tauri exposes two different event channels. TypeScript subscribes via `plugin:event|listen`, which is Tauri's **event registry**. Only `Emitter::emit` reaches it. A Tauri mobile *plugin* calling `Plugin.trigger` hits a **completely separate** channel — nothing would fire and there would be no error. Use `Emitter::emit` from `on_window_event` or command handlers; do not switch to `Plugin.trigger`.
 </Warning>
 
 <Note>
-The native `keyboard-height` event does not fire yet in a production build. `on_window_event` in `lib.rs` is intentionally a stub in this shell ("no dead emit on desktop") — the contract and the arbitration are wired, the emit lines land once the mobile targets are initialised. The composer nonetheless tracks the keyboard on device: the Tauri shell reads `visualViewport` until the native event takes over.
+The native `keyboard-height` event does not fire yet — there is no Tauri window event for it, and this shell has not added an iOS `keyboardWillShow`/`Hide` or Android `WindowInsets` listener for it either. Every other event in the contract is now live natively. The Tauri shell reads `visualViewport` for the keyboard height until a native emitter lands, and would hand over the moment one arrives.
 </Note>
 
-The capability file `src-tauri/capabilities/default.json` grants the one permission this seam needs: `core:event:default`, so the webview can subscribe via `plugin:event|listen`. The `back_gesture_result` command is deliberately **not** listed — an app command registered through `invoke_handler` is always reachable and has no ACL entry to grant; naming one that does not exist fails `tauri-build` before the crate compiles.
+The capability file `src-tauri/capabilities/default.json` grants what this seam needs: `core:event:default`, so the webview can subscribe via `plugin:event|listen`, plus `opener:allow-open-url` and `opener:allow-default-urls` so `openExternal` actually reaches the OS. Without the `opener:*` scope every `http(s)`/`mailto`/`tel` URL is still refused. The `back_gesture_result` command is deliberately **not** listed — an app command registered through `invoke_handler` is always reachable and has no ACL entry to grant; naming one that does not exist fails `tauri-build` before the crate compiles.
+
+```json
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "windows": ["main"],
+  "platforms": ["android", "iOS", "macOS", "windows", "linux"],
+  "permissions": [
+    "core:event:default",
+    "opener:allow-open-url",
+    "opener:allow-default-urls"
+  ]
+}
+```
+
+The `platforms` array is explicit because every permission here exists on all five — the desktop dev build must not fail on it. A mobile-only grant belongs in its own capability scoped to its platform.
 
 <Warning>
-Do **not** add an `allow-back-gesture-result` (or similar `allow-<command_name>`) entry to `capabilities/default.json`. Only *plugin* commands have ACL entries; app commands registered via `invoke_handler` are always reachable, and naming a non-existent permission fails `tauri-build`.
+Do **not** add an `allow-back-gesture-result` (or similar `allow-<command_name>`) entry to `capabilities/default.json`. Only *plugin* commands have ACL entries; app commands registered via `invoke_handler` are always reachable, and naming a non-existent permission fails `tauri-build`. The in-repo `tauri-plugin-back-gesture` has no JS-facing commands, so nothing there needs an ACL entry either.
 </Warning>
 
 ---
@@ -165,6 +181,81 @@ Assert insets are non-negative before layout. A negative inset lifts content off
 ## Back-gesture arbitration
 
 Android presses back, Rust asks the webview whether it wants it, and if the webview says no, Rust lets the system act.
+
+### The in-repo `tauri-plugin-back-gesture`
+
+The Android back callback is owned end-to-end by an in-repo Rust plugin, `tauri-plugin-back-gesture`, not by Tauri's own `AppPlugin`.
+
+Tauri's `AppPlugin` already installs an `OnBackPressedCallback`, but it routes the press to *JavaScript plugin listeners* via `Plugin.trigger` — a completely separate channel that reaches neither Tauri's event registry nor Rust. Wiring it that way would fire nothing, with no error anywhere. Arbitration also has to run in Rust: the webview's answer is fire-and-forget (`bridge.invoke` swallows every rejection into `null`), so only Rust can time it out.
+
+The press travels Kotlin → `Channel` → Rust → `emit`:
+
+```
+BackGesturePlugin.kt   OnBackPressedCallback, registered in `load` not `init`
+                       so it is always newer than Tauri's, and the dispatcher
+                       consults the most recently added callback first
+  -> trigger(EVENT)    the base Plugin class's own `registerListener` command,
+                       handed a Rust-owned tauri::ipc::Channel
+  -> Rust closure      commands::on_back_pressed
+  -> Emitter::emit     "back-gesture" — what the webview actually hears
+  -> back_gesture_result(handled), or a 400ms watchdog if silence
+  -> fallBack()        re-dispatch with the callback disabled so the SYSTEM
+                       default runs; on Android 12+ that backgrounds the task
+                       rather than destroying the activity, preserving warm start
+```
+
+```mermaid
+graph LR
+    Kotlin[📱 BackGesturePlugin.kt<br/>OnBackPressedCallback] --> Channel[📨 tauri::ipc::Channel]
+    Channel --> Rust[⚙️ on_back_pressed]
+    Rust --> Emit[📤 Emitter::emit<br/>back-gesture]
+    Emit --> Web[🌐 Webview]
+    Web --> Result[💬 back_gesture_result]
+    Result --> Fall[🚦 fallBack — Android system default]
+
+    classDef native fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef bridge fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef event fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef web fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Kotlin native
+    class Channel,Rust bridge
+    class Emit event
+    class Web,Result web
+    class Fall gate
+```
+
+The Kotlin callback is registered in `load(webView)` — **not** `init()` — so it is always newer than Tauri's own callback. Android's `OnBackPressedDispatcher` consults the most recently added enabled callback first, and `load` runs once the WebView exists, after every plugin's `init`, so this callback always wins. Registered in `init` it would win only when the plugin store happened to initialise it after Tauri's.
+
+The public Rust API, from `src-tauri/plugins/back-gesture/src/lib.rs`:
+
+```rust
+pub const PLUGIN_NAME: &str = "back-gesture";
+pub enum Error { Platform(String) }
+pub struct BackGesture<R: Runtime> { ... }
+impl<R: Runtime> BackGesture<R> {
+    pub fn fall_back(&self) -> Result<(), Error>;
+}
+pub trait BackGestureExt<R: Runtime> {
+    fn back_gesture(&self) -> &BackGesture<R>;
+}
+pub fn init<R: Runtime>(
+    on_press: impl Fn(&AppHandle<R>) + Send + Sync + 'static,
+) -> TauriPlugin<R>;
+```
+
+| Constant | Value | Pinned by |
+|---|---|---|
+| `PLUGIN_NAME` | `"back-gesture"` | `src-tauri/tests/contract.rs` |
+| Java package / `PLUGIN_IDENTIFIER` | `ai.praison.mobile.backgesture` | Kotlin `package` |
+| Kotlin event name / `EVT_PRESSED` | `"pressed"` | must match Rust |
+
+<Note>
+On iOS and desktop the plugin is inert by design: it registers nothing, `on_press` never fires, and `fall_back` does nothing. iOS has no OS-level back, and an app that terminates itself is an App Review rejection that reads to the user as a crash.
+</Note>
+
+The state diagram below is what the arbitration *inside* that plugin's Rust closure does with each press.
 
 ```mermaid
 graph TB
@@ -262,19 +353,33 @@ The transcript element is deliberately **not** a live region — `reconcile`/`ap
 
 ## Lifecycle mapping decision
 
-Tauri surfaces two states and `ShellPort` declares three, so `phase_for` in `src-tauri/src/shell/lifecycle.rs` maps between them.
+Tauri surfaces suspend/resume/focus and `ShellPort` declares three phases, so `phase_for` in `src-tauri/src/shell/lifecycle.rs` maps five window events between them.
 
-| Tauri event | `phase_for` returns | Semantic on OS |
+| Tauri `WindowEvent` | `phase_for` returns | Emitted after `Tracker` observes |
 |---|---|---|
-| `WindowEvent::Suspended` | `"background"` | `willResignActive` (iOS) / `onPause` (Android) — semantically **inactive** |
-| `WindowEvent::Resumed` | `"active"` | `willEnterForeground` / `onResume` |
-| *(anything else)* | *dropped* | TS drops unrecognised phases rather than defaulting |
+| `Suspended` | `"background"` | Yes — first observation after any other phase |
+| `Resumed` | `"active"` | Yes — first observation after any other phase |
+| `Focused(true)` | `"active"` | Suppressed when it immediately follows `Resumed` (identical phase) |
+| `Focused(false)` | `"inactive"` | Suppressed when it immediately follows `Suspended` (background → inactive would lie about direction) |
+| *(anything else)* | *dropped* | — |
 
 <Note>
 `Suspended` maps to `background`, not `inactive`, and that is deliberate. `boot.ts` only flushes on `background`, and on iOS the app can be killed while suspended with no further callback — so anything unflushed at that moment is lost. Mapping to `inactive` would mean the flush never runs and transcripts are lost on every backgrounding. The cost — a control-centre pull-down stopping the run loop — is the cheaper mistake.
 </Note>
 
-`inactive` is not currently emitted by this shell at all; reporting all three phases needs platform code (`didEnterBackgroundNotification` on iOS, `ProcessLifecycleOwner` on Android).
+`inactive` **is** now emitted, from `Focused(false)` — a system dialog over the activity, or a window blur on the desktop dev build — except when suppressed after `Suspended`. `active` comes from both `Resumed` and focus gain, because a control-centre dismissal on iOS is `didBecomeActive` with no `willEnterForeground` before it.
+
+### The `Tracker` — why raw phases go through a filter
+
+The lifecycle emitter runs each phase through `Tracker` in `src-tauri/src/shell/lifecycle.rs` before it emits, because the platforms deliver focus and suspension in an order that would otherwise announce `inactive` after `background`, or `active` twice. State lives in `pub struct LifecycleState(pub Mutex<Tracker>)` in `shell/mod.rs`, `manage`d on the app.
+
+| Suppressed sequence | Why |
+|---|---|
+| Android: `onPause` → `onWindowFocusChanged(false)` | The focus-change would report the app as having come *up* to `inactive` while it is already backgrounded. Emit `background` once and drop the trailing `inactive`. |
+| Android: `onResume` → `onWindowFocusChanged(true)` | Both events say `active`; emit once. |
+| Any repeated phase | The current phase is remembered; a duplicate is dropped. |
+
+Pinned by `android_home_press_announces_background_once_and_not_inactive_after_it` and `android_return_announces_active_once_for_resume_plus_focus`.
 
 ---
 
@@ -290,6 +395,10 @@ The mobile build sets its platform minimums for the first time in `tauri.conf.js
 | Product name | `PraisonAI` |
 
 These floors also drive the CSP, the WebView bundle target, and the store version story — see [Shipping to iOS and Android](/features/mobile/shipping-to-stores).
+
+<Note>
+The in-repo `tauri-plugin-back-gesture` sets its own lower floor in `build.gradle.kts` (`minSdk = 24`, `compileSdk = 36`) and requires `AppCompatActivity`. The **app** still requires API 26 — the higher floor wins. The plugin's lower floor only means it could be reused in an app with a lower minimum; it does not change the app's floor.
+</Note>
 
 ---
 
@@ -309,6 +418,22 @@ strip = "debuginfo"
 ```
 
 The same reasoning keeps the `mobile_entry_point` attribute on `run()`: the macro expands to the JNI symbol on Android and `start_app` on iOS, so renaming `run` breaks the entry point.
+
+<Note>
+`run()`'s builder chain is split into `configure()` so tests build the same app on Tauri's mock runtime. The chain a dev editing `lib.rs` must not drop is:
+
+```rust
+builder
+    .plugin(tauri_plugin_opener::init())
+    .plugin(tauri_plugin_back_gesture::init(commands::on_back_pressed))
+    .manage(commands::BackState::default())
+    .manage(shell::LifecycleState::default())
+    .invoke_handler(tauri::generate_handler![commands::back_gesture_result])
+    .on_window_event(shell::on_window_event)
+```
+
+`.on_window_event(...)` itself is covered by a **source-string assertion** in `tests/wiring.rs`, not a behavioural test, because Tauri's `MockRuntime` accepts the callback and drops it — `test/mock_runtime.rs` never stores it. The test labels this explicitly. Wiring is otherwise covered by mutation-tested behavioural tests in `src-tauri/tests/wiring.rs` and `tests/lifecycle.rs`.
+</Note>
 
 ---
 
@@ -333,6 +458,10 @@ TypeScript drops an unknown phase silently — better to add the phase on both s
 
 <Accordion title="Do not use Plugin.trigger for shell events">
 The TypeScript subscribes to Tauri's event registry, which only `Emitter::emit` reaches. `Plugin.trigger` hits a separate channel and fails with no error.
+</Accordion>
+
+<Accordion title="Do not use Plugin.trigger for back-gesture from a Tauri plugin either">
+Even from inside the in-repo `tauri-plugin-back-gesture`, the press is routed through `registerListener` + a Rust-owned `tauri::ipc::Channel` → `Emitter::emit`, never `Plugin.trigger`, for the same reason: `Plugin.trigger` reaches JS plugin listeners, not Tauri's event registry or Rust.
 </Accordion>
 
 <Accordion title="Do not lower the answer-timeout below 250 ms">
