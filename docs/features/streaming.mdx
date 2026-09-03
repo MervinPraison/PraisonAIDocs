@@ -347,9 +347,67 @@ Tools can also emit incremental progress while they run using `emit_tool_progres
 **Where the two-phase flow lives.** The follow-up completion after tools is issued by the custom-LLM streaming path (`praisonaiagents/llm/llm.py::get_response_stream`), which most providers route through. The follow-up **keeps** `tools` available and is fetched non-streamed, then yielded as a single block — so the model can call another tool if it needs to. This is not bounded to a single round.
 </Note>
 
+<Note>
+**Fixed in PraisonAI PR [#4757](https://github.com/MervinPraison/PraisonAI/pull/4757).** Before #4757, `get_response_stream` called an undefined `_create_tool_message`. The first tool result raised `AttributeError`, was silently swallowed by a broad `except Exception`, and the run fell through to a non-streaming branch that discarded `tool_calls` — so **every tool turn under `stream=True` produced an empty answer**. Providers whose `_supports_streaming_tools()` returns `False` — **Anthropic, Gemini and Ollama** — took that broken branch on every tools turn. Since #4757, `_create_tool_message` is a real method and the non-streaming fallback runs a bounded tool loop that actually executes tools and asks the model again with the results.
+</Note>
+
 <Warning>
-The native sync-OpenAI streaming path (`agent/chat_mixin.py::_start_stream_impl`) does **not** yet issue a follow-up completion after a tool runs: the streamed generator ends once tool results are appended to chat history. If you rely on `start(stream=True)` with tools on the sync OpenAI adapter and see no synthesized answer, use the non-streaming path (`chat()` / `start()` without `stream=True`) for that turn.
+This fix is scoped to the custom-LLM path (`llm.py::get_response_stream`). The native sync-OpenAI streaming path (`agent/chat_mixin.py::_start_stream_impl`) is a **separate** path that PR #4757 does not touch: it does **not** yet issue a follow-up completion after a tool runs — the streamed generator ends once tool results are appended to chat history. If you rely on `start(stream=True)` with tools on the sync OpenAI adapter and see no synthesized answer, use the non-streaming path (`chat()` / `start()` without `stream=True`) for that turn.
 </Warning>
+
+### The non-streaming fallback loop
+
+Providers that cannot stream with tools run a bounded, non-streamed tool loop under the hood.
+
+Any provider whose `_supports_streaming_tools()` returns `False` takes this path — currently **Anthropic** (`anthropic/claude-sonnet-4-20250514`), **Gemini** (`gemini/gemini-2.0-flash`), and **Ollama** (`ollama/llama3.2`).
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as get_response_stream
+    participant M as Model (non-streamed)
+    participant T as Tool
+
+    U->>S: start(stream=True) with tools
+    Note over S: provider does not stream with tools<br/>(Anthropic / Gemini / Ollama)
+
+    loop bounded by max_iter and max_tool_calls_per_turn
+        S->>M: request (tools=..., stream=False)
+        M-->>S: tool_calls (+ optional prose)
+        S-->>U: yield prose (if any)
+        S->>T: execute each tool_call
+        T-->>S: result (or error → reported to model)
+        S->>S: append tool results to messages
+    end
+
+    M-->>S: final answer (no tool_calls)
+    S-->>U: yield final answer
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef stream fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef model fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class U user
+    class S stream
+    class M model
+    class T tool
+```
+
+What the fallback does now:
+
+1. Issues a non-streamed request with `tools=` still attached.
+2. If the response has no `tool_calls`, yields whatever prose is there and stops.
+3. If it has `tool_calls`, records the assistant turn (with `tool_calls` for OpenAI-shaped providers, plain content for Ollama), yields any accompanying prose, then executes each tool.
+4. A failing tool is reported to the model as `{"error": "..."}` rather than aborting the run.
+5. Loops back and asks the model again with the tool-result messages appended.
+
+Prose emitted alongside tool calls is still yielded to the caller. `_create_tool_message` — now a real method — mirrors the non-streaming loop's formatting, including Ollama's natural-language variant.
+
+| Parameter | Default | Bounds |
+|---|---|---|
+| `max_iterations` | falls back to `Agent(max_iter=...)` | How many model round trips the fallback makes |
+| `max_tool_calls_per_turn` | `10` | Tool calls per model turn; when reached, the batch is truncated and a warning is logged |
 
 #### Tool activity telemetry
 
@@ -852,6 +910,10 @@ praisonai chat --stream --verbose "Explain quantum computing"
   <Accordion title="Streaming is safe for input guardrails, not output guardrails">
     **Input** guardrails **do** run on `iter_stream()` and `start(stream=True)` (since PR #4462) — a blocked prompt yields `[Input blocked by guardrail: ...]` and stops. So streaming is safe if you only need to block bad prompts. **Output** guardrails are still bypassed on streaming — the SDK logs a warning when one is combined with streaming. Use `chat()` (or the non-streaming path of `start()` / `astart()`) when you need validated output. See [Streaming and guardrails](#streaming-and-guardrails).
   </Accordion>
+
+  <Accordion title="Anthropic, Gemini and Ollama don't natively stream with tools">
+    These providers do not natively stream with tools. `start(stream=True)` still works, but under the hood the tool loop runs non-streamed and each model turn's answer is yielded as one block. Since PR [#4757](https://github.com/MervinPraison/PraisonAI/pull/4757), tool calls on this path actually execute — earlier versions silently produced an empty stream. `max_iterations` (falls back to `Agent(max_iter=...)`) bounds how many round trips the fallback makes, and `max_tool_calls_per_turn` bounds tool calls per model turn. See [The non-streaming fallback loop](#the-non-streaming-fallback-loop).
+  </Accordion>
 </AccordionGroup>
 
 ---
@@ -875,6 +937,10 @@ The follow-up LLM call (the one that synthesizes tool results into a final answe
 - Persistent rate limit — pair streaming with a [Rate Limiter](/features/rate-limiter) at higher RPM, or back off the caller.
 - Context-length overflow — reduce conversation history or tool-result size.
 - Provider outage — include the `ref:` ID when reporting. The internal log line (`ref=..., model=..., error=...`) makes it searchable.
+
+### "Streaming with tools returns nothing on Anthropic / Gemini / Ollama"
+
+Fixed in PraisonAI PR [#4757](https://github.com/MervinPraison/PraisonAI/pull/4757). If you are on an older version, upgrade — earlier versions called an undefined method inside a swallowed exception and dropped every tool call. The failure symptom was a `Streaming failed with unexpected error` log line followed by an empty response. See [The non-streaming fallback loop](#the-non-streaming-fallback-loop).
 
 ### "Streaming is not supported in sync OpenAIAdapter" / Deepseek multi-agent crash
 
