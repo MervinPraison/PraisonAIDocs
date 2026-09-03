@@ -171,14 +171,8 @@ async function dispatchMergeGateForOldestReady(github, owner, repo, readyCandida
   let dispatched = 0;
   for (const cand of readyCandidates) {
     if (dispatched >= maxDispatches) break;
-    if ((cand.labels || []).includes('claude-merge-gate-active')) {
-      const gate = await mergeGate.reconcileMergeGateActiveLabel(
-        github, owner, repo, cand.prNumber, cand.labels || [], core
-      );
-      if (gate.block) {
-        core?.info?.(`Skip dispatch PR #${cand.prNumber}: merge gate already active`);
-        continue;
-      }
+    if (await mergeGate.shouldSkipMergeGateDispatch(github, owner, repo, cand.prNumber, core)) {
+      continue;
     }
     await github.rest.repos.createDispatchEvent({
       owner,

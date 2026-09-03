@@ -84,6 +84,16 @@ function isClaudeTriggerNoise(c) {
   return false;
 }
 
+function isClaudeFinalReplyComment(c) {
+  const login = (c.user?.login || '').toLowerCase();
+  const fromAutomation =
+    login.includes('praisonai-triage') ||
+    login.includes('github-actions') ||
+    AUTO_ACTORS.some((a) => a.toLowerCase() === login);
+  if (!fromAutomation) return false;
+  return (c.body || '').includes('Claude finished');
+}
+
 function hasRecentClaudeTrigger(comments, minutes = 35) {
   const cutoff = Date.now() - minutes * 60 * 1000;
   return comments.some((c) => {
@@ -321,7 +331,16 @@ function isNavOnlyDocsJsonPatch(patch) {
 function finalClaudeCompletedOnSha(comments, headPushedAt) {
   if (!hasFinalClaudeReviewTrigger(comments)) return false;
   if (isStaleFinalAfterPush(comments, headPushedAt)) return false;
-  return true;
+  const finals = comments.filter(isFinalClaudeTriggerComment);
+  if (finals.length === 0) return false;
+  const latestFinal = finals.reduce((a, b) =>
+    new Date(a.created_at) > new Date(b.created_at) ? a : b
+  );
+  const finalTime = new Date(latestFinal.created_at).getTime();
+  return comments.some((c) => {
+    if (!isClaudeFinalReplyComment(c)) return false;
+    return new Date(c.created_at).getTime() >= finalTime - 60000;
+  });
 }
 
 const FINAL_CLAUDE_REVIEW_BODY =
@@ -440,6 +459,76 @@ function hasBlockingClaudeRunForPr(runs, headRef) {
   return (runs || []).some((r) => claudeRunBlocksPr(r, headRef));
 }
 
+const MERGE_GATE_WORKFLOW_FILE = 'claude-merge-gate.yml';
+const MAX_PENDING_MERGE_GATE_RUNS = 3;
+const MIN_CORE_RATE_LIMIT_REMAINING = 200;
+
+function mergeGateDispatchBlockedReason({ labels, pendingRuns, maxPending = MAX_PENDING_MERGE_GATE_RUNS }) {
+  if ((labels || []).includes(MERGE_GATE_ACTIVE_LABEL)) {
+    return 'merge gate already active on PR';
+  }
+  if (pendingRuns >= maxPending) {
+    return `${pendingRuns} merge gate run(s) already queued or in progress (max ${maxPending})`;
+  }
+  return null;
+}
+
+function countSubstantiveMergeGateRuns(runs) {
+  return (runs || []).filter((r) => r && r.event !== 'workflow_run').length;
+}
+
+async function countPendingMergeGateRuns(github, owner, repo) {
+  let pending = 0;
+  for (const status of ['queued', 'in_progress']) {
+    try {
+      const { data } = await github.rest.actions.listWorkflowRuns({
+        owner,
+        repo,
+        workflow_id: MERGE_GATE_WORKFLOW_FILE,
+        status,
+        per_page: 30,
+      });
+      pending += countSubstantiveMergeGateRuns(data.workflow_runs);
+    } catch {
+      // Best-effort backpressure only.
+    }
+  }
+  return pending;
+}
+
+async function getCoreRateLimitRemaining(github) {
+  try {
+    const { data } = await github.rest.rateLimit.get();
+    return data?.resources?.core?.remaining ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function shouldSkipMergeGateDispatch(github, owner, repo, prNumber, core, options = {}) {
+  const maxPending = options.maxPending ?? MAX_PENDING_MERGE_GATE_RUNS;
+  const minCoreRemaining = options.minCoreRemaining ?? MIN_CORE_RATE_LIMIT_REMAINING;
+  const remaining = await getCoreRateLimitRemaining(github);
+  if (remaining !== null && remaining < minCoreRemaining) {
+    core?.info?.(
+      `Skip merge gate dispatch for PR #${prNumber}: rate limit low (${remaining} core remaining)`
+    );
+    return true;
+  }
+  const ctx = await loadPrContext(github, owner, repo, prNumber);
+  const pendingRuns = await countPendingMergeGateRuns(github, owner, repo);
+  const reason = mergeGateDispatchBlockedReason({
+    labels: ctx.labels,
+    pendingRuns,
+    maxPending,
+  });
+  if (reason) {
+    core?.info?.(`Skip merge gate dispatch for PR #${prNumber}: ${reason}`);
+    return true;
+  }
+  return false;
+}
+
 function mergeGateJobTargetsPr(jobName, prNumber) {
   const name = jobName || '';
   return name.includes(`(${prNumber},`) || name.includes(`(${prNumber})`);
@@ -449,7 +538,7 @@ async function listMergeGateRuns(github, owner, repo, status = null) {
   const params = {
     owner,
     repo,
-    workflow_id: 'claude-merge-gate.yml',
+    workflow_id: MERGE_GATE_WORKFLOW_FILE,
     per_page: 30,
   };
   if (status) params.status = status;
@@ -750,6 +839,14 @@ function isMergeGateVerdictComment(body) {
   return /(?:^|\n)\s*MERGE_GATE_VERDICT:\s*(APPROVE|BLOCK)\b/m.test(text);
 }
 
+function hasRecentMergeGateScanComment(comments, withinMinutes = 30) {
+  const cutoff = Date.now() - withinMinutes * 60 * 1000;
+  return (comments || []).some((c) => {
+    if (!(c.body || '').includes('Merge gate scan')) return false;
+    return new Date(c.created_at).getTime() > cutoff;
+  });
+}
+
 function secretScanReasons(files) {
   for (const f of files) {
     if (/\/tests?\//.test(f.filename) || /test_.*\.py$/.test(f.filename)) continue;
@@ -1019,7 +1116,17 @@ module.exports = {
   evaluatePipelineQuiescent,
   selectMergeGateCandidates,
   isMergeGateVerdictComment,
+  hasRecentMergeGateScanComment,
+  isClaudeFinalReplyComment,
   findMergeGateVerdict,
+  MERGE_GATE_WORKFLOW_FILE,
+  MAX_PENDING_MERGE_GATE_RUNS,
+  MIN_CORE_RATE_LIMIT_REMAINING,
+  getCoreRateLimitRemaining,
+  mergeGateDispatchBlockedReason,
+  countSubstantiveMergeGateRuns,
+  countPendingMergeGateRuns,
+  shouldSkipMergeGateDispatch,
   MERGE_GATE_ACTIVE_LABEL,
   MERGE_GATE_ACTIVE_STALE_MS,
   mergeGateJobTargetsPr,
