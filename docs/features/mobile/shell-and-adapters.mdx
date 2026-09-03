@@ -213,17 +213,25 @@ Pinned by `"the tauri bridge opens links in a NEW context, with the opener sever
 
 ## The native counterpart
 
-On desktop and web-only builds, `readKeyboardHeight(view)` is the entire source of the keyboard height. On iOS and Android the keyboard height, safe-area insets, lifecycle, and back-press come from the [Native Shell](/features/mobile/native-shell) instead — four Tauri events the webview subscribes to by string.
+On desktop and web-only builds, `readKeyboardHeight(view)` is the entire source of the keyboard height. On iOS and Android the safe-area insets, lifecycle, and back-press come from the [Native Shell](/features/mobile/native-shell) instead — Tauri events the webview subscribes to by string. On **Android** the keyboard height and insets additionally arrive through the [window-insets bridge](/features/mobile/native-shell#the-android-window-insets-bridge), because the web APIs read nothing there.
 
-The two are complementary, not alternatives. The web shell's `keyboardHeightPx` seed still runs at construction so the first frame lays out correctly; the native `keyboard-height` event feeds every update after it.
+The sources are complementary, not alternatives. The web shell's `keyboardHeightPx` seed still runs at construction so the first frame lays out correctly; a native source (the `keyboard-height` event on iOS, the insets bridge on Android) feeds every update after it.
 
 ---
 
-## The two-source keyboard model
+## The three-source keyboard model {#the-three-source-keyboard-model}
 
-The Tauri shell seeds the keyboard height from `visualViewport` and subscribes to it live, then hands over to the native event the moment one arrives — one writer at a time.
+The Tauri shell has **three** possible sources for the keyboard height, and exactly one writer at a time. It seeds from `visualViewport` and subscribes to it live, then hands over to whichever native source arrives first.
 
-`createTauriShell` takes a `view?: Window` param so the path runs in tests without a phone. It seeds `keyboardHeightPx` from `readKeyboardHeight(view)`, the same reader the web shell uses, and subscribes to `visualViewport`'s `resize` and `scroll`. The native `keyboard-height` event is authoritative where it exists, so the first native height unsubscribes the viewport listener — two live writers would race on every keyboard animation.
+| # | Source | Platform |
+|---|---|---|
+| 1 | `readKeyboardHeight(view)` from `visualViewport` | iOS + desktop |
+| 2 | The native `keyboard-height` Tauri event (`EVT_KEYBOARD`) | Not natively emitted anywhere yet — reserved for a future iOS/desktop emitter |
+| 3 | The Android `NATIVE_INSETS_GLOBAL` bridge, `keyboard` field | Android |
+
+**Precedence and handover.** Any native source — either the `keyboard-height` event or the Android insets bridge — is authoritative and retires the `visualViewport` listener the moment its first payload arrives, so there is one live writer at a time and no race across an IME animation. Once `nativeInsetsSeen` is `true`, a subsequent empty `safe-area-changed` payload is dropped rather than re-read from `env()`. See [Native Shell → The Android window-insets bridge](/features/mobile/native-shell#the-android-window-insets-bridge).
+
+`createTauriShell` takes a `view?: Window` param so the path runs in tests without a phone. It seeds `keyboardHeightPx` from `readKeyboardHeight(view)`, the same reader the web shell uses, and subscribes to `visualViewport`'s `resize` and `scroll`. On Android `visualViewport` reads 0 while `enableEdgeToEdge()` is on, so the seed is 0 there and the insets bridge is the real source.
 
 ```ts
 import { createTauriShell } from "praisonai-mobile/adapters/tauri";
@@ -237,20 +245,39 @@ window.setKeyboardHeight(320);
 
 ```mermaid
 sequenceDiagram
-    participant VV as visualViewport
+    participant MA as MainActivity (Android)
+    participant G as __praisonaiNativeInsets
     participant TS as TauriShell
-    participant NE as native event
+    participant VV as visualViewport
+    participant Sub as subscribers
 
     VV->>TS: resize / scroll → readKeyboardHeight
     Note over TS: viewport is the only writer
-    NE->>TS: keyboard-height (px)
+    MA->>G: WindowInsets dispatch + every IME frame
+    G->>TS: { top, right, bottom, left, keyboard }
     TS->>VV: unsubscribe
+    TS->>Sub: publishInsets + publishKeyboard
     Note over TS: native is authoritative now
 ```
 
-This was a hard `0` whose only writer was the native event, and `keyboard-height` — unlike the other three shell events — is still not emitted natively. Because `app.css` pins `#root` to `position: fixed; inset: 0`, the layout viewport does not shrink either, so without the viewport reader the composer would sit under the keyboard the instant anyone tapped it. The two-source model (viewport reader as a live seed, native event as an override the day it arrives) is what makes the composer track the slide on device today.
+On iOS this was a hard `0` whose only writer was the native `keyboard-height` event — still not emitted natively — so the `visualViewport` seed is what makes the composer track the slide there. On Android `visualViewport` reports nothing either, and because `app.css` pins `#root` to `position: fixed; inset: 0` the layout viewport does not shrink, so the Android bridge's `keyboard` field is the only source. Either way, one native source retires the viewport listener on its first payload.
 
-The fake window now models `visualViewport.removeEventListener`, so a test using `createFakeWindow()` can exercise an adapter that unsubscribes — previously a listener could be added and never removed, and any adapter that unsubscribed threw. Both paths are pinned by `adapters/src/conformance/contracts.test.ts` — "the TAURI shell reports the keyboard height, without any native event" and "a native keyboard height takes over from the viewport reading". See [Adapter Conformance → Keyboard height](/features/mobile/adapter-conformance#keyboard-height).
+The retry loop that lands the first Android push runs on the native side (see [Native Shell → The retry-until-acknowledged loop](/features/mobile/native-shell#the-android-window-insets-bridge)):
+
+```mermaid
+sequenceDiagram
+    participant MA as MainActivity
+    participant Web as WebView document
+
+    MA->>Web: evaluateJavascript push (page not booted)
+    Web-->>MA: "false" — no global yet, a legal no-op
+    Note over MA: wait PUSH_RETRY_MS (120 ms)
+    MA->>Web: retry push
+    Web-->>MA: "true" — global ran, insets applied
+    Note over MA: loop stops (≤ MAX_PUSH_ATTEMPTS = 125, ~15 s)
+```
+
+The fake window now models `visualViewport.removeEventListener`, so a test using `createFakeWindow()` can exercise an adapter that unsubscribes — previously a listener could be added and never removed, and any adapter that unsubscribed threw. The paths are pinned by `adapters/src/conformance/contracts.test.ts` — "the TAURI shell reports the keyboard height, without any native event" and "a native keyboard height takes over from the viewport reading" — by `adapters/src/tauri/native-insets.test.ts` (the Android bridge, driven with a fake `Window` that has no `visualViewport`), and by `tools/shell-seam.test.mjs` (the Kotlin ↔ TypeScript global name). See [Adapter Conformance → Keyboard height](/features/mobile/adapter-conformance#keyboard-height).
 
 ---
 

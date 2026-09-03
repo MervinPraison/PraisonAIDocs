@@ -73,20 +73,20 @@ Four events go native → web, one command comes web → native. Every string be
 
 | Direction | Name (string literal) | Rust constant | Payload | Notes |
 |---|---|---|---|---|
-| Native → Web | `safe-area-changed` | `EVT_SAFE_AREA` | Insets object. **A payload carrying even one edge is applied, not discarded.** A payload with *no* edges at all = "re-read the CSS" (not "every inset is zero"). Now emitted on `Resized` and `ScaleFactorChanged` with a **deliberately empty payload** — Tauri does not expose the insets, so the WebView re-reads the CSS `env()` variables it has already recomputed. | Consumed by `coerceInsets` in `adapters/src/tauri/shell.ts` |
+| Native → Web | `safe-area-changed` | `EVT_SAFE_AREA` | Insets object. **A payload carrying even one edge is applied, not discarded.** A payload with *no* edges at all = "re-read the CSS" (not "every inset is zero"). Emitted on `Resized` and `ScaleFactorChanged` with a **deliberately empty payload** — on iOS and desktop Tauri does not expose the insets, so the WebView re-reads the CSS `env()` variables it has already recomputed. On Android that re-read is **suppressed** once `nativeInsetsSeen` is `true` (see the [Android window-insets bridge](#the-android-window-insets-bridge)), because `env()` there is the display cutout only and re-reading it after a rotation would drop the status/navigation bars back to 0. | Consumed by `coerceInsets` in `adapters/src/tauri/shell.ts` |
 | Native → Web | `keyboard-height` | `EVT_KEYBOARD` | Number (px) | **`0` is a value, not an absence.** Must fire *through* the show/hide transition, not only at endpoints — or the composer teleports while the keyboard slides |
 | Native → Web | `lifecycle` | `EVT_LIFECYCLE` | `"active" \| "inactive" \| "background"` | Unrecognised phase is dropped by TS, never defaulted (defaulting to `active` would resume the render loop while the app is suspended) |
 | Native → Web | `back-gesture` | `EVT_BACK` | *(no payload)* | The handler takes no argument |
 | Web → Native | `back_gesture_result` | `CMD_BACK_RESULT` | `{ handled: boolean }` | Answered via `bridge.invoke`; failures are swallowed — see arbitration below (no capability entry — app commands via `invoke_handler` are always reachable) |
 
-The Tauri shell now falls back to `visualViewport` when the native `keyboard-height` event has not fired yet, and hands over to native the moment one arrives. The `on_window_event` handler now emits `lifecycle` and `safe-area-changed` on device; only `keyboard-height` is still not natively emitted, so the composer continues to track it through the viewport reader. See [Shell & Adapters → The two-source keyboard model](/features/mobile/shell-and-adapters#the-two-source-keyboard-model).
+On iOS and desktop the Tauri shell falls back to `visualViewport` when the native `keyboard-height` event has not fired yet, and hands over to native the moment one arrives. On Android `visualViewport` reports nothing while `enableEdgeToEdge()` is on, so the handover is triggered by the [Android window-insets bridge](#the-android-window-insets-bridge) (`NATIVE_INSETS_GLOBAL`, which carries both channels) instead. The `on_window_event` handler emits `lifecycle` and `safe-area-changed` on device; the `keyboard-height` Tauri event is still not natively emitted anywhere. See [Shell & Adapters → The three-source keyboard model](/features/mobile/shell-and-adapters#the-three-source-keyboard-model).
 
 <Warning>
 Tauri exposes two different event channels. TypeScript subscribes via `plugin:event|listen`, which is Tauri's **event registry**. Only `Emitter::emit` reaches it. A Tauri mobile *plugin* calling `Plugin.trigger` hits a **completely separate** channel — nothing would fire and there would be no error. Use `Emitter::emit` from `on_window_event` or command handlers; do not switch to `Plugin.trigger`.
 </Warning>
 
 <Note>
-The native `keyboard-height` event does not fire yet — there is no Tauri window event for it, and this shell has not added an iOS `keyboardWillShow`/`Hide` or Android `WindowInsets` listener for it either. Every other event in the contract is now live natively. The Tauri shell reads `visualViewport` for the keyboard height until a native emitter lands, and would hand over the moment one arrives.
+The `keyboard-height` **Tauri event** still does not fire — there is no Tauri window event for it, and no iOS `keyboardWillShow`/`Hide` listener has been added either. On **iOS** the shell therefore reads `visualViewport` for the keyboard height and would hand over the moment a native emitter lands. On **Android** that gap is now closed differently: the [window-insets bridge](#the-android-window-insets-bridge) delivers the keyboard height on the `keyboard` field of `NATIVE_INSETS_GLOBAL` — not through the `keyboard-height` event — because `visualViewport` reads nothing there. Every other event in the contract is live natively.
 </Note>
 
 The capability file `src-tauri/capabilities/default.json` grants what this seam needs: `core:event:default`, so the webview can subscribe via `plugin:event|listen`, plus `opener:allow-open-url` and `opener:allow-default-urls` so `openExternal` actually reaches the OS. Without the `opener:*` scope every `http(s)`/`mailto`/`tel` URL is still refused. The `back_gesture_result` command is deliberately **not** listed — an app command registered through `invoke_handler` is always reachable and has no ACL entry to grant; naming one that does not exist fails `tauri-build` before the crate compiles.
@@ -137,16 +137,20 @@ The pair keeps the check from degenerating to "always absent": a fully present g
 
 ## Insets and keyboard
 
-The shell writes safe-area insets and the keyboard height to the `.screen` element as CSS custom properties, and keeps them current for the life of the app.
+The shell writes safe-area insets to the `#root` element and the keyboard height to the composer's own screen as CSS custom properties, and keeps them current for the life of the app.
 
-| Custom property | Source | When it updates |
-|-----------------|--------|-----------------|
-| `--inset-top` | `insets.top` | mount + every `onInsetsChanged` |
-| `--inset-bottom` | `insets.bottom` | mount + every `onInsetsChanged` |
-| `--inset-left` / `--inset-right` | `insets.left` / `insets.right` | mount + every `onInsetsChanged` |
-| `--keyboard-height` | `keyboardHeightPx` | mount + every `onKeyboardHeightChanged` |
+| Custom property | Written on | Source | When it updates |
+|-----------------|-----------|--------|-----------------|
+| `--inset-top` | `#root` | `insets.top` | mount + every `onInsetsChanged` |
+| `--inset-bottom` | `#root` | `insets.bottom` | mount + every `onInsetsChanged` |
+| `--inset-left` / `--inset-right` | `#root` | `insets.left` / `insets.right` | mount + every `onInsetsChanged` |
+| `--keyboard-height` | composer screen | `keyboardHeightPx` | mount + every `onKeyboardHeightChanged` |
 
 Top comes from top and bottom from bottom — the two were swapped at one point, and a regression test now pins the mapping.
+
+<Note>
+`main.ts` writes `--inset-*` on `#root` (not on the chat `.screen` element) so sibling screens — Settings and Chats — read the same numbers. `--inset-*` sits alongside the pre-existing `--safe-area-inset-*` mirror: the **layout** consumes `--inset-*`, while the **shell** reads `--safe-area-inset-*` back through `readInsets`. The `env(safe-area-inset-*)` mirror is deliberately left untouched, so the pre-script paint is still inset on iOS.
+</Note>
 
 <Note>
 `onInsetsChanged` and `onKeyboardHeightChanged` are subscribed for the life of the app, not just at mount. Rotation, keyboard show/hide, and safe-area changes all reach the layout after the first frame — a shell adapter that fires `onInsetsChanged` only once looks correct on load and wrong on rotation.
@@ -175,6 +179,109 @@ The dedupe belongs on the Tauri shell adapter, not the shared contract. The fake
 <Note>
 Assert insets are non-negative before layout. A negative inset lifts content off the wrong edge — a negative `top` pushes the composer up under the notch instead of clear of it. The *"no inset is negative"* case is now pinned against hollowing by the `shell_negative_insets` break mode — see [Adapter Conformance](/features/mobile/adapter-conformance#the-ten-break-modes).
 </Note>
+
+---
+
+## The Android window-insets bridge {#the-android-window-insets-bridge}
+
+On Android none of the web APIs can see the system bars or the software keyboard, so a native → web global (`NATIVE_INSETS_GLOBAL`) carries both. It is the Android-only source that feeds the shell's insets **and** keyboard height.
+
+### Why it exists
+
+`MainActivity.onCreate` calls `enableEdgeToEdge()`, which sets `decorFitsSystemWindows = false`. With that, the window is never resized by the system bars or the IME, so **no web API observes them**:
+
+| Web API | With the IME shown, edge-to-edge on |
+|---|---|
+| `env(safe-area-inset-*)` | The **display cutout only** — not the status bar, not the navigation bar, never the keyboard |
+| `window.innerHeight` | The full viewport |
+| `visualViewport.height` | The full viewport |
+| `navigator.virtualKeyboard.boundingRect` | `0×0` |
+
+Measured on an Android 15 emulator (Pixel-class, 1080×2400 @ 420 dpi): with a portrait cutout, `env(safe-area-inset-top)` read `49px` — the cutout at dpr 2.625 — while the 24 CSS-px status bar contributed 0. Rotated to landscape, that same 49 px moved to `left` and `top` became 0 even though the status bar was still along the top edge. With the IME shown and the textarea focused, every keyboard read was 0, so `readKeyboardHeight` returned 0 and the composer painted underneath the keyboard.
+
+The values exist only in native `WindowInsetsCompat`. `MainActivity` reads them and pushes them across.
+
+### The seam
+
+One string, pinned on both sides by `tools/shell-seam.test.mjs`:
+
+| Side | Symbol | Value |
+|---|---|---|
+| Kotlin (`MainActivity.kt`) | `INSETS_GLOBAL` | `__praisonaiNativeInsets` |
+| TypeScript (`adapters/src/tauri/shell.ts`) | `NATIVE_INSETS_GLOBAL` | `__praisonaiNativeInsets` |
+
+A rename on either side is otherwise silent — `evaluateJavascript` calls `window.<name> && window.<name>(...)`, so a name the shell does not install is a legal no-op, and the app lays out as though the phone had no bars and no keyboard.
+
+### The payload
+
+```ts
+export interface NativeInsetsPayload {
+  readonly top?: unknown;
+  readonly right?: unknown;
+  readonly bottom?: unknown;
+  readonly left?: unknown;
+  readonly keyboard?: unknown;
+}
+```
+
+Every field is optional and every field is coerced through `toPx`, because the payload crosses an `evaluateJavascript` string boundary and a `NaN` reaching a CSS length silently drops the whole declaration.
+
+| Field | What Kotlin sends |
+|---|---|
+| `top` / `right` / `bottom` / `left` | `getInsets(systemBars() or displayCutout())`, folded into one "do not paint here" number per edge |
+| `keyboard` | `getInsets(ime()).bottom` |
+
+The cutout is folded into the edges because on devices whose cutout is deeper than the status bar — every emulator AVD with a punch hole, and any such phone in landscape — the bars alone are too small.
+
+<Warning>
+The keyboard travels on its **own** field, never folded into `bottom`. `ui/src/layout/insets.ts` composes it with `bottom` using `max()`, so sending it on both channels would compute `bottom + keyboard` — the "web page in a box" double-count. `shell-seam.test.mjs` pins `bottom` to the system bars and `keyboard` to the IME inset.
+</Warning>
+
+### The animation callback
+
+`setOnApplyWindowInsetsListener` fires once at each end of the IME transition, so on its own the composer teleports between endpoints. `WindowInsetsAnimationCompat.Callback` (registered with `DISPATCH_MODE_CONTINUE_ON_SUBTREE`) runs `onProgress` every frame in between, which is what makes the composer slide with the keyboard instead of jumping.
+
+<Note>
+The listener **returns** the insets rather than consuming them — the WebView is not the only view in the tree, so consuming would starve any sibling view of the same data.
+</Note>
+
+### The retry-until-acknowledged loop
+
+The very first `requestApplyInsets` evaluates `window.<global> && window.<global>(...)` against a document that has no global yet — a legal no-op — and Android has no reason to redispatch, so without a retry the app sat at zero insets until the user rotated the phone.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `PUSH_RETRY_MS` | `120` | Delay between pushes |
+| `MAX_PUSH_ATTEMPTS` | `125` | Ceiling on retries (~15 s total) |
+
+The loop pushes until the injected JS returns `"true"` — the acknowledgement that the global ran — then stops.
+
+```mermaid
+graph TB
+    Push[📤 evaluateJavascript push] --> Ack{🔍 returned "true"?}
+    Ack -->|yes| Stop[✅ stop — page acknowledged]
+    Ack -->|no, page not booted| Retry{⏱️ attempt ≤ 125?}
+    Retry -->|yes| Wait[💤 wait 120 ms] --> Push
+    Retry -->|no ~15 s elapsed| Give[🛑 give up]
+
+    classDef push fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef guard fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef stop fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Push push
+    class Ack,Retry guard
+    class Stop ok
+    class Wait,Give stop
+```
+
+<Note>
+Polling rather than `@JavascriptInterface`: the WebView is Tauri's, and interfaces added in `onWebViewCreate` only inject into documents loaded **after** the call, so the interface would miss the very first document. A `density <= 0` guard sits on the divide that converts device pixels to CSS pixels — a NaN reaching a CSS length silently drops the whole declaration.
+</Note>
+
+### The handover in the shell
+
+When `NATIVE_INSETS_GLOBAL` fires, the shell publishes **both** insets and keyboard, retires the `visualViewport` listener (it reports nothing on Android anyway), and sets `nativeInsetsSeen = true`. From then on, a subsequent empty `safe-area-changed` payload is **dropped** rather than re-read from `env()` — re-reading would silently drop the status and navigation bars back to 0. The global is installed on `view`, not `globalThis`, so a test drives it with a fake window and no phone.
 
 ---
 
