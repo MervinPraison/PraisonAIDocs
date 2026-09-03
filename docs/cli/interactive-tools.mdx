@@ -1,6 +1,6 @@
 ---
 title: "Interactive Tools"
-description: "Default ACP, Edit, LSP, and Search tools for interactive modes (TUI and prompt)"
+description: "Default ACP, Edit, LSP, Search, Basic, and Clarify tools for interactive modes (TUI and prompt)"
 icon: "toolbox"
 ---
 
@@ -15,13 +15,14 @@ This uses the ripgrep-backed `grep`, `glob`, and structural `ast_grep_search` to
 
 ## Overview
 
-PraisonAI interactive modes (`praisonai tui launch` and `praison "prompt"`) now include **ACP (Agentic Change Plan)**, **Edit (targeted/fuzzy edits)**, **LSP (Language Server Protocol)**, and **Search** (ripgrep-backed grep/glob + structural ast_grep_search) tools by default.
+PraisonAI interactive modes (`praisonai tui launch` and `praison "prompt"`) now include **ACP (Agentic Change Plan)**, **Edit (targeted/fuzzy edits)**, **LSP (Language Server Protocol)**, **Search** (ripgrep-backed grep/glob + structural ast_grep_search), and **Clarify** (human-in-the-loop question tool) tools by default.
 
 This enables agents to:
 - **Create, edit, and delete files** with plan/approve/apply/verify flow (ACP)
 - **Precisely edit files** with a targeted find-and-replace engine (`edit_file`) and atomic multi-file patches (`apply_patch`), backed by a 5-strategy fuzzy match ladder, SHA-256 staleness guard, BOM/CRLF preservation, and post-edit LSP/linter diagnostics. See [File Editing](/features/file-editing) for the engine details.
 - **Analyze code** with symbol listing, definition lookup, and reference finding (LSP)
 - **Search the codebase** with ripgrep-backed text/file search and structural AST search (Search)
+- **Ask the user a focused clarifying question** when genuinely blocked, instead of silently guessing (Clarify — gated on a live interactive TTY)
 - **Execute commands** with safety guardrails
 
 <Note>
@@ -37,6 +38,9 @@ This enables agents to:
 | **LSP** | `lsp_list_symbols`, `lsp_find_definition`, `lsp_find_references`, `lsp_get_diagnostics` | Code intelligence |
 | **Search** | `grep`, `glob`, `ast_grep_search` | Fast codebase search — ripgrep-backed text/file search + structural AST search |
 | **Basic** | `read_file`, `write_file`, `list_files`, `execute_command`, `internet_search` | Standard tools |
+| **Clarify** | `clarify` | Human-in-the-loop clarify tool — pauses the run to ask one focused question. Withheld in headless/non-TTY/CI/JSON runs; the core best-judgment fallback then handles ambiguity without blocking. |
+
+The Clarify group is **auto-gated**: enabled in config by default, but only actually exposed to the LLM when the run is on a real interactive terminal (see [Clarify Gating](#clarify-gating) below). All other groups are unconditionally enabled by default.
 
 All groups are enabled by default in interactive modes; you can disable individual groups per **Disabling Tool Groups** below.
 
@@ -68,7 +72,7 @@ praison "Search the web" --no-acp --no-lsp
 praisonai tui launch --no-acp --no-lsp
 ```
 
-The `--no-acp` / `--no-lsp` flags disable those groups. There is **no `--no-edit` flag** and **no `--no-search` flag** — disable the edit or search group with the env var below or `ToolConfig(enable_edit=False)` / `ToolConfig(enable_search=False)` from Python.
+The `--no-acp` / `--no-lsp` flags disable those groups. There is **no `--no-edit` flag** and **no `--no-search` flag** — disable the edit or search group with the env var below or `ToolConfig(enable_edit=False)` / `ToolConfig(enable_search=False)` from Python. There is also **no `--no-clarify` flag** — turn the clarify tool off with `PRAISON_NO_CLARIFY=1`, `PRAISON_TOOLS_DISABLE=clarify`, or `ToolConfig(enable_clarify=False)`.
 
 ### Environment Variables
 
@@ -82,7 +86,11 @@ export PRAISON_TOOLS_DISABLE=search
 praison "Hello world"
 
 # Disable multiple groups
-export PRAISON_TOOLS_DISABLE=acp,edit,lsp,search
+export PRAISON_TOOLS_DISABLE=acp,edit,lsp,search,clarify
+praison "Hello world"
+
+# Force the clarify tool off even on a real terminal
+export PRAISON_NO_CLARIFY=1
 praison "Hello world"
 
 # Set workspace
@@ -218,6 +226,81 @@ Standard file and search tools:
 | `execute_command` | Run shell commands |
 | `internet_search` | Search the web |
 
+### Clarify Tool (Human-in-the-Loop)
+
+Clarify pauses the run to ask one focused question when the agent is genuinely blocked.
+
+```bash
+# The clarify tool appears automatically on an interactive terminal
+praison "Build me a web scraper"
+```
+
+```
+🤔 Which language?
+
+Choices:
+  1. python
+  2. rust
+
+Your choice (number or text): 1
+```
+
+The agent asks, you answer in your terminal, and the run resumes with your choice.
+
+```mermaid
+graph LR
+    subgraph "Clarify Flow"
+        A[🤖 Agent blocked] --> B[❓ clarify question]
+        B --> C[💻 Terminal prompt]
+        C --> D[🙂 User answers]
+        D --> E[✅ Run resumes]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class B,C tool
+    class D,E result
+```
+
+| Tool | Description |
+|------|-------------|
+| `clarify` | Async callable `clarify(question: str, choices: list[str] \| None = None) -> str`. Pauses the turn and reads the answer from the terminal via `create_cli_clarify_handler()`. A numbered menu is shown when `choices` is provided, free-text input otherwise. `Ctrl+C` / EOF returns `"skip"`. |
+
+#### Clarify Gating
+
+The `clarify` tool is only exposed when **all** of these hold, checked in this order. If any gate fails, the tool is **withheld entirely** — the LLM never sees a `clarify` tool, so the core `ClarifyHandler` best-judgment fallback silently handles ambiguity instead of blocking on `input()`.
+
+```mermaid
+graph TB
+    A[🤖 Interactive run starts] --> G1{PRAISON_NO_CLARIFY truthy?}
+    G1 -->|Yes| W[⚠️ Withhold clarify<br/>best-judgment fallback]
+    G1 -->|No| G2{CI truthy?}
+    G2 -->|Yes| W
+    G2 -->|No| G3{PRAISON_OUTPUT_MODE<br/>json / stream-json / actions?}
+    G3 -->|Yes| W
+    G3 -->|No| G4{stdin AND stdout isatty?}
+    G4 -->|No| W
+    G4 -->|Yes| E[✅ Expose clarify tool]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef gate fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class G1,G2,G3,G4 gate
+    class W warn
+    class E ok
+```
+
+1. **`PRAISON_NO_CLARIFY`** — unset or one of `""`, `0`, `false`, `no` keeps the gate open; `1`, `true`, `yes` disable clarify.
+2. **`CI`** — unset or one of `""`, `0`, `false`, `no` keeps the gate open; any other truthy value disables clarify (CI runners can allocate PTYs even without a human present).
+3. **`PRAISON_OUTPUT_MODE`** — must **not** be `json`, `stream-json`, or `actions` (structured/machine consumers never prompt).
+4. **`sys.stdin.isatty()` and `sys.stdout.isatty()`** — both must return `True` (a real interactive terminal).
+
 ## Python API
 
 ```python
@@ -237,12 +320,18 @@ config = ToolConfig(
     enable_edit=True,
     enable_lsp=True,
     enable_search=True,
+    enable_clarify=True,
     approval_mode="auto",  # or "manual"
 )
 tools = get_interactive_tools(config=config)
 
 # Disable specific groups
 tools = get_interactive_tools(disable=["acp"])
+
+# Disable only the clarify group
+tools = get_interactive_tools(disable=["clarify"])
+# or
+tools = get_interactive_tools(config=ToolConfig(enable_clarify=False))
 
 # Disable only the search group
 tools = get_interactive_tools(disable=["search"])
@@ -268,6 +357,7 @@ tools = get_interactive_tools(groups=["basic"])
 | `enable_lsp` | `True` | Enable LSP tools |
 | `enable_search` | `True` | Enable the ripgrep-backed `grep` / `glob` / `ast_grep_search` tools |
 | `enable_basic` | `True` | Enable basic tools |
+| `enable_clarify` | `True` | Enable the human-in-the-loop `clarify` tool. Also runtime-gated on an interactive TTY — see [Clarify Gating](#clarify-gating). |
 | `approval_mode` | `"auto"` | Approval mode: auto, manual, scoped |
 
 ### Approval Modes
@@ -284,7 +374,10 @@ tools = get_interactive_tools(groups=["basic"])
 
 | Variable | Description |
 |----------|-------------|
-| `PRAISON_TOOLS_DISABLE` | Comma-separated groups to disable. Accepts: `acp`, `edit`, `lsp`, `search`, `basic`. Applied by `ToolConfig.__post_init__`, so direct constructions honor it too. |
+| `PRAISON_TOOLS_DISABLE` | Comma-separated groups to disable. Accepts: `acp`, `edit`, `lsp`, `search`, `basic`, `clarify`. Applied by `ToolConfig.__post_init__`, so direct constructions honor it too. |
+| `PRAISON_NO_CLARIFY` | Set to `1` / `true` / `yes` to force the `clarify` tool off even on a real terminal. Any other value / unset leaves the gate open. |
+| `PRAISON_OUTPUT_MODE` | When `json`, `stream-json`, or `actions`, the `clarify` tool is withheld so machine consumers never see a prompt. |
+| `CI` | Any truthy value (anything other than empty / `0` / `false` / `no`) withholds `clarify`, because CI runners can allocate pseudo-TTYs without a human present. |
 | `PRAISON_WORKSPACE` | Override workspace path |
 | `PRAISON_APPROVAL_MODE` | Set approval mode (auto, manual, scoped) |
 | `PYTHONIOENCODING` | Set to `utf-8` for Windows automation subprocess compatibility |
@@ -326,6 +419,8 @@ praison "prompt" / praisonai tui launch
     ├── LSP Tools → CodeIntelligenceRouter → LSP/Fallback
     │
     ├── Search Tools → ripgrep (fallback: Python / grep -rn)
+    │
+    ├── Clarify Tool → CLI ClarifyHandler → stdin prompt (gated on interactive TTY)
     │
     └── Basic Tools → Direct execution
 ```
@@ -465,5 +560,6 @@ All artifacts automatically redact sensitive information:
 - [LSP Code Intelligence](/cli/lsp-code-intelligence) - LSP details
 - [Search Tools](/tools/search-tools) - SDK-level `grep` / `glob` reference
 - [AST-Grep Agent](/tools/ast-grep-tools) - SDK-level structural search reference
+- [Clarify Tool](/features/clarify-tool) - SDK / bot / custom-handler side of the human-in-the-loop clarify feature
 - [Debug CLI](/cli/debug-cli) - Debug commands
 - [Interactive TUI Testing](/cli/interactive-tui#testing-interactive-mode) - Test framework
