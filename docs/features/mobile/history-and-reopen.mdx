@@ -68,16 +68,30 @@ Tapping an `open-chat` row calls `session.open(chatId)`, reloads the stored mess
 |------------|--------------|--------|
 | `none` | `strings.chatsEmpty` — a new install, not data loss | `buildChatList` returns `state: "none"` |
 | `all-unreadable` | `strings.chatsAllUnreadable(count)` warning row | every file failed to parse |
-| `has-chats` | a `<button>` per row | at least one chat read cleanly |
+| `has-chats` | a `<div class="row-chat">` per row — an **Open** button and a **Delete** button | at least one chat read cleanly |
+
+Each chat row is a `<div>` holding two controls: an **Open** button carrying the title and a muted `.chat-updated` span, and a **Delete** button on the right. The row is a `<div>` rather than a `<button>` because a `<button>` cannot legally contain another `<button>`.
 
 ```ts
 // buildChatsScreen — only real chats carry the open-chat intent.
 if (row.kind === "chat") {
-  el.dataset["action"] = "open-chat";
-  el.dataset["chatId"] = row.id;
+  open.dataset["action"] = "open-chat";
+  open.dataset["chatId"] = row.id;
+  open.textContent = row.title;
+  const updated = doc.createElement("span");
+  updated.className = "chat-updated";
+  updated.textContent = row.updatedLabel;
+  open.append(updated);
+  open.setAttribute(
+    "aria-label",
+    strings.chatUpdated(chatRowName(strings, row), row.updatedLabel),
+  );
+} else {
+  open.setAttribute("aria-label", chatRowName(strings, row));
 }
-el.setAttribute("aria-label", chatRowName(strings, row));
 ```
+
+The open button's `aria-label` is `strings.chatUpdated(title, updatedLabel)` — one string builds both the visible time and the spoken time, so the two cannot drift. An unreadable row has no update time and keeps the bare `chatRowName`. The `updatedLabel` was computed on every visit by `buildChatList(summaries, unreadableIds, Date.now())` all along; the row is now what finally renders it, so a list sorted by recency shows why one "Untitled" sorts above another.
 
 <Note>
 An empty list and a list that is empty because everything in it failed to parse are **not** the same screen. The first is a new install; the second is data loss. `buildChatList` distinguishes them so the UI can too — see [Chat Recovery](/features/mobile/chat-recovery).
@@ -151,7 +165,7 @@ graph LR
 The previous conversation is retained on the chat screen and reachable via the back gesture and the top bar — nothing about the open chat depends on the list load succeeding.
 
 <Note>
-The guarantee is pinned by `"a storage failure while the chat list loads stays LOCAL, not fatal"` in `app/src/main.test.ts`. It boots the app, fails the next storage read while entering the `chats` route, and asserts the chat screen's composer is still reachable and the fatal "could not start" screen never appeared.
+The guarantee is pinned by `"a storage failure while the chat list loads stays LOCAL, not fatal"` in `app/src/main.test.ts`. It boots the app, fails the next storage read while entering the `chats` route, and asserts the chat screen's composer is still reachable and the fatal "could not start" screen never appeared. The same LOCAL-not-fatal rule now also covers a rejection raised by the title lookup done for the delete announcement — see [Delete a conversation](#delete-a-conversation).
 </Note>
 
 ---
@@ -205,6 +219,113 @@ app.router.push({ name: "chat", chatId: intent.chatId });
 
 <Note>
 `history` lives in the mount closure and is **prepended to every reconcile** in `publish`. A follow-up turn's rows land below it, and because history is inside the render state, a reconcile never emits `remove` for rows it did not know about. New chat resets `history = []`.
+</Note>
+
+---
+
+## Delete a conversation
+
+Deleting a chat closes the loop from `session.remove` → `repository.remove` → `storage.remove` — all three were implemented and contract-tested with no app caller, so until now a stored conversation could be opened but never removed.
+
+```mermaid
+%%{init: {'themeVariables': {'actorBkg':'#8B0000','actorTextColor':'#fff','actorBorder':'#7C90A0'}}}%%
+sequenceDiagram
+    participant User
+    participant Row as chat row
+    participant Session
+    participant Storage
+    participant Announce as assertive region
+
+    User->>Row: tap Delete
+    Row->>Row: arm — relabel to "Confirm"
+    User->>Row: tap Confirm
+    Row->>Session: session.remove(chatId)
+    Session->>Storage: repository.remove → storage.remove
+    Storage-->>Session: removed
+    Session->>Row: refreshChats(section)
+    Session->>Announce: chatDeleted(title)
+```
+
+Deletion is **two taps** and the state machine disarms itself the moment the route changes.
+
+```mermaid
+graph LR
+    Rest[🟢 resting<br/>Delete] -->|first tap| Armed[🟠 armed<br/>Confirm]
+    Armed -->|second tap| Gone[💾 session.remove]
+    Armed -->|tap another row| Rest
+    Armed -->|leave chats route| Rest
+
+    classDef rest fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef armed fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef gone fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Rest rest
+    class Armed armed
+    class Gone gone
+```
+
+The `delete-chat` intent handler runs a fixed sequence.
+
+```ts
+// main.ts — the "delete-chat" intent.
+const title = await titleOf(app, intent.chatId); // read stays OUTSIDE the try
+try {
+  await app.session.remove(intent.chatId);
+} catch {
+  assertive.textContent = strings.chatDeleteFailed;
+  return;
+}
+if (controller.chatId === intent.chatId) {
+  controller.setChat(null);           // clears the open chat off screen
+  render = emptyRender;
+  nodes.nodes.clear();
+  announcer = initialAnnouncer;
+  transcript.textContent = "";
+  polite.textContent = "";
+  assertive.textContent = "";
+}
+await refreshChats(section);          // same rebuild the route builder uses
+assertive.textContent = strings.chatDeleted(title);
+```
+
+<Steps>
+<Step title="First tap arms">
+The delete button re-labels to `strings.actionConfirmDelete` ("Confirm") and its `aria-label` becomes `strings.deleteChatConfirm(title)`. Nothing is removed yet. This is the only irreversible action in the app, and the delete control sits millimetres from the open control on a touch screen.
+</Step>
+
+<Step title="Second tap on the same row removes">
+`session.remove(chatId)` runs the `repository.remove` → `storage.remove` chain. A tap on a **different** row moves the arming instead of deleting — the first tap never deletes.
+</Step>
+
+<Step title="Leaving the chats route disarms">
+Any armed delete is reset on route change, so a first tap in one visit cannot spend itself into a delete on the next.
+</Step>
+</Steps>
+
+The assertive announcement uses the chat's clean title, looked up via `session.list` in a `titleOf` helper that degrades to the chat id if the list read rejects. The read stays **outside** the `remove` try, so a failed lookup for a nicety cannot escalate to the app-wide crash screen.
+
+<Warning>
+A refused `storage.remove` — `SecurityError` with site data blocked, or `QuotaExceededError` — is announced through the assertive live region as `strings.chatDeleteFailed` ("That conversation could not be deleted."), not swallowed. A delete that quietly did nothing leaves the user believing a conversation is gone when it is still there.
+</Warning>
+
+The list rebuilds through the extracted `refreshChats(section)` helper — the same function the route builder uses on visit — so "the row is gone" and "the list is now empty" (falling back to `strings.chatsEmpty`) are the **same** rendering, not two hand-written paths that can drift.
+
+<AccordionGroup>
+<Accordion title="The first tap on Delete never deletes">
+Two taps on the same row, in that order. A tap on a different row moves the arming rather than deleting two.
+</Accordion>
+
+<Accordion title="Deleting the open chat clears it off screen">
+The transcript, live regions and render state are reset in the same step, so the user is not left typing into a conversation that no longer exists on disk — the next turn would otherwise silently re-create it.
+</Accordion>
+
+<Accordion title="A storage refusal is spoken, not silent">
+`chatDeleteFailed` reaches the assertive region; a delete that quietly did nothing leaves the user believing a conversation is gone when it is still there.
+</Accordion>
+</AccordionGroup>
+
+<Note>
+The delete-time LOCAL-not-fatal guarantee is pinned by `"a delete when the chat list read REJECTS stays LOCAL, not fatal"` in `app/src/main.test.ts`. The same rule that keeps a chat-list load failure local now also covers a rejection raised by the title lookup done for the delete announcement — `titleOf` degrades to the chat id rather than crashing the app.
 </Note>
 
 ---
