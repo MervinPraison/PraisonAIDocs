@@ -33,46 +33,53 @@ graph LR
 
 <Steps>
 
-<Step title="Default — every turn runs on the current loop, no config">
+<Step title="Default — start an agent, the gateway calls the in-process executor">
 
-The gateway uses `InProcessTurnExecutor` when nothing is set, so every turn runs on the current event loop exactly as today.
+Set no executor and the gateway drives every turn through `InProcessTurnExecutor`, running on the current event loop exactly as today.
 
 ```python
-from praisonaiagents.gateway import InProcessTurnExecutor, TurnPlacement
+from praisonaiagents import Agent
+from praisonai_bot.gateway import WebSocketGateway
 
-executor = InProcessTurnExecutor()
-
-async def run_a_turn():
-    placement = await executor.place("session-alice")
-
-    async def turn():
-        return "hello"
-
-    return await executor.execute_turn(placement, turn)
+# No executor set → gateway uses InProcessTurnExecutor by default.
+# Every turn runs on the current loop, byte-for-byte compatible.
+agent = Agent(name="Support", instructions="Help users")
+WebSocketGateway(agent=agent).start()
 ```
 
 </Step>
 
-<Step title="Isolate a bad session's turn on its own worker">
+<Step title="Confirm the active executor from to_dict()">
 
-Select an isolated executor from a wrapper package (subprocess / container / remote) when you need blast-radius containment. Core ships only the seam and the safe in-process default — the wrapper ships concrete isolated executors.
+Read the active executor off the config — the same string `gateway doctor` reports.
 
 ```python
-from praisonaiagents.gateway import TurnExecutorProtocol, TurnPlacement
+from praisonaiagents import GatewayConfig
 
-class MyIsolatedExecutor:  # user code — lives in your wrapper, not core
-    async def place(self, session_id: str) -> TurnPlacement:
-        worker_id = await self._spawn_worker(session_id)
-        return TurnPlacement(session_id=session_id, worker_id=worker_id, epoch=0)
-
-    async def execute_turn(self, placement, turn, *, cancel_token=None, limits=None):
-        return await self._await_worker_result(placement, turn, cancel_token, limits)
-
-    async def teardown(self, placement, *, reason: str) -> None:
-        await self._kill_worker(placement.worker_id)
-
-assert isinstance(MyIsolatedExecutor(), TurnExecutorProtocol)  # runtime-checkable
+GatewayConfig().to_dict()["executor"]   # → "inprocess"
 ```
+
+</Step>
+
+<Step title="Plug in an isolated executor via GatewayConfig">
+
+Pass any object satisfying `TurnExecutorProtocol` to `GatewayConfig.executor`; the gateway resolves it once at start-up.
+
+```python
+from praisonaiagents import Agent, GatewayConfig
+from praisonaiagents.gateway import InProcessTurnExecutor
+from praisonai_bot.gateway import WebSocketGateway
+
+# Any object satisfying TurnExecutorProtocol works here.
+config = GatewayConfig(executor=InProcessTurnExecutor())
+gateway = WebSocketGateway(agent=Agent(name="Support", instructions="Help"),
+                           config=config)
+gateway.start()
+
+config.to_dict()["executor"]   # → "InProcessTurnExecutor"
+```
+
+Reach for a concrete isolated executor (subprocess / container / remote) when you need blast-radius containment — see [Common Patterns](#common-patterns).
 
 </Step>
 
@@ -116,6 +123,48 @@ sequenceDiagram
 
 ---
 
+## How the gateway drives it
+
+`WebSocketGateway` resolves the executor once at start-up, then routes every turn through `place()` → `execute_turn()`.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant GW as WebSocketGateway
+    participant EX as executor
+    participant W as Worker
+
+    User->>GW: message
+    GW->>EX: place(session_id)
+    EX-->>GW: TurnPlacement
+    GW->>EX: execute_turn(placement, turn, cancel_token, limits)
+    EX->>W: run turn
+    alt worker replies
+        W-->>EX: result
+        EX-->>GW: result
+        GW-->>User: reply (outcome=ok)
+    else worker wedges
+        EX-->>GW: WorkerWedgedError
+        GW->>EX: teardown(placement, reason="wedged")
+        GW-->>User: worker wedged; session re-placed (outcome=error)
+    end
+```
+
+| Where | What it does |
+|---|---|
+| `GatewayConfig.executor` | Selects the executor. `None` ⇒ `InProcessTurnExecutor`. |
+| `WebSocketGateway.__init__` | Resolves `self._executor = config.executor or InProcessTurnExecutor()`. |
+| `WebSocketGateway._drive_turn` | Every turn goes through `executor.place()` → `executor.execute_turn()`. |
+| `WorkerWedgedError` handler | Tears down **only that session's** worker (scoped, not process-wide). |
+| Session queue outcome | Wedged turn reports `outcome_status="error"`, not the default `"ok"`. |
+| `GatewayConfig.to_dict()["executor"]` | `"inprocess"` by default; the executor class name when explicit. |
+
+<Note>
+Before the seam was wired, the gateway ran turns directly on the event loop and a wedged turn triggered a process-wide `os._exit`. Now `WebSocketGateway._drive_turn` routes through the configured executor, and a `WorkerWedgedError` tears down only the offending session's worker.
+</Note>
+
+---
+
 ## The Contract
 
 `TurnExecutorProtocol` is a runtime-checkable protocol with three async methods.
@@ -144,9 +193,12 @@ An isolated executor does **not** ship the live `turn` callable (and its capture
 
 ## Configuration Options
 
-The seam is a typed contract, not a config block. Reach for these SDK references for the full surface.
+The seam is configured through `GatewayConfig.executor` (defaults to `None`, which resolves to `InProcessTurnExecutor` at runtime). `GatewayConfig.to_dict()["executor"]` reports the active executor for `gateway doctor` / observability.
 
 <CardGroup cols={2}>
+<Card icon="code" href="/sdk/reference/praisonaiagents/classes/GatewayConfig">
+  `GatewayConfig` — the `executor` field + full gateway config.
+</Card>
 <Card icon="code" href="/sdk/reference/praisonaiagents/classes/TurnExecutorProtocol">
   `TurnExecutorProtocol` — auto-generated SDK reference.
 </Card>
@@ -229,6 +281,10 @@ The in-process default is zero-cost and dependency-free but offers no isolation 
 
 <Accordion title="Never cross a boundary with a live callable">
 An isolated worker owns the session via `place()` and rebuilds the turn from serialisable inputs on its own side. Do not try to send the live `turn` callable across a process boundary — treat it as the gateway-side await point for the worker's result.
+</Accordion>
+
+<Accordion title="Leave executor=None unless you need isolation">
+The default `GatewayConfig(executor=None)` resolves to `InProcessTurnExecutor` — today's on-loop behaviour, no dependency, no cost. Only set `executor=` when you need blast-radius containment (subprocess / container / remote) or per-session limits. Verify what actually resolved with `config.to_dict()["executor"]` — that same string is what `gateway doctor` prints.
 </Accordion>
 
 </AccordionGroup>
