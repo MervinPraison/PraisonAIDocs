@@ -96,7 +96,7 @@ sequenceDiagram
 
 | Rule | Behaviour |
 |------|-----------|
-| `value` rows are editable | Rendered as `<select>` / `<input>`; `secret` rows stay presence-only (the facade has no getter for a secret). |
+| `value` rows are editable | Rendered as `<select>` / `<input>`. `secret` rows are **also** editable now, through the dedicated `set-secret` / `clear-secret` intents — a masked field plus a Remove button, with the value never read back from the facade. See [Secret rows](#secret-rows). |
 | Control kind | `choice` → `<select>`, `number` → `<input type="number">`, everything else → `<input type="text">`. |
 | Validation | The change listener runs `validateInput(def, raw)` — parse, then the def's own `validate` — before calling `settings.set`. |
 | Refusal resets | A `null` from `validateInput`, a `false` from `set`, or a thrown persist resets the field to `String(settings.get(def.key) ?? def.default)`. |
@@ -157,23 +157,46 @@ control.dataset["settingKey"] = def.key; // e.g. "baseUrl"
 
 `Actionable.value` is absent on every non-field element on purpose: absence means "not a field", never "cleared". A `<div>` row, a `<span>` label, or a section heading has no `value`, so a stray tap on a row background cannot decode into a `set-setting` with an empty `raw` and wipe the engine address. Both the key and the value are required — a missing key is refused (the store would refuse `""` silently), and a missing value means the element is not a field at all.
 
+A secret field emits `set-secret`, not `set-setting`, and its Remove button emits `clear-secret`. The two intents are kept separate on purpose (from the `intents.ts` block comment): so no single code path decides at runtime whether a value lands in the plaintext settings file or in the keychain — a shared `set-setting` with a boolean flag would be exactly that path, and getting the boolean wrong once from a stale def puts an API key on disk. Two intents cannot make that mistake. For `set-secret`, `intentFrom` applies the trim-and-refuse-empty rule: a cleared field on blur (`raw.trim() === ""`) is refused rather than treated as "delete it", because removing a credential must be asked for by name through `clear-secret`.
+
 <Note>
 The settings screen is rebuilt on every visit, so a listener attached to a field would belong to a node thrown away on the next navigation. Delegating on the root — like every tap — is what keeps the commit path alive across navigations.
 </Note>
 
 ---
 
+## Secret rows
+
+A secret row is a masked field, a Remove button, and a separate presence node — never a value read back from the store.
+
+`secretControls` in `app/src/main.ts` builds the row under a three-property contract, and each property has a broken version that looks completely normal on screen:
+
+| Property | Rule |
+|----------|------|
+| Value | **Never assigned.** `settingControl` seeds a value field from the store; the mirror of that line here would be the leak. The field paints empty on every visit, and `syncSecret` empties it again after every commit — the value is in the DOM only while the user is holding it there. |
+| Masking | `type="password"` with `autocomplete="off"`, `autocapitalize="off"`, `autocorrect="off"`, `spellcheck="false"` — dots for a shoulder-surfer, no autofill, and no unrecognised token shipped off to a spellchecker. |
+| Presence | A separate node (`data-secret-presence`) starting at **UNKNOWN**, never at "Not set": telling someone their key is missing while the async `hasSecret` lookup is still in flight is how a working key gets pasted twice. |
+
+`refreshSecretPresence` resolves `hasSecret` for every secret def and writes the answer into that presence node. It is **sequence-guarded**: a save followed by a Remove fires two overlapping lookups, and with a native keychain adapter `hasSecret` can resolve out of order, so an older answer landing last would paint a stale label over the current one. Each call takes a `latestPresenceSeq` ticket, and only the latest is allowed to write.
+
+`syncSecret(key, refusal)` empties the field after every commit and sets the refusal text on the row's `role="alert"` node (or clears and hides it when there is none) — the same assertive channel a rejected `value` setting uses.
+
+See [API Keys](/features/mobile/api-keys) for the user-facing flow and [Storage & Secrets](/features/mobile/storage-and-secrets#how-a-setting-reaches-the-keychain) for where the value lives.
+
+---
+
 ## Configuration Options
 
-`SETTING_DEFS` ships exactly two editable settings today (source: `app/src/registry.ts`).
+`SETTING_DEFS` ships three editable settings today — two `value` rows and one `secret` row (source: `app/src/registry.ts`).
 
 | Key | Type | Default | Control | Notes |
 |-----|------|---------|---------|-------|
-| `engineId` | `string` (choice) | `remote-http` | `<select>` | Choices come from `SETTING_DEFS.engineId.choices`. The picker lists only `remote-http` in shipping builds. |
+| `engineId` | `string` (choice) | `remote-http` | `<select>` | Choices come from `SETTING_DEFS.engineId.choices`: `remote-http` and `praisonai-ts`. |
 | `baseUrl` | `string` | `http://127.0.0.1:8765` | `<input type="text">` | Resolved per request by `enginesFor` — the next `/chat` and `/health` go to the current stored value. Trailing slashes are stripped per resolution. Changing it is the recovery for an unreachable engine. |
+| `openaiApiKey` | `secret` | `""` (never stored) | `<input type="password">` + Remove button | Kept in the keychain; never in the settings file; never shown back. Read per turn by the in-process engine via `apiKeyFor`. See [API Keys](/features/mobile/api-keys). |
 
 <Note>
-The store's coercion and validation machinery stays intact for any future setting, but only `engineId` and `baseUrl` are read by the shipping app today. See [Storage & Secrets → Shipped defaults are valid](/features/mobile/storage-and-secrets).
+The store's coercion and validation machinery stays intact for any future setting; `engineId`, `baseUrl`, and `openaiApiKey` are the keys the shipping app reads (`CONSUMED_SETTING_KEYS`), and `registry.test.ts` forbids a declared-but-unread setting. See [Storage & Secrets → Shipped defaults are valid](/features/mobile/storage-and-secrets).
 </Note>
 
 ---
@@ -227,8 +250,8 @@ The control listens on `change`, not `input`, so a half-typed address is never s
 The field resets to `settings.get(key) ?? def.default`, so a value that never persisted cannot linger in memory. A rolled-back write leaves the field showing what the next launch will actually read.
 </Accordion>
 
-<Accordion title="Never call the settings screen a secrets UI">
-`SettingsFacade` has no `getSecret`; secret rows stay presence-only. Editing a secret from the Settings screen is not possible — rotate secrets through `SecretsPort`. See [Storage & Secrets](/features/mobile/storage-and-secrets).
+<Accordion title="A secret row takes writes but never reads back">
+Editing a secret is a first-class row now: a masked field commits through `set-secret`, and a Remove button through `clear-secret`. But the value is unreadable from the UI facade — the row shows presence and takes writes; only the engine, holding the full `SecretsPort`, reads the value back. See [API Keys](/features/mobile/api-keys) and [Storage & Secrets](/features/mobile/storage-and-secrets).
 </Accordion>
 </AccordionGroup>
 
