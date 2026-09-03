@@ -181,9 +181,13 @@ graph TD
 | Keyword | `"hourly"`, `"daily"`, `"weekly"` | Predefined intervals (3600 / 86400 / 604800 seconds) |
 | Interval | `"*/30m"`, `"*/6h"`, `"*/10s"` | Custom interval (minutes, hours, seconds) |
 | Cron | `"cron:0 7 * * *"` | 5-field cron expression |
-| One-shot | `"at:2026-03-01T09:00:00"` | ISO 8601 timestamp |
-| Relative | `"in 20 minutes"` | Relative to now |
+| One-shot | `"at:2026-03-01T09:00:00"` | ISO 8601 timestamp — a naive value is stamped with the resolved zone at parse time (see [Timezones](#timezones-for-at-and-cron)) |
+| Relative | `"in 20 minutes"` | Relative to now (stored as an aware UTC instant) |
 | Seconds | `"3600"` | Raw seconds |
+
+<Note>
+A naive `at:` timestamp (no `Z`, no `+HH:MM`) is a **wall-clock** reading. As of [PraisonAI #4732](https://github.com/MervinPraison/PraisonAI/pull/4732) the parser stamps it with the resolved zone at parse time, so the stored value names an unambiguous instant. See [Timezones for `at:` and `cron:`](#timezones-for-at-and-cron).
+</Note>
 
 ## Examples
 
@@ -271,6 +275,64 @@ agent = Agent(
     ],
 )
 ```
+
+## Timezones for `at:` and `cron:`
+
+Which wall-clock time a schedule uses depends on the timezone it resolves to.
+
+For a naive `at:` ISO timestamp (no `Z`, no `+HH:MM`) and the natural-language clock forms (`at 9am`, `at 17:00`), the parser resolves the zone in order:
+
+1. The `tz` argument passed to the schedule (per-schedule).
+2. The instance default (the `scheduler.timezone` key in `config.yaml`).
+3. The `PRAISONAI_SCHEDULE_TIMEZONE` environment variable (process-wide default).
+4. The machine's local zone.
+
+The offset attached is the one **in force on the target date**, so a summer date gets the DST offset and a winter date gets the standard offset. An `at:` string that already carries an offset (`+05:30`, `Z`, `+00:00`) is used verbatim — the offset in the string always wins.
+
+`cron:` expressions follow the same 1–3 precedence but fall back to **UTC** at step 4, unchanged from previous releases. Only the naive-`at:` path defaults to the local zone.
+
+### The stored value is aware
+
+As of [PraisonAI #4732](https://github.com/MervinPraison/PraisonAI/pull/4732), `parse_schedule` returns a `Schedule` whose `at` is already an aware ISO string. A job authored on one machine and later polled by a runner in a different zone fires at the same wall-clock time the person originally typed — the guess `is_due()` used to make at fire time is gone.
+
+```python
+from praisonaiagents.scheduler.parser import parse_schedule
+
+# In Europe/London, in the winter, this stores an offset of +00:00
+parse_schedule("at:2026-12-01T09:00:00").at   # -> "2026-12-01T09:00:00+00:00"
+
+# In Europe/London, in the summer, this stores an offset of +01:00
+parse_schedule("at:2026-07-01T09:00:00").at   # -> "2026-07-01T09:00:00+01:00"
+
+# An explicit tz overrides the system zone
+parse_schedule("at:2026-07-01T09:00:00", tz="America/New_York").at
+# -> "2026-07-01T09:00:00-04:00"
+
+# An explicit offset in the string is kept verbatim
+parse_schedule("at:2026-07-01T09:00:00+02:00").at
+# -> "2026-07-01T09:00:00+02:00"
+```
+
+### DST is handled per target date
+
+`localize_wall_clock` attaches the offset in force **on the target date**, not the offset in force right now. In Europe/London, `at:2026-07-01T09:00:00` stamps `+01:00` (BST) even if you parse it in January, and `at:2026-12-01T09:00:00` stamps `+00:00` (GMT) even if you parse it in July. You do not need to hand-compute offsets in the ISO string.
+
+### `PRAISONAI_SCHEDULE_TIMEZONE` fails loudly on bad names
+
+An unknown IANA zone in `PRAISONAI_SCHEDULE_TIMEZONE` (or in the `tz=` argument) now raises `ValueError` from `parse_schedule` when it hits an `at:` or clock form, instead of being accepted silently and never firing. A `Schedule(kind="at", at=<naive iso>)` built directly hits the same check when `is_due()` reads it.
+
+```bash
+# Rejected at add time instead of firing never
+PRAISONAI_SCHEDULE_TIMEZONE=Not/A/Zone \
+  praisonai schedule add "x" -s "at:2026-07-01T09:00:00"
+# -> ValueError: Unknown IANA timezone: 'Not/A/Zone'
+```
+
+### Legacy stored jobs
+
+<Note>
+Jobs stored **before #4705** were read as UTC. Since #4705 they are read in the local zone; #4732 does not re-move them, but the DST correction means a legacy naive `at` on the other DST half of the year is now read at the correct wall-clock time instead of an hour off. Jobs stored **after #4732** carry the offset in the ISO string and are portable across machines. `in N minutes` was already stored as an aware UTC instant and is unchanged. Hand-written `config.yaml` `at:` strings that omit an offset are still supported — they fall through the same `localize_wall_clock` path in `is_due()`, using the schedule's `tz`, else the store default, else `PRAISONAI_SCHEDULE_TIMEZONE`, else the runner's local zone.
+</Note>
 
 ## Agent self-management flow
 
