@@ -444,6 +444,33 @@ Resolution order for `get_small_model(primary_model, fallback)`:
 3. `defaults.model` (or `agent.model`) — if set.
 4. `fallback` — preserves today's hardcoded `gpt-4o-mini` when nothing is configured.
 
+### Env-var fallback (new in PR #4812)
+
+Call sites outside the config-file loader (memory quality scoring, context compaction/summarisation, `lite` helpers, workflow routing, task callbacks, learn-manager extraction) resolve their auxiliary model through a parallel env-var ladder. This is what lets you run **fully locally** without having to set `defaults.small_model` in a config file.
+
+| Precedence | Source | Set via |
+|---|---|---|
+| 1 | Explicit `llm=…` argument on the call site | Code — e.g. `Memory(llm="ollama/qwen3:0.6b")` |
+| 2 | `PRAISONAI_AUXILIARY_MODEL` env var | `export PRAISONAI_AUXILIARY_MODEL=ollama/qwen3:0.6b` |
+| 3 | `OPENAI_MODEL_NAME` env var | `export OPENAI_MODEL_NAME=ollama/llama3.3:70b` |
+| 4 | `"gpt-4o-mini"` (unchanged legacy default) | — |
+
+**Why a dedicated variable?** A local setup usually wants a *smaller* model for internal helper calls than for the agent itself. Pointing `OPENAI_MODEL_NAME` at a 70B local model should not make every internal summarisation call use it:
+
+```bash
+# unset:                                              -> gpt-4o-mini
+export OPENAI_MODEL_NAME=ollama/llama3.3:70b       # -> ollama/llama3.3:70b for everything
+export PRAISONAI_AUXILIARY_MODEL=ollama/qwen3:0.6b # -> agent stays on 70B; helpers use 0.6b
+```
+
+Empty or whitespace-only env values are ignored, so `OPENAI_MODEL_NAME=" "` does not override the default.
+
+The env-var resolver covers **8 modules**: `memory/memory.py`, `memory/learn/manager.py`, `context/compressor.py`, `context/optimizer.py`, `workflows/workflows.py`, `lite/__init__.py`, `task/task.py`, and `session/title.py`.
+
+**Deliberately not routed** — cost tables (`utils/cost_utils.py`, `llm/_cost.py`, where the name selects a *price*, not a model), docstring examples, and public dataclass field defaults. Setting `PRAISONAI_AUXILIARY_MODEL` does **not** change pricing behaviour.
+
+**Session-title generation** is the one call site that combines both ladders: config-file `defaults.small_model` still wins over env vars there (its `fallback` is now `PRAISONAI_AUXILIARY_MODEL` → `OPENAI_MODEL_NAME` → `"gpt-4o-mini"` instead of a hardcoded literal).
+
 ---
 
 ## Usage Examples
@@ -481,7 +508,11 @@ flowchart LR
         A["1️⃣ defaults.small_model"] --> R["Resolved model"]
         B["2️⃣ primary_model<br/>(Agent's model)"] -->|if 1 unset| R
         C["3️⃣ defaults.model"] -->|if 1 & 2 unset| R
-        D["4️⃣ fallback<br/>(gpt-4o-mini)"] -->|last resort| R
+        D["4️⃣ PRAISONAI_AUXILIARY_MODEL"] -->|env fallback| E["5️⃣ OPENAI_MODEL_NAME"]
+        E -->|env fallback| F["6️⃣ gpt-4o-mini"]
+        D -->|last resort| R
+        E -->|last resort| R
+        F -->|last resort| R
     end
     classDef primary fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef secondary fill:#189AB4,stroke:#7C90A0,color:#fff
@@ -489,7 +520,7 @@ flowchart LR
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
     class A primary
     class B,C secondary
-    class D fallback
+    class D,E,F fallback
     class R result
 ```
 
