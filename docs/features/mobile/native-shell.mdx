@@ -67,9 +67,9 @@ The same `cargo test` and `cargo clippy -- -D warnings` run in CI on both `ubunt
 
 ---
 
-## The shell contract — four events + one command
+## The shell contract — four events + two commands
 
-Four events go native → web, one command comes web → native. Every string below is pinned by `src-tauri/tests/contract.rs` on the Rust side and `tools/shell-seam.test.mjs` on the TypeScript side — a rename on either side breaks the shell silently.
+Four events go native → web, and two commands come web → native — a press answer and a standing back-declaration. Every string below is pinned by `src-tauri/tests/contract.rs` on the Rust side and `tools/shell-seam.test.mjs` on the TypeScript side — a rename on either side breaks the shell silently.
 
 | Direction | Name (string literal) | Rust constant | Payload | Notes |
 |---|---|---|---|---|
@@ -78,6 +78,7 @@ Four events go native → web, one command comes web → native. Every string be
 | Native → Web | `lifecycle` | `EVT_LIFECYCLE` | `"active" \| "inactive" \| "background"` | Unrecognised phase is dropped by TS, never defaulted (defaulting to `active` would resume the render loop while the app is suspended) |
 | Native → Web | `back-gesture` | `EVT_BACK` | *(no payload)* | The handler takes no argument |
 | Web → Native | `back_gesture_result` | `CMD_BACK_RESULT` | `{ handled: boolean }` | Answered via `bridge.invoke`; failures are swallowed — see arbitration below (no capability entry — app commands via `invoke_handler` are always reachable) |
+| Web → Native | `back_gesture_can_go_back` | `CMD_BACK_CAN_GO_BACK` | `{ canGoBack: boolean }` | Standing declaration, sent on route-stack change (not in reply to a press); read by the watchdog when an answer never arrives. Default is `false`, so a bundle that never loaded still lets back leave the app. See arbitration below |
 
 On iOS and desktop the Tauri shell falls back to `visualViewport` when the native `keyboard-height` event has not fired yet, and hands over to native the moment one arrives. On Android `visualViewport` reports nothing while `enableEdgeToEdge()` is on, so the handover is triggered by the [Android window-insets bridge](#the-android-window-insets-bridge) (`NATIVE_INSETS_GLOBAL`, which carries both channels) instead. The `on_window_event` handler emits `lifecycle` and `safe-area-changed` on device; the `keyboard-height` Tauri event is still not natively emitted anywhere. See [Shell & Adapters → The three-source keyboard model](/features/mobile/shell-and-adapters#the-three-source-keyboard-model).
 
@@ -287,7 +288,7 @@ When `NATIVE_INSETS_GLOBAL` fires, the shell publishes **both** insets and keybo
 
 ## Back-gesture arbitration
 
-Android presses back, Rust asks the webview whether it wants it, and if the webview says no, Rust lets the system act.
+Android presses back, Rust asks the webview whether it wants it, and if the webview says no — or cannot answer in time — Rust lets the system act. To decide the timeout case correctly, the webview also declares, out of band, whether it could take the next press.
 
 ### The in-repo `tauri-plugin-back-gesture`
 
@@ -305,32 +306,45 @@ BackGesturePlugin.kt   OnBackPressedCallback, registered in `load` not `init`
                        handed a Rust-owned tauri::ipc::Channel
   -> Rust closure      commands::on_back_pressed
   -> Emitter::emit     "back-gesture" — what the webview actually hears
-  -> back_gesture_result(handled), or a 400ms watchdog if silence
-  -> fallBack()        re-dispatch with the callback disabled so the SYSTEM
-                       default runs; on Android 12+ that backgrounds the task
-                       rather than destroying the activity, preserving warm start
+  -> back_gesture_result(handled), or a 400ms watchdog if silence — and the
+                       watchdog reads the standing back_gesture_can_go_back
+                       declaration instead of treating silence as "declined"
+  -> defer()           at the task root, moveTaskToBack(true) — the task goes
+                       behind the launcher and the process stays warm; above the
+                       root, re-dispatch with the callback disabled so the SYSTEM
+                       default runs beneath it
 ```
+
+Two channels feed one gesture: a press that has already happened (answered in reply, or timed out) and a standing declaration sent ahead of any press whenever the route stack changes.
 
 ```mermaid
 graph LR
-    Kotlin[📱 BackGesturePlugin.kt<br/>OnBackPressedCallback] --> Channel[📨 tauri::ipc::Channel]
-    Channel --> Rust[⚙️ on_back_pressed]
-    Rust --> Emit[📤 Emitter::emit<br/>back-gesture]
-    Emit --> Web[🌐 Webview]
-    Web --> Result[💬 back_gesture_result]
-    Result --> Fall[🚦 fallBack — Android system default]
+    subgraph "Two channels, one gesture"
+        Route[🧭 route change] -.declare.-> Decl[📌 back_gesture_can_go_back]
+        Decl -.state.-> Gate[🚦 Gate.can_go_back]
 
-    classDef native fill:#8B0000,stroke:#7C90A0,color:#fff
+        Kotlin[📱 OS back press] --> Rust[⚙️ on_back_pressed]
+        Rust --> Emit[📤 emit back-gesture]
+        Emit --> Web[🌐 webview handler]
+        Web -->|answers in time| Result[💬 back_gesture_result]
+        Web -.silence.-> Timeout[⏰ 400 ms watchdog]
+        Result --> Gate
+        Timeout --> Gate
+        Gate -->|handled or can_go_back| Ignore[🙈 app keeps the press]
+        Gate -->|declined and cannot go back| Fall[⬇️ fall_back]
+    end
+
+    classDef event fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef bridge fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef event fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef web fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef gate fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef state fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef watch fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef out fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class Kotlin native
-    class Channel,Rust bridge
-    class Emit event
-    class Web,Result web
-    class Fall gate
+    class Kotlin,Route event
+    class Rust,Emit,Web,Result,Decl bridge
+    class Gate state
+    class Timeout watch
+    class Ignore,Fall out
 ```
 
 The Kotlin callback is registered in `load(webView)` — **not** `init()` — so it is always newer than Tauri's own callback. Android's `OnBackPressedDispatcher` consults the most recently added enabled callback first, and `load` runs once the WebView exists, after every plugin's `init`, so this callback always wins. Registered in `init` it would win only when the plugin store happened to initialise it after Tauri's.
@@ -359,6 +373,10 @@ pub fn init<R: Runtime>(
 | Kotlin event name / `EVT_PRESSED` | `"pressed"` | must match Rust |
 
 <Note>
+The plugin surface above is unchanged by the back-declaration channel. `back_gesture_can_go_back` is an **app** command in `src-tauri/src/commands.rs` (added to `generate_handler!` in `lib.rs`), not a plugin method — it only writes the `Gate`'s standing state, which `Gate::timed_out` reads. The plugin still exposes exactly `fall_back`, and the two-path choice between `moveTaskToBack(true)` and re-dispatch lives inside the plugin's Kotlin `defer()`.
+</Note>
+
+<Note>
 On iOS and desktop the plugin is inert by design: it registers nothing, `on_press` never fires, and `fall_back` does nothing. iOS has no OS-level back, and an app that terminates itself is an App Review rejection that reads to the user as a crash.
 </Note>
 
@@ -371,13 +389,16 @@ The state diagram below is what the arbitration *inside* that plugin's Rust clos
 ```mermaid
 graph TB
     Idle((Idle)) -->|press| Pending((Pending))
+    Idle -.declare_can_go_back true/false.-> Idle
+    Pending -.declare_can_go_back true/false.-> Pending
     Pending -->|answered handled=true| Idle
     Pending -->|answered handled=false| FallBack[⚙️ fall_back]
     FallBack --> Idle
-    Pending -->|timed_out after 400ms| FallBack
+    Pending -->|timed_out and can_go_back=false| FallBack
+    Pending -->|timed_out and can_go_back=true| Ignore[🙈 Ignore]
     Pending -->|press while pending| Drop[🚫 Drop]
     Drop --> Pending
-    Pending -->|answered AFTER timeout| Ignore[🙈 Ignore]
+    Pending -->|answered AFTER timeout| Ignore
     Ignore --> Idle
 
     classDef state fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -389,7 +410,9 @@ graph TB
     class Drop,Ignore ignore
 ```
 
-Three failure modes shape the `Gate` in `src-tauri/src/shell/back.rs`.
+`declare_can_go_back` is a dotted self-loop, not an edge between states: it sets out-of-band state (`Gate::can_go_back`, default `false`) that `timed_out` reads. It never changes whether a press is pending — only which way the watchdog resolves silence.
+
+Four failure modes shape the `Gate` in `src-tauri/src/shell/back.rs`.
 
 1. **The answer may never come.** `bridge.invoke` on the TS side swallows every rejection into `null`, so silence is indistinguishable from success. Without a watchdog (`ANSWER_TIMEOUT_MS = 400`), a bundle that failed to load leaves a back button that does nothing *forever* — worse than one that exits.
 
@@ -404,24 +427,42 @@ Lowering it under 250 ms stops the crate compiling (`E0080`) rather than failing
 </Note>
 2. **There is no correlation id.** The webview sends `{ handled }` and nothing else. Two presses close together produce two answers Rust cannot tell apart — the second could pop an activity the first decided to keep. **Dropping while pending is the only correct option available on this side.**
 3. **A late answer must not act twice.** If the watchdog fires and the app has backgrounded, an answer arriving after must be ignored, not sent back again. It is the bug this design is most likely to ship, and has its own test in `src-tauri/tests/back_gesture.rs`.
+4. **Slow is not dead.** The round trip is not bounded by anything this crate controls: the emit reaches the webview on the platform's UI thread, and the handler runs on the thread that is painting. On an Android 15 emulator the same press was answered in 0.7 s once and 5.4 s the next time, both far past the watchdog. Treating that silence as "the app does not want this press" sent an app the user was actively using to the background — back on the Settings screen left the app entirely, while its own router had already popped back to the chat. So the webview **declares**, in advance and out of band, whether it can go back (`Gate::declare_can_go_back`), and the watchdog only lets the platform act when the app has said it cannot.
+
+<Note>
+The declaration only decides what silence means; an explicit answer still outranks it. `answered(false)` falls back even when the last declaration was `true`, and `answered(true)` is honoured regardless — the standing state is consulted by `timed_out`, never by `answered`.
+</Note>
 
 The `Gate` returns an `Action` rather than performing it, so the decision is testable and the side effect lives at the edge.
 
 | Method | Returns | Meaning |
 |---|---|---|
-| `Gate::new()` | `Gate` | Create in Idle |
+| `Gate::new()` | `Gate` | Create in Idle, `can_go_back = false` |
 | `press()` | `Action::Ask \| Action::Drop` | Ask webview, or drop if already pending |
-| `answered(handled: bool)` | `Action::Ignore \| Action::FallBack \| Action` | Ignore if late; fall back if `handled=false` |
-| `timed_out()` | `Action::FallBack \| Action::Ignore` | Fall back once; subsequent calls ignore |
+| `answered(handled: bool)` | `Action::Ignore \| Action::FallBack` | Ignore if late; fall back if `handled=false` |
+| `timed_out()` | `Action::FallBack \| Action::Ignore` | Fall back once when the app has declared it cannot go back; ignore otherwise (or if a stray) |
+| `declare_can_go_back(canGoBack: bool)` | `()` | Set the standing answer; read by `timed_out` when a press is unanswered |
+| `can_go_back()` | `bool` | Read back the last declaration (default `false`) |
 | `is_pending()` | `bool` | Test hook |
 
 The fallback itself differs per platform, from `src-tauri/src/commands.rs`.
 
 | Platform | Fallback action | Rationale |
 |---|---|---|
-| Android | Re-dispatch with our callback disabled so the system default runs | On Android 12+ this moves the task to the back rather than destroying the activity |
+| Android | `defer()` branches on `isTaskRoot` — `moveTaskToBack(true)` at the root, else re-dispatch with our callback disabled | On Android 12+ the system-default path backgrounds a root activity, but **only** when the *system* dispatches the press. Re-dispatching it ourselves at the root walks the app-level path to `finishAfterTransition()`, killing the process. `moveTaskToBack(true)` sends the task behind the launcher and keeps the process warm; above the root, re-dispatch runs whatever sits beneath. |
 | iOS | No-op | An iOS app must never terminate itself — App Review rejection, reads as a crash |
 | Desktop (dev) | No-op | The desktop `main.rs` is a dev binary only |
+
+### Who declares, and when
+
+The standing `setCanGoBack` declaration has one router-side caller and one hard rule for when it is `false`.
+
+| Caller | Declares | Why |
+|---|---|---|
+| `attachBackGesture` in `ui/src/router.ts` | `backDecision(stack).consumed` on attach, on every stack change (via `router.subscribe`), and `false` on detach | Same pure decision the press handler makes, so the declaration and the answer never disagree; `false` on detach because a torn-down view's router speaks for nothing |
+| The crash handler in `app/src/main.ts` | `false` **before** repainting the fatal screen | A dead webview must not swallow the gesture |
+| The Tauri adapter in `adapters/src/tauri/shell.ts` | Sends on change; suppresses no-op re-sends but always sends the **first** value — even `false` | The first send overwrites whatever the previous page declared after a reload; a chat-to-chat move keeps the answer `true` and is deduped away |
+| The web adapter in `adapters/src/web/shell.ts` | Documented **no-op** | Browser `popstate` is answered synchronously in the same task — there is no bridge to race with |
 
 ---
 
@@ -577,6 +618,14 @@ Even from inside the in-repo `tauri-plugin-back-gesture`, the press is routed th
 
 <Accordion title="Do not lower the answer-timeout below 250 ms">
 The floor is a compile-time assertion in `shell::back`, not a runtime test, so lowering it stops the crate compiling. Too short a timeout falls back while a slow handler is still deciding.
+</Accordion>
+
+<Accordion title="Keep false as the safe default for setCanGoBack">
+A shell that has never been told otherwise must behave as though `false` was declared: a bundle that never loaded declared nothing, and back must still be able to leave the app. The router declares on attach, on every stack change, and `false` on detach; the crash screen declares `false` before repainting. Never default the standing state to `true`.
+</Accordion>
+
+<Accordion title="Background a root activity — never re-dispatch it">
+At the task root, `defer()` calls `moveTaskToBack(true)`; re-dispatching the press ourselves walks the app-level path to `finishAfterTransition()`, which kills the process and turns the next return into a cold start with the transcript lost. Only re-dispatch above the root.
 </Accordion>
 
 <Accordion title="Keep the mobile_entry_point attribute on run()">
