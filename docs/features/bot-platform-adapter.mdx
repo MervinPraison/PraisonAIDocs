@@ -138,13 +138,14 @@ sequenceDiagram
         Note over Adapter: on failure, wait retry_after<br/>(else base * 2**attempt)
     end
     Adapter-->>Caller: SendResult(ok, message_ids)
+    Note over Adapter: if any chunk was queued/duplicate,<br/>the aggregate status carries it — not "sent"
 ```
 
 ---
 
 ## What Do I Need to Override?
 
-Start with the four abstract methods, then reach for defaults only when the platform can do better.
+Start with the four abstract methods, then reach for defaults only when the platform can do better. An adapter that defers a send to a durable outbox returns `SendResult(ok=True, queued=True, ...)`; one that re-sends after crash recovery returns `SendResult(ok=True, duplicate=True, ...)` — the `status` derives automatically so the caller can [branch on the outcome](#branching-on-delivery-outcome).
 
 ```mermaid
 graph TB
@@ -257,6 +258,47 @@ Four behaviours are worth calling out:
 3. **Typing is best-effort.** Failures in `send_typing()` are swallowed, so a broken indicator never breaks delivery.
 4. **`edit_message` declares "not supported" instead of crashing.** Callers on channels without edits use the `edit_not_supported` fallback to decide whether to re-send.
 
+If any chunk in a multi-chunk reply comes back `queued` or `duplicate`, `deliver()` carries that outcome onto the aggregate `SendResult.status` — a deferred or at-least-once delivery is no longer masked as `"sent"`.
+
+---
+
+## Branching on delivery outcome
+
+A swallowed exception must never become a silent drop. Branch on `result.status` after `deliver()` — the four outcomes are a closed set, so the caller always knows what happened without depending on an exception a wrapper layer might eat.
+
+```python
+from praisonaiagents.bots import SendStatus  # "sent" | "failed" | "queued" | "duplicate"
+
+result = await adapter.deliver(chat_id, reply)
+
+match result.status:
+    case "sent":       ...   # landed inline
+    case "queued":     ...   # persisted to outbox, will land later
+    case "duplicate":  ...   # crash-recovered — may be a re-send
+    case "failed":     ...   # honest failure (see result.error / result.error_kind)
+```
+
+```mermaid
+graph TB
+    Send[✉️ deliver returns SendResult] --> Q1{queued?}
+    Q1 -->|Yes| QD[status = queued]
+    Q1 -->|No| Q2{duplicate?}
+    Q2 -->|Yes| DP[status = duplicate]
+    Q2 -->|No| Q3{ok?}
+    Q3 -->|Yes| ST[status = sent]
+    Q3 -->|No| FL[status = failed]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Send input
+    class Q1,Q2,Q3 decision
+    class QD,DP,ST,FL result
+```
+
+An adapter that persists to a durable outbox returns `SendResult(ok=True, queued=True, ...)`, and one that re-sends after crash recovery returns `SendResult(ok=True, duplicate=True, ...)` — the `status` property derives automatically from those flags.
+
 ---
 
 ## Configuration Options
@@ -270,10 +312,24 @@ Four behaviours are worth calling out:
 | `chat_id` | `Optional[str]` | `None` | The chat/channel the message was delivered to. |
 | `message_ids` | `List[str]` | `[]` | Ids of **every** chunk that landed, in send order. On a partial failure the ids of chunks that landed before the error are preserved. |
 | `error` | `Optional[str]` | `None` | Human-readable error string when `ok=False`. |
+| `retryable` | `bool` | `True` | Whether the failure is worth retrying. Permanent failures set this `False` so the retry loop short-circuits. |
 | `retry_after` | `Optional[float]` | `None` | Suggested seconds to wait before retrying, from the platform's rate-limit response. Honoured by the default retry loop. |
+| `queued` | `bool` | `False` | `True` when the send was persisted to a durable outbox for later delivery rather than delivered inline. Drives `status == "queued"`. |
+| `duplicate` | `bool` | `False` | `True` when a crash-recovered re-send may be a duplicate — an honest at-least-once outcome. Drives `status == "duplicate"`. |
+| `status` | `SendStatus` (property) | _derived_ | Closed, branchable delivery outcome. Precedence: `queued` beats `duplicate` beats (`"sent"` if `ok` else `"failed"`). |
 | `metadata` | `Dict[str, Any]` | `{}` | Additional platform-specific result details. On a successful multi-chunk `deliver()` this includes `{"chunks": N}`. |
 
-`SendResult.to_dict()` returns a plain dict for logging and observability.
+`SendResult.status` is a closed union — the `SendStatus` literal alias `"sent" | "failed" | "queued" | "duplicate"` — so a caller can exhaustively branch on the outcome instead of treating it as an arbitrary string. Import both from the top-level package:
+
+```python
+from praisonaiagents.bots import SendResult, SendStatus
+```
+
+`SendResult.to_dict()` returns a plain dict for logging and observability, now including the `status`, `queued`, and `duplicate` keys.
+
+<Note>
+**Backward compatible.** `send_message` may still return a legacy `BotMessage` — it is accepted and treated as `status == "sent"`. New or refactored adapters SHOULD return a `SendResult` so the caller can branch on the typed status.
+</Note>
 
 `BasePlatformAdapter` class attributes declare adapter behaviour.
 
