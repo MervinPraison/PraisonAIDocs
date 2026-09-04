@@ -21,24 +21,28 @@ No config, no new dependencies — SQLite lives at `~/.praisonai/runs/ledger.db`
 
 ```mermaid
 graph LR
-    subgraph "Run Ledger"
+    subgraph "Run Ledger — exactly-once wake-back"
         A[🤖 Agent starts run] --> B[upsert running]
         B --> C{Process alive?}
         C -->|yes| D[upsert succeeded]
-        C -->|crash| E[recover_orphans on restart]
+        C -->|crash| E[recover_orphans on boot]
         E --> F[status = LOST]
-        F --> G[Gateway wakes user back]
+        F --> G[deliver_terminal]
+        G -->|ok| H[mark_delivered ✓]
+        G -->|fail / raise| I[left undelivered — retried next boot]
+        I -.retry.-> E
     end
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef out fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef retry fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class A agent
-    class B,C process
-    class E,F warn
-    class D,G out
+    class B,C,E,G process
+    class F,I warn
+    class D,H out
 ```
 
 ## Quick Start
@@ -79,10 +83,34 @@ for r in ledger.list_active():
     print(r.run_id, r.status)
 ```
 </Step>
+
+<Step title="Guarantee exactly-once wake-back">
+```python
+# Guarantee every recovered LOST run wakes its origin — exactly once.
+import asyncio
+from praisonaiagents.runs import (
+    SQLiteRunLedger, TerminalOutcomeDelivererProtocol, notify_recovered,
+)
+
+class TelegramDeliverer:
+    async def deliver_terminal(self, record) -> bool:
+        # Wake the origin thread; return True only if the message actually landed.
+        return await send_telegram(record.channel, record.thread_id,
+                                   f"Run interrupted: {record.terminal_outcome}")
+
+ledger = SQLiteRunLedger()
+delivered = asyncio.run(notify_recovered(ledger, TelegramDeliverer()))
+print(f"Woke {delivered} interrupted run(s)")
+```
+</Step>
 </Steps>
 
 <Note>
-`recover_orphans()` returns the list of records it marked `LOST`. It preserves each run's `channel` and `thread_id` so the gateway can wake the same user back.
+`recover_orphans()` returns every **undelivered** `LOST` run — both those reconciled in this call and any left undelivered by a prior boot. It preserves each run's `channel` and `thread_id` so the gateway can wake the same user back.
+</Note>
+
+<Note>
+**Retry on next boot is automatic.** If `deliver_terminal` returns `False` (or raises), the run stays `delivered = False`. The next boot's `recover_orphans()` will surface it again so a working transport can wake the user without any manual re-arming.
 </Note>
 
 ---
@@ -128,8 +156,39 @@ sequenceDiagram
 
 1. `_recover_orphaned_runs()` runs on boot, right after `_resume_interrupted_turns()`.
 2. `recover_orphans()` terminalises every still-active run to `LOST`, preserving its `channel` and `thread_id`.
-3. Each `LOST` run's origin receives a durable restart notice, enqueued into the SQLite `scheduled_outbox` under a stable `run-recovery:<run_id>` key — **exactly-once even across a crash loop**. A boot-time miss (transport not ready yet) leaves a pending row that drains on the next boot.
+3. Each `LOST` run's origin receives a durable restart notice. The gateway calls the transport, and **only on a successful landing** marks the run `delivered` in the ledger — so a failed/raising transport (rather than being silently dropped) is left `delivered = False` and automatically retried on the next boot. When no origin route exists (empty `channel`), the run is marked `delivered` immediately to stop the ledger re-surfacing an undeliverable run on every subsequent boot.
 4. It's a **no-op** when core lacks the ledger or `ledger.db` doesn't exist yet — gateways that never used the ledger are unaffected, and no empty DB is ever created.
+
+### Exactly-once wake-back
+
+A `LOST` run stays owed a wake-back until its notice actually lands — surviving a transport outage across boots without ever double-notifying.
+
+```mermaid
+sequenceDiagram
+    participant Boot as Gateway boot
+    participant Ledger as SQLiteRunLedger
+    participant Deliverer as Wrapper transport
+    participant User
+
+    Note over Boot: First boot — transport is down
+    Boot->>Ledger: recover_orphans()
+    Ledger-->>Boot: [RunRecord LOST, delivered=false]
+    Boot->>Deliverer: deliver_terminal(record)
+    Deliverer-->>Boot: false (transport down)
+    Note over Ledger: delivered stays false — visible, retryable
+
+    Note over Boot: Second boot — transport recovered
+    Boot->>Ledger: recover_orphans()
+    Ledger-->>Boot: [same RunRecord — still undelivered]
+    Boot->>Deliverer: deliver_terminal(record)
+    Deliverer->>User: "Your run was interrupted"
+    Deliverer-->>Boot: true
+    Boot->>Ledger: mark_delivered(run_id)
+
+    Note over Boot: Third boot — nothing owed
+    Boot->>Ledger: recover_orphans()
+    Ledger-->>Boot: [] (exactly-once holds)
+```
 
 The user-facing message the origin receives:
 
@@ -190,6 +249,7 @@ A durable record of a single run. `channel` and `thread_id` capture the origin r
 | `created_at` | `float` | `time.time()` | Creation timestamp |
 | `updated_at` | `float` | `time.time()` | Last-update timestamp |
 | `metadata` | `dict` | `{}` | Free-form extra data |
+| `delivered` | `bool` | `False` | Whether the terminal outcome has been delivered to the origin channel. `True` means the wake-back already landed and this run will never be re-notified. |
 
 `to_dict()` / `from_dict()` roundtrip a record to a JSON/SQLite-friendly dict and back.
 
@@ -203,14 +263,42 @@ assert restored.status == RunStatus.RUNNING
 
 ### RunLedgerProtocol
 
-The pluggable store contract — swap in a heavier backend by implementing these four methods.
+The pluggable store contract — swap in a heavier backend by implementing these methods.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `upsert(record)` | `None` | Insert or update, keyed by `run_id` |
 | `get(run_id)` | `RunRecord \| None` | Fetch one run, or `None` if unknown |
 | `list_active()` | `list[RunRecord]` | All runs still in an active status |
-| `recover_orphans()` | `list[RunRecord]` | Mark active runs `LOST`, return them (idempotent) |
+| `recover_orphans()` | `list[RunRecord]` | Mark active runs `LOST`, return **every undelivered** `LOST` run (retries earlier misses) |
+| `mark_delivered(run_id)` | `None` | Flag a run's wake-back as delivered — exactly-once boundary |
+
+`mark_delivered(run_id)` records that this run's terminal outcome reached its origin. Once set, `recover_orphans()` will never return this run again — the durable half of the exactly-once guarantee.
+
+### TerminalOutcomeDelivererProtocol
+
+The transport contract the wrapper implements. Core owns the exactly-once *guarantee*; the wrapper supplies only the concrete transport.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `async deliver_terminal(record)` | `bool` | Deliver `record`'s terminal outcome to `record.channel` / `record.thread_id`. Return `True` when the outcome reached the origin, `False` when it could not (so the run stays undelivered and is retried next boot). |
+
+### notify_recovered
+
+`notify_recovered(ledger, deliverer)` is the async binder that closes the loop. For each record from `recover_orphans()` it invokes `deliverer.deliver_terminal(record)` and, **only on success**, calls `ledger.mark_delivered(record.run_id)`. A raising transport is treated as a failed (retryable) delivery, never crashing recovery for the other runs. Returns the number of runs successfully delivered this call.
+
+```python
+import asyncio
+from praisonaiagents.runs import SQLiteRunLedger, notify_recovered
+
+class MyDeliverer:
+    async def deliver_terminal(self, record) -> bool:
+        return await send(record.channel, record.thread_id,
+                          f"Run interrupted: {record.terminal_outcome}")
+
+ledger = SQLiteRunLedger()
+count = asyncio.run(notify_recovered(ledger, MyDeliverer()))
+```
 
 ### SQLiteRunLedger
 
@@ -222,8 +310,12 @@ The zero-dependency default, backed by stdlib `sqlite3`.
 
 - **No new dependencies** — stdlib `sqlite3` only.
 - **Thread-safe** — a re-entrant lock guards a shared WAL connection.
-- **`recover_orphans()`** preserves the origin route and is idempotent (a second call returns `[]`).
+- **`recover_orphans()`** preserves the origin route and returns every undelivered `LOST` run; once `mark_delivered` flips a run, a later call filters it out.
 - **`close()`** releases the connection; the file persists across restarts.
+
+<Note>
+**Automatic in-place migration.** Older `ledger.db` files from before this release lack the `delivered` column. Opening the ledger runs an additive `ALTER TABLE runs ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0` — existing rows default to `delivered = False` (safe: they get retried once), and every subsequent open is a no-op. Nothing to run manually.
+</Note>
 
 ---
 
@@ -288,6 +380,10 @@ Call `upsert()` as the run moves `queued → running → waiting → succeeded/f
 <Accordion title="Swap the store for heavier backends">
 `SQLiteRunLedger` is the default, but any object implementing `RunLedgerProtocol` (Postgres, Redis, a hosted queue) drops in unchanged — the gateway only depends on the protocol.
 </Accordion>
+
+<Accordion title="Return the truth from deliver_terminal">
+Have `deliver_terminal` return `True` **only** when the message actually landed on the origin (or was durably enqueued to a store that will land it). Returning `True` optimistically breaks the exactly-once guarantee — a transient network blip becomes a permanently lost wake-back. When the send fails, return `False` (or let the exception propagate) so the ledger retries it next boot.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -304,7 +400,7 @@ The process is killed or crashes before the run finishes. In-memory state is gon
 </Step>
 
 <Step title="The gateway wakes the user back">
-On boot, the gateway automatically calls `recover_orphans()`, marks the run `LOST`, and posts a durable notice back to the same Telegram thread: "A background run was interrupted by a restart… Please resend your request." No user code required.
+On boot, the gateway automatically calls `recover_orphans()`, marks the run `LOST`, and posts a durable notice back to the same Telegram thread. If Telegram is unreachable at that instant, the notice stays owed — and the **next** boot delivers it. Once the user has been told, they are **never** re-notified for the same run, however many times PraisonAI restarts.
 </Step>
 </Steps>
 
