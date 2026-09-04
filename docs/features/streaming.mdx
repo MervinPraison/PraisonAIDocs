@@ -796,9 +796,53 @@ Same signal, two consumers — the [`ON_RETRY` hook](/features/agent-retry) is f
 
 ---
 
+## Token usage on the streaming path
+
+Streamed calls now record real prompt and completion tokens, not zeros.
+
+Before [PraisonAI PR #4819](https://github.com/MervinPraison/PraisonAI/pull/4819), the Chat Completions streaming path's `choices` guard swallowed the trailing usage-only chunk, and the Responses API streaming path never inspected the `response.completed` event — so `CompletionUsage(0, 0, 0)` reached your metrics collector on every streamed turn. Since #4819:
+
+- `process_stream_chunks` reads the usage chunk before the `choices` guard, and `process_stream_response` requests `stream_options={"include_usage": True}` on every streamed call (a caller-supplied `stream_options` is respected).
+- `_stream_responses_api` / `_stream_responses_api_async` capture the final response from `response.completed` and hand it to `_track_token_usage`; the sync path also fires the `llm_end` display callback (`tokens_in`, `tokens_out`, `latency_ms`).
+
+| Behaviour | Chat Completions | Responses API (sync) | Responses API (async) |
+|---|---|---|---|
+| `usage` captured on every call | ✅ | ✅ | ✅ |
+| `_track_token_usage(...)` invoked | ✅ | ✅ | ✅ |
+| `llm_end` display callback fires | (existing, unchanged) | ✅ | ❌ (mirrors non-stream async, which also skips it) |
+
+<Note>
+If you set `stream_options` yourself (for example to opt out of the usage chunk), the SDK respects your choice and does not clobber it. Otherwise `{"include_usage": True}` is the default.
+</Note>
+
+Token counters populate even for a purely streamed call — no callbacks, no `_emit`:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.streaming import StreamEvent, StreamEventType, StreamMetrics
+
+metrics = StreamMetrics()
+
+def on_event(event: StreamEvent):
+    metrics.update_from_event(event)
+
+agent = Agent(instructions="You are a helpful assistant")
+agent.stream_emitter.add_callback(on_event)
+
+for chunk in agent.start("Explain AI briefly", stream=True):
+    print(chunk, end="", flush=True)
+
+print(metrics.format_summary())
+# tokens_in / tokens_out are now non-zero on a streamed turn
+```
+
+The [`llm_end` display callback](/features/display-callbacks) now fires on the Responses API streaming path (sync) too, carrying the same `tokens_in` / `tokens_out` / `latency_ms` fields as the non-streaming path.
+
+---
+
 ## Metrics
 
-Track Time To First Token (TTFT) and throughput.
+Track Time To First Token (TTFT) and throughput. Token counters `tokens_in` / `tokens_out` are now accurate on the streaming path (see [Token usage on the streaming path](#token-usage-on-the-streaming-path)).
 
 ```python
 from praisonaiagents import Agent
