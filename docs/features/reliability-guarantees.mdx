@@ -18,6 +18,14 @@ Long tool-using conversations and mixed async task batches used to fail in three
 - `temperature` set in `Agent(llm={...})` now reaches the request (previously silently overridden by `1.0`). See [LLM Configuration](/configuration/llm-config#core-llm-configuration).
 </Note>
 
+<Note>
+**Behaviour changes (PraisonAI PR #4808).** Three silent defects at the LLM message layer are fixed automatically by upgrading:
+
+- A tool returning `[{"error": "..."}]` is now surfaced as an error on every path (previously the async secondary path dumped it as data).
+- The error sentence sent back to the model is the same on every path.
+- A tool returning a non-JSON-serializable value (`set`, `datetime`, `bytes`, custom class) no longer raises `TypeError` and kills the turn.
+</Note>
+
 ```python
 from praisonaiagents import Agent, Task, PraisonAIAgents
 
@@ -51,13 +59,15 @@ graph LR
         C[Window trim] --> D[Tool-call ↔ tool-result pair preserved]
         E[Async batch dependency] --> F[Dependency flushed before dependent]
         G[Async turn failure] --> H[chat_history rolled back to pre-turn snapshot]
+        I[Tool returns non-serializable value] --> J[Fed to model as str(value), turn continues]
+        K[Tool returns list-of-errors] --> L[Surfaced as role=tool error on every path]
     end
 
     classDef failure fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef recovery fill:#189AB4,stroke:#7C90A0,color:#fff
 
-    class A,C,E,G failure
-    class B,D,F,H recovery
+    class A,C,E,G,I,K failure
+    class B,D,F,H,J,L recovery
 ```
 
 **Async turn failure** → `achat()`/`astart()` roll back the pre-turn `chat_history` snapshot, matching the sync path. (Since PR #4739 — see [Async Agents](/features/async#failed-turns-leave-chat-history-clean).)
@@ -132,6 +142,29 @@ PraisonAIAgents(agents=[researcher, writer], tasks=[research, article]).start()
 ```
 
 </Step>
+
+<Step title="A tool returning a non-serializable value doesn't crash the turn">
+
+A tool returning a `datetime`, `set`, `bytes`, or custom object is fed to the model as `str(value)` on every path — the run continues instead of raising `TypeError`.
+
+```python
+from datetime import datetime
+from praisonaiagents import Agent
+
+def current_time() -> datetime:
+    """Return the current time."""
+    return datetime.now()  # not JSON-serializable
+
+agent = Agent(
+    name="Clock",
+    instructions="Tell the user the current time using the tool.",
+    tools=[current_time],
+)
+
+agent.start("What time is it?")
+```
+
+</Step>
 </Steps>
 
 ---
@@ -174,6 +207,48 @@ A parse failure returns a distinct internal sentinel that is kept separate from 
 | Streaming batch (`get_response_stream`) | Reports `role="tool"` error, skips dispatch |
 | Non-streaming batch (`get_response`) | Reports `role="tool"` error, skips dispatch |
 | Async Responses-API loop (`get_response_async`) | Reports `role="tool"` error, skips dispatch |
+
+### Uniform tool-result message
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Formatter
+    participant LLM
+
+    Agent->>Formatter: Tool result (error, list-error, or non-serializable value)
+    Note over Formatter: One formatter for every non-Ollama path
+    Formatter-->>Agent: Same error sentence / str(value) fallback
+    Agent->>LLM: role=tool message
+    LLM-->>Agent: Answer
+```
+
+Every non-Ollama path now routes tool results through one formatter, so the same tool value produces the same message regardless of which internal branch handled it. Previously five inline copies had drifted apart:
+
+| copy in `llm.py` | error sentence used | list-of-errors handled | `json.dumps` guarded |
+|---|---|---|---|
+| sync sequential | `"...inform the user."` (shorter) | yes | no |
+| sync batch (non-Ollama) | `"...could not be completed"` (fuller) | yes | no |
+| async secondary | `"...inform the user."` (shorter) | **no — dumped as data** | no |
+| async batch (non-Ollama) | `"...could not be completed"` (fuller) | yes | no |
+| streaming | `"...could not be completed"` (fuller) | yes | **yes** |
+
+The uniform behaviour is:
+
+- A tool returning `[{"error": "..."}]` is **always** surfaced as an error to the model.
+- The error sentence is the same everywhere: `Error: <msg>. Please inform the user that the operation could not be completed.`
+- A non-JSON-serializable value (`set`, `datetime`, `bytes`, custom class) falls back to `str(result)` instead of raising `TypeError`.
+
+| Execution path | Coverage |
+|---|---|
+| Sync sequential | Same message; list-error surfaced; non-serializable safe |
+| Sync batch (non-Ollama) | Same message; list-error surfaced; non-serializable safe |
+| Async sequential | Same message; **list-error now surfaced** (previously dumped as data); non-serializable safe |
+| Async batch (non-Ollama) | Same message; list-error surfaced; non-serializable safe |
+| Streaming | Unchanged behaviour — already the reference implementation |
+| Ollama (`OllamaAdapter`) | Intentional divergence: `role: "user"`, natural-language shape |
+
+The Ollama path keeps its natural-language `role: "user"` shape — the one genuine divergence, unchanged.
 
 ### Tool-pair-safe window trim
 
@@ -239,6 +314,12 @@ Bounded retention preserves tool-call ↔ tool-result pairs automatically. The r
 <Accordion title="Give dependent async tasks their context=[...]">
 
 Declare dependencies with `context=[task]` (or a workflow `next_tasks` edge). Batch ordering is preserved for you — the dependency is flushed before the dependent runs, so the dependent always sees real upstream output.
+
+</Accordion>
+
+<Accordion title="You don't need to make tool return values JSON-serializable for reliability">
+
+A tool returning `datetime`, `set`, `bytes`, or a custom object is fed to the model as `str(value)` and the turn continues. Serialization is still recommended for readability, but it is no longer a correctness requirement.
 
 </Accordion>
 
