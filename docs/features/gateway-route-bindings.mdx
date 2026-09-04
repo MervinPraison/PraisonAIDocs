@@ -25,12 +25,13 @@ The user messages a channel; route bindings map that channel to the correct agen
 ```mermaid
 graph LR
     subgraph "Route Bindings"
-        Msg[📩 Inbound Message] --> Facts[🧠 Extract Facts<br/>peer · role · channel · account]
+        Msg[📩 Inbound Message] --> Facts[🧠 Extract Facts<br/>peer · role · channel · account<br/>thread · guild · parent]
         Facts --> Resolve{🎯 Match Binding<br/>most-specific first}
-        Resolve -->|peer match| VIP[👑 VIP Agent<br/>profile: vip]
+        Resolve -->|thread match| Escal[🎯 Escalations Agent]
+        Resolve -->|peer match| VIP[👑 VIP Agent]
         Resolve -->|channel match acme| Acme[🛟 Support Agent<br/>profile: acme]
-        Resolve -->|channel match globex| Globex[🛟 Support Agent<br/>profile: globex]
-        Resolve -->|fallback| Default[🤖 Default Agent<br/>profile: none]
+        Resolve -->|guild match globex| Globex[🛟 Support Agent<br/>profile: globex]
+        Resolve -->|fallback| Default[🤖 Default Agent]
     end
 
     classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -39,7 +40,7 @@ graph LR
 
     class Msg input
     class Facts,Resolve process
-    class VIP,Acme,Globex,Default agent
+    class Escal,VIP,Acme,Globex,Default agent
 
 ```
 
@@ -110,6 +111,44 @@ A user with id `12345678` always gets `vip`. A support-role member who DMs the b
 
 </Step>
 
+<Step title="Route a whole Discord server to one tenant">
+
+Bind one `guild_id:` and every current and future channel in that server routes to the same agent.
+
+```yaml
+channels:
+  discord:
+    token: ${DISCORD_BOT_TOKEN}
+    routes:
+      default: general
+    bindings:
+      - { guild_id: "9001", agent: support, profile: acme }
+```
+
+A single rule handles every channel in the guild — no need to list them all, and new channels are covered automatically.
+
+</Step>
+
+<Step title="Send one support thread to a specialist">
+
+Layer a `thread_id:` binding on top of a channel or guild binding — a thread rule beats them both.
+
+```yaml
+channels:
+  discord:
+    token: ${DISCORD_BOT_TOKEN}
+    routes:
+      default: general
+    bindings:
+      - { guild_id: "9001", agent: support, profile: acme }
+      - { channel_id: "333", agent: sales,  profile: acme }    # also covers threads under 333
+      - { thread_id: "77",  agent: escalations, profile: acme } # one thread beats the channel rule
+```
+
+A thread rule beats a channel or guild rule — the specialist agent picks up messages in that one thread, everything else falls through.
+
+</Step>
+
 <Step title="Restrict tools by trust tier">
 
 Add `trust:` to any binding to scope the toolset the model sees — strangers get a safe subset, your operator keeps full power.
@@ -159,7 +198,7 @@ sequenceDiagram
     participant Agent
 
     User->>Bot: Sends a message
-    Bot->>Gateway: Inbound facts (peer, roles, channel_id, account, chat_type)
+    Bot->>Gateway: Inbound facts (peer, roles, channel_id, account, chat_type, thread_id, guild_id, parent_channel_id)
     Gateway->>Resolver: bindings + facts + default_agent
     Resolver-->>Gateway: RouteMatch (agent + reason)
     Gateway->>Agent: Dispatch to chosen agent
@@ -170,10 +209,37 @@ The gateway resolves the target agent in four deterministic steps:
 
 | Step | What the gateway does |
 |------|----------------------|
-| 1 | Extracts `peer`, `roles`, `channel_id`, `account`, `chat_type` from the inbound message |
+| 1 | Extracts `peer`, `roles`, `channel_id`, `account`, `chat_type`, `thread_id`, `guild_id`, `parent_channel_id` from the inbound message |
 | 2 | Tries every `bindings:` rule, keeps only the ones that match |
 | 3 | Sorts surviving matches: higher `priority` wins, then higher specificity, then declaration order |
 | 4 | If no binding matches, falls back to `routes[chat_type]`, then `routes["default"]`, then the literal agent id `"default"` |
+
+---
+
+## Parent-chain matching
+
+A `channel_id` condition now matches the channel itself **and** any thread/forum-post whose parent is that channel — one channel rule naturally covers the conversations beneath it.
+
+```mermaid
+graph LR
+    subgraph "Parent-chain match"
+        Msg[📩 Message in<br/>thread-abc] --> Facts[channel_id: thread-abc<br/>parent_channel_id: 333]
+        Facts --> Rule{Binding:<br/>channel_id: 333}
+        Rule -->|matches| Agent[✅ Sales Agent]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Msg input
+    class Facts,Rule process
+    class Agent ok
+```
+
+If you want a specific thread to escape the parent's route, add a `thread_id:` binding — it beats the channel/guild rule via specificity.
+
+A legacy `channel_id`-only binding still resolves exactly as before — parent-chain only widens what it matches, never narrows.
 
 ---
 
@@ -183,14 +249,16 @@ The gateway resolves the target agent in four deterministic steps:
 graph TD
     Q1{Do you only need to route<br/>by chat type — dm / group / channel?}
     Q1 -->|Yes| Routes[Use flat <code>routes:</code> map only]
-    Q1 -->|No| Q2{Do you need to route by<br/>user, role, channel id, or bot account?}
+    Q1 -->|No| Q2{Do you need to route by<br/>user, role, channel, or bot account?}
     Q2 -->|Yes| Bindings[Use <code>bindings:</code><br/>keep <code>routes: default</code> as fallback]
-    Q2 -->|Not sure| Both[Use both — <code>bindings:</code> for specific cases,<br/><code>routes:</code> for fallback]
+    Q2 -->|Not sure| Q3{Do you multiplex whole servers<br/>or route specific threads?}
+    Q3 -->|Yes| ThreadGuild[Use <code>guild_id:</code> for whole servers<br/><code>thread_id:</code> for specific threads<br/><code>channel_id:</code> covers threads below it]
+    Q3 -->|No| Both[Use both — <code>bindings:</code> for specific cases,<br/><code>routes:</code> for fallback]
 
     classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
-    class Q1,Q2 question
-    class Routes,Bindings,Both answer
+    class Q1,Q2,Q3 question
+    class Routes,Bindings,ThreadGuild,Both answer
 ```
 
 ---
@@ -205,7 +273,9 @@ Each entry in the `bindings:` list is a `RouteBinding`:
 | `chat_type` | `Optional[str]` | `None` | `"dm"` \| `"group"` \| `"channel"` |
 | `peer` | `Optional[str]` | `None` | Sender/user id (most specific) |
 | `role` | `Optional[str]` | `None` | Role / guild-role membership of the sender |
-| `channel_id` | `Optional[str]` | `None` | Specific chat/channel id |
+| `channel_id` | `Optional[str]` | `None` | Specific chat/channel id. Also matches messages in a thread/forum-post whose parent is this id — a channel-level route naturally covers the threads beneath it. |
+| `thread_id` | `Optional[str]` | `None` | Match a specific thread / forum-post id — most specific unit. One triage-spun support thread can route to a specialist agent. |
+| `guild_id` | `Optional[str]` | `None` | Match a whole server / workspace id (Discord guild, Slack workspace). One rule covers every current and future channel in the guild. |
 | `account` | `Optional[str]` | `None` | Receiving bot account (multi-account channels) |
 | `priority` | `int` | `0` | Higher wins; ties broken by specificity then declaration order |
 | `trust` | `Optional[str]` | `None` | Trust tier — `"untrusted"` \| `"standard"` \| `"trusted"`. `untrusted` applies a conservative deny-list (no shell, no file mutation, no delegation, no self-scheduling). **Unknown values fail closed to `untrusted`**. |
@@ -219,13 +289,19 @@ All non-`None` conditions in a binding must match the inbound message for that b
 
 | Field | Specificity weight |
 |-------|--------------------|
-| `peer` | 16 (most specific) |
+| `thread_id` | 32 (most specific) |
+| `peer` | 16 |
 | `role` | 8 |
 | `channel_id` | 8 |
+| `guild_id` | 4 |
 | `account` | 4 |
 | `chat_type` | 2 |
 
 Ties on `(priority, specificity)` are broken by **declaration order** — the first matching binding in your list wins.
+
+<Note>
+`thread_id`, `guild_id`, and `parent_channel_id` are all optional and default to `None`. Existing configs resolve exactly as today, and positional `RouteBinding(...)` constructors keep their meaning — the new fields are appended, never inserted mid-list.
+</Note>
 
 ---
 
@@ -395,6 +471,62 @@ channels:
 
 Strangers who DM the bot never see shell, file-mutation, delegation, or scheduling tools. Your operator (`peer: "operator-123"`) retains the full toolset. See [Gateway Tool Policy](/features/gateway-tool-policy) for the complete security reference.
 
+**Route a whole Discord server to one tenant profile**
+
+```yaml
+channels:
+  discord-acme:
+    platform: discord
+    token: ${ACME_DISCORD_TOKEN}
+    routes:
+      default: general
+    bindings:
+      - { guild_id: "9001", agent: support, profile: acme }
+```
+
+**Escalate one support thread to a specialist agent**
+
+```yaml
+channels:
+  discord:
+    token: ${DISCORD_BOT_TOKEN}
+    routes:
+      default: general
+    bindings:
+      - { channel_id: "333", agent: support }
+      - { thread_id: "77",  agent: escalations }
+```
+
+**A channel route automatically covers its threads**
+
+```yaml
+channels:
+  discord:
+    token: ${DISCORD_BOT_TOKEN}
+    routes:
+      default: general
+    bindings:
+      - { channel_id: "sales", agent: sales }   # matches messages in "sales" and every thread under it
+```
+
+**Resolve a thread over a whole-server rule in Python**
+
+```python
+from praisonaiagents.gateway import RouteBinding, RouteFacts, resolve_route
+
+bindings = [
+    RouteBinding(agent="support", guild_id="9001", profile="acme"),
+    RouteBinding(agent="escalations", thread_id="77", profile="acme"),
+]
+facts = RouteFacts(
+    chat_type="channel", channel_id="333", thread_id="77",
+    guild_id="9001", parent_channel_id="333",
+)
+match = resolve_route(bindings, facts)
+print(match.agent)   # "escalations"  ← thread beats guild
+print(match.profile) # "acme"
+```
+
 ---
 
 ## Best Practices
@@ -426,6 +558,14 @@ If your list grows past ~10 entries, consider grouping users by role at the plat
 
 <Accordion title="Name the isolation scope on the binding, not the agent">
 The same agent can serve many customers if each route carries its own `profile`. The gateway reads `RouteMatch.profile` and keys the turn's memory namespace off the name (secret-scope / home remain follow-ups). Leaving `profile` off means the route is unscoped; a fallback match never inherits another tenant's profile, so misrouted traffic can't leak conversation history across customers.
+</Accordion>
+
+<Accordion title="Use guild_id for whole-tenant routing">
+When each tenant owns a Discord server or Slack workspace, bind on `guild_id:` instead of listing every channel. A newly-created channel in that server automatically inherits the guild's route, and pairing it with `profile:` gives each tenant its own memory namespace. See [Gateway Tenant Profiles](/features/gateway-tenant-profile).
+</Accordion>
+
+<Accordion title="Escalate to a thread, not a new channel">
+For triage patterns — a general support agent spins up a thread for a hard case — bind the thread id to the specialist agent. The thread rule beats the parent channel's rule automatically, and messages in every other thread still route through the parent.
 </Accordion>
 
 </AccordionGroup>
