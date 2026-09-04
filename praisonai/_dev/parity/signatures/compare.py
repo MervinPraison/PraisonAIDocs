@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -92,14 +93,24 @@ class Rules:
     aliases: Dict[str, Dict[str, str]] = field(default_factory=dict)
     flattened: Dict[str, Dict[str, List[str]]] = field(default_factory=dict)
     default_equivalences: List[Tuple[Any, Any]] = field(default_factory=list)
+    #: ``(python expression text, typescript token)`` pairs. Separate from
+    #: ``default_equivalences`` because a Python *expression* default (a module
+    #: sentinel such as ``_UNSET``) is not a literal and must not be compared
+    #: against literals of the same spelling.
+    default_expr_equivalences: List[Tuple[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Rules':
         data = data or {}
         equivalences = []
+        expr_equivalences = []
         for item in data.get('default_equivalences') or []:
-            equivalences.append((item.get('python'), item.get('typescript')))
+            if 'python_expr' in item:
+                expr_equivalences.append((item['python_expr'], item.get('typescript')))
+            else:
+                equivalences.append((item.get('python'), item.get('typescript')))
         return cls(
+            default_expr_equivalences=expr_equivalences,
             case=data.get('case', 'snake_to_camel'),
             aliases={k: dict(v or {}) for k, v in (data.get('aliases') or {}).items()},
             flattened={k: {p: list(f) for p, f in (v or {}).items()}
@@ -274,6 +285,13 @@ def defaults_equivalent(py: Param, ts: Param, rules: Rules) -> bool:
             return True
     for py_eq, ts_eq in rules.default_equivalences:
         if py.default_kind == 'literal' and py_value == py_eq and type(py_value) is type(py_eq):
+            if ts_token == ts_eq and type(ts_token) is type(ts_eq):
+                return True
+    # A Python module-level sentinel (``_UNSET``) and TypeScript's `undefined`
+    # are the same "the caller passed nothing" marker; only the spelling of the
+    # sentinel differs, so the two sides resolve identically.
+    for py_expr, ts_eq in rules.default_expr_equivalences:
+        if py.default_kind == 'expr' and py_value == py_expr:
             if ts_token == ts_eq and type(ts_token) is type(ts_eq):
                 return True
     return False
@@ -715,6 +733,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# A source location is `path/to/file.ext:LINE`. Editing an unrelated part of a
+# covered file shifts those line numbers without changing a single fact about
+# parity, and comparing the reports byte for byte turned that into a red build
+# on main -- the same "a number moved, nothing happened" noise this checker was
+# built to remove. Staleness is judged on the report with line numbers masked;
+# `--write` still records the real ones.
+_SOURCE_LOCATION_RE = re.compile(r'(?P<path>[\w./-]+\.(?:py|ts|mjs|tsx)):(?P<line>\d+)')
+
+
+def strip_source_lines(text: str) -> str:
+    """The report with `file.ext:123` reduced to `file.ext`, for staleness checks."""
+    return _SOURCE_LOCATION_RE.sub(lambda m: m.group('path'), text)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -762,7 +794,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 rel = path.relative_to(repo_root)
                 if not path.is_file():
                     evaluation.failures.append(f'{rel} does not exist -- run --write and commit it')
-                elif path.read_text(encoding='utf-8') != content:
+                elif strip_source_lines(path.read_text(encoding='utf-8')) != strip_source_lines(content):
                     evaluation.failures.append(f'{rel} is out of date -- run --write and commit the result')
 
         _print_report(evaluation, comparisons)

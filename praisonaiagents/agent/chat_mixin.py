@@ -4675,6 +4675,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
                         logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
+                    # Rollback chat history so a failed async turn does not leave
+                    # a dangling, unanswered user message (mirrors the sync path
+                    # and achat()'s own guardrail handler).
+                    self._rollback_chat_history_to(chat_history_length)
                     return None
         except ToolExecutionError:
             raise
@@ -4683,6 +4687,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             if get_logger().getEffectiveLevel() == logging.DEBUG:
                 total_time = time.time() - start_time
                 logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
+            # Rollback chat history so a failed async turn does not leave a
+            # dangling, unanswered user message (mirrors the sync path).
+            self._rollback_chat_history_to(chat_history_length)
             return None
 
     async def _achat_completion(self, response, tools, reasoning_steps=False):
@@ -4906,7 +4913,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             original_verbose = self.verbose
             self.verbose = False
             memory_prefetch_context = self._prefetch_memory(prompt)
-            
+
+            # Ephemeral attachments (images / data URIs) are folded into a
+            # multimodal prompt so streaming turns reach vision models too,
+            # matching chat()/achat(). The text prompt is kept intact through
+            # knowledge retrieval below and the multimodal content is built
+            # afterwards, so knowledge augmentation never flattens the image.
+            # Only the text is stored in history.
+            attachments = kwargs.get('attachments')
+
             # For custom LLM path, use the new get_response_stream generator
             if self._using_custom_llm:
                 # Handle knowledge search
@@ -4922,6 +4937,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         else:
                             knowledge_content = "\n".join(search_results)
                         actual_prompt = f"{prompt}\n\nKnowledge: {knowledge_content}"
+
+                if attachments:
+                    actual_prompt = self._build_multimodal_prompt(actual_prompt, attachments)
                 
                 # Handle tools properly
                 tools = kwargs.get('tools', self.tools)
@@ -4962,7 +4980,26 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 try:
                     # Use the new streaming generator from LLM class
                     response_content = ""
-                    stream_history = self.chat_history
+                    # Compact before sending, exactly as the OpenAI-client
+                    # branch below does. #4729 added compaction to that branch
+                    # only, so a configured ContextManager -- auto-enabled
+                    # whenever tools are present -- was still skipped for every
+                    # agent routed through the custom-LLM path. The trigger is
+                    # the routing flag, not the vendor: llm="openai/gpt-4o-mini"
+                    # takes this branch too. Zero overhead when context=False.
+                    stream_system_prompt = self._build_system_prompt(
+                        tool_param,
+                        memory_prefetch_context=memory_prefetch_context,
+                    )
+                    if self.context_manager:
+                        stream_history, _ = self._apply_context_management(
+                            messages=self.chat_history,
+                            system_prompt=stream_system_prompt or "",
+                            tools=tool_param,
+                        )
+                        stream_history = list(stream_history)
+                    else:
+                        stream_history = self.chat_history
                     durable_context = self._get_durable_run_context()
                     if durable_context is not None:
                         stream_history = durable_context.restore_messages(
@@ -4973,12 +5010,17 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         stream_sampling_kwargs['max_tokens'] = kwargs['max_tokens']
                     if kwargs.get('top_p') is not None:
                         stream_sampling_kwargs['top_p'] = kwargs['top_p']
+                    # reasoning_effort travelled the same route as max_tokens
+                    # and top_p -- collected by the caller, forwarded into
+                    # start(), and then dropped, because this enumeration never
+                    # listed it. llm.py already consumes it from here.
+                    _stream_effort = kwargs.get(
+                        'reasoning_effort', getattr(self, 'reasoning_effort', None))
+                    if _stream_effort is not None:
+                        stream_sampling_kwargs['reasoning_effort'] = _stream_effort
                     for chunk in self.llm_instance.get_response_stream(
                         prompt=actual_prompt,
-                        system_prompt=self._build_system_prompt(
-                            tool_param,
-                            memory_prefetch_context=memory_prefetch_context,
-                        ),
+                        system_prompt=stream_system_prompt,
                         chat_history=stream_history,
                         temperature=kwargs.get('temperature', 1.0),
                         tools=tool_param,
@@ -5030,6 +5072,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         else:
                             knowledge_content = "\n".join(search_results)
                         actual_prompt = f"{prompt}\n\nKnowledge: {knowledge_content}"
+
+                if attachments:
+                    actual_prompt = self._build_multimodal_prompt(actual_prompt, attachments)
                 
                 # Handle tools properly
                 tools = kwargs.get('tools', self.tools)
@@ -5097,6 +5142,33 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         completion_args["max_tokens"] = kwargs['max_tokens']
                     if kwargs.get('top_p') is not None:
                         completion_args["top_p"] = kwargs['top_p']
+                    # Native reasoning control. resolve_reasoning_params returns
+                    # {} for "off", for an unset level, and for a model with no
+                    # reasoning knob, so the default stays a no-op; a reasoning
+                    # model gets reasoning_effort and Anthropic/Gemini get their
+                    # thinking budget. completion_args is copied into
+                    # followup_args below, so tool follow-ups inherit it.
+                    _effort = kwargs.get(
+                        'reasoning_effort', getattr(self, 'reasoning_effort', None))
+                    if _effort is not None:
+                        try:
+                            from ..thinking.effort import resolve_reasoning_params
+                            _reasoning = resolve_reasoning_params(_effort, self.llm)
+                            for _key, _value in _reasoning.items():
+                                # ``reasoning_effort`` is a native OpenAI SDK
+                                # keyword; anything else (e.g. an extended-thinking
+                                # ``thinking`` budget for an Anthropic/Gemini-named
+                                # model reached over an OpenAI-compatible endpoint)
+                                # is a provider-specific body field the OpenAI SDK
+                                # rejects as a top-level kwarg, so route it through
+                                # ``extra_body`` instead of raising TypeError.
+                                if _key == "reasoning_effort":
+                                    completion_args[_key] = _value
+                                else:
+                                    completion_args.setdefault(
+                                        "extra_body", {})[_key] = _value
+                        except ImportError:
+                            pass
                     if formatted_tools:
                         completion_args["tools"] = formatted_tools
                     
