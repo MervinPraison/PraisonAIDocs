@@ -145,15 +145,41 @@ As of PR [#4394](https://github.com/MervinPraison/PraisonAI/pull/4394), the asyn
 `PersistenceOrchestrator.on_message` / `aon_message` / `on_agent_end` / `aon_agent_end` delegate to those helpers instead of keeping a second copy, so the async/sync-store behaviour is identical no matter which entry point you pick — `MemoryConfig(db=PraisonAIDB(...))` or the orchestrator-based `wrap_agent_with_persistence` / `PersistentAgent` / `create_persistent_session`.
 
 <Note>
-`_call_store` and `_dispatch_async` are internal plumbing on `PraisonAIDB`, not public API. They are named here only to describe the shared dispatch mechanism.
+`_call_store` splits by op kind: writes stay fire-and-forget on the shared bridge (idempotent, uuid-keyed); reads (`_READ_OPS = {"get", "get_session", "get_messages", "list_sessions"}`) route through `run_sync_or_offload`, returning the real value on a sync path and raising loudly inside a running loop. `_call_store`, `_dispatch_async`, and `_READ_OPS` are internal plumbing on `PraisonAIDB`, not public API. They are named here only to describe the shared dispatch mechanism.
 </Note>
 
-### Sync hook against an async-mode store
+### Sync reads from inside a running loop
 
-Calling a sync hook against a store opened with `mode="async"` now fails clearly instead of crashing deep inside the store.
+Sync reads reached from inside a running event loop now fail loudly instead of silently dropping the read.
 
 <Warning>
-Calling the sync `on_agent_start` against a store opened with `mode="async"` **from inside a running event loop** now raises a clear `RuntimeError` telling you to use the async surface (previously it crashed with the opaque `TypeError: 'coroutine' object is not iterable`). Called outside a loop, sync now resolves the coroutine transparently.
+**Sync reads from inside a running loop now fail loudly.** Calling a sync hook whose store op is a read — `get`, `get_session`, `get_messages`, `list_sessions`, or any sync completion hook (`on_run_end`, `on_trace_end`, `on_span_end`) that does a read-modify-write — from **inside a running event loop** raises `RuntimeError` steering you to the async surface. In previous releases it silently returned `None`: a resumed session looked empty, and the completion hooks merged into `{}` and overwrote the persisted record with a partial dict. Outside a loop, sync reads resolve the coroutine transparently. Writes are unaffected — they remain uuid-keyed fire-and-forget on the bridge.
+
+Fixed in PR [#4821](https://github.com/MervinPraison/PraisonAI/pull/4821), fixes [#4820](https://github.com/MervinPraison/PraisonAI/issues/4820).
+</Warning>
+
+### Which hook to call from where
+
+Pick sync or async by whether you sit inside a running loop and whether you read or write.
+
+```mermaid
+graph TB
+    Q{Am I inside<br/>a running loop?}
+    Q -->|No| Sync[✅ Use sync hook<br/>on_agent_start / on_message]
+    Q -->|Yes, and I'm reading| Async[⚡ Use async hook<br/>aon_agent_start / aon_message]
+    Q -->|Yes, and I'm writing| SyncOK[✅ Sync write is safe<br/>fire-and-forget on bridge]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef async fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q question
+    class Sync,SyncOK good
+    class Async async
+```
+
+<Warning>
+**Troubleshooting.** _Symptom in older versions:_ a resumed session came back empty even though messages had been persisted; a completed run/trace/span record lost `run_id`, `started_at`, `input_content`, or its spans/events after a sync completion hook fired from async code. Root cause: sync reads reached from a running loop were silently dropped. Fixed in PR #4821 — the same call now raises `RuntimeError` pointing you at the `aon_*` hook.
 </Warning>
 
 ### State-store lifecycle key
