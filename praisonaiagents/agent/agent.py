@@ -238,6 +238,12 @@ _COMPLETION_PATTERNS = (
     (re.compile(r'\bfinished\b'), True),      # 'finished' needs negation check
 )
 
+# Emitted at most once per process: pointing at a non-OpenAI endpoint without
+# naming a model silently falls back to OpenAI's default, which that endpoint
+# almost certainly does not serve.
+_LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED = False
+
+
 class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
@@ -2145,6 +2151,21 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         if reasoning_effort is not None:
             self._llm_option_kwargs['reasoning_effort'] = reasoning_effort
 
+        # Local-runtime descriptor: llm="local" (or "local:<engine>/<model>").
+        # Opt-in only -- discovery never fires for any other spec, so a fully
+        # configured agent pays nothing. Resolved here into a concrete
+        # provider/model so the normal LLM path handles it unchanged.
+        if isinstance(llm, str) and (llm == "local" or llm.startswith("local:")):
+            from ..local import resolve as _resolve_local
+            _spec = llm[len("local:"):] if llm.startswith("local:") else None
+            _target = _resolve_local(_spec or None)
+            llm = _target.litellm_model
+            if base_url is None:
+                base_url = _target.base_url
+            if api_key is None:
+                api_key = _target.api_key
+            self._local_target = _target
+
         # Panel (multi-model) descriptor: "panel:<name>" or {"provider": "panel"}.
         # Resolved lazily into a PanelLLM; composes with the normal tool loop.
         # Detected inline (no heavy import) to keep Agent() construction lazy.
@@ -2246,14 +2267,57 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # Otherwise, fall back to OpenAI environment/name (cached for performance)
         else:
             model_name = llm or Agent._get_default_model()
-            if auth:
+            # Pointing at a non-OpenAI endpoint without naming a model leaves the
+            # OpenAI default in place, so the endpoint is asked for a model it
+            # has never heard of -- Ollama answers 404 "model 'gpt-4o-mini' not
+            # found", which reads like an SDK bug rather than a missing line of
+            # config. Warn, don't raise: an OpenAI-compatible proxy may legitimately
+            # serve that exact name.
+            #
+            # Only fire when the resolved default really is the OpenAI default:
+            # a provider credential (e.g. OLLAMA_HOST) resolves an
+            # already-correct provider-prefixed model, so there is nothing to
+            # warn about. Read the endpoint in the order the OpenAI client uses
+            # (OPENAI_API_BASE before OPENAI_BASE_URL, see openai_client.py) so
+            # the message names the endpoint the request actually goes to.
+            if (
+                llm is None
+                and model_name == 'gpt-4o-mini'
+                and not os.getenv('OPENAI_MODEL_NAME')
+            ):
+                _endpoint = os.getenv('OPENAI_API_BASE') or os.getenv('OPENAI_BASE_URL')
+                if _endpoint and 'api.openai.com' not in _endpoint:
+                    global _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED
+                    if not _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED:
+                        with Agent._env_cache_lock:
+                            if not _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED:
+                                _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED = True
+                                logging.warning(
+                                    "No model specified, so the OpenAI default %r will be sent to %s. "
+                                    "That endpoint probably does not serve it. Set OPENAI_MODEL_NAME "
+                                    "to a model it does serve (e.g. OPENAI_MODEL_NAME=ollama/llama3.2), "
+                                    "or pass llm= explicitly.",
+                                    model_name, _endpoint,
+                                )
+            # A provider-prefixed model must be built as an LLM instance, which
+            # owns provider routing and the per-provider adapters. The
+            # `"/" in llm` branch above only inspects the explicit `llm=`
+            # argument, so a prefixed model that arrived from a credential env
+            # var (_PROVIDER_DEFAULT_MODELS) or from OPENAI_MODEL_NAME lands
+            # here instead and would otherwise fall through to the plain OpenAI
+            # client holding a model name OpenAI has never heard of. Re-check
+            # the *resolved* name so `llm="ollama/x"` and OLLAMA_HOST agree.
+            _has_provider_prefix = isinstance(model_name, str) and "/" in model_name
+            if auth or _has_provider_prefix:
                 # A subscription auth provider only takes effect inside LLM
                 # (which injects the resolved OAuth credentials), so a bare
                 # model name plus auth= must still build an LLM instance rather
                 # than falling through to the plain OpenAI client.
-                llm_params = {'model': model_name, 'auth': auth}
+                llm_params = {'model': model_name}
                 if api_key:
                     llm_params['api_key'] = api_key
+                if auth:
+                    llm_params['auth'] = auth
                 llm_params['metrics'] = metrics
                 llm_params['web_search'] = web_search
                 llm_params['web_fetch'] = web_fetch

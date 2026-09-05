@@ -664,11 +664,12 @@ Respond with ONLY a valid JSON tool call in this format:
         if model_lower.startswith("gemini") or model_lower.startswith("google/gemini"):
             return "gemini"
         
-        # Check base_url for provider hints
-        base_urls = [self.base_url, os.getenv("OPENAI_BASE_URL", ""), os.getenv("OPENAI_API_BASE", "")]
-        if any(url and ("ollama" in url.lower() or ":11434" in url) for url in base_urls):
-            return "ollama"
-        
+        # NOTE: the base_url hint that used to live here checked exactly the
+        # same three URLs for exactly the same two patterns as
+        # _is_ollama_provider() above, so it was an unguarded duplicate -- and
+        # it re-captured hosted models that _is_ollama_provider() had just
+        # correctly declined. Detection now happens once, in one place.
+
         # Substring fallback for routed models whose provider is not the first
         # path segment (e.g. bedrock/anthropic.claude-*, vertex_ai/claude-*,
         # openrouter/anthropic/*, vertex_ai/gemini-*). Mirrors the substring
@@ -712,10 +713,25 @@ Respond with ONLY a valid JSON tool call in this format:
         if not self.model:
             return False
         
-        # Direct ollama/ prefix
-        if self.model.startswith("ollama/"):
+        # An explicit Ollama route prefix -- the user speaking, always wins.
+        # "ollama_chat/" is litellm's recommended prefix for Ollama tool calling
+        # and resolves to provider "ollama" in _detect_provider, so omitting it
+        # here made this predicate disagree with the adapter that gets selected.
+        if self.model.startswith(("ollama/", "ollama_chat/")):
             return True
-        
+
+        # A base_url says WHERE the server is, not WHAT it serves. Only let it
+        # imply Ollama for a model that could plausibly be running locally.
+        # Without this, the README's own local-model recipe
+        # (OPENAI_BASE_URL=http://localhost:11434/v1) gave gpt-4o and
+        # claude-* the Ollama adapter: tool results downgraded to
+        # natural-language user turns, streaming-with-tools disabled, and
+        # forced-tool prompts injected into a conversation that never needed
+        # them.
+        from .model_providers import is_hosted_only_model
+        if is_hosted_only_model(self.model):
+            return False
+
         # Check base_url if provided
         if self.base_url and "ollama" in self.base_url.lower():
             return True
@@ -2791,13 +2807,28 @@ Respond with ONLY a valid JSON tool call in this format:
                         )
 
                         if stream:
-                            response_text, tool_calls = self._stream_responses_api(
+                            response_text, tool_calls, stream_response = self._stream_responses_api(
                                 responses_params,
                                 verbose=verbose,
                                 stream_callback=stream_callback,
                                 emit_events=emit_events,
                                 current_time=current_time,
                             )
+                            # Streamed calls still incur real token cost; track
+                            # usage from the final response.completed event so
+                            # the public collector isn't silently zeroed.
+                            if stream_response is not None:
+                                self._track_token_usage(stream_response, self.model)
+                                if self.metrics and getattr(stream_response, 'usage', None):
+                                    usage = stream_response.usage
+                                    tokens_in = getattr(usage, 'input_tokens', 0) or 0
+                                    tokens_out = getattr(usage, 'output_tokens', 0) or 0
+                                    llm_latency_ms = (time.time() - current_time) * 1000
+                                    _get_display_functions()['execute_sync_callback'](
+                                        'llm_end', model=self.model,
+                                        tokens_in=tokens_in, tokens_out=tokens_out,
+                                        cost=None, latency_ms=llm_latency_ms,
+                                    )
                         else:
                             resp = self._call_responses_api(**responses_params)
                             response_text, tool_calls, _reasoning = self._extract_from_responses_output(resp)
@@ -2966,19 +2997,9 @@ Respond with ONLY a valid JSON tool call in this format:
                                 )
 
                                 # Append tool result as standard tool message
-                                if tool_result is None:
-                                    content = "Function returned an empty output"
-                                elif isinstance(tool_result, dict) and 'error' in tool_result:
-                                    content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user."
-                                elif isinstance(tool_result, list) and tool_result and isinstance(tool_result[0], dict) and 'error' in tool_result[0]:
-                                    content = f"Error: {tool_result[0].get('error', 'Unknown error')}. Please inform the user."
-                                else:
-                                    content = json.dumps(tool_result)
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_result_obj.tool_call_id,
-                                    "content": content,
-                                })
+                                messages.append(self._create_tool_message(
+                                    function_name, tool_result,
+                                    tool_result_obj.tool_call_id, is_ollama=False))
 
                             # Report any unparseable tool-call arguments so the
                             # model can re-emit them (never dispatched with {}).
@@ -3137,12 +3158,7 @@ Respond with ONLY a valid JSON tool call in this format:
                         if formatted_tools and not self._supports_streaming_tools():
                             # Provider doesn't support streaming with tools, use non-streaming
                             use_streaming = False
-                        
-                        # Gemini has issues with streaming + tools, disable streaming for Gemini when tools are present
-                        if use_streaming and formatted_tools and self._is_gemini_model():
-                            logging.debug("Disabling streaming for Gemini model with tools due to JSON parsing issues")
-                            use_streaming = False
-                        
+
                         # Track whether fallback was successful to avoid duplicate API calls
                         fallback_completed = False
                         
@@ -3485,42 +3501,16 @@ Respond with ONLY a valid JSON tool call in this format:
                     tool_calls = final_response["choices"][0]["message"].get("tool_calls")
                     
                     
-                    # For Ollama and local OpenAI-compatible servers, parse tool
-                    # calls from response text if not in the tool_calls field.
-                    # This is essential after a repair prompt, which asks the
-                    # model to reply with a bare JSON tool call as text content.
-                    if (self._is_ollama_provider() or self._is_local_openai_provider()) and not tool_calls and response_text and formatted_tools:
-                        # Try to parse JSON tool call from response text
-                        try:
-                            response_json = json.loads(response_text.strip())
-                            if isinstance(response_json, dict) and "name" in response_json:
-                                # Convert Ollama format to standard tool_calls format
-                                tool_calls = [{
-                                    "id": f"tool_{iteration_count}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": response_json["name"],
-                                        "arguments": json.dumps(response_json.get("arguments", {}))
-                                    }
-                                }]
-                                logging.debug(f"Parsed Ollama tool call from response: {tool_calls}")
-                            elif isinstance(response_json, list):
-                                # Handle multiple tool calls
-                                tool_calls = []
-                                for idx, tool_json in enumerate(response_json):
-                                    if isinstance(tool_json, dict) and "name" in tool_json:
-                                        tool_calls.append({
-                                            "id": f"tool_{iteration_count}_{idx}",
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_json["name"],
-                                                "arguments": json.dumps(tool_json.get("arguments", {}))
-                                            }
-                                        })
-                                if tool_calls:
-                                    logging.debug(f"Parsed multiple Ollama tool calls from response: {tool_calls}")
-                        except (json.JSONDecodeError, KeyError) as e:
-                            logging.debug(f"Could not parse Ollama tool call from response: {e}")
+                    # Recover a tool call the provider emitted as response text
+                    # instead of in the tool_calls field. Which providers do this
+                    # is the adapter's business, not this loop's; DefaultAdapter
+                    # returns None so no other provider is affected.
+                    if not tool_calls and response_text and formatted_tools:
+                        recovered = self._provider_adapter.recover_tool_calls_from_text(
+                            response_text, formatted_tools)
+                        if recovered:
+                            tool_calls = recovered
+                            logging.debug(f"Recovered tool calls from response text: {tool_calls}")
                     
                     # Parse tool calls from XML format in response text 
                     # Try for known XML models first, or fallback for any model that might output XML
@@ -3792,20 +3782,8 @@ Respond with ONLY a valid JSON tool call in this format:
                                 pass
                             else:
                                 # For other providers, use tool role with tool_call_id
-                                # Format error results more clearly
-                                if tool_result is None:
-                                    content = "Function returned an empty output"
-                                elif isinstance(tool_result, dict) and 'error' in tool_result:
-                                    content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
-                                elif isinstance(tool_result, list) and len(tool_result) > 0 and isinstance(tool_result[0], dict) and 'error' in tool_result[0]:
-                                    content = f"Error: {tool_result[0].get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
-                                else:
-                                    content = json.dumps(tool_result)
-                                messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "content": content
-                                })
+                                messages.append(self._create_tool_message(
+                                    function_name, tool_result, tool_call_id, is_ollama=False))
 
                             # Check if we should continue (for tools like sequential thinking)
                             # This mimics the logic from agent.py lines 1004-1007
@@ -3864,8 +3842,11 @@ Respond with ONLY a valid JSON tool call in this format:
                         
                         # Special early stopping logic for Ollama when tool results are available
                         # Ollama often provides empty responses after successful tool execution
-                        if (self._is_ollama_provider() and accumulated_tool_results and iteration_count >= 1 and 
-                            (not response_text or response_text.strip() == "")):
+                        if self._provider_adapter.handle_empty_response_with_tools({
+                            'iteration_count': iteration_count,
+                            'accumulated_tool_results': accumulated_tool_results,
+                            'response_text': response_text or '',
+                        }):
                             # Generate coherent response from tool results
                             tool_summary = self._generate_ollama_tool_summary(accumulated_tool_results, response_text)
                             if tool_summary:
@@ -4454,6 +4435,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     self._tool_parse_error_message(function_name, tool_call_id)
                                 )
                                 continue
+                            # Validate and filter arguments for Ollama provider.
+                            # Pre-dispatch, so this is streaming-safe: nothing has
+                            # been yielded that would need retracting. Weak local
+                            # models routinely emit arguments belonging to a
+                            # different function, and dispatching those calls the
+                            # user's tool with parameters it never declared.
+                            if is_ollama and tools:
+                                arguments = self._validate_and_filter_ollama_arguments(
+                                    function_name, arguments, tools)
                             tool_calls_batch.append(ToolCall(
                                 function_name=function_name,
                                 arguments=arguments, 
@@ -4660,6 +4650,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 messages.append(
                                     self._tool_parse_error_message(function_name, tool_call_id))
                                 continue
+                            # Validate and filter arguments for Ollama provider.
+                            # Pre-dispatch, so this is streaming-safe: nothing has
+                            # been yielded that would need retracting. Weak local
+                            # models routinely emit arguments belonging to a
+                            # different function, and dispatching those calls the
+                            # user's tool with parameters it never declared.
+                            if is_ollama and tools:
+                                arguments = self._validate_and_filter_ollama_arguments(
+                                    function_name, arguments, tools)
                             try:
                                 tool_result = execute_tool_fn(function_name, arguments)
                             except Exception as tool_error:  # noqa: BLE001
@@ -4920,11 +4919,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     current_time = time.time()
 
                     if stream:
-                        response_text, tool_calls = await self._stream_responses_api_async(
+                        response_text, tool_calls, stream_response = await self._stream_responses_api_async(
                             responses_params,
                             stream_callback=kwargs.get('stream_callback'),
                             emit_events=kwargs.get('emit_events', False),
                         )
+                        # Streamed calls still incur real token cost; track
+                        # usage from the final response.completed event.
+                        if stream_response is not None:
+                            self._track_token_usage(stream_response, self.model)
                     else:
                         resp = await self._call_responses_api_async(**responses_params)
                         response_text, tool_calls, _reasoning = self._extract_from_responses_output(resp)
@@ -5014,17 +5017,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 _get_display_functions()['display_tool_call'](display_message, console=self.console)
 
                             # Append tool result
-                            if tool_result is None:
-                                content = "Function returned an empty output"
-                            elif isinstance(tool_result, dict) and 'error' in tool_result:
-                                content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user."
-                            else:
-                                content = json.dumps(tool_result)
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": content,
-                            })
+                            messages.append(self._create_tool_message(
+                                function_name, tool_result, tool_call_id, is_ollama=False))
 
                         if iteration_count + 1 >= max_iterations:
                             self._last_stop_reason = "max_steps"
@@ -5297,20 +5291,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             pass
                         else:
                             # For other providers, use tool role with tool_call_id
-                            # Format error results more clearly
-                            if tool_result is None:
-                                content = "Function returned an empty output"
-                            elif isinstance(tool_result, dict) and 'error' in tool_result:
-                                content = f"Error: {tool_result.get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
-                            elif isinstance(tool_result, list) and len(tool_result) > 0 and isinstance(tool_result[0], dict) and 'error' in tool_result[0]:
-                                content = f"Error: {tool_result[0].get('error', 'Unknown error')}. Please inform the user that the operation could not be completed."
-                            else:
-                                content = json.dumps(tool_result)
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": content
-                            })
+                            messages.append(self._create_tool_message(
+                                function_name, tool_result, tool_call_id, is_ollama=False))
 
                     # Flush deferred media follow-ups after all tool replies
                     # for this turn have been appended (provider contract).
@@ -5487,8 +5469,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     # Special early stopping logic for Ollama when tool results are available
                     # Ollama often provides empty responses after successful tool execution
-                    if (self._is_ollama_provider() and accumulated_tool_results and iteration_count >= 1 and 
-                        (not response_text or response_text.strip() == "")):
+                    if self._provider_adapter.handle_empty_response_with_tools({
+                        'iteration_count': iteration_count,
+                        'accumulated_tool_results': accumulated_tool_results,
+                        'response_text': response_text or '',
+                    }):
                         # Generate coherent response from tool results
                         tool_summary = self._generate_ollama_tool_summary(accumulated_tool_results, response_text)
                         if tool_summary:
@@ -6560,6 +6545,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # tool_calls accumulator: {output_index: {"id":..., "name":..., "arguments":...}}
         _pending_tools: Dict[int, Dict[str, Any]] = {}
         _emit = emit_events and stream_callback is not None
+        _final_response = None
 
         if _emit:
             from ..streaming.events import StreamEvent, StreamEventType
@@ -6570,6 +6556,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 evt_type = event.get("type", "")
             else:
                 evt_type = getattr(event, "type", "")
+
+            # ── Completed — capture the final response for usage accounting ──
+            if evt_type == "response.completed":
+                _final_response = (event.get("response") if isinstance(event, dict)
+                                   else getattr(event, "response", None))
 
             # ── Text delta ──────────────────────────────────────────
             if evt_type == "response.output_text.delta":
@@ -6662,7 +6653,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 },
             })
 
-        return response_text, tool_calls if tool_calls else None
+        return response_text, tool_calls if tool_calls else None, _final_response
 
     async def _stream_responses_api_async(
         self,
@@ -6680,6 +6671,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         response_text = ""
         _pending_tools: Dict[int, Dict[str, Any]] = {}
         _emit = emit_events and stream_callback is not None
+        _final_response = None
 
         if _emit:
             from ..streaming.events import StreamEvent, StreamEventType
@@ -6689,6 +6681,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 evt_type = event.get("type", "")
             else:
                 evt_type = getattr(event, "type", "")
+
+            if evt_type == "response.completed":
+                _final_response = (event.get("response") if isinstance(event, dict)
+                                   else getattr(event, "response", None))
 
             if evt_type == "response.output_text.delta":
                 delta_text = (event.get("delta", "") if isinstance(event, dict)
@@ -6764,7 +6760,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 "function": {"name": tc["name"], "arguments": tc["arguments"]},
             })
 
-        return response_text, tool_calls if tool_calls else None
+        return response_text, tool_calls if tool_calls else None, _final_response
 
     def _process_streaming_chunk(self, chunk) -> Optional[str]:
         """Extract content from a streaming chunk"""
@@ -6813,21 +6809,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         """
         if is_ollama:
             return self._format_ollama_tool_result_message(function_name, result)
-        if result is None:
-            content = "Function returned an empty output"
-        elif isinstance(result, dict) and 'error' in result:
-            content = (f"Error: {result.get('error', 'Unknown error')}. "
-                       "Please inform the user that the operation could not be completed.")
-        elif (isinstance(result, list) and result
-                and isinstance(result[0], dict) and 'error' in result[0]):
-            content = (f"Error: {result[0].get('error', 'Unknown error')}. "
-                       "Please inform the user that the operation could not be completed.")
-        else:
-            try:
-                content = json.dumps(result)
-            except (TypeError, ValueError):
-                content = str(result)
-        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+        adapter = getattr(self, '_provider_adapter', None)
+        if adapter is None:
+            from .adapters import DefaultAdapter
+            adapter = DefaultAdapter()
+        return adapter.format_tool_result_message(function_name, result, tool_call_id)
 
     def _serialize_tool_calls(self, tool_calls) -> List[Dict]:
         """Convert tool calls to a serializable format for all providers."""

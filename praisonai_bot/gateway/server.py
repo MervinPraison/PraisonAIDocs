@@ -6354,24 +6354,49 @@ class WebSocketGateway:
                 logger.exception("run ledger recover_orphans failed on boot")
                 return 0
             recovered = 0
+            mark_delivered = getattr(ledger, "mark_delivered", None)
             for record in lost or []:
                 channel_target = self._channel_target_for_run(record)
                 if not channel_target:
+                    # No route to wake: mark delivered so the ledger does not
+                    # re-surface an undeliverable run on every subsequent boot.
+                    if callable(mark_delivered):
+                        try:
+                            mark_delivered(record.run_id)
+                        except Exception:  # pragma: no cover - defensive
+                            logger.exception(
+                                "mark_delivered failed for run %s",
+                                record.run_id,
+                            )
                     continue
                 outcome = record.terminal_outcome or "run interrupted by restart"
                 notice = (
                     "A background run was interrupted by a restart and could "
                     f"not be recovered ({outcome}). Please resend your request."
                 )
+                ok = False
                 try:
-                    await self._deliver_lost_run_notice(
+                    ok = await self._deliver_lost_run_notice(
                         channel_target, notice, record.run_id,
                     )
                 except Exception:
                     logger.exception(
                         "Failed to notify origin for lost run %s", record.run_id,
                     )
-                recovered += 1
+                # Exactly-once: only mark delivered once the notice actually
+                # landed (or was durably enqueued). A failed/raising delivery
+                # leaves ``delivered = 0`` so recover_orphans retries it on the
+                # next boot instead of dropping the user's wake-back forever.
+                if ok:
+                    if callable(mark_delivered):
+                        try:
+                            mark_delivered(record.run_id)
+                        except Exception:  # pragma: no cover - defensive
+                            logger.exception(
+                                "mark_delivered failed for run %s",
+                                record.run_id,
+                            )
+                    recovered += 1
             if recovered:
                 logger.info(
                     "Recovered %d orphaned ledger run(s) on boot", recovered,
@@ -7050,11 +7075,18 @@ class WebSocketGateway:
         roles: Optional[List[str]] = None,
         channel_id: Optional[str] = None,
         account: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        guild_id: Optional[str] = None,
+        parent_channel_id: Optional[str] = None,
     ) -> Any:
         """Build a RouteFacts object from inbound message facts.
 
         Returns None if the core RouteFacts type is unavailable so callers can
-        gracefully fall back to chat-type-only routing.
+        gracefully fall back to chat-type-only routing. ``thread_id`` /
+        ``guild_id`` / ``parent_channel_id`` are optional so per-thread,
+        whole-server, and parent-chain routing work when the adapter surfaces
+        them, while older adapters keep resolving exactly as before (Issue
+        #4839).
         """
         try:
             from praisonaiagents.gateway import RouteFacts
@@ -7065,6 +7097,13 @@ class WebSocketGateway:
                 roles=list(roles or []),
                 channel_id=str(channel_id) if channel_id is not None else None,
                 account=str(account) if account is not None else None,
+                thread_id=str(thread_id) if thread_id is not None else None,
+                guild_id=str(guild_id) if guild_id is not None else None,
+                parent_channel_id=(
+                    str(parent_channel_id)
+                    if parent_channel_id is not None
+                    else None
+                ),
             )
         except Exception:  # pragma: no cover - defensive
             return None
@@ -8062,12 +8101,33 @@ class WebSocketGateway:
             channel_id = getattr(message.channel, "channel_id", None) if message.channel else None
             bot_user = getattr(bot, "bot_user", None)
             account = getattr(bot_user, "user_id", None) if bot_user else None
+            # Thread / guild / parent facts for finer routing (Issue #4839).
+            # ``thread_id`` is on the envelope already; guild id and thread
+            # parent, where a platform surfaces them (e.g. Discord), ride in
+            # the channel metadata so no new envelope field is required.
+            thread_id = getattr(message, "thread_id", None)
+            channel_meta = getattr(message.channel, "metadata", None) if message.channel else None
+            guild_id = None
+            parent_channel_id = None
+            if isinstance(channel_meta, dict):
+                guild_id = (
+                    channel_meta.get("guild_id")
+                    or channel_meta.get("server_id")
+                    or channel_meta.get("workspace_id")
+                )
+                parent_channel_id = (
+                    channel_meta.get("parent_channel_id")
+                    or channel_meta.get("parent_id")
+                )
             facts = gateway._build_route_facts(
                 routing_ctx,
                 peer=peer,
                 roles=roles,
                 channel_id=channel_id,
                 account=account,
+                thread_id=thread_id,
+                guild_id=guild_id,
+                parent_channel_id=parent_channel_id,
             )
             agent = gateway._resolve_agent_for_message(
                 channel_name, routing_ctx, facts=facts
@@ -8173,11 +8233,16 @@ class WebSocketGateway:
                 else None
             )
             account = bot.bot_user.user_id if getattr(bot, "bot_user", None) else None
+            # Forum-topic id doubles as the thread fact for per-thread routing
+            # (Issue #4839); the parent is the chat the topic lives under.
+            thread_id = getattr(message, "thread_id", None)
             facts = gateway._build_route_facts(
                 routing_ctx,
                 peer=user_id,
                 channel_id=chat_id,
                 account=account,
+                thread_id=thread_id,
+                parent_channel_id=chat_id if thread_id is not None else None,
             )
             agent = gateway._resolve_agent_for_message(
                 channel_name, routing_ctx, facts=facts

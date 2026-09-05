@@ -36,6 +36,75 @@ _BUILTINS: Dict[str, Callable[[str], bool]] = {
 }
 
 
+# Closed-weights model families that no local runtime can serve. Used to stop a
+# local ``base_url`` (an OpenAI-compatible proxy on :11434, say) from being read
+# as "this is an Ollama model".
+#
+# Open-weights families are deliberately ABSENT -- gemma, llama, mistral, qwen,
+# deepseek and phi are all routinely served by Ollama, so they must stay
+# eligible for URL-based local detection. That is why this is a separate, much
+# narrower predicate than ``resolve_provider``: the latter maps ``gemma-`` to
+# "google" and ``mistral-`` to "mistral", which is correct for provider routing
+# and wrong for deciding whether a model could be running locally.
+HOSTED_ONLY_PREFIXES = ("gpt-", "o1-", "o3-", "o4-", "chatgpt-", "claude", "gemini-")
+
+
+def is_hosted_only_model(model_name: str) -> bool:
+    """True if ``model_name`` names a closed-weights model no local server hosts.
+
+    Every route segment is tested, so single-prefix (``openai/gpt-4o``), nested
+    (``openrouter/openai/gpt-4o``, ``openrouter/anthropic/claude-*``) and
+    vendor-qualified (``bedrock/anthropic.claude-*``, ``us.anthropic.claude-*``)
+    forms all resolve to the hosted family they name -- mirroring the substring
+    fallback that ``_detect_provider`` uses for the same routed models. An
+    open-weights model reached over the OpenAI-compatible route
+    (``openai/qwen3:0.6b``) is not hosted-only and keeps its local treatment,
+    because the prefixes tested are themselves closed-weights families no local
+    runtime serves.
+    """
+    if not model_name:
+        return False
+    lower = model_name.lower()
+    # Split on both route ("/") and vendor-qualifier (".") boundaries so a
+    # family name anywhere in the path is seen: bedrock/anthropic.claude-3 ->
+    # ["bedrock", "anthropic", "claude-3"].
+    for segment in lower.replace(".", "/").split("/"):
+        if segment.startswith(HOSTED_ONLY_PREFIXES):
+            return True
+    return False
+
+
+# The small helper model used for internal auxiliary calls -- memory quality
+# scoring, context compaction, session titling, workflow routing. Historically
+# about a dozen sites resolved this from OPENAI_MODEL_NAME while about twenty
+# more hardcoded the same string, so half of them could not be pointed anywhere
+# else. That, not the endpoint, is what blocks running fully locally: litellm and
+# the openai SDK both honour OPENAI_BASE_URL, so those sites do reach a local
+# server -- and then ask it for a model no local server serves.
+DEFAULT_AUXILIARY_MODEL = "gpt-4o-mini"
+
+
+def default_auxiliary_model(explicit: Optional[str] = None) -> str:
+    """Resolve the model to use for an internal auxiliary LLM call.
+
+    Precedence: an explicit argument, then PRAISONAI_AUXILIARY_MODEL, then
+    OPENAI_MODEL_NAME, then DEFAULT_AUXILIARY_MODEL.
+
+    PRAISONAI_AUXILIARY_MODEL exists because a local setup often wants a
+    *smaller* model for helper calls than for the agent itself -- pointing
+    OPENAI_MODEL_NAME at a 70B local model should not make every internal
+    summarisation call use it.
+    """
+    if explicit:
+        return explicit
+    import os
+    for var in ("PRAISONAI_AUXILIARY_MODEL", "OPENAI_MODEL_NAME"):
+        value = (os.environ.get(var) or "").strip()
+        if value:
+            return value
+    return DEFAULT_AUXILIARY_MODEL
+
+
 def _entry_point_matchers():
     """Yield (provider_id, matcher) pairs registered by third-party plugins.
 
