@@ -560,6 +560,83 @@ sequenceDiagram
 On the console backend, the prompt now offers **five** choices: `[o] once`, `[s] this session`, `[a] always`, `[n] no`, `[d] deny & redirect`. See [Interactive Tool Approval](/docs/features/interactive-approval#scope-choice) for the full scope semantics.
 </Note>
 
+## Standing grants and attached backends
+
+An attached approval backend now honours the same standing registry grants as the no-backend path since [PR #4878](https://github.com/MervinPraison/PraisonAI/pull/4878).[^backend-standing-grants]
+
+The same standing-grant check now runs for any agent with an attached approval backend — including the default `ConsoleBackend` and every chat/gateway front-end — since [PR #4878](https://github.com/MervinPraison/PraisonAI/pull/4878). Before #4878 the backend branch went straight to the prompt and ignored `PRAISONAI_AUTO_APPROVE`, YAML approvals, and session grants.
+
+Before calling the backend, `_resolve_approval_decision` checks each standing grant in order — first hit wins and the backend is never asked:
+
+| # | Check | Grant source |
+|---|-------|--------------|
+| 1 | `is_env_auto_approve()` | `PRAISONAI_AUTO_APPROVE` env var |
+| 2 | `is_yaml_approved(tool_name)` | YAML `approve:` list |
+| 3 | `is_auto_approved(tool_name, scope_id)` | Registry `mark_approved` grant |
+| 4 | `is_already_approved(tool_name, tool_args, scope_id)` | Exact-args approval cache |
+| 5 | `_is_session_scoped(agent_name, tool_name, tool_args, scope_id)` | `[s]` session grant recorded at the prompt |
+| 6 | Backend prompt | No standing grant matched |
+
+If any standing grant is present, an `ApprovalDecision(approved=True, reason="Approved by a standing registry grant")` is returned directly. When the backend *does* prompt and the user picks `[s]` this session or `[a]` always, the decision is fed back into the registry (`mark_approved` + `_persist_scoped_decision`) so every later matching call in the same run is served from the fast path.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Registry
+    participant Backend
+
+    Agent->>Registry: is_env_auto_approve? / is_yaml_approved? / is_auto_approved? / is_already_approved? / _is_session_scoped?
+    alt Any standing grant hits
+        Registry-->>Agent: approved (skip backend)
+    else No standing grant
+        Agent->>Backend: request_approval(request)
+        Backend-->>Agent: ApprovalDecision (approved / denied, scope=once/session/always)
+        Agent->>Registry: _persist_scoped_decision + mark_approved (best-effort)
+    end
+```
+
+Set `PRAISONAI_AUTO_APPROVE=true` and every gated call runs immediately — even on the default TTY case where a `ConsoleBackend` is attached automatically:
+
+```python
+import os
+from praisonaiagents import Agent
+
+os.environ["PRAISONAI_AUTO_APPROVE"] = "true"
+
+agent = Agent(
+    name="Shell",
+    instructions="Run shell commands safely.",
+    tools=["shell"],
+)
+
+agent.start("List the files in the current directory")
+```
+
+Before PR #4878 this env var was **ignored** — the default `ConsoleBackend` still prompted 3 out of 3 identical calls. After PR #4878 it works: zero prompts, the tool runs immediately.
+
+A session grant picked at the prompt is now remembered for the rest of the run:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Shell", instructions="Run shell commands.", tools=["shell"])
+
+# First call — ConsoleBackend prompts; user picks [s] this session.
+agent.chat("git status")
+
+# Every later matching call is served from the registry — no re-prompt.
+agent.chat("git status --short")
+agent.chat("git log --oneline -n 5")
+```
+
+Before PR #4878 the second and third calls each re-prompted because the session grant was never persisted; after PR #4878 they run silently.
+
+<Note>
+**Fail-closed contract preserved.** No standing grant → the backend is asked. A denied backend response is still a denial. A one-shot `[o]` once approval is *not* recorded as a standing session grant. A grant-lookup or bookkeeping exception → the historical behaviour is preserved (the code falls through and asks).
+</Note>
+
+[^backend-standing-grants]: Fixed in [PraisonAI PR #4878](https://github.com/MervinPraison/PraisonAI/pull/4878). Measured after the fix: with `PRAISONAI_AUTO_APPROVE=true` the backend prompted **0 of 3** identical calls (was 3 of 3); with the env var unset it still prompted **3 of 3** — the gate must still ask when no grant exists.
+
 ## Diff preview in approval prompts
 
 When an agent proposes a file-mutating tool call, the approval prompt shows a coloured unified diff of the pending change instead of the raw tool arguments.
