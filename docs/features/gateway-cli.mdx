@@ -254,9 +254,18 @@ Options:
                                   drain, no admission), off (pre-3438 immediate teardown).
                                   Overrides `reliability:` from YAML but is overridden
                                   by explicit --drain-timeout / --max-concurrent-runs.
-  --preflight / --no-preflight    Validate channel credentials before
-                                  starting (fail fast on bad tokens)
+  --preflight / --no-preflight    Validate channel credentials before starting.
+                                  A channel with a bad token is reported and
+                                  skipped (parked degraded, auto-recovers); the
+                                  gateway still serves every healthy channel.
+                                  Use --no-preflight to skip probing entirely,
+                                  or --strict-preflight to abort on any bad token
                                   [default: --preflight]
+  --strict-preflight / --no-strict-preflight
+                                  Fail fast and abort the whole gateway if ANY
+                                  channel credential is bad, instead of isolating
+                                  that one channel as degraded. Defaults to the
+                                  config's gateway.preflight.strict (off) (#4862)
   --strict-tools / --no-strict-tools
                                   Fail fast if any tool named in the config
                                   cannot be resolved. Use --no-strict-tools to
@@ -290,6 +299,8 @@ Examples:
   praisonai gateway start --config gateway.yaml  # explicit path still wins
   praisonai gateway start --agents agents.yaml --port 9000
   praisonai gateway start --config gateway.yaml --no-preflight
+  praisonai gateway start --config gateway.yaml --strict-preflight     # opt into fail-closed
+  praisonai gateway start --config gateway.yaml --no-strict-preflight  # override YAML strict:true
   praisonai gateway start --config gateway.yaml --no-strict-tools
   praisonai gateway start --config gateway.yaml --no-verify-turn
   praisonai gateway start --config gateway.yaml --reliability production
@@ -320,7 +331,7 @@ Omitting `--reliability` is safe by default as of PR #3442 — the CLI resolves 
 <Note>
 **Corporate proxies / SSL-inspecting networks.** A preflight failure caused only by `SSLCertVerificationError` / `certificate_verify_failed` does **not** abort the start — the token is usually valid and the runtime adapter's SSL stack is more permissive. The gateway prints a one-line warning naming the three CA-bundle env vars and continues.
 
-If any channel also fails for a non-SSL reason (bad token, unreachable host, timeout), preflight still hard-aborts — fix that channel or pass `--no-preflight`. See [Corporate CA bundle (SSL-inspecting networks)](#corporate-ca-bundle-ssl-inspecting-networks).
+If any channel also fails for a non-SSL reason (bad token, unreachable host, timeout), preflight now **isolates that one channel as degraded** and serves every healthy channel (auto-recovers on hot-reload — see [Degraded Channel Isolation](/features/gateway-degraded-channels)). Preflight only fails closed when either `--strict-preflight` / `gateway.preflight.strict: true` is set, or no channel is left serviceable. Pass `--no-preflight` to skip probing entirely. See [Corporate CA bundle (SSL-inspecting networks)](#corporate-ca-bundle-ssl-inspecting-networks).
 </Note>
 
 <Note>
@@ -915,17 +926,33 @@ gateway_auth_token: weak → would mint a strong token (--dry-run)
 
 ### Pre-flight gate on start
 
-`praisonai gateway start` runs the same probe automatically before launch when invoked with `--config gateway.yaml`:
+`praisonai gateway start` runs the same probe automatically before launch when invoked with `--config gateway.yaml`. By default a bad token isolates only that channel — every healthy channel keeps serving:
 
 ```bash
+# Default: isolate the failing channel, serve the rest
 $ praisonai gateway start --config gateway.yaml
-slack        ✗  invalid_auth (token expired)
+telegram     ✗  invalid_auth (token expired)
+slack        ✓
+discord      ✓
 
-Pre-flight check failed — aborting start. Fix the channel credentials
-above or pass --no-preflight to skip.
+Pre-flight: 2 channel(s) OK; skipping telegram as configured-unavailable
+(auto-recovers when the credential is fixed). See `gateway status`.
 ```
 
-To bypass during local dev (e.g. flaky probe network):
+Opt into strict mode to restore the old fail-closed behaviour — or preflight fails closed on its own when no channel is serviceable:
+
+```bash
+# --strict-preflight (opt-in) or when NO channel is serviceable: fail closed
+$ praisonai gateway start --config gateway.yaml --strict-preflight
+telegram     ✗  invalid_auth (token expired)
+slack        ✓
+
+Pre-flight check failed — aborting start (--strict-preflight set). Fix the
+channel credentials above, or pass --no-preflight to skip /
+--no-strict-preflight to isolate the degraded channel and serve the rest.
+```
+
+To bypass probing during local dev (e.g. flaky probe network):
 
 ```bash
 praisonai gateway start --config gateway.yaml --no-preflight
@@ -957,14 +984,15 @@ REQUESTS_CA_BUNDLE / PRAISONAI_SSL_CA_BUNDLE to your corporate CA, or pass
 --no-preflight to skip this check.
 ```
 
-The probe decides its action from the mix of failures:
+The probe decides its action from the mix of failures and whether strict mode is set:
 
-| Probe outcome (across all channels) | Preflight action |
-|-------------------------------------|------------------|
-| All channels `ok` | Start proceeds silently. |
-| ≥1 channel fails with a non-SSL error (token, network, timeout) | Hard-abort, exit `1`. |
-| All failures are SSL cert-verify only | **Soft-fail** — print the SSL warning, continue to start, exit `0`. |
-| Mixed: ≥1 SSL cert-verify **and** ≥1 token/network failure | Hard-abort (the non-SSL failure wins), exit `1`. |
+| Probe outcome (across all channels) | `strict` off (default) | `strict` on |
+|-------------------------------------|------------------------|-------------|
+| All channels `ok` | Start proceeds silently | Start proceeds silently |
+| ≥1 channel fails with a non-SSL error, ≥1 healthy | **Isolate** the failing channel(s) as `CREDENTIAL_UNAVAILABLE`, serve the rest, exit `0` | Hard-abort, exit `1` |
+| Every channel fails with a non-SSL error (no healthy channel) | Hard-abort (nothing left to serve), exit `1` | Hard-abort, exit `1` |
+| All failures are SSL cert-verify only | **Soft-fail** — print the SSL warning, continue to start, exit `0` | Soft-fail (unchanged) |
+| Mixed: ≥1 SSL cert-verify **and** ≥1 non-SSL failure | Isolate the non-SSL failure(s), SSL warning printed, exit `0` if any channel remains healthy | Hard-abort, exit `1` |
 
 <Warning>
 Only certificate-verify failures soft-fail. Other TLS handshake failures — `WRONG_VERSION_NUMBER`, `NO_SHARED_CIPHER`, `HANDSHAKE_FAILURE` — still hard-abort, because they usually indicate a real bug that also breaks the channel at runtime.
@@ -995,12 +1023,14 @@ The runtime adapter reads the same three env vars, so setting one fixes both the
 
 ```mermaid
 graph TB
-    subgraph "Preflight failure classification"
-        Fail[❌ Probe failure] --> Kind{Failure kind?}
-        Kind -->|Only SSL cert-verify| Soft[⚠️ Warn + continue]
-        Kind -->|Any non-SSL failure| Hard[⛔ Abort — exit 1]
-        Kind -->|Mixed SSL + non-SSL| Hard
-        Soft --> Hint[💡 Set SSL_CERT_FILE / REQUESTS_CA_BUNDLE / PRAISONAI_SSL_CA_BUNDLE]
+    subgraph "Preflight decision"
+        Fail[❌ Probe failure] --> Kind{Only SSL cert-verify?}
+        Kind -->|Yes| Soft[⚠️ Warn + continue]
+        Kind -->|No| Cred{Any healthy channel?}
+        Cred -->|No| Abort1[⛔ Abort — nothing to serve]
+        Cred -->|Yes| Strict{--strict-preflight<br/>or preflight.strict?}
+        Strict -->|Yes| Abort2[⛔ Abort — strict mode]
+        Strict -->|No| Isolate[🛡️ Isolate degraded,<br/>serve healthy — exit 0]
     end
 
     classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -1010,10 +1040,9 @@ graph TB
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Fail fail
-    class Kind gate
-    class Soft soft
-    class Hard hard
-    class Hint ok
+    class Kind,Cred,Strict gate
+    class Soft,Isolate ok
+    class Abort1,Abort2 hard
 ```
 
 ### Token resolution
