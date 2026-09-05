@@ -77,7 +77,7 @@ A single channel's unavailable credential is isolated; structural errors and the
 | `{source: file, id: /run/secrets/x}` file empty at boot | Same — whole gateway down | Same isolation as above |
 | Structurally invalid config (missing `platform:`) | Fails closed | **Still fails closed** (unchanged) |
 | Gateway's own ingress / auth secret unavailable | Fails closed | **Still fails closed** (unchanged) |
-| Preflight probe running (`--preflight`, default) | Hard-abort on failure | **Unchanged** — preflight still hard-aborts. Isolation only kicks in when preflight is skipped or a credential drops between preflight and full config load |
+| Preflight probe running (`--preflight`, default) | Hard-abort on failure | **Isolate the failing channel and serve every healthy channel** — changed by [PR #4863](https://github.com/MervinPraison/PraisonAI/pull/4863). The CLI start-gate now defers to the same degradation contract: a bad token no longer takes healthy channels offline. Fails closed only when `--strict-preflight` / `gateway.preflight.strict: true` is set, or when no channel is left serviceable |
 | Token accepted at boot, rejected mid-flight (revoked/rotated/expired → 401/403) | Whole channel went to `FAILED`; required a process restart to try a new token | Isolated as `CREDENTIAL_UNAVAILABLE` (degraded); `reconnect()` / hot-reload picks up the fresh token without a restart. See [Channel Supervision](/docs/features/gateway-channel-supervision#runtime-credential-rejection). |
 
 The single most important distinction: a **channel** credential fails open (isolated, degraded); the **gateway's own** config and ingress secret fail closed (abort).
@@ -215,7 +215,7 @@ For a token that was rejected **at runtime** (rather than empty at boot), `prais
 
 Some operators prefer strict fail-closed — enforce it at the operator layer, not the schema.
 
-Preflight (`--preflight`, the default) still hard-aborts on a credential failure at start. The isolation contract only matters after the gateway is already running, or when preflight was explicitly skipped with `--no-preflight`.
+Preflight (`--preflight`, the default) now applies the same isolation contract at start-time: a channel with a bad credential is reported, skipped, and parked in `CREDENTIAL_UNAVAILABLE` while every healthy channel keeps serving. Preflight fails closed only when the operator opts into strict mode (`--strict-preflight` or `gateway.preflight.strict: true`) or when no channel is left serviceable (nothing to serve). Operators who want the pre-PR-#4863 behaviour — one bad token aborts everything — should opt into strict mode explicitly.
 
 There is intentionally **no** knob to make the schema raise again — that behaviour was removed precisely because it took healthy channels down. To gate a deploy on strict availability, fail the release if `praisonai gateway doctor --json` reports any `configured-but-unavailable` or `missing`:
 
@@ -225,6 +225,24 @@ python -c "import json,sys; d=json.load(open('doctor.json')); \
   bad=[(c,f,v) for c,fs in d.get('secrets',{}).items() for f,v in fs.items() if v not in ('available','configured')]; \
   sys.exit(1) if bad else None"
 ```
+
+### Strict opt-in
+
+Opt back into fail-closed preflight when one bad token *should* abort the whole gateway. Set it in YAML for every start, or pass the flag for a one-off.
+
+```yaml
+# gateway.yaml — opt back into fail-closed preflight
+gateway:
+  preflight:
+    strict: true
+```
+
+```bash
+# One-off override without touching YAML
+praisonai gateway start --config gateway.yaml --strict-preflight
+```
+
+`--strict-preflight` / `--no-strict-preflight` overrides the YAML `strict` key for that run. Even without strict mode, preflight still fails closed when no channel is left serviceable.
 
 ---
 
