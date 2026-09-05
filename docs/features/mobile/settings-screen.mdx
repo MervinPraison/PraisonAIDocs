@@ -51,13 +51,36 @@ The insets flow from `#root` (written by `main.ts` from `shell.insets`), not fro
 
 Chat rows use the class **`.row-chat`**, renamed in this change from a stylesheet-only `.chat-row` that `buildChatsScreen` never emitted — so every row had been falling back to the bare `button` rule (a centre-aligned, auto-width pill) instead of a full-width list row. The truncation for a long title is now on the row itself, where a chat named from a long first message would otherwise wrap to as many lines as it liked.
 
+### Sections, in registry order
+
+The screen paints top-to-bottom in the order `SETTING_DEFS` declares its keys — the API key first, in a section of its own, then the engine:
+
+1. **API key** (lead section, panel background, ink-coloured heading) — the one field a new user came for. It sat third under a heading called "Engine" until [#4847](https://github.com/MervinPraison/PraisonAI/pull/4847); a credential is not an engine setting.
+2. **Engine** (soft heading) — the `Engine` picker and the `Engine address` field beneath it.
+
+Registry order **is** screen order. `buildSettings` groups rows by insertion order (`view-model.ts`: "section order is REGISTRY order: the order the author of the registry chose"), so moving a def in `SETTING_DEFS` is the whole of the reordering — there is no second list to keep in step. The section names are named constants (`SECTION_API_KEY = "API key"`, `SECTION_ENGINE = "Engine"` in `app/src/registry.ts`) rather than repeated literals, so a typo like `"Engine "` cannot silently split one heading into two.
+
+The lead section is marked, not hard-coded. `buildSettingsScreen` sets `title.dataset["lead"] = "true"` on `index === 0` and the same mark on each row under it, so the stylesheet gives the first section weight without the renderer having to know **which** section is the lead — registry order decides.
+
+<Note>
+**The headings are styled against the class the app actually emits.** `buildSettingsScreen` emits `<h3 class="settings-section">`, but `app.css` styled `.section-heading` (which nothing paints), so until #4847 every heading rendered at the browser's default `h3` and the whole screen read as one flat list where a credential and an engine address had the same weight. The rules now target `.screen-settings .settings-section`, with `[data-lead]` colouring the lead heading `var(--ink)` and `.row-setting[data-lead]` giving the lead rows a `var(--panel)` background.
+</Note>
+
+### Help text is now painted per row
+
+Every def has carried a `help` string since the registry was written, and nothing rendered it until #4847 — a silent-since-inception defect, not a new field.
+
+- Each row now paints `<p class="setting-help">` between the label and the control, seeded from `SettingDef.help` (`settingHelp` in `main.ts`).
+- The control's `aria-describedby` includes the help id (`setting-help-<key>`), so a screen reader that focuses a field hears its label followed by what the field is for.
+- The help colour is `var(--soft)` at `.84rem`; it is not faded when the row is disabled — see [When a setting depends on another](#when-a-setting-depends-on-another).
+
 ---
 
 ## Quick Start
 
 <Steps>
 <Step title="Open Settings from the top bar">
-The Settings screen renders one editable row per `value` setting. On a fresh phone install, the **Engine address** field shows the default `http://127.0.0.1:8765` — the phone itself, which nothing answers.
+The **API key** section paints first, as the lead — an **OpenAI API key** row on a panel background. Below it, the **Engine** section holds the `Engine` picker and the **Engine address** field, which on a fresh phone install shows the default `http://127.0.0.1:8765` — the phone itself, which nothing answers.
 </Step>
 
 <Step title="Change the Engine address">
@@ -100,7 +123,8 @@ sequenceDiagram
 
 | Rule | Behaviour |
 |------|-----------|
-| `value` rows are editable | Rendered as `<select>` / `<input>`. `secret` rows are **also** editable now, through the dedicated `set-secret` / `clear-secret` intents — a masked field plus a Remove button, with the value never read back from the facade. See [Secret rows](#secret-rows). |
+| `value` rows are editable | Rendered as `<select>` / `<input>`, each preceded by a `<p class="setting-help">` seeded from `SettingDef.help`. `secret` rows are **also** editable, through the dedicated `set-secret` / `clear-secret` intents — a masked field plus a Remove button *offered only when a key is present*, with the value never read back from the facade. See [Secret rows](#secret-rows). |
+| Dependent rows | A def with `appliesWhen` is **disabled, not hidden**, when its controller does not hold the required value, with a `.setting-inactive` note naming the switch. See [When a setting depends on another](#when-a-setting-depends-on-another). |
 | Control kind | `choice` → `<select>`, `number` → `<input type="number">`, everything else → `<input type="text">`. |
 | Validation | The change listener runs `validateInput(def, raw)` — parse, then the def's own `validate` — before calling `settings.set`. |
 | Refusal resets | A `null` from `validateInput`, a `false` from `set`, or a thrown persist resets the field to `String(settings.get(def.key) ?? def.default)`. |
@@ -114,6 +138,74 @@ The four input paths and their outcomes:
 | `def.validate` returns `null` via `set` | `false` | unchanged | unchanged | not notified | resets to stored value |
 | Persist succeeds | `true` | new value | new value | notified | shows new value |
 | Persist **throws** (SecurityError / QuotaExceededError) | *throws* | rolled back | unchanged | not notified | resets to stored value; app keeps running |
+
+---
+
+## When a setting depends on another {#when-a-setting-depends-on-another}
+
+The **Engine address** field applies only under the remote engine. Pick the in-process engine and the row stays on screen — **disabled, not hidden** — with a note naming the switch that turns it back on. {#applieswhen}
+
+```mermaid
+graph LR
+    Pick[⚙️ engineId] -->|is remote-http| Live[✅ baseUrl LIVE]
+    Pick -->|is praisonai-ts| Off[🚫 baseUrl DISABLED + note]
+
+    classDef pick fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef live fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef off fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Pick pick
+    class Live live
+    class Off off
+```
+
+**`SettingDef.appliesWhen`** is `{ key, equals }`, declared on the def in the registry — not derived by the screen. `baseUrl` carries `appliesWhen: { key: "engineId", equals: ENGINE_REMOTE_HTTP }`. It is declared here for the same reason `secretRef` is: the registry is the only layer allowed to name a concrete setting, and a view that hard-codes "baseUrl is dead unless engineId is remote-http" goes stale the day a third engine lands.
+
+**`appliesTo(def, read)`** (in `core/src/settings/store.ts`) returns `true` for any def with no `appliesWhen`. It reads the dependency through `get`, **not** `isSet`, so a def's default counts — `engineId` really is `remote-http` on first launch before the user touches the picker, and reading `isSet` would report every dependent setting as inactive until its controller had been changed at least once.
+
+On the view model, `ValueRow.applies` and `ValueRow.inactiveBecause` carry this to the row. `inactiveBecause` names the controller by **label** (`{ label, value }`), not by key — so the sentence the user reads matches the picker the user sees, never a raw `engineId`.
+
+The row is kept **disabled, not hidden**, deliberately:
+
+- A field that disappears takes its value off the screen. A user flipping between engines to compare would watch their typed address vanish and reappear (the store keeps it — but the user cannot *see* that nothing is lost).
+- An address is what a user looks for **before** choosing the engine that uses it. A greyed row that names the switch teaches that the two are connected in one glance; a row that is not there cannot.
+
+The inactive-note lives in its own `<p class="setting-inactive">` node, hidden when the row applies. It is deliberately **not** `role="alert"` — nothing has gone wrong, and announcing it would interrupt the very edit that produced it. Its text is the i18n key `settingInactive(label, value)`:
+
+```ts
+settingInactive("Engine", "remote-http")
+// → "Set Engine to remote-http to use this."
+```
+
+Only the control is greyed — not the label or the help — so the two lines still worth reading stay legible:
+
+```css
+.row-setting .setting-input:disabled,
+.row-setting select:disabled { color: var(--soft); background: transparent; border-style: dashed; }
+```
+
+For a screen reader, when a row is inactive the control's `aria-describedby` also points at the inactive-note id (`setting-inactive-<key>`); when it applies again, `syncSettings` removes that id from the list so no stale reason is read.
+
+<Note>
+**Paint and sync say the same thing.** `syncSettings` recomputes `applies`, `disabled`, `aria-describedby` and the inactive-note text in one walk using `rowsOf(buildSettings(app.settings))` — the **same** function first paint uses. Changing one setting can switch another off (picking the in-process engine is what makes the address stop meaning anything), and recomputing here rather than on a rebuild keeps whatever the user typed in the fields while the dependency flips.
+</Note>
+
+---
+
+## What `baseUrl` will accept {#httpurl}
+
+`baseUrl` shipped with **no validator at all**, so `7.0.0.1:8765` was stored in silence, displayed back, and discovered to be wrong only when a turn failed with a transport error naming nothing the user had typed. The refusal *path* existed since [#4694](https://github.com/MervinPraison/PraisonAI/pull/4694); nothing had ever been handed to it to refuse. `validate: httpUrl()` (in `core/src/settings/store.ts`) is that missing half — and it normalises as well as refuses.
+
+| Input | Outcome | Why |
+|---|---|---|
+| `7.0.0.1:8765` | **Refused** | `new URL` cannot parse it; stored silently before. |
+| `localhost:8765` | **Refused** | Parses as a URL whose protocol is `localhost:` — the near-miss a developer types. Only `http:` and `https:` are accepted. |
+| `ftp://host:9000` | **Refused** | Non-http scheme. |
+| `http://host:9000/?token=abc` | **Refused** | A query string breaks endpoint concatenation (`${base}/chat` → `${base}/?token=abc/chat`). Same rule for `#fragment`. |
+| `  http://10.0.0.7:9000/  ` | Accepted, stored as `http://10.0.0.7:9000` | Trimmed, trailing slash stripped. |
+| `http://HOST:9000` | Accepted, stored as `http://host:9000` | `url.origin` lowercases the host. |
+
+Normalising here rather than at every call site keeps one address from being stored as three settings that behave identically — a trailing slash, a trailing space and an uppercase host all mean the same engine. Query and fragment are refused because the engine builds `${base}/chat`, `${base}/health`, `${base}/approve/{id}` by plain concatenation (`engines/src/remote-http/engine.ts`): a stored `http://host:8765/?token=abc` would become `http://host:8765/?token=abc/chat`, a request for `/` with a mangled query rather than `/chat`.
 
 ---
 
@@ -135,11 +227,23 @@ sequenceDiagram
     Field->>intentFrom: set-setting {key, raw}
     intentFrom->>validateInput: validateInput(def, raw)
     validateInput-->>intentFrom: null | value
-    intentFrom->>Alert: settingRejected(label)
-    Alert-->>User: "Engine address was not changed: that value was refused."
+    alt def.example is undefined
+        intentFrom->>Alert: settingRejected(label)
+        Alert-->>User: "Engine address was not changed: that value was refused."
+    else def.example is set
+        intentFrom->>Alert: settingRejectedExample(label, example)
+        Alert-->>User: "Engine address was not changed. Enter it like http://192.168.1.10:8765."
+    end
 ```
 
-The message is the labeled i18n string `settingRejected(label)` — `"Engine address was not changed: that value was refused."` — not a generic `"Invalid value"`. It names the setting because the field may already have scrolled off, and it is set on both the inline `role="alert"` node **and** the assertive live region, so the user hears it interrupt rather than wait behind queued status ticks.
+Two labeled i18n strings, not one generic `"Invalid value"`. `main.ts` chooses `settingRejectedExample(label, example)` when `def.example !== undefined`, otherwise falls back to `settingRejected(label)`:
+
+| Def carries | String used | Rendered |
+|---|---|---|
+| an `example` | `settingRejectedExample(label, example)` | `"Engine address was not changed. Enter it like http://192.168.1.10:8765."` |
+| no `example` | `settingRejected(label)` | `"Engine address was not changed: that value was refused."` |
+
+`settingRejected` names the setting and stops there — the whole of what it can say for a def whose `validate` is a clamp. For `baseUrl`, stopping there left the user staring at the field they just typed into with no idea which part was wrong: `7.0.0.1:8765` and `http://192.168.1.10:8765` differ in a scheme, and nothing on the screen said one was expected. The new `SettingDef.example` field (in `store.ts`) is shown **only** when `validate` refuses; a def with no `validate` has nothing to refuse and needs no example. The message names the setting because the field may already have scrolled off, and it is set on both the inline `role="alert"` node **and** the assertive live region, so the user hears it interrupt rather than wait behind queued status ticks.
 
 <Note>
 **Only the refused key's message is touched.** A successful write on one key clears its own message and leaves another key's refusal standing. Clearing every note would wipe a refusal the user has not read off a different setting; leaving them all would keep accusing a write that has since succeeded. The guard is `if (errorFor !== key) continue;` in `syncSettings`.
@@ -169,19 +273,42 @@ The settings screen is rebuilt on every visit, so a listener attached to a field
 
 ---
 
-## Secret rows
+## Secret rows {#secret-rows}
 
-A secret row is a masked field, a Remove button, and a separate presence node — never a value read back from the store.
+A secret row is a masked field, a separate presence node, and a Remove button **that is offered only when there is a key to remove** — never a value read back from the store.
 
-`secretControls` in `app/src/main.ts` builds the row under a three-property contract, and each property has a broken version that looks completely normal on screen:
+<Note>
+**Remove is not always shown.** The screen shipped with an unconditional Remove button under a row that read "Not set" — a control that destroyed nothing and reported nothing. It was never intended to be always-visible, and it was a defect for months. Since #4847 the button is painted only when a key is present to remove.
+</Note>
+
+`secretControls` in `app/src/main.ts` builds the row under a contract, and each property has a broken version that looks completely normal on screen:
 
 | Property | Rule |
 |----------|------|
 | Value | **Never assigned.** `settingControl` seeds a value field from the store; the mirror of that line here would be the leak. The field paints empty on every visit, and `syncSecret` empties it again after every commit — the value is in the DOM only while the user is holding it there. |
 | Masking | `type="password"` with `autocomplete="off"`, `autocapitalize="off"`, `autocorrect="off"`, `spellcheck="false"` — dots for a shoulder-surfer, no autofill, and no unrecognised token shipped off to a spellchecker. |
 | Presence | A separate node (`data-secret-presence`) starting at **UNKNOWN**, never at "Not set": telling someone their key is missing while the async `hasSecret` lookup is still in flight is how a working key gets pasted twice. |
+| Remove | Painted and clickable **only** when `canClear` is true. `secretControls` sets both `clear.hidden` and `clear.disabled` from `!row.canClear`. |
 
-`refreshSecretPresence` resolves `hasSecret` for every secret def and writes the answer into that presence node. It is **sequence-guarded**: a save followed by a Remove fires two overlapping lookups, and with a native keychain adapter `hasSecret` can resolve out of order, so an older answer landing last would paint a stale label over the current one. Each call takes a `latestPresenceSeq` ticket, and only the latest is allowed to write.
+### `Presence → canClear`
+
+`SecretRow.canClear` (in `ui/src/settings/view-model.ts`) is `state === "configured" && status?.ref !== undefined` — a key is confirmed present **and** the screen knows which slot to clear:
+
+| Presence state | `canClear` | Remove |
+|---|---|---|
+| `unknown` (keychain lookup in flight) | `false` | not painted, not clickable |
+| `not-set` | `false` | not painted, not clickable |
+| `configured` (**and** a `ref` is known) | `true` | painted, clickable |
+
+The rule is `state === "configured"`, **not** `state !== "not-set"`. `unknown` is a check still in flight (rule 2 in `view-model.ts`), and offering to destroy a credential the app has not yet confirmed exists is the same false promise pointed the other way. `unknown` is also the state every row is in on first paint, so this fix stops Remove flashing in and out while `hasSecret` lands.
+
+Both `hidden` **and** `disabled` are set. `hidden` alone is insufficient because the click handler is delegated on root — a hidden node still answers a synthetic click. The CSS is stated explicitly because `.setting-clear` is a flex item and `align-self` does not create a display declaration:
+
+```css
+.setting-clear[hidden] { display: none; }
+```
+
+`refreshSecretPresence` resolves `hasSecret` for every secret def and now flips **presence and Remove in the same pass**: after filling each `data-secret-presence` node it walks the `data-action="clear-secret"` nodes and sets `node.hidden = !configured`. Two passes (or a rebuild) is exactly what let a row read "Not set" with a live Remove under it. It is still **sequence-guarded** — a save followed by a Remove fires two overlapping lookups, and with a native keychain adapter `hasSecret` can resolve out of order, so each call takes a `latestPresenceSeq` ticket and only the latest is allowed to write. The answers map now stores a `boolean` (`configured`) rather than a pre-rendered presence label; the label is derived at write time inside the walk.
 
 `syncSecret(key, refusal)` empties the field after every commit and sets the refusal text on the row's `role="alert"` node (or clears and hides it when there is none) — the same assertive channel a rejected `value` setting uses.
 
@@ -208,13 +335,25 @@ The row is emitted by the same loop as every other row, so a renderer that only 
 
 ## Configuration Options
 
-`SETTING_DEFS` ships three editable settings today — two `value` rows and one `secret` row (source: `app/src/registry.ts`).
+`SETTING_DEFS` ships three editable settings today — one `secret` row and two `value` rows, in the order they paint (source: `app/src/registry.ts`).
 
-| Key | Type | Default | Control | Notes |
-|-----|------|---------|---------|-------|
-| `engineId` | `string` (choice) | `remote-http` | `<select>` | Choices come from `SETTING_DEFS.engineId.choices`: `remote-http` and `praisonai-ts`. |
-| `baseUrl` | `string` | `http://127.0.0.1:8765` | `<input type="text">` | Resolved per request by `enginesFor` — the next `/chat` and `/health` go to the current stored value. Trailing slashes are stripped per resolution. Changing it is the recovery for an unreachable engine. |
-| `openaiApiKey` | `secret` | `""` (never stored) | `<input type="password">` + Remove button | Kept in the keychain; never in the settings file; never shown back. Read per turn by the in-process engine via `apiKeyFor`. See [API Keys](/features/mobile/api-keys). |
+| Key | Type | Default | Section | Applies when | Validate | Example |
+|-----|------|---------|---------|--------------|----------|---------|
+| `openaiApiKey` | secret | `""` (never stored) | **API key** (lead) | always | — | — |
+| `engineId` | choice | `remote-http` | Engine | always | (choice enum) | — |
+| `baseUrl` | text | `http://127.0.0.1:8765` | Engine | `engineId == remote-http` | `httpUrl()` | `http://192.168.1.10:8765` |
+
+- **`openaiApiKey`** — kept in the keychain, never in the settings file, never shown back; read per turn by the in-process engine via `apiKeyFor`. See [API Keys](/features/mobile/api-keys) and [Secret rows](#secret-rows).
+- **`engineId`** — choices from `SETTING_DEFS[1].choices`: `remote-http` and `praisonai-ts`.
+- **`baseUrl`** — resolved per request by `enginesFor`, so the next `/chat` and `/health` go to the current stored value; validated and normalised by [`httpUrl()`](#httpurl), and [disabled under the in-process engine](#when-a-setting-depends-on-another). Changing it is the recovery for an unreachable engine.
+
+Each row's `help` string, verbatim from `registry.ts`:
+
+| Key | `help` |
+|---|---|
+| `openaiApiKey` | "The in-process engine signs its requests with this. It is kept in the platform secret store, never in the settings file, and never shown back to you." |
+| `engineId` | "Which agent runtime answers. Remote talks to a PraisonAI engine over HTTP; in-process runs the agent loop on this device." |
+| `baseUrl` | "Where the remote engine listens. Include the scheme and the port." |
 
 <Note>
 The store's coercion and validation machinery stays intact for any future setting; `engineId`, `baseUrl`, and `openaiApiKey` are the keys the shipping app reads (`CONSUMED_SETTING_KEYS`), and `registry.test.ts` forbids a declared-but-unread setting. See [Storage & Secrets → Shipped defaults are valid](/features/mobile/storage-and-secrets).
@@ -273,6 +412,18 @@ The field resets to `settings.get(key) ?? def.default`, so a value that never pe
 
 <Accordion title="A secret row takes writes but never reads back">
 Editing a secret is a first-class row now: a masked field commits through `set-secret`, and a Remove button through `clear-secret`. But the value is unreadable from the UI facade — the row shows presence and takes writes; only the engine, holding the full `SecretsPort`, reads the value back. See [API Keys](/features/mobile/api-keys) and [Storage & Secrets](/features/mobile/storage-and-secrets).
+</Accordion>
+
+<Accordion title="Remove is offered only when there is a key to remove">
+`SecretRow.canClear` is `state === "configured" && ref !== undefined`. The button sets both `hidden` and `disabled` from `!canClear`, and `refreshSecretPresence` flips it in the same pass as the presence label — so a row reading "Not set" never carries a live Remove. See [Presence → canClear](#secret-rows).
+</Accordion>
+
+<Accordion title="A setting that does not apply is disabled, not hidden">
+`baseUrl` carries `appliesWhen: { key: "engineId", equals: "remote-http" }`. Under the in-process engine the row stays on screen, greyed, with a `.setting-inactive` note reading "Set Engine to remote-http to use this." — so the typed address never vanishes and the connection between the two settings is visible at a glance. See [When a setting depends on another](#when-a-setting-depends-on-another).
+</Accordion>
+
+<Accordion title="baseUrl refuses anything that is not an http(s) origin">
+`httpUrl()` rejects a bare host (`7.0.0.1:8765`), a non-http scheme (`ftp://…`, and `localhost:8765` whose protocol is `localhost:`), and any query or fragment; it trims, strips a trailing slash and lowercases the host on what it accepts. A refusal names an example — `settingRejectedExample(label, example)` → "Engine address was not changed. Enter it like http://192.168.1.10:8765." See [What `baseUrl` will accept](#httpurl).
 </Accordion>
 </AccordionGroup>
 
