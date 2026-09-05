@@ -33,21 +33,22 @@ For tool allow/deny enforcement, use the dedicated `policy` parameter with a [Po
 
 ```mermaid
 graph LR
-    Agent["🤖 Agent"] --> Output["📄 Output"]
-    Output --> Check{"🛡️ Guardrail\nCheck"}
-    Check -->|"✅ Pass"| Result["✅ Validated\nOutput"]
-    Check -->|"❌ Fail"| Retry["🔄 Retry\nwith feedback"]
-    Retry --> Agent
+    In["📥 Input"] --> VIn{"🛡️ validate_input"}
+    VIn -->|allow| Agent["🤖 Agent"]
+    Agent --> VTC{"🛡️ validate_tool_call"}
+    VTC -->|allow| Tool["🔧 Tool"]
+    Tool --> VTR{"🛡️ validate_tool_result"}
+    VTR -->|allow / redact| Agent
+    Agent --> VOut{"🛡️ validate_output"}
+    VOut -->|allow| Out["📤 Output"]
 
-    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef guard fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef node fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef warning fill:#F59E0B,stroke:#7C90A0,color:#fff
 
-    class Agent agent
-    class Output,Check tool
-    class Result success
-    class Retry warning
+    class VIn,VTC,VTR,VOut guard
+    class In,Out,Agent node
+    class Tool tool
 ```
 
 ## Quick Start
@@ -172,7 +173,7 @@ Input-side validation runs on both `chat()` / `start()` and `achat()` / `astart(
 
 ## Class-based Guardrails (Object Protocol)
 
-Any Python object exposing `validate_input(content, **kwargs)`, `validate_output(content, **kwargs)`, or `validate_tool_call(tool_name, arguments, **kwargs)` is accepted directly by `Agent(guardrails=...)`. Pass a single instance, or a list of instances, and the SDK wraps them in a `GuardrailChain` for you.
+Any Python object exposing `validate_input(content, **kwargs)`, `validate_output(content, **kwargs)`, `validate_tool_call(tool_name, arguments, **kwargs)`, or `validate_tool_result(tool_name, result, **kwargs)` is accepted directly by `Agent(guardrails=...)`. Pass a single instance, or a list of instances, and the SDK wraps them in a `GuardrailChain` for you.
 
 ```python
 from praisonaiagents import Agent
@@ -188,6 +189,10 @@ class ProfanityFilter:
 
     def validate_tool_call(self, tool_name, arguments, **kwargs):
         return (False, arguments) if tool_name == "rm" else (True, arguments)
+
+    def validate_tool_result(self, tool_name, result, **kwargs):
+        # Redact or reject anything the raw tool output leaked
+        return ("sk-" not in str(result)), result
 
 agent = Agent(
     name="Support",
@@ -258,7 +263,7 @@ The exception message names the value and the supported shapes so you can fix th
 ```
 TypeError: guardrails=123 (type int) is not a supported guardrail. Pass a
 validator callable taking one TaskOutput, an object implementing
-validate_input/validate_output/validate_tool_call, a list of such objects,
+validate_input/validate_output/validate_tool_call/validate_tool_result, a list of such objects,
 a GuardrailConfig, or a string LLM-validation prompt.
 ```
 
@@ -616,6 +621,100 @@ sequenceDiagram
 
 ---
 
+## Tool-Result Validation (`validate_tool_result`)
+
+When a guardrail object exposes `validate_tool_result(tool_name, result, **kwargs) -> (bool, Any)`, it is consulted on the tool's raw output before it re-enters the LLM context. A return of `(False, ...)` rejects the result (fail-closed); a return of `(True, rewritten)` replaces it with the rewritten value.
+
+`validate_output` only ever sees the model's paraphrase of a tool result — a leaked secret or a prompt-injection payload in the raw output was previously invisible to guardrails. `validate_tool_result` closes that gap.
+
+```python
+from praisonaiagents import Agent
+
+class NoSecretsGuardrail:
+    def validate_tool_result(self, tool_name, result, **kwargs):
+        if "sk-" in str(result):
+            return False, result   # reject: fail-closed
+        return True, result
+
+def run_shell(cmd: str) -> str:
+    return "API_KEY=sk-leaked-secret-123"
+
+agent = Agent(
+    name="Ops",
+    instructions="Help with shell operations.",
+    guardrails=NoSecretsGuardrail(),
+    tools=[run_shell],
+)
+agent.start("Show me the env")
+# -> the leaked secret in the raw tool result is blocked before it reaches the LLM
+```
+
+Redact in-place instead of rejecting:
+
+```python
+from praisonaiagents import Agent
+
+class RedactingGuardrail:
+    def validate_tool_result(self, tool_name, result, **kwargs):
+        return True, str(result).replace("sk-leaked-secret-123", "[REDACTED]")
+
+def run_shell(cmd: str) -> str:
+    return "API_KEY=sk-leaked-secret-123"
+
+agent = Agent(
+    name="Ops",
+    instructions="Help with shell operations.",
+    guardrails=RedactingGuardrail(),
+    tools=[run_shell],
+)
+agent.start("Show me the env")
+# -> the model sees "API_KEY=[REDACTED]" instead of the raw secret
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Tool
+    participant Guard as validate_tool_result
+    participant LLM
+
+    User->>Agent: chat("show me the env")
+    Agent->>Tool: run_shell("env")
+    Tool-->>Agent: "API_KEY=sk-leaked-secret-123"
+    Agent->>Guard: validate_tool_result("run_shell", raw_output)
+    alt Reject
+        Guard-->>Agent: (False, _)
+        Note over Agent: Result replaced with guardrail_denied error
+        Agent->>LLM: {"error": "...", "guardrail_denied": True}
+    else Redact
+        Guard-->>Agent: (True, "API_KEY=[REDACTED]")
+        Agent->>LLM: redacted result
+    end
+    LLM-->>Agent: response
+    Agent-->>User: final answer
+```
+
+**Behaviour** (fail-closed, mirrors `validate_tool_call`):
+
+| Guardrail returns | Result delivered to the LLM |
+|-------------------|-----------------------------|
+| `(True, original)` | Original result, unchanged |
+| `(True, rewritten)` | The rewritten value (e.g. a redacted string) |
+| `(False, _)` | `{"error": "Tool '<name>' result rejected by guardrail", "guardrail_denied": True}` |
+| raises `Exception` | `{"error": "Tool '<name>' result denied: guardrail check failed (...)", "guardrail_denied": True}` |
+| No such guardrail | Passthrough — zero overhead |
+
+**Async and MCP parity.** The check runs on both `chat()` / `execute_tool` and `achat()` / `execute_tool_async`, including the async MCP branch — a successful MCP tool result is gated the same way a native tool result is.
+
+**Framework-issued denial markers pass through untouched.** A result already tagged `guardrail_denied`, `policy_denied`, `approval_denied`, `permission_denied`, or `approval_error` is never re-inspected. But an ordinary tool-authored `{"error": ..., "content": "..."}` dict (a crawl result with a partial-failure error and content, or a shell tool's recoverable failure) **is still validated** — untrusted content in an error dict can still carry a secret or an injection payload.
+
+<Note>
+**Since PraisonAI PR [#4859](https://github.com/MervinPraison/PraisonAI/pull/4859)** (merged 2026-09-05, fixes [#4855](https://github.com/MervinPraison/PraisonAI/issues/4855)), `validate_tool_result` is a first-class guardrail surface. On earlier releases there was no protocol method to write for tool-output validation — a leaked secret or prompt-injection payload in a raw tool result flowed straight into the LLM context. String and LLM-string guardrails (`guardrails="Be polite"`) are **excluded** from this wiring on purpose — running an extra LLM call after every tool result would be a hot-path regression, mirroring the tool-call exclusion.
+</Note>
+
+---
+
 ## Configuration Options
 
 <Card title="GuardrailConfig SDK Reference" icon="code" href="/sdk/reference/praisonaiagents/modules/feature_configs">
@@ -713,13 +812,14 @@ The chain short-circuits — it stops at the first guardrail that fails. On succ
 | `guardrails` | `List[GuardrailProtocol]` | — | Guardrails run in order |
 | `fail_open` | `bool` | `False` | `False` fails closed — a guardrail that raises blocks the content; `True` lets it through (unsafe) |
 
-Each guardrail can expose three validation entry points, all called through the chain:
+Each guardrail can expose four validation entry points, all called through the chain:
 
 | Method | When it runs |
 |--------|--------------|
 | `validate_input` | Before the agent processes an input prompt |
 | `validate_output` | Before an output is returned to the user |
 | `validate_tool_call` | Before a tool call executes |
+| `validate_tool_result` | After a tool executes, before its raw result re-enters the LLM context |
 
 Any object with matching method names satisfies `GuardrailProtocol` — it is duck-typed, so a guardrail only needs the methods it actually uses.
 
