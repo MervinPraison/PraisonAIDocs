@@ -43,7 +43,7 @@ A missing key is now caught before any Send, so the provider SDK error is no lon
 
 The prose `The OPENAI_API_KEY environment variable is missing or empty` used to be the only "no key" signal, shown after the first Send. It has been replaced by first-screen guidance — the **"Add an API key to start"** panel — see [Empty Chat](/features/mobile/empty-chat).
 
-If a user still reaches this error prose from another path — clearing the key mid-chat and then sending a message — the recovery action lands them on Settings via the same `strings.recoveryLabel("settings")` → **"Open settings"** label the empty-chat panel uses, so the route reads the same everywhere.
+If a user still reaches this error prose from another path — clearing the key mid-chat and then sending a message — the resulting error prose now classifies as `auth` ([PR #4873](https://github.com/MervinPraison/PraisonAI/pull/4873)), so the row's recovery button lands them on Settings just like the empty-state panel does — via the same `strings.recoveryLabel("settings")` → **"Open settings"** label, so the route reads the same everywhere. See [Common Pitfalls → A missing key is `auth`, not `internal`](#common-pitfalls) for the classification detail.
 
 ---
 
@@ -125,6 +125,40 @@ See [Dropped Events](/features/mobile/dropped-events#the-error-before-start-exce
 
 ---
 
+## An error row shows the kind in words
+
+Since [PR #4873](https://github.com/MervinPraison/PraisonAI/pull/4873), the row renders `strings.errorTitle(errorKind)` as a bold block above the provider's message, in addition to the `errorRowName` `aria-label` that already existed for the screen-reader announcement. The title is chosen by kind, never by parsing the message. The full provider prose is kept in an `.error-message` span underneath — support engineers still find it by search.
+
+Before this landed, sighted users saw only the SDK sentence (e.g. `The OPENAI_API_KEY environment variable is missing or empty; either provide it, or instantiate the OpenAI client with an apiKey option, like new OpenAI({ apiKey: 'My API Key' }).`) while screen-reader users heard *"Sign-in problem. …"* — two audiences, two different accounts of one event.
+
+`paint()` for `case "error"` appends two spans inside the row:
+
+```ts
+// dom.ts — the kind is shown in words, the message is kept in full underneath.
+const title = el.ownerDocument.createElement("span");
+title.className = "error-title";
+title.textContent = strings.errorTitle(row.errorKind);
+const message = el.ownerDocument.createElement("span");
+message.className = "error-message";
+message.textContent = row.message;
+el.append(title, message);
+```
+
+The DOM shape:
+
+```html
+<p class="row row-error">
+  <span class="error-title">Sign-in problem</span>
+  <span class="error-message">The OPENAI_API_KEY environment variable is missing or empty</span>
+</p>
+```
+
+<Note>
+The `.error-title` span is `display: block` — not cosmetic. Both title and message are `<span>`s inside one row, so without it the row reads *"Sign-in problemThe OPENAI_API_KEY environment variable…"* as one run. The CSS rule is `.row-error .error-title { display: block; font-weight: 600; }`; no colour is set on the selector on purpose — `.row-error` already sets one and both spans inherit it.
+</Note>
+
+---
+
 ## Body and transport rules for cancel and approve POSTs
 
 Status is only half the contract. `postOk` / `decide` / `cancel` in `engines/src/remote-http/engine.ts` also judge the **body** and survive a **thrown transport** — a 200 with a bad body is "a lie the UI cannot detect", so a Stop or an approval is confirmed only when the engine actually accepted it.
@@ -201,15 +235,42 @@ An expired key is `auth` and routes to Settings; being offline is `transport` an
 A `403` — what a scoped key or a proxy returns — is `kind: "auth"`, so it sends the user to credentials rather than offering an endless Retry. The branch is **status-first**: `{status: 403, message: "nope"}` classifies as `auth` even when the message says nothing recognisable. Without the status branch, only prose containing the literal `"403"` or `"forbidden"` would be caught, and a provider whose message is silent would misclassify as `internal` and offer no route to Settings. `{status: 401}` behaves the same way. Pinned by `"a 403 is an auth failure even when its message says nothing useful"`.
 </Accordion>
 
-<Accordion title="Message-only auth classification: the `authentication` alternative">
-When a provider error arrives **without a status** — a thrown SDK error, an unwrapped provider response — `classify` in `engines/src/praisonai-ts/classify.ts` falls back to a message regex. That regex holds **two independent** word-alternatives, and either one alone routes to Settings:
+<Accordion title="Message-only auth classification: `invalid key`, `authentication`, and missing-key alternatives">
+When a provider error arrives **without a status** — a thrown SDK error, an unwrapped provider response — `classify` in `engines/src/praisonai-ts/classify.ts` falls back to a message regex. There are now **three independent** groups of message alternatives, and any one alone routes to Settings:
 
 | Alternative | Example error string that matches |
 |---|---|
 | `invalid[ _-]?x?-?api[ _-]?key` | `"Invalid API key"`, `"invalid_x_api_key"` |
 | `authentication` | `"authentication_error"`, `"Authentication Error"`, `"Authentication failed"` |
+| Missing-key patterns (three regex branches — see next accordion) | `"The OPENAI_API_KEY environment variable is missing or empty"`, `"API key is missing"`, `"Missing credentials"` |
 
 A bare `authentication_error` with no "invalid api key" phrase still classifies as `auth`, so the user is sent to Settings rather than to a Retry that fails again with the same rejected credential. Drop the `authentication` alternative and such an error misclassifies as `internal` with no route to Settings — the exact regression the source comment records as fixed. Pinned by `"anthropic auth, no key phrase"`, `"authentication, spelled out"`, and `"authentication failed"`.
+
+The third group — the missing-key patterns from [PR #4873](https://github.com/MervinPraison/PraisonAI/pull/4873) — completes the story: a key that was never *set* is a different sentence from a key that was *rejected*, and until #4873 it reached neither of the first two alternatives. See the next accordion for the exact branches.
+</Accordion>
+
+<Accordion title="A missing key is `auth`, not `internal` — new patterns">
+A key that was never *set* is a different sentence from a key that was rejected, and until [PR #4873](https://github.com/MervinPraison/PraisonAI/pull/4873) it reached none of the auth patterns. The single most likely failure a fresh install has — `The OPENAI_API_KEY environment variable is missing or empty` — classified as `internal`, whose recovery is `none`, so the one error whose entire answer is "open Settings and paste a key" offered no route to Settings.
+
+Three regex branches now route missing-key prose to `auth` → `settings`:
+
+| Alternative | Example error string that matches |
+|---|---|
+| `(?:[a-z0-9]+_)?api[_ -]?key\b[^.;]{0,80}\b(?:missing\|not set\|unset\|empty\|required\|not provided)\b` | `"The OPENAI_API_KEY environment variable is missing or empty"`, `"GOOGLE_GENERATIVE_AI_API_KEY environment variable is not set"` |
+| `\b(?:missing\|no\|empty)\b[^.;]{0,40}\bapi[_ -]?key\b` | `"API key is missing"`, `"No API key provided"` |
+| `\bmissing credentials?\b` | `"Missing credentials"`, `"Missing credential"` |
+
+Now recognised as `auth` (all were `internal` before):
+
+| Provider message | Prior kind | New kind |
+|---|---|---|
+| `The OPENAI_API_KEY environment variable is missing or empty; …` | `internal` | `auth` |
+| `The ANTHROPIC_API_KEY environment variable is missing or empty` | `internal` | `auth` |
+| `GOOGLE_GENERATIVE_AI_API_KEY environment variable is not set` | `internal` | `auth` |
+| `API key is missing` | `internal` | `auth` |
+| `Missing credentials` | `internal` | `auth` |
+
+The gap between "api key" and its qualifier is bounded by `[^.;]` (not `.`) so a later "missing" in an unrelated clause of the same paragraph cannot drag an unrelated failure into `auth`. Unrelated failures still classify correctly — `"The server had an error while processing your request"` and `"something went sideways"` stay `internal`, `"fetch failed"` stays `transport`, `"429 Rate limit reached for gpt-4o"` stays `rate_limit`, and `"The model produced an empty response"` stays `internal` (recovery `retry`, not `settings`). Pinned by `"a key that was never SET is an auth failure, not an internal one"` and its pair `"the missing-key patterns do not swallow unrelated failures"` in `classify.test.ts`.
 </Accordion>
 
 <Accordion title="HTTP 500 is transport (Retry offered)">
