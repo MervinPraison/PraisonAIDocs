@@ -279,6 +279,16 @@ async def main():
 asyncio.run(main())
 ```
 
+`aspawn_sub_agent` + `await_for_completions` are reliable — a sub-agent running on a background thread wakes the awaiter as soon as it finishes, and mixing sync and async spawn calls on the same `AgentTeam` is safe because both paths share one `threading.RLock`.
+
+<Warning>
+**Fixed in PraisonAI [PR #4887](https://github.com/MervinPraison/PraisonAI/pull/4887).** Prior to this release the async spawn/completion path had three defects reachable from ordinary usage: (1) `await_for_completions()` could hang until timeout — or forever with `timeout=None` — because `check_completions()` called `asyncio.get_running_loop()` from a background spawn thread, which raised `RuntimeError` that was silently swallowed, so the awaiter never woke even after the sub-agent finished; (2) the sync path used `threading.RLock` while the async path used `asyncio.Lock`, which excludes nothing against a real OS thread, so mixing sync and async spawn on one `AgentTeam` was a genuine data race; (3) fire-and-forget `asyncio.create_task(...)` results were not stored, so the event loop's weak reference let a sub-agent run be garbage-collected mid-run. After this release, `await_for_completions` captures the running loop in its own coroutine frame and closes over it in `check_completions`, both paths share one `threading.RLock`, and background spawn tasks are held in a strong-reference set (`self._bg_spawn_tasks`) so they cannot be collected. No API surface changed.
+</Warning>
+
+<Note>
+`await_for_completions` subscribes to the event bus **before** running the initial state check, so a sub-agent that finishes between the check and the subscribe no longer causes a lost signal.
+</Note>
+
 ---
 
 ## Best Practices
@@ -338,6 +348,17 @@ spawned = team.spawn_sub_agent(agent, task, metadata=metadata)
 def on_completion(event):
     request_id = event.metadata.get("request_id")
     notify_user_of_completion(request_id, event.result)
+```
+</Accordion>
+
+<Accordion title="Mixing sync and async spawn on the same team is safe">
+Since [PR #4887](https://github.com/MervinPraison/PraisonAI/pull/4887), `spawn_sub_agent` (sync) and `aspawn_sub_agent` / `aannounce_completion` / `await_for_completions` (async) share one `threading.RLock`, so calling both on the same `AgentTeam` no longer races on shared completion state.
+
+```python
+# Both paths guard the same state — safe to interleave
+team.spawn_sub_agent(agent_a, task_a)
+await team.aspawn_sub_agent(agent_b, task_b)
+completions = await team.await_for_completions(timeout=60.0)
 ```
 </Accordion>
 </AccordionGroup>
