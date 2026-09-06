@@ -147,7 +147,25 @@ The bridge probes for a running event loop using `asyncio.get_running_loop()`. I
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `timeout` | `float` | `300` | Maximum seconds to wait for coroutine completion |
+| `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s) | Maximum seconds to wait for coroutine completion. The default is **resolved per call** — see [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number) for the omitted / `None` / number distinction. |
+
+---
+
+## Timeout resolution: omitted vs `None` vs number
+
+The `timeout` argument on `run_sync`, `run_sync_or_offload`, `arun_sync_or_offload`, and `AsyncBridge.run_sync` uses a private `_UNSET` sentinel as its default, so the bridge can tell "argument omitted" apart from an explicit `timeout=None`.
+
+| Caller passes | Effective timeout |
+|---|---|
+| Nothing (argument omitted) | `_default_timeout()` — reads `PRAISONAI_RUN_SYNC_TIMEOUT`, default `300.0` |
+| `timeout=None` explicitly | **Unbounded** wait (opt-in) |
+| `timeout=<number>` | That value verbatim |
+
+The sync-scheduler bridges (`praisonai/integration/bridges/schedules_runner.py`, `praisonai/cli/commands/schedule.py`) pass `timeout=None` so a long-running claimed job is never cancelled after 300 s.
+
+<Note>
+`_default_timeout()` reads and parses `PRAISONAI_RUN_SYNC_TIMEOUT` **per call**, not at import. A malformed value (e.g. `notanumber`) falls back to `300.0` instead of crashing `import praisonai`, and a late-set value (dotenv loaded after import, per-request reconfig) takes effect on the next call.
+</Note>
 
 ---
 
@@ -294,6 +312,8 @@ The wrapper-layer bridge (`praisonai._async_bridge`) creates its
 background loop lazily on the first `run_sync()` call. Pure imports
 do not allocate a loop or thread. Calling the module-level `shutdown()` before any
 `run_sync()` is a safe no-op — it only affects the shared default bridge, not any `AsyncBridge()` instances you create yourself.
+
+The shared default's `atexit` teardown hook is also registered lazily, on the first real use of the shared default bridge (inside `AsyncBridge._spawn_locked()`, guarded by `self is globals().get("_BG")`). A bare `import praisonai` no longer installs a process-wide `atexit` hook, so Django/Airflow/Streamlit embedders are unaffected until they actually call `run_sync`.
 </Note>
 
 ---
@@ -419,15 +439,15 @@ graph LR
 | Class / Function | Signature | Description |
 |------------------|-----------|-------------|
 | `AsyncBridge` | `class AsyncBridge` | Per-instance async runner; create one per tenant or service. |
-| `AsyncBridge.run_sync` | `(self, coro, *, timeout=300) -> T` | Run a coroutine on this bridge's background loop. |
+| `AsyncBridge.run_sync` | `(self, coro, *, timeout=_UNSET) -> T` | Run a coroutine on this bridge's background loop. Omitted → `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s); `None` → unbounded; number → verbatim. See [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number). |
 | `AsyncBridge.shutdown` | `(self, timeout=5.0, *, permanent=False) -> None` | Cancel pending tasks and stop this bridge's loop. With `permanent=True`, the bridge cannot be reused; later `run_sync`/`submit` raise `RuntimeError`. `scoped_bridge()` uses `permanent=True` for scope-owned bridges. PR #2122: releases the bridge lock before awaiting cancellation. |
 | `AsyncBridge.submit` | `(self, coro) -> concurrent.futures.Future` | Submit without waiting; returns a `concurrent.futures.Future`. |
 | `AsyncBridge.get` | `(self) -> asyncio.AbstractEventLoop` | Get (lazily spawn) the bridge's event loop. |
-| `run_sync` (module-level) | `(coro, *, timeout=300) -> T` | Routes through the shared default `AsyncBridge`. Behaviour unchanged. |
+| `run_sync` (module-level) | `(coro, *, timeout=_UNSET) -> T` | Routes through the shared default `AsyncBridge`. Omitted → `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s); `None` → unbounded; number → verbatim. See [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number). |
 | `shutdown` (module-level) | `() -> None` | Shuts down **only** the shared default bridge. User-owned instances are untouched. |
 
 **Environment:** 
-- `PRAISONAI_RUN_SYNC_TIMEOUT`: Default timeout in seconds (300). Read by **both** `praisonai._async_bridge` (this page) and `praisonai_code.cli.features.agent_tools._run_sync` (see [Agent-Centric Tools → Timeouts & Cancellation](/cli/agent-tools#timeouts-cancellation)).
+- `PRAISONAI_RUN_SYNC_TIMEOUT`: Default timeout in seconds (300). **Resolved per call** (not at import) via `_default_timeout()`; a malformed value falls back to `300.0`, and late-set env vars (dotenv loaded after import, per-request reconfig) are honoured. An explicit `timeout=None` opts into an **unbounded** wait (used by the sync-scheduler bridges for long-lived jobs). Read by **both** `praisonai._async_bridge` (this page) and `praisonai_code.cli.features.agent_tools._run_sync` (see [Agent-Centric Tools → Timeouts & Cancellation](/cli/agent-tools#timeouts-cancellation)).
 
 <Warning>
 Do **not** call `run_sync` from inside `async def` — use `await` instead. The function raises `RuntimeError` if called from within a running event loop to prevent deadlocks.
@@ -505,7 +525,7 @@ async def run(prompt: str):
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `coro` | `Awaitable[T]` | — | The coroutine to run. Refused inside a loop (strict mode) — it is `.close()`'d so it does not leak as a "coroutine was never awaited" warning. |
-| `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300s) | Same env var as `run_sync`. |
+| `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300s) | Same env var as `run_sync`. Omitted → resolved per call; `None` → **unbounded**; number → verbatim. See [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number). |
 | `thread_name` | `str` | `"praisonai-sync-offload"` | Name of the offload worker thread (only used under the `PRAISONAI_ALLOW_LOOP_BLOCKING` opt-in). |
 
 Called from a plain sync caller, it dispatches to the active `AsyncBridge` via `run_sync`, sharing its background loop and connection pools. Called from inside a running loop **with `PRAISONAI_ALLOW_LOOP_BLOCKING=true`**, it copies the caller's ContextVars onto a worker thread that hands the coroutine to the **same** bridge — never a fresh `asyncio.new_event_loop()` — so a caller-installed `scoped_bridge()` binding still wins and LiteLLM/HTTPX per-loop connection pools are preserved. Exceptions re-raise on the caller thread.
@@ -647,7 +667,7 @@ The user calls an async endpoint; the agent's coroutine runs on the shared backg
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `coro` | `Awaitable[T]` | — | The coroutine to await. |
-| `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s) | Same env var as `run_sync`. On expiry the in-flight future is cancelled (`fut.cancel()`) and `asyncio.TimeoutError` re-raises. |
+| `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s) | Same env var as `run_sync`. Omitted → resolved per call; `None` → **unbounded**; number → verbatim (see [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number)). On expiry the in-flight future is cancelled (`fut.cancel()`) and `asyncio.TimeoutError` re-raises. |
 
 Unlike `run_sync_or_offload`, this variant does **not** park the running loop thread. It submits `coro` to the active `AsyncBridge` and awaits the result, so the loop keeps serving other work. The coroutine runs on the shared background bridge loop — never a fresh `asyncio.new_event_loop()` — so a caller-installed `scoped_bridge()` binding still wins and per-loop LiteLLM/HTTPX connection pools are preserved. On timeout or cancellation, the in-flight future is cancelled before the exception re-raises.
 
@@ -815,6 +835,38 @@ asyncio.run(main())
 |--------|-----------|-------------|
 | `scoped_bridge` | `(bridge: Optional[AsyncBridge] = None) -> Iterator[AsyncBridge]` | Context manager. Binds a per-scope bridge via `ContextVar`. With `None`, creates and owns a fresh bridge (shut down with `permanent=True` on exit). With a caller-provided bridge, the caller retains lifecycle ownership. |
 | `current_bridge` | `() -> AsyncBridge` | Returns the bridge bound by an enclosing `scoped_bridge()` block, else the shared default. |
+
+---
+
+## Sync `generate_crew_and_kickoff` auto-scoping
+
+`AgentsGenerator.generate_crew_and_kickoff()` now wraps its `adapter.run(...)` call in `scoped_bridge()` automatically. Every sync run isolates its `run_sync`-driven work onto its own loop+thread, so a stuck coroutine in one agent/tenant can no longer park the shared default loop for the rest.
+
+```mermaid
+graph TB
+    subgraph "Two concurrent sync runs"
+        RunA[👤 Run A<br/>generate_crew_and_kickoff] --> SBA[🌉 scoped_bridge A]
+        RunB[👤 Run B<br/>generate_crew_and_kickoff] --> SBB[🌉 scoped_bridge B]
+        SBA --> LA[🔁 loop A]
+        SBB --> LB[🔁 loop B]
+    end
+
+    classDef run fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef bridge fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef loop fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class RunA,RunB run
+    class SBA,SBB bridge
+    class LA,LB loop
+```
+
+Callers doing multi-tenant sync runs no longer need to add their own `scoped_bridge()` around `generate_crew_and_kickoff` — a stuck coroutine in one run cannot affect another.
+
+<Note>
+`agenerate_crew_and_kickoff()` (async) is intentionally **not** wrapped. Async callers awaiting `adapter.arun(...)` directly do not benefit from a per-call loop swap and get better connection-pool reuse without it.
+</Note>
+
+See [Wrapper → Lifecycle / cleanup](/developers/wrapper#lifecycle-cleanup) for the embedder view.
 
 ---
 
