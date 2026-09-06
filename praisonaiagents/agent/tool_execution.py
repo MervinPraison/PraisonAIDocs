@@ -983,6 +983,13 @@ class ToolExecutionMixin:
                         )
                         time.sleep(delay)
             
+            # Tool-result guardrail gate (protocol-driven). Runs on the raw
+            # result before any middleware/trust-wrapping/hooks so a guardrail
+            # can inspect or redact unsafe tool output (a leaked secret, a
+            # prompt-injection payload) before it re-enters the LLM context.
+            # Fail-closed. Zero overhead when unset.
+            result = self._apply_tool_result_guardrails(function_name, result)
+
             # Apply runtime-scoped middleware normalization BEFORE hooks fire
             # Plugin harnesses can register middleware to normalize vendor-specific results
             runtime_id = getattr(self, '_runtime_id', 'praisonai')  # Default to native runtime
@@ -1675,6 +1682,50 @@ class ToolExecutionMixin:
                 or (trust_level == "external")  # External tools need approval
             )
             if needs_approval:
+                # Consult the registry's standing grants before prompting.
+                # This branch used to go straight to the backend, skipping
+                # is_env_auto_approve / is_yaml_approved / is_auto_approved /
+                # is_already_approved entirely -- and it is the DEFAULT branch,
+                # since a bare Agent() on a TTY installs a ConsoleBackend. So
+                # PRAISONAI_AUTO_APPROVE=true still prompted (measured: 3 of 3
+                # identical calls), a YAML approval was ignored, and an
+                # "approve for this session" grant was never remembered.
+                agent_name_for_registry = getattr(self, 'name', None)
+                scope_id = getattr(self, '_approval_scope_id', None) or agent_name_for_registry
+                try:
+                    standing_grant = (
+                        approval_registry.is_env_auto_approve()
+                        or approval_registry.is_yaml_approved(tool_name)
+                        or approval_registry.is_auto_approved(tool_name, scope_id)
+                        or approval_registry.is_already_approved(
+                            tool_name, tool_args, scope_id
+                        )
+                        # A "[s] this session" grant is stored by reusable
+                        # permission target, not by exact arguments, so a later
+                        # call with different args (same target, e.g. the same
+                        # ``bash:git status *`` prefix) is covered too. Without
+                        # this check the attached backend re-prompts for a call
+                        # the user already blessed for the session -- the exact
+                        # re-prompting this PR set out to stop.
+                        or approval_registry._is_session_scoped(
+                            agent_name_for_registry, tool_name, tool_args, scope_id
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - a grant lookup must never
+                    # block the call; fall through and ask, which is the safe
+                    # direction to fail in.
+                    standing_grant = False
+                if standing_grant:
+                    decision = ApprovalDecision(
+                        approved=True,
+                        reason="Approved by a standing registry grant",
+                    )
+                    if is_async:
+                        async def _granted():
+                            return decision
+                        return _granted()
+                    return decision
+
                 # Attach a rendered unified diff for file-mutating tools so the
                 # reviewer approves the actual change rather than a truncated
                 # argument dump. Non-edit tools get no diff (``None``) and keep
@@ -1692,19 +1743,46 @@ class ToolExecutionMixin:
                     context={"diff": diff_preview} if diff_preview else {},
                 )
                 
+                # Record a backend decision back into the registry so a
+                # "[s] this session" (or "always") grant the user gives at the
+                # prompt is remembered -- exactly as the no-backend
+                # registry.approve_* path does via _persist_scoped_decision.
+                # Without this, the fast-path _is_session_scoped check above can
+                # never match, and the user is re-prompted on every matching
+                # call for the rest of the run. Best-effort: a bookkeeping error
+                # must never change or block the returned decision.
+                def _remember(decision):
+                    try:
+                        if getattr(decision, "approved", False):
+                            approval_registry.mark_approved(
+                                tool_name, tool_args, agent_name_for_registry, scope_id
+                            )
+                        approval_registry._persist_scoped_decision(
+                            agent_name_for_registry, tool_name, tool_args,
+                            decision, scope_id,
+                        )
+                    except Exception:  # noqa: BLE001 - bookkeeping only
+                        pass
+                    return decision
+
                 if is_async:
                     # Async path - return the coroutine for caller to await
                     cfg_timeout = getattr(self, '_approval_timeout', 0)
-                    if cfg_timeout is None:
-                        return backend.request_approval(request)
-                    elif cfg_timeout > 0:
-                        import asyncio
-                        return asyncio.wait_for(
-                            backend.request_approval(request),
-                            timeout=cfg_timeout,
-                        )
-                    else:
-                        return backend.request_approval(request)
+
+                    async def _ask_backend_async():
+                        if cfg_timeout is None:
+                            decision = await backend.request_approval(request)
+                        elif cfg_timeout > 0:
+                            import asyncio
+                            decision = await asyncio.wait_for(
+                                backend.request_approval(request),
+                                timeout=cfg_timeout,
+                            )
+                        else:
+                            decision = await backend.request_approval(request)
+                        return _remember(decision)
+
+                    return _ask_backend_async()
                 else:
                     # Sync path - handle timeout and sync/async backend compatibility
                     cfg_timeout = getattr(self, '_approval_timeout', 0)
@@ -1720,7 +1798,7 @@ class ToolExecutionMixin:
                     
                     try:
                         if hasattr(backend, 'request_approval_sync'):
-                            return backend.request_approval_sync(request)
+                            return _remember(backend.request_approval_sync(request))
                         else:
                             # Use the shared utility to avoid code duplication and handle timeout correctly
                             from ..approval.utils import run_coroutine_safely
@@ -1734,10 +1812,10 @@ class ToolExecutionMixin:
                                 # cfg_timeout == 0: use backend default or fallback
                                 effective_timeout = getattr(backend, '_timeout', 60)
                             
-                            return run_coroutine_safely(
+                            return _remember(run_coroutine_safely(
                                 backend.request_approval(request),
                                 timeout=effective_timeout
-                            )
+                            ))
                     finally:
                         if orig_timeout is not None and hasattr(backend, '_timeout'):
                             backend._timeout = orig_timeout
@@ -1854,6 +1932,61 @@ class ToolExecutionMixin:
         except Exception as e:  # noqa: BLE001 — fail closed to the block path
             logging.debug(
                 "doom_loop approval routing failed for %s (%s); blocking",
+                function_name, e,
+            )
+            return False
+
+    async def _doom_loop_approved_async(self, function_name, arguments, verdict) -> bool:
+        """Async twin of :meth:`_doom_loop_approved`.
+
+        Identical decision semantics, but routes the backend prompt through the
+        registry's native ``approve_async`` so an async-only or event-loop-bound
+        approval backend runs on the *caller's* loop (preserving loop-bound
+        resources) instead of the sync bridge's throwaway worker-thread loop.
+        Every non-allow outcome — deny, timeout, no backend, or any error —
+        returns ``False`` so the caller falls back to the historical hard-stop.
+        """
+        try:
+            from ..approval import get_approval_registry
+            from ..approval.registry import DOOM_LOOP_TARGET
+
+            manager = getattr(self, "_permission_manager", None)
+            if manager is not None:
+                try:
+                    from ..permissions import PermissionAction
+                    action = manager.resolve_tool_action(
+                        "doom_loop", getattr(self, "name", None)
+                    )
+                    if action == PermissionAction.ALLOW:
+                        return True
+                    if action == PermissionAction.DENY:
+                        return False
+                except Exception as e:  # noqa: BLE001
+                    logging.debug(
+                        "doom_loop permission-manager resolve failed (%s); "
+                        "falling through to backend", e,
+                    )
+
+            registry = get_approval_registry()
+            request_args = {
+                "tool": function_name,
+                "detector": verdict.get("detector"),
+                "count": verdict.get("count"),
+                "args_fingerprint": self._doom_loop_args_fingerprint(
+                    function_name, arguments
+                ),
+            }
+            decision = await registry.approve_async(
+                getattr(self, "name", None),
+                DOOM_LOOP_TARGET,
+                request_args,
+                force=True,
+                scope_id=getattr(self, "_approval_scope_id", None),
+            )
+            return bool(getattr(decision, "approved", False))
+        except Exception as e:  # noqa: BLE001 — fail closed to the block path
+            logging.debug(
+                "doom_loop async approval routing failed for %s (%s); blocking",
                 function_name, e,
             )
             return False
@@ -2562,6 +2695,62 @@ class ToolExecutionMixin:
             if isinstance(processed, dict):
                 arguments = processed
         return None, arguments
+
+    def _apply_tool_result_guardrails(self, function_name, result):
+        """Gate a tool's raw result through any tool-result guardrails.
+
+        Runs after execution and before the result re-enters the LLM context so
+        a guardrail can inspect or redact unsafe tool output (a leaked secret, a
+        prompt-injection payload) that ``validate_output`` never sees. Returns
+        the (possibly rewritten) result when allowed, or an error dict tagged
+        ``guardrail_denied`` when rejected. Fail-closed on guardrail error,
+        mirroring ``_check_tool_policy_and_guardrails``. Zero overhead when no
+        tool-result guardrail is set. Denial error dicts pass straight through
+        untouched so a gated/failed tool is not re-inspected.
+        """
+        guardrails = getattr(self, "_tool_result_guardrails", None)
+        if not guardrails:
+            return result
+        # Only skip results the framework itself already gated/denied — those
+        # carry an explicit control marker and were never real tool output. An
+        # ordinary tool-authored ``{"error": ...}`` (a crawl result with both
+        # ``error`` and ``content``, a shell tool's recoverable failure) is still
+        # untrusted content that can carry a secret or an injection payload, so
+        # it MUST be validated like any other result.
+        if isinstance(result, dict) and (
+            result.get("guardrail_denied")
+            or result.get("policy_denied")
+            or result.get("approval_denied")
+            or result.get("permission_denied")
+            or result.get("approval_error")
+        ):
+            return result
+        for guardrail in guardrails:
+            validate = getattr(guardrail, "validate_tool_result", None)
+            if validate is None:
+                continue
+            try:
+                is_valid, processed = validate(function_name, result)
+            except Exception as e:  # noqa: BLE001
+                # Fail closed: a guardrail dependency/implementation error must
+                # block, not deliver, the unchecked result.
+                logging.warning(
+                    f"Tool '{function_name}' result denied: guardrail validate_tool_result raised: {e}"
+                )
+                return {
+                    "error": f"Tool '{function_name}' result denied: guardrail check failed ({e})",
+                    "guardrail_denied": True,
+                }
+            if not is_valid:
+                logging.warning(
+                    f"Tool '{function_name}' result rejected by tool-result guardrail"
+                )
+                return {
+                    "error": f"Tool '{function_name}' result rejected by guardrail",
+                    "guardrail_denied": True,
+                }
+            result = processed  # Accept the (possibly redacted) result
+        return result
 
     def _execute_tool_impl(self, function_name, arguments):
         """Internal tool execution implementation."""

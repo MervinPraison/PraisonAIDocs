@@ -308,6 +308,15 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     cls._env_output_checked = True
         return cls._env_output_mode
     
+    @staticmethod
+    def _local_discovery(target):
+        """Re-read the discovery for a resolved local target (cached upstream)."""
+        try:
+            from ..local import probe_endpoint
+            return probe_endpoint(target.base_url, expect=target.engine)
+        except Exception:
+            return None
+
     # Ordered (credential env-var, provider-appropriate default model). The
     # first provider whose credential is present wins. OpenAI is first so
     # existing OpenAI users keep their default; any other single configured
@@ -1450,7 +1459,16 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 elif memory_backend == "file":
                     memory = True
                 elif _memory_config.config:
-                    memory = _memory_config.config
+                    # Carry the backend into the dict. _init_memory reads the
+                    # provider as memory.get("provider", memory.get("backend",
+                    # "file")), so handing it the bare config lost the backend
+                    # entirely and silently fell back to FileMemory --
+                    # MemoryConfig(backend="sqlite", config={...}) built a
+                    # FileMemory while to_dict() went on reporting "sqlite".
+                    # An explicit provider/backend inside config still wins.
+                    memory = dict(_memory_config.config)
+                    if "provider" not in memory and "backend" not in memory:
+                        memory["provider"] = memory_backend
                 else:
                     memory = memory_backend
             elif hasattr(_memory_config, 'search') and hasattr(_memory_config, 'add'):
@@ -1473,9 +1491,18 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             if learn is False:
                 _learn_config = None
             elif learn is True:
-                # learn=True shorthand enables AGENTIC mode (auto-learning)
+                # learn=True is a coordinated posture (Issue #4864): enable
+                # AGENTIC extraction AND a conversational-aware nudge cadence in
+                # one switch, so an always-on companion bot actually learns.
+                # nudge_min_tool_iters=0 lets a chat-only turn (no tool calls)
+                # still nudge; auto_memory is turned on below so durable facts
+                # are captured on every turn, not just tool-using ones.
                 from ..memory.learn.protocols import LearnMode
-                _learn_config = LearnConfig(mode=LearnMode.AGENTIC)
+                _learn_config = LearnConfig(
+                    mode=LearnMode.AGENTIC,
+                    nudge_interval=10,
+                    nudge_min_tool_iters=0,
+                )
             elif isinstance(learn, LearnConfig):
                 _learn_config = learn
             elif isinstance(learn, dict):
@@ -1522,6 +1549,14 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         elif _learn_config is not None and isinstance(memory, dict):
             # Merge learn config into memory dict
             memory["learn"] = _learn_config.to_dict() if hasattr(_learn_config, 'to_dict') else _learn_config
+
+        # Coordinated learn posture (Issue #4864): the ``learn=True`` shorthand
+        # turns on conversational fact extraction too, so an always-on companion
+        # accrues durable persona/preferences from plain chat — not just from
+        # tool-using turns. Only defaults it on when the caller did not set
+        # auto_memory explicitly (via MemoryConfig), so an explicit choice wins.
+        if learn is True and auto_memory is None:
+            auto_memory = True
         
         # ─────────────────────────────────────────────────────────────────────
         # Resolve HISTORY from MemoryConfig - FAST PATH
@@ -2165,6 +2200,35 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             if api_key is None:
                 api_key = _target.api_key
             self._local_target = _target
+
+            # Keep a local agent local end to end. Without this, chat went to
+            # the local server while knowledge/memory embedded against OpenAI --
+            # sending the user's documents AND their queries off the machine
+            # with no warning, which defeats the entire point of asking for a
+            # local model. Only fills a gap: an explicit embedder always wins.
+            _wants_embeddings = (retrieval_config is not None
+                                 or embedder_config is not None
+                                 or memory not in (None, False))
+            if _wants_embeddings and not embedder_config and not (
+                    retrieval_config or {}).get('embedder_config'):
+                from ..local import (local_embedder_config as _local_embedder,
+                                     select_embedding_model as _select_embed)
+                _embed_model = _select_embed(
+                    getattr(_d, 'models', ()) if (_d := Agent._local_discovery(_target)) else (),
+                    getattr(_d, 'model_meta', ()) if _d else ())
+                if _embed_model:
+                    embedder_config = _local_embedder(
+                        _target.engine, _target.base_url, _embed_model)
+                    if retrieval_config is not None:
+                        retrieval_config.setdefault('embedder_config', embedder_config)
+                else:
+                    logging.warning(
+                        "llm=%r resolved a local model, but %s serves no embedding "
+                        "model, so knowledge/memory would embed against a remote "
+                        "provider -- sending your documents off this machine. "
+                        "Pull one (e.g. `ollama pull nomic-embed-text`) or set an "
+                        "explicit embedder to silence this.",
+                        llm, _target.base_url)
 
         # Panel (multi-model) descriptor: "panel:<name>" or {"provider": "panel"}.
         # Resolved lazily into a PanelLLM; composes with the normal tool loop.
@@ -2870,6 +2934,10 @@ Your Goal: {self.goal}
         # Learning configuration (top-level, peer to memory)
         # Stored for access via agent._learn_config
         self._learn_config = _learn_config
+        # Raw learn= intent, so surfaces that default-enable learning (e.g. the
+        # gateway/bot) can tell "unset" (None) apart from an explicit opt-out
+        # (learn=False) — both of which leave _learn_config None (Issue #4864).
+        self._learn_enabled = learn
 
         # Agent-centric feature instances (lazy loaded for zero performance impact)
         self._auto_memory = auto_memory
@@ -6644,6 +6712,9 @@ Answer:"""
         # ``self._tool_call_guardrails`` but nothing ever assigned it, so the
         # whole ``validate_tool_call`` surface was dead code. Always define it.
         self._tool_call_guardrails = []
+        # ``tool_execution._apply_tool_result_guardrails`` reads this to gate a
+        # tool's raw output before it re-enters the LLM context. Always define it.
+        self._tool_result_guardrails = []
         if self.guardrail is None:
             self._guardrail_fn = None
             return
@@ -6719,6 +6790,17 @@ Answer:"""
             and not getattr(_fn, "_praison_output_only", False)
         ):
             self._tool_call_guardrails = [_fn]
+
+        # Register the tool-result surface the same way. Output-only (string/LLM)
+        # guardrails are excluded on purpose: running an LLM validation after
+        # every tool result would be a hot-path regression, mirroring the
+        # tool-call exclusion above.
+        if (
+            _fn is not None
+            and callable(getattr(_fn, "validate_tool_result", None))
+            and not getattr(_fn, "_praison_output_only", False)
+        ):
+            self._tool_result_guardrails = [_fn]
 
     def _process_handoffs(self):
         """Process handoffs and convert them to tools that can be used by the agent."""
