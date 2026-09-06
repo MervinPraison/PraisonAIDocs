@@ -7,14 +7,6 @@ icon: "list-check"
 
 Tasks define specific work for agents to complete with clear objectives.
 
-<Note>
-32 options on `Task.__init__` are accepted for Python-SDK parity but not yet acted on in the TypeScript SDK. If you pass one and see a `[praisonai] … not yet honoured` notice, see the [Parity Notices](/docs/features/typescript-parity-notices) page for the full list.
-</Note>
-
-<Info>
-The behaviour behind 28 of these options is now implemented in the SDK's Task engine and will become active once the team runner wires it in — see PR [#4838](https://github.com/MervinPraison/PraisonAI/pull/4838). Until then these options still emit the parity notice above.
-</Info>
-
 ```mermaid
 graph LR
     subgraph "Task Execution"
@@ -22,56 +14,204 @@ graph LR
         B --> C[🤖 Agent]
         C --> D[✅ Result]
     end
-    
-    
-    class A user
-    class B task
-    class C,D output
 
-    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef task fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef agent fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
 
     class A user
     class B task
     class C agent
     class D output
-    classDef agent fill:#8B0000,color:#fff
-    classDef tool fill:#189AB4,color:#fff
 ```
 
 ## Quick Start
 
 <Steps>
 
-<Step title="Simple Usage">
+<Step title="Run a task through a team">
 ```typescript
-import { Agent, Task } from 'praisonai';
+import { Agent, Team, Task } from 'praisonai';
 
-const agent = new Agent({
-  instructions: 'You research and summarize topics'
+const team = new Team({
+  agents: [new Agent({ instructions: 'You research and summarize topics' })],
+  tasks: [new Task({ name: 'research', description: 'Research AI trends in 2024' })]
 });
 
-const task = new Task({
-  description: 'Research AI trends in 2024',
-  agent: agent
-});
-
-const result = await task.execute();
-console.log(result.output);
+const results = await team.start();
+console.log(results[0]);
 ```
 </Step>
 
-<Step title="With Configuration">
+<Step title="With expected output">
 ```typescript
-const task = new Task({
-  description: 'Analyze sales data',
-  expectedOutput: 'A summary with top 3 insights',
-  agent: analyst
+const team = new Team({
+  agents: [analyst],
+  tasks: [new Task({
+    name: 'analyse',
+    description: 'Analyze sales data',
+    expectedOutput: 'A summary with top 3 insights'
+  })]
 });
+
+await team.start();
 ```
 </Step>
 
 </Steps>
+
+<Note>
+Only `autonomy`, `web`, `reflection`, and `planning` are still accepted for Python-SDK parity but **not yet implemented** in the TypeScript SDK. Passing one emits a `[praisonai] … not yet honoured` notice — see [Parity Notices](/docs/features/typescript-parity-notices). Every other Task option below is fully live through `team.start()`.
+</Note>
+
+---
+
+## How a Task Runs
+
+`team.start()` runs every task through the same pipeline, in this exact order.
+
+```mermaid
+graph TB
+    A[Rerun gate] --> B[Dependency check]
+    B --> C[Start hooks]
+    C --> D[Resolve agent]
+    D --> E{handler?}
+    E -->|yes| F[Run handler]
+    E -->|no| G[Assemble context]
+    G --> H[Memory + knowledge + images]
+    H --> I{Cache hit?}
+    I -->|hit| L[Complete]
+    I -->|miss| J[Run model with retries]
+    J --> K[Parse output + write memory]
+    K --> L
+    F --> L
+
+    classDef gate fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef run fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,B,C,D,E,I gate
+    class F,G,H,J,K run
+    class L done
+```
+
+| Step | What happens |
+|------|--------------|
+| Rerun gate | A re-queued completed task is skipped unless `rerun` (or `execution.rerun`) is set. |
+| Dependency check | If a `dependsOn` task failed, `skipOnFailure` marks this one degraded; otherwise it fails. |
+| Start hooks | Team `onTaskStart`, then the task's own `hooks.onTaskStart`. |
+| Resolve agent | With no agent but an `agentConfig`, one is built at run time named `<taskName>Agent`. |
+| `handler` | Runs **instead of the model** when provided. |
+| Context | `retainFullContext` carries every earlier result; the default carries only the latest. |
+| Memory + knowledge | Recalled and folded into the prompt. |
+| Images | Per-task `images` attach as multimodal `image_url` parts. |
+| Cache | A `caching` hit returns the stored answer and skips the retries. |
+| Retries | `retryDelay` backs off `min(delay * 2^attempt, 300)` seconds. |
+| Output | `outputPydantic` / `outputConfig.pydanticModel` parse the answer and strip ` ```json ` fences. |
+| Complete | Result stored to memory, then team and task `onTaskComplete` hooks. |
+
+---
+
+## Task Options
+
+Every option below changes what `team.start()` does.
+
+### Core
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `description` | `string` | — | What the task should accomplish. |
+| `expectedOutput` | `string` | `"Complete the task successfully"` | Desired format of the result. |
+| `agent` | `Agent` | `null` | Agent assigned to the task. |
+| `agentConfig` | `object` | `null` | Build an agent at run time when none is set. |
+| `dependsOn` / `context` | `Task[]` | `[]` | Tasks whose results feed this one. |
+| `handler` | `function` | `null` | Run a function instead of the model. |
+| `hooks` | `{ onTaskStart, onTaskComplete }` | `null` | Per-task lifecycle callbacks. |
+
+```typescript
+// handler runs instead of the model
+new Task({
+  name: 'compute',
+  description: 'add the numbers',
+  handler: () => 'computed without an LLM'
+});
+
+// agentConfig builds `researchAgent` at run time
+new Task({
+  name: 'research',
+  description: 'research whales',
+  agentConfig: { llm: 'gpt-4o-mini', instructions: 'be brief' }
+});
+```
+
+### Context, memory & knowledge
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `retainFullContext` | `boolean` | `false` | Carry every earlier result, not just the latest. |
+| `memory` | store | `null` | Recall into the prompt and write the answer back. |
+| `failOnMemoryError` | `boolean` | `false` | Re-throw memory failures instead of swallowing them. |
+| `config.memory_config` | `object` | `null` | Auto-create a per-task memory store. |
+| `knowledge` | `string \| string[] \| base` | `null` | Fold matching knowledge into the prompt. |
+| `images` | `string[]` | `[]` | Attach pictures as multimodal parts. |
+
+```typescript
+new Task({
+  name: 'summarise',
+  description: 'summarise whales',
+  memory,                 // recalled into the prompt, answer written back
+  retainFullContext: true,
+  knowledge: 'penguins cannot fly'
+});
+```
+
+### Output
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `outputPydantic` | schema | `null` | Parse the answer into a typed object. |
+| `outputConfig` | `{ pydanticModel }` | `null` | Same parsing through its own field. |
+
+```typescript
+new Task({
+  name: 'shape',
+  description: 'shape it',
+  outputPydantic: { type: 'object', properties: { title: { type: 'string' } } }
+});
+```
+
+### Execution & retries
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `asyncExecution` | `boolean` | `false` | Batch consecutive async tasks together. |
+| `caching` | `boolean` | `false` | Serve a repeated prompt from cache. |
+| `rerun` | `boolean` | `false` | Run again when the team reaches it a second time. |
+| `execution` | `{ rerun }` | `null` | Alternate switch for `rerun`. |
+| `retryDelay` | `number` | `0` | Seconds to back off between attempts (doubles each retry). |
+| `skipOnFailure` | `boolean` | `false` | Run even if a dependency failed. |
+
+```typescript
+new Task({ name: 'alpha', description: 'alpha', asyncExecution: true });
+new Task({ name: 'quote', description: 'quote the price', caching: true, rerun: true });
+```
+
+### Routing & loops
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `isStart` | `boolean` | `false` | Entry point of a workflow graph. |
+| `nextTasks` | `string[]` | `[]` | Tasks to run after this one. |
+| `taskType` | `string` | `"task"` | `'decision'` drives the routing table. |
+| `routing` / `condition` | `{ [decision]: string[] }` | `null` | Route by the decision the model returned. |
+| `when` | `string` | `null` | Condition gating `thenTask` / `elseTask`. |
+| `thenTask` / `elseTask` | `string` | `null` | Branch targets. |
+| `loopOver` | `string` | `null` | Variable name of an array to fan out over. |
+| `loopVar` | `string` | `"item"` | Placeholder each loop item binds to. |
+| `inputFile` | `string` | `null` | CSV file — one subtask per row. |
+
+Routing lives on [Routing](/docs/js/routing); loops live on [Loops](/docs/js/loops).
 
 ---
 
@@ -82,53 +222,13 @@ sequenceDiagram
     participant User
     participant Task
     participant Agent
-    
+
     User->>Task: Define task
     Task->>Agent: Assign work
     Agent->>Agent: Execute
     Agent-->>Task: Complete
     Task-->>User: Result
 ```
-
----
-
-## Configuration Levels
-
-```typescript
-// Level 1: String - Simple description
-const task = new Task({
-  description: 'Write a blog post about AI',
-  agent: writer
-});
-
-// Level 2: Dict - With options
-const task = new Task({
-  description: 'Write a blog post',
-  expectedOutput: '500 words, engaging tone',
-  agent: writer
-});
-
-// Level 3: Instance - Full control
-const task = new Task({
-  description: 'Write a blog post',
-  expectedOutput: '500 words',
-  agent: writer,
-  context: [researchTask],  // Use output from other tasks
-  callback: (result) => console.log('Done!')
-});
-```
-
----
-
-## Task Options
-
-| Option | Description |
-|--------|-------------|
-| `description` | What the task should accomplish |
-| `expectedOutput` | Format/structure of result |
-| `agent` | Agent assigned to the task |
-| `context` | Other tasks to use as input |
-| `async` | Run without blocking |
 
 ---
 
@@ -149,13 +249,17 @@ const task = new Task({
   <Accordion title="Be specific in descriptions">
     "Write 500-word blog post about AI benefits" beats "Write about AI".
   </Accordion>
-  
-  <Accordion title="Define expected output">
-    Telling the agent what format you want improves results.
+
+  <Accordion title="Use handler for deterministic steps">
+    A `handler` runs instead of the model — perfect for math, lookups, or calling your own code.
   </Accordion>
-  
-  <Accordion title="Use context for dependencies">
-    Chain tasks by passing earlier outputs as context.
+
+  <Accordion title="Chain tasks with dependsOn">
+    Pass earlier tasks so their output feeds the next one.
+  </Accordion>
+
+  <Accordion title="Reach for caching on repeated prompts">
+    `caching: true` skips the model entirely on a repeat.
   </Accordion>
 </AccordionGroup>
 
@@ -164,8 +268,14 @@ const task = new Task({
 ## Related
 
 <CardGroup cols={2}>
-  <Card title="Workflows" icon="diagram-project" href="/js/workflows">
-    Multi-step workflows
+  <Card title="Handlers" icon="bolt" href="/docs/features/task-handlers">
+    Run a function instead of the model
+  </Card>
+  <Card title="Routing" icon="route" href="/js/routing">
+    Branch between tasks
+  </Card>
+  <Card title="Loops" icon="repeat" href="/js/loops">
+    Fan out over lists and CSVs
   </Card>
   <Card title="Teams" icon="users" href="/js/teams">
     Multi-agent teams
