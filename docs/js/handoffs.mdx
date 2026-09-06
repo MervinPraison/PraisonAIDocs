@@ -7,10 +7,6 @@ icon: "hand"
 
 Agents can transfer conversations to other specialized agents when needed.
 
-<Note>
-8 options on `Handoff` are accepted for Python-SDK parity but not yet acted on in the TypeScript SDK. If you pass one and see a `[praisonai] … not yet honoured` notice, see the [Parity Notices](/docs/features/typescript-parity-notices) page for the full list.
-</Note>
-
 ```mermaid
 graph LR
     subgraph "Agent Handoff"
@@ -170,11 +166,173 @@ Define `role` and `goal` on handoff targets and the main agent routes more accur
 
 ## Safety Features
 
-Handoffs include built-in protections:
+Handoffs include built-in protections, all controllable per handoff:
 
-- **Cycle detection**: Prevents A → B → A loops
-- **Depth limits**: Maximum 10 handoffs in a chain
-- **Timeouts**: Handoffs timeout after 5 minutes
+- **Cycle detection**: Prevents A → B → A loops. Toggle via `detectCycles`; enabled by default. Raises `HandoffCycleError` before touching the target.
+- **Depth limits**: Maximum 10 handoffs in a chain by default; override with `maxDepth`. Raises `HandoffDepthError` before touching the target.
+- **Timeouts**: Handoffs time out after 5 minutes by default; override with `timeoutSeconds` (in seconds; `<= 0` disables). Raises `HandoffTimeoutError` (always retryable).
+- **Concurrency**: Each `Handoff` instance has its own concurrency semaphore (default 5); override with `maxConcurrent`. Not process-wide.
+
+The cycle check runs before the depth check, and both run before anything is pushed onto the chain — a rejected handoff never consumes a chain slot.
+
+---
+
+## Controlling context, safety, and concurrency
+
+`handoff()` accepts eight settings that steer what the target sees and how the transfer behaves. Add them one at a time.
+
+<Steps>
+
+<Step title="Steer what the target sees">
+Show the target only the last N messages instead of the summary default.
+
+```typescript
+import { Agent, handoff } from 'praisonai';
+
+const billing = new Agent({ name: 'Billing', instructions: 'Handle billing questions.' });
+
+const mainAgent = new Agent({
+  name: 'Assistant',
+  instructions: 'You are a helpful assistant',
+  handoffs: [
+    handoff({ agent: billing, contextPolicy: 'last_n', maxContextMessages: 10 })
+  ]
+});
+```
+</Step>
+
+<Step title="Cap tokens and keep the system prompt">
+Drop the oldest messages until the context fits a token budget, but never drop `system` messages.
+
+```typescript
+handoff({
+  agent: billing,
+  contextPolicy: 'last_n',
+  maxContextTokens: 4000,
+  preserveSystem: true,
+});
+```
+</Step>
+
+<Step title="Bound execution">
+Give the target a time limit and cap how many copies run at once.
+
+```typescript
+handoff({ agent: billing, timeoutSeconds: 30, maxConcurrent: 3 });
+```
+</Step>
+
+<Step title="Add safety guards">
+Refuse cycles and cap the chain depth.
+
+```typescript
+handoff({ agent: billing, detectCycles: true, maxDepth: 5 });
+```
+</Step>
+
+<Step title="Set everything at once">
+Combine all eight in one config object.
+
+```typescript
+handoff({
+  agent: billing,
+  contextPolicy: 'last_n',
+  maxContextMessages: 10,
+  maxContextTokens: 4000,
+  preserveSystem: true,
+  timeoutSeconds: 30,
+  maxConcurrent: 3,
+  detectCycles: true,
+  maxDepth: 5,
+});
+```
+</Step>
+
+</Steps>
+
+---
+
+## Which context policy should I pick?
+
+`contextPolicy` decides how much history the target sees.
+
+```mermaid
+graph TB
+    Start([What should the target see?]) --> Q1{Long conversation?}
+    Q1 -->|"No, first turn"| Full["contextPolicy: 'full'"]
+    Q1 -->|"Yes, tokens matter"| Q2{Semantic gist or raw tail?}
+    Q2 -->|"Semantic gist"| Summary["contextPolicy: 'summary'"]
+    Q2 -->|"Raw last N"| LastN["contextPolicy: 'last_n' + maxContextMessages"]
+    Q1 -->|"Target starts fresh"| None["contextPolicy: 'none'"]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
+    class Start start
+    class Q1,Q2 question
+    class Full,Summary,LastN,None answer
+```
+
+---
+
+## Inside a handoff
+
+`execute()` runs a safety check, selects the context, seeds it onto the target, runs the target, then restores the target's original history.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Source
+    participant Handoff
+    participant Target
+
+    User->>Source: Ask a question
+    Source->>Handoff: execute(context)
+    Handoff->>Handoff: checkSafety (detectCycles, maxDepth)
+    Handoff->>Handoff: selectHandoffMessages (contextPolicy, tokens, system)
+    Handoff->>Target: withSeededHistory(...)
+    Target-->>Handoff: response
+    Handoff->>Handoff: restore target's original history
+    Handoff-->>Source: HandoffResult (context.handoffChain updated)
+    Source-->>User: Answer
+```
+
+---
+
+## HandoffConfig reference
+
+Every option lives on the `HandoffConfig` object passed to `handoff()` (or `new Handoff({ agent, ... })`).
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `contextPolicy` | `'none' \| 'last_n' \| 'summary' \| 'full'` | `'summary'` | What the target sees. `none` = nothing; `last_n` = last `maxContextMessages`; `summary` = last 3 messages (hard-coded); `full` = everything. |
+| `maxContextMessages` | `number` | `10` | Slice size for `last_n` only. `<= 0` keeps everything. Ignored by other policies. |
+| `maxContextTokens` | `number` | `4000` | Token ceiling applied last; drops oldest first. `<= 0` disables. TypeScript honours this beyond Python, which declares but never reads the field. |
+| `preserveSystem` | `boolean` | `true` | Keep `system` messages regardless of slice or token budget. A system prompt larger than the budget is kept in full. |
+| `timeoutSeconds` | `number` | `300` | Bounds the target's turn. `<= 0` disables. Throws `HandoffTimeoutError` (always retryable). |
+| `maxConcurrent` | `number` | `5` | Per-instance semaphore. `<= 0` = unlimited. Not process-wide — two `Handoff` instances at 1 each run in parallel. |
+| `detectCycles` | `boolean` | `true` | Throws `HandoffCycleError` if the target is already in the handoff chain. |
+| `maxDepth` | `number` | `10` | Throws `HandoffDepthError` before the target is touched when the chain is already this deep. |
+
+<Note>
+Python's `HandoffConfig` declares `max_context_tokens` and serialises it, but no code path reads it. TypeScript implements the documented meaning, so `maxContextTokens` actually caps tokens here. If you port behavioural tests from Python, expect this one divergence.
+</Note>
+
+---
+
+## Chain threading
+
+The handoff chain tracks the agents already traversed to reach the current point. `HandoffContext` carries it on an optional field:
+
+```typescript
+handoffChain?: readonly string[];
+```
+
+Leave it unset and the chain in force for the current execution is used — what nested handoffs want. Set it to resume a chain that crossed a process boundary (a queued handoff, a rehydrated request) or to start one deliberately deep. `execute()` writes the extended chain back onto the result's context, so passing `result.context` onward threads it by hand.
+
+The handoff module exposes helpers for advanced flows: `currentHandoffChain()` reads the chain in scope (oldest first), `currentHandoffDepth()` its length, `runWithHandoffChain(chain, fn)` runs `fn` under a given chain, `selectHandoffMessages(messages, config)` is the standalone context selector, and `resetHandoffChain()` clears the module-level fallback used where `AsyncLocalStorage` is unavailable (Node 18, browsers).
+
+`parallelHandoffs` snapshots the current chain once and passes each sibling an explicit copy, so fan-out never reads the ambient value — each sibling gets an isolated chain, and cycle detection and `maxDepth` are enforced per task, not shared across siblings.
 
 ---
 
