@@ -37,8 +37,8 @@ praisonai code [OPTIONS] [PROMPT]
 | `--file` | `-f` | Attach file(s) to context | |
 | `--no-acp` | | Disable ACP tools (file operations) | `false` |
 | `--no-lsp` | | Disable LSP tools (code intelligence) | `false` |
-| `--safe` / `--no-safe` | | Safe mode: prompt before file writes and shell commands (default: **on**). Use `--no-safe` to disable. | `true` |
-| `--dangerously-skip-approval` | | Skip all tool approval prompts and export `PRAISONAI_TOOL_SAFETY=off` for the subprocess tree | `false` |
+| `--safe` / `--no-safe` | | Safe mode: prompt before file writes and shell commands (default: **on**). `--no-safe` disables it and registers `AutoApproveBackend` on the approval registry. Re-running in safe mode within the same process clears a bypass a prior `--no-safe` installed. | `true` |
+| `--dangerously-skip-approval` | | Skip all tool approval prompts. Registers `AutoApproveBackend` on the approval registry (so the core `@require_approval` gate is also bypassed) **and** exports `PRAISON_APPROVAL_MODE=auto` / `PRAISONAI_TOOL_SAFETY=off` for the subprocess tree. Strictly opt-in; mutually exclusive with `--plan`. See [Tool Approval](/cli/tool-approval). | `false` |
 | `--plan` | | Read-only planning mode — the agent may explore/read/search but every mutating tool is denied. Discoverable alias for the read-only planning permission mode. Cannot be combined with `--no-safe` or `--dangerously-skip-approval` (exits 1). | `false` |
 | `--session` | `-s` | Session ID to resume | |
 | `--resume` | | Resume a session by id in headless `-p` mode (alias of `--session` for scripted multi-turn). `--session` still wins when both are set. | |
@@ -49,12 +49,13 @@ praisonai code [OPTIONS] [PROMPT]
 | `--pure` / `--no-plugins` | | Skip discovery/loading of external plugins for this run only (equivalent to `PRAISONAI_NO_PLUGINS=1`); persisted enable/disable state is unchanged. | `false` |
 | `--agent` | `-a` | Named custom agent profile from `.praisonai/agents/` (tools + permission scope) | |
 | `--thinking` | | Reasoning effort for this invocation: `off`, `minimal`, `low`, `medium`, `high` | |
+| `--max-steps` | | Maximum tool-calling steps for this coding session. Raises **both** `ExecutionConfig.max_steps` and `ExecutionConfig.max_tool_calls_per_turn` (the two tool loops enforce different knobs). Env fallback: `PRAISONAI_CODE_MAX_STEPS`. See [Step budget for coding sessions](#step-budget-for-coding-sessions). | `200` |
 | `--append-system-prompt` | | Append text (literal or `@file`) to the system prompt for this invocation only. Env fallback: `PRAISONAI_APPEND_SYSTEM_PROMPT`. Never persisted. See [Append System Prompt](/features/append-system-prompt). | `None` |
 | `--checkpoints` / `--no-checkpoints` | | Auto-checkpoint the workspace before each file-mutating turn, enabling in-session `/undo` and `/revert`. **On by default** for interactive `praisonai code`; pass `--no-checkpoints` to disable it for this run. | `--checkpoints` |
 | `--revert <ref>` | | One-shot: restore workspace to a prior checkpoint (`id`, short id, or `last`) and exit | — |
 
 <Note>
-Safe mode (`--safe`) is **on by default** as of PR #2369. Dangerous built-in tools ask for approval in interactive sessions and are denied in non-interactive (CI) sessions. Use `--no-safe` to opt out, or `--dangerously-skip-approval` for a complete bypass. See [Approval](/features/approval) for full details.
+Safe mode (`--safe`) is **on by default** as of PR #2369. Dangerous built-in tools ask for approval in interactive sessions and are denied in non-interactive (CI) sessions. Use `--no-safe` to opt out, or `--dangerously-skip-approval` for a complete bypass — both register `AutoApproveBackend` on the approval registry so the core `@require_approval` gate is also bypassed. A safe-mode run *clears* a bypass a prior `--no-safe` call left in the same process (REPL/worker/test), removing only the backend it installed itself. See [Approval](/features/approval) for full details.
 </Note>
 
 <Tip>
@@ -91,6 +92,120 @@ cat data.json | praisonai code "Write a parser for this shape"
 ```
 
 Prompt argument is merged **first**, piped body second (joined with `\n`). See [Piped Input](/features/cli-piped-stdin).
+
+## Step budget for coding sessions
+
+`praisonai code` runs with a **coding-sized** step budget by default: **200 steps**, applied to both tool-execution loops.
+
+```mermaid
+graph LR
+    Flag["--max-steps N"] --> Env["PRAISONAI_CODE_MAX_STEPS"]
+    Env --> Def["DEFAULT_CODE_MAX_STEPS = 200"]
+    Def --> Budget["ExecutionConfig(max_steps=N,<br/>max_tool_calls_per_turn=N)"]
+
+    classDef flag fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef env fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef def fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef cfg fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Flag flag
+    class Env env
+    class Def def
+    class Budget cfg
+```
+
+The core `Agent` defaults (`max_steps=20`, `max_tool_calls_per_turn=10`) are tuned for a general-purpose Q&A agent with two or three tools, and are left untouched — no library user's behaviour changes. But 10 tool calls is "list files, read two files, one grep": it cannot reach a test run. The coding CLI raises the ceiling for its own sessions only.
+
+### Override
+
+<Steps>
+<Step title="Explicit flag">
+
+```bash
+praisonai code --max-steps 300 "Refactor the auth module across all files"
+```
+
+</Step>
+
+<Step title="Environment fallback (CI / sandbox)">
+
+```bash
+export PRAISONAI_CODE_MAX_STEPS=300
+praisonai code "Refactor the auth module across all files"
+```
+
+</Step>
+</Steps>
+
+**Precedence:** `--max-steps` flag > `PRAISONAI_CODE_MAX_STEPS` env > `DEFAULT_CODE_MAX_STEPS` (200). An unparseable or non-positive value falls through to the next source.
+
+The flag raises *both* budget knobs to the same value, because:
+
+| Model routing | Bounded by |
+|---|---|
+| OpenAI-native (`gpt-4o-mini`, the default) | `ExecutionConfig.max_steps` |
+| LiteLLM (`gemini/*`, `anthropic/*`, ollama, …) | `ExecutionConfig.max_steps` **and** `ExecutionConfig.max_tool_calls_per_turn` per turn |
+
+Raising only one leaves the other as the real (and invisible) ceiling.
+
+<AccordionGroup>
+<Accordion title="Why 200?">
+A coding agent's unit of work is *read → edit → run tests → read the failure* (≈4 calls per fix attempt), before any orientation. 200 steps is ~50 edit/verify cycles, chosen to cover the *tail* rather than the median: trajectories cluster at 20–40 steps, but hard tasks — the ones benchmarks measure — run past 100, and a budget at the median silently truncates those. Runaway loops stay bounded by the orthogonal guards (per-tool loop guard, `ExecutionConfig.max_execution_time`, `max_budget`, model context window).
+</Accordion>
+
+<Accordion title="What about max_tool_calls_per_turn?">
+The LiteLLM tool loop counts every tool call in a turn against `max_tool_calls_per_turn`, while the OpenAI-native loop is bounded by `max_steps`. `--max-steps` sets both to the same value so a Gemini/Anthropic-routed session isn't capped at 10 calls while an OpenAI-routed one runs to your budget.
+</Accordion>
+
+<Accordion title="Does this change the SDK defaults?">
+No. The coding budget applies only to `praisonai code`. The Python `Agent` defaults (`max_steps=20`, `max_tool_calls_per_turn=10`) are unchanged.
+</Accordion>
+</AccordionGroup>
+
+See [Step Budget](/features/max-steps#praisonai-code-defaults) for the general `ExecutionConfig.max_steps` contract and how to detect truncation with `agent.last_stop_reason`.
+
+## Headless truncation contract (`code -p`)
+
+A budget-exhausted headless run exits **`2`** with `status: "truncated"` — distinct from a hard failure (`1`) and a clean completion (`0`).
+
+```mermaid
+graph LR
+    Req[📝 code -p task] --> Loop[🔧 LLM tool loop]
+    Loop --> Ex[⚠️ Budget exhausted]
+    Ex --> Wrap[📝 Wrap-up summary]
+    Wrap --> Out[⛔ exit 2<br/>status: truncated]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef out fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Req input
+    class Loop proc
+    class Ex,Wrap warn
+    class Out out
+```
+
+This matches [`praisonai run` → truncation](/cli/run#exit-codes) and closes a hazard where a wrap-up summary (a perfectly non-empty string) was classified as `status: "ok"`, exit `0`, silently reporting truncation as success to CI and benchmark adapters.
+
+```bash
+praisonai code -p --output json --max-steps 6 \
+  "Run pytest and fix every failing test until 0 failures"
+
+# → exit 2
+# → {"result": "Tool call limit reached (…). Task may be too complex …",
+#    "session_id": null, "usage": {…}, "status": "truncated"}
+```
+
+Under `--output text`, a stderr warning follows the printed result:
+
+```
+Warning: run hit the step/tool-call budget; the output above is a summary of partial progress, not a completed task. Re-run with a higher --max-steps.
+```
+
+JSON / stream-JSON consumers do **not** see this stderr line — the `status: "truncated"` field is the machine signal.
+
+The shared truncation check (`run._run_was_truncated`) resolves through `agent.last_stop_reason == "max_steps"`, so `code -p` and `praisonai run` agree on the `0` / `1` / `2` exit-code contract.
 
 ## First-run credential gate
 
@@ -177,7 +292,7 @@ graph LR
 | `usage.in` | Input tokens for this run. |
 | `usage.out` | Output tokens for this run. |
 | `usage.cost` | Estimated cost from the token collector + pricing table. |
-| `status` | `ok` on success, `failed` on an empty result, `error` when the agent raised. |
+| `status` | `ok` on success, `truncated` when the step/tool budget was exhausted (exit `2`), `failed` on an empty result, `error` when the agent raised. |
 | `error` | Present only when `status` is `error` — the exception message. |
 
 ### Text mode
@@ -198,8 +313,11 @@ The exit code lets CI, benchmarks, and shell scripts branch on success without p
 | `status` | When | Exit code |
 |----------|------|-----------|
 | `ok` | Non-empty result | `0` |
+| `truncated` | Step/tool budget exhausted (`last_stop_reason == "max_steps"`) | `2` |
 | `failed` | Empty / `None` result | `1` |
 | `error` | The agent raised an exception | `1` |
+
+See [Headless truncation contract (`code -p`)](#headless-truncation-contract-code-p) for the `truncated` case.
 
 ```bash
 if praisonai code -p "Generate the release notes" --output text > notes.md; then
@@ -578,3 +696,4 @@ See [Checkpoints](/features/checkpoints) for the full checkpoint feature referen
 - [LSP Code Intelligence](/cli/lsp-code-intelligence) - Language server integration
 - [Approval](/features/approval) - Tool approval and safety defaults
 - [Checkpoints](/features/checkpoints) - Workspace checkpointing and undo
+- [Step Budget](/features/max-steps#praisonai-code-defaults) - The `max_steps` contract and the coding-sized default
