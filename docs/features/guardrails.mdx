@@ -339,6 +339,88 @@ sequenceDiagram
 
 Guardrails work identically in sync (`.start()`, `.chat()`) and async (`.astart()`, `.achat()`) execution paths.
 
+---
+
+## Retry preserves the conversation
+
+When a guardrail rejects an answer, the retry now continues the **same conversation** instead of restarting it with one fresh message.
+
+```mermaid
+graph LR
+    Rej[❌ Rejected answer] --> Append[➕ Appended to history<br/>as the assistant turn]
+    Append --> Fb[💬 User turn:<br/>validation reason]
+    Fb --> Recall[🔁 LLM re-call with FULL history<br/>system prompt · tools · prior turns<br/>· rejected answer · feedback]
+    Recall --> New[🆕 New answer re-validated]
+
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Rej bad
+    class Append,Fb,Recall step
+    class New ok
+```
+
+Bounded by the `max_guardrail_retries` that already existed — no new setting. After retries exhaust, the reason is left on `agent.last_guardrail_error` and `chat()` returns `None`.
+
+```python
+from praisonaiagents import Agent
+
+def must_be_json(output):
+    import json
+    try:
+        json.loads(output.raw)
+        return True, output
+    except json.JSONDecodeError as e:
+        return False, f"Not valid JSON: {e}"
+
+agent = Agent(
+    name="DataBot",
+    instructions="Always answer with a JSON object.",
+    guardrails=must_be_json,
+    max_guardrail_retries=3,
+)
+
+result = agent.chat("Give me the config")
+if result is None:
+    # Retries exhausted — read why the last attempt was rejected
+    print(agent.last_guardrail_error)   # e.g. "Not valid JSON: Expecting value…"
+```
+
+<Warning>
+**Behaviour before PraisonAI [#4929](https://github.com/MervinPraison/PraisonAI/pull/4929).** The retry already ran, but it built **one** fresh user message — `prompt + "Note: Previous response failed validation due to: …"` — and sent that alone. The system prompt, retrieved context, tool results, and the rejected answer never reached the retry, so the model was asked to fix an answer it could no longer see. The fix appends the rejected assistant turn plus the reason as a user turn and re-calls with full history. **No config change** — retries simply continue the conversation now. The test invariant `second[:len(first)] == first` proves the conversation is *continued*, not restarted.
+</Warning>
+
+### Reading the rejection reason
+
+`agent.last_guardrail_error` (`Optional[str]`) holds the reason from the final rejected attempt after retries exhaust. `chat()` still returns `None` on exhaustion; read `last_guardrail_error` to find out why.
+
+```python
+answer = agent.chat("…")
+if answer is None and agent.last_guardrail_error:
+    log.warning("Guardrail exhausted: %s", agent.last_guardrail_error)
+```
+
+### Sync agents no longer stream during retry
+
+Before #4929, the retry hard-coded `stream=True` regardless of the agent's configuration, so a sync agent logged an ERROR and fell back on **every** retry. That is fixed — a sync agent retries on the sync path, no code change required.
+
+<Note>
+When you compose guardrails with a `GuardrailChain`, a rejection now surfaces the underlying guardrail's reason directly, instead of burying it under a `"Guardrail error: …"` prefix — so `last_guardrail_error` and the retry feedback carry the message your validator returned.
+</Note>
+
+---
+
+## Guarding a single tool
+
+`Agent(guardrails=…)` fires for **every** tool call. To validate, rewrite, or block **one** tool's arguments or result, declare `input_guardrails=` / `output_guardrails=` on the tool itself — built on the same `GuardrailResult` / `GuardrailChain` machinery.
+
+<Card title="Per-Tool Guardrails" icon="shield-halved" href="/features/per-tool-guardrails">
+  Guard one tool's arguments and results without hand-wrapping the function
+</Card>
+
+---
+
 <Note>
 **Since [MervinPraison/PraisonAI#4469](https://github.com/MervinPraison/PraisonAI/pull/4469)**, string / `LLMGuardrail` output guardrails and multi-agent task guardrails on the async path (`.astart()`, `.achat()`, `arun_task`) offload the blocking validator LLM call to a worker thread via `loop.run_in_executor(...)`. Concurrent tasks under `asyncio.gather(...)` no longer stall on one task's guardrail validation. Contextvars (trace emission, session context) are preserved across the offload via `copy_context_to_callable`, so custom guardrails see the same contextual state as on the sync path.
 </Note>
