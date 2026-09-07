@@ -11,6 +11,10 @@ Execute multiple steps concurrently and combine their results. This pattern is i
 Steps inside this pattern inherit the same `max_retries`, `guardrails`, and `output_file` policies as top-level steps. See [Nested workflows → Retry, guardrails, and `output_file`](/docs/features/nested-workflows#retry-guardrails-and-output_file-inside-nested-steps).
 </Note>
 
+<Note>
+As of PraisonAI [#4932](https://github.com/MervinPraison/PraisonAI/pull/4932), an `output_variable` set inside a branch is preserved after the parallel block. Earlier releases silently discarded it.
+</Note>
+
 ```python
 from praisonaiagents import Agent, AgentFlow, parallel, WorkflowContext, StepResult
 
@@ -135,6 +139,99 @@ def aggregator(ctx: WorkflowContext) -> StepResult:
 **Index alignment under `partial_ok`.** A failed branch contributes `None` at the same index as its step, so `parallel_outputs[i]` is always the result of `parallel_step.steps[i]`. As of PraisonAI [#4203](https://github.com/MervinPraison/PraisonAI/pull/4203), a downstream reader of `parallel_outputs[i]` can no longer silently receive a later branch's result once an earlier branch fails.
 </Note>
 
+## Named outputs from branches
+
+Every step inside `parallel([...])` may set `output_variable`. As of PraisonAI [#4932](https://github.com/MervinPraison/PraisonAI/pull/4932), that write is visible to any step **after** the parallel block, keyed by that exact name — not just as a positional entry in `parallel_outputs`.
+
+```python
+from praisonaiagents import AgentFlow, Task, WorkflowContext, StepResult, parallel
+
+def branch_a(ctx: WorkflowContext) -> StepResult:
+    return StepResult(output="A")
+
+def branch_b(ctx: WorkflowContext) -> StepResult:
+    return StepResult(output="B")
+
+def after(ctx: WorkflowContext) -> StepResult:
+    a = ctx.variables["branch_a_output"]
+    b = ctx.variables["branch_b_output"]
+    return StepResult(output=f"{a} + {b}")
+
+workflow = AgentFlow(steps=[
+    parallel([
+        Task(name="branch_a", handler=branch_a, output_variable="branch_a_output"),
+        Task(name="branch_b", handler=branch_b, output_variable="branch_b_output"),
+    ]),
+    Task(name="after", handler=after),
+])
+result = workflow.start("go")
+print(result["variables"]["branch_a_output"])  # "A"
+print(result["variables"]["branch_b_output"])  # "B"
+```
+
+The branch's own `output_variable` is stored under that exact name; the ordered `parallel_outputs` list is still there for aggregators that want positional access.
+
+Each branch runs against its own deep copy of the variables, so branches never race on one shared dict. After the block, only the keys a branch actually wrote merge back into the shared scope — untouched variables keep the parent's own object.
+
+```mermaid
+graph TB
+    P[parallel block] --> BA[branch_a scope]
+    P --> BB[branch_b scope]
+    BA -->|delta: branch_a_output| M[Merge in declaration order]
+    BB -->|delta: branch_b_output| M
+    M --> S[Shared scope updated]
+
+    classDef branch fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef merge fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef scope fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class P,BA,BB branch
+    class M merge
+    class S scope
+```
+
+### Two branches wrote the same variable
+
+When two branches write the same `output_variable`, **declaration order wins** — the later branch overwrites the earlier, matching what running the same steps sequentially would produce. The result never depends on which thread finishes first.
+
+```python
+workflow = AgentFlow(steps=[
+    parallel([
+        Task(name="first",  handler=lambda ctx: StepResult(output="FROM-FIRST"),
+             output_variable="shared"),
+        Task(name="second", handler=lambda ctx: StepResult(output="FROM-SECOND"),
+             output_variable="shared"),
+    ]),
+])
+result = workflow.start("go")
+print(result["variables"]["shared"])  # "FROM-SECOND"
+# WARNING logged: Parallel branches 0 and 1 both wrote variable 'shared'...
+```
+
+A `WARNING` names the key and both branches. Silent last-writer-wins was the exact bug [#4932](https://github.com/MervinPraison/PraisonAI/pull/4932) removes, so a collision is reported rather than hidden.
+
+<Tip>
+If two branches want to write the same concept, give them distinct `output_variable` names (`branch_a_score`, `branch_b_score`) and combine them in the aggregator.
+</Tip>
+
+```mermaid
+graph TB
+    B0["branch 0 writes 'shared'"] --> M[Merge in declaration order]
+    B1["branch 1 writes 'shared'"] --> M
+    M --> W["⚠️ Collision warning: branch 1 wins"]
+    W --> S["shared = branch 1's value"]
+
+    classDef branch fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef merge fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef scope fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class B0,B1 branch
+    class M merge
+    class W warn
+    class S scope
+```
+
 ## Examples
 
 ### With Agents
@@ -232,8 +329,8 @@ sequenceDiagram
 |---|---|
 | 1. Fan-out | `parallel()` submits each step to a thread pool simultaneously |
 | 2. Execute | Steps run concurrently; each receives the same workflow context |
-| 3. Collect | All results gather into `ctx.variables["parallel_outputs"]` in completion order |
-| 4. Continue | Next workflow step (aggregator) receives the merged outputs |
+| 3. Collect | Results gather into `ctx.variables["parallel_outputs"]`, index-aligned with the branches; named `output_variable` writes merge back in declaration order |
+| 4. Continue | Next workflow step (aggregator) receives the merged outputs and named variables |
 
 ---
 
@@ -251,6 +348,9 @@ sequenceDiagram
   </Accordion>
   <Accordion title="Keep branch outputs small">
     Large parallel results inflate context — summarise before merging downstream.
+  </Accordion>
+  <Accordion title="Give sibling branches distinct output_variable names">
+    Two branches writing the same `output_variable` collide — the later-declared branch silently overwrites the earlier one (with a warning). That class of silent loss is exactly what [#4932](https://github.com/MervinPraison/PraisonAI/pull/4932) fixes; distinct names (`branch_a_score`, `branch_b_score`) avoid it entirely.
   </Accordion>
 </AccordionGroup>
 
@@ -277,9 +377,13 @@ graph TB
 
 | Strategy | Behavior | Use Case |
 |----------|----------|----------|
-| `partial_ok` | Continue with partial results. Failed branches return `"Error: <msg>"` | Data aggregation where some sources may be unavailable |
+| `partial_ok` | Continue with partial results. Failed branches contribute `None` at the same index in `parallel_outputs`, index-aligned with the step. | Data aggregation where some sources may be unavailable |
 | `fail_fast` | Cancel remaining branches and raise `WorkflowStepError` on first failure | Critical workflows where any failure invalidates results |
 | `fail_all` | Wait for all branches, then raise `WorkflowStepError` if any failed | Comprehensive error reporting and debugging |
+
+<Note>
+**Variable merging on failure.** Under `partial_ok`, the variables a failed branch had already written before it failed are preserved — its own `output_variable` is never set (the failure path returns before that write), so a downstream reader cannot pick up a value the failure invented. Under `fail_fast` / `fail_all`, **nothing from any branch is merged**: the block raises before the merge runs. See [Named outputs from branches](#named-outputs-from-branches).
+</Note>
 
 ### Examples
 
@@ -310,15 +414,15 @@ workflow = AgentFlow(steps=[
 ```python
 def aggregator(ctx: WorkflowContext) -> StepResult:
     outputs = ctx.variables["parallel_outputs"]
-    
-    # Filter successful results
-    successful = [o for o in outputs if not o.startswith("Error:")]
-    errors = [o for o in outputs if o.startswith("Error:")]
-    
+
+    # A failed branch contributes None at its index
+    successful = [o for o in outputs if o is not None]
+    failures = [o for o in outputs if o is None]
+
     if len(successful) >= 2:  # Minimum threshold
         return StepResult(output=f"Processed {len(successful)} sources")
     else:
-        return StepResult(output=f"Insufficient data: {len(errors)} failures")
+        return StepResult(output=f"Insufficient data: {len(failures)} failures")
 ```
 
 ### Stop propagation from nested steps
