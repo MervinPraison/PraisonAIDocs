@@ -317,13 +317,19 @@ graph LR
 
 ### Exported Types
 
-Import these types for the streaming surface:
+Import these types for the streaming, chat, and execute surfaces:
 
 ```typescript
-import type { AgentEvent, AgentStreamOptions } from 'praisonai';
+import type {
+  AgentEvent,
+  AgentStreamOptions,
+  AgentChatCallOptions,  // new — chat() with errorsAsNull
+  AgentExecuteTask,      // new — execute() first-argument union
+  AgentTaskLike,         // new — duck-type: { description?: string, ... }
+} from 'praisonai';
 ```
 
-`AgentEvent` is the discriminated union yielded by `streamEvents()`; `AgentStreamOptions` is the optional second argument to `stream()` / `streamEvents()`. See [Streaming](/js/streaming) for both reference tables.
+`AgentEvent` is the discriminated union yielded by `streamEvents()`; `AgentStreamOptions` is the optional second argument to `stream()` / `streamEvents()`. See [Streaming](/js/streaming) for both reference tables. `AgentChatCallOptions` extends `AgentChatOptions` with `errorsAsNull`; `AgentExecuteTask` is `string | AgentTaskLike | Task`, the first argument to `execute()`.
 
 ### Behaviour notes (v1.7.4)
 
@@ -450,6 +456,34 @@ const controller = new AbortController();
 await agent.chat("Write an essay", undefined, controller.signal);
 ```
 
+#### Return `null` on error (`errorsAsNull`)
+
+By default `chat()` rejects on any error. Pass `{ errorsAsNull: true }` for Python's contract — the promise resolves with `null` instead. The return type widens to `Promise<string | null>` only on this call.
+
+```typescript
+const result: string | null = await agent.chat(
+  "Hello!",
+  undefined,
+  undefined,
+  { errorsAsNull: true },
+);
+
+if (result === null) {
+  // the turn failed; the error was still logged via Logger.error
+}
+```
+
+Still fatal, even with `errorsAsNull: true` (Python re-raises these too):
+
+| Error | Why |
+|---|---|
+| `AbortError` / aborted signal | An aborted turn is not an empty answer |
+| `InterruptedError` | Same |
+| `ToolExecutionError` | A tool failed — the caller must handle it |
+| `BudgetExceededError` | A budget stop is not a model outcome |
+
+Only `chat()` honours `errorsAsNull`. `start()` and `stream()` accept `AgentChatOptions` and ignore it — see the [Parity Notices](/docs/features/typescript-parity-notices) ledger for why an accepted-but-ignored option is the defect this package tracks.
+
 ### start(prompt?: string)
 
 Run the agent. The prompt is **optional** — omit it and the agent falls back to its `instructions` (or `"Hello"` when `instructions` is not set).
@@ -467,13 +501,88 @@ Pass a prompt to override that fallback:
 const response = await agent.start("Begin the task");
 ```
 
-### execute()
+### execute(task?, context?)
 
-Execute without a new prompt (uses existing context):
+Run a task on this agent. Matches Python's `Agent.execute(task, context=None)`.
 
 ```typescript
-const response = await agent.execute();
+import { Agent } from 'praisonai';
+
+const agent = new Agent({ instructions: "You are a research assistant" });
+
+// A string runs as the task
+await agent.execute("Summarise the Q3 revenue report.");
+
+// A task-like object is read through `description`
+await agent.execute({ description: "Write the release notes." });
+
+// A real Task instance also works
+import { Task } from 'praisonai';
+const task = new Task({ name: "research", description: "…", expected_output: "…" });
+await agent.execute(task);
+
+// Chain prior output — substituted for {{previous}} in the prompt
+await agent.execute("Improve this draft: {{previous}}", "the rough draft");
+
+// An array of dependency results is joined with blank lines
+await agent.execute("Merge: {{previous}}", ["result A", "result B"]);
+
+// No task → runs the agent's own instructions (unchanged)
+await agent.execute();
 ```
+
+The prompt is resolved in four branches:
+
+```mermaid
+graph TB
+    Start([execute task, context]) --> Q1{task given?}
+    Q1 -->|no| Instr[Run instructions]
+    Q1 -->|yes| Q2{typeof task}
+    Q2 -->|string| Str[Run the string]
+    Q2 -->|object| Q3{task.description<br/>is a string?}
+    Q3 -->|yes| Desc[Run task.description]
+    Q3 -->|no| Cast[Run String task]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class Q1,Q2,Q3 decision
+    class Instr,Str,Desc,Cast result
+```
+
+**Resolution order** for the prompt:
+
+1. `execute()` with no argument → runs `instructions`
+2. `execute(str)` → runs `str` as the task
+3. `execute(task)` with a string `task.description` → runs `task.description`
+4. `execute(other)` → runs `String(other)`
+
+The optional second argument, `context`, is prior output substituted for `{{previous}}` in the resolved prompt. An array is joined with blank lines (fan-in of dependency results). `execute()` routes through `chat()`, so the turn is recorded in history and in `getResult()`.
+
+<Warning>
+**Breaking change (v2).** Before this release, `execute(str)` treated the string as `previousResult` (substituted for `{{previous}}` in the instructions) and **silently discarded** it if the instructions had no placeholder. To reproduce the old chaining call, write:
+
+```typescript
+await agent.execute(undefined, previousResult);
+```
+</Warning>
+
+### getResult(): string | null
+
+The text this agent produced on its most recent completed turn. `null` until the agent has run at least once.
+
+```typescript
+const agent = new Agent({ instructions: "You are helpful" });
+
+agent.getResult(); // null
+
+await agent.chat("Hello!");
+agent.getResult(); // "Hi, how can I help?"
+```
+
+Recording covers every entry point — `start()`, `chat()`, `execute()`, `stream()`, `streamEvents()`, and cache hits on `chat()`. A turn that throws or is cancelled leaves the previous value in place: the field records the last result there **was**, not the last attempt.
 
 ## History (save & restore a chat)
 
@@ -711,6 +820,7 @@ const a15 = new Agent({ instructions: 'Run code', sandbox: true });
 | `taskDescription` | `string` | As `taskName`. |
 | `taskId` | `string` | As `taskName`. |
 | `config` | `Record<string, unknown>` | Forwarded verbatim to a managed backend's `execute()`. |
+| `errorsAsNull` | `boolean` | `chat()` only. Resolve with `null` instead of rejecting. Cancellation, `ToolExecutionError`, and `BudgetExceededError` still reject. Widens the return to `Promise<string \| null>`. |
 
 ```typescript
 import { Agent } from 'praisonai';
