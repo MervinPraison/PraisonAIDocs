@@ -4,6 +4,8 @@
 
 This report compares **TypeScript/JavaScript SDK feature categories** against **TypeScript/JavaScript documentation** (docs/js/).
 
+> **Method-level parity** (which Python methods have a TypeScript counterpart) is tracked separately in the SDK: [`inventory-baseline.json`](https://github.com/MervinPraison/PraisonAI/blob/main/src/praisonai/praisonai/_dev/parity/signatures/inventory-baseline.json). This `DOCS_PARITY.md` answers *"does a doc page exist per category?"* — not whether every method exists. The **Tasks** row is `✅ Documented`; note that `import { Task } from 'praisonai'` is the workflow-step class — see [Tasks](/js/tasks) and the [Parity Notices](/js/typescript) table for the `Task` / `LLM` / `FunctionTool` export nuances.
+
 ## Summary
 
 | Metric | Count |
