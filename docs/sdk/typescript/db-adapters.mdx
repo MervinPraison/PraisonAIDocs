@@ -12,14 +12,76 @@ Database adapters provide persistence for conversations, sessions, and agent sta
 
 | Adapter | Description |
 |---------|-------------|
-| `SQLiteAdapter` | SQLite database |
-| `UpstashRedisAdapter` | Upstash Redis |
+| `SqliteDbAdapter` | Durable SQLite session store — full `DbAdapter` contract |
+| `MemoryDbAdapter` | In-process Maps — ephemeral session store |
+| `SQLiteAdapter` | Legacy low-level SQLite transport (degrades to a `Map`) |
+| `UpstashRedisAdapter` | Upstash Redis key/value transport |
 | `MemoryRedisAdapter` | In-memory Redis-compatible |
-| `NeonPostgresAdapter` | Neon PostgreSQL |
+| `NeonPostgresAdapter` | Neon PostgreSQL key/value transport |
 | `MemoryPostgresAdapter` | In-memory PostgreSQL-compatible |
 | `PostgresSessionStorage` | PostgreSQL session storage |
 
-## SQLite
+## SqliteDbAdapter
+
+`SqliteDbAdapter` implements the full `DbAdapter` contract (sessions, messages, runs, tool calls, traces, spans) on a real SQLite file, so a session written by one process is readable by the next. It is what `db("sqlite:./data.db")` returns.
+
+```typescript
+import { db } from 'praisonai';
+
+// Recommended URL-style entry point
+const adapter = db('sqlite:./data.db');
+
+await adapter.saveMessage({
+  sessionId: 'session-123',
+  role: 'user',
+  content: 'Hello',
+});
+
+// Last 50 messages for the session, chronological order
+const messages = await adapter.getMessages('session-123', 50);
+```
+
+`createSqliteDbAdapter({ filename })` (or `new SqliteDbAdapter({ filename })`) remains available for direct construction:
+
+```typescript
+import { createSqliteDbAdapter } from 'praisonai';
+
+const adapter = createSqliteDbAdapter({ filename: './data.db' });
+```
+
+### Driver probe order
+
+Two drivers back the adapter, tried in order. Opening the file is part of loading — `better-sqlite3`'s ABI failure only surfaces at `new Database(...)`, so a driver is "loaded" only once a connection actually opens.
+
+1. **`better-sqlite3`** — the declared dependency. A native module compiled against one Node ABI; run under a mismatched Node major it throws `ERR_DLOPEN_FAILED`.
+2. **`node:sqlite`** — Node's built-in SQLite (Node ≥ 22.5). No native build, same on-disk format, so a file written by either driver reads in the other.
+
+Pin the choice with `PRAISONAI_SQLITE_DRIVER=better-sqlite3|node` or the `driver` constructor option.
+
+### No memory fallback
+
+If neither driver can open the file, **every operation rejects** with a message naming what each driver did and how to fix it. It never degrades to an in-process `Map` — a persistence layer that quietly stops persisting is the bug this adapter exists to fix.
+
+<Info>
+Set `PRAISONAI_REQUIRE_SQLITE=1` in CI to turn a driver-unavailable skip into a hard failure, so a pipeline cannot silently pass without real persistence.
+</Info>
+
+### Incompatible-schema diagnostic
+
+On open, the adapter verifies each required table's columns. A file written with an incompatible table shape (for example, one created by the legacy `SQLiteAdapter` below) is diagnosed immediately rather than deferring the failure into the first `INSERT`:
+
+```text
+SQLite file "./data.db" already has a "messages" table with an incompatible
+shape (missing: run_id, tool_call_id). It was most likely written by the
+low-level SQLiteAdapter in "praisonai/db/sqlite", whose tables differ.
+Point db("sqlite:...") at a different file, or migrate that one.
+```
+
+<Warning>
+`SqliteDbAdapter` is **not** the legacy `SQLiteAdapter` in `praisonai/db/sqlite`. That low-level transport has narrower tables and silently degrades to an in-process `Map` when its native binding will not load. `SqliteDbAdapter` never does that.
+</Warning>
+
+## SQLite (legacy low-level adapter)
 
 ```typescript
 import { createSQLiteAdapter } from 'praisonai';
