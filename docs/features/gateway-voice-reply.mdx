@@ -192,6 +192,7 @@ Fields from `TtsConfig` / `TtsConfigSchema`.
 | `speed` | `Optional[float]` | `None` | Speaking-rate multiplier (`0.25`–`4.0`). Provider default when `None`. |
 | `format` | `str` | `"ogg"` | Output audio format. `"ogg"` / `"opus"` are the voice-note native formats. |
 | `max_chars` | `int` | `4000` | Skip TTS for replies longer than this. `0` disables the cap. |
+| `stream` | `bool` | `False` | Opt-in sentence-level streaming. When `True`, the reply is split into sentences and each is synthesised & delivered as it becomes available — time-to-first-audio drops from full-response latency to first-sentence latency. Falls back to a single whole-clip synth when off (default), when the reply is a single sentence, or when the reply is over `max_chars`. |
 
 ### Bool shorthand
 
@@ -243,6 +244,100 @@ graph TB
 
 ---
 
+## Sentence-Level Streaming
+
+Streaming TTS synthesises and delivers your reply sentence-by-sentence, so the user hears the first clause while the rest is still being spoken.
+
+With `stream: false` (default) the whole reply is synthesised into one clip before anything plays — the user waits for full-response latency. With `stream: true` time-to-first-audio drops to first-sentence latency.
+
+<CodeGroup>
+```yaml YAML
+channels:
+  telegram:
+    platform: telegram
+    token: ${TELEGRAM_BOT_TOKEN}
+    voice:
+      mode: match_inbound
+      stream: true      # NEW: synthesise & deliver sentence-by-sentence
+```
+
+```python Python
+from praisonai_bot.bots._config_schema import (
+    ChannelConfigSchema,
+    TtsConfigSchema,
+)
+
+channel = ChannelConfigSchema(
+    platform="telegram",
+    token="${TELEGRAM_BOT_TOKEN}",
+    voice=TtsConfigSchema(
+        enabled=True,
+        mode="match_inbound",
+        stream=True,
+    ),
+)
+```
+</CodeGroup>
+
+### When streaming kicks in
+
+Streaming is used only when all three preconditions hold — otherwise the whole-file path runs.
+
+- `stream: true` is set.
+- The full reply is under `max_chars` (the cap is checked against the whole reply before the per-sentence loop, so long replies can't sneak through as many under-cap clauses).
+- The reply splits into more than one sentence. A single-sentence reply falls through to the whole-file path — streaming buys nothing there.
+
+```mermaid
+sequenceDiagram
+    participant User as 🎤 User
+    participant Adapter as 📱 Adapter
+    participant Agent as 🧠 Agent
+    participant TTS as 🔊 TTS
+
+    User->>Adapter: Voice / text message
+    Adapter->>Agent: chat(text)
+    Agent-->>Adapter: 💬 Plain-text reply
+    Adapter-->>User: 💬 Text reply (always first)
+    loop for each sentence
+        Adapter->>TTS: synthesize(sentence)
+        alt success
+            TTS-->>Adapter: 🎧 clip
+            Adapter-->>User: 🎧 Voice clip
+        else fail, nothing played
+            TTS-->>Adapter: None → fall back to whole-file
+        else fail, audio already playing
+            TTS-->>Adapter: None → skip this clause, continue
+        end
+    end
+```
+
+### Failure semantics
+
+Failures are audible-output-aware, so the user never hears a reply restart.
+
+- Nothing played yet + the first clip fails → falls back to whole-file synth on the full text.
+- Some audio already played + a clause fails → skip that clause and continue; **never** replays from the beginning.
+
+### When to enable
+
+Flip `stream: true` when replies are usually multi-sentence and users are waiting for audio.
+
+```mermaid
+graph TB
+    Q{Reply is likely long<br/>and voice matters?} -->|no| Off[stream: false<br/>whole-clip synth]
+    Q -->|yes| Chatty{Want the user to hear<br/>the first sentence ASAP?}
+    Chatty -->|yes| Stream[stream: true]
+    Chatty -->|no| Off
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q,Chatty question
+    class Off,Stream opt
+```
+
+---
+
 ## Per-Platform YAML
 
 Telegram is wired today; other adapters share the same `_tts` helper and can adopt it without further core changes.
@@ -257,6 +352,7 @@ channels:
     voice:
       mode: match_inbound      # bot speaks back when they do
       voice: nova
+      stream: true             # sentence-level delivery (opt-in)
 ```
 
 ```yaml Slack (adapter adoption pending)
@@ -294,7 +390,7 @@ channels:
 
 | Platform | Voice reply status | Notes |
 |----------|--------------------|-------|
-| Telegram | ✅ Wired | Reference consumer — delivers via `send_voice`. Streaming and non-streaming reply paths both honour the policy. |
+| Telegram | ✅ Wired | Reference consumer — delivers via `send_voice`. Optional sentence-level streaming (`stream: true`) delivers a clip per sentence. |
 | Slack | 🔜 Adapter can adopt | Same shared `_tts` helper; adapter update needed. |
 | WhatsApp | 🔜 Adapter can adopt | Same shared `_tts` helper; adapter update needed. |
 | Discord | 🔜 Adapter can adopt | Same shared `_tts` helper; adapter update needed. |
@@ -312,6 +408,7 @@ A voice-in / voice-out conversation on Telegram with `mode: match_inbound`.
 3. The gateway sees `voice.mode: match_inbound` and that the inbound was a voice memo → synthesises the reply with `openai/tts-1`.
 4. The user receives **both**: the text reply and a native voice note they can play right in the chat.
 5. If the user next sends a text message, they get only a text reply — no unnecessary audio.
+6. When `stream: true` is set, the user hears the first sentence as soon as it is synthesised while the rest of the reply is still being spoken.
 
 ---
 
@@ -345,6 +442,16 @@ voice:
 Voice reply is best-effort — the plain-text reply is always delivered first, so users never lose a message even when synthesis fails.
 </Accordion>
 
+<Accordion title="Stream long replies for lower time-to-first-audio">
+Set `stream: true` when replies are typically more than one sentence and users are waiting for audio. Time-to-first-audio drops from full-response latency to first-sentence latency, and the whole-file path is still used automatically for single-sentence replies or replies over `max_chars`.
+
+```yaml
+voice:
+  mode: match_inbound
+  stream: true
+```
+</Accordion>
+
 <Accordion title="Keep the manual escape hatch for pre-rendered audio">
 The `[[audio_as_voice]]` marker still works on Telegram for audio you've already produced — e.g. a recording pulled from a knowledge base.
 </Accordion>
@@ -363,6 +470,9 @@ The `[[audio_as_voice]]` marker still works on Telegram for audio you've already
 </Card>
 <Card title="Voice Notes" icon="microphone" href="/features/gateway-voice-notes">
   The inbound voice-notes doc for gateway bots.
+</Card>
+<Card title="Streaming Replies" icon="bolt" href="/features/bot-streaming-replies">
+  The text-streaming counterpart — stream the reply text into chat as it is generated.
 </Card>
 <Card title="Gateway" icon="network-wired" href="/gateway">
   The overall gateway pattern — voice reply is one of several channel features.
