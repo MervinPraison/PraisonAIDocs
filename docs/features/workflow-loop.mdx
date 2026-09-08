@@ -11,6 +11,10 @@ The `loop()` helper runs a step for each item in a list, CSV, or text file — i
 Steps inside this pattern inherit the same `max_retries`, `guardrails`, and `output_file` policies as top-level steps. See [Nested workflows → Retry, guardrails, and `output_file`](/docs/features/nested-workflows#retry-guardrails-and-output_file-inside-nested-steps).
 </Note>
 
+<Note>
+As of PraisonAI [#4947](https://github.com/MervinPraison/PraisonAI/pull/4947), an `output_variable` set inside a `loop()` body is preserved after the loop block — keyed by that exact name. Earlier releases silently discarded it. This is the sibling fix to [#4932](https://github.com/MervinPraison/PraisonAI/pull/4932), which fixed the same defect in `parallel(...)`.
+</Note>
+
 ```python
 from praisonaiagents import Agent, AgentFlow, loop, WorkflowContext, StepResult
 
@@ -161,7 +165,120 @@ After loop completion:
 
 | Variable | Type | Description |
 |----------|------|-------------|
-| `loop_outputs` | `List[str]` | All outputs from loop iterations |
+| `loop_outputs` | `List[str]` | All outputs from loop iterations, in item order |
+| A body step's `output_variable` | `Any` | The **last item's** value — see [Named outputs from a loop body](#named-outputs-from-a-loop-body) |
+| A body step's `StepResult.variables` writes | `Any` | Merged back into the enclosing scope; last item wins on collisions |
+
+## Named outputs from a loop body
+
+Every step inside `loop([...])` may set `output_variable`. As of PraisonAI [#4947](https://github.com/MervinPraison/PraisonAI/pull/4947), that write is visible to any step **after** the loop block, keyed by that exact name — not just as a positional entry in `loop_outputs`.
+
+```python
+from praisonaiagents import AgentFlow, Task, WorkflowContext, StepResult, loop
+
+def process(ctx: WorkflowContext) -> StepResult:
+    return StepResult(output=f"processed-{ctx.variables['item']}")
+
+def after(ctx: WorkflowContext) -> StepResult:
+    return StepResult(output=f"last was {ctx.variables['result']}")
+
+workflow = AgentFlow(steps=[
+    loop(steps=[Task(name="worker", handler=process, output_variable="result")],
+         over="items"),
+    Task(name="after", handler=after),
+], variables={"items": ["a", "b", "c"]})
+
+output = workflow.start("go")
+print(output["variables"]["result"])          # "processed-c"  ← last item wins
+print(output["variables"]["loop_outputs"])    # ["processed-a", "processed-b", "processed-c"]
+```
+
+The body step's own `output_variable` is stored under that exact name; the ordered `loop_outputs` list is still there for aggregators that want positional access.
+
+A `StepResult.variables={"foo": ...}` write from inside the loop body works the same way: the key merges back into the enclosing scope after the loop.
+
+```mermaid
+graph TB
+    L[loop block] --> Mode{Sequential or Parallel?}
+    Mode -->|Sequential| Seq[Shared scope, iterations see previous writes]
+    Mode -->|Parallel| Par[Deep-copied per iteration, deltas merged in item order]
+    Seq --> Out[After the loop: last item's value wins]
+    Par --> Out
+
+    classDef block fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class L block
+    class Mode decision
+    class Seq,Par process
+    class Out result
+```
+
+### Sequential vs parallel: same final scope
+
+The two loop modes agree on the resulting variables scope. `parallel=True` is meant to be a **faster way to run the same loop**, not different semantics — so:
+
+- Both end with the last item's value for a variable the body rewrites each iteration.
+- Both propagate body writes (`output_variable` and `StepResult.variables`) back to the enclosing scope.
+- Both keep loop control variables (`item` / `var_name`, `loop_index`, `item.<key>`) scoped to the loop.
+
+The one thing sequential offers that parallel cannot is **accumulation across iterations**: since the sequential loop runs against the shared scope, iteration N reads iteration N-1's writes.
+
+```python
+from praisonaiagents import AgentFlow, Task, WorkflowContext, StepResult, loop
+
+def accumulate(ctx: WorkflowContext) -> StepResult:
+    so_far = ctx.variables.get("acc") or ""
+    updated = so_far + ctx.variables["item"]
+    return StepResult(output=updated, variables={"acc": updated})
+
+workflow = AgentFlow(steps=[
+    loop(steps=[Task(name="acc_step", handler=accumulate)],
+         over="items", parallel=False),
+], variables={"items": ["a", "b", "c"]})
+
+result = workflow.start("go")
+print(result["variables"]["acc"])           # "abc"
+print(result["variables"]["loop_outputs"])  # ["a", "ab", "abc"]
+```
+
+This is deliberately unavailable in the parallel loop — its iterations run concurrently, so there is no "previous iteration" to read from.
+
+### Iteration collisions are not warned about
+
+Unlike `parallel(...)`, when the loop body rewrites the same `output_variable` on every iteration, **no warning is logged**. N iterations of one loop body necessarily write the body's `output_variable` N times — that is the normal shape of a loop, not an accident. The final value is the **last item's**, exactly as an unrolled sequence would produce.
+
+Compare with `parallel(...)`, where two sibling branches writing the same variable **does** log a `WARNING` because that pattern almost always signals an authoring mistake. See [Named outputs from branches](/features/workflow-parallel#named-outputs-from-branches) for the parallel counterpart.
+
+### Loop control variables stay loop-scoped
+
+The variables the loop injects itself — `item` (or your custom `var_name`), `loop_index`, and flattened `item.<key>` accessors for dict items — are **loop machinery, not results**. They stay scoped to the loop in both modes:
+
+- The sequential path restores whatever those names held **before** the loop (so a pre-existing `variables={"item": "ORIGINAL"}` is unaffected).
+- The parallel path drops them from the merged delta.
+- Even if a body step deliberately sets `output_variable="item"`, that write is stripped so the two modes agree.
+
+```python
+from praisonaiagents import AgentFlow, Task, WorkflowContext, StepResult, loop
+
+def process(ctx: WorkflowContext) -> StepResult:
+    return StepResult(output=f"processed-{ctx.variables['item']}")
+
+def after(ctx: WorkflowContext) -> StepResult:
+    return StepResult(output=f"last was {ctx.variables['result']}")
+
+workflow = AgentFlow(steps=[
+    loop(steps=[Task(name="worker", handler=process, output_variable="result")],
+         over="items"),
+    Task(name="after", handler=after),
+], variables={"items": ["a", "b"], "item": "ORIGINAL"})
+
+result = workflow.start("go")
+print(result["variables"]["item"])          # "ORIGINAL" — untouched
+print("loop_index" in result["variables"])  # False
+```
 
 ## Examples
 
@@ -291,6 +408,9 @@ sequenceDiagram
   </Accordion>
   <Accordion title="Clean up resources in finally blocks">
     Close files and connections even when individual items fail.
+  </Accordion>
+  <Accordion title="Read a body step's output_variable after the loop, not just loop_outputs">
+    As of [#4947](https://github.com/MervinPraison/PraisonAI/pull/4947), a body step's `output_variable` is visible after the loop under that exact name — set to the last item's value. `loop_outputs` still holds the ordered list of every iteration's last-step output for aggregators that need positional access. Reach for the named variable when you only need the final value; reach for `loop_outputs` when you need all of them.
   </Accordion>
 </AccordionGroup>
 
