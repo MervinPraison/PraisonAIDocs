@@ -257,6 +257,7 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 | Component | Lock Type | Reason |
 |-----------|-----------|--------|
 | `chat_history` | `AsyncSafeState` (DualLock: RLock + per-loop `asyncio.Lock`) | Re-entrant on same thread; non-blocking in async contexts |
+| Handoff history seeding | per-target-agent `DualLock` attached lazily as `agent._handoff_seed_lock` | Serialises seed + chat per target agent so overlapping handoffs to one specialist can't interleave `chat_history` — see [Handoff seeding](#handoff-history-seeding) |
 | `_cache_lock` | `threading.RLock` | Allows reentrant access from cached helpers |
 | `PersistenceOrchestrator._cache_lock` | `threading.RLock` | Protects `_session_cache` reads/writes; the store is a bounded `OrderedDict` LRU (not a plain dict), and reads return `deepcopy()` to prevent shared mutable state |
 | `RateLimiter` (sync) | `threading.Lock` | Protects `_tokens`, `_api_tokens`, and refill state from races in multi-threaded acquire calls |
@@ -724,6 +725,17 @@ Under 10-thread concurrency, loaders can no longer double-run or be skipped mid-
 - For long-lived daemons that switch projects, call `praisonai.tool_resolver.reset_default_resolver()` to force re-anchoring.
 
 This eliminated the singleton-config-bleed and first-caller-CWD-wins bugs while keeping `cleanup_runtime()` and convenience functions like `resolve_tool()` source-compatible.
+
+### Handoff history seeding
+
+A handoff seeds the filtered conversation onto the **target** agent's `chat_history` for the duration of the transfer, then restores it. Because that history is shared mutable state on the target, overlapping handoffs to the *same* target agent (e.g. two `parallel_handoffs` entries pointing at one specialist) would interleave their seed-and-restore steps and leak one caller's context into another's.
+
+Seeding is now serialised per target agent by a `DualLock` attached lazily as `agent._handoff_seed_lock`:
+
+- **Sync path** holds the lock's threading (`RLock`) side around apply-seed → `chat()` → restore.
+- **Async path** holds the lock's per-loop `asyncio.Lock` side **and** the sync side for the whole seeded `achat()` turn. The async side alone would not exclude a concurrent *cross-thread sync* handoff to the same target, so both sides are held together.
+
+If a target agent cannot hold the attribute (e.g. `__slots__`), a transient lock is used and behaviour falls back to the pre-lock path — the common case stays fully guarded. No public API changed; the guarantee is automatic. See [Agent Handoffs](/features/handoffs#concurrent-handoffs-to-the-same-target) and [Multi-Agent Context Safety](/features/multi-agent-context-safety).
 
 ### Handoff chain isolation under `asyncio.gather`
 
