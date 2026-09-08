@@ -81,7 +81,7 @@ sequenceDiagram
     httpx->>API: HTTP call
     API-->>httpx: response
     httpx-->>Operation: JSON or text
-    Note over Operation: On failure returns "{name} failed: {error}"<br/>so the model can retry
+    Note over Operation: Transport failures and safety refusals (off-origin,<br/>scheme downgrade, hostless URL) all come back as<br/>"{name} failed: {reason}" so the model can react<br/>instead of ending the turn
     Operation-->>Agent: result
     Agent-->>User: Response
 ```
@@ -164,17 +164,41 @@ The `auth` dict is keyed by `type`.
 
 The toolset refuses unsafe requests and never fetches arbitrary URLs while parsing.
 
+```mermaid
+graph TB
+    Req[📝 Tool call] --> Build[🧠 build_request]
+    Build --> Host{Same host<br/>as base_url?}
+    Host -->|No| RefuseHost[⛔ Refuse: off-origin]
+    Host -->|Yes| Scheme{Same scheme<br/>https vs http?}
+    Scheme -->|No| RefuseScheme[⛔ Refuse: scheme downgrade]
+    Scheme -->|Yes| HasHost{Has a host<br/>at all?}
+    HasHost -->|No| RefuseHostless[⛔ Refuse: pass base_url=]
+    HasHost -->|Yes| Send[🌐 Send to API]
+
+    classDef req fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef refuse fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef send fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Req req
+    class Build,Host,Scheme,HasHost process
+    class RefuseHost,RefuseScheme,RefuseHostless refuse
+    class Send send
+```
+
 | Behaviour | What happens |
 |-----------|--------------|
 | **`http://` + auth** | Raises `ValueError` — credentials are never sent in the clear. Pass an `https://` `base_url` or fix the spec |
 | **Swagger 2 schemes** | When both `http` and `https` are listed, `https` wins (not `schemes[0]`) |
 | **Remote `$ref`** | Ignored — parsing a spec never fetches external URLs. Self-referential schemas are cycle-broken to `{"type": "object"}` |
 | **Path parameters** | Every value is `quote(value, safe="")` before substitution, so `../../admin` or `https://other/` cannot alter host, path, query or fragment |
+| **Origin pin (host)** | If an absolute path in the spec, or any argument path, would send the request to a host other than the configured `base_url`, the tool returns `"{name} failed: {name}: refusing to send credentialed request to {other_origin}; configured origin is {configured_origin}"`. Credentials never leave the configured origin |
+| **Origin pin (scheme)** | A same-host `http://` value in the spec is refused the same way when the configured `base_url` is `https://` — no silent HTTPS→HTTP downgrade |
 | **Strict body (OpenAPI 3)** | Only properties declared in the `requestBody` schema are sent — framework-injected kwargs (e.g. `idempotency_key`) are dropped, so `additionalProperties: false` schemas stay clean |
 | **Swagger 2 `in: body`** | The whole named argument becomes the JSON body verbatim |
-| **Relative `servers[0].url`** | A remotely loaded spec with `servers: [{ url: "/v1" }]` resolves against the fetched URL — no hostless URLs |
+| **Relative `servers[0].url`** | A remotely loaded spec with `servers: [{ url: "/v1" }]` resolves against the `spec_url`. With `spec_dict=` or `spec_str=` there is no URL to resolve against — the tool returns `"{name} failed: {name}: no host to send to -- the spec's server URL is relative ('/v1') and could not be resolved. Pass an absolute base_url= to OpenAPIToolset."` instead of an opaque transport error |
 | **Tool names** | `operationId` is sanitised; when absent, name is `method + "_" + sanitised path` — stable across runs |
-| **Errors return, not raise** | A network/HTTP failure comes back as `"{name} failed: {exc}"` so the model can react instead of ending the turn |
+| **Errors return, not raise** | A network/HTTP failure comes back as `"{name} failed: {exc}"` so the model can react instead of ending the turn. The `ValueError`s raised inside `build_request()` (the two origin/hostless refusals above) are caught by `__call__()` and returned the same way |
 | **`header_provider` faults** | If the provider raises, the request continues without its headers (a warning is logged) |
 
 ---
@@ -221,6 +245,18 @@ request = tools[0].build_request(id="123")
 print(request)   # {"method": ..., "url": ..., "headers": ...}
 ```
 
+**Force a base URL when the spec has a relative `servers:` entry:**
+
+```python
+from praisonaiagents.tools.openapi_toolset import OpenAPIToolset
+
+toolset = OpenAPIToolset(
+    spec_dict=my_spec,                   # servers: [{ url: "/v1" }]
+    base_url="https://api.example.com",  # required — no spec_url to resolve against
+    auth={"type": "bearer", "token": "..."},
+)
+```
+
 ---
 
 ## OpenAPI Toolset vs MCP
@@ -245,6 +281,9 @@ A workaround existed (`MCP("npx -y @ivotoby/openapi-mcp-server ...")`); the tool
   <Accordion title="Always use https when sending auth">
     The toolset refuses to attach credentials to an `http://` endpoint. If the
     spec declares a cleartext server, pass an `https://` `base_url` explicitly.
+    A same-host scheme downgrade — a spec supplying `http://` for an origin you
+    configured as `https://` — is refused too, so a token never travels in the
+    clear.
   </Accordion>
   <Accordion title="Filter to the operations the agent actually needs">
     A large spec can generate dozens of tools. Use `tool_filter` to keep only
@@ -253,6 +292,14 @@ A workaround existed (`MCP("npx -y @ivotoby/openapi-mcp-server ...")`); the tool
   <Accordion title="Prefix tools when combining specs">
     Two specs may both define `get_users`. Set a distinct `tool_name_prefix`
     per toolset so names stay unique on one agent.
+  </Accordion>
+  <Accordion title="Trust the origin pin when pointing at a spec you don't control">
+    When you point the toolset at a spec URL you do not control, the spec — not
+    just the model — can try to relocate a call. The toolset pins every
+    credentialed request to your configured origin's host and scheme, so an
+    absolute path in the spec cannot silently send your token somewhere else.
+    Nothing to do — this is on by default; the tool returns a refusal message
+    the model can see.
   </Accordion>
   <Accordion title="Preview requests in tests with build_request">
     `build_request(**args)` binds arguments to URL, headers and body without
