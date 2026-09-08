@@ -110,11 +110,96 @@ Every provider accepts the same `ComputeConfig` on `provision()` and `execute()`
 
 ---
 
+## `ComputeToolPlace` — turning a provider into a tool place
+
+`ComputeToolPlace` adapts a `ComputeProvider` to the place `toolsRunOn` selects, so a tool call can run on the provider instead of in the host process.
+
+```typescript
+import { Agent, ComputeToolPlace, DockerCompute } from 'praisonai';
+
+// 1. A place with a command template per tool. 'greet' knows how to run itself.
+const place = new ComputeToolPlace(new DockerCompute(), {
+  greet: 'echo hello-{{who}}',
+});
+
+// 2. Point the agent at that place. Everything else stays local.
+const agent = new Agent({ instructions: 'Greeter', toolsRunOn: place });
+
+// 3. When the model calls greet({ who: 'world' }), the shell command runs
+//    inside Docker and its stdout comes back as the tool result.
+await agent.chat('Say hi to the world.');
+```
+
+```mermaid
+sequenceDiagram
+    participant Model
+    participant Agent
+    participant Place as ComputeToolPlace
+    participant Provider as DockerCompute
+    participant Instance
+
+    Model->>Agent: tool_call greet({who:'world'})
+    Agent->>Place: runTool('greet', args, localFn)
+    Place->>Place: fillCommand("echo hello-{{who}}") →<br/>"echo hello-'world'"
+    Place->>Provider: ensure instance
+    Provider->>Instance: provision (once)
+    Place->>Provider: execute(id, command)
+    Provider-->>Place: {stdout:'hello-world', exitCode:0}
+    Place-->>Agent: 'hello-world'
+    Agent-->>Model: tool_result 'hello-world'
+```
+
+Five decisions govern where a call goes and what a failure returns:
+
+**A declared command runs on the provider.**
+```typescript
+const place = new ComputeToolPlace(new LocalCompute(), { greet: 'echo hello-{{who}}' });
+const out = await place.runTool('greet', { who: 'world' }, async () => 'LOCAL');
+// out.trim() === 'hello-world'
+```
+
+**A tool with no command falls back to the local implementation.** A JavaScript closure cannot cross a process boundary; running it locally and saying so beats implying isolation that is not there.
+```typescript
+const place = new ComputeToolPlace(new LocalCompute());
+await place.runTool('anything', {}, async () => 'LOCAL'); // 'LOCAL'
+```
+
+**Arguments are quoted — an injection stays one argument.** Every substituted `{{arg}}` is single-quoted.
+```typescript
+const place = new ComputeToolPlace(new LocalCompute(), { greet: 'echo hello-{{who}}' });
+const out = await place.runTool('greet', { who: 'a; echo pwned' }, async () => 'x');
+// out.trim() === 'hello-a; echo pwned'  — the literal text, not a second command
+```
+
+**A timeout raises rather than returning an empty string.** An empty string would read as a successful tool call that found nothing.
+```typescript
+// ComputeError: Tool 'slow' timed out on local. No output was produced, ...
+```
+
+**An unavailable provider raises instead of silently running on the host.** Silently running on the host what a caller asked to sandbox is the opposite of what asking for a sandbox means.
+```typescript
+// ComputeError: toolsRunOn='docker' but that provider is not available here.
+// Tools would silently run on the host instead, ...
+```
+
+**`setCommand(toolName, template)` declares a tool after construction.**
+```typescript
+const place = new ComputeToolPlace(new LocalCompute());
+place.setCommand('later', 'echo declared-later');
+await place.runTool('later', {}, async () => 'x'); // 'declared-later'
+```
+
+### Auto-registration on import
+
+`registerComputeToolPlaces()` populates the placement registry with the built-in providers (`local`, `docker`). It is idempotent and called on import of `praisonai/compute`, so consumers never call it themselves. Registering a *new* compute provider with `registerComputeProvider('e2b', …)` also mirrors into the placement registry, so `new Agent({ toolsRunOn: 'e2b' })` works after that one call.
+
+---
+
 ## `LocalCompute`
 
 Runs commands in the host Node process — the honest baseline that does not isolate anything.
 
-- Runs commands via `child_process.exec`.
+- Spawns a detached shell (`/bin/sh -c` on POSIX, `%ComSpec% /d /s /c` on Windows) and kills the whole process group on timeout, so a backgrounded descendant (`(sleep 3; touch marker) &`) is terminated with the shell rather than orphaned.
 - **Does not sandbox.** Use `DockerCompute` or a remote provider for untrusted code.
 - Unavailable in webviews / mobile / any runtime without `child_process`. `child_process` is loaded through a computed specifier so bundlers cannot see it statically; there, `isAvailable()` returns `false` and any `provision()` / `execute()` throws `ComputeError`.
 
@@ -130,7 +215,7 @@ Real isolation via the `docker` CLI.
 - Default image `python:3.11-slim`, default workdir `/workspace`.
 - Checks `docker info`, not `docker --version` — the CLI can be installed while the daemon is down, so it surfaces "daemon down" honestly instead of promising availability and then failing on provision.
 - Timeouts fire **inside** the container (`timeout -k 5 <seconds>`), so the process is actually killed — not just the host-side `docker exec` client, which would leave the command running.
-- `shutdown()` runs `docker rm -f <id>`; if that fails, the instance is marked `error` and `ComputeError` is raised. A container reported stopped while still running is exactly the silent wrongness this guards against.
+- `shutdown()` runs `docker rm -f <id>`; if that fails, the instance is marked `error` and `ComputeError` is raised ("Could not remove container … It may still be running."). A container reported stopped while still running is exactly the silent wrongness this guards against. A clean removal forgets the container.
 - Env vars, workdir, and image on `ComputeConfig` are honoured; shell metacharacters in values are single-quoted, so a filename with a space cannot become two arguments.
 
 ---
@@ -203,7 +288,7 @@ r.timedOut    // true
 r.exitCode    // null
 ```
 
-*"We don't know the answer"* and *"the answer is no"* are different, and collapsing them makes a slow command look like a failing one. `DockerCompute` maps the container-side `timeout` exit code `124` back to the same `{ timedOut: true, exitCode: null }`, so both providers report timeouts identically.
+*"We don't know the answer"* and *"the answer is no"* are different, and collapsing them makes a slow command look like a failing one. `DockerCompute` maps the container-side `timeout` exit code `124` back to the same `{ timedOut: true, exitCode: null }`, so both providers report timeouts identically. On POSIX, `LocalCompute` escalates the timeout `SIGTERM` → `SIGKILL` 2 s later, so a shell that ignores `SIGTERM` still goes.
 
 ---
 
