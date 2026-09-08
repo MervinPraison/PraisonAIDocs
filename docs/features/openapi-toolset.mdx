@@ -194,12 +194,41 @@ graph TB
 | **Path parameters** | Every value is `quote(value, safe="")` before substitution, so `../../admin` or `https://other/` cannot alter host, path, query or fragment |
 | **Origin pin (host)** | If an absolute path in the spec, or any argument path, would send the request to a host other than the configured `base_url`, the tool returns `"{name} failed: {name}: refusing to send credentialed request to {other_origin}; configured origin is {configured_origin}"`. Credentials never leave the configured origin |
 | **Origin pin (scheme)** | A same-host `http://` value in the spec is refused the same way when the configured `base_url` is `https://` — no silent HTTPS→HTTP downgrade |
-| **Strict body (OpenAPI 3)** | Only properties declared in the `requestBody` schema are sent — framework-injected kwargs (e.g. `idempotency_key`) are dropped, so `additionalProperties: false` schemas stay clean |
+| **Strict body (declared `properties`)** | Only properties declared in the `requestBody` schema are sent. Model hallucinations and framework-injected kwargs (`idempotency_key`, `run_id`, …) are dropped, so `additionalProperties: false` schemas stay clean |
+| **Composed body (`allOf` / `oneOf` / `anyOf`)** | Properties from every branch are advertised and accepted. `oneOf` / `anyOf` take the **union** — the superset of what the tool *may* accept. Only `allOf` contributes to the request's required-field list; a field required by one branch of a `oneOf` is not required of the request as a whole. Nested composition and self-referential `$ref`s are handled without hangs |
+| **Free-form body (bare `{"type": "object"}` or `additionalProperties: true`)** | Arguments the model supplies are forwarded verbatim. A **closed** empty schema (`additionalProperties: false` with no properties, directly or in an `allOf` branch) is honoured instead — nothing is sent |
 | **Swagger 2 `in: body`** | The whole named argument becomes the JSON body verbatim |
 | **Relative `servers[0].url`** | A remotely loaded spec with `servers: [{ url: "/v1" }]` resolves against the `spec_url`. With `spec_dict=` or `spec_str=` there is no URL to resolve against — the tool returns `"{name} failed: {name}: no host to send to -- the spec's server URL is relative ('/v1') and could not be resolved. Pass an absolute base_url= to OpenAPIToolset."` instead of an opaque transport error |
 | **Tool names** | `operationId` is sanitised; when absent, name is `method + "_" + sanitised path` — stable across runs |
 | **Errors return, not raise** | A network/HTTP failure comes back as `"{name} failed: {exc}"` so the model can react instead of ending the turn. The `ValueError`s raised inside `build_request()` (the two origin/hostless refusals above) are caught by `__call__()` and returned the same way |
 | **`header_provider` faults** | If the provider raises, the request continues without its headers (a warning is logged) |
+
+Framework-injected kwargs are stripped on **all** paths — free-form, declared, and composed — so durable-execution metadata never leaks into a strict API.
+
+### Body Shapes
+
+Every `requestBody` schema falls into one of three modes, decided in this order.
+
+```mermaid
+graph TB
+    Schema[📋 requestBody schema] --> Closed{additionalProperties: false<br/>and no declared properties?}
+    Closed -->|Yes| Empty[⛔ Closed empty<br/>No body sent]
+    Closed -->|No| Declares{Declares properties?<br/>top-level or via<br/>allOf / oneOf / anyOf}
+    Declares -->|Yes| Strict[✅ Strict<br/>Only declared keys pass]
+    Declares -->|No| Free[✅ Free-form<br/>All model keys pass]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef refuse fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef send fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Schema input
+    class Closed,Declares decision
+    class Empty refuse
+    class Strict,Free send
+```
+
+Framework-injected kwargs are dropped in every mode.
 
 ---
 
@@ -244,6 +273,32 @@ tools = OpenAPIToolset(spec_url="https://api.example.com/openapi.json").get_tool
 request = tools[0].build_request(id="123")
 print(request)   # {"method": ..., "url": ..., "headers": ...}
 ```
+
+**Call an operation whose body uses `allOf` — no special configuration:**
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.tools.openapi_toolset import OpenAPIToolset
+
+spec = {
+    "openapi": "3.0.0",
+    "servers": [{"url": "https://api.example.com"}],
+    "paths": {"/pets": {"post": {
+        "operationId": "createPet",
+        "requestBody": {"content": {"application/json": {"schema": {
+            "allOf": [
+                {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+                {"type": "object", "properties": {"age": {"type": "integer"}}},
+            ],
+        }}}},
+    }}},
+}
+
+agent = Agent(name="pets", tools=OpenAPIToolset(spec_dict=spec).get_tools())
+agent.start("Create a pet called Rex, age 3")
+```
+
+Both `name` and `age` are advertised to the model and forwarded to the API — a composed spec works with no extra wiring.
 
 **Force a base URL when the spec has a relative `servers:` entry:**
 
