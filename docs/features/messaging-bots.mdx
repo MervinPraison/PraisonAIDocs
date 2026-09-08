@@ -134,6 +134,21 @@ praisonai bot agentmail --token $AGENTMAIL_API_KEY
 ```
 
 A default agent is created automatically with basic assistant capabilities.
+
+<Warning>
+Slack requires `--app-token` / `SLACK_APP_TOKEN` for Socket Mode. Omitting it is now a startup failure — the CLI errors early instead of silently subscribing to nothing:
+
+```
+Error: Slack app token required (Socket Mode)
+Provide via --app-token or SLACK_APP_TOKEN environment variable
+Create one at https://api.slack.com/apps -> Basic Information
+-> App-Level Tokens (scope: connections:write)
+```
+</Warning>
+
+<Note>
+`praisonai bot linear`, `bot email`, `bot agentmail`, `bot webhook`, and WhatsApp **cloud** mode now stay running correctly. Previously these non-blocking adapters exited `0` in about a second, so `systemd Restart=on-failure` never restarted them. The CLI now holds the loop open while the adapter reports `is_running`.
+</Note>
 </Step>
 
 <Step title="(Optional) Custom Agent">
@@ -861,7 +876,14 @@ You should see:
 1. **Event Subscriptions enabled?** → Must be ON
 2. **Bot events subscribed?** → `app_mention` and `message.im` must be listed
 3. **Reinstalled after changes?** → Required after adding scopes/events
-4. **App Token provided?** → `--app-token` is required for Socket Mode
+4. **App Token provided?** → **required** — the CLI now fails fast if `--app-token` / `SLACK_APP_TOKEN` is missing:
+
+   ```
+   Error: Slack app token required (Socket Mode)
+   Provide via --app-token or SLACK_APP_TOKEN environment variable
+   Create one at https://api.slack.com/apps -> Basic Information
+   -> App-Level Tokens (scope: connections:write)
+   ```
 5. **Bot invited to channel?** → Use `/invite @BotName` before @mentioning
 </Accordion>
 
@@ -1658,6 +1680,164 @@ praisonai bot start --config bot.yaml
 The `.env` file in the current directory is auto-loaded, so you can store tokens there and reference them with `${VAR_NAME}` syntax.
 </Tip>
 
+### Token is optional
+
+Omit `token:` entirely — the declared `platform:` resolves the platform's own documented env var (for example `TELEGRAM_BOT_TOKEN` for Telegram, `DISCORD_BOT_TOKEN` for Discord):
+
+```yaml
+platform: telegram
+
+agent:
+  name: "My Assistant"
+  instructions: "You are a helpful AI assistant."
+```
+
+```bash
+export TELEGRAM_BOT_TOKEN="123456:ABC-DEF..."
+praisonai bot start --config bot.yaml
+```
+
+### The declared platform wins
+
+The `platform:` you declare always wins. If other platform credentials happen to be exported in the environment, `bot start` refuses to auto-enable them behind your back and logs a warning naming each one it skipped:
+
+```
+WARNING Config declares 'platform: telegram'; NOT auto-enabling discord, slack
+despite their credentials being present in the environment. The declared
+platform wins. To run them too, list them under 'channels:' explicitly.
+```
+
+<Warning>
+Earlier versions could silently start the wrong platform: a `bot.yaml` saying `platform: telegram` could bring up a Discord bot if `DISCORD_BOT_TOKEN` was set. Now the declared platform always wins. To run several platforms from one config, list them under `channels:` explicitly.
+</Warning>
+
+---
+
+## Registered but verb-less platforms — `praisonai bot run`
+
+`bot run` starts any registered platform by name — including `signal`, `webhook`, `local`, entry-point plugin channels, and `adapter:` drop-ins that don't have their own verb.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="signal-bot", instructions="Answer messages on Signal.")
+agent.start("Welcome the user when they say hi.")
+```
+
+```bash
+# Same agent, run over Signal — no Python needed
+praisonai bot run --platform signal --agent agents.yaml
+```
+
+```mermaid
+graph LR
+    subgraph "praisonai bot run"
+        CLI[📝 --platform name] --> Reg{🔍 Registry}
+        Reg -->|found| Adp[🔌 Adapter]
+        Reg -->|unknown| Err[⛔ Exit 1]
+        Adp --> Facade[🤖 Bot facade]
+        Facade --> Agent[🧠 Agent]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class CLI input
+    class Reg decision
+    class Adp,Facade process
+    class Agent agent
+    class Err result
+```
+
+<Steps>
+<Step title="Local channel (REPL-style)">
+```bash
+praisonai bot run --platform local
+```
+</Step>
+
+<Step title="Signal via signal-cli-bridge">
+```bash
+praisonai bot run --platform signal --agent agents.yaml
+```
+</Step>
+
+<Step title="Generic webhook receiver">
+```bash
+praisonai bot run --platform webhook --port 8080
+```
+</Step>
+
+<Step title="Plugin / drop-in channel">
+```bash
+praisonai bot run --platform my-plugin-channel --token $MY_TOKEN
+```
+</Step>
+</Steps>
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--platform <name>` | Registered platform to start (required) |
+| `--token <t>` | Falls back to the platform's own env var |
+| `--port <n>` | For webhook-style channels |
+| `--agent <path>` | Agent YAML configuration file |
+| `--model <m>` | LLM model to use |
+| `--browser` / `--browser-profile <p>` / `--browser-headless` | Browser control |
+| `--tools <t>...` | Tools to enable |
+| `--skills <s>...` / `--skills-dir <path>` | Skills configuration |
+| `--memory` / `--memory-provider <p>` | Memory configuration |
+| `--knowledge` / `--knowledge-sources <s>...` | Knowledge/RAG |
+| `--web` / `--web-provider <p>` | Web search |
+| `--sandbox` / `--exec` / `--auto-approve` | Execution controls |
+| `--group-policy respond_all\|mention_only\|command_only` | Group behavior |
+| `--session-id <s>` / `--user-id <u>` | Session and memory isolation |
+| `--thinking off\|minimal\|low\|medium\|high` | Thinking mode |
+
+An unknown platform is rejected up front with a listing of the registered ones:
+
+```
+Error: Unknown platform 'foo'
+Registered platforms: agentmail, discord, email, linear, local, signal, slack, telegram, webhook, whatsapp
+```
+
+<Note>
+`bot run` (and `bot start` for `platform: local`, `signal`, `webhook`) forwards adapter-specific extras from the validated channel schema — such as the Webhook adapter's `verify` signature verifier or Signal's `account` / `bridge_url`. Previously the `start` path dropped these, silently replacing a configured Webhook verifier with the adapter's unverified default.
+</Note>
+
+### Which command should I use?
+
+```mermaid
+graph TB
+    Q{What do you have?} -->|Just a token + one platform| A1[praisonai bot &lt;platform&gt;]
+    Q -->|A registered platform without its own verb| A2[praisonai bot run --platform &lt;name&gt;]
+    Q -->|A bot.yaml describing platforms + agent| A3[praisonai bot start --config bot.yaml]
+    Q -->|Multiple channels / production gateway| A4[praisonai gateway start --config gateway.yaml]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class A1,A2,A3,A4 opt
+```
+
+### Bot startup exit codes
+
+`praisonai bot ...` now exits **1** on any startup failure — bad config path, missing token, unknown platform, or adapter import failure:
+
+```bash
+$ praisonai bot start --config /nope.yaml
+Error: Config file not found: /nope.yaml
+$ echo $?
+1
+```
+
+This makes `systemd Restart=on-failure` and shell `if praisonai bot ... ; then` scripting work as expected.
+
 ---
 
 ## Token Types — When to Use What
@@ -1678,7 +1858,7 @@ Different platforms use different types of tokens. Here's when to use each:
 | Token | Format | When to Use |
 |-------|--------|-------------|
 | **Bot Token** | `xoxb-...` | **Always required.** Get from OAuth & Permissions → Install to Workspace. Used for sending messages and API calls. |
-| **App Token** | `xapp-...` | **Required for Socket Mode** (default). Get from Socket Mode settings. Enables WebSocket connection without a public URL. |
+| **App Token** | `xapp-...` | **Required for Socket Mode** (default) — the CLI errors out if it's missing. Get from **Basic Information → App-Level Tokens** (scope: `connections:write`). Enables the WebSocket connection without a public URL. |
 | **Client ID** | `12345.67890` | **OAuth flow only.** Used when building apps that are installed by multiple workspaces (not needed for single-workspace bots). |
 | **Client Secret** | `d119ac...` | **OAuth flow only.** Used with Client ID for the OAuth2 authorization flow. Never expose publicly. |
 
