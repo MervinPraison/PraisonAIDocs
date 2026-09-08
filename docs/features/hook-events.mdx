@@ -747,6 +747,40 @@ def after_compaction(event_data):
 Plugin persisters subscribe to `AFTER_COMPACTION` to read `event_data.summary`. See [Compacted Session Resume](/features/session-compaction-checkpoint) for the built-in checkpoint that ships with PraisonAI, and [Context Compaction](/docs/features/context-compaction#new-compactionresult-fields) for the full `CompactionResult` fields.
 </Note>
 
+### Plugin Lifecycle Events
+
+| Event | Trigger | Payload |
+|-------|---------|---------|
+| `ON_INIT` | Emitted by `PluginManager.register()` right after the plugin runs its own `on_init` | `PluginLifecycleInput` |
+| `ON_SHUTDOWN` | Emitted by `PluginManager.unregister()` right after the plugin runs its own `on_shutdown` | `PluginLifecycleInput` |
+
+`plugin.on_init` / `plugin.on_shutdown` are the plugin's *own* callbacks; `ON_INIT` / `ON_SHUTDOWN` are the runtime events **other** listeners (metrics/audit plugins, gateways) subscribe to. Lets an observability plugin see the plugin set change at runtime instead of polling `list_plugins()`.
+
+```python
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult, PluginLifecycleInput
+
+@registry.on(HookEvent.ON_INIT)
+def on_plugin_registered(event_data: PluginLifecycleInput):
+    print(f"Plugin loaded: {event_data.plugin_name} v{event_data.plugin_version}")
+    return HookResult.allow()
+
+@registry.on(HookEvent.ON_SHUTDOWN)
+def on_plugin_removed(event_data: PluginLifecycleInput):
+    print(f"Plugin unloaded: {event_data.plugin_name}")
+    return HookResult.allow()
+```
+
+**Observe-only.** Fully guarded — a failing hook never breaks plugin loading. Zero cost when nothing is listening (early-out on `registry.has_hooks(...)`).
+
+#### `PluginLifecycleInput` Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `plugin_name` | `str` | `""` | Registered plugin name |
+| `plugin_version` | `str` | `""` | Plugin version |
+| `plugin_description` | `str` | `""` | Plugin description |
+| `session_id`, `cwd`, `event_name`, `timestamp`, `agent_name` | — | — | Standard `HookInput` fields |
+
 ### Message Events
 
 | Event | Trigger | Input Type | Use Case |
@@ -776,6 +810,25 @@ True
 Legacy string values (`"before_message"`, `"after_message"`, `"tool_result_persist"`) still resolve — config files, `add_hook("before_message", ...)` calls, and any other string-based registration keep working unchanged.
 
 `MESSAGE_RECEIVED` is a **first-class control point**: hooks can drop an inbound message so the agent never runs, or rewrite the message content before the agent (or memory) sees it. This is symmetric with `MESSAGE_SENDING` on the outbound side.
+
+### Aliased Events
+
+Three `HookEvent` members are **aliases** — the enum member and its live target are the same object. Registration on the alias is registration on the live event.
+
+| Alias | Live event | Notes |
+|-------|-----------|-------|
+| `HookEvent.BEFORE_MESSAGE` | `HookEvent.MESSAGE_RECEIVED` | The plugin-facing `Plugin.before_message` method has always routed here |
+| `HookEvent.AFTER_MESSAGE` | `HookEvent.MESSAGE_SENDING` | Outbound counterpart |
+| `HookEvent.TOOL_RESULT_PERSIST` | `HookEvent.AFTER_TOOL` | `AFTER_TOOL` already sees the result before it is written into the conversation |
+
+```python
+>>> HookEvent.BEFORE_MESSAGE is HookEvent.MESSAGE_RECEIVED
+True
+>>> HookEvent("before_message") is HookEvent.MESSAGE_RECEIVED
+True
+```
+
+Legacy string values (`"before_message"`, `"after_message"`, `"tool_result_persist"`) still resolve — config files, `add_hook("before_message", ...)` calls, and any other string-based registration keep working unchanged.
 
 <Note>
 `MESSAGE_RECEIVED` and `MESSAGE_SENDING` payloads now include the enriched identity fields (`platform`, `sender_id`, `channel_id`, `channel_type`, `message_id`, `session_id`) when the underlying input provides them — the same fields that reach the [Plugin `_message_payload` bridge](/features/plugins#message-lifecycle-plugins).
@@ -1008,13 +1061,12 @@ Typical uses:
 |-------|---------|----------|
 | `TOOL_RESULT_PERSIST` | Alias of `AFTER_TOOL` (see [Aliased Events](#aliased-events)) — subscribe to `AFTER_TOOL` directly | Result modification |
 
-`TOOL_RESULT_PERSIST` resolves to the same enum member as `AFTER_TOOL` — there is no separate persistence chokepoint. Subscribe to `AFTER_TOOL`, which already sees the tool result before it is written into the conversation.
+`TOOL_RESULT_PERSIST` resolves to the same enum member as `AFTER_TOOL`. Register on `AFTER_TOOL` — it already receives the tool result before it is written into the conversation, and mutating `event_data.tool_output` is exactly what gets stored.
 
 ```python
 @registry.on(HookEvent.AFTER_TOOL)
 def on_persist(event_data):
-    print(f"Persisting: {event_data.tool_name}")
-    # Modify or filter result before storage
+    # Mutate event_data.tool_output to rewrite the value stored + sent to the model
     return HookResult.allow()
 ```
 
