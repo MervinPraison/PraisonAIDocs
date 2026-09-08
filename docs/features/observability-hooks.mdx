@@ -221,6 +221,33 @@ sequenceDiagram
     Note over RunA,RunB: Separate handles — no cross-finalize, no tag leak
 ```
 
+#### Per-task isolation under asyncio
+
+Each asyncio task gets its own run stack, so the void-signature `finalize_observability(tag)` is safe even when N concurrent `arun()` tasks share one worker thread.
+
+The run stack lives in a `contextvars.ContextVar`, not `threading.local()`. asyncio copies the context per task (`asyncio.create_task`, `asyncio.to_thread`, `copy_context`), so `_run_stack.get()` in each task returns that task's own stack — task A's `finalize_observability("crewai")` pops task A's run, never task B's. A thread-local slot would be shared by every task on the thread, letting task A close task B's sinks mid-run and restore another tenant's emitter.
+
+The value is treated as **immutable (copy-on-write)**: `_push_run`, `_pop_run`, and `_remove_run` always `set` a brand-new list, and `_get_run_stack()` returns a copy. A `ContextVar` copied into a child context shares the same underlying list object, so mutating it in place would let a spawned task pop from its parent's stack.
+
+```mermaid
+sequenceDiagram
+    participant T1 as Task 1
+    participant T2 as Task 2
+    participant CV as _run_stack ContextVar
+
+    T1->>CV: _push_run(run1) → set [run1]
+    T2->>CV: _push_run(run2) → set [run2]
+    Note over T1,T2: Shared _run_stack ContextVar — each task sees a per-task copy
+    T1->>CV: _get_run_stack() → [run1]
+    T2->>CV: _get_run_stack() → [run2]
+    T1->>CV: finalize_observability(tag) → pop run1
+    T2->>CV: finalize_observability(tag) → pop run2
+```
+
+Prefer the explicit-handle form `finalize_observability(tag, run=my_run)` wherever you hold the handle; the void form is the compatibility shim for legacy call sites. Both are now concurrency-safe — the void form's `_pop_run()` reaches only this context's stack.
+
+The regression suite `test_observability_run_stack_isolation.py` is the canonical guarantee: `_push` does not mutate a copied context, `_pop` in a copied context leaves the parent intact, `_get_run_stack` returns a copy, two concurrent asyncio tasks get isolated stacks, and `_remove_run` is copy-on-write. Fixed in PR [#4948](https://github.com/MervinPraison/PraisonAI/pull/4948) (fixes [#4945](https://github.com/MervinPraison/PraisonAI/issues/4945)).
+
 ### `discover_observability_sinks`
 
 | Signature | Returns | Description |
