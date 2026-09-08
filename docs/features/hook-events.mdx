@@ -918,14 +918,14 @@ def on_gateway_stop(event_data):
 
 ### Schedule & background events
 
-Schedule hooks fire when scheduled jobs are managed and triggered by `BotOS`. `JOB_COMPLETED` is emitted by `BackgroundJobManager.start_job` for **every** background job it runs — not only `spawn_subagent(background=True)` jobs — when the job reaches a terminal state (`COMPLETED` or `FAILED`), best-effort (a raising handler cannot crash the worker). It does **not** fire for `CANCELLED` or `LOST`.
+Schedule hooks fire when scheduled jobs are managed and triggered by `BotOS`. `JOB_COMPLETED` fires from `BackgroundJobManager.start_job` for **every** managed background job when it reaches a terminal state (`COMPLETED` or `FAILED`) — best-effort (a raising handler cannot crash the worker).
 
 | Event | Trigger | Input Type | Key Fields | Use Case |
 |-------|---------|------------|------------|----------|
 | `SCHEDULE_ADD` | Schedule job persisted | `ScheduleAddInput` | `job_name`, `job_id`, `schedule`, `message`, `agent_id`, `principal`, `enabled` | Audit schedule changes |
 | `SCHEDULE_REMOVE` | Schedule job deleted | `ScheduleRemoveInput` | `job_name`, `job_id`, `schedule`, `principal` | Audit schedule changes |
 | `SCHEDULE_TRIGGER` | Scheduled job runs | `ScheduleTriggerInput` | `job_name`, `job_id`, `message` | Observability, metrics |
-| `JOB_COMPLETED` | Any managed background job reaches `COMPLETED` or `FAILED` (never `CANCELLED`/`LOST`) | `JobCompletedInput` | `job_id`, `status`, `result`, `error`, `agent_name`, `session_id`, `deliver`, `platform`, `chat_id`, `thread_id` | Observability, custom delivery routing, chat-back delivery (see [Background Subagents](/features/background-subagents)) |
+| `JOB_COMPLETED` | Any managed background job reaches a terminal state (`COMPLETED` or `FAILED`) | `JobCompletedInput` | `job_id`, `status`, `result`, `error`, `agent_name`, `session_id`, `deliver`, `platform`, `chat_id`, `thread_id` | Observability, custom delivery routing, chat-back delivery (see [Background Subagents](/features/background-subagents)) |
 
 ```python
 @registry.on(HookEvent.SCHEDULE_TRIGGER)
@@ -968,34 +968,38 @@ A spent `delete_after_run` one-shot fires `SCHEDULE_REMOVE` **exactly once**: th
 
 ### Background Job Events
 
-`JOB_COMPLETED` fires from `BackgroundJobManager.start_job` for every managed background job when it reaches `COMPLETED` or `FAILED` — best-effort, so a raising handler cannot crash the worker. See the [JOB_COMPLETED Hook](/features/job-completed-hook) page for the full guide.
+`JOB_COMPLETED` fires from `BackgroundJobManager.start_job` for **every** managed background job when it reaches a terminal state (`COMPLETED` or `FAILED`) — not only jobs launched via `spawn_subagent(background=True)`. It does **not** fire for `CANCELLED` or `LOST`. Best-effort: a raising handler cannot crash the worker.
 
 ```python
-from praisonaiagents.hooks import HookEvent, add_hook
+from praisonaiagents.hooks import add_hook, HookResult
 
-@add_hook(HookEvent.JOB_COMPLETED)
 def log_job_result(data):
     print(f"Job {data.job_id} → {data.status}")
     if data.status == "completed":
         print(f"Result: {data.result}")
     else:
         print(f"Error: {data.error}")
+    return HookResult.allow()
+
+add_hook("job_completed", log_job_result)
 ```
 
 #### `JobCompletedInput` Fields
 
+The payload carries flat, typed fields — origin fields are always strings (empty string when unset).
+
 | Field | Type | Description |
 |-------|------|-------------|
 | `job_id` | `str` | Unique job identifier |
-| `status` | `str` | Terminal state: `"completed"` or `"failed"` |
+| `status` | `str` | `"completed"` or `"failed"` |
 | `result` | `Any` | Return value on success; `None` on failure |
 | `error` | `str \| None` | Error message on failure; `None` on success |
-| `agent_name` | `str` | Always `"background"` for manager-emitted jobs |
-| `session_id` | `str` | Origin session id (empty string when unset) |
-| `deliver` | `str` | Delivery token set at spawn time (empty string when unset) |
-| `platform` | `str` | Origin platform (empty string when unset) |
-| `chat_id` | `str` | Origin chat/channel id (empty string when unset) |
-| `thread_id` | `str` | Origin thread id (empty string when unset) |
+| `agent_name` | `str` | Always `"background"` |
+| `session_id` | `str` | Origin session (empty when unset) |
+| `deliver` | `str` | Delivery target (empty when the job was not routed) |
+| `platform` | `str` | Origin platform |
+| `chat_id` | `str` | Origin chat/channel ID |
+| `thread_id` | `str` | Origin thread ID |
 
 Typical uses:
 - Observability and metrics on background job failure rates
@@ -1133,74 +1137,91 @@ Non-list `command` values (already-serialised strings, `None`) pass through unch
 ### Kanban Events
 
 <Note>
-**Where do these come from?** The SQLite kanban store is the single emission chokepoint — every writer (CLI `praisonai kanban ...`, agent tools, the gateway dispatcher, the HTTP API, the UI) goes through it, so one emission per transition covers them all. Subscribe with `add_hook`; you never emit these yourself. See [fire_hook](/features/fire-hook) if you emit your own events.
+**Where do these events come from?** Every writer — the CLI (`praisonai kanban ...`), agent tools, the gateway dispatcher, the HTTP API and the UI — goes through the SQLite store. The store is the single emission chokepoint, so one `fire_hook` per transition covers every writer. You don't call `fire_hook` yourself for these; subscribe with `add_hook` and the store emits.
 </Note>
 
-The store fires six lifecycle events after a transition commits, each carrying a `KanbanHookInput` (unknown keys such as `task` land in `.extra`).
+| Event | Emitted From | Use Case |
+|-------|--------------|----------|
+| `KANBAN_TASK_CREATED` | `create_task`, after commit | Task added to board |
+| `KANBAN_TASK_CLAIMED` | `claim_task`, only when the CAS won | Task assigned |
+| `KANBAN_TASK_MOVED` | `move_task` (every status change), `reclaim_stale_claims`, dispatcher promotion | Task status changed |
+| `KANBAN_TASK_DONE` | `move_task` when destination is `done` (rides alongside `MOVED`) | Task completed |
+| `KANBAN_TASK_BLOCKED` | `move_task` when destination is `blocked`, and `record_failure` on a circuit-breaker trip | Task blocked |
+| `KANBAN_TASK_FAILED` | `record_failure` — one per recorded attempt failure | Task failed |
 
-| Event | Emitted when | Key payload |
-|-------|--------------|-------------|
-| `KANBAN_TASK_CREATED` | Task committed to the board (not on idempotency-key replay) | `task_id`, `board`, `status`, `to_status`, `assignee`, `task` |
-| `KANBAN_TASK_CLAIMED` | A worker wins the claim race (loser emits nothing) | `task_id`, `status`, `from_status`, `to_status`, `assignee`, `worker_pid`, `claim_expires` |
-| `KANBAN_TASK_MOVED` | Any status change (also reclaim and auto-promotion) | `task_id`, `status`, `from_status`, `to_status`, `assignee`, `task` |
-| `KANBAN_TASK_DONE` | Destination is `done` (fires alongside `MOVED`) | `task_id`, `status`, `from_status`, `to_status`, `assignee`, `task` |
-| `KANBAN_TASK_BLOCKED` | Destination is `blocked`, or the circuit breaker trips | `task_id`, `status`, `from_status`, `to_status`, `task` (circuit break adds `consecutive_failures`, `max_retries`, `circuit_broken`, `error`) |
-| `KANBAN_TASK_FAILED` | Each recorded attempt failure | `task_id`, `status`, `from_status`, `to_status`, `consecutive_failures`, `max_retries`, `circuit_broken`, `error` |
+Every kanban event delivers a `KanbanHookInput`. These keys are always present: `task_id`, `board`, `status`, plus `to_status` on every transition and `from_status` on everything except `CREATED`.
+
+| Key | On | Notes |
+|-----|-----|-------|
+| `assignee` | most | `worker_id` for `CLAIMED`/reclaim, current assignee for `MOVED`/`DONE`/`BLOCKED`. |
+| `task` | `CREATED`/`MOVED`/`DONE`/`BLOCKED` | Full `task.to_dict()`. Absent on `FAILED` and reclaim moves. |
+| `reclaimed` | `MOVED` (reclaim only) | `True` when a stale claim was reclaimed. |
+| `reason` | `MOVED` (reclaim only) | `"dead"` or `"stale_heartbeat"`. |
+| `worker_pid` | `CLAIMED` | The claiming worker's PID. |
+| `claim_expires` | `CLAIMED` | ISO-8601 UTC timestamp. |
+| `consecutive_failures` | `FAILED`, `BLOCKED` (on break) | Attempt counter. |
+| `max_retries` | `FAILED`, `BLOCKED` (on break) | Retry limit for the task. |
+| `circuit_broken` | `FAILED`, `BLOCKED` (on break) | `True` when this failure tripped the breaker. |
+| `error` | `FAILED`, `BLOCKED` (on break) | First 500 chars of the failure text. |
 
 ```python
-@registry.on(HookEvent.KANBAN_TASK_MOVED)
-def track_progress(event_data):
-    print(f"Task {event_data.task_id}: {event_data.from_status} → {event_data.to_status}")
+from praisonaiagents.hooks import add_hook, HookResult
+
+def track_progress(data):
+    print(f"Task {data.task_id}: {data.from_status} → {data.to_status}")
     return HookResult.allow()
 
-@registry.on(HookEvent.KANBAN_TASK_BLOCKED)
-def handle_blocked(event_data):
-    print(f"Task blocked: {event_data.task_id}")
-    return HookResult.allow()
+add_hook("kanban_task_moved", track_progress)
 ```
 
-#### A subscriber in a real scenario
-
-A user adds a card; the store commits it and the subscriber runs.
+A subscriber runs the moment a user changes the board.
 
 ```mermaid
 sequenceDiagram
     participant User
     participant Store as Kanban Store
-    participant Hook as KANBAN_TASK_CREATED
+    participant Fire as fire_hook
+    participant Plugin as Subscriber
 
     User->>Store: praisonai kanban add "Ship docs"
-    Store->>Store: commit task
-    Store->>Hook: fire_hook (task_id, board, task)
-    Hook-->>User: log / metric / alert
+    Store->>Store: Commit the new task
+    Store->>Fire: fire_hook("kanban_task_created", {...})
+    Fire->>Plugin: KANBAN_TASK_CREATED
+    Plugin-->>User: Logs the new task
 ```
 
 #### Circuit-breaker double-emit
 
-A `record_failure` that trips the breaker fires **both** `KANBAN_TASK_FAILED` **and** `KANBAN_TASK_BLOCKED`, in that order — a subscriber on each event sees one of each for the same transition.
+A `record_failure` that trips the breaker fires **both** `KANBAN_TASK_FAILED` **and** `KANBAN_TASK_BLOCKED`, in that order. A subscriber on both events sees one of each for the same transition — use `circuit_broken` to detect it.
 
 ```python
-@registry.on(HookEvent.KANBAN_TASK_FAILED)
-def on_failed(event_data):
-    if event_data.extra.get("circuit_broken"):
-        print(f"Task {event_data.task_id} tripped the breaker; a BLOCKED event follows")
+from praisonaiagents.hooks import add_hook, HookResult
+
+def on_failed(data):
+    if data.extra.get("circuit_broken"):
+        print(f"Task {data.task_id} tripped the breaker; BLOCKED follows")
     return HookResult.allow()
+
+add_hook("kanban_task_failed", on_failed)
 ```
 
-#### Reclaim of a stale claim
+#### Reclaim
 
-Reclaiming a stale claim (`running → ready`) fires `KANBAN_TASK_MOVED` with `reclaimed=True` and `reason` in `{"dead", "stale_heartbeat"}`. There is no separate reclaim event.
+Reclaiming a stale claim (`running → ready`) fires `KANBAN_TASK_MOVED` with `reclaimed=True` and `reason` in `{"dead", "stale_heartbeat"}`. There is no separate reclaim event — reclaim *is* a move.
 
 ```python
-@registry.on(HookEvent.KANBAN_TASK_MOVED)
-def on_reclaim(event_data):
-    if event_data.extra.get("reclaimed"):
-        print(f"Reclaimed {event_data.task_id}: {event_data.extra.get('reason')}")
+from praisonaiagents.hooks import add_hook, HookResult
+
+def on_reclaim(data):
+    if data.extra.get("reclaimed"):
+        print(f"Task {data.task_id} reclaimed ({data.extra.get('reason')})")
     return HookResult.allow()
+
+add_hook("kanban_task_moved", on_reclaim)
 ```
 
 <Note>
-When a `workspace_kind="worktree"` task fails to merge cleanly, the dispatcher moves it to `blocked` (which fires `KANBAN_TASK_BLOCKED`) and records the conflicted files on the **task comment thread**, not on the hook payload. Poll them via `kanban_show(task_id)`. See [Kanban → Merge conflict handling](/docs/features/kanban#merge-conflict-handling).
+**Merge conflicts are recorded on the task comment thread, not the hook payload.** When a worktree task fails to merge cleanly, the conflicted files are written to the task's comments (read via `kanban_show(task_id)`) — the `KANBAN_TASK_BLOCKED` payload does not carry `conflicted_files`. See [Kanban → Per-Task Worktree Isolation](/docs/features/kanban#per-task-worktree-isolation).
 </Note>
 
 <Note>
@@ -1220,15 +1241,18 @@ When the dispatcher auto-promotes a child task, `KANBAN_TASK_MOVED` fires with t
 ```
 
 <Note>
-Auto-promotion events (dispatcher-emitted) do **not** include `from_status`, whereas store-emitted `MOVED` events always do. Check for `from_status` absence to distinguish an auto-promotion from a manual move.
+Dispatcher-emitted auto-promotion events do **not** include `from_status`, while store-emitted `MOVED` events always do. Check for its absence to distinguish an auto-promotion from a manual move.
 </Note>
 
 ```python
-@registry.on(HookEvent.KANBAN_TASK_MOVED)
-def on_auto_promotion(event_data):
-    if event_data.get("to_status") == "ready" and not event_data.get("from_status"):
-        print(f"Task {event_data['task_id']} auto-promoted to ready")
+from praisonaiagents.hooks import add_hook, HookResult
+
+def on_auto_promotion(data):
+    if data.to_status == "ready" and not data.from_status:
+        print(f"Task {data.task_id} auto-promoted to ready")
     return HookResult.allow()
+
+add_hook("kanban_task_moved", on_auto_promotion)
 ```
 
 ---
