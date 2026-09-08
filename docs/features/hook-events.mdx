@@ -38,7 +38,7 @@ sequenceDiagram
 
 
 <Note>
-This page covers **in-process lifecycle hooks** (SETUP, SESSION_START, BEFORE_AGENT, etc.) that fire inside a running agent. For **HTTP inbound triggers** that start agent runs from external services via `POST /hooks/<path>`, see [Gateway Inbound Hooks](/features/gateway-inbound-hooks).
+This page covers **in-process lifecycle hooks** (SESSION_START, BEFORE_AGENT, etc.) that fire inside a running agent. For **HTTP inbound triggers** that start agent runs from external services via `POST /hooks/<path>`, see [Gateway Inbound Hooks](/features/gateway-inbound-hooks).
 </Note>
 
 <Note>
@@ -101,9 +101,7 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph "Agent Lifecycle Events"
-        A[🚀 SETUP] --> B[📥 SESSION_START]
-        B --> C[💬 USER_PROMPT_SUBMIT]
-        C --> D[🤖 BEFORE_AGENT]
+        B[📥 SESSION_START] --> D[🤖 BEFORE_AGENT]
         D --> E[🧠 BEFORE_LLM]
         E --> F[📋 BEFORE_TOOL_DEFINITIONS]
         F --> G[📤 AFTER_LLM]
@@ -113,19 +111,16 @@ graph TB
         J --> K[✅ AFTER_AGENT]
         K --> L[📴 SESSION_END]
     end
-    
-    classDef setup fill:#6366F1,stroke:#7C90A0,color:#fff
+
     classDef session fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef agent fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
-    
-    class A setup
+
     class B,L session
-    class C,D,K agent
+    class D,K agent
     class E,F,G,H,J tool
     class I result
-
 ```
 
 ## Quick Start
@@ -640,54 +635,96 @@ agent = Agent(
 
 ### User Interaction Events
 
-| Event | Trigger | Use Case |
-|-------|---------|----------|
-| `USER_PROMPT_SUBMIT` | User submits prompt | Input validation, logging |
-| `NOTIFICATION` | Notification sent | Alert routing |
+<Note>
+There is no dedicated `USER_PROMPT_SUBMIT` event. `BEFORE_AGENT` is the closest live equivalent — it fires at `Agent.chat()` entry carrying the mutable `prompt` and can block — but it also fires for internal / sub-agent invocations no user ever submitted, so an audit hook subscribed to it will over-report. Filter on `event_data.parent_agent_name is None` if you only care about top-level user prompts.
 
-```python
-@registry.on(HookEvent.USER_PROMPT_SUBMIT)
-def on_prompt(event_data):
-    print(f"User prompt: {event_data.prompt}")
-    # Validate or modify input
-    return HookResult.allow()
-
-@registry.on(HookEvent.NOTIFICATION)
-def on_notification(event_data):
-    print(f"Notification: {event_data.message}")
-    # Route to external service
-    return HookResult.allow()
-```
+There is no `NOTIFICATION` event.
+</Note>
 
 ### Subagent Events
 
 | Event | Trigger | Use Case |
 |-------|---------|----------|
-| `SUBAGENT_STOP` | Subagent completes | Result handling |
+| `SUBAGENT_STOP` | A subagent spawned via `spawn_subagent` reaches a terminal state (success or failure) | Result handling, telemetry, cost accounting |
+
+Fires exactly once per subagent from the single completion chokepoint in `tools/subagent_tool.py` — covers synchronous spawns, `background=True` jobs, resolver-routed named agents, generic factory spawns, simulation mode, and failures.
 
 ```python
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult, SubagentStopInput
+
 @registry.on(HookEvent.SUBAGENT_STOP)
-def on_subagent_stop(event_data):
-    print(f"Subagent completed: {event_data.agent_name}")
-    print(f"Result: {event_data.result}")
+def on_subagent_stop(event_data: SubagentStopInput):
+    print(f"Subagent: {event_data.agent_name}")
+    print(f"Task:     {event_data.task}")
+    print(f"Success:  {event_data.success}")
+    if event_data.success:
+        print(f"Output:   {event_data.output}")
+    else:
+        print(f"Error:    {event_data.error}")
+    print(f"LLM:      {event_data.llm}")
+    print(f"Depth:    {event_data.depth}")
+    print(f"Duration: {event_data.duration_ms:.1f} ms")
     return HookResult.allow()
 ```
+
+**Observe-only.** Errors in the hook never break the subagent — the emit is fully guarded.
+
+#### `SubagentStopInput` Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `task` | `str` | `""` | The task string the subagent was spawned with |
+| `success` | `bool` | `True` | `False` when the subagent raised |
+| `output` | `Any` | `None` | Terminal output — serialised via `str()` in `to_dict()` |
+| `error` | `Optional[str]` | `None` | Error message when `success` is False |
+| `llm` | `Optional[str]` | `None` | Effective LLM used |
+| `permission_mode` | `Optional[str]` | `None` | Effective permission mode |
+| `depth` | `int` | `0` | Depth of the subagent in the spawn tree |
+| `duration_ms` | `float` | `0.0` | Wall-clock time from spawn to terminal state |
+| `agent_name`, `session_id`, `cwd`, `event_name`, `timestamp` | — | — | Standard `HookInput` fields (`agent_name` carries the subagent name) |
+
+### Plugin Lifecycle Events
+
+| Event | Trigger | Payload |
+|-------|---------|---------|
+| `ON_INIT` | Emitted by `PluginManager.register()` right after the plugin runs its own `on_init` | `PluginLifecycleInput` |
+| `ON_SHUTDOWN` | Emitted by `PluginManager.unregister()` right after the plugin runs its own `on_shutdown` | `PluginLifecycleInput` |
+
+`plugin.on_init` / `plugin.on_shutdown` are the plugin's *own* callbacks; `ON_INIT` / `ON_SHUTDOWN` are the runtime events **other** listeners (metrics/audit plugins, gateways) subscribe to. Lets an observability plugin see the plugin set change at runtime instead of polling `list_plugins()`.
+
+```python
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult, PluginLifecycleInput
+
+@registry.on(HookEvent.ON_INIT)
+def on_plugin_registered(event_data: PluginLifecycleInput):
+    print(f"Plugin loaded: {event_data.plugin_name} v{event_data.plugin_version}")
+    return HookResult.allow()
+
+@registry.on(HookEvent.ON_SHUTDOWN)
+def on_plugin_removed(event_data: PluginLifecycleInput):
+    print(f"Plugin unloaded: {event_data.plugin_name}")
+    return HookResult.allow()
+```
+
+**Observe-only.** Fully guarded — a failing hook never breaks plugin loading. Zero cost when nothing is listening (early-out on `registry.has_hooks(...)`).
+
+#### `PluginLifecycleInput` Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `plugin_name` | `str` | `""` | Registered plugin name |
+| `plugin_version` | `str` | `""` | Plugin version |
+| `plugin_description` | `str` | `""` | Plugin description |
+| `agent_name`, `session_id`, `cwd`, `event_name`, `timestamp` | — | — | Standard `HookInput` fields |
 
 ### System Events
 
 | Event | Trigger | Use Case |
 |-------|---------|----------|
-| `SETUP` | Initialization/maintenance | Config loading |
 | `BEFORE_COMPACTION` | Before context compaction | Pre-compaction hooks |
 | `AFTER_COMPACTION` | After context compaction | Post-compaction validation |
 
 ```python
-@registry.on(HookEvent.SETUP)
-def on_setup(event_data):
-    print("System initializing...")
-    # Load configuration
-    return HookResult.allow()
-
 @registry.on(HookEvent.BEFORE_COMPACTION)
 def before_compaction(event_data):
     print(f"Compacting context: {event_data.token_count} tokens")
@@ -718,6 +755,25 @@ Plugin persisters subscribe to `AFTER_COMPACTION` to read `event_data.summary`. 
 | `MESSAGE_SENDING` | Before message sent | `MessageSendingInput` | Outbound gate — cancel or rewrite outbound text |
 | `MESSAGE_SENT` | After message sent | `MessageSentInput` | Confirmation |
 | `MESSAGE_UNDELIVERED` | Reply permanently undeliverable (target confirmed dead / retries exhausted) | `MessageUndeliveredInput` | **Operator routing** — mirror to home channel, alert, or re-queue |
+
+#### Aliased Events
+
+Three `HookEvent` members are **aliases** — the enum member and its live target are the same object. Registration on the alias is registration on the live event.
+
+| Alias | Live event | Notes |
+|-------|-----------|-------|
+| `HookEvent.BEFORE_MESSAGE` | `HookEvent.MESSAGE_RECEIVED` | The plugin-facing `Plugin.before_message` method has always routed here |
+| `HookEvent.AFTER_MESSAGE` | `HookEvent.MESSAGE_SENDING` | Outbound counterpart |
+| `HookEvent.TOOL_RESULT_PERSIST` | `HookEvent.AFTER_TOOL` | `AFTER_TOOL` already sees the result before it is written into the conversation |
+
+```python
+>>> HookEvent.BEFORE_MESSAGE is HookEvent.MESSAGE_RECEIVED
+True
+>>> HookEvent("before_message") is HookEvent.MESSAGE_RECEIVED
+True
+```
+
+Legacy string values (`"before_message"`, `"after_message"`, `"tool_result_persist"`) still resolve — config files, `add_hook("before_message", ...)` calls, and any other string-based registration keep working unchanged.
 
 `MESSAGE_RECEIVED` is a **first-class control point**: hooks can drop an inbound message so the agent never runs, or rewrite the message content before the agent (or memory) sees it. This is symmetric with `MESSAGE_SENDING` on the outbound side.
 
@@ -943,10 +999,12 @@ Typical uses:
 
 | Event | Trigger | Use Case |
 |-------|---------|----------|
-| `TOOL_RESULT_PERSIST` | Before result storage | Result modification |
+| `TOOL_RESULT_PERSIST` | Alias of `AFTER_TOOL` (see [Aliased Events](#aliased-events)) — subscribe to `AFTER_TOOL` directly | Result modification |
+
+`TOOL_RESULT_PERSIST` resolves to the same enum member as `AFTER_TOOL` — there is no separate persistence chokepoint. Subscribe to `AFTER_TOOL`, which already sees the tool result before it is written into the conversation.
 
 ```python
-@registry.on(HookEvent.TOOL_RESULT_PERSIST)
+@registry.on(HookEvent.AFTER_TOOL)
 def on_persist(event_data):
     print(f"Persisting: {event_data.tool_name}")
     # Modify or filter result before storage
@@ -1143,19 +1201,20 @@ def on_auto_promotion(event_data):
 | `BEFORE_LLM` | LLM | Before LLM API call — fires sync + async |
 | `AFTER_LLM` | LLM | After LLM response — fires sync + async |
 | `MODEL_FALLBACK` | LLM | Primary model unavailable mid-turn — runtime switched to the next `fallback_models` entry (observe-only; provider internals redacted). See [Model Fallback → Observing the Switch](/features/model-fallback#observing-the-switch). |
+| `ON_INIT` | Plugin | A plugin was registered — fires from `PluginManager.register()` after `plugin.on_init`. Payload: `PluginLifecycleInput` |
+| `ON_SHUTDOWN` | Plugin | A plugin was unregistered — fires from `PluginManager.unregister()` after `plugin.on_shutdown`. Payload: `PluginLifecycleInput` |
 | `SESSION_START` | Session | Session starts |
 | `SESSION_END` | Session | Session ends |
 | `SESSION_PERSIST_FAILED` | Session | A durable session write failed **or** a stored session file was found corrupt at load time — observe-only; a failed write is spilled and re-ingested (see [Write-failure salvage](/features/session-persistence#write-failure-salvage)), a corrupt read is quarantined (see [Corruption-quarantine on load](/features/session-persistence#corruption-quarantine-on-load)) |
 | `ON_ERROR` | Error | Error occurs |
 | `ON_RETRY` | Error | Before retry |
-| `USER_PROMPT_SUBMIT` | User | User submits prompt |
-| `NOTIFICATION` | User | Notification sent |
-| `SUBAGENT_STOP` | Subagent | Subagent completes |
-| `SETUP` | System | Initialization |
+| `SUBAGENT_STOP` | Subagent | A subagent spawned via `spawn_subagent` reached a terminal state. Fires once from the single completion chokepoint — covers sync, background, resolver-routed, factory spawns, simulation, and failures. Payload: `SubagentStopInput` |
 | `BEFORE_COMPACTION` | Context | Before compaction |
 | `AFTER_COMPACTION` | Context | After compaction |
 | `MESSAGE_RECEIVED` | Message | Inbound gate — drop (deny) or redact/rewrite before agent dispatch; payload carries enriched identity (`platform`, `sender_id`, `channel_id`, `channel_type`, `message_id`, `session_id`) (see [Inbound Message Gate](/features/inbound-message-gate)) |
 | `MESSAGE_SENDING` | Message | Outbound gate — cancel or rewrite before sending; payload carries the enriched identity fields |
+| `BEFORE_MESSAGE` | Message | **Alias of `MESSAGE_RECEIVED`.** Subscribe to `MESSAGE_RECEIVED` directly |
+| `AFTER_MESSAGE` | Message | **Alias of `MESSAGE_SENDING`.** Subscribe to `MESSAGE_SENDING` directly |
 | `MESSAGE_SENT` | Message | After successful delivery; enriched identity payload — also the plugin `message_sent(message)` bridge |
 | `MESSAGE_UNDELIVERED` | Message | Reply permanently undeliverable — operator routing; enriched identity payload plus `error`/`notice_delivered`, also the plugin `message_undelivered(message)` bridge (see [Undelivered Message Notice](/features/undelivered-messages)) |
 | `GATEWAY_START` | Gateway | Gateway starts |
@@ -1164,7 +1223,7 @@ def on_auto_promotion(event_data):
 | `SCHEDULE_REMOVE` | Schedule | Schedule job deleted (store `remove`/`remove_by_name`/one-shot cleanup) |
 | `SCHEDULE_TRIGGER` | Schedule | Scheduled job runs |
 | `JOB_COMPLETED` | Background | Background job reached terminal state (COMPLETED or FAILED) |
-| `TOOL_RESULT_PERSIST` | Storage | Before result storage |
+| `TOOL_RESULT_PERSIST` | Storage | **Alias of `AFTER_TOOL`.** Subscribe to `AFTER_TOOL` directly — the two names resolve to the same enum member |
 | `CLI_BACKEND_EXECUTE` | CLI Backend | Fires after an Agent delegates a turn to a CLI backend subprocess (success **and** failure). Observe-only. |
 | `KANBAN_TASK_CREATED` | Kanban | Task added to board |
 | `KANBAN_TASK_CLAIMED` | Kanban | Task assigned |
