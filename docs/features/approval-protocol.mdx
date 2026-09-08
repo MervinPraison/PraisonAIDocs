@@ -162,7 +162,7 @@ The request object a backend receives, describing the tool call awaiting approva
 
 ### `ApprovalDecision` fields
 
-The decision object a backend returns. Denials can carry a `feedback` string to steer the agent's next turn.
+The decision object a backend returns. Denials can carry a `feedback` string to steer the agent's next turn, and a decision may instead be a **deferral** carrying `escalate=True` that hands the call to a human.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -174,6 +174,7 @@ The decision object a backend returns. Denials can carry a `feedback` string to 
 | `scope` | `str` | `"once"` | How long the decision is remembered: `"once"`, `"session"`, or `"always"`. |
 | `scope_pattern` | `Optional[str]` | `None` | Reusable target/pattern to persist for `always`. |
 | `feedback` | `Optional[str]` | `None` | Free-text guidance supplied by the user when denying a tool call (via `[d] deny & redirect` on `ConsoleBackend` or the Rich/Textual reject dialog). When present on a denial, `tool_execution.py` folds it into the denied tool's `error_msg` as course-correction for the next turn. `None` (default) keeps today's plain-deny semantics. |
+| `escalate` | `bool` | `False` | When `True`, the decision is a *deferral to a human*, not a final verdict — the autonomous reviewer was uncertain and asks a person to decide instead of failing open or blindly denying. Enforced invariant: `escalate=True` always forces `approved=False` (fail-closed), so a consumer that ignores this flag keeps today's safe deny-by-default; a human-in-the-loop backend may route escalated requests to a person. |
 
 ---
 
@@ -297,6 +298,8 @@ agent = Agent(
     approval=SlackBackend()
 )
 ```
+
+A custom backend may also return `ApprovalDecision(approved=False, escalate=True)` to signal a deferral to a human. Consumers that only check `approved` still fail-closed correctly, since `escalate=True` forces `approved=False`.
 
 ---
 
@@ -546,7 +549,7 @@ agent = Agent(
 
 ## Agent Approval
 
-Delegate approval decisions to another AI agent. The approver agent evaluates the tool call and responds with APPROVE or DENY.
+Delegate approval decisions to another AI agent. The reviewer sees the tool name and arguments as untrusted data and returns one of `APPROVE`, `DENY`, or `ESCALATE`.
 
 ```python
 from praisonaiagents import Agent
@@ -565,6 +568,14 @@ worker = Agent(
 )
 ```
 
+The reviewer prompt is hardened against prompt injection:
+
+- The tool name and arguments are wrapped in an `<arguments>…</arguments>` untrusted-data block; forged `<arguments>`/`</arguments>` tags in the tool name or values are neutralised to `‹arguments›`.
+- Command-like argument values (keys in `{command, cmd, commands, script, shell, code, source, program}`) have any trailing `# …` shell comment stripped before the reviewer sees them; other args pass through unchanged.
+- The reviewer replies with one of `APPROVE` / `DENY` / `ESCALATE`. Parsing is fail-closed: empty, ambiguous, mixed, or negated ("DO NOT APPROVE") responses → `DENY`; `ESCALATE` yields `ApprovalDecision(approved=False, escalate=True)`.
+
+The sanitiser only cleans the copy shown to the reviewer — the arguments the tool actually receives are unchanged.
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `approver_agent` | Auto-created | Agent instance to evaluate requests |
@@ -573,6 +584,28 @@ worker = Agent(
 <Note>
   `AgentApproval` lives in the core SDK (`praisonaiagents.approval`) — no extra dependencies needed.
 </Note>
+
+<Warning>
+`AgentApproval` uses an LLM to decide. The prompt has been hardened against prompt injection since [PraisonAI PR #4954](https://github.com/MervinPraison/PraisonAI/pull/4954) (untrusted-data delimiters, shell-comment stripping, tri-state verdict), but an LLM reviewer is still weaker than an explicit policy or a human. Pair it with a stricter backend (gateway policy, human approval on high-risk tools) for defence in depth.
+</Warning>
+
+### Handling ESCALATE
+
+When the reviewer is uncertain it returns `escalate=True` — route the request to a human instead of guessing.
+
+```python
+decision = await backend.request_approval(request)
+
+if decision.approved:
+    run_tool()
+elif decision.escalate:
+    # Reviewer deferred to a human — route to a HITL channel
+    route_to_human(request, decision)
+else:
+    deny(decision.reason)
+```
+
+See [AgentApproval Hardening](/features/approval-agent-hardening) for the full security model.
 
 ---
 
