@@ -148,7 +148,7 @@ Use Shell Tools to execute shell commands with AI agents.
   <Card title="Shell Options" icon="sliders">
     Customize shell operations:
     ```python
-    timeout=30, shell=True
+    timeout=30
     ```
   </Card>
 </CardGroup>
@@ -246,6 +246,7 @@ Safely executes shell commands:
 - **Dangerous command blocking** (PR #2062) — `rm`, `mkfs`, `dd`, `shutdown`, etc.
 - Environment and working directory control
 - **Large output spill** — over-budget output is saved to a retrievable artifact
+- **Shell syntax refusal** (PR #4968) — redirects, pipes, chains, substitutions and newlines are refused with a named-token error rather than silently mangled
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -258,7 +259,7 @@ Safely executes shell commands:
 | `spill_dir` | `Optional[str]` | `None` | Directory for artifacts (overrides `PRAISONAI_TOOL_OUTPUT_DIR`). |
 
 <Note>
-Commands always run with `shell=False` for security. The command string is split with `shlex`, so pipes and redirects are not interpreted.
+Commands always run with `shell=False` for security — the string is split with `shlex`, not handed to a shell. To keep agents from being told an unsupported redirect/pipe/chain succeeded, this tool now **refuses** those commands with an error naming the token. To combine steps, call `execute_command` once per step.
 </Note>
 
 ### Dangerous Command Protection
@@ -332,6 +333,89 @@ result = execute_command(
 #     'stdout_artifact': '/tmp/praisonai_tool_output/stdout_xxxxx.txt',
 #     'stderr_artifact': '/tmp/praisonai_tool_output/stderr_xxxxx.txt'
 # }
+```
+
+### Refused Shell Syntax
+
+`execute_command` refuses shell metacharacters it cannot honour so agents get a clear error instead of a silent no-op.
+
+Because commands run with `shell=False`, a redirect like `>` is never interpreted — it becomes a literal argument. Before PR #4968, `execute_command("echo written > redir.txt")` returned `success=True` with `stdout="written > redir.txt\n"` and no file, so the agent was told its redirect had succeeded with nothing to correct on. Now the tool refuses the command and names the offending token, so the agent can run the steps separately instead.
+
+Tokens refused when they appear **outside quotes**:
+
+| Command | Refused? | Reason |
+|---|---|---|
+| `echo written > redir.txt` | Yes (`>`) | unquoted redirect |
+| `echo a >> log.txt` | Yes (`>>`) | unquoted redirect |
+| `cd .. && pwd` | Yes (`&&`) | unquoted chain |
+| `false \|\| echo fallback` | Yes (`\|\|`) | unquoted chain |
+| `ls \| head` | Yes (`\|`) | unquoted pipe |
+| `echo a; echo b` | Yes (`;`) | unquoted separator |
+| `echo $(whoami)` | Yes (`$(`) | unquoted substitution |
+| `echo "$(whoami)"` | Yes (`$(`) | POSIX shells evaluate `$(...)` inside double quotes |
+| ``echo "`whoami`"`` | Yes (`` ` ``) | same for backticks |
+| `echo 'a \| b'` | No | single-quoted, literal |
+| `echo '$(whoami)'` | No | single-quoted, literal |
+| `git commit -m "fix: a > b"` | No | `>` inside double quotes is inert |
+| `echo first\ntouch proof.txt` | Yes (`\n`) | newline separates commands like `;` |
+
+The `\r` carriage return is also treated as a separator.
+
+When refused, the result names the token and reports failure:
+
+```python
+{
+    "error": "Shell syntax '>' is not supported by this executor, which runs commands directly (shell=False) so untrusted input cannot reach a shell. Run the steps separately, or use a tool that provides a real shell inside a sandbox.",
+    "stdout": "",
+    "stderr": "",
+    "exit_code": 1,
+    "success": False,
+}
+```
+
+An agent that tries a redirect is refused, then writes the file with `write_file` instead:
+
+```python
+from praisonaiagents import Agent, execute_command
+from praisonaiagents.tools import write_file
+
+agent = Agent(
+    name="ShellAssistant",
+    instructions="Run shell commands. If a redirect or pipe is refused, use write_file or run the steps separately.",
+    tools=[execute_command, write_file],
+)
+
+# The agent tries: execute_command("echo hello > out.txt")
+#   → refused with "Shell syntax '>' is not supported by this executor..."
+# The agent recovers by calling write_file("out.txt", "hello") instead.
+agent.start("Save 'hello' to out.txt")
+```
+
+<Tip>
+Quotes decide what counts as syntax. Single-quoted content is left alone (`echo '$(whoami)'` runs literally), but `$(...)` and backticks are still refused inside **double** quotes because POSIX shells evaluate them there.
+</Tip>
+
+Users seeing this for the first time need to know what to do instead:
+
+```mermaid
+graph TB
+    A[Need a redirect / pipe / chain?] --> E[execute_command]
+    E --> R{Shell syntax outside quotes?}
+    R -->|yes| X[Refused: named-token error]
+    X --> S1[Split into separate execute_command calls]
+    X --> S2[Use file_tools: read_file / write_file]
+    X --> S3[Use a sandboxed shell tool]
+    R -->|no| OK[Run command]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class E tool
+    class R,X warn
+    class S1,S2,S3,OK ok
 ```
 
 ### Large Output Handling
@@ -537,23 +621,21 @@ for process in list_processes():
 
 3. Command Execution:
 ```python
-# Run a series of maintenance commands
+# Run maintenance commands one at a time — call the binary directly, no shell syntax
 commands = [
     "apt-get update",
     "apt-get upgrade -y",
-    "apt-get autoremove -y"
+    "apt-get autoremove -y",
 ]
 for cmd in commands:
-    result = execute_command(
-        cmd,
-        timeout=300,
-        shell=True
-    )
+    result = execute_command(cmd, timeout=300)
     if result['success']:
         print(f"Command succeeded: {cmd}")
     else:
         print(f"Command failed: {result['stderr']}")
 ```
+
+Chaining these with `&&` or piping with `|` would be refused; run each command as its own `execute_command` call, as shown.
 
 ## Best Practices
 
@@ -614,6 +696,8 @@ agents = AgentTeam(
     agents=[commander, monitor],
     tasks=[command_task, monitor_task]
 )
+agents.start()
+```
 
 ## Related
 
@@ -626,5 +710,8 @@ agents = AgentTeam(
   </Card>
   <Card title="Tool Output Spill" icon="file-arrow-down" href="/docs/features/tool-output-spill">
     Save large command output to a retrievable artifact
+  </Card>
+  <Card title="Protected Paths" icon="shield" href="/docs/features/protected-paths">
+    Guard sensitive files from tool writes
   </Card>
 </CardGroup>
