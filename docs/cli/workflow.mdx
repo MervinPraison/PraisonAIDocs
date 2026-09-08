@@ -5,7 +5,7 @@ description: "Create and execute reusable multi-step workflows"
 icon: "diagram-project"
 ---
 
-The `workflow` command manages reusable multi-step workflows stored in `.praison/workflows/`.
+The `workflow` command manages reusable multi-step workflows stored in `.praisonai/workflows/`.
 
 <Info>
 **Install requirement:** `praisonai workflow` requires `pip install praisonai` (the full wrapper). On a standalone `pip install praisonai-code` install these subcommands (`list`, `show`, `run`) exit `1` with `workflow requires the full wrapper. Install the full wrapper: pip install praisonai` — a single-line hint, no Rich traceback ([PR #2854](https://github.com/MervinPraison/PraisonAI/pull/2854)).
@@ -285,7 +285,7 @@ The `framework:` validation only applies to the native YAML workflow executor (`
 
 ## Workflow File Format
 
-Workflows are stored in `.praison/workflows/` as **Markdown files** with YAML frontmatter:
+Workflows are stored in `.praisonai/workflows/` as **Markdown files** with YAML frontmatter:
 
 ```markdown
 ---
@@ -329,7 +329,7 @@ Write a blog post about {{topic}} using the research data.
 
 ## How It Works
 
-1. **Load**: Workflow file is loaded from `.praison/workflows/`
+1. **Load**: Workflow file is loaded from `.praisonai/workflows/`
 2. **Variables**: Variables are substituted into step prompts
 3. **Execution**: Each step is executed sequentially with its configured agent
 4. **Context**: Results from each step are passed to the next
@@ -341,6 +341,68 @@ flowchart TD
     C -->|context| D[Step 2: Write<br/>Writer Agent]
     D --> E[Complete]
 ```
+
+## Exit Codes
+
+`praisonai workflow` now returns process exit codes that reflect what actually happened, so CI, benchmarks, and shell pipelines can branch on success without parsing stdout.
+
+| Command | Success | Failure |
+|---------|---------|---------|
+| `workflow run <name>` | `0` when **every** step succeeds | non-zero when any step fails, the file is missing, or (hierarchical) the manager rejects or raises |
+| `workflow validate <file>` | `0` on a valid file | non-zero on validation errors |
+| `workflow list` / `workflow show` | `0` | — |
+| `workflow help` | `2` | — (Typer rejects the bare `help` topic before the legacy path) |
+
+<Warning>
+**Behaviour change (PraisonAI PR #4946).** An `agent`/`action` step that produces **no output** is now a **step failure**, not a warning. Previously every path in the `workflow` handler exited `0` even when steps failed — the fix behind `.github/workflows/praisonai-pr-review.yml` no longer passing unconditionally. Any recipe, tutorial, or CI job that shells out to `praisonai workflow run` and swallows the exit code should be updated: a non-zero exit is now a signal, not noise.
+</Warning>
+
+Before the fix, a failed model call was silently swallowed and the run still reported success:
+
+```text
+[Writer] Authentication failed for openai.
+⚠️  Step 'haiku': Output is None.
+✅ Workflow completed successfully!
+EXIT=0
+```
+
+After the fix, the same run fails loudly:
+
+```text
+❌ Workflow failed: haiku: agent produced no output (None) — the model call most likely failed
+EXIT=1
+```
+
+<Note>
+`handler` steps are unchanged — a custom Python `handler` may legitimately return `None`. Only `agent` and `action` steps are treated as failures when they produce nothing.
+</Note>
+
+### The `error` field on a failed result
+
+A failed `Workflow.start()` (or `.run()`) result carries an `error` string describing the first failure. It is populated whenever the final workflow status is `failed`; a successful run does not set it.
+
+```python
+from praisonaiagents import Workflow
+
+result = Workflow(...).start()
+if result.get("error"):
+    print("workflow failed:", result["error"])
+```
+
+| Failure | Example `error` value |
+|---------|-----------------------|
+| LLM produced `None` | `haiku: agent produced no output (None) — the model call most likely failed` |
+| Manager rejected the step (hierarchical) | `Manager rejected step 'review': output is off-topic` |
+| Manager call raised (hierarchical) | the underlying exception text from the manager LLM call |
+
+### Hierarchical Mode Validation
+
+When a workflow runs with `process="hierarchical"`, a manager LLM judges each step's output. Three fail-open defects are fixed as of PR #4946:
+
+- **Manager rejections are honoured.** The manager verdict is parsed with the engine's own `_parse_json_output` helper (the same one used elsewhere in the engine), which strips the ```` ```json ```` fences models routinely emit. A bare `json.loads` used to raise `JSONDecodeError` on every fenced reply and substitute `{"approved": true, "reason": "assuming success"}`, silently discarding a rejection. Now `"approved": false` fails the run.
+- **An unreadable verdict fails closed.** If the manager response cannot be parsed into a dict, it is treated as *not approved* rather than assumed successful.
+- **A manager outage fails the run.** Exceptions raised during the manager call are now failures, not a logged-and-ignored pass.
+- **A step that produced nothing is judged too** — the same no-output rule from the sequential path applies here.
 
 ## Examples
 
