@@ -165,6 +165,155 @@ graph TB
 
 ---
 
+## Remote-sandbox media (Modal, E2B, Daytona, Fly.io, SSH, …)
+
+When an agent runs off-box in a remote sandbox and generates a file, the gateway fetches the artifact back and delivers it through the same MEDIA path — the user gets the file automatically.
+
+```python
+from praisonaiagents import Agent, SandboxConfig
+
+chart_agent = Agent(
+    name="ChartAgent",
+    instructions=(
+        "Generate the requested chart, save it under /workspace/, "
+        "then return a MEDIA:/workspace/<filename>.png line."
+    ),
+    sandbox=SandboxConfig(sandbox_type="modal"),   # or e2b, daytona, flyio, ssh, novita
+)
+chart_agent.start("Draw a sales chart for Q1 and send it to the user.")
+```
+
+The user sends a message. The agent runs remotely, writes the chart on the sandbox filesystem, and returns `MEDIA:/workspace/chart.png`. The gateway detects the remote path, fetches it back, re-screens it, and delivers it — no extra wiring.
+
+```mermaid
+graph LR
+    subgraph "Remote-sandbox media bridge"
+        A[🤖 Agent<br/>in remote sandbox] --> M[📎 MEDIA:/workspace/chart.png]
+        M --> D{🔍 Local file?}
+        D -->|yes / http URL| G[✅ Deliver]
+        D -->|no| R{🧭 Resolver owns path?}
+        R -->|no| X[⚠️ Drop + warn]
+        R -->|yes| F[⬇️ fetch_to_local]
+        F --> V[🛡️ validate_media_delivery_path]
+        V -->|reject| X
+        V -->|accept| G
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef skip fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class M,F,V process
+    class D,R decision
+    class X skip
+    class G result
+```
+
+### End-to-end flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent as Agent (remote sandbox)
+    participant Parser as split_media_from_output_async
+    participant Resolver as RemoteMediaResolver<br/>(sandbox backend)
+    participant Guard as validate_media_delivery_path
+    participant Adapter as Bot Adapter
+
+    User->>Agent: "Draw a Q1 sales chart"
+    Agent-->>Parser: "Here it is.\nMEDIA:/workspace/sales.png"
+    Parser->>Parser: os.path.exists("/workspace/sales.png") → False
+    Parser->>Resolver: owns_path("/workspace/sales.png")
+    Resolver-->>Parser: True
+    Parser->>Resolver: await fetch_to_local("/workspace/sales.png")
+    Resolver-->>Parser: "/tmp/agent-media/…/sales.png" (local copy)
+    Parser->>Guard: validate_media_delivery_path(local_copy)
+    Guard-->>Parser: ✅ safe
+    Parser-->>Adapter: media_urls=[local_copy], text="Here it is."
+    Adapter-->>User: "Here it is." + sales.png attached
+```
+
+### Behaviour
+
+| MEDIA path shape | Resolver present? | Behaviour |
+|------------------|-------------------|-----------|
+| Local file that exists on the gateway host | any | Delivered as before |
+| `http://` / `https://` URL | any | Delivered as before |
+| Sandbox path (e.g. `/workspace/chart.png`) | ❌ none | **Dropped + warning logged** (historical behaviour) |
+| Sandbox path owned by resolver | ✅ | Fetched to local, re-screened, delivered |
+| Sandbox path **not** owned by resolver | ✅ | **Dropped + warning logged** |
+| Sandbox path, `fetch_to_local` raises | ✅ | **Dropped + warning logged**, never crashes the reply |
+| Fetched file rejected by delivery guard | ✅ | **Dropped + warning logged** |
+
+Unlike the old silent drop, the operator now always gets a `logger.warning(...)` when a MEDIA path is undeliverable, so the failure is visible in logs.
+
+### The `RemoteMediaResolver` protocol
+
+Exported from `praisonaiagents.gateway`:
+
+```python
+from praisonaiagents.gateway import RemoteMediaResolver
+
+@runtime_checkable
+class RemoteMediaResolver(Protocol):
+    """Resolves a sandbox-local media path to a gateway-local deliverable path."""
+
+    def owns_path(self, path: str) -> bool:
+        """True if `path` refers to a file inside this sandbox."""
+        ...
+
+    async def fetch_to_local(self, remote_path: str) -> str:
+        """Fetch `remote_path` out of the sandbox to a local path.
+        The caller re-screens the returned path through the outbound-path guard."""
+        ...
+```
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `owns_path` | `(path: str) -> bool` | Non-blocking check: is this a path inside my sandbox? |
+| `fetch_to_local` | `async (remote_path: str) -> str` | Pull the artifact into a local delivery cache; returns the gateway-local path |
+
+Each remote sandbox backend already has a `download_file` / `read_file` primitive (Modal `read_file`, E2B `read_file`, Daytona `fs.download_file`, Fly.io `compute.download_file`, SSH `read_file`, Docker `download_file`, Novita `read_file`, Subprocess `read_file`). The active sandbox backend for the turn is the resolver — application code does **not** implement this protocol itself.
+
+### Compatibility & safety
+
+- **Byte-for-byte backward compatible.** With no resolver in play, `split_media_from_output_async()` returns the same dict shape and values as the existing `split_media_from_output()` — local paths and URLs are untouched.
+- **No new required parameters on `Agent`.** No new dependencies added. No per-turn plumbing surfaced to user code.
+- **The exfiltration guard still runs.** Fetched artifacts are re-screened by `validate_media_delivery_path()` before delivery, so the system-directory / credential-basename denylist, size cap, strict-mode allowlist, and `recent_mtime_seconds` window all still apply. See [Path safety guard](#path-safety-guard).
+- **Fail-open on error.** A resolver failure (missing/wrong backend, download error, guard rejection) degrades to the historical silent drop **plus** an operator-visible warning — never a crash on the reply path.
+- **The sync `split_media_from_output()` is unchanged.** Only the new async variant `split_media_from_output_async()` is remote-aware.
+
+### When does this fire?
+
+```mermaid
+graph TB
+    A[Agent returned MEDIA:&lt;path&gt;] --> L{Path exists locally<br/>or starts with http?}
+    L -->|yes| DEL[✅ Deliver as before]
+    L -->|no| S{Turn ran in a remote sandbox<br/>with a resolver?}
+    S -->|no| DROP[⚠️ Drop + warn]
+    S -->|yes| O{Resolver owns_path?}
+    O -->|no| DROP
+    O -->|yes| F[⬇️ fetch_to_local]
+    F --> V{Guard accepts?}
+    V -->|no| DROP
+    V -->|yes| DEL
+
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef deliver fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef drop fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class L,S,O,V decision
+    class DEL deliver
+    class DROP drop
+    class F step
+```
+
+---
+
 ## Configuration (`media_delivery` YAML block)
 
 ```yaml
@@ -396,6 +545,10 @@ The basename denylist blocks common credential filenames, but keep your output d
 Use `platform:channel_id:thread_id` — not just `platform:channel_id` — for reports and charts that belong to an ongoing thread. Text and attachment now land together in the same thread; the `:channel_id` form still posts to the parent chat.
 </Accordion>
 
+<Accordion title="Write remote-sandbox files to a well-known workspace path">
+When you run agents in a remote sandbox, instruct them to save generated files under a stable directory (e.g. `/workspace/`) and reference that exact path in `MEDIA:` lines. Every shipped remote backend's `owns_path` recognises its sandbox filesystem root, and the fetched copy is validated by the same `validate_media_delivery_path()` guard as local files — so the same `allowlist_roots` / `strict` / `max_size_mb` rules apply after fetch.
+</Accordion>
+
 </AccordionGroup>
 
 ---
@@ -414,5 +567,8 @@ Use `platform:channel_id:thread_id` — not just `platform:channel_id` — for r
   </Card>
   <Card title="Bot Inbound Media" icon="image" href="/features/bot-inbound-media">
     Handle images and files sent by users
+  </Card>
+  <Card title="Sandbox Backends" icon="shield" href="/features/sandbox-backends">
+    Where the agent's code actually runs
   </Card>
 </CardGroup>
