@@ -154,6 +154,11 @@ The request object a backend receives, describing the tool call awaiting approva
 | `context` | `Dict[str, Any]` | `{}` | Arbitrary context dict for backend-specific data. |
 | `approval_id` | `str` | auto | Stable correlation id that survives a process restart. |
 | `authorized_reviewers` | `Optional[List[str]]` | `None` | Reviewer identities allowed to resolve this request. Honoured by the gateway backend (see [per-request reviewer custody](/features/gateway-scoped-approvals#per-request-reviewer-custody)); ignored by backends that do not implement reviewer custody. `None` lets any resolver resolve. |
+| `liveness` | `Optional[Callable[[], bool]]` | `None` | Zero-arg predicate returning `True` while the originating turn is still live. When present, the registry and the direct-backend path drop a resolution that arrives after the turn was stopped or superseded — **fail-closed**: the tool does not run and no `session`/`always` grant is persisted. `None` (the default) preserves the pre-[#4950](https://github.com/MervinPraison/PraisonAI/pull/4950) behaviour: the request is treated as always live. Populated automatically by the SDK from the run's cooperative cancel signal — application code does not set it. See [Live-Authority Binding](#live-authority-binding). |
+
+<Note>
+`approval_id`, `agent_name`, and `session_id` survive a process restart and re-hydrate from a durable [`ApprovalStore`](/features/durable-approvals). `liveness` is a **per-turn predicate** — it is not persisted and is rebuilt when a turn resumes.
+</Note>
 
 ### `ApprovalDecision` fields
 
@@ -697,6 +702,68 @@ The wrapper ships `ApprovalStore` (SQLite) in `praisonai.bots`. See [Durable App
 <Note>
 All five chat backends (`SlackApproval`, `TelegramApproval`, `DiscordApproval`, `WebhookApproval`, `HTTPApproval`) accept a `store=` and expose `rehydrate()` via the shared `DurableApprovalMixin` in `praisonai_bot.bots._approval_base`. See [Durable Chat-Native Backends](/docs/features/durable-approvals#durable-chat-native-backends).
 </Note>
+
+---
+
+## Live-Authority Binding
+
+Since [PraisonAI #4950](https://github.com/MervinPraison/PraisonAI/pull/4950), every approval that flows through the core `ApprovalRegistry` is bound to the **liveness of the originating turn**. If the user hits `/stop` (or a superseding turn takes over) while an approval is parked on a human — a Telegram tap, a Slack reply, a webhook decision, a local dashboard click — the resolution that lands afterwards is dropped **fail-closed** at the resolution boundary:
+
+- The tool does not run.
+- No `session` or `always` grant is persisted for the abandoned turn.
+- The returned decision is `ApprovalDecision(approved=False, reason="Turn no longer live (stopped or superseded)")`.
+
+This is inherited automatically by **every** backend that goes through the registry — the built-ins listed on this page, `PresentationApprovalBackend`, and any custom third-party backend. It also applies when a backend is attached directly to the `Agent` via `approval=...` (the direct-backend path).
+
+```mermaid
+graph TB
+    Start[👤 User asks agent to<br/>delete production data]
+    Prompt[🔒 Approval card sent to<br/>Telegram / Slack / Discord]
+    Stop[👤 User types /stop<br/>while approval is pending]
+    Late[👆 Reviewer taps Allow<br/>3 minutes later]
+
+    Start --> Prompt
+    Prompt --> Stop
+    Stop --> Late
+    Late --> Drop{Core registry:<br/>request.liveness&#40;&#41; ?}
+    Drop -->|False — stopped| FailClosed[❌ Fail-closed<br/>Tool does not run<br/>No grant persisted]
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef prompt fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef bad fill:#EF4444,stroke:#7C90A0,color:#fff
+
+    class Start,Stop,Late user
+    class Prompt prompt
+    class Drop check
+    class FailClosed bad
+```
+
+### Backward-compatibility
+
+`ApprovalRequest.liveness` defaults to `None`, and both `approve_sync` / `approve_async` accept `liveness=None`. Existing code that constructs an `ApprovalRequest` by hand and calls the registry keeps the old always-live behaviour. A liveness probe that **raises** is treated as live (fail-open on the *probe*, never on the decision) so a buggy predicate can never wedge the approval path.
+
+### What the registry does
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Registry
+    participant Backend
+    participant Human
+
+    Agent->>Registry: approve_async(..., liveness=turn_alive)
+    Registry->>Backend: request_approval(ApprovalRequest(liveness=...))
+    Note over Human: User types /stop — turn is stopped
+    Human-->>Backend: taps Allow
+    Backend-->>Registry: ApprovalDecision(approved=True, scope="always")
+    Registry->>Registry: _reject_if_stale(request)
+    Note over Registry: liveness&#40;&#41; → False → drop fail-closed
+    Registry-->>Agent: ApprovalDecision(approved=False,<br/>reason="Turn no longer live...")
+    Note over Registry: mark_approved / persist_scoped_decision NOT called
+```
+
+The predicate the SDK supplies follows the effective per-turn cancel token — the same authority an explicit `cancel_token=` argument or a `/stop` targets — and falls back to the agent's interrupt controller when no per-turn token is registered. When neither is attached the request stays always-live, preserving today's behaviour.
 
 ---
 
