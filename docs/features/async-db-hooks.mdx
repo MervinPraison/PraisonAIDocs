@@ -154,13 +154,61 @@ Because bg-write tracking is per-instance (PR [#4861](https://github.com/MervinP
 
 ### Sync reads from inside a running loop
 
-Sync reads reached from inside a running event loop now fail loudly instead of silently dropping the read.
+Bare sync reads reached from inside a running event loop fail loudly instead of silently dropping the read.
 
 <Warning>
-**Sync reads from inside a running loop now fail loudly.** Calling a sync hook whose store op is a read — `get`, `get_session`, `get_messages`, `list_sessions`, or any sync completion hook (`on_run_end`, `on_trace_end`, `on_span_end`) that does a read-modify-write — from **inside a running event loop** raises `RuntimeError` steering you to the async surface. In previous releases it silently returned `None`: a resumed session looked empty, and the completion hooks merged into `{}` and overwrote the persisted record with a partial dict. Outside a loop, sync reads resolve the coroutine transparently. Writes are unaffected — they remain uuid-keyed fire-and-forget on the bridge.
+**Bare sync reads from inside a running loop fail loudly.** Calling a sync hook whose store op is a bare read — `get`, `get_session`, `get_messages`, or `list_sessions` — from **inside a running event loop** raises `RuntimeError` steering you to the async surface. In previous releases it silently returned `None`: a resumed session looked empty. Outside a loop, sync reads resolve the coroutine transparently. Writes are unaffected — they remain uuid-keyed fire-and-forget on the bridge.
 
 Fixed in PR [#4821](https://github.com/MervinPraison/PraisonAI/pull/4821), fixes [#4820](https://github.com/MervinPraison/PraisonAI/issues/4820).
 </Warning>
+
+<Note>
+The four sync **completion** hooks — `on_run_end`, `on_agent_end`, `on_trace_end`, `on_span_end` — read internally (a read-modify-write) but **do not** fail loudly from a running loop. They persist correctly via the async completion write path below. See PR [#4948](https://github.com/MervinPraison/PraisonAI/pull/4948).
+</Note>
+
+### Async completion write path
+
+The four sync completion hooks persist correctly from inside a running loop by routing the whole read-modify-write through one bridge submission.
+
+`on_run_end`, `on_agent_end`, `on_trace_end`, and `on_span_end` each call `_merge_and_set`, which builds a single coroutine that does `get` → merge → `set` on the state store and hands it to the shared bridge as a tracked fire-and-forget write (recorded in `self._bg_writes`). Because the read never crosses the loop boundary, the write half always executes — the completion actually persists instead of leaving the record stuck at `status="running"`.
+
+```mermaid
+sequenceDiagram
+    participant Hook as on_run_end (sync)
+    participant Merge as _merge_and_set
+    participant Bridge as async bridge
+    participant Store as state store
+
+    Hook->>Merge: patch (output, status, ended_at)
+    Merge->>Bridge: submit(one coroutine)
+    Bridge->>Store: async_get(key)
+    Store-->>Bridge: current record
+    Bridge->>Store: async_set(key, merged)
+    Merge->>Merge: self._bg_writes.add(fut)
+    Note over Merge,Store: uuid-keyed + idempotent — deferring is safe
+```
+
+The merge is uuid-keyed and idempotent, so deferring the write is safe by construction. Pre-existing fields (`run_id`, `started_at`, `input_content`, spans, events) are preserved; completion fields (`output_content`, `status`, `ended_at`) are merged in.
+
+**Ordering guarantee.** Callers who must see the persisted record before returning (tests, request handlers reading the state store synchronously) should flush the pending write first.
+
+```python
+import asyncio
+from praisonai.db.adapter import PraisonAIDB
+
+async def main():
+    db = PraisonAIDB("sqlite:///agent_data.db")
+
+    # Sync completion hook from inside a running loop — persists, never raises.
+    db.on_run_end("chat_123", "run_1", output_content="done", status="completed")
+
+    # The write is fire-and-forget on the bridge; flush it before reading back.
+    await asyncio.to_thread(db.flush_pending_writes)
+
+asyncio.run(main())
+```
+
+Only completion hooks that read internally changed. **Bare reads (`get`, `get_session`, `get_messages`, `list_sessions`) still fail loudly** from inside a running loop — PR [#4821](https://github.com/MervinPraison/PraisonAI/pull/4821) semantics are unchanged.
 
 ### Which hook to call from where
 
@@ -170,8 +218,8 @@ Pick sync or async by whether you sit inside a running loop and whether you read
 graph TB
     Q{Am I inside<br/>a running loop?}
     Q -->|No| Sync[✅ Use sync hook<br/>on_agent_start / on_message]
-    Q -->|Yes, and I'm reading| Async[⚡ Use async hook<br/>aon_agent_start / aon_message]
-    Q -->|Yes, and I'm writing| SyncOK[✅ Sync write is safe<br/>fire-and-forget on bridge]
+    Q -->|Yes, bare read<br/>get / get_session| Async[⚡ Use async hook<br/>aon_agent_start / aon_message]
+    Q -->|Yes, write or<br/>completion hook| SyncOK[✅ Sync is safe<br/>fire-and-forget on bridge]
 
     classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef good fill:#10B981,stroke:#7C90A0,color:#fff
@@ -182,8 +230,12 @@ graph TB
     class Async async
 ```
 
+<Note>
+**Follow-up note on completion hooks.** The diagram's "bare read" branch covers `get`, `get_session`, `get_messages`, and `list_sessions`. The completion hooks (`on_run_end` / `on_agent_end` / `on_trace_end` / `on_span_end`) read internally but take the safe "fire-and-forget on bridge" branch via `_merge_and_set` — see [Async completion write path](#async-completion-write-path).
+</Note>
+
 <Warning>
-**Troubleshooting.** _Symptom in older versions:_ a resumed session came back empty even though messages had been persisted; a completed run/trace/span record lost `run_id`, `started_at`, `input_content`, or its spans/events after a sync completion hook fired from async code. Root cause: sync reads reached from a running loop were silently dropped. Fixed in PR #4821 — the same call now raises `RuntimeError` pointing you at the `aon_*` hook.
+**Troubleshooting.** _Symptom in older versions:_ a resumed session came back empty even though messages had been persisted; a completed run/trace/span record lost `run_id`, `started_at`, `input_content`, or its spans/events after a sync completion hook fired from async code — the record stayed `status="running"` with no `output_content` or `ended_at`. Root cause: the internal read reached from a running loop was dropped and the merge overwrote (or never wrote) the record. Fixed in PR [#4948](https://github.com/MervinPraison/PraisonAI/pull/4948) (fixes [#4945](https://github.com/MervinPraison/PraisonAI/issues/4945)) — the sync completion hooks now route the whole read-modify-write through one bridge submission, so the completion actually persists from inside a running loop. Bare reads still raise `RuntimeError` pointing you at the `aon_*` hook (PR #4821).
 </Warning>
 
 ### State-store lifecycle key

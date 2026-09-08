@@ -207,6 +207,54 @@ def _get_workflow_models():
 
 As of PR [#4861](https://github.com/MervinPraison/PraisonAI/pull/4861), all three lazy-model factories in `praisonai/auto.py` (team, workflow, job workflow) route through the shared `lazy_get`, so exception caching and `lazy_reset` behave identically across them — no more ad-hoc `_models_cache` with divergent semantics. A broken `pydantic` install now fails fast and identically for every factory, and `lazy_reset` clears all three caches at once.
 
+### Transient vs structural failures
+
+`LazyCache(retry_cooldown: float = 30.0)` splits cached loader failures by type, so a one-off environment blip no longer poisons the cache for the whole process lifetime.
+
+| Failure type | Examples | Cache lifetime |
+|---|---|---|
+| Structural | `ImportError`, `ValueError`, `AttributeError`, `RuntimeError` | Process lifetime — fails fast on every subsequent call |
+| Transient | `OSError`, `ConnectionError`, `TimeoutError` | `retry_cooldown` seconds (default 30s), then the loader is retried |
+| Control-flow | `KeyboardInterrupt`, `SystemExit` | Never cached — propagate immediately |
+
+A transient failure is timestamped when cached. Inside the cool-down window `get(key, loader)` re-raises the cached error; once the cool-down expires the next `get` retries the loader, and a success clears the cached failure. `reset(key)` clears both the value cache and the failure timestamp; `reset()` with no key clears everything.
+
+```mermaid
+graph TB
+    Get[📥 get key] --> Look{🔍 cached?}
+    Look -->|miss| Load[🔄 run loader]
+    Look -->|structural error| Raise[❌ raise]
+    Look -->|transient error| Cool{⏱️ cool-down<br/>expired?}
+    Cool -->|no| Raise
+    Cool -->|yes| Load
+    Load -->|ok| Store[💾 store value]
+    Load -->|fails| Stamp[🕒 store timestamped failure]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Get input
+    class Look,Cool check
+    class Load process
+    class Raise,Stamp bad
+    class Store good
+```
+
+Use a scoped instance for multi-tenant callers instead of sharing the module-level singleton.
+
+```python
+from praisonai._lazy_cache import LazyCache
+
+# Scoped cache with a shorter cool-down for a tenant that expects
+# transient errors to clear quickly.
+cache = LazyCache(retry_cooldown=5.0)
+```
+
+The cool-down mirrors the one `PraisonAIDB._init_stores` already uses for the same failure mode. It closes a real failure: a long-lived process (`praisonai serve`) that hit a transient `OSError` on first `litellm` load previously returned the cached error for the entire process lifetime — every subsequent request in every tenant. With the cool-down, the process recovers automatically once the underlying condition clears. See PR [#4948](https://github.com/MervinPraison/PraisonAI/pull/4948) (fixes [#4945](https://github.com/MervinPraison/PraisonAI/issues/4945)).
+
 ## Best Practices
 
 <AccordionGroup>
@@ -221,6 +269,9 @@ As of PR [#4861](https://github.com/MervinPraison/PraisonAI/pull/4861), all thre
   </Accordion>
   <Accordion title="Prefer lite for embedded use">
     Use the lite package when you bring your own LLM client and need minimal footprint.
+  </Accordion>
+  <Accordion title="Use a scoped LazyCache in multi-tenant callers">
+    Construct a scoped `LazyCache` instance per tenant so a `reset` in one tenant does not stomp another, and tune `retry_cooldown` to how quickly transient failures are expected to clear.
   </Accordion>
 </AccordionGroup>
 
