@@ -166,7 +166,7 @@ graph LR
 
 | Plugin type | What it adds |
 |-------------|--------------|
-| **Tool** | Functions registered via `@tool` |
+| **Tool** | Functions registered via `@tool` in a single-file plugin, **or** returned from `Plugin.get_tools()` (see [Tool Plugins](#tool-plugins-subclass-plugin-with-get-tools)) |
 | **Hook** | Lifecycle callbacks (`before_tool`, `before_tool_definitions`, `after_llm`, …) |
 | **Guardrail** | Output validation on `after_agent` |
 
@@ -181,14 +181,16 @@ graph TB
     Q[How is the plugin delivered?] --> A[Drop a file in a plugins dir]
     Q --> B[Enable a built-in by name]
     Q --> C[Register a hook at runtime]
+    Q --> D[Ship a class-based Plugin that returns callables]
     A --> R1[discover_and_load_plugins]
     B --> R2[plugins.enable list]
     C --> R3[add_hook decorator]
+    D --> R4[register a Plugin with get_tools]
 
     classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef option fill:#10B981,stroke:#7C90A0,color:#fff
-    class Q,A,B,C decision
-    class R1,R2,R3 option
+    class Q,A,B,C,D decision
+    class R1,R2,R3,R4 option
 ```
 
 ## Plugin Locations
@@ -333,6 +335,151 @@ discover_and_load_plugins()
 agent = Agent(name="Assistant", instructions="Help users")
 agent.start("Search for Python tutorials")
 ```
+
+---
+
+## Tool Plugins (subclass `Plugin` with `get_tools()`)
+
+Subclass `Plugin`, return callables from `get_tools()`, register once — every agent in the process can call them.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Init as Agent.__init__
+    participant Merge as _merge_plugin_tools
+    participant Mgr as PluginManager
+    participant Plugin as Registered Tool Plugin
+    participant Agent
+
+    User->>Init: Agent(instructions=...)
+    Init->>Merge: after tools=[...] resolved
+    Merge->>Mgr: get_all_tools()
+    Mgr->>Plugin: plugin.get_tools()
+    Plugin-->>Mgr: [random_number]
+    Mgr-->>Merge: [random_number]
+    Merge-->>Init: append to self.tools (skip collisions)
+    Init-->>User: Agent ready — plugin tool callable
+```
+
+A class-based `PluginType.TOOL` plugin's `get_tools()` output is merged into `self.tools` during `Agent.__init__` — you do **not** call `plugins.enable()`, touch `PluginManager.get_all_tools()`, or pass anything special to `Agent(...)`. Registering the plugin marks it enabled in the manager, and that is enough for its tools to reach every subsequent agent.
+
+### Quick Start
+
+<Steps>
+<Step title="Register a tool plugin in code">
+
+Return callables from `get_tools()`, register once, and the tool reaches the agent — no `plugins.enable()`, no `tools=[...]`.
+
+```python
+from praisonaiagents import Agent, Plugin, PluginInfo
+from praisonaiagents.plugins import get_plugin_manager
+
+def random_number() -> int:
+    """Returns a random number."""
+    return 42
+
+class BasicToolPlugin(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="basic_tools")
+
+    def get_tools(self):
+        return [random_number]
+
+# Register once for the process.
+get_plugin_manager().register(BasicToolPlugin())
+
+# No plugins.enable(), no tools=[...] — the plugin's tool reaches the agent.
+agent = Agent(instructions="Give me a random number using your tools.")
+agent.start()
+```
+
+</Step>
+
+<Step title="Load the bundled plugin by name">
+
+The reference `basic_tools` plugin ships in the separate `praisonai-plugins` package. Install it, enable it once, and every subsequent agent gains its tool.
+
+```bash
+pip install praisonai-plugins
+praisonai plugins enable basic_tools
+```
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="Give me a random number using your tools.")
+agent.start()   # random_number is callable — no tools=[...] needed
+```
+
+</Step>
+</Steps>
+
+### User Interaction Flow
+
+Before this wiring, an agent asked for a random number would fabricate one. Now it actually calls the plugin's tool:
+
+```
+$ python app.py
+User: give me a random number using your tools
+Agent → tool call: random_number()
+Tool  → 42
+Agent → 42
+```
+
+### Precedence and Safety Rules
+
+| Rule | Behaviour |
+|------|-----------|
+| **Agent tools win on name collision** | If `Agent(tools=[foo])` and a plugin also returns a `foo`, the agent's `foo` is kept and the plugin's `foo` is **skipped with a `WARNING` log** — never silently shadowed. |
+| **Metadata-only descriptors are skipped** | A bare `{"name": "phantom_tool"}` dict with no callable is **not** appended (logged as a `WARNING`) — it advertises a tool the agent could never actually invoke. |
+| **Registration alone enables tool plugins** | Tool plugins do not require `plugins.enable()`. The `PluginManager` marks a plugin enabled on `register(...)`; that is enough for `get_all_tools()` to include it. Only hook / metric / lifecycle plugins need the package-wide `plugins.enable()` flag. |
+| **Zero cost when plugin system unused** | If the plugin system is not enabled, the merge short-circuits — no scan, no cost. |
+| **Never breaks agent init** | Any failure in plugin discovery / merge is caught; the agent is constructed regardless. |
+| **Thread-safe iteration** | `get_all_tools()` snapshots the enabled `(name, plugin)` pairs under the manager's lock, so a concurrent `register` / `unregister` on another thread cannot raise `RuntimeError: dictionary changed size during iteration` and drop every plugin tool. |
+
+The collision rule in code — the agent's own tool always wins:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.plugins import get_plugin_manager
+# BasicToolPlugin from the Quick Start already registered — it exposes random_number
+
+def random_number() -> str:
+    return "agent's own version"
+
+agent = Agent(instructions="test", tools=[random_number])
+# agent.tools contains ONE random_number: the user's.
+# The plugin's random_number is skipped with:
+#   WARNING  Plugin tool 'random_number' skipped: an agent tool with the same name
+#            already exists (existing tool wins).
+```
+
+### `@tool` vs `Plugin.get_tools()` vs `FunctionPlugin`
+
+Two ways to add a tool from a plugin — pick the one that matches how the tool is shipped.
+
+```mermaid
+graph TB
+    Q[How is the tool shipped?] --> A[Standalone .py file in ~/.praisonai/plugins/]
+    Q --> B[Class-based plugin — bundled with hooks, config, session lifecycle]
+    Q --> C[One-off callable at runtime]
+
+    A --> R1["@tool decorator in a single-file plugin"]
+    B --> R2["Subclass Plugin, return callables from get_tools()"]
+    C --> R3["FunctionPlugin(hooks={...})"]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef option fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q decision
+    class A,B,C option
+    class R1,R2,R3 result
+```
+
+<Note>
+The bundled `basic_tools` plugin in the separate `praisonai-plugins` package is the canonical `PluginType.TOOL` example — its `get_tools()` returns `[random_number]`, and that tool now reaches every agent end-to-end.
+</Note>
 
 ---
 
@@ -1340,9 +1487,10 @@ The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `befor
 
 Batteries-included plugins ship in the separate `praisonai-plugins` package — install once, then enable by name.
 
-| Plugin | Hook | Enable |
+| Plugin | Type | Enable |
 |--------|------|--------|
-| `cli_backend_tracer` | `cli_backend_execute` | `PRAISONAI_CLI_BACKEND_DEBUG=1 praisonai plugins enable cli_backend_tracer` |
+| `cli_backend_tracer` | `cli_backend_execute` hook | `PRAISONAI_CLI_BACKEND_DEBUG=1 praisonai plugins enable cli_backend_tracer` |
+| `basic_tools` | `PluginType.TOOL` | `praisonai plugins enable basic_tools` — every subsequent agent gains `random_number` |
 
 `cli_backend_tracer` overrides `Plugin.cli_backend_execute(context)` and logs every CLI backend delegation to the standard `praisonai` logger — with the prompt already redacted, so the log stream is safe to ship to an aggregator.
 
