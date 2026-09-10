@@ -130,7 +130,7 @@ sequenceDiagram
 
 | Component | Purpose | Thread Safety |
 |-----------|---------|---------------|
-| `ConcurrencyRegistry` | Limits parallel agent runs | ✅ Thread-safe |
+| `ConcurrencyRegistry` | Limits parallel agent runs — a **true global cap across every event loop and thread** | ✅ Thread-safe |
 | Tool Executor | Runs tools with timeout | ✅ Per-agent pool |
 | Plugin APIs | Enable/disable plugins | ✅ Lock-protected |
 | `AgentTeam` / `PraisonAIAgents` run guard | Refuses concurrent runs on one instance | ✅ Per-instance re-entrancy lock |
@@ -141,29 +141,33 @@ PraisonAI's concurrency controls at a glance:
 - **Per-agent tool executor** applies `tool_timeout` and recycles a hung worker.
 - **`AgentTeam` / `PraisonAIAgents` instances are single-run** — a second concurrent `start()` / `astart()` on the same object raises `RuntimeError`. Batched runs via `start_for_each` / `astart_for_each` are unaffected. See [AgentTeam Batch Runs → Concurrent-run safety](/features/agentteam-batch#concurrent-run-safety).
 
+<Note>
+**Global cap across loops and threads.** Each agent's limit is backed by a loop-neutral `threading.Semaphore` keyed by agent name, so the configured cap holds across **every** event loop and thread. Sync and async callers share the **same** per-agent permit pool. Multi-loop / multi-thread deployments no longer crash with "bound to a different event loop". See [PR #5050](https://github.com/MervinPraison/PraisonAI/pull/5050).
+</Note>
+
 ---
 
 ## Sync vs Async Rule
 
-The concurrency registry enforces strict separation between sync and async contexts:
+`acquire_sync()` is safe from any context; in async code prefer `await acquire()` to avoid blocking the loop.
 
-| Context | Method | What happens if you mix |
-|---------|--------|-------------------------|
+| Context | Method | What happens |
+|---------|--------|--------------|
 | **Sync** | `registry.acquire_sync(name)` | ✅ Works correctly |
-| **Async** | `await registry.acquire(name)` | ✅ Works correctly |
-| **Mixed** | `acquire_sync()` in async | ❌ Raises `RuntimeError` |
+| **Async** | `await registry.acquire(name)` | ✅ Works correctly — yields to the loop |
+| **Mixed** | `acquire_sync()` in async | ⚠️ Works, but blocks the calling thread — prefer `await acquire()` |
 
 <Warning>
-Calling `acquire_sync()` from an async context raises `RuntimeError("acquire_sync('<agent_name>') cannot be called with a running event loop; use async acquire() in async contexts.")`. Use `await acquire()` instead.
+`acquire_sync()` is safe to call from any context (sync or async). Under the hood it acquires a loop-neutral `threading.Semaphore`, so it never raises "bound to a different event loop". In an **async** context, however, it blocks the current thread until a permit is available — prefer `await acquire()` there so other tasks on the loop keep running. Sync and async callers share the **same** per-agent permit pool, so the configured limit is a true global cap across every event loop and thread.
 </Warning>
 
-**Example error:**
+**Prefer `await acquire()` in async code:**
 ```python
-async def bad_example():
-    registry.acquire_sync("agent")  # RuntimeError!
+async def works_but_blocks():
+    registry.acquire_sync("agent")  # ⚠️ permitted, but blocks the event loop thread
 
-async def good_example():
-    await registry.acquire("agent")  # ✅ Correct
+async def recommended():
+    await registry.acquire("agent")  # ✅ yields to the loop
 ```
 
 ---
@@ -340,8 +344,8 @@ finally:
 ```
 </Accordion>
 
-<Accordion title="Don't mix sync and async acquire">
-Keep acquisition method consistent with execution context:
+<Accordion title="Prefer async acquire in async code">
+Mixing is no longer an error — `acquire_sync()` in an async context simply blocks its thread. Sync and async callers contend for the **same** per-agent permit pool (see the `test_sync_and_async_share_one_pool` test in [PR #5050](https://github.com/MervinPraison/PraisonAI/pull/5050)). Still prefer `await acquire()` in async code so the event loop keeps running:
 
 ```python
 # ✅ Good - sync context, sync acquire
@@ -354,7 +358,7 @@ def sync_handler():
 
 # ✅ Good - async context, async acquire  
 async def async_handler():
-    await registry.acquire("agent")
+    await registry.acquire("agent")  # yields to the loop
     try:
         await agent.astart("task")
     finally:
