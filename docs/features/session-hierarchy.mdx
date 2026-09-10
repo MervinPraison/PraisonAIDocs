@@ -88,7 +88,7 @@ store.revert_to_snapshot(session_id, snapshot_id)
 
 ## Multi-Worker Safety
 
-Multiple processes can share one session directory — reads reload when the on-disk file changes.
+Multiple processes can share one session directory — public reads always reload from disk, so cross-instance writes are visible immediately.
 
 ```mermaid
 sequenceDiagram
@@ -103,10 +103,47 @@ sequenceDiagram
 
 | Operation | Safe under concurrency |
 |---|---|
-| `get_extended_session()` | Yes — mtime-checked cache |
+| `get_extended_session()` | Yes — always reloads from disk; cross-instance writes are visible immediately |
 | `add_message()` | Yes — locked read-modify-write |
 | `fork_session()` | Yes — reloads parent first |
 | `create_snapshot()` / `revert_to_snapshot()` | Yes — atomic under lock |
+
+<Note>
+`get_extended_session()` returns fresh data on every call — do not rely on object identity (`session_a is session_b`). The in-process cache stays coherent, but the same read may return a newly constructed `ExtendedSessionData` object.
+</Note>
+
+---
+
+## Cache Semantics
+
+Public reads always reload from disk; internal helpers reuse a cache guarded by a file lock.
+
+| Method | Cache behaviour |
+|---|---|
+| `get_extended_session()` / `get_chat_history()` / `get_session()` | Always reload from disk under lock — no identity guarantee |
+| `_load_extended_session()` (used internally by `fork_session`, `revert_to_snapshot`, `get_children`) | mtime-checked cache, safe because the caller holds a `FileLock` |
+| `invalidate_cache(session_id=None)` | Clears both in-memory caches — rarely needed on the read path |
+
+`invalidate_cache()` only matters if your own code caches `ExtendedSessionData` references; the public read path never needs it.
+
+### Cross-instance reads
+
+A write from a second store instance on the same directory is seen by the first store's next read — no manual `invalidate_cache()` required.
+
+```python
+from praisonaiagents.session import get_hierarchical_session_store, HierarchicalSessionStore
+
+store = get_hierarchical_session_store()
+session_id = store.create_session(title="Cross-worker")
+store.add_message(session_id, "user", "first")
+
+# A second store instance pointing at the same session_dir
+other = HierarchicalSessionStore(session_dir=store.session_dir)
+other.add_message(session_id, "user", "second")
+
+seen = store.get_extended_session(session_id)
+assert [m.content for m in seen.messages] == ["first", "second"]
+```
 
 ---
 
