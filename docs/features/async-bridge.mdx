@@ -445,6 +445,8 @@ graph LR
 | `AsyncBridge.get` | `(self) -> asyncio.AbstractEventLoop` | Get (lazily spawn) the bridge's event loop. |
 | `run_sync` (module-level) | `(coro, *, timeout=_UNSET) -> T` | Routes through the shared default `AsyncBridge`. Omitted → `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s); `None` → unbounded; number → verbatim. See [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number). |
 | `shutdown` (module-level) | `() -> None` | Shuts down **only** the shared default bridge. User-owned instances are untouched. |
+| `DispatchKind` | `class DispatchKind(str, enum.Enum)` — values `READ`, `WRITE` | Explicit "how a sync caller consumes the result of a (possibly async) store op" — makes read-vs-write intent visible at the call site instead of relying on a name-string allow-list. `READ` = caller consumes the returned value (never fire-and-forget); `WRITE` = caller only cares that it eventually completes. |
+| `dispatch_maybe_awaitable` | `(value: Any, *, kind: DispatchKind, tracker: weakref.WeakSet \| None = None, tracker_lock: threading.Lock \| None = None, op_name: str = "op") -> Any` | Single owner of the submit / track / done-callback policy used by db-adapter dispatch sites. **Not awaitable** → returned as-is; **no running loop** → block on the shared bridge via `run_sync`; **running loop + `READ`** → route through `run_sync_or_offload` (returns the value on a sync path, fails loudly inside a loop instead of corrupting a read-modify-write with a silent `None`); **running loop + `WRITE`** → submit to the active bridge as tracked fire-and-forget (a warning done-callback logs failures), returns `None`. |
 
 **Environment:** 
 - `PRAISONAI_RUN_SYNC_TIMEOUT`: Default timeout in seconds (300). **Resolved per call** (not at import) via `_default_timeout()`; a malformed value falls back to `300.0`, and late-set env vars (dotenv loaded after import, per-request reconfig) are honoured. An explicit `timeout=None` opts into an **unbounded** wait (used by the sync-scheduler bridges for long-lived jobs). Read by **both** `praisonai._async_bridge` (this page) and `praisonai_code.cli.features.agent_tools._run_sync` (see [Agent-Centric Tools → Timeouts & Cancellation](/cli/agent-tools#timeouts-cancellation)).
@@ -462,6 +464,54 @@ The module-level `shutdown()` only stops the shared default bridge. Per-instance
 - Gateway operations
 
 See also: [Approval Protocol](/features/approval-protocol) and [Gateway](/features/gateway).
+
+---
+
+## `dispatch_maybe_awaitable` — one helper for sync-hook dispatch
+
+`dispatch_maybe_awaitable()` is the single owner of the "a sync call may return a coroutine; run it correctly" policy. It picks one of four branches from the running-loop state and an explicit `DispatchKind`.
+
+```mermaid
+graph TB
+    A[value from store method] --> B{isawaitable?}
+    B -->|No| R1[✅ Return value as-is]
+    B -->|Yes| C{Running loop?}
+    C -->|No| R2[✅ run_sync — block on bridge]
+    C -->|Yes| D{DispatchKind?}
+    D -->|READ| R3[⚡ run_sync_or_offload<br/>strict inside a loop]
+    D -->|WRITE| R4[🚀 submit → tracked<br/>fire-and-forget, return None]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class B,C,D question
+    class R1,R2 ok
+    class R3,R4 warn
+```
+
+`DispatchKind` makes read-vs-write intent explicit at the call site instead of depending on a name-string allow-list. The four branches:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Not awaitable | Returned as-is. |
+| No running loop | Block on the shared bridge via `run_sync`. |
+| Running loop + `READ` | Route through `run_sync_or_offload` — returns the value on a sync path, fails loudly inside a loop instead of corrupting a read-modify-write with a silent `None`. |
+| Running loop + `WRITE` | Submit to the active bridge as tracked fire-and-forget; a warning done-callback logs failures; returns `None`. |
+
+This is the shared helper the `PraisonAIDB._call_store`, `_merge_and_set`, and `on_agent_end` paths route through — the split policy is no longer hand-rolled per call site ([PR #5038](https://github.com/MervinPraison/PraisonAI/pull/5038)). See [Async DB Hooks → Shared dispatch](/features/async-db-hooks#shared-dispatch-for-both-entry-points) for the db-adapter view.
+
+<Note>
+`dispatch_maybe_awaitable` is a wrapper internal used by the db adapter — end users do not call it directly. The `READ` strict-inside-a-loop behaviour ([PR #4821](https://github.com/MervinPraison/PraisonAI/pull/4821)) and the completion-hook persistence guarantee ([PR #4948](https://github.com/MervinPraison/PraisonAI/pull/4948)) are pre-existing behaviours the helper now enforces in one place; PR #5038 is DRY consolidation with no user-visible behaviour change.
+</Note>
+
+The contract tests in `praisonai/tests/unit/test_async_bridge.py::TestDispatchMaybeAwaitable` pin the four branches:
+
+- `test_non_awaitable_passthrough` — a plain value is returned unchanged.
+- `test_no_loop_read_blocks_and_returns_value` — no running loop + `READ` blocks and returns the value.
+- `test_no_loop_write_blocks_and_returns_value` — no running loop + `WRITE` runs to completion (fire-and-forget is a running-loop concern).
+- `test_running_loop_write_is_tracked_fire_and_forget` — running loop + `WRITE` submits, tracks, and returns `None` while the write still completes.
+- `test_running_loop_failed_write_logs_and_does_not_raise` — a failed deferred `WRITE` is swallowed (logged) via the done-callback, never surfacing to the sync caller.
 
 ---
 
