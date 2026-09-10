@@ -16,9 +16,9 @@ agent = Agent(
 agent.start("What did we decide about the billing migration?")
 ```
 
-An agent can now search its own past conversation transcripts — asking "what did we decide about the billing migration?" across every stored session.
+An agent can now search its own past conversation transcripts — asking "what did we decide about the billing migration?" across every stored session, including older turns that have been compacted out of the active window.
 
-The user asks what was decided last week; session search recalls matching turns from prior stored conversations.
+The user asks what was decided last week; session search recalls matching turns from prior stored conversations — even ones summarised out of the live context by the default `retention="compact"` policy.
 
 
 ```mermaid
@@ -41,6 +41,27 @@ graph LR
     class D,S,B shape
     class R result
 
+```
+
+Search scans **both** archived (compacted) turns and the active window, so a detail summarised out of the live context is still recalled:
+
+```mermaid
+graph LR
+    subgraph "compact retention"
+        A[💬 Active window] -->|compaction| AR[🗄️ Archived messages]
+        A -->|replaced by| SUM[📝 Synthetic summary]
+    end
+    AR --> SS[🔍 session_search]
+    A --> SS
+    SS --> H[✅ Hits archived + active]
+    classDef active fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef arch fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef search fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    class A,SUM active
+    class AR arch
+    class SS search
+    class H result
 ```
 
 ## Quick Start
@@ -94,6 +115,22 @@ agent = Agent(
 agent.start("What did we decide about the billing migration?")
 ```
 </Step>
+
+<Step title="Recall a compacted (archived) detail">
+```python
+from praisonaiagents.tools import session_search
+import json
+
+# Under the default retention="compact" policy, older turns are moved into
+# archived_messages and replaced in the active window by a synthetic summary —
+# but they stay searchable. A hit on an archived turn is flagged archived=True.
+result = json.loads(session_search(query="deploy token XZ99"))
+for hit in result["results"]:
+    for msg in hit["messages"]:
+        marker = " (archived)" if msg["archived"] else ""
+        print(f"[{msg['role']}]{marker} {msg['content']}")
+```
+</Step>
 </Steps>
 
 ---
@@ -118,6 +155,8 @@ sequenceDiagram
 ```
 
 Sessions live at `~/.praisonai/sessions/*.json` — one JSON file per session. The default `DefaultSessionStore` search is a dependency-free substring/keyword scan with no setup. The index hop above appears only when a `SqliteSessionStore` is active; the default flow reads the JSON files directly.
+
+Both stores scan a single **archived + active** projection of each session: `archived_messages` (turns compacted out of the live window) are scanned *ahead* of the active `messages`, so a compacted conversation stays fully recallable rather than losing its raw turns. Every returned context message carries an `archived: bool` flag so the caller can see exactly where the compaction boundary falls instead of having archived turns silently blended into the current window.
 
 <Tip>
 A session-id that was never seen locally can be *hydrated* on demand from a configured mirror via `SessionMirrorProtocol.load(session_id)`. See [Session Mirror](/features/session-mirror).
@@ -189,8 +228,8 @@ Returned when `query` is set:
       "score": 4.0,
       "anchor_index": 12,
       "messages": [
-        {"index": 7, "role": "user", "content": "...", "timestamp": "..."},
-        {"index": 8, "role": "assistant", "content": "...", "timestamp": "..."}
+        {"index": 7, "role": "user", "content": "...", "timestamp": "...", "archived": true},
+        {"index": 8, "role": "assistant", "content": "...", "timestamp": "...", "archived": false}
       ],
       "bookends": {
         "opening": [
@@ -208,6 +247,8 @@ Returned when `query` is set:
 ```
 
 The `bookends` key is present only when the session has more than `BOOKEND_SIZE` (2) user+assistant messages — mirroring `SessionHit.as_dict()`.
+
+Each entry in `messages` includes `index`, `role`, `content`, `timestamp`, and an `archived` boolean. `archived: true` marks a turn recalled from `archived_messages` (compacted out of the active window); `archived: false` marks a turn still in the live window.
 </Tab>
 <Tab title="Scroll">
 Returned when `session_id` is set (no `query`):
@@ -219,10 +260,12 @@ Returned when `session_id` is set (no `query`):
   "session_id": "abc-123",
   "around_message_id": "42",
   "messages": [
-    {"index": 37, "role": "user", "content": "...", "timestamp": "..."}
+    {"index": 37, "role": "user", "content": "...", "timestamp": "...", "archived": false}
   ]
 }
 ```
+
+Scroll walks the same archived + active projection as discovery, so an `anchor_index` handed back from a hit — including one landing on an archived turn — resolves to the exact same message here. Each entry keeps its `archived` flag.
 </Tab>
 <Tab title="Browse">
 Returned when called with no arguments:
@@ -257,6 +300,29 @@ Discovery mode scores hits using keyword matching:
 Ties are broken by recency (`updated_at` descending). Scores are heuristic — treat them as relative rankings, not probabilities.
 
 Snippets are centred on the first match and trimmed to ~120 characters with `…` ellipses.
+
+---
+
+## Recall Across Compacted History
+
+Under the default `retention="compact"` policy, older raw turns are moved into `archived_messages` and replaced in the active window by a single synthetic summary. Those archived turns stay searchable: `search()` and `window()` both scan an **archived + active** projection, with archived turns scanned first so a hit anchors in context exactly like an active-turn hit.
+
+- **`archived: True`** on a returned context message marks a turn recalled from `archived_messages`. The compaction boundary stays visible to the caller rather than being silently blended into the current window.
+- **`window()` shares the coordinate space.** An `anchor_index` from a discovery hit — including one landing on an archived turn — resolves to the exact same message when you scroll around it.
+- **Both built-in stores use one projection.** `DefaultSessionStore`, `SqliteSessionStore`, and the exported `SqliteTranscriptStore` share the same archived + active projection, so results cannot drift between backends.
+
+<Note>
+Before this change, cross-session recall indexed only a session's **active** `messages`; compacted raw turns were dropped from the index on the next write and became permanently unsearchable. `session_search` now spans archived + active turns.
+</Note>
+
+### SQLite index upgrade (INDEX_CONTENT_VERSION → 2)
+
+`SqliteSessionStore` bumps its `INDEX_CONTENT_VERSION` to `2` because `_flatten` now indexes `archived_messages` alongside the active `messages`. On the first startup after upgrade, the store detects the stale version and rebuilds every session's FTS row once, so archived-only queries work immediately rather than only after each session's next write.
+
+- **No user action required.** Startup performs a bounded one-time backfill, then persists the new version so subsequent startups fall back to the cheap "skip already-indexed sessions" path.
+- **New `session_index_meta` table.** An internal key/value table (`content_version` key) tracks the persisted index-content version. Operators upgrading an existing store should expect this table to appear in the SQLite index file.
+
+See [Session Store → SqliteSessionStore](/features/session-store#sqlitesessionstore) for the full index schema.
 
 ---
 
@@ -410,8 +476,8 @@ assert isinstance(store, SearchableSessionStoreProtocol)
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `search` | `search(query, *, limit=5, window=5) -> List[SessionHit]` | Keyword scan across all stored sessions |
-| `window` | `window(session_id, around_message_id=None, *, window=5) -> List[Dict]` | ±N messages around an anchor; uses most recent if anchor omitted |
+| `search` | `search(query, *, limit=5, window=5) -> List[SessionHit]` | Keyword scan across archived + active turns of all stored sessions |
+| `window` | `window(session_id, around_message_id=None, *, window=5) -> List[Dict]` | ±N messages around an anchor in the archived + active projection; uses most recent if anchor omitted |
 | `recent` | `recent(*, limit=10) -> List[SessionSummary]` | Most recently updated sessions |
 
 ### `SessionHit` Fields
@@ -424,7 +490,7 @@ assert isinstance(store, SearchableSessionStoreProtocol)
 | `snippet` | `str` | `""` | Short snippet centred on the first match |
 | `score` | `float` | `0.0` | Match score (higher = better) |
 | `anchor_index` | `int` | `-1` | Index of the best-matching message |
-| `messages` | `List[Dict]` | `[]` | Context window around the hit |
+| `messages` | `List[Dict]` | `[]` | Context window around the hit; each entry carries `index`, `role`, `content`, `timestamp`, and `archived: bool` |
 | `bookends` | `Dict[str, List[Dict]]` | `{}` | `{"opening": [...], "closing": [...]}` — first/last user+assistant turns; empty when the session has ≤ `BOOKEND_SIZE` conversational messages |
 
 ### `SessionSummary` Fields
