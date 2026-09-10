@@ -20,7 +20,7 @@ agent.start("Search quantum computing")  # circuit breaker protects automaticall
 ```
 
 <Note>
-**Sync and Async Parity**: Circuit breaker protection applies uniformly to both sync and async tool execution paths. Parity was first delivered in [MervinPraison/PraisonAI#4469](https://github.com/MervinPraison/PraisonAI/pull/4469), which wraps each async invocation through `CircuitBreaker.acall(...)` — event-loop safe, no `time.sleep`. [MervinPraison/PraisonAI#4533](https://github.com/MervinPraison/PraisonAI/pull/4533) then added the `_circuit_breaker_precheck(...)` / `_circuit_breaker_record(...)` helpers for the pre-check and outcome recording. Both a **raised exception** inside the tool and a **result dict carrying `error`** count as breaker failures — but approval / permission / policy / guardrail denials do not. Earlier releases skipped the breaker on `achat()`/`astart()`.
+**Sync and Async Parity**: Circuit breaker protection applies uniformly to both sync and async tool execution paths. Parity was first delivered in [MervinPraison/PraisonAI#4469](https://github.com/MervinPraison/PraisonAI/pull/4469), which wraps each async invocation through `CircuitBreaker.acall(...)` — event-loop safe, no `time.sleep`. [MervinPraison/PraisonAI#4533](https://github.com/MervinPraison/PraisonAI/pull/4533) then added the `_circuit_breaker_precheck(...)` / `_circuit_breaker_record(...)` helpers for the pre-check and outcome recording. Both a **raised exception** inside the tool and a **result dict carrying `error`** count as breaker failures — but approval / permission / policy / guardrail denials do not. Earlier releases skipped the breaker on `achat()`/`astart()`. [MervinPraison/PraisonAI#4969](https://github.com/MervinPraison/PraisonAI/pull/4969) then removed a double-record on the async path and started recording `wait_for` cancellations so async timeouts count toward the threshold like sync failures.
 </Note>
 
 <Note>
@@ -177,6 +177,10 @@ stateDiagram-v2
 
 The async path (`achat()` / `astart()`) performs the same OPEN → HALF_OPEN → CLOSED transitions through the shared helpers — `_circuit_breaker_precheck` runs the pre-check, `_circuit_breaker_record` records the outcome — so this diagram applies uniformly to `chat`/`start` and `achat`/`astart`.
 
+<Note>
+**Fixed in [PR #4969](https://github.com/MervinPraison/PraisonAI/pull/4969)** (async parity): earlier releases counted each async outcome twice, so an async breaker actually opened at half the configured `failure_threshold` and closed at half the configured `success_threshold`. If you tuned these values to compensate on async workloads, you can now restore them to the values you'd use on sync.
+</Note>
+
 The mechanism is identical to sync, but delivered through `CircuitBreaker.acall(...)` rather than `CircuitBreaker.call(...)` so it never blocks the event loop ([PR #4469](https://github.com/MervinPraison/PraisonAI/pull/4469)). An **error-dict result** counts as a failure just like a raised exception — the async path surfaces it to the breaker through a `_ToolFailure` sentinel, mirroring the sync `_ToolFailure` wrapper — so five error-dict results open the breaker exactly as five raises would.
 
 Async workflows using `asyncio.gather(...)` get the same parity: one failing tool opens only its own per-agent breaker and short-circuits, so it won't consume retries across every gathered task.
@@ -221,6 +225,12 @@ graph TB
 
 ---
 
+## What DOES Trip the Breaker
+
+**Async tool timeouts count.** When an async tool is cancelled by the per-call `tool_timeout`, the timeout is recorded on the breaker just like a raised exception or an error-dict result. Five consecutive timeouts open the circuit; the sixth call short-circuits with `circuit_open: True`.
+
+---
+
 ## What Does NOT Trip the Breaker
 
 Circuit breakers ignore certain error types to avoid false positives:
@@ -262,6 +272,28 @@ async def main():
     # After 5 raised failures the breaker opens; the 6th call
     # short-circuits with {"circuit_open": True} instead of retrying.
     await agent.achat("Search quantum computing")
+
+asyncio.run(main())
+```
+
+An async tool that hangs past `tool_timeout` counts the same way — the timeout is recorded on the breaker, so five consecutive timeouts open the circuit.
+
+```python
+import asyncio
+from praisonaiagents import Agent, tool
+
+@tool
+async def slow_upstream(query: str) -> str:
+    """Async tool that hangs past tool_timeout."""
+    await asyncio.sleep(60)
+    return "never"
+
+agent = Agent(name="Researcher", tools=[slow_upstream], tool_timeout=2)
+
+async def main():
+    # After 5 consecutive timeouts, the 6th call short-circuits.
+    for _ in range(6):
+        await agent.achat("Search quantum computing")
 
 asyncio.run(main())
 ```
