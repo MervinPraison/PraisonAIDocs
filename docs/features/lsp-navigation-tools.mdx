@@ -1,11 +1,11 @@
 ---
 title: "LSP Navigation Tools"
 sidebarTitle: "LSP Navigation Tools"
-description: "Zero-config, language-server-accurate go-to-definition, find-references, hover, and symbol search for agents"
+description: "Zero-config, language-server-accurate go-to-definition, find-references, hover, symbol search, call hierarchy, and go-to-implementation for agents"
 icon: "magnifying-glass-code"
 ---
 
-Give your agent language-server-accurate go-to-definition, find-references, and symbol search that works out of the box — the right server is picked from the file extension, and a missing server degrades to an actionable install hint instead of a silent no-op.
+Give your agent language-server-accurate go-to-definition, find-references, call hierarchy, implementation lookup, and symbol search that works out of the box — the right server is picked from the file extension, and a missing server degrades to an actionable install hint instead of a silent no-op.
 
 ```mermaid
 graph LR
@@ -26,6 +26,10 @@ graph LR
     class Note warn
 ```
 
+<Note>
+**New in the toolset:** call hierarchy (`lsp_incoming_calls`, `lsp_outgoing_calls`) and go-to-implementation (`lsp_implementations`) now join the navigation tools — the auto-detect flow above stays the same.
+</Note>
+
 ## Quick Start
 
 <Steps>
@@ -39,11 +43,14 @@ from praisonaiagents import Agent
 agent = Agent(
     name="Coder",
     instructions="Navigate the codebase using LSP-accurate tools before editing.",
-    tools=["lsp_definition", "lsp_references", "lsp_hover",
-           "lsp_document_symbols", "lsp_workspace_symbols"],
+    tools=[
+        "lsp_definition", "lsp_references", "lsp_hover",
+        "lsp_document_symbols", "lsp_workspace_symbols",
+        "lsp_implementations", "lsp_incoming_calls", "lsp_outgoing_calls",
+    ],
 )
 
-agent.start("Where is `resolve_within_root` defined and who calls it?")
+agent.start("Where is `compute` defined, who calls it, and which classes implement `Storage`?")
 ```
 
 </Step>
@@ -99,6 +106,8 @@ sequenceDiagram
 
 Each tool call spawns a fresh `LSPClient`, opens the document (`didOpen`), runs the query, and closes cleanly. There is no shared long-lived server process — every call is self-contained.
 
+Call-hierarchy tools first issue `callHierarchy/prepareCallHierarchy` to resolve a `CallHierarchyItem`, then fan out to `callHierarchy/incomingCalls` or `callHierarchy/outgoingCalls`. Multiple prepared items are queried and duplicates are collapsed automatically.
+
 ### Monorepos
 
 When a `file_path` is passed, the client initialises the language server against the nearest **root marker** (`pyproject.toml`, `go.mod`, `Cargo.toml`, `tsconfig.json`, `.git`, …) rather than the current working directory. Nested-project searches resolve against the file's real project root. See [LSP Auto-Detect](/features/lsp-auto-detect) for the full marker table and the helpers you can call yourself.
@@ -110,7 +119,10 @@ When a `file_path` is passed, the client initialises the language server against
 ```mermaid
 graph TB
     Q{What do you need?} --> D["Where is X defined?"]
-    Q --> R["Who calls X?"]
+    Q --> R["Where is X used?"]
+    Q --> IC["Who calls X?"]
+    Q --> OC["What does X call?"]
+    Q --> IM["Which classes implement X?"]
     Q --> H["What is X's type or signature?"]
     Q --> F["What does this file expose?"]
     Q --> W["Find X anywhere in the repo"]
@@ -121,6 +133,18 @@ graph TB
 
     subgraph "References"
         R --> lsp_ref[lsp_references]
+    end
+
+    subgraph "Incoming Calls"
+        IC --> lsp_inc[lsp_incoming_calls]
+    end
+
+    subgraph "Outgoing Calls"
+        OC --> lsp_out[lsp_outgoing_calls]
+    end
+
+    subgraph "Implementations"
+        IM --> lsp_imp[lsp_implementations]
     end
 
     subgraph "Hover"
@@ -139,13 +163,16 @@ graph TB
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
 
     class Q question
-    class lsp_def,lsp_ref,lsp_hov,lsp_doc,lsp_wks tool
+    class lsp_def,lsp_ref,lsp_inc,lsp_out,lsp_imp,lsp_hov,lsp_doc,lsp_wks tool
 ```
 
 | Tool | Signature | Purpose | LSP Method |
 |------|-----------|---------|-----------|
 | `lsp_definition` | `(file_path, line=None, character=None, symbol=None)` | Go to definition of a symbol | `textDocument/definition` |
 | `lsp_references` | `(file_path, line=None, character=None, symbol=None, include_declaration=True)` | Find all references to a symbol | `textDocument/references` |
+| `lsp_implementations` | `(file_path, line=None, character=None, symbol=None)` | Concrete implementations behind an interface / abstract method | `textDocument/implementation` |
+| `lsp_incoming_calls` | `(file_path, line=None, character=None, symbol=None)` | Callers of a symbol (who calls this?) | `callHierarchy/incomingCalls` |
+| `lsp_outgoing_calls` | `(file_path, line=None, character=None, symbol=None)` | Callees of a symbol (what does this call?) | `callHierarchy/outgoingCalls` |
 | `lsp_hover` | `(file_path, line, character)` | Type / signature / doc at a position | `textDocument/hover` |
 | `lsp_document_symbols` | `(file_path)` | List symbols defined in a file | `textDocument/documentSymbol` |
 | `lsp_workspace_symbols` | `(query, file_path=None)` | Search symbols across the workspace | `workspace/symbol` |
@@ -218,7 +245,7 @@ available, command, install_hint = probe("go")
 # (False, "gopls", "go install golang.org/x/tools/gopls@latest")
 ```
 
-The five `lsp_*` navigation tools embed the hint in their error string:
+Every `lsp_*` navigation tool embeds the hint in its error string:
 
 ```text
 Error: go language server `gopls` not installed (install with `go install golang.org/x/tools/gopls@latest`); install it to use lsp navigation (falling back to grep is advised)
@@ -310,7 +337,7 @@ await client.start()   # rootUri = packages/api, not os.getcwd()
 
 ## Addressing: Position or Symbol
 
-Position-taking tools (`lsp_definition`, `lsp_references`, `lsp_hover`) accept two addressing styles:
+Position-taking tools (`lsp_definition`, `lsp_references`, `lsp_hover`, `lsp_implementations`, `lsp_incoming_calls`, `lsp_outgoing_calls`) accept two addressing styles:
 
 - **Explicit position** — pass `line` and `character` as 0-indexed integers (LSP convention). The output uses 1-indexed numbers so results are human-readable.
 - **Symbol name** — pass `symbol="my_func"` and the tool locates the first word-boundary occurrence of that name in the file, converting it to a position automatically.
@@ -343,6 +370,25 @@ from praisonaiagents.tools import lsp_definition, lsp_references
 
 print(lsp_definition("src/utils.py", symbol="compute"))
 print(lsp_references("src/utils.py", symbol="compute"))
+```
+
+**Before renaming a function, see every real caller**
+
+Call hierarchy resolves the symbol first, so it catches dynamic dispatch and skips same-named identifiers a `grep` would over- or under-match:
+
+```python
+from praisonaiagents.tools import lsp_incoming_calls, lsp_outgoing_calls
+
+print(lsp_incoming_calls("src/utils.py", symbol="compute"))
+print(lsp_outgoing_calls("src/utils.py", symbol="compute"))
+```
+
+**Find every concrete implementation of an interface**
+
+```python
+from praisonaiagents.tools import lsp_implementations
+
+print(lsp_implementations("src/storage/base.py", symbol="Storage"))
 ```
 
 **Explore an unfamiliar file**
