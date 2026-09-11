@@ -880,6 +880,14 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     "streaming moved into output=; use "
                     "output=OutputConfig(stream=True)."
                 ),
+                "tool_retry_policy": (
+                    "tool retry moved into tool_config=; use "
+                    "tool_config=ToolConfig(retry_policy=RetryPolicy(...))."
+                ),
+                "tool_timeout": (
+                    "tool timeout moved into tool_config=; use "
+                    "tool_config=ToolConfig(timeout=...)."
+                ),
             }
             _hint = "".join(
                 f"\n  {name}: {_HINTS[name]}" for name in sorted(_unknown) if name in _HINTS
@@ -2544,7 +2552,12 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                         self.tools.extend(get_ast_grep_tools())
                     except ImportError:
                         pass  # No default tools available
-        
+
+        # Merge tools contributed by enabled PluginType.TOOL plugins so a plugin's
+        # get_tools() output is actually callable by this agent. Existing tools win
+        # on a name collision (reported, not silently shadowed).
+        self._merge_plugin_tools()
+
         self.max_iter = max_iter
         self.max_rpm = max_rpm
         self.max_execution_time = max_execution_time
