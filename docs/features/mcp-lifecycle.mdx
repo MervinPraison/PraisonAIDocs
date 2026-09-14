@@ -225,17 +225,35 @@ mcp = MCP("uvx mcp-server-time")
 mcp.shutdown()
 ```
 
-`shutdown()` dispatches to the right teardown call per transport. HTTP-stream and WebSocket clients expose `close()` (not `shutdown()`), so `shutdown()` falls back to `close()` for them — previously these two transports leaked on shutdown.
-
-| Transport | Client method actually invoked |
-|---|---|
-| Stdio | subprocess terminate + stream close |
-| SSE | HTTP stream close |
-| HTTP Stream | `close()` (fallback) |
-| WebSocket | `close()` (fallback) |
+`shutdown()` closes an MCP connection. For stdio transports it enqueues a sentinel on the runner queue, **joins the background thread**, and lets the transport terminate its child process. For HTTP-stream / WebSocket transports it dispatches to `close()` (or `aclose()` if awaitable). It is idempotent — a second call is a no-op — and it never raises: cleanup errors are swallowed as best-effort.
 
 <Note>
-Since PraisonAI [#4423](https://github.com/MervinPraison/PraisonAI/pull/4423), a failed construction (handshake timeout or init error) invokes an internal `MCPToolRunner.stop()` — a best-effort teardown that joins the background thread so a failed handshake does not leak a stdio subprocess. It runs automatically inside `MCP.__init__`; it is **not** a public API. Public shutdown stays `mcp.shutdown()` or the context-manager form. See [MCP → Errors on construction](/features/mcp#errors-on-construction).
+`shutdown()` now joins the runner thread and terminates the stdio subprocess in the same call. In long-lived processes (gateways, API servers, notebooks, CI parallel tests) this prevents one leaked `npx` / `node` child per agent lifecycle — a regression fixed in [PR #5078](https://github.com/MervinPraison/PraisonAI/pull/5078).
+</Note>
+
+| Transport | Client method invoked | Cleanup performed |
+|---|---|---|
+| Stdio | subprocess terminate + stream close | Sentinel → thread join → subprocess terminate |
+| SSE | HTTP stream close | Stream close |
+| HTTP Stream | `close()` (fallback) | Session close |
+| WebSocket | `close()` (fallback) | Socket close |
+
+### Idempotency & retry
+
+`shutdown()` is safe to call multiple times:
+
+```python
+from praisonaiagents import MCP
+
+mcp = MCP("uvx mcp-server-time")
+mcp.shutdown()
+mcp.shutdown()   # no-op — self.runner is None
+```
+
+If an in-flight tool call keeps the runner thread alive past the join timeout, the runner reference is kept so a later `shutdown()` can retry the join. The thread is a daemon, so a surviving runner never blocks interpreter exit.
+
+<Note>
+`MCPToolRunner.stop()` is the internal helper that queues the sentinel **and** joins the daemon thread. Since [PR #5078](https://github.com/MervinPraison/PraisonAI/pull/5078) it runs on both normal `MCP.shutdown()` (via the `MCP.shutdown()` → `runner.stop()` call) and on construction failures (handshake timeout / init error). It is not a public API — public shutdown stays `mcp.shutdown()` or the context-manager form. See [PR #5078](https://github.com/MervinPraison/PraisonAI/pull/5078) and [issue #5074](https://github.com/MervinPraison/PraisonAI/issues/5074).
 </Note>
 
 ### `__del__`
@@ -267,6 +285,60 @@ with MCP("ws://localhost:8080") as mcp: ...
 
 All four transports now close uniformly on `shutdown()`. HTTP-stream and WebSocket close via the `close()` fallback inside `MCP.shutdown()` — previously these two leaked subprocesses/threads on shutdown, while stdio and SSE cleaned up correctly.
 
+## Long-running processes
+
+Gateways, HTTP invoke APIs, Jupyter kernels, and CI test runners create many `Agent(mcp=...)` instances over their lifetime. Every stdio MCP spawns a child process (`npx` / `node`) and a daemon runner thread. If those aren't torn down when the agent is done, the host process leaks one child per MCP per agent.
+
+```mermaid
+sequenceDiagram
+    participant Server as Long-lived Process
+    participant Agent
+    participant MCP
+    participant Child as npx / node
+
+    loop Each request
+        Server->>Agent: Agent(tools=[MCP(...)])
+        Agent->>MCP: __init__
+        MCP->>Child: spawn stdio subprocess
+        Server->>Agent: agent.start(...)
+        Server->>Agent: agent.close()
+        Agent->>MCP: shutdown()
+        MCP->>Child: terminate (thread join + stream close)
+    end
+
+    Note over Server,Child: With PR #5078, each iteration ends<br/>with zero leaked children.
+```
+
+The recommended pattern for long-lived hosts is a `try/finally` around every agent that carries MCP tools:
+
+```python
+from praisonaiagents import Agent, MCP
+
+def handle_request(prompt: str) -> str:
+    agent = Agent(
+        name="Assistant",
+        tools=[MCP("uvx mcp-server-time")],
+    )
+    try:
+        return agent.start(prompt)
+    finally:
+        agent.close()   # walks tools, calls MCP.shutdown() on each
+```
+
+Async equivalent:
+
+```python
+import asyncio
+from praisonaiagents import Agent, MCP
+
+async def handle_request(prompt: str) -> str:
+    async with Agent(
+        name="Assistant",
+        tools=[MCP("uvx mcp-server-time")],
+    ) as agent:
+        return await agent.achat(prompt)
+```
+
 ## Best Practices
 
 <AccordionGroup>
@@ -285,6 +357,10 @@ Open each MCP in its own `with` block or nest them — both instances shut down 
 
 <Accordion title="Pass secrets via env, not inline">
 Use the `env=` parameter with `os.getenv(...)` rather than hard-coding API keys in recipe files.
+</Accordion>
+
+<Accordion title="Close every agent in long-running hosts">
+Gateways, API servers, and notebooks accumulate leaked `node` / `npx` children if `MCP.shutdown()` (or `agent.close()`) is never called. Wrap each request or session in `try/finally` and call `agent.close()` — or use `with MCP(...) as mcp:` for per-MCP scope. Since [PR #5078](https://github.com/MervinPraison/PraisonAI/pull/5078), `shutdown()` reliably terminates the stdio subprocess and joins the runner thread.
 </Accordion>
 
 </AccordionGroup>
