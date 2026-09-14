@@ -142,6 +142,78 @@ graph TB
 
 ---
 
+## Streaming honours the same Stop
+
+`start(stream=True)` and `iter_stream()` short-circuit a pending tool batch on Stop, just like `chat()` — the same `InterruptController` / `cancel_token` seam covers the streaming path end-to-end.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Stream as get_response_stream
+    participant Exec as execute_batch
+    participant Tool as Pending tools
+    participant Model
+
+    User->>Agent: start(prompt, stream=True)
+    Agent->>Stream: forward cancel_token
+    Stream->>Model: request (tools=...)
+    Model-->>Stream: tool_calls
+    User->>Agent: interrupt_controller.request("user_stop")
+    Stream->>Exec: execute_batch(..., cancel_token=token)
+    Exec-->>Stream: cancelled ToolResult (pending calls skipped)
+    Note over Stream,Model: follow-up completion request is NOT issued
+    Stream-->>Agent: stream ends
+    Agent-->>User: streamed output stops promptly
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef stream fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef tool fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef model fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class User user
+    class Agent agent
+    class Stream,Exec stream
+    class Tool tool
+    class Model model
+```
+
+| Coverage | Non-streaming (`chat()`) | Streaming (`start(stream=True)` / `iter_stream()`) |
+|---|---|---|
+| Cancel before model returns tool_calls | ✅ | ✅ |
+| Pending tool batch short-circuits on Stop | ✅ | ✅ (since PR #5081) |
+| Follow-up completion request skipped on Stop | ✅ | ✅ (since PR #5081) |
+| Fallback loop (Anthropic / Gemini / Ollama with tools) honours Stop | ✅ | ✅ (since PR #5081) |
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.agent import InterruptController
+
+controller = InterruptController()
+
+agent = Agent(
+    name="Runner",
+    instructions="Search, then summarise.",
+    tools=["shell", "search"],
+    interrupt_controller=controller,
+)
+
+# From another thread / a UI Stop button:
+# controller.request("user_stop")
+
+for chunk in agent.start("Find the largest file under /var/log and summarise it", stream=True):
+    print(chunk, end="", flush=True)
+# On Stop mid-turn: pending tools return `error_kind="cancelled"` and the
+# stream ends — no further completion request is issued.
+```
+
+<Note>
+**Fixed in PraisonAI [PR #5081](https://github.com/MervinPraison/PraisonAI/pull/5081) (issue [#5073](https://github.com/MervinPraison/PraisonAI/issues/5073)).** Before this PR, `cancel_token` was dropped at the `ToolCallExecutor.execute_batch()` boundary on the streaming path — `Stop` halted the model between iterations but shell / MCP / file tools already dispatched in the current batch ran to completion, and the streaming loop still spent one more completion request on the cancelled turn. Since #5081, the token is forwarded from the public streaming entry point (`start(stream=True)` / `iter_stream()`) through `get_response_stream` into `execute_batch`, and three additional guards break the streaming and fallback loops the moment the token is signalled.
+</Note>
+
+---
+
 ## Custom `InterruptController` implementations
 
 Exposing the `event` is optional — a controller without it keeps working, giving loop-level cancellation only.
