@@ -43,7 +43,7 @@ graph LR
 | What is dead? | An individual **client connection** | The **event loop itself** (process is a zombie) |
 | Detected how? | `PING` / `PONG` frames on the wire | OS-thread probe via `loop.call_soon_threadsafe` |
 | Reaction | Close the connection (`LIVENESS_TIMEOUT`) | Dump stacks and `os._exit(75)` for restart |
-| Config surface | `LivenessConfig` in `gateway.yaml` | Python opt-in via `watchdog.arm(loop)` |
+| Config surface | `LivenessConfig` in `gateway.yaml` | `gateway.watchdog.*` YAML, and Python `arm(loop)` / `arm_deadline(deadline_s)` |
 | Runs on | Gateway reaper task (async) | Dedicated OS thread (survives loop hang) |
 </Note>
 
@@ -247,6 +247,122 @@ The watchdog's `last_lag_ms` property also feeds `pressure.event_loop_lag_p99_ms
 
 ---
 
+## Shutdown-phase deadline mode
+
+`arm_deadline(seconds)` fires on a **wall-clock overrun** independent of loop responsiveness, so a wedged teardown on a still-alive loop still gets an all-thread stack dump + bounded `os._exit(75)` instead of an external `SIGKILL`.
+
+```mermaid
+graph LR
+    subgraph "Shutdown-phase deadline"
+        Stop[🛑 stop() / SIGTERM] --> Arm[⏱️ arm_deadline<br/>drain_timeout + grace]
+        Arm --> Drain[🧹 ordered teardown]
+        Drain --> Done{Clean by<br/>deadline?}
+        Done -->|Yes| Cancel[✅ cancel — no exit]
+        Done -->|No| Dump[🚨 dump all-thread stacks]
+        Dump --> Exit[💥 os._exit(75)]
+        Exit --> Sup[👷 supervisor restart]
+    end
+
+    classDef signal fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Stop signal
+    class Arm,Drain process
+    class Done decision
+    class Cancel success
+    class Dump,Exit warn
+    class Sup success
+```
+
+Deadline mode is a **sibling** of the loop-probe mode — they cover different failure shapes.
+
+| Concern | Loop-probe mode | Shutdown-phase deadline mode |
+|---|---|---|
+| What is dead? | The **event loop itself** (process is a zombie) | A **teardown step** while the loop is still responsive |
+| Detected how? | Missed OS-thread probes on the loop | Wall-clock overrun of `drain_timeout + grace` |
+| Armed by | `arm(loop)` in the embedder / `_server.serve()` in the gateway | `arm_deadline(deadline_s)` in `stop()` and in the supervisor-driven teardown `finally` |
+| Disarmed by | `disarm()` after `serve()` returns / in `stop()` | `cancel()` in `stop()`'s `finally` — clean stops never self-exit |
+| Runs on | Dedicated `praisonai-loop-watchdog` daemon thread | Dedicated `praisonai-shutdown-watchdog` daemon thread |
+
+<Tabs>
+
+<Tab title="YAML (recommended)">
+
+Add a `shutdown_grace` key to the same `gateway.watchdog` block. This is the extra budget added **on top of** `drain_timeout` before the deadline fires.
+
+```yaml
+# gateway.yaml
+gateway:
+  watchdog:
+    enabled: true
+    liveness_interval: 5
+    liveness_strikes: 3
+    shutdown_grace: 5      # seconds beyond drain_timeout before the deadline fires
+    dump_file: /var/log/praisonai/loop-wedge.log
+```
+
+If `drain_timeout: 10` (see [Graceful Drain](/features/gateway-graceful-drain)) and `shutdown_grace: 5`, the deadline fires ~15 seconds into a wedged shutdown — well before systemd's default `TimeoutStopSec=90` reaches `SIGKILL`.
+
+</Tab>
+
+<Tab title="Python stop(grace=…)">
+
+`stop()` accepts a per-call `grace` override that wins over `policy.shutdown_grace_s`.
+
+```python
+import asyncio
+from praisonai_bot.gateway.server import Gateway
+
+gateway = Gateway.from_yaml("gateway.yaml")
+asyncio.create_task(gateway.serve())
+
+# ... later, on shutdown:
+await gateway.stop(drain_timeout=30, grace=10)
+# → the deadline watchdog fires at ~40s if any teardown step is wedged
+```
+
+Passing `grace=None` (the default) uses `policy.shutdown_grace_s` — set once in `gateway.yaml` and stops don't need to specify it.
+
+</Tab>
+
+<Tab title="Custom runtime arm_deadline">
+
+Embedding your own asyncio runtime? Wrap your shutdown in an `arm_deadline` / `cancel` pair.
+
+```python
+import asyncio
+from praisonaiagents.gateway import LoopWatchdog, LoopWatchdogPolicy
+
+watchdog = LoopWatchdog(LoopWatchdogPolicy(shutdown_grace_s=5.0))
+watchdog.arm(loop)  # loop-probe mode during serving
+
+async def shutdown(drain_timeout=10.0):
+    watchdog.arm_deadline(drain_timeout + watchdog.policy.shutdown_grace_s)
+    try:
+        await ordered_teardown()      # your adapter.disconnect(), WS drain, DB close, ...
+    finally:
+        watchdog.cancel()             # clean stops never self-exit
+
+# ...
+loop.run_until_complete(shutdown())
+watchdog.disarm()
+```
+
+Both modes share the same `_dump_stacks` + `os._exit(exit_code)` machinery and the same `on_wedge="dump_only"` diagnostic override.
+
+</Tab>
+
+</Tabs>
+
+<Note>
+**Added in PraisonAI [PR #5084](https://github.com/MervinPraison/PraisonAI/pull/5084) (issue [#5079](https://github.com/MervinPraison/PraisonAI/issues/5079)).** Before this PR, the loop-probe watchdog was — correctly, per [#3410](https://github.com/MervinPraison/PraisonAI/issues/3410) — disarmed the moment a deliberate `stop()` started, so a wedged teardown on a still-alive loop hung until systemd's `TimeoutStopSec` fired `SIGKILL`, with no stack dump. Deadline mode closes that gap: the wrapper arms `drain_timeout + shutdown_grace` at the start of the stop path (and around the SIGTERM/SIGINT-driven teardown), cancels on clean completion, and self-exits with a diagnostic dump if the deadline elapses. It is fully opt-in and no-op when a watchdog is unconfigured; a cancel racing an in-flight expiry suppresses the destructive `os._exit`, and a stale generation after re-arm stays inert.
+</Note>
+
+---
+
 ## Configuration Options
 
 `LoopWatchdogPolicy` holds every knob.
@@ -258,6 +374,7 @@ The watchdog's `last_lag_ms` property also feeds `pressure.event_loop_lag_p99_ms
 | `on_wedge` | `"dump_and_exit"` \| `"dump_only"` | `"dump_and_exit"` | What to do once a wedge is confirmed. `"dump_and_exit"` dumps all-thread stacks then calls `os._exit(exit_code)`; `"dump_only"` dumps stacks but leaves the process running. |
 | `exit_code` | `int` | `75` (`GATEWAY_RESTART_EXIT_CODE`) | Exit code used when `on_wedge == "dump_and_exit"`. Defaults to EX_TEMPFAIL so a supervisor restarts the process. |
 | `dump_file` | `Optional[str]` | `None` | Optional path to *also* write the stack dump to (appended, line-buffered). `None` writes to stderr only. |
+| `shutdown_grace_s` | `float` | `5.0` | Extra budget (seconds) added beyond a caller's `drain_timeout` when arming the shutdown-phase deadline via `arm_deadline`. Must be finite and `>= 0` (zero is allowed; negative, `NaN`, `inf` raise `ValueError`). Only consulted by shutdown-phase deadline mode; the loop-probe mode ignores it. |
 
 **Computed property:**
 
@@ -274,6 +391,10 @@ The watchdog's `last_lag_ms` property also feeds `pressure.event_loop_lag_p99_ms
 | `disarm()` | Stop watching. Safe to call multiple times / when not armed. Joins the worker (best-effort) with a `probe_interval_s + 1.0s` timeout. |
 | `armed` | `True` iff the worker thread is alive. |
 | `wedged` | `True` once a wedge has been confirmed (mainly useful for `dump_only`). |
+| `arm_deadline(deadline_s)` | Start a wall-clock shutdown deadline on a dedicated daemon thread (`praisonai-shutdown-watchdog`). Non-positive / non-finite `deadline_s` is a silent no-op. Idempotent while armed. See [Shutdown-phase deadline mode](#shutdown-phase-deadline-mode). |
+| `cancel()` | Cancel an armed shutdown deadline. Sets the current generation's stop event (suppressing an in-flight expiry even mid-dump). Safe when not armed. |
+| `deadline_armed` | `True` iff a shutdown-phase deadline is currently armed. |
+| `deadline_expired` | `True` once a shutdown deadline actually fired (mainly useful for `on_wedge="dump_only"` diagnostics). Cancelled generations do not flip this. |
 
 ### YAML config keys
 
@@ -285,6 +406,7 @@ The `gateway.watchdog` block is a thin façade over `LoopWatchdogPolicy` for gat
 | `liveness_interval` | `float` | `5.0` | `LoopWatchdogPolicy.probe_interval_s` | Seconds between probes scheduled onto the loop. |
 | `liveness_strikes` | `int` | `3` | `LoopWatchdogPolicy.missed_probes_before_wedged` | Consecutive missed probes before a wedge is declared. |
 | `dump_file` | `str` \| `null` | `null` | `LoopWatchdogPolicy.dump_file` | Optional path to also write the stack dump to. `null` writes to stderr only. |
+| `shutdown_grace` | `float` | `5.0` | `LoopWatchdogPolicy.shutdown_grace_s` | Extra budget (seconds) beyond `drain_timeout` before the shutdown-phase deadline fires. Only active when the wrapper's stop path or supervisor-driven teardown runs. |
 
 An invalid value (for example `liveness_interval: 0`) fails closed: the gateway logs a warning and runs without a watchdog.
 
