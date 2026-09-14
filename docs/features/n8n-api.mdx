@@ -252,6 +252,42 @@ sequenceDiagram
 Do NOT pass a hard-coded fallback like `session_id || "default"` — that single bucket becomes one continuous conversation shared by every caller who lacks a real id, silently defeating the isolation this endpoint provides. Either pass a **per-user / per-conversation** id, or omit the field entirely to get the ephemeral (isolated, non-persistent) mode.
 </Warning>
 
+### Per-request cleanup
+
+`/invoke` releases the per-request clone deterministically. After every response — success **or** error — the wrapper calls `await agent.aclose()` (or `agent.close()` in a worker thread when the clone only exposes the sync form). Only clones are closed; when the resolved agent is the shared registry template (plain mocks / non-isolatable agents) it is left untouched, so subsequent requests don't hit a torn-down instance.
+
+This means:
+
+- **MCP stdio subprocesses** started by a clone's tools are terminated before the response returns — no `node.exe` / `uvx …` accumulation in long-lived n8n polling loops.
+- **LLM HTTP client pools** and **tool-executor threads** owned by the clone are released.
+- **Cleanup failures never mask the response** — they are caught and logged (`logger.exception("Agent cleanup failed")`).
+
+No API change: `AgentInvokeRequest` / `AgentInvokeResponse` are unchanged. This is a wrapper-internal fix delivered in [PR #5083](https://github.com/MervinPraison/PraisonAI/pull/5083).
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Route as /invoke handler
+    participant Resolve as resolve_session_agent
+    participant Clone as Agent clone
+    participant Cleanup as clone teardown
+
+    Client->>Route: POST {message, session_id?}
+    Route->>Resolve: (agent_id, session_id)
+    Resolve->>Clone: clone_for_channel()
+    Clone-->>Route: isolated clone
+    Route->>Clone: astart() / start()
+    Clone-->>Route: result
+    Route->>Cleanup: await aclose() / close()
+    Cleanup->>Clone: aclose() / close()
+    Cleanup-->>Route: (errors logged, swallowed)
+    Route-->>Client: response
+```
+
+<Note>
+Every deployment that serves `praisonai serve agents.yaml` (or embeds `router` from `praisonai.api.agent_invoke`) gets this cleanup automatically — including every n8n workflow that hits the endpoint. See [Agent Lifecycle Cleanup](/features/agent-lifecycle-cleanup) and [Agent Invoke Registry](/features/agent-invoke-registry).
+</Note>
+
 **Response:**
 
 ```json
@@ -810,6 +846,14 @@ Secure your API integration:
 
 **Fix:** upgrade to the release containing PR #4400.
 </Tab>
+
+<Tab title="Rising memory / threads / MCP subprocesses">
+**Symptom:** After N invokes against a long-lived server, `ps` / Task Manager shows growing numbers of MCP stdio processes (`node.exe`, `uvx …`) or the process's memory / thread count creeps up.
+
+**Cause:** Fixed in PR #5083. Before that release, the invoke handler discarded the per-request agent clone without calling `close()` / `aclose()`, so lazily-created MCP subprocesses, LLM HTTP pools, and tool-executor threads leaked.
+
+**Fix:** Upgrade to the release containing PR #5083. Verify with `pytest src/praisonai/tests/test_n8n_agent_invoke.py::TestAgentInvokeCleanup -v`.
+</Tab>
 </Tabs>
 
 ### Debugging Steps
@@ -836,5 +880,11 @@ Secure your API integration:
   </Card>
   <Card title="CLI n8n Commands" icon="terminal" href="/cli/n8n">
     Command-line tools for n8n workflow management
+  </Card>
+  <Card title="Agent Lifecycle Cleanup" icon="broom" href="/features/agent-lifecycle-cleanup">
+    How per-request clones release LLM clients and MCP subprocesses
+  </Card>
+  <Card title="Agent Invoke Registry" icon="user" href="/features/agent-invoke-registry">
+    Templates vs. per-request clones and their teardown
   </Card>
 </CardGroup>
