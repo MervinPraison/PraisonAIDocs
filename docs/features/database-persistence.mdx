@@ -110,9 +110,12 @@ sequenceDiagram
 
     User->>Agent: start(prompt)
     Agent->>DB: on_agent_start(session_id)
-    DB->>Store: load history
+    DB->>Store: load history (incl. tool_calls / tool_call_id)
     Store-->>Agent: previous messages
-    Agent->>DB: on_user_message / on_agent_message
+    Agent->>DB: on_user_message
+    Agent->>DB: on_assistant_message (with tool_calls)
+    Agent->>DB: on_tool_message (tool_call_id)
+    Agent->>DB: on_agent_message (final answer)
     Agent-->>User: reply
 ```
 
@@ -181,6 +184,79 @@ The auto ID ends in a per-instance random suffix, so:
 - Two `Agent(name="Assistant")` instances **never** share history — no cross-instance bleed, even when started in the same UTC hour.
 - The auto ID **cannot** resume a conversation across process restarts — a new instance gets a new suffix, hence a new session. For resumable multi-turn conversations, pass an explicit `session_id`. See [Session Persistence](/features/session-persistence).
 </Warning>
+
+---
+
+## Custom DB Adapter
+
+Any object with the right method shape works as a DB adapter — no base class, no import required.
+
+```python
+from praisonaiagents import Agent, MemoryConfig
+
+agent = Agent(
+    name="Assistant",
+    instructions="Help the user.",
+    memory=MemoryConfig(db=MyDbAdapter(), session_id="chat-42"),
+)
+agent.start("Read a.txt and summarise it")
+```
+
+The adapter persists each turn and returns prior messages on `on_agent_start`, so the session resumes across restarts.
+
+### Required vs optional methods
+
+| Required method | What it does |
+|---|---|
+| `on_agent_start(agent_name, session_id, user_id=None, metadata=None)` | Return the resumed message list (as `DbMessage` instances) |
+| `on_user_message(session_id, content, metadata=None)` | Persist a user turn |
+| `on_agent_message(session_id, content, metadata=None)` | Persist a plain assistant turn |
+| `on_tool_call(session_id, tool_name, arguments, result, metadata=None)` | Persist a tool invocation |
+| `on_agent_end(session_id, metadata=None)` | Flush / finalise the turn |
+
+| Optional method | What it does |
+|---|---|
+| `on_assistant_message(session_id, content, tool_calls=None, metadata=None)` | Persist an assistant turn **with** structured `tool_calls` |
+| `on_tool_message(session_id, content, tool_call_id, metadata=None)` | Persist a `role="tool"` result linked to `tool_call_id` |
+
+The two optional methods (PR [#5082](https://github.com/MervinPraison/PraisonAI/pull/5082)) let a resumed session hand the model the same tool transcript the JSON store already keeps.
+
+### Minimal adapter
+
+```python
+class MyDbAdapter:
+    def on_agent_start(self, agent_name, session_id, user_id=None, metadata=None):
+        return []  # return DbMessage list to resume
+
+    def on_user_message(self, session_id, content, metadata=None):
+        ...
+
+    def on_agent_message(self, session_id, content, metadata=None):
+        ...
+
+    # Optional — implement these to persist tool turns faithfully
+    def on_assistant_message(self, session_id, content, tool_calls=None, metadata=None):
+        ...
+
+    def on_tool_message(self, session_id, content, tool_call_id, metadata=None):
+        ...
+```
+
+<Note>
+Adapters that omit `on_assistant_message` / `on_tool_message` still work — assistant tool-call turns fall back to text-only via `on_agent_message`, and raw `role="tool"` turns are dropped. Add them to give resumed sessions the same tool transcript the JSON store already has.
+</Note>
+
+<Tip>
+Third-party code can feature-detect the capability with `isinstance`:
+
+```python
+from praisonaiagents.db import ToolTurnDbAdapterProtocol
+
+isinstance(my_adapter, ToolTurnDbAdapterProtocol)  # True if it opts in
+```
+</Tip>
+
+Reference: PraisonAI PR [#5082](https://github.com/MervinPraison/PraisonAI/pull/5082) (fixes [#5075](https://github.com/MervinPraison/PraisonAI/issues/5075)).
 
 ---
 
