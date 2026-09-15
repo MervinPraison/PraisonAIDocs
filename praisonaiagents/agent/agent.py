@@ -23,9 +23,12 @@ from .tool_execution import ToolExecutionMixin, BackoffPolicy
 from .chat_handler import ChatHandlerMixin
 from .session_manager import SessionManagerMixin
 from .async_safety import AsyncSafeState, DualLock
-# NOTE: UnifiedExecutionMixin is deprecated and unused by any production path
-# (Issue #2644). It is kept in the MRO for backward compatibility during the
-# deprecation cycle and will be removed afterwards.
+# NOTE: UnifiedExecutionMixin's *public* methods are deprecated and unused by
+# any production path (Issue #2644); it is kept in the MRO for backward
+# compatibility during the deprecation cycle and will be removed afterwards.
+# The one live helper it used to own (_run_async_in_sync_context) has been
+# relocated to async_safety.run_async_in_sync_context, so dropping this mixin
+# from the MRO is a true no-op.
 from .unified_execution_mixin import UnifiedExecutionMixin
 from .sandbox_mixin import SandboxMixin
 from .message_steering import SteeringMixin
@@ -7971,6 +7974,41 @@ Answer:"""
                 elif hasattr(self.memory, 'close_connections'):
                     self.memory.close_connections()
             
+            # LLM client cleanup - release live client pools asynchronously.
+            # Mirror close()'s targets but never touch the ``llm_instance``
+            # property (it would lazily *create* a client just to close it);
+            # only tear down an already-materialised ``_llm_instance``.
+            try:
+                llm_instance = getattr(self, '_llm_instance', None)
+                if llm_instance is not None:
+                    aclose = getattr(llm_instance, 'aclose', None)
+                    if aclose is not None:
+                        try:
+                            if asyncio.iscoroutinefunction(aclose):
+                                await aclose()
+                            else:
+                                aclose()
+                        except Exception:
+                            close = getattr(llm_instance, 'close', None)
+                            if callable(close):
+                                close()
+                    else:
+                        close = getattr(llm_instance, 'close', None)
+                        if callable(close):
+                            close()
+
+                openai_client = getattr(self, '_Agent__openai_client', None)
+                if openai_client is not None and hasattr(openai_client, 'close'):
+                    openai_client.close()
+
+                llm = getattr(self, 'llm', None)
+                if llm and not isinstance(llm, str):
+                    llm_client = getattr(llm, '_client', None)
+                    if llm_client and hasattr(llm_client, 'close'):
+                        llm_client.close()
+            except Exception as e:
+                logger.warning(f"LLM client cleanup failed: {e}")
+
             # Close MCP clients passed via tools=[MCP(...)]
             # (mirrors remove_mcp_server()'s best-effort shutdown)
             if isinstance(self.tools, list):
