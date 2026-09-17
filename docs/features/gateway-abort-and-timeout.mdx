@@ -1,14 +1,16 @@
 ---
 title: "Gateway Abort and Per-Turn Timeout"
 sidebarTitle: "Abort & Timeout"
-description: "Cancel a running agent turn from the gateway with /stop, an abort WebSocket frame, or a per-turn timeout"
+description: "Cancel a running agent turn or drain a whole session (turn + queued backlog) from the gateway with /stop, /stop all, /cancel, an abort WebSocket frame, or a per-turn timeout"
 icon: "circle-stop"
 ---
 
-Stop a hung or runaway gateway turn cooperatively using `/stop`, an `abort` WebSocket frame, or a configurable per-turn timeout — all driven by the same `InterruptController` primitive the CLI uses for Ctrl-C.
+Stop a hung or runaway gateway turn cooperatively using `/stop`, an `abort` WebSocket frame, or a configurable per-turn timeout — or stop the whole session (the running turn **and** everything queued behind it) with `/stop all`, `/cancel`, or `abort` carrying `scope: "session"`.
 
 <Note>
 Available since [PraisonAI#3472](https://github.com/MervinPraison/PraisonAI/pull/3472). The gateway advertises `abort` in the `hello_ok` capability handshake, accepts `abort` / `message_abort` WebSocket frames, honours `/stop` (or `stop`) in chat, and enforces a configurable per-turn timeout via `gateway.per_turn_timeout`.
+
+Session-scoped stop (`/stop all`, `/cancel`, `abort` with `scope: "session"`) added in [PraisonAI#5130](https://github.com/MervinPraison/PraisonAI/pull/5130). Default remains turn-scoped for back-compat.
 </Note>
 
 ```python
@@ -21,23 +23,47 @@ The gateway relays a `message_abort` event to clients when a turn is cancelled, 
 
 ```mermaid
 graph LR
-    S[/stop chat] --> H[Session Handler]
-    W[abort WS frame<br/>WRITE scope] --> H
+    S1[/stop / stop] --> H[Session Handler]
+    S2[/stop all / /cancel] --> H
+    W1[abort scope=turn] --> H
+    W2[abort scope=session] --> H
     T[per_turn_timeout] --> H
-    H --> IC[Per-turn<br/>InterruptController]
-    IC -->|cooperative<br/>request| A[Agent turn]
-    A -->|unwinds<br/>≤ 5s| Fin[Turn cancelled: ...]
+    H -->|TURN| IC[Per-turn<br/>InterruptController]
+    H -->|SESSION| IC
+    H -->|SESSION| Q[Drain session inbox<br/>+ bump stop_epoch]
+    IC --> A[Agent turn]
+    Q --> C[pending_cancelled: N]
+    A --> Fin[turn_aborted: true]
     Fin --> F[message_abort frame]
-    F --> R[client render]
+    C --> R[reply payload]
+    F --> R
 
     classDef in fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef cfg fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef out fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class S,W,T in
-    class H,IC,A proc
-    class Fin,F,R out
+    class S1,S2,W1,W2,T in
+    class H,IC,A,Q proc
+    class Fin,F,C,R out
+```
+
+Pick the scope that matches what you want stopped — the running answer only, or that answer plus everything you queued behind it.
+
+```mermaid
+graph TB
+    Q{What do you want to stop?} --> A[Just the running answer]
+    Q --> B[Everything I typed — the running answer AND my queued follow-ups]
+    A --> A1[/stop  ·  stop  ·  abort frame default]
+    B --> B1[/stop all  ·  /cancel  ·  abort frame with scope=session]
+
+    classDef q fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef turn fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef session fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class A,A1 turn
+    class B,B1 session
 ```
 
 ## Quick Start
@@ -49,6 +75,36 @@ graph LR
     ```json
     {"type": "message", "content": "/stop"}
     ```
+  </Step>
+  <Step title="Cancel the whole session with /stop all or /cancel">
+    When the user typed several follow-ups and wants everything they queued cancelled too, a session-scoped stop cancels the in-flight turn **and** drains the session inbox.
+
+    ```json
+    {"type": "message", "content": "/stop all"}
+    ```
+
+    Reply carries the drained count:
+
+    ```json
+    {
+      "type": "aborted",
+      "session_id": "sess-1",
+      "scope": "session",
+      "turn_aborted": true,
+      "pending_cancelled": 2
+    }
+    ```
+
+    `/cancel` is an alias for `/stop all`.
+  </Step>
+  <Step title="Session-scope the abort WebSocket frame">
+    The same `abort` frame drains the backlog when you add `scope: "session"`:
+
+    ```json
+    {"type": "abort", "reason": "user", "scope": "session"}
+    ```
+
+    `scope` is optional; absent or unknown falls back to `TURN`.
   </Step>
   <Step title="Cancel with an abort WebSocket frame">
     Send an `abort` frame — requires the `write` operator scope (same as sending a message as the agent):
@@ -118,6 +174,29 @@ Default `0.0` = disabled. Every turn runs to completion, exactly as in releases 
 
 ---
 
+## Stop Scopes
+
+Two scopes. `TURN` stops the current answer. `SESSION` stops the current answer and drains everything the user queued behind it.
+
+| Scope | Chat command | Abort frame | What it stops |
+|-------|-------------|-------------|---------------|
+| `TURN` (default, back-compat) | `/stop`, `stop` | `{"type":"abort"}` or `{"scope":"turn"}` | The in-flight turn only. Backlog preserved. |
+| `SESSION` | `/stop all`, `/cancel` | `{"type":"abort","scope":"session"}` | The in-flight turn **and** every queued-but-unstarted message on the session inbox. |
+
+Both `StopScope` and `StopResult` are exported from the public gateway surface:
+
+```python
+from praisonaiagents.gateway import StopScope, StopResult
+```
+
+`StopResult.to_dict()` serialises to exactly `{"scope": ..., "turn_aborted": ..., "pending_cancelled": ...}`. `pending_cancelled` is the count of queued messages a `SESSION` stop drained — a visible, intentional non-outcome, never a silent drop — and is always `0` for a `TURN` stop.
+
+<Note>
+An unknown or malformed `scope` never escalates to `SESSION` — it falls back to the caller's default (`TURN`). A session drain always requires an explicit opt-in.
+</Note>
+
+---
+
 ## Frame shapes
 
 ### Client → Gateway
@@ -125,10 +204,15 @@ Default `0.0` = disabled. Every turn runs to completion, exactly as in releases 
 **Abort frame** — requires the [`write`](/features/gateway-operator-scopes#core-method-classification) operator scope:
 
 ```json
-{"type": "abort", "reason": "user"}
+{"type": "abort", "reason": "user", "scope": "session"}
 ```
 
-`message_abort` is accepted as an alias for `type`; `reason` is optional and defaults to `"user"`.
+`message_abort` is accepted as an alias for `type`.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `reason` | `string` | `"user"` | Echoed back in the terminal turn message. |
+| `scope` | `"turn"` \| `"session"` | `"turn"` | `"session"` also drains the queued backlog; absent/unknown → `"turn"`. |
 
 <Note>
 `abort` is classified as `write` in the gateway method registry — the same scope as sending a `message`, on the principle that aborting a turn mutates it exactly as sending one does.
@@ -136,20 +220,54 @@ Default `0.0` = disabled. Every turn runs to completion, exactly as in releases 
 
 **Portable stop command** — any client already joined to a session can cancel via the message channel:
 
+| Command | Scope | What it stops |
+|---------|-------|---------------|
+| `/stop`, `stop` | `TURN` | The in-flight turn only. Backlog preserved. |
+| `/stop all` | `SESSION` | The in-flight turn **and** the queued backlog. |
+| `/cancel` | `SESSION` | Alias for `/stop all`. |
+
 ```json
-{"type": "message", "content": "/stop"}
+{"type": "message", "content": "/stop all"}
 ```
 
-`stop` (no slash, case-insensitive) is also accepted.
+Matching is case-insensitive and whitespace-trimmed.
 
 ### Gateway → Client (reply to abort)
 
-| Reply | When |
-|-------|------|
-| `{"type": "aborted", "session_id": "<sid>"}` | A turn was active and cancellation was signalled. |
-| `{"type": "no_active_turn", "session_id": "<sid>"}` | The client is joined but nothing is currently running. |
-| `{"type": "error", "code": "insufficient_scope", "message": "insufficient scope", "required_scope": "write"}` | The client is missing the WRITE scope. |
-| `{"type": "error", "message": "Not joined to any session"}` | The client hasn't joined a session. |
+The reply carries the `StopResult` fields alongside `type` and `session_id`.
+
+| Reply | When | Extra fields |
+|-------|------|-------------|
+| `{"type": "aborted", ...}` | A turn was active *or* the `SESSION` drain cancelled queued messages. | `scope`, `turn_aborted` (bool), `pending_cancelled` (int ≥ 0) |
+| `{"type": "no_active_turn", ...}` | No turn was running and (for `SESSION`) the inbox was empty. | `scope`, `turn_aborted: false`, `pending_cancelled: 0` |
+| `{"type": "error", "code": "insufficient_scope", "message": "insufficient scope", "required_scope": "write"}` | The client is missing the WRITE scope. | (unchanged) |
+| `{"type": "error", "message": "Not joined to any session"}` | The client hasn't joined a session. | (unchanged) |
+
+`type` is `"aborted"` when *either* `turn_aborted` is true *or* `pending_cancelled > 0`; otherwise `"no_active_turn"`. A `SESSION` stop with no active turn but 3 queued messages still replies `"aborted"` with `pending_cancelled: 3` — the queued work counts as work stopped.
+
+**Turn-scoped reply:**
+
+```json
+{
+  "type": "aborted",
+  "session_id": "sess-1",
+  "scope": "turn",
+  "turn_aborted": true,
+  "pending_cancelled": 0
+}
+```
+
+**Session-scoped reply:**
+
+```json
+{
+  "type": "aborted",
+  "session_id": "sess-1",
+  "scope": "session",
+  "turn_aborted": true,
+  "pending_cancelled": 3
+}
+```
 
 ### Terminal turn message
 
@@ -212,6 +330,22 @@ sequenceDiagram
   <Accordion title="Default-path cooperative cancel needed PR #4301">
     Prior to [PraisonAI PR #4301](https://github.com/MervinPraison/PraisonAI/pull/4301), the gateway's cooperative cancel reached the agent but the agent dropped the token before `OpenAIClient` on the default sync path. So the gateway's `_ABORT_GRACE_SECONDS = 5.0` hard-cancel was the only real halt on plain `Agent(llm="gpt-4o-mini")`. Upgrade to get cooperative interruption between tool iterations, not just after the 5-second grace.
   </Accordion>
+  <Accordion title="Race-window: the dequeue-to-registration gap">
+    The queue worker dequeues a message *before* registering it as an active turn. A `SESSION` stop bumps a per-session `_stop_epoch` counter; the worker snapshots the epoch at dequeue and re-checks it just before dispatch. A mismatch means a stop landed in the gap — the message is dropped instead of executed, and it is counted toward `pending_cancelled` so the reported outcome is never a silent loss. See `praisonai_bot/gateway/server.py` (search `dequeued_stop_epoch`).
+
+    ```mermaid
+    sequenceDiagram
+        participant Worker
+        participant Session
+        participant Client
+
+        Worker->>Session: dequeue message (snapshot _stop_epoch)
+        Client->>Session: /stop all (bump _stop_epoch, count inflight)
+        Worker->>Session: re-check _stop_epoch before dispatch
+        Note over Worker: epoch mismatch → drop, don't run
+        Session-->>Client: pending_cancelled includes it
+    ```
+  </Accordion>
 </AccordionGroup>
 
 ---
@@ -226,6 +360,9 @@ Real scenarios this page lets you pattern-match to:
 | Operator dashboard spots a runaway turn | WS client (WRITE scope) sends `{"type": "abort", "reason": "operator-timeout"}` | Gateway replies `{"type": "aborted", "session_id": "..."}`; next turn resumes |
 | Ops set a hard ceiling | `gateway.per_turn_timeout: 120.0` | A wedged turn auto-cancels after 2 minutes with `"Turn cancelled: exceeded per-turn timeout."` |
 | One `Agent` serves ten users | User A hits `/stop` | User B's parallel turn keeps running — controllers are per-turn, not per-agent |
+| User fires 3 follow-ups, then wants everything stopped | User types `/stop all` (or `/cancel`) | Current turn cancels, 3 queued messages drop, reply shows `pending_cancelled: 3` |
+| Operator dashboard revokes an entire session's plan | WS `{"type":"abort","scope":"session","reason":"operator-timeout"}` | Same drain, plus the explicit reason echoed in the terminal turn message |
+| User cancels while queue is running but no active turn | `/stop all` | `turn_aborted: false`, `pending_cancelled: N`, backlog is now empty |
 
 ---
 
