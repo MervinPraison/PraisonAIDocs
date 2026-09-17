@@ -88,7 +88,7 @@ store.revert_to_snapshot(session_id, snapshot_id)
 
 ## Multi-Worker Safety
 
-Multiple processes can share one session directory — public reads always reload from disk, so cross-instance writes are visible immediately.
+Multiple processes can share one session directory — reads use an mtime-checked cache, so a write that changes the file on disk is visible on the next read.
 
 ```mermaid
 sequenceDiagram
@@ -103,32 +103,41 @@ sequenceDiagram
 
 | Operation | Safe under concurrency |
 |---|---|
-| `get_extended_session()` | Yes — always reloads from disk; cross-instance writes are visible immediately |
+| `get_extended_session()` | Yes — mtime-checked cache; a changed file is re-read, so cross-instance writes are visible on the next read |
 | `add_message()` | Yes — locked read-modify-write |
 | `fork_session()` | Yes — reloads parent first |
 | `create_snapshot()` / `revert_to_snapshot()` | Yes — atomic under lock |
 
 <Note>
-`get_extended_session()` returns fresh data on every call — do not rely on object identity (`session_a is session_b`). The in-process cache stays coherent, but the same read may return a newly constructed `ExtendedSessionData` object.
+Object identity is not a stable API — expect either a fresh `ExtendedSessionData` object or a cached one. When the file on disk is unchanged, consecutive `get_extended_session()` calls can return the same cached object; when it has changed, you get a fresh one. Use the returned data, not `session_a is session_b`. Changed in [PR #4958](https://github.com/MervinPraison/PraisonAI/pull/4958).
 </Note>
+
+Pass `force_reload=True` for the rare case a caller needs the old unconditional-reread behaviour:
+
+```python
+from praisonaiagents.session import get_hierarchical_session_store
+
+store = get_hierarchical_session_store()
+session = store.get_extended_session(session_id, force_reload=True)  # bypass cache
+```
 
 ---
 
 ## Cache Semantics
 
-Public reads always reload from disk; internal helpers reuse a cache guarded by a file lock.
+`get_extended_session()` now shares the same mtime-checked cache as the internal helpers — a read hits the cache when the file is unchanged and re-reads when its mtime bumps.
 
 | Method | Cache behaviour |
 |---|---|
-| `get_extended_session()` / `get_chat_history()` / `get_session()` | Always reload from disk under lock — no identity guarantee |
-| `_load_extended_session()` (used internally by `fork_session`, `revert_to_snapshot`, `get_children`) | mtime-checked cache, safe because the caller holds a `FileLock` |
+| `get_extended_session(force_reload=False)` / `get_chat_history()` / `get_session()` | mtime-checked cache — cached when the file is unchanged, re-read when it changes; pass `force_reload=True` to always re-read |
+| `_load_extended_session()` (used internally by `fork_session`, `revert_to_snapshot`, `get_children`) | Same mtime-checked cache, safe because the caller holds a `FileLock` |
 | `invalidate_cache(session_id=None)` | Clears both in-memory caches — rarely needed on the read path |
 
-`invalidate_cache()` only matters if your own code caches `ExtendedSessionData` references; the public read path never needs it.
+`invalidate_cache()` only matters if your own code caches `ExtendedSessionData` references; the read path never needs it.
 
 ### Cross-instance reads
 
-A write from a second store instance on the same directory is seen by the first store's next read — no manual `invalidate_cache()` required.
+A write from a second store instance on the same directory changes the file's mtime, so it is seen by the first store's next read — no manual `invalidate_cache()` required.
 
 ```python
 from praisonaiagents.session import get_hierarchical_session_store, HierarchicalSessionStore
