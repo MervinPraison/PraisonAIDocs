@@ -5,8 +5,10 @@ description: "Unit-test agents without hitting a provider"
 icon: "flask"
 ---
 
-Run agent tests offline — no API keys, no network, no bill — with `ScriptedModel` in place of a real provider and `allow_model_requests(False)` as a hard gate.
+Run agent tests offline — no API keys, no network, no bill — with `ScriptedModel` in place of a real provider and a hard gate that blocks any real request.
 
+<Tabs>
+<Tab title="Python">
 ```python
 from praisonaiagents import Agent, ScriptedModel
 
@@ -39,9 +41,59 @@ graph LR
     class S,A run
     class Assert ok
 ```
+</Tab>
+<Tab title="TypeScript">
+```ts
+import { Agent, ScriptedModel, allowModelRequests } from 'praisonai';
+
+allowModelRequests(false);            // nothing in this suite may reach a provider
+
+const model = new ScriptedModel(['Refunded order A1.']);
+const agent = new Agent({ instructions: 'Support bot.', llm: model });
+
+expect(await agent.chat('refund order A1')).toBe('Refunded order A1.');
+expect(model.requestCount).toBe(1);
+expect(model.requests[0].prompt).toBe('refund order A1');
+```
+
+`ScriptedModel` subclasses the real `BaseLLM`, replacing only `generate` / `generateStream` / `generateText` / `streamText` / `generateObject`. Prompt assembly, tool schemas, and the response shape all run production code — the double cannot drift from the real client because it *is* the real client with its network boundary swapped out.
+
+```mermaid
+graph LR
+    P[🧪 jest] --> G{🚦 allowModelRequests<br/>false?}
+    G -->|blocked| X[🚫 ModelRequestBlocked<br/>names your call site]
+    G -->|scripted| S[🎬 ScriptedModel replies]
+    S --> A[🤖 Agent runs production path<br/>prompt · tools · streaming]
+    A --> Assert[✅ expect(...)]
+
+    classDef test fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef run fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class P test
+    class G gate
+    class X bad
+    class S,A run
+    class Assert ok
+```
+
+<Note>
+**TypeScript differs from Python in a few ways:**
+- Method / helper naming is camelCase (`allowModelRequests`, `noModelRequests`, `modelRequestsAllowed`, `requestCount`) rather than snake_case.
+- `noModelRequests` takes a function (`await noModelRequests(async () => { ... })`); Python uses a `with` context manager.
+- Scripting a tool call is **Python-only** for now — `ScriptedModel.tool_call(...)` does not yet exist in TS. Scripts are strings or `(req) => string` callables. Track parity on the [TS parity issue](https://github.com/MervinPraison/PraisonAI/pull/4964).
+- The request gate uses a **counter** from day one, so an inner `noModelRequests()` scope exiting first cannot re-enable requests while an outer scope is still open.
+- `ModelRequestBlocked` is a regular `Error` subclass. A `try { ... } catch (e) { ... }` around an agent call will catch it — rethrow, or check `e instanceof ModelRequestBlocked`.
+</Note>
+</Tab>
+</Tabs>
 
 ## Quick Start
 
+<Tabs>
+<Tab title="Python">
 <Steps>
 <Step title="Install and gate the suite">
 Add the gate to `conftest.py` so nothing in the suite can reach a provider.
@@ -94,9 +146,62 @@ assert model.requests[0].last_user_message == "refund order A1"
 ```
 </Step>
 </Steps>
+</Tab>
+<Tab title="TypeScript">
+<Steps>
+<Step title="Install and gate the suite">
+Add the gate to a Jest setup file so nothing in the suite can reach a provider.
+
+```bash
+npm install praisonai
+```
+
+```ts
+// jest.setup.ts
+import { allowModelRequests } from 'praisonai';
+
+allowModelRequests(false);   // nothing in this suite may reach a provider
+```
+</Step>
+
+<Step title="Script one text reply">
+```ts
+import { Agent, ScriptedModel } from 'praisonai';
+
+const model = new ScriptedModel(['Paris.']);
+const agent = new Agent({ instructions: 'Geography bot.', llm: model });
+
+expect(await agent.chat('Capital of France?')).toBe('Paris.');
+```
+</Step>
+
+<Step title="Script a reply from the request">
+Script entries may be plain strings **or** functions of the recorded request (parity with Python's lambda).
+
+```ts
+import { Agent, ScriptedModel } from 'praisonai';
+
+const model = new ScriptedModel([(req) => `You said: ${req.prompt}`]);
+const agent = new Agent({ instructions: 'Echo bot.', llm: model });
+
+expect(await agent.chat('hello')).toBe('You said: hello');
+```
+</Step>
+
+<Step title="Assert on what the agent sent">
+```ts
+expect(model.requestCount).toBe(1);
+expect(model.requests[0].prompt).toBe('hello');
+```
+</Step>
+</Steps>
+</Tab>
+</Tabs>
 
 ## Canonical example
 
+<Tabs>
+<Tab title="Python">
 ```python
 # conftest.py
 from praisonaiagents import allow_model_requests
@@ -119,9 +224,35 @@ assert agent.start("refund order A1") == "Refunded order A1."
 assert model.request_count == 2
 assert model.requests[0].tool_names == ("refund",)
 ```
+</Tab>
+<Tab title="TypeScript">
+```ts
+// jest.setup.ts
+import { allowModelRequests } from 'praisonai';
+allowModelRequests(false);           // nothing in this suite may reach a provider
+```
+
+```ts
+import { Agent, ScriptedModel } from 'praisonai';
+
+const model = new ScriptedModel(['Refunded order A1.']);
+const agent = new Agent({ instructions: 'Support bot.', llm: model });
+
+expect(await agent.chat('refund order A1')).toBe('Refunded order A1.');
+expect(model.requestCount).toBe(1);
+expect(model.requests[0].prompt).toBe('refund order A1');
+```
+
+<Note>
+Scripting a tool call is **Python-only** today — there is no `ScriptedModel.toolCall(...)` in TS. Script entries are strings or `(req) => string` callables. A scripted model driving a retryable guardrail is a common test pattern — see [Retry preserves the conversation](./guardrails#retry-preserves-the-conversation).
+</Note>
+</Tab>
+</Tabs>
 
 ## How it works
 
+<Tabs>
+<Tab title="Python">
 `ScriptedModel` is a real `LLM` subclass that replaces only the methods which talk to a provider — nothing else.
 
 - System prompts are assembled normally, tools are serialised to real schemas, scripted tool calls are dispatched through the agent's own executor, and results are fed back as real tool messages.
@@ -136,9 +267,28 @@ from praisonaiagents import ScriptedModel
 # A reply that depends on what the agent actually sent:
 model = ScriptedModel([lambda req: f"You said: {req.last_user_message}"])
 ```
+</Tab>
+<Tab title="TypeScript">
+`ScriptedModel` extends the real `BaseLLM` and replaces only `generate` / `generateStream` / `generateText` / `streamText` / `generateObject`. Everything else runs production code.
+
+- Prompt assembly, tool schemas, and the response shape all run the real client — the double cannot drift because it *is* the real client with its network boundary swapped out.
+- When the agent asks for one more reply than the script holds, the double throws `ScriptExhausted`.
+
+A script entry is a plain string (a final answer) or a callable receiving the `RecordedRequest`:
+
+```ts
+import { ScriptedModel } from 'praisonai';
+
+// A reply that depends on what the agent actually sent:
+const model = new ScriptedModel([(req) => `You said: ${req.prompt}`]);
+```
+</Tab>
+</Tabs>
 
 ## The request gate
 
+<Tabs>
+<Tab title="Python">
 `allow_model_requests(False)` blocks all six litellm request sites and both OpenAI client properties process-wide. Any attempt to reach a provider raises `ModelRequestBlocked`, whose message names the offending call site in **your** code.
 
 ```python
@@ -166,6 +316,30 @@ with no_model_requests():
 <Warning>
 **`ModelRequestBlocked` and `ScriptExhausted` derive from `BaseException`, not `Exception` — on purpose.** The agent's tool loop catches `Exception` broadly and turns failures into a `None` answer. An ordinary exception raised from inside the double would reach your test as a mysterious `None`, hiding the very thing the test needs to be told ("your script is one reply short", "a real request leaked"). Deriving from `BaseException` lets these escape the loop — the same reasoning pytest uses for its own outcome exceptions. Do not wrap your agent calls in a bare `except Exception` that would swallow them.
 </Warning>
+</Tab>
+<Tab title="TypeScript">
+`allowModelRequests(false)` turns off real provider calls for the whole process. Any attempt to reach a provider throws `ModelRequestBlocked`, whose message names the offending call site. `modelRequestsAllowed()` is a predicate you can check directly.
+
+Scope a single block with `noModelRequests()` — it takes a function and blocks real requests for its duration:
+
+```ts
+import { Agent, noModelRequests } from 'praisonai';
+
+await noModelRequests(async () => {
+  const agent = new Agent({ instructions: '…', llm: 'gpt-4o' });
+  await agent.chat('hello');   // throws ModelRequestBlocked
+});
+```
+
+<Note>
+The gate uses a **counter**, not a saved-and-restored boolean. An inner `noModelRequests()` scope exiting first cannot re-enable requests while an outer scope is still open — nested scopes compose safely.
+</Note>
+
+<Warning>
+`ModelRequestBlocked` is a regular `Error` subclass, not a `BaseException`. The Agent's turn loop does not swallow it, but a `try { ... } catch (e) { ... }` block wrapping an agent call **will** catch it. Either rethrow, or check `e instanceof ModelRequestBlocked`.
+</Warning>
+</Tab>
+</Tabs>
 
 ## When to use offline vs. real-API testing
 
@@ -190,6 +364,8 @@ Offline tests assert what the agent *does* — which tool it calls, in what orde
 
 ## `ScriptedModel` configuration
 
+<Tabs>
+<Tab title="Python">
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `script` | `Iterable[str \| ScriptedReply \| ScriptedToolCall \| dict \| callable]` | `()` | Ordered replies. Strings are text answers; use `ScriptedModel.tool_call(...)` for a tool call; a callable receives the `RecordedRequest`. |
@@ -209,6 +385,31 @@ Inspection surface after a run:
 | `requests[i].tool_results` | `tuple[dict, …]` | Tool-result messages in that request's history. |
 
 `ScriptedReply`, `ScriptedToolCall`, and `RecordedRequest` are importable from `praisonaiagents.model_harness` when you need to build or type them explicitly.
+</Tab>
+<Tab title="TypeScript">
+The constructor takes an ordered script and an optional config:
+
+```ts
+new ScriptedModel(
+  script: Array<string | ((request: RecordedRequest) => string)>,
+  config?: Partial<LLMConfig>,   // model defaults to "scripted/test-model"
+)
+```
+
+Inspection surface after a run:
+
+| Attribute / method | Returns | Use |
+|--------------------|---------|-----|
+| `model.requestCount` | `number` | How many completions the agent asked for. |
+| `model.requests` | `RecordedRequest[]` | Every request the agent sent, in order. |
+| `model.requests[i].prompt` | `string` | The last user-message text on turn *i*. |
+| `model.requests[i].systemPrompt` | `string \| undefined` | The assembled system prompt. |
+| `model.requests[i].options` | `LLMGenerateOptions \| undefined` | The full options object passed to `generate`. |
+| `model.remaining` | `number` | Replies left unconsumed. |
+| `model.reset()` | `void` | Rewind so the same instance can drive another run. |
+| `model.extend(...entries)` | `void` | Append more replies to the script. |
+</Tab>
+</Tabs>
 
 ## Best Practices
 
