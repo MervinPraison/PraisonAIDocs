@@ -361,7 +361,11 @@ graph LR
     class New ok
 ```
 
-Bounded by the `max_guardrail_retries` that already existed — no new setting. After retries exhaust, the reason is left on `agent.last_guardrail_error` and `chat()` returns `None`.
+Bounded by the retry budget — `max_guardrail_retries` (Python) / `maxGuardrailRetries` (TypeScript). After retries exhaust, the reason surfaces to the caller.
+
+<Tabs>
+<Tab title="Python">
+After retries exhaust, the reason is left on `agent.last_guardrail_error` and `chat()` returns `None`.
 
 ```python
 from praisonaiagents import Agent
@@ -390,6 +394,61 @@ if result is None:
 <Warning>
 **Behaviour before PraisonAI [#4929](https://github.com/MervinPraison/PraisonAI/pull/4929).** The retry already ran, but it built **one** fresh user message — `prompt + "Note: Previous response failed validation due to: …"` — and sent that alone. The system prompt, retrieved context, tool results, and the rejected answer never reached the retry, so the model was asked to fix an answer it could no longer see. The fix appends the rejected assistant turn plus the reason as a user turn and re-calls with full history. **No config change** — retries simply continue the conversation now. The test invariant `second[:len(first)] == first` proves the conversation is *continued*, not restarted.
 </Warning>
+</Tab>
+<Tab title="TypeScript">
+The TS retry appends the rejected assistant turn plus the reason to the same conversation, mirroring the Python behaviour. A guardrail returns `{ status: 'passed' }` or `{ status: 'failed', message }`:
+
+```ts
+import { Agent } from 'praisonai';
+
+const mustBeJson = (output: string) => {
+  try {
+    JSON.parse(output);
+    return { status: 'passed' as const };
+  } catch (e) {
+    return { status: 'failed' as const, message: `Not valid JSON: ${(e as Error).message}` };
+  }
+};
+
+const agent = new Agent({
+  instructions: 'Always answer with a JSON object.',
+  guardrails: mustBeJson,
+  maxGuardrailRetries: 3,      // NEW in PraisonAI #4964; defaults to 0
+});
+
+const result = await agent.chat('Give me the config');
+```
+
+To signal "not acceptable, here is why" from several frames down, throw `GuardrailRetry` — caught by the agent's turn loop and bounded by `maxGuardrailRetries`:
+
+```ts
+import { Agent, GuardrailRetry } from 'praisonai';
+
+const validatePostcode = (output: string) => {
+  if (!output.startsWith('SW1')) {
+    // Bounded by maxGuardrailRetries; on exhaustion the byte-identical
+    // "Agent X: guardrail 'name' blocked the response: <reason>" error
+    // is thrown so existing callers and tests are unaffected.
+    throw new GuardrailRetry("the postcode must be in the customer's country");
+  }
+  return { status: 'passed' as const };
+};
+
+const agent = new Agent({
+  instructions: 'Return a UK postcode only.',
+  guardrails: validatePostcode,
+  maxGuardrailRetries: 2,
+});
+```
+
+<Note>
+- `maxGuardrailRetries` defaults to `0` — **no retry**, throw immediately with the historical error text. A deliberate opt-in, so upgrading to a version that includes #4964 does not change behaviour for any existing app.
+- `GuardrailRetry` is caught in the agent's turn loop; every other exception from a guardrail is still a genuine failure.
+- On exhaustion, the error surfaces as `Error("Agent <name>: guardrail \"<name>\" blocked the response: <reason>")` — byte-identical to the pre-PR message, so existing test assertions keep matching.
+- Both `{ status: 'failed', message }` and `throw new GuardrailRetry(...)` trigger the same retry path; use whichever fits the frame from which you spot the problem.
+</Note>
+</Tab>
+</Tabs>
 
 ### Reading the rejection reason
 
