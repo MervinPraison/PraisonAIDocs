@@ -223,6 +223,10 @@ agent = Agent(
 ```
 
 <Note>
+**`npx` no longer needs a manual timeout bump.** The explicit `timeout=120` above is no longer required for cold starts — `npx`/`uvx`/`bunx`/`pnpm`/`yarn` already default to 180s when you omit `timeout=`. Pass an explicit value only when your network or VPN needs longer, or when you specifically want a tighter bound.
+</Note>
+
+<Note>
 **Command parsing.** Any whitespace in the first argument is shell-split. The first token becomes the executable; the rest are prepended to whatever you pass in `args=`. See [Passing runtime arguments](/features/mcp#passing-runtime-arguments) for the three equivalent forms.
 </Note>
 
@@ -253,7 +257,31 @@ agent.start("Look up X and Y at the same time")
 
 ### Timeouts
 
-The `timeout` parameter on `MCP()` (default `60s`) bounds every call issued via the MCP session — tool calls, resource reads (`read_resource`), and prompt fetches (`get_prompt`). It is enforced at two layers:
+The `timeout` parameter on `MCP()` bounds every call issued via the MCP session — tool calls, resource reads (`read_resource`), and prompt fetches (`get_prompt`). When you don't pass an explicit value, the default is:
+
+- **60s** for URL transports (ws/http/sse) and non-launcher stdio commands,
+- **180s** for cold-start package launchers (`npx`, `uvx`, `bunx`, `pnpm`, `yarn`, including the Windows `.cmd`/`.exe` shims and full paths ending in one) — their first run downloads the server package before the MCP handshake can begin (PraisonAI [#5110](https://github.com/MervinPraison/PraisonAI/pull/5110)).
+
+An explicit `MCP(..., timeout=N)` overrides both defaults.
+
+```mermaid
+graph TB
+    Q{Not sure what<br/>timeout to pass?}
+    Q -->|"Cold-start launcher<br/>npx / uvx / bunx / pnpm / yarn"| Cold[Skip timeout=<br/>defaults to 180s]
+    Q -->|"Other stdio command<br/>python / node / native binary"| Std[Skip timeout=<br/>defaults to 60s]
+    Q -->|"URL transport<br/>ws:// http:// sse://"| Url[Skip timeout=<br/>defaults to 60s]
+    Q -->|"Slow network, VPN,<br/>corporate proxy"| Custom["Pass timeout=<br/>explicitly, e.g. 300"]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef defaults fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef explicit fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q question
+    class Cold,Std,Url defaults
+    class Custom explicit
+```
+
+The timeout is enforced at two layers:
 
 - **Server-side:** every session call is wrapped in `asyncio.wait_for(...)`, so a misbehaving server can only stall one request. On timeout the response is `"MCP {kind} call timed out after {N} seconds (server side)"` where `{kind}` is `tool`, `resource`, or `prompt`.
 - **Caller-side:** the response queue also uses `get(timeout=...)`, so a caller that never receives a reply sees `"Error: MCP tool call timed out after {N} seconds"`. The agent runtime **normalizes this into `{"error": "MCP tool call timed out after N seconds", "timeout": True}`** before returning it to the tool-execution loop, so MCP timeouts participate in retry, doom-loop detection, and circuit-breaking instead of silently looking like a successful string result.
@@ -263,6 +291,46 @@ As of [PraisonAI PR #4634](https://github.com/MervinPraison/PraisonAI/pull/4634)
 `timeout=` also bounds the initial MCP handshake — `initialize()` waits at most `timeout` seconds before failing with `"Error: MCP initialization timed out after {N} seconds"`. That string is normalized to the same `{"error": ..., "timeout": True}` shape by the agent runtime.
 
 Since PraisonAI [#4423](https://github.com/MervinPraison/PraisonAI/pull/4423), the **construction-time** stdio handshake raises `TimeoutError` at the `MCP.__init__` layer (before any normalization can happen), so callers who construct `MCP()` inline must catch it directly — see [MCP → Errors on construction](/features/mcp#errors-on-construction).
+
+A first `npx`/`uvx` run downloads the package before the handshake, which is why the effective init timeout auto-extends to 180s.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant MCP
+    participant Launcher as npx/uvx
+    participant Server as MCP server
+
+    User->>Agent: agent.start("List files")
+    Agent->>MCP: MCP("npx -y @…/server-filesystem /tmp")
+    MCP->>MCP: launcher detected → timeout = 180s
+    MCP->>Launcher: spawn subprocess
+    Launcher->>Launcher: download package (60–120s)
+    Launcher->>Server: start
+    Server-->>MCP: listening on stdio
+    MCP-->>Agent: tools ready
+    Agent-->>User: reply
+```
+
+If the cold download runs past 180s, construction raises with a pre-warm hint.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant MCP
+    participant Launcher as npx/uvx
+
+    User->>Agent: agent.start("List files")
+    Agent->>MCP: MCP("npx -y @…/server-filesystem /tmp")
+    MCP->>MCP: launcher detected → timeout = 180s
+    MCP->>Launcher: spawn subprocess
+    Launcher->>Launcher: still downloading at 180s
+    MCP--xLauncher: stop subprocess
+    MCP-->>Agent: TimeoutError + pre-warm hint
+    Agent-->>User: "pre-warm once, or pass timeout=300"
+```
 
 <Note>
 Normalization is deliberately narrow: only the two MCP-internal timeout signatures (`"MCP tool call timed out after …"` and `"MCP initialization timed out after …"`) are converted to the `{"error": …, "timeout": True}` shape. Legitimate MCP tool output that happens to begin with `"Error: "` (e.g. a linter or `grep` wrapper that reports errors as strings) passes through unchanged and remains a successful string result. Same behaviour on `chat()` and `achat()` as of PR #4634.
