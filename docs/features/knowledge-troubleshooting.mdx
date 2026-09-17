@@ -1,0 +1,197 @@
+---
+title: "Knowledge Troubleshooting"
+sidebarTitle: "Troubleshooting"
+description: "Diagnose common knowledge/RAG failure modes: indexed but not grounded, missing chonkie, wrong chunks"
+icon: "triangle-exclamation"
+---
+
+Knowledge troubleshooting maps the most common "my agent has documents but ignores them" symptoms to fixes you can verify in seconds.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Docs Assistant",
+    instructions="Answer using the knowledge base only.",
+    knowledge=["policy.txt"],
+)
+
+agent.start("What is the daily API-call limit?")
+```
+
+The user passes files and asks a question; this guide confirms the answer actually came from those files — not from the model's memory.
+
+```mermaid
+graph TB
+    START[👤 knowledge=... configured]
+    INSTALL{pip install<br/>praisonaiagents[knowledge]<br/>succeeded?}
+    SEARCH{agent.knowledge.search<br/>returns the marker chunk?}
+    CHAT{agent.chat echoes<br/>the marker + fact?}
+    CHONKIE[❌ ModuleNotFoundError: chonkie]
+    INDEX[❌ Indexing / embedding issue]
+    GROUND[❌ Grounding failure]
+    OK[✅ RAG is grounded]
+
+    START --> INSTALL
+    INSTALL -->|No| CHONKIE
+    INSTALL -->|Yes| SEARCH
+    SEARCH -->|No| INDEX
+    SEARCH -->|Yes| CHAT
+    CHAT -->|No| GROUND
+    CHAT -->|Yes| OK
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class START start
+    class INSTALL,SEARCH,CHAT decision
+    class CHONKIE,INDEX,GROUND warn
+    class OK ok
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Install the knowledge extra">
+```bash
+pip install "praisonaiagents[knowledge]"
+```
+</Step>
+
+<Step title="Run the three-check marker test">
+Follow the decision tree top to bottom: install → search → chat. All three must pass before you trust RAG.
+</Step>
+</Steps>
+
+---
+
+## Symptom: "Indexed OK, but agent answers generically"
+
+Search returns the right chunks, but the agent answers from its own memory — a silent hallucination against your own docs.
+
+**Before (broken):**
+
+```
+Q: What is policy ZEBRA-QUOTA-9917 daily limit?
+A: I don't have access to a specific policy with that identifier.
+```
+
+**After (grounded):**
+
+```
+Q: What is policy ZEBRA-QUOTA-9917 daily limit?
+A: Policy ZEBRA-QUOTA-9917 limits daily API calls to 42.
+```
+
+### Verification recipe
+
+Run this marker test against a fresh install. It proves both that search finds the chunk **and** that `chat()` actually uses it.
+
+```python
+from pathlib import Path
+from praisonaiagents import Agent
+
+Path("policy.txt").write_text(
+    "Company policy ZEBRA-QUOTA-9917 limits daily API calls to 42."
+)
+agent = Agent(
+    instructions="Answer using the knowledge base only.",
+    llm="gpt-4o-mini",
+    knowledge=["policy.txt"],
+)
+search_ok = any("ZEBRA-QUOTA-9917" in str(r) for r in agent.knowledge.search("ZEBRA-QUOTA-9917"))
+answer = agent.chat("What is policy ZEBRA-QUOTA-9917 daily limit?")
+chat_ok = "ZEBRA-QUOTA-9917" in answer and "42" in answer
+print(f"SEARCH_OK={search_ok}  CHAT_OK={chat_ok}")
+```
+
+<Warning>
+`SEARCH_OK` alone does **not** prove RAG is working — that was exactly the trap this bug set. Both `SEARCH_OK` **and** `CHAT_OK` must be `True`.
+</Warning>
+
+### Why a unique marker matters
+
+Generic questions can get a lucky correct guess from the model's parametric knowledge, giving a false pass. Use a non-memorisable token like `ZEBRA-QUOTA-9917` so a correct answer can only come from your documents.
+
+<Note>
+This silent grounding failure in **sync** `chat()` / `start()` was fixed in PR [#5109](https://github.com/MervinPraison/PraisonAI/pull/5109) (merged 2026-09-17, closing [#5098](https://github.com/MervinPraison/PraisonAI/issues/5098)). The retrieved context now reaches the LLM prompt for both text and multimodal (attachment) paths. The async path was already correct. The fix shipped on `main` on 2026-09-17; it is released in the next `praisonaiagents` version. If your `SEARCH_OK=True` but `CHAT_OK=False`, upgrade `praisonaiagents`.
+</Note>
+
+### Interim workaround (pinned to an older release)
+
+If you cannot upgrade yet, inject the retrieved context into the prompt yourself:
+
+```python
+chunks = agent.knowledge.search(user_query)
+context = "\n".join(str(c) for c in chunks)
+answer = agent.chat(f"Context:\n{context}\n\nQuestion: {user_query}")
+```
+
+<Warning>
+You should **not** need this on current releases. It exists only to support code pinned to a version released before PR #5109.
+</Warning>
+
+---
+
+## Symptom: `ModuleNotFoundError: No module named 'chonkie'`
+
+The knowledge extra (which bundles the `chonkie` chunker) is not installed.
+
+```bash
+pip install "praisonaiagents[knowledge]"
+```
+
+---
+
+## Symptom: chat is grounded but the wrong chunks come back
+
+`CHAT_OK` passes, but the cited chunks are off-topic — a retrieval-quality problem, not a grounding one. Tune reranking and chunker settings.
+
+<CardGroup cols={2}>
+  <Card title="RAG Strategies" icon="layer-group" href="/rag/strategies/overview">
+    Choose chunking and retrieval strategies for your corpus.
+  </Card>
+  <Card title="RAG Quality" icon="gauge-high" href="/rag/quality">
+    Reranking and quality filters for better chunk selection.
+  </Card>
+</CardGroup>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Always run the marker test after wiring up knowledge">
+    A unique token like `ZEBRA-QUOTA-9917` turns "it looks configured" into a `SEARCH_OK` + `CHAT_OK` pass/fail you can trust.
+  </Accordion>
+  <Accordion title="Never trust SEARCH_OK on its own">
+    Retrieval succeeding does not prove the agent used the result. Assert `CHAT_OK` too.
+  </Accordion>
+  <Accordion title="Pin the knowledge extra in your project">
+    Add `"praisonaiagents[knowledge]"` to requirements so `chonkie` is always present across environments.
+  </Accordion>
+  <Accordion title="Upgrade before reaching for workarounds">
+    The manual context-injection workaround is only for pinned-old releases; upgrading removes the need entirely.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Knowledge Quick Start" icon="rocket" href="/knowledge/quickstart">
+    Pass files to an agent and start asking questions.
+  </Card>
+  <Card title="RAG Quickstart" icon="rocket" href="/rag/quickstart">
+    Get retrieval-augmented answers in a few steps.
+  </Card>
+  <Card title="Knowledge Indexing Errors" icon="triangle-exclamation" href="/features/knowledge-indexing-errors">
+    Diagnose empty indexes and embedding-backend failures.
+  </Card>
+  <Card title="Knowledge Search Results" icon="magnifying-glass" href="/features/knowledge-search-results">
+    Understand the shape of `knowledge.search()` results.
+  </Card>
+</CardGroup>
