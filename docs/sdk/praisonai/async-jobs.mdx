@@ -38,10 +38,13 @@ print(f"Status: {job.status}")
 | `job_id` | Unique job identifier |
 | `recipe_name` | Name of the recipe being executed |
 | `status` | Current job status |
+| `client` | Lazily-constructed shared `httpx.Client` bound to `api_url` — reused by every `get_status()` / `get_result()` / `cancel()` / `wait()` poll. |
 | `get_status()` | Fetch current status from API |
 | `get_result()` | Fetch job result from API |
 | `cancel()` | Cancel the job |
-| `wait(poll_interval, timeout)` | Wait for completion |
+| `wait(poll_interval, timeout)` | Wait for completion (reuses one keep-alive connection across all polls) |
+| `close()` | Close the shared HTTP client and release its connection pool |
+| `__enter__` / `__exit__` | Context-manager protocol — calls `close()` on scope exit |
 
 ### Waiting for Completion
 
@@ -55,9 +58,40 @@ result = job.wait(poll_interval=5, timeout=300)
 print(f"Result: {result}")
 ```
 
+### Deterministic cleanup with `with`
+
+`JobHandle` is a long-lived handle: one `wait()` may poll the jobs API dozens of times. It holds a lazily-constructed shared `httpx.Client`, so those polls share one keep-alive connection instead of doing a fresh TLS handshake per call. Use the handle as a context manager — or call `close()` — to release the connection pool deterministically:
+
+```python
+from praisonai import recipe
+
+with recipe.submit_job("my-recipe", input="test") as job:
+    result = job.wait(poll_interval=5, timeout=300)
+    print(result)
+# `job.client` is closed here — pooled sockets are released.
+```
+
+Not using `with`? Call `close()` explicitly:
+
+```python
+from praisonai import recipe
+
+job = recipe.submit_job("my-recipe", input="test")
+try:
+    result = job.wait(poll_interval=5, timeout=300)
+finally:
+    job.close()
+```
+
+<Tip>
+A 10-minute `wait(poll_interval=5)` uses **one** keep-alive HTTP connection for all ~120 polls, not one fresh TCP+TLS handshake per poll. This applies to `get_status()`, `get_result()`, `cancel()`, and every iteration of `wait()`.
+</Tip>
+
 ### Using the Jobs API Directly
 
 `recipe_name` and `recipe_config` are honoured by the router as of PR [#4085](https://github.com/MervinPraison/PraisonAI/pull/4085); earlier versions accepted the fields but did not forward them to the executor.
+
+If your code creates its own client to hit the Jobs API directly (rather than using `submit_job`), keep the client alive across calls — the wrapper's own `JobHandle` does exactly this.
 
 ```python
 from praisonai.jobs import Job, JobSubmitRequest, JobExecutor, create_app
