@@ -547,7 +547,46 @@ from praisonaiagents.session.protocols import SessionStoreProtocol
 | `TemplateStoreProtocol` | _deferred_ | Template persistence for repatriated CLI features |
 | `ServeHandlerProtocol` | _deferred_ | Dispatch serve subcommands without direct wrapper imports |
 
-The `praisonai.adapters` module lazily re-exports existing adapter classes (`AutoReader`, `ChromaVectorStore`, `BasicRetriever`, `FusionRetriever`, `LLMReranker`, and registration helpers) to preserve backward compatibility. Registration into the core-SDK singletons is now explicit — call `praisonai.adapters.register_default_adapters()` to wire the built-in readers/retrievers/rerankers in a single idempotent step, replacing the earlier import-time auto-registration (PraisonAI 4.6.156+).
+The `praisonai.adapters` module lazily re-exports existing adapter classes (`AutoReader`, `ChromaVectorStore`, `BasicRetriever`, `FusionRetriever`, `LLMReranker`, and registration helpers) to preserve backward compatibility. Registration into the core-SDK singletons is now automatic at the wrapper entry points (`praisonai.run`, `praisonai.arun`, and every `praisonai` CLI command that runs an agent file) — `register_default_adapters()` is called for you before the agent starts, so YAML declarations like `retriever: fusion` and `reranker: llm` resolve out of the box (PraisonAI 4.7.9+). Library-mode Python callers importing `praisonai.adapters.*` directly still call `register_default_adapters()` themselves (idempotent + lock-guarded, so a subsequent auto-call is a no-op). Multi-tenant hosts can pre-register custom adapters under built-in names — the wrapper defaults preserve any existing entry (register-only-if-absent) and never overwrite.
+
+### Writing a custom managed backend
+
+`ManagedBackendBase` provides the shared `async stream()` producer-thread + sentinel-queue pump. `AnthropicManagedAgent` and `LocalManagedAgent` both inherit from it; a third managed backend (E2B, Modal, Fly.io, …) implements two hooks instead of copying the queue loop.
+
+<Note>
+`ManagedBackendBase` lives in `praisonai.integrations._managed_base` — the leading underscore marks it as an extension point rather than a stable public import path. Cite the class name and subclass it; if a top-level `praisonai.integrations` re-export lands later, switch to that.
+</Note>
+
+| Method | Type | Required? | Purpose |
+|--------|------|-----------|---------|
+| `_ensure_session(self) -> str` | sync | ✅ | Return a session id; called on the producer thread before `_iter_events` |
+| `_iter_events(self, session_id, prompt) -> Iterator[str]` | sync generator | ✅ | Yield text chunks for `prompt` on `session_id`; runs on the producer thread so blocking SDK calls are fine |
+| `_after_stream(self, full: str) -> None` | sync | ⬜ | Post-stream bookkeeping (persist the assembled assistant turn, sync usage). Default: no-op |
+
+`_ensure_session` runs *before* the first `_iter_events` call. A backend that snapshots session state should populate `agent_id` / `environment_id` inside `_ensure_session` — `LocalManagedAgent._ensure_session()` creates the inner agent first for exactly this reason, so the first persisted snapshot is complete rather than orphaned.
+
+```python
+from praisonai.integrations._managed_base import ManagedBackendBase
+
+class MyManagedAgent(ManagedBackendBase):
+    def _ensure_session(self) -> str:
+        # Create/lookup your session with your provider; return its id.
+        return self._session_id or self._provision_session()
+
+    def _iter_events(self, session_id, prompt):
+        # Runs on the producer thread — blocking SDK calls are fine here.
+        for chunk in self._provider_client.stream(session_id, prompt):
+            if chunk.text:
+                yield chunk.text
+
+    def _after_stream(self, full: str) -> None:
+        # Optional: persist the assembled assistant turn + usage.
+        self._persist_message("assistant", full)
+```
+
+<Warning>
+Do NOT override `async def stream(self, prompt, **kwargs)` — the base class owns it, including the `run_in_executor` hop over `queue.get`. Overriding it re-introduces the duplication this refactor removed, and future protocol fixes will bypass your backend.
+</Warning>
 
 ### C8.4 Legacy Structure
 
