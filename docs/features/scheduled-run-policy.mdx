@@ -376,6 +376,68 @@ graph TB
 
 ---
 
+## Failure Alerting — Once Per Incident
+
+Failure summaries are de-duplicated per incident by default: a broken job alerts **once**, stays silent on identical repeats, and sends a single recovery note on the next success.
+
+```mermaid
+graph LR
+    F[❌ Failure] --> Sig[🔐 error_signature]
+    Sig --> Same{Same signature<br/>already alerted?}
+    Same -->|Yes| Silent[🤫 Silent]
+    Same -->|No / changed| Alert[📣 ⚠️ Failure summary]
+    S[✅ Success] --> Open{Incident open?}
+    Open -->|Yes| Recover[🟢 ✅ recovered.]
+    Open -->|No| NoOp[No-op]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef silent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class F,S input
+    class Sig process
+    class Same,Open gate
+    class Silent,NoOp silent
+    class Alert,Recover output
+```
+
+Tolerate a single flaky tick — alert only when the same failure repeats twice.
+
+```python
+from praisonaiagents import Agent
+from praisonai.scheduler import RunPolicy
+
+agent = Agent(
+    name="nightly-brief",
+    instructions="Summarise overnight repo activity.",
+)
+
+# Tolerate a single flaky tick — alert only when the same failure repeats twice.
+# The wrapper folds each failure through the built-in IncidentTracker for you.
+policy = RunPolicy(alert_after_failures=2)
+
+agent.start("Every day at 02:00, brief last-night activity to slack:#eng.")
+```
+
+| Run outcome | Prior state | What operators see |
+|---|---|---|
+| Failure, first with this signature | no open incident | `⚠️ Scheduled job '<name>' failed: <error>` (one alert) |
+| Failure, same signature repeats | already alerted | Silent — no re-alert |
+| Failure, different signature | already alerted on signature A | Fresh `⚠️` alert for signature B |
+| Failure, below `alert_after_failures` threshold | still counting | Silent — counter advances |
+| Success after an alerted incident | incident alerted | `✅ Scheduled job '<name>' recovered.` (one note) |
+| Success with no open incident | clean | Silent |
+| Failure with `deliver_on_failure=False` | any | Silent (no-op) |
+| Failure with no state store attached | any | Falls back to per-tick delivery (prior behaviour preserved) |
+
+<Note>
+A failed send does **not** consume the alert or the recovery note — the incident state is committed only after delivery lands. If the channel is down, the next tick re-observes and retries the alert; the next success retries the recovery note.
+</Note>
+
+---
+
 ## Configuration Options
 
 ### `RunPolicy`
@@ -388,6 +450,7 @@ graph TB
 | `deliver_on_failure` | `bool` | `True` | On failure, deliver a compact failure summary to the delivery target. |
 | `audit_dir` | `Optional[str]` | `None` | Directory for durable output audit. `None` disables the audit. |
 | `scanner` | `Optional[Callable]` | `None` | Custom scanner callable. Overrides built-in heuristic. May return `PromptScanResult` or `bool`. |
+| `alert_after_failures` | `int` | `1` | When `deliver_on_failure` is on, alert only after this many *consecutive* failures of the **same error signature**. Latches failure summaries through the core `IncidentTracker` so a broken job alerts **once** per distinct error and sends a single `✅ recovered.` note on the next success. Values below `1` are treated as `1`. Falls back to per-tick delivery when no state store is available. |
 
 ### `PromptScanResult`
 
@@ -550,6 +613,8 @@ if result.status == "succeeded" and result.delivery_error:
 #   result.delivered is True   ⇔  the payload reached the target
 #   result.delivered is False  ⇔  it did not, and delivery_error is populated
 ```
+
+A failed send does not consume the alert. When a failure summary or recovery note does not reach the channel, the incident state is left un-committed, so the next tick re-observes and retries the alert and the next success retries the recovery note (see `test_incident_wiring.py::TestDeliveryFailureRetry`).
 </Accordion>
 </AccordionGroup>
 
