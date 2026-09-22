@@ -229,6 +229,16 @@ Calling `client.connect()` on an instance whose previous loop had a server-suppl
 | `on_state_change` | `Callable[[str], None]` | Connection state changes |
 | `on_reconnect_paused` | `Callable[[ConnectErrorCode, Optional[str]], None]` | The reconnect loop stopped on a **terminal** connect rejection (e.g. `auth_required`, `agent_not_found`). Receives `(code, next_step)` so callers can surface the reason and drive re-auth / re-pair / re-configure. Not fired for transient failures — those keep backing off. |
 
+**`send()` method:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `message` | `str \| Dict[str, Any]` | — | Message content. A raw string is wrapped in a `{"type": "message", "content": ...}` frame. |
+| `request_id` | `Optional[str]` | `None` | Idempotency key. When provided, the server dedups a resend of the same id so the turn runs exactly once. |
+| `queue` | `bool` | `False` | If `True`, a send issued while disconnected is queued and flushed on the next reconnect with the same `request_id` instead of raising `ConnectionError`. |
+
+**Returns:** `Optional[str]` — the `request_id` used (auto-generated when needed), or `None` when no idempotency key was involved.
+
 ---
 
 ## Protocol Version Negotiation
@@ -561,6 +571,171 @@ The bot keeps responding because:
 1. Events are buffered until the cursor is confirmed
 2. The `since=cursor` on reconnect replays any events delivered while offline
 3. Users see continuous responses with no error messages
+
+The diagram above covers the **inbound** side — events the client *receives* during a blip. The next section covers the **outbound** side — a message the user *sends* during a blip.
+
+---
+
+## Exactly-Once Send (Queue and Flush)
+
+One flag makes an outbound message survive a reconnect and run exactly once.
+
+```python
+from praisonai.gateway import GatewayClient
+
+client = GatewayClient(url="wss://gateway.example.com/ws", agent_id="assistant")
+await client.connect()
+
+# One line makes the send exactly-once across reconnects.
+await client.send("Summarise today's meeting notes", queue=True)
+```
+
+Without a `request_id`, an in-flight `send()` is either lost on a socket drop (at-most-once) or double-runs the turn if you resend (at-least-once). Attaching a stable `request_id` lets the server dedup a resend, so a queued-and-flushed message runs **exactly once**.
+
+```mermaid
+graph TB
+    subgraph "Without request_id (legacy)"
+        A1[send] -->|drop| A2[at-most-once<br/>lost]
+        A1 -->|resend| A3[duplicate turn<br/>runs twice]
+    end
+    subgraph "With request_id + queue=True"
+        B1[send queue=True] -->|drop| B2[queued]
+        B2 -->|reconnect| B3[flush same request_id]
+        B3 -->|server dedup| B4[exactly-once]
+    end
+
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef queued fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A1,B1,B3 process
+    class A2,A3 bad
+    class B2 queued
+    class B4 good
+```
+
+### What the user experiences
+
+A user chatting through the bot sends a message during a Wi-Fi blip; with `queue=True` the message is held, flushed on reconnect, and the agent runs the turn once.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Client as GatewayClient
+    participant GW as Gateway
+
+    User->>Client: send("...", queue=True)
+    Note over Client: disconnected — queue frame<br/>with stable request_id
+    Client--xGW: (offline)
+    Note over Client: reconnect + flush outbox
+    Client->>GW: message (request_id=r-1)
+    GW->>GW: reserve op:{session}:r-1 → run turn
+    GW-->>Client: accepted (request_id=r-1)
+    Note over Client,GW: a resend of r-1 is deduped
+    GW-->>Client: final response
+    Client-->>User: reply (turn ran once)
+```
+
+### How it works
+
+| Step | What happens |
+|------|--------------|
+| `send(msg)` | Legacy raise-on-disconnect (back-compat). |
+| `send(msg, queue=True)` | Queues on disconnect with an auto-generated stable `request_id`; flushes on next connect. |
+| `send(msg, request_id="r-1")` | Attaches the caller-supplied id; the server dedups a resend of the same id. |
+| Server first delivery | Reserves the request, runs the turn, records it on success, and releases it if the turn never ran (agent unavailable, `/stop`, `/cancel`, exception before enqueue). |
+| Server duplicate delivery | Acks `{"status": "duplicate", "request_id": ...}` without re-running. |
+| `accepted` ack | Echoes `request_id` when supplied so the client can correlate. |
+
+### Choose your mode
+
+```mermaid
+graph TB
+    Q1{Chat / operator client<br/>that must survive Wi-Fi blips?}
+    Q1 -->|Yes| Q2{Need your own correlation id?}
+    Q2 -->|No| M1[send msg, queue=True<br/>server generates a stable id]
+    Q2 -->|Yes| M2[send msg, request_id=..., queue=True]
+    Q1 -->|No, tolerate loss| M3[send msg — default,<br/>raise-on-disconnect]
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef mode fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef legacy fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Q1,Q2 question
+    class M1,M2 mode
+    class M3 legacy
+```
+
+### Return value and correlation
+
+`send()` returns `Optional[str]` — the `request_id` actually used (auto-generated when needed), or `None` when no idempotency key was involved. Persist it to correlate the `accepted` ack and match the eventual `final` response.
+
+```python
+rid = await client.send("Book the 3pm meeting", queue=True)
+# rid is the stable id attached to the frame — store it, then match it
+# against the `request_id` echoed on the `accepted` ack and the `final` reply.
+```
+
+<Note>
+**Semantic guarantees** (pinned by the request-idempotency test suite):
+
+1. Same `request_id` → the server dedups (the turn runs once).
+2. Distinct `request_id`s → both turns run.
+3. Missing `request_id` → legacy behaviour (no dedup — keeps existing clients working).
+4. If the turn never actually ran (agent unavailable, `/stop`, `/cancel`, or the enqueue itself raised), the reservation is released so a later retry with the same id gets a real chance.
+</Note>
+
+### Common patterns
+
+<Tabs>
+
+<Tab title="Queue while disconnected">
+```python
+from praisonai.gateway import GatewayClient
+
+client = GatewayClient(url="wss://gateway.example.com/ws", agent_id="assistant")
+await client.connect()
+
+# Even if the socket is down right now, this is queued and flushed
+# on the next reconnect with the same request_id.
+rid = await client.send("Summarise today's meeting notes", queue=True)
+print(f"queued as {rid}")
+```
+</Tab>
+
+<Tab title="Caller-supplied stable id">
+```python
+from praisonai.gateway import GatewayClient
+
+client = GatewayClient(url="wss://gateway.example.com/ws", agent_id="assistant")
+await client.connect()
+
+# A bot that persists messages in its own DB can reuse the row id as the
+# request_id so a resend of that row dedups server-side.
+db_row_id = "msg-42"
+await client.send("Reply to Alice", request_id=db_row_id, queue=True)
+```
+</Tab>
+
+<Tab title="Legacy fire-and-forget">
+```python
+from praisonai.gateway import GatewayClient
+
+client = GatewayClient(url="wss://gateway.example.com/ws", agent_id="assistant")
+await client.connect()
+
+# No request_id, no queue — existing code keeps working exactly as before:
+# raises ConnectionError if the socket is down, no dedup.
+await client.send("Hello")
+```
+</Tab>
+
+</Tabs>
+
+<Tip>
+This is **not** a breaking change. `queue` defaults to `False` and a missing `request_id` keeps the legacy raise-on-disconnect, no-dedup behaviour — existing callers keep working unchanged.
+</Tip>
 
 ---
 
