@@ -892,33 +892,132 @@ asyncio.run(main())
 
 ---
 
-## Sync `generate_crew_and_kickoff` auto-scoping
+## `async_scoped_bridge()` — async-safe context manager
 
-`AgentsGenerator.generate_crew_and_kickoff()` now wraps its `adapter.run(...)` call in `scoped_bridge()` automatically. Every sync run isolates its `run_sync`-driven work onto its own loop+thread, so a stuck coroutine in one agent/tenant can no longer park the shared default loop for the rest.
+`async_scoped_bridge()` is the async-safe sibling of `scoped_bridge()` for `async def` callers — same binding semantics, but the scope-owned bridge is torn down off-loop so scope exit never parks the caller's event loop.
+
+Wrap your async handler in one line — a stuck coroutine in one tenant's request can no longer freeze the loop for every other tenant:
+
+```python
+from praisonai._async_bridge import async_scoped_bridge
+
+async def handle(...):
+    async with async_scoped_bridge():
+        ...
+```
+
+```mermaid
+graph LR
+    subgraph "N async requests, N scoped bridges"
+        R1[👤 Request A] --> B1[🌉 scoped_bridge A]
+        R2[👤 Request B] --> B2[🌉 scoped_bridge B]
+        B1 --> W1[🧵 teardown → worker thread]
+        B2 --> W2[🧵 teardown → worker thread]
+    end
+
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef bridge fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef worker fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class R1,R2 request
+    class B1,B2 bridge
+    class W1,W2 worker
+```
+
+### When to use it
+
+Pick the context manager that matches your caller.
 
 ```mermaid
 graph TB
-    subgraph "Two concurrent sync runs"
+    Q{Inside an<br/>async def?} -->|No — CLI, sync handler| Sync[🔒 scoped_bridge]
+    Q -->|Yes — FastAPI, async gateway| Async[⚡ async_scoped_bridge]
+
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef sync fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef async fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q decision
+    class Sync sync
+    class Async async
+```
+
+- `scoped_bridge()` — sync callers (CLI, `generate_crew_and_kickoff`, sync request handlers).
+- `async_scoped_bridge()` — inside `async def` (FastAPI handlers, `agenerate_crew_and_kickoff`, custom async gateways). Preferred over the sync sibling for any `async def`, because scope exit on the sync context manager parks the loop thread for up to ~10s while `shutdown()` waits for cancellation and joins the background thread.
+
+### FastAPI multi-tenant handler
+
+```python
+from fastapi import FastAPI
+from praisonaiagents import Agent
+from praisonai._async_bridge import async_scoped_bridge
+
+app = FastAPI()
+
+@app.post("/tenants/{tenant_id}/ask")
+async def ask(tenant_id: str, prompt: str):
+    # Per-request isolated bridge — a stuck coroutine here cannot
+    # park the loop for other tenants.
+    async with async_scoped_bridge():
+        agent = Agent(name=f"agent-{tenant_id}", instructions="Answer briefly")
+        return {"answer": await agent.astart(prompt)}
+```
+
+<Warning>
+Do **not** use the sync `scoped_bridge()` from inside `async def`. Its teardown runs on the caller thread and will park the loop for up to ~10s while `AsyncBridge.shutdown()` cancels in-flight tasks and joins the background thread — the exact "one stuck tenant stalls every other tenant" pathology `async_scoped_bridge()` exists to prevent.
+</Warning>
+
+### Teardown internals
+
+A scope-owned bridge (no argument) is torn down via `asyncio.to_thread(bridge.shutdown, permanent=True)` under `asyncio.shield`, so the blocking cancel-and-join runs on a worker thread instead of the event loop. `asyncio.shield` keeps that teardown running to completion even when the surrounding scope is being cancelled, so the loop+thread is neither leaked nor blocked. A caller-provided bridge is left untouched — the caller owns its lifecycle.
+
+### Behavioural contract
+
+| Guarantee | What it means |
+|-----------|---------------|
+| Binds its own bridge | Inside the scope, `current_bridge()` resolves to the bridge this block owns. |
+| Teardown never blocks the loop | A slow `shutdown()` (~0.3s) does not park the loop; concurrent tasks keep advancing. |
+| Owned bridge is poisoned on exit | A scope-owned bridge is `permanent=True` after exit; a leaked context cannot resurrect it. |
+| Caller-provided bridge untouched | A bridge passed in as an argument is never shut down — the caller retains ownership. |
+
+### API Reference
+
+| Symbol | Signature | Description |
+|--------|-----------|-------------|
+| `async_scoped_bridge` | `(bridge: Optional[AsyncBridge] = None) -> AsyncContextManager[AsyncBridge]` | Async-safe context manager. Same binding semantics as `scoped_bridge()`. A scope-owned bridge (no argument) is torn down via `asyncio.to_thread(bridge.shutdown, permanent=True)` under `asyncio.shield`, so scope exit — normal, error, or cancellation — never parks the caller's event loop. A caller-provided bridge is left untouched (caller owns lifecycle). |
+
+---
+
+## `generate_crew_and_kickoff` auto-scoping (sync and async)
+
+Both `generate_crew_and_kickoff()` (sync) and `agenerate_crew_and_kickoff()` (async) now auto-wrap each run in a per-run scoped bridge — the sync path uses `scoped_bridge()`, the async path uses `async_scoped_bridge()`. Every run isolates its `run_sync`-driven work onto its own loop+thread, so a stuck coroutine in one agent/tenant can no longer park the shared default loop for the rest.
+
+```mermaid
+graph TB
+    subgraph "Sync runs — scoped_bridge()"
         RunA[👤 Run A<br/>generate_crew_and_kickoff] --> SBA[🌉 scoped_bridge A]
         RunB[👤 Run B<br/>generate_crew_and_kickoff] --> SBB[🌉 scoped_bridge B]
         SBA --> LA[🔁 loop A]
         SBB --> LB[🔁 loop B]
     end
 
+    subgraph "Async runs — async_scoped_bridge()"
+        ARunC[👤 arun C<br/>agenerate_crew_and_kickoff] --> ASBC[🌉 async_scoped_bridge C]
+        ARunD[👤 arun D<br/>agenerate_crew_and_kickoff] --> ASBD[🌉 async_scoped_bridge D]
+        ASBC --> LC[🔁 loop C]
+        ASBD --> LD[🔁 loop D]
+    end
+
     classDef run fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef bridge fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef loop fill:#10B981,stroke:#7C90A0,color:#fff
 
-    class RunA,RunB run
-    class SBA,SBB bridge
-    class LA,LB loop
+    class RunA,RunB,ARunC,ARunD run
+    class SBA,SBB,ASBC,ASBD bridge
+    class LA,LB,LC,LD loop
 ```
 
-Callers doing multi-tenant sync runs no longer need to add their own `scoped_bridge()` around `generate_crew_and_kickoff` — a stuck coroutine in one run cannot affect another.
-
-<Note>
-`agenerate_crew_and_kickoff()` (async) is intentionally **not** wrapped. Async callers awaiting `adapter.arun(...)` directly do not benefit from a per-call loop swap and get better connection-pool reuse without it.
-</Note>
+Callers doing multi-tenant runs no longer need to add their own `scoped_bridge()` around either entry point — a stuck coroutine in one run cannot affect another. On the async path this closes a live multi-tenancy regression: `praisonai serve`, the gateway, and FastAPI-embed deployments no longer let a stuck coroutine in one tenant park the shared default loop+thread for the others. The earlier reasoning that async callers await `arun` directly did not hold in practice — adapter internals, user tools, the sync `DeliveryRouter._finalize_delivery`, and `BlueprintAgent.start()` (via `run_sync(...)`) all reach back into the sync bridge, which previously resolved to the process-default bridge under the async path.
 
 See [Wrapper → Lifecycle / cleanup](/developers/wrapper#lifecycle-cleanup) for the embedder view.
 
