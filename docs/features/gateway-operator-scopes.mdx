@@ -136,6 +136,27 @@ sequenceDiagram
 3. Each HTTP route and WebSocket action checks the required scope.
 4. Outbound events are filtered — approval events only reach clients with the `approvals` scope.
 
+WebSocket frames go through the central `authorize_method` gate before any handler runs.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Dispatcher
+    participant Registry as resolve_required_scope
+    participant Handler
+
+    Client->>Dispatcher: WS frame {type: "message", ...}
+    Dispatcher->>Registry: authorize_method("message", scopes, params)
+    alt scope satisfied
+        Registry-->>Dispatcher: OK
+        Dispatcher->>Handler: dispatch
+        Handler-->>Client: result
+    else GatewayUnauthorized
+        Registry-->>Dispatcher: raise (method, required)
+        Dispatcher-->>Client: {type: error, code: insufficient_scope, required_scope}
+    end
+```
+
 ---
 
 ## Scope Reference
@@ -310,7 +331,7 @@ Every method maps to a `GatewayMethodDescriptor` in the module-level `GATEWAY_ME
 </Warning>
 
 <Note>
-The registry is the **declared** classification. Today the WebSocket dispatcher still enforces scopes per handler; `resolve_required_scope()` will be wired into a single dispatch wrapper in a follow-up. Classifying `hello` / `join` / `leave` / `abort` ([PraisonAI PR #4345](https://github.com/MervinPraison/PraisonAI/pull/4345)) is the prerequisite that makes that wiring safe — without it, wiring the resolver would demand `admin` for the connection handshake and lock out every client.
+As of [PraisonAI PR #5217](https://github.com/MervinPraison/PraisonAI/pull/5217), the WebSocket dispatcher **calls the registry directly** — every inbound method goes through a central `authorize_method(method, client_scopes, params)` gate before any handler runs. `resolve_required_scope()` is the single source of truth. A plugin-registered or newly-added method is gated automatically; a method nobody classified requires `admin` by omission rather than being reachable ungated. See [Central authorization gate](#central-authorization-gate) below.
 </Note>
 
 ### Quick lookup
@@ -405,7 +426,7 @@ Core methods are classified at import; anything unlisted defaults to `admin`.
 | `hello`, `join`, `leave` | `read` |
 | `agent.message` | `write` |
 | `message` | `write` |
-| `abort` | `write` |
+| `abort`, `message_abort` | `write` |
 | `session.status` | `read` |
 | `session.transcript` | `read` |
 | `approvals.resolve` | `approvals` |
@@ -416,7 +437,7 @@ Core methods are classified at import; anything unlisted defaults to `admin`.
 | `channels.resume` | `admin` |
 | `channels.reconnect` | `admin` |
 
-Connection-lifecycle frames (`hello`, `join`, `leave`) run before a client has negotiated any scope, so they classify as `read` — the lowest meaningful level. `abort` mutates the turn just like sending one, so it carries the same `write` requirement as `message`.
+Connection-lifecycle frames (`hello`, `join`, `leave`) run before a client has negotiated any scope, so they classify as `read` — the lowest meaningful level. `abort` (and its wire alias `message_abort`) mutates the turn just like sending one, so both carry the same `write` requirement as `message`.
 
 <AccordionGroup>
 <Accordion title="Descriptor fields">
@@ -434,6 +455,48 @@ Connection-lifecycle frames (`hello`, `join`, `leave`) run before a client has n
 | `escalate_unknown_scope` | `admin` | Scope for unknown fields under `strict_fields` |
 </Accordion>
 </AccordionGroup>
+
+---
+
+## Central authorization gate
+
+Every gateway method now flows through one default-deny gate before any handler runs.
+
+Nothing changes for end users — the gateway gates dispatch for you.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", instructions="You are a helpful assistant.")
+agent.start("hello")  # dispatch is gated automatically; nothing to configure
+```
+
+Plugin authors extending the dispatcher can call the gate directly.
+
+```python
+from praisonaiagents.gateway import (
+    authorize_method,
+    GatewayUnauthorized,
+    OperatorScope,
+)
+
+try:
+    authorize_method("message", {OperatorScope.READ})
+except GatewayUnauthorized as exc:
+    print(exc.method, exc.required.value)
+    # -> message write
+```
+
+- Called once, centrally, at the top of `_handle_client_message` — no per-handler wiring needed.
+- Default-deny: an unclassified method requires `admin`.
+- `admin` implies every scope.
+- `read` is the baseline lifecycle scope — any operator holding at least one actionable scope (`write` / `approvals` / `pairing` / `admin`) satisfies `read`, so a `write`-only operator can still complete `hello` / `join` / `leave` / `session.status`. An empty scope set cannot satisfy even `read`.
+- A malformed `method` (non-string / unhashable) fails closed to `admin` rather than raising `TypeError`.
+- Transport `PING` / `PONG` frames bypass the gate (handled earlier in the wire loop).
+
+<Note>
+`GatewayUnauthorized` is a `PermissionError` subclass carrying `.method: str` and `.required: OperatorScope`. `str(exc)` renders as `method 'X' requires scope 'Y'`, and the dispatcher maps it to the `insufficient_scope` wire envelope with `required_scope` set.
+</Note>
 
 ---
 
@@ -482,13 +545,13 @@ Core methods are classified at import in `praisonaiagents.gateway.protocols`:
 | Method | Required scope |
 |---|---|
 | `hello`, `join`, `leave` | `read` |
-| `agent.message`, `message`, `abort` | `write` |
+| `agent.message`, `message`, `abort`, `message_abort` | `write` |
 | `session.status`, `session.transcript` | `read` |
 | `approvals.resolve` | `approvals` |
 | `pairing.approve`, `pairing.revoke` | `pairing` |
 | `channels.control`, `channels.pause`, `channels.resume`, `channels.reconnect` | `admin` |
 
-Connection-lifecycle frames (`hello`, `join`, `leave`) run before a client has negotiated any scope, so they classify as `read` — the lowest meaningful level. `abort` mutates the turn just like sending one, so it carries the same `write` requirement as `message`.
+Connection-lifecycle frames (`hello`, `join`, `leave`) run before a client has negotiated any scope, so they classify as `read` — the lowest meaningful level. `abort` (and its wire alias `message_abort`) mutates the turn just like sending one, so both carry the same `write` requirement as `message`.
 
 ### Registering a plugin method
 
@@ -565,6 +628,8 @@ resolve_required_scope("myplugin.combo", {"pair": True}) # ADMIN — fail-closed
 | `GATEWAY_METHODS: dict[str, GatewayMethodDescriptor]` | The module-level registry |
 | `register_gateway_method(name, *, scope=ADMIN, owner="core", since=None, escalate_fields=None, strict_fields=False, safe_fields=None, escalate_unknown_scope=ADMIN, replace=False)` | Registers `name`. Raises `ValueError` on duplicate unless `replace=True` |
 | `resolve_required_scope(method, params=None)` | Resolves the effective required scope. Unknown method → `admin` |
+| `authorize_method(method, client_scopes, params=None)` | Central default-deny gate. Resolves the required scope from `resolve_required_scope()` and raises `GatewayUnauthorized` when `client_scopes` do not satisfy it. Called by the WebSocket dispatcher for every non-ping frame |
+| `GatewayUnauthorized` | `PermissionError` subclass raised by `authorize_method`. Carries `.method: str` and `.required: OperatorScope` so the dispatcher can render `insufficient_scope` with `required_scope` set |
 
 <Note>
 `register_gateway_method` is safe to call at plugin import time. The core-method classification runs at `praisonaiagents.gateway.protocols` import, so any plugin registration you do afterwards adds to the same registry.
