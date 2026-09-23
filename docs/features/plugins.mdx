@@ -334,6 +334,136 @@ plugins:
 The gate judges a plugin by **where its file is located**, not where a symlink points. A repository-controlled symlink at `.praisonai/plugins/evil.py -> /tmp/evil.py` still counts as project-local and stays gated — it cannot slip past by resolving elsewhere.
 </Warning>
 
+<Note>
+This gate decides **whether a plugin loads at all**. A separate boundary decides whether a loaded plugin may read or rewrite conversation content — see [Security: Conversation-Content Capability Gate](#security-conversation-content-capability-gate).
+</Note>
+
+---
+
+## Security: Conversation-Content Capability Gate
+
+A plugin that isn't bundled must be explicitly granted `allow_conversation` before it can read or rewrite prompts, responses, and outbound messages — its tools still run either way.
+
+```mermaid
+graph LR
+    Hook[📩 Hook fires] --> Kind{🔎 Conversation<br/>hook?}
+    Kind -->|No — tool/channel/utility| Fire[✅ Dispatch]
+    Kind -->|Yes| Origin{🏛️ First-party?}
+    Origin -->|Yes — bundled| Fire
+    Origin -->|No| Grant{🔐 allow_conversation<br/>= true?}
+    Grant -->|Yes| Fire
+    Grant -->|No| Skip[⏭️ Silently skipped]
+
+    classDef event fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef allow fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Hook event
+    class Kind,Origin,Grant check
+    class Fire allow
+    class Skip deny
+```
+
+A third-party plugin's `tools` still register and fire; only the eight conversation-content hooks are withheld until you grant access.
+
+### Which hooks are gated
+
+These eight hooks carry — and can rewrite — the user's prompt, the model's response, or an outbound reply, so they are default-deny for third-party plugins:
+
+| Plugin method | Hook | Direction |
+|---------------|------|-----------|
+| `before_agent` | `BEFORE_AGENT` | Inbound prompt |
+| `before_llm` | `BEFORE_LLM` | Inbound messages |
+| `after_llm` | `AFTER_LLM` | Model response |
+| `after_agent` | `AFTER_AGENT` | Agent response |
+| `before_message` | `MESSAGE_RECEIVED` | Inbound message |
+| `after_message` | `MESSAGE_SENDING` | Outbound reply |
+| `message_sent` | `MESSAGE_SENT` | Outbound reply |
+| `message_undelivered` | `MESSAGE_UNDELIVERED` | Outbound reply |
+
+<Warning>
+The outbound `message_sending` / `message_sent` / `message_undelivered` events are gated **on purpose**. `message_sending` can rewrite the assistant reply, and `message_sent` / `message_undelivered` expose it — so "conversation content" means both directions, not just inbound prompts.
+</Warning>
+
+### Grant a third-party plugin access
+
+Add `allow_conversation: true` to the plugin's own option block in `.praisonai/config.yaml`:
+
+```yaml
+plugins:
+  my_pii_redactor:
+    allow_conversation: true      # opt in to before_llm / after_llm / message_*
+    # ...any other plugin options are still delivered to on_config as before
+```
+
+Or grant it in code:
+
+```python
+from praisonaiagents.plugins.manager import PluginManager
+
+manager = PluginManager()
+manager.set_plugin_options({"my_pii_redactor": {"allow_conversation": True}})
+```
+
+<Note>
+`allow_conversation` is **framework-reserved** — the manager interprets it and does **not** pass it through to the plugin's `on_config`. Every other key in the block still reaches `on_config` as before.
+</Note>
+
+### What "first-party" means
+
+First-party plugins — those bundled inside the installed `praisonaiagents/` package on disk — are granted conversation access automatically. This is a different notion from the location trust levels (project vs user-global vs entry-point) of the [Project-Plugin Trust Gate](#security-project-plugin-trust-gate).
+
+A plugin is first-party only when **both** hold:
+
+1. its class's module name is `praisonaiagents` or starts with `praisonaiagents.`, **and**
+2. that module's real on-disk file resolves to a path inside the installed `praisonaiagents/` package directory.
+
+<Warning>
+A malicious pip package that sets `__module__ = "praisonaiagents.evil"` is **rejected** — its file lives in the attacker's `site-packages`, not inside the framework's package directory, so the second check fails. Claiming first-party trust is not spoofable by a module string alone.
+</Warning>
+
+### Interaction with the project-plugin trust gate
+
+The two gates are complementary. A project-local single-file plugin authorised to *load* via `PRAISONAI_ALLOW_PROJECT_PLUGINS=true` is still **not** first-party — it must also carry `allow_conversation: true` in its config block before it sees any conversation-content hook.
+
+| Plugin origin | `before_tool`, tools, channels | `before_llm` / `after_llm` / `message_*` |
+|---------------|:------------------------------:|:----------------------------------------:|
+| First-party (bundled) | ✅ Fires | ✅ Fires |
+| Third-party, no grant | ✅ Fires | ❌ Silently skipped |
+| Third-party with `allow_conversation: true` | ✅ Fires | ✅ Fires |
+
+### Tools and channels are never gated
+
+An ungranted plugin still registers `get_tools()`, `before_tool`, `after_tool`, `before_tool_definitions`, `on_permission_ask`, channel adapters, `on_init` / `on_shutdown`, `session_start` / `session_end`, `on_error`, `on_config`, and `on_auth`. Only the eight conversation-content hooks above require the grant.
+
+### Which plugins see prompt content
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Manager as PluginManager
+    participant Bundled as First-party plugin
+    participant Third as Third-party plugin<br/>(ungranted)
+    participant Granted as Third-party plugin<br/>(allow_conversation=true)
+
+    User->>Agent: prompt
+    Agent->>Manager: before_llm(messages)
+    Manager->>Bundled: before_llm(...) ✅
+    Manager-->>Third: skipped (default-deny)
+    Manager->>Granted: before_llm(...) ✅
+    Manager-->>Agent: (rewritten) messages
+```
+
+<Warning>
+**Upgrading?** Any third-party plugin whose value depended on `before_llm` / `after_llm` / `message_*` — guardrails, PII redactors, translators, message-lifecycle telemetry — silently stops rewriting until you grant it. Enumerate the affected plugins:
+
+```bash
+praisonai plugins list --json | jq '.[] | select(.requests_conversation == true and .conversation_granted == false)'
+```
+</Warning>
+
 ---
 
 ## Inspect the Plugin Registry
@@ -347,7 +477,7 @@ for p in get_plugin_registry():
     print(p["name"], p["source"], p["enabled"], p["hooks"])
 ```
 
-Each entry is a dict: `{name, version, description, source, enabled, hooks}` (single-file entries also include `path`). The `source` field records provenance:
+Each entry is a dict: `{name, version, description, source, enabled, hooks, requests_conversation, conversation_granted}` (single-file entries also include `path`). The `source` field records provenance:
 
 | `source` | Origin |
 |----------|--------|
@@ -358,6 +488,13 @@ Each entry is a dict: `{name, version, description, source, enabled, hooks}` (si
 <Note>
 `enabled` reflects **both** the live manager state and the persisted config allow-list, so it renders correctly even before any agent starts.
 </Note>
+
+Two fields surface the [conversation-content capability gate](#security-conversation-content-capability-gate):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `requests_conversation` | `bool` or `null` | `true` if the plugin declares any of the eight conversation-content hooks. `null` for an entry-point plugin not yet loaded — its hooks are unknown without executing it, which the runtime avoids. |
+| `conversation_granted` | `bool` | `true` if the plugin is first-party or has `allow_conversation: true`. |
 
 ---
 
@@ -715,6 +852,10 @@ agent = Agent(name="Assistant", instructions="Help users.")
 agent.start("My SSN is 123-45-6789")   # response is redacted before the user sees it
 ```
 
+<Warning>
+`PIIRedactor` uses `after_llm`, a conversation-content hook. If you install it from pip (third-party), it won't fire until you grant `plugins.pii_redactor.allow_conversation: true` — see [Conversation-Content Capability Gate](#security-conversation-content-capability-gate).
+</Warning>
+
 ---
 
 ## Plugin Lifecycle Observability
@@ -931,6 +1072,10 @@ def create_plugin():
 ## Message-Lifecycle Plugins
 
 Override `before_message`, `after_message`, `message_sent`, or `message_undelivered` to react to every hop of a message's lifecycle — per-user policy, per-channel redaction, delivery telemetry, or dead-letter escalation.
+
+<Warning>
+All four `message_*` methods are conversation-content hooks. A third-party plugin overriding them needs `allow_conversation: true` before they fire — see [Conversation-Content Capability Gate](#security-conversation-content-capability-gate). Bundled and first-party plugins are granted automatically.
+</Warning>
 
 ### Choosing a message hook
 
@@ -1386,7 +1531,7 @@ A bare `enabled: true` is now **preserved** — enabling a plugin while it is se
 
 ### Per-plugin option blocks
 
-Reserved keys (`enabled`, `auto_discover`, `directories`, `allow_project_plugins`) configure the plugin *system*; **any other key whose value is a mapping is treated as a per-plugin option map** delivered to that plugin's `on_config` hook.
+Reserved keys (`enabled`, `auto_discover`, `directories`, `allow_project_plugins`) configure the plugin *system*; **any other key whose value is a mapping is treated as a per-plugin option map** delivered to that plugin's `on_config` hook. Inside a per-plugin block, `allow_conversation` is also framework-reserved — the manager reads it to gate conversation-content hooks and does **not** forward it to `on_config`.
 
 ```yaml
 plugins:
@@ -1542,26 +1687,30 @@ Writing a `.toml` config requires `tomli_w`. Without it the CLI **fails fast** w
 The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `before_tool_definitions`, `before_message`) also accept a deny/block decision instead of a rewrite — see [Blocking Plugins](#blocking-plugins-guardrails--policies). `after_tool` additionally accepts a rewrite **or** block — see [Redact / Block Tool Output](/features/redact-tool-output).
 </Note>
 
-| Plugin method | Hook event | In-place mutation |
-|---------------|-----------|-------------------|
-| `before_agent(prompt, ctx)` | `BEFORE_AGENT` | Return a `str` → rewrites `data.prompt` |
-| `after_agent(response, ctx)` | `AFTER_AGENT` | Return a `str` → rewrites `data.response` |
-| `before_llm(messages, params)` | `BEFORE_LLM` | Return `(new_messages, ...)` → replaces `data.messages` |
-| `after_llm(response, usage)` | `AFTER_LLM` | Return a `str` → rewrites `data.response` |
-| `before_tool(name, args)` | `BEFORE_TOOL` | Return a `dict` → replaces `data.tool_input` |
-| `after_tool(name, result)` | `AFTER_TOOL` | Return value → rewrites `data.tool_output` (redact/scrub). Return `PluginDecision.deny(reason)` / raise `GuardrailBlocked` → block; the model sees the block reason instead of the tool output. `None` → passthrough. Applies to sync `chat()` and async `achat()`. |
-| `before_tool_definitions(defs)` | `BEFORE_TOOL_DEFINITIONS` | Return a `list` → replaces `data.tool_definitions` |
-| `before_message(msg)` | `MESSAGE_RECEIVED` | Payload carries `content` + identity (`platform`, `sender_id`, `channel_id`, `channel_type`, `message_id`, `session_id` when set). Return `{"content": "..."}` → rewrites `data.content`. Return `PluginDecision.deny(reason)` → drops the inbound message. |
-| `after_message(msg)` | `MESSAGE_SENDING` | Same enriched payload. Return `{"content": "..."}` → rewrites `data.content`. |
-| `message_sent(msg)` | `MESSAGE_SENT` | Observational (successful delivery). Payload carries the same enriched fields; return value is ignored. |
-| `message_undelivered(msg)` | `MESSAGE_UNDELIVERED` | Observational (permanent delivery failure). Payload adds `error` and `notice_delivered` to the enriched fields; return value is ignored. |
-| `on_permission_ask(target, reason)` | `ON_PERMISSION_ASK` | `True`/`False`/`None` → allow/deny/allow |
-| `on_config(config)` | `ON_CONFIG` | Return a `dict` → rewrites `data.config` |
-| `on_auth(auth_type, credentials)` | `ON_AUTH` | Return a `dict` → rewrites `data.credentials` (works when starting as `None`) |
-| `session_start(context)` | `SESSION_START` | Observational (session `source`, `session_name`, `session_id`) |
-| `session_end(context)` | `SESSION_END` | Observational (`reason`, `total_turns`, `total_tokens`, `session_id`) |
-| `on_error(error_type, error_message, context)` | `ON_ERROR` | Observational (`stack_trace`, nested `context`, `session_id`) |
-| `cli_backend_execute(context)` | `CLI_BACKEND_EXECUTE` | Observational (`backend`, `command` — redacted, `content`, `error`, `transport`, `praisonai_llm_http`, `session_id`) |
+| Plugin method | Hook event | Requires grant? | In-place mutation |
+|---------------|-----------|:---------------:|-------------------|
+| `before_agent(prompt, ctx)` | `BEFORE_AGENT` | 🔐 | Return a `str` → rewrites `data.prompt` |
+| `after_agent(response, ctx)` | `AFTER_AGENT` | 🔐 | Return a `str` → rewrites `data.response` |
+| `before_llm(messages, params)` | `BEFORE_LLM` | 🔐 | Return `(new_messages, ...)` → replaces `data.messages` |
+| `after_llm(response, usage)` | `AFTER_LLM` | 🔐 | Return a `str` → rewrites `data.response` |
+| `before_tool(name, args)` | `BEFORE_TOOL` | — | Return a `dict` → replaces `data.tool_input` |
+| `after_tool(name, result)` | `AFTER_TOOL` | — | Return value → rewrites `data.tool_output` (redact/scrub). Return `PluginDecision.deny(reason)` / raise `GuardrailBlocked` → block; the model sees the block reason instead of the tool output. `None` → passthrough. Applies to sync `chat()` and async `achat()`. |
+| `before_tool_definitions(defs)` | `BEFORE_TOOL_DEFINITIONS` | — | Return a `list` → replaces `data.tool_definitions` |
+| `before_message(msg)` | `MESSAGE_RECEIVED` | 🔐 | Payload carries `content` + identity (`platform`, `sender_id`, `channel_id`, `channel_type`, `message_id`, `session_id` when set). Return `{"content": "..."}` → rewrites `data.content`. Return `PluginDecision.deny(reason)` → drops the inbound message. |
+| `after_message(msg)` | `MESSAGE_SENDING` | 🔐 | Same enriched payload. Return `{"content": "..."}` → rewrites `data.content`. |
+| `message_sent(msg)` | `MESSAGE_SENT` | 🔐 | Observational (successful delivery). Payload carries the same enriched fields; return value is ignored. |
+| `message_undelivered(msg)` | `MESSAGE_UNDELIVERED` | 🔐 | Observational (permanent delivery failure). Payload adds `error` and `notice_delivered` to the enriched fields; return value is ignored. |
+| `on_permission_ask(target, reason)` | `ON_PERMISSION_ASK` | — | `True`/`False`/`None` → allow/deny/allow |
+| `on_config(config)` | `ON_CONFIG` | — | Return a `dict` → rewrites `data.config` |
+| `on_auth(auth_type, credentials)` | `ON_AUTH` | — | Return a `dict` → rewrites `data.credentials` (works when starting as `None`) |
+| `session_start(context)` | `SESSION_START` | — | Observational (session `source`, `session_name`, `session_id`) |
+| `session_end(context)` | `SESSION_END` | — | Observational (`reason`, `total_turns`, `total_tokens`, `session_id`) |
+| `on_error(error_type, error_message, context)` | `ON_ERROR` | — | Observational (`stack_trace`, nested `context`, `session_id`) |
+| `cli_backend_execute(context)` | `CLI_BACKEND_EXECUTE` | — | Observational (`backend`, `command` — redacted, `content`, `error`, `transport`, `praisonai_llm_http`, `session_id`) |
+
+<Note>
+🔐 marks the eight [conversation-content hooks](#security-conversation-content-capability-gate). For a third-party plugin they fire only after `allow_conversation: true`; first-party plugins are granted automatically.
+</Note>
 
 `on_config` and `on_auth` write their returned dict back onto the payload even when the target attribute starts as `None` — so a plugin can inject credentials the first time they're requested, not only edit an existing dict.
 
@@ -1595,6 +1744,10 @@ See [Hook Events → CLI Backend Events](/docs/features/hook-events#cli-backend-
 ## Blocking Plugins (Guardrails & Policies)
 
 Guardrail and policy plugins can now stop an action before it happens, not just rewrite it — refuse a dangerous tool call, drop a spam message, or decline an LLM request.
+
+<Warning>
+A third-party guardrail that hooks `before_llm` or `before_message` — both conversation-content hooks — is silently skipped until granted `allow_conversation: true`. Blocking on `before_tool` / `after_tool` needs no grant. See [Conversation-Content Capability Gate](#security-conversation-content-capability-gate).
+</Warning>
 
 ```mermaid
 graph LR
@@ -1928,5 +2081,8 @@ All lifecycle methods — `register`, `unregister`, `enable`, `disable`, `execut
 </Card>
 <Card title="Redact Tool Output" icon="shield-halved" href="/features/redact-tool-output">
   Scrub secrets or block tool results before the model sees them
+</Card>
+<Card title="Conversation-Content Gate" icon="lock" href="/features/plugins#security-conversation-content-capability-gate">
+  Grant third-party plugins access to prompts and responses
 </Card>
 </CardGroup>
