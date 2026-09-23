@@ -202,11 +202,7 @@ No `expected_parameters` field and no `Expected parameters for '<tool>' — ...`
 
 ## Text-based tool-call recovery (local models)
 
-Small local models sometimes emit a tool call as JSON text in the `content` field instead of using the `tool_calls[]` field. The adapters for Ollama and local OpenAI-compatible servers (LM Studio, vLLM, llama.cpp) parse that JSON and dispatch the call anyway.
-
-<Note>
-**Async parity fixed in PraisonAI PR [#4940](https://github.com/MervinPraison/PraisonAI/pull/4940)** (merged 2026-09-08). Before #4940, text-based recovery fired only on the sync path (`agent.start()` / `agent.chat()`); the async path (`agent.astart()` / `agent.achat()`) silently ignored a tool call the model emitted as JSON text, so the same agent, same model, same prompt stopped calling tools the moment the caller awaited instead of called. Both paths now behave identically. Streaming does not yet have this recovery — a small local model that emits a tool call as JSON text inside a streamed response still surfaces as prose.
-</Note>
+Small local models often emit a tool call as text inside `content` instead of using the native `tool_calls[]` field. The adapters for Ollama and OpenAI-compatible local servers (LM Studio, vLLM, llama.cpp) parse that text and dispatch the call anyway — with no extra LLM round trip.
 
 ```python
 from praisonaiagents import Agent
@@ -214,48 +210,129 @@ from praisonaiagents import Agent
 def get_weather(city: str) -> str:
     return f"{city}: 21°C"
 
-agent = Agent(llm="lm_studio/qwen2.5-7b-instruct", tools=[get_weather])
-agent.start("What is the weather in Paris?")
-# The model may reply with the tool call as JSON text — it dispatches anyway.
+# Small local model that often writes tool calls as text
+agent = Agent(
+    llm="ollama/qwen2.5:7b",
+    instructions="Answer weather questions using the get_weather tool.",
+    tools=[get_weather],
+)
+
+agent.start("What's the weather in Paris and Berlin?")
+# Even if the model writes:
+#   <tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>
+#   <tool_call>{"name": "get_weather", "arguments": {"city": "Berlin"}}</tool_call>
+# both calls run in order — no re-prompt, no extra round trip.
 ```
 
-The recovered shape is a JSON object (or a list of them) with `name` and `arguments`:
+<Note>
+**Extended in PraisonAI PR [#5215](https://github.com/MervinPraison/PraisonAI/pull/5215)** (merged 2026-09-23). Two new dialects are now recovered — `<tool_call>{...}</tool_call>` and `<function=name>{...}</function>` — on top of the existing whole-content JSON path. Two safety guarantees now apply to all three dialects: an **advertised-name allowlist** (a model hallucinating a tool name in prose can never trigger execution) and **fenced code-block masking** (a call *shown as documentation* is never run). Both the sync path (`agent.start()` / `agent.chat()`) and the async path (`agent.astart()` / `agent.achat()`) get the same coverage — async parity was first landed in [PR #4940](https://github.com/MervinPraison/PraisonAI/pull/4940). Streaming still does not have this recovery.
+</Note>
 
-```json
+### Three dialects, one code path
+
+<Tabs>
+<Tab title="Whole-content JSON">
+```text
 {"name": "get_weather", "arguments": {"city": "Paris"}}
 ```
+Both `{...}` and `[{...}, {...}]` shapes work.
+</Tab>
 
-Both `{...}` and `[{...}, {...}]` shapes work. Hosted OpenAI-compatible endpoints, Anthropic, and Gemini deliberately do **not** get this behaviour — a hosted model returning JSON prose must never have it silently interpreted as a tool call.
+<Tab title="<tool_call> block">
+```text
+I'll check that for you.
+<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>
+```
+Multiple `<tool_call>` blocks are recovered in the order they appear. The payload's `name` or `tool` key is accepted; arguments come from `arguments` or `parameters`.
+</Tab>
 
-| Adapter | Text-based recovery | Applies on |
-|---|---|---|
-| `OllamaAdapter` (`ollama/…`, `ollama_chat/…`) | ✅ recovers | sync, async |
-| `LocalOpenAIAdapter` (LM Studio, vLLM, `hosted_vllm/`, llama.cpp) | ✅ recovers | sync, async |
-| `DefaultAdapter` (hosted OpenAI-compatible via `base_url`) | ❌ | — |
-| `AnthropicAdapter` | ❌ | — |
-| `GeminiAdapter` | ❌ | — |
+<Tab title="<function=…> block">
+```text
+Sure, let me look it up.
+<function=get_weather>{"city": "Paris"}</function>
+```
+Multiple `<function=…>` blocks are recovered in the order they appear.
+</Tab>
+</Tabs>
 
-Streaming is deliberately omitted from the "Applies on" column because no adapter recovers on the streaming path today.
+Interleaved dialects are salvaged **in text order** (sorted by match offset) — a side-effecting or dependent call is never reordered ahead of one it relies on.
 
-If the response also carries a native `tool_calls[]` entry, that is dispatched — text-based recovery only runs when `tool_calls[]` is empty. So a well-formed native call is never overridden by JSON prose the model happened to also include.
+### Safety guarantees
+
+<AccordionGroup>
+<Accordion title="Advertised-name allowlist">
+Every recovered name must match a tool the model was actually offered. A hallucinated name in prose is silently discarded — this now applies to the whole-content JSON path too.
+
+```python
+# The agent was created with only [get_weather, get_stock_price].
+# The model wrote:
+#   <tool_call>{"name": "wire_transfer", "arguments": {...}}</tool_call>
+# Salvage returns None -- no tool executes.
+```
+</Accordion>
+
+<Accordion title="Fenced code-block masking">
+A call inside a Markdown fence (` ``` ` or `~~~`, length ≥ 3) is treated as documentation and never run — including calls that name a real tool.
+
+````text
+Example format:
+```
+<tool_call>{"name": "delete_user", "arguments": {"id": "42"}}</tool_call>
+```
+````
+
+An **unclosed** fence is treated as running to end-of-content, so a truncated example that opens a fence and names a real tool cannot slip through.
+</Accordion>
+
+<Accordion title="Case-insensitive tag matching">
+`<TOOL_CALL>`, `<Tool_Call>`, and `<FUNCTION=name>` all match — a model that emits the tags in any case still recovers just like the lowercase form.
+</Accordion>
+
+<Accordion title="Zero cost when nothing to salvage">
+Clean provider-native responses return `None` after a single lowercase marker check — no regex runs on prose that never mentions a call. There is no per-turn cost to fear.
+</Accordion>
+</AccordionGroup>
+
+### Adapter coverage
+
+| Adapter | Recovery | Sync path | Async path | Streaming |
+|---|---|---|---|---|
+| `OllamaAdapter` (`ollama/…`, `ollama_chat/…`) | ✅ all three dialects | ✅ | ✅ | ❌ |
+| `LocalOpenAIAdapter` (LM Studio, vLLM, `hosted_vllm/`, llama.cpp) | ✅ all three dialects | ✅ | ✅ | ❌ |
+| `DefaultAdapter` (hosted OpenAI-compatible via `base_url`) | ❌ | — | — | — |
+| `AnthropicAdapter` | ❌ | — | — | — |
+| `GeminiAdapter` | ❌ | — | — | — |
+
+Hosted models deliberately do not get salvage — a hosted model returning JSON prose must never have it silently interpreted as a tool call. Streaming does not yet have this recovery on any adapter; all three dialects apply on the **non-streaming** path only, sync and async.
+
+If the response also carries a native `tool_calls[]` entry, that is dispatched — text-based recovery only runs when `tool_calls[]` is empty. So a well-formed native call is never overridden by prose the model happened to also include.
 
 Recovery participates in the same repair budget as name-and-parameter repair — controlled by `max_tool_repairs` (default 2 for local adapters, 0 for hosted).
 
 ```mermaid
 graph TB
-    Text[🤖 Tool call as JSON text] --> Which{🔌 Which adapter?}
-    Which -->|Ollama · LM Studio · vLLM · llama.cpp| Parse[🧩 Parse + dispatch]
-    Which -->|Hosted · Anthropic · Gemini| Skip[🚫 Left as prose]
+    Resp[🤖 Model response] --> Native{🔍 Native tool_calls?}
+    Native -->|Yes| RunNative[✅ Dispatch native]
+    Native -->|No| Marker{🔎 Any marker in content?}
+    Marker -->|No| Prose[💬 Treat as prose]
+    Marker -->|Yes| Mask[🧯 Mask fenced code]
+    Mask --> Parse[🧩 Scan 3 dialects]
+    Parse --> Allow{🛡 In allowlist?}
+    Allow -->|No| Drop[🚫 Discard]
+    Allow -->|Yes| Order[🔢 Sort by text position]
+    Order --> RunSalv[✅ Dispatch salvaged]
 
     classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef safe fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef good fill:#10B981,stroke:#7C90A0,color:#fff
-    classDef skip fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef skip fill:#6366F1,stroke:#7C90A0,color:#fff
 
-    class Text input
-    class Which check
-    class Parse good
-    class Skip skip
+    class Resp input
+    class Native,Marker,Allow check
+    class Mask,Order safe
+    class RunNative,RunSalv good
+    class Prose,Drop skip
 ```
 
 ---
