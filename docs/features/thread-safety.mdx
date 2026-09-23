@@ -372,8 +372,29 @@ Reference: PraisonAI PR #1609 (thread-safe defensive copying) and PR #3792 (boun
 Reads inside the lock guarantee that a metadata merge picks up any messages another worker appended just before. **Since PR #1709, `FileLock.__enter__` raises `IOError` on timeout** (previously the lock failure was silent, which could lead to torn writes on a stuck lock). The default `lock_timeout` is `5.0` seconds — pass `DefaultSessionStore(lock_timeout=...)` to tune it.
 
 <Warning>
-**Behaviour change in PR #1709**: `FileLock.__enter__` now raises `IOError` instead of returning silently on lock-acquisition timeout. If you have custom code that uses `FileLock` directly from `praisonaiagents.session.store`, wrap it in a `try/except IOError` or raise the timeout via `DefaultSessionStore(lock_timeout=...)`.
+**Behaviour change in PR #1709**: `praisonaiagents.session.store.FileLock.__enter__` now raises `IOError` instead of returning silently on lock-acquisition timeout. If you have custom code that uses `FileLock` directly from `praisonaiagents.session.store`, wrap it in a `try/except IOError` or raise the timeout via `DefaultSessionStore(lock_timeout=...)`.
 </Warning>
+
+<Note>
+There are **two distinct `FileLock` classes** with different histories — do not conflate them:
+
+| Class | Used by | Timeout behaviour |
+|---|---|---|
+| `praisonaiagents.session.store.FileLock` | `DefaultSessionStore` (above) | Raises `IOError` on acquisition timeout (PR #1709) |
+| `praisonaiagents.storage.base.FileLock` | `BaseJSONStore` and downstream learn stores | mtime-based staleness + heartbeat (PR #5136, below) |
+</Note>
+
+### storage.base.FileLock — mtime staleness + heartbeat
+
+`praisonaiagents.storage.base.FileLock` backs `BaseJSONStore` and every JSON-backed store built on it (including the [learned-memory store](/features/learn)). It judges staleness by the lock **file's** mtime age, not by how long any individual waiter has queued.
+
+| Rule | Behaviour |
+|---|---|
+| Staleness measure | `time.time() - lock_path.stat().st_mtime` — the lock file's own age |
+| Heartbeat | A daemon thread started in `__enter__` refreshes the lock file's mtime every `max(timeout/3, 0.001)` seconds via `os.utime`; `__exit__` stops it |
+| Reclaim | Only a truly abandoned lock (holder crashed without running `__exit__` or heartbeating) ages past `timeout` and is reclaimed |
+
+This closes a corruption bug: previously, staleness was measured as `time.time() - start`, where `start` was when *this waiter* began waiting. A live holder legitimately in a long critical section (large JSON write, slow disk) had its lock file `unlink()`ed out from under it as soon as one waiter's `timeout` elapsed — admitting two writers into the same read-modify-write save concurrently and silently clobbering one another's writes. The mtime + heartbeat scheme keeps a long-held lock exclusive. Added in [PR #5136](https://github.com/MervinPraison/PraisonAI/pull/5136).
 
 ### SqliteTranscriptStore — cross-process safety
 
