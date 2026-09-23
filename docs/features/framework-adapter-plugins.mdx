@@ -344,8 +344,8 @@ Framework adapters must implement the `FrameworkAdapter` protocol:
 | `resolve(*, config=None)` | ❌ | Pick the concrete adapter variant from YAML config (keyword-only `config`; default returns `self`) |
 | `resolve_alias()` | ❌ | Return the concrete adapter name to dispatch to (string). Default returns `self.name`. Override when your adapter is a router that picks a sibling adapter at runtime by name. |
 | `setup(*, framework_tag)` | ❌ | Framework-specific pre-run hooks (default no-op) |
-| `run(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ✅ | Execute framework logic (all four trailing kwargs are validated at registration time — see Troubleshooting) |
-| `arun(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ❌ | Async execution path. Validated at registration time whenever it exists — same rules as `run()`. `arun` remains optional; adapters without it keep the sync-only offload behaviour. When `SUPPORTS_ASYNC` is `False` (default), it offloads `run()` to this adapter's bounded thread pool and logs a one-line warning. Override with a native `async def` for a fully async path. |
+| `run(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ✅ | Execute framework logic (all four trailing kwargs are validated at registration time — see Troubleshooting). Relying on `**kwargs` instead of naming these validates but logs a warning — see [`**kwargs`-only adapters are accepted but warned](#kwargs-only-adapters-are-accepted-but-warned). |
+| `arun(config, llm_config, topic, *, tools_dict, agent_callback, task_callback, cli_config)` | ❌ | Async execution path. Validated at registration time whenever it exists — same rules as `run()`, including the [`**kwargs`-only warning](#kwargs-only-adapters-are-accepted-but-warned). `arun` remains optional; adapters without it keep the sync-only offload behaviour. When `SUPPORTS_ASYNC` is `False` (default), it offloads `run()` to this adapter's bounded thread pool and logs a one-line warning. Override with a native `async def` for a fully async path. |
 | `cleanup()` | ❌ | Release resources after execution (default no-op; also shuts down the offload pool) |
 | `SUPPORTS_ASYNC` | ❌ | `bool`, default `False`. Set `True` when you override `arun()` with a native `async def`. When `False`, `arun()` offloads `run()` to the adapter's bounded thread pool and logs a one-line warning. |
 | `_THREAD_OFFLOAD_MAX_WORKERS` | ❌ | `int`, default `4`. Size of this adapter's private `ThreadPoolExecutor` used by `arun()`'s sync-offload path. Override on the class or instance for high-concurrency workloads. |
@@ -362,6 +362,30 @@ missing keyword parameters ['agent_callback', 'cli_config', 'task_callback', 'to
 The error names the failing method (`.run` or `.arun`), so `arun()` is now validated with the same rules whenever it exists. A `run()` (or `arun()`) that declares a `**kwargs` catch-all satisfies the check without listing each protocol keyword explicitly.
 
 Adapters that fail validation also report `registry.is_available("<name>") == False` instead of raising — so a broken plugin will simply disappear from the available-framework list rather than crashing the CLI.
+
+#### `**kwargs`-only adapters are accepted but warned
+
+A signature that relies on `**kwargs` still validates for backward compatibility — an adapter can legitimately forward `**kwargs` to a delegate. But if `run()` / `arun()` does **not** name every one of `tools_dict`, `agent_callback`, `task_callback`, and `cli_config` explicitly and instead leans on `**kwargs`, registration now logs a warning naming the un-declared kwargs. If those kwargs aren't forwarded, their safety guarantees — `tool_timeout` wraps, `agent_callback` / `task_callback` observability hooks, and `cli_config` approval / guardrails / allowed-tools knobs — are silently dropped.
+
+```
+FrameworkAdapter 'my_adapter'.run names none of the adapter kwargs
+['agent_callback', 'cli_config', 'task_callback', 'tools_dict']
+explicitly and relies on **kwargs; if these are not forwarded, their
+safety guarantees (tool_timeout, callbacks, approval/guardrails via
+cli_config) will be silently dropped.
+```
+
+The warning fires whenever the signature has a `**kwargs` catch-all **and** is missing one or more of the four named kwargs. The log line lists exactly the missing ones. Built-in adapters (`crewai`, `autogen`, `autogen-v4`, `ag2`, `praisonai`) name all four explicitly, so no warning fires for them.
+
+| `run` / `arun` signature | Registration behaviour |
+|--------------------------|-------------------------|
+| Names all four kwargs explicitly (with or without `**kwargs`) | Silent — no warning |
+| Names some / none of the four kwargs, **no** `**kwargs` | `TypeError` at registration |
+| Missing one or more of the four kwargs, **has** `**kwargs` | Accepted **but** `logger.warning` names the un-declared kwargs |
+
+<Tip>
+Always name `tools_dict`, `agent_callback`, `task_callback`, and `cli_config` explicitly in `run()` / `arun()` (even if you also accept `**kwargs`) so the safety guarantees are preserved and the registry stays silent.
+</Tip>
 
 <Note>
 `resolve_alias()` (PR #2086) and `resolve(*, config=None)` (PR #2070) serve different roles. Use `resolve(*, config=...)` when variant selection depends on YAML keys such as `autogen_version`. Use `resolve_alias()` when routing depends on environment or runtime state. Family adapters may combine both.
@@ -912,6 +936,21 @@ class OptionalDepsAdapter(BaseFrameworkAdapter):
 ## Best Practices
 
 <AccordionGroup>
+
+<Accordion title="Name the four adapter kwargs explicitly">
+
+Always name `tools_dict`, `agent_callback`, `task_callback`, and `cli_config` in `run()` / `arun()` — even if you also accept `**kwargs`. This keeps the safety guarantees (`tool_timeout` wraps, callbacks, and `cli_config` approval / guardrails) intact and stops the registry logging a warning at registration.
+
+```python
+def run(self, config, llm_config, topic, *, tools_dict=None,
+        agent_callback=None, task_callback=None, cli_config=None,
+        **kwargs):
+    ...
+```
+
+An adapter that leans on `**kwargs` alone still registers, but logs a warning naming the un-declared kwargs — see [`**kwargs`-only adapters are accepted but warned](#kwargs-only-adapters-are-accepted-but-warned).
+
+</Accordion>
 
 <Accordion title="Handle Missing Dependencies Gracefully">
 
