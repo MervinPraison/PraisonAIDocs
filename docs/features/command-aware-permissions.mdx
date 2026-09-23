@@ -180,6 +180,150 @@ The `external_dir:` rows above only apply when `PermissionManager` is created wi
 
 ---
 
+## Windows / PowerShell dialect
+
+PowerShell and `cmd` wrappers are unwrapped so the inner cmdlet — not the opaque `powershell -Command "…"` — is what your rules see.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.approval.protocols import ApprovalConfig
+
+agent = Agent(
+    name="Safe Windows Worker",
+    instructions="Run shell commands safely on Windows",
+    approval=ApprovalConfig(permissions={
+        "bash:Remove-Item *": "deny",
+        "bash:*": "allow",
+    }),
+)
+
+# All of these are blocked by the single Remove-Item deny above:
+#   powershell -Command "Remove-Item C:\tmp\x"
+#   pwsh -c "Remove-Item .\out.txt"
+#   powershell -NoProfile -Command "Remove-Item .\x"
+#   powershell -Command "& { Remove-Item .\x }"
+#   powershell -EncodedCommand <base64-of-'Remove-Item .\x'>
+agent.start("Clean up temp files")
+```
+
+```mermaid
+graph LR
+    Cmd[📥 Shell command] --> Detect{Executable is<br/>powershell / pwsh / cmd?}
+    Detect -->|No| Posix[🐧 POSIX parse<br/>unchanged]
+    Detect -->|Yes| Unwrap[🪟 Unwrap<br/>-Command / -c / /c]
+    Unwrap --> Encoded{Is<br/>-EncodedCommand?}
+    Encoded -->|Yes| Decode[🔓 Base64 UTF-16LE decode]
+    Encoded -->|No| Strip[✂️ Strip scriptblock<br/>&amp; { … }]
+    Decode --> Strip
+    Strip --> Inner[🔧 Parse inner<br/>in matching dialect]
+    Inner --> Gate[🛡️ Same deny→ask→allow<br/>as POSIX]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decide fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef posix fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef win fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Cmd input
+    class Detect,Encoded decide
+    class Posix posix
+    class Unwrap,Decode,Strip,Inner win
+    class Gate ok
+```
+
+### What Windows dialects understand
+
+| Wrapper / construct | Example | Result |
+|---|---|---|
+| `powershell -Command "…"` | `powershell -Command "Remove-Item C:\tmp\x"` | `[Remove-Item]` (dialect = `powershell`) |
+| `pwsh -c "…"` (short flag) | `pwsh -c "New-Item .\out.txt"` | `[New-Item]` |
+| `cmd /c "…"` | `cmd /c "del C:\tmp\x"` | `[del]` (dialect = `cmd`) |
+| Option-prefixed PS | `powershell -NoProfile -Command "Remove-Item C:\outside\x"` | `[Remove-Item]` (switches before `-Command` are skipped) |
+| Option-prefixed cmd | `cmd /d /c "del C:\outside\x"` | `[del]` |
+| PowerShell pipeline | `powershell -Command "Get-Content a.txt \| Set-Content b.txt"` | `[Get-Content, Set-Content]` |
+| Call-operator scriptblock | `powershell -Command "& { Remove-Item .\x }"` | `[Remove-Item]` — `{` is not left as the executable |
+| Bare call operator | `powershell -Command "& Remove-Item .\x"` | `[Remove-Item]` |
+| `-EncodedCommand` (base64 UTF-16LE) | `powershell -EncodedCommand UgBlAG0Abw…` | decoded, then parsed inline |
+| `-e` / `-ec` abbreviations | `pwsh -e UgBlAG0Abw…` | decoded, then parsed inline |
+| Undecodable `-EncodedCommand` | `powershell -EncodedCommand not!valid!base64` | **fail-closed** — stays a single opaque `powershell` op |
+| `powershell script.ps1` (no `-Command`) | `powershell script.ps1` | opaque single op — filename is **not** misparsed as a command flag |
+| Drive-letter path arg | `powershell -Command "Remove-Item C:\tmp\x"` | `C:\tmp\x` is a `path_arg` (POSIX would not see it) |
+| Relative Windows path arg | `powershell -Command "Set-Content .\out.txt hi"` | `.\out.txt` is a `path_arg` |
+| UNC / backslash tokens | `\\host\share\x`, `.\x`, `..\x` | recognised as Windows path shapes |
+
+### Recognised mutation vocabulary
+
+Match is case-insensitive; a directory prefix on the executable is ignored.
+
+**PowerShell (cmdlets + aliases):**
+`Remove-Item`, `New-Item`, `Move-Item`, `Copy-Item`, `Rename-Item`, `Set-Content`, `Add-Content`, `Clear-Content`, `Out-File`, and aliases `ri`, `rd`, `del`, `erase`, `ni`, `mi`, `move`, `cpi`, `copy`, `cp`, `rni`, `ren`, `sc`, `ac`, `rm`, `mv`.
+
+**`cmd` built-ins:**
+`del`, `erase`, `rd`, `rmdir`, `md`, `mkdir`, `move`, `copy`, `xcopy`, `ren`, `rename`.
+
+<Note>
+`Get-Content`, `Get-ChildItem`, and `dir` are **not** mutations — they follow the same read-vs-write distinction as POSIX.
+</Note>
+
+### Workspace boundary on Windows
+
+The workspace boundary fires on Windows paths the same way it fires on POSIX paths.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.approval.protocols import ApprovalConfig
+
+agent = Agent(
+    name="Windows Worker",
+    instructions="Only write inside the workspace",
+    approval=ApprovalConfig(permissions={"bash:*": "allow"}),
+)
+
+# Inside workspace → allowed
+#   powershell -Command "Set-Content .\note.txt hi"
+#
+# Outside workspace → prompts (external_dir:* boundary fires)
+#   powershell -Command "Remove-Item C:\Users\Public\secret.txt"
+#   powershell -NoProfile -Command "Remove-Item C:\outside\x"
+#   powershell -EncodedCommand <base64-of-'Remove-Item C:\outside\x'>
+agent.start("Save today's notes")
+```
+
+- The boundary check fires the same way it does for POSIX `rm` — Windows users no longer get a weaker default.
+- Option-prefixed forms (`-NoProfile -Command …`, `cmd /d /c …`) do not defeat the unwrap.
+- `-EncodedCommand` payloads are decoded (base64 UTF-16LE) before gating, so a base64 blob cannot slip an external write past the gate.
+
+Anchor: [Workspace Boundary](/features/workspace-boundary).
+
+### Fail-closed behaviour
+
+- **Undecodable `-EncodedCommand`** → the wrapper stays opaque (executable is preserved as `powershell`), so a command-specific deny or allow on `powershell *` still applies; a broad wildcard does not silently authorise the payload.
+- **`powershell script.ps1`** (no command flag) → stays opaque, filename is not treated as a command operand.
+- **Any parse failure** → whole-command fallback (existing POSIX behaviour, extended to Windows) — no rule is silently weakened.
+
+### Which rule should I write?
+
+A rule name matches the executable name: POSIX pattern names catch POSIX executables; Windows cmdlet names catch cmdlets. The path-based workspace boundary is dialect-agnostic, so that half of the safety story needs no per-OS duplication.
+
+```mermaid
+graph TB
+    Start[What do you want to block?] --> Q1{POSIX only,<br/>Windows only,<br/>or both?}
+    Q1 -->|POSIX only| P[bash:rm *]
+    Q1 -->|Windows only| W[bash:Remove-Item *]
+    Q1 -->|Both| Both["Two rules:<br/>bash:rm *<br/>bash:Remove-Item *"]
+    Both --> Note[Path-based boundary<br/>catches the rest automatically]
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decide fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef rule fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1 decide
+    class P,W,Both,Note rule
+```
+
+---
+
 ## Shell expansion escalates to ASK
 
 Shell commands containing an expansion that cannot be statically resolved are escalated to `ASK` instead of being silently allowed by a broad rule.
@@ -253,6 +397,16 @@ A `deny: bash:rm *` rule now blocks **all** of these:
 | `bash:(cd /tmp && rm -rf x)` | **ALLOWED** | denied |
 | `execute_command({"command=": "rm -rf /tmp/x"})` (argument-key mangling) | **ALLOWED** | denied |
 | `bash:echo '$(rm -rf x)'` (single-quoted) | denied | **allowed** (correctly — literal) |
+
+Windows dialects — with a matching cmdlet deny like `bash:Remove-Item *` (or `bash:del *` / `bash:New-Item *`):
+
+| Command | Previous | Now |
+|---|---|---|
+| `bash:powershell -Command "Remove-Item x"` | **ALLOWED** | denied |
+| `bash:cmd /c "del x"` | **ALLOWED** | denied |
+| `bash:pwsh -c "New-Item x"` | **ALLOWED** | denied |
+| `bash:powershell -EncodedCommand …` (decodes to `Remove-Item x`) | **ALLOWED** | denied |
+| `bash:powershell -Command "& { Remove-Item x }"` | **ALLOWED** | denied |
 
 ---
 
@@ -415,6 +569,10 @@ Truncating redirects produce a `write:<path>` sub-target. Use `write:/etc/*` to 
 
 <Accordion title="Zero overhead when permissions are off">
 The command parser is lazy-imported: no parsing cost when permissions are not in use or the target is a non-shell tool.
+</Accordion>
+
+<Accordion title="On Windows, prefer cmdlet names in your rules">
+`bash:Remove-Item *` catches `powershell -Command "Remove-Item …"`, `pwsh -c "Remove-Item …"`, `& { Remove-Item … }` scriptblocks, and `-EncodedCommand` payloads that decode to `Remove-Item`. `bash:rm *` still catches POSIX `rm`; write both if your workflow targets both OSes.
 </Accordion>
 </AccordionGroup>
 
