@@ -285,6 +285,8 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 | `PersistenceOrchestrator._cache_lock` | `threading.RLock` | Protects `_session_cache` reads/writes; the store is a bounded `OrderedDict` LRU (not a plain dict), and reads return `deepcopy()` to prevent shared mutable state |
 | `RateLimiter` (sync) | `threading.Lock` | Protects `_tokens`, `_api_tokens`, and refill state from races in multi-threaded acquire calls |
 | `RateLimiter` (async) | `asyncio.Lock` | Same protection for coroutine contexts |
+| `praisonaiagents.output.status._output_lock` | `threading.Lock` | Guards the status singleton's timing dicts, `_ai_call_count`, and session token/cost accumulators — see [Output singleton lock](#output-singleton-tracestatus-lock-pr-5219) |
+| `praisonaiagents.output.trace._output_lock` | `threading.Lock` | Guards the trace singleton's `_llm_start_time` / `_tool_start_times` — see [Output singleton lock](#output-singleton-tracestatus-lock-pr-5219) |
 
 ### Deep-copy support
 
@@ -868,6 +870,46 @@ Each gathered task rebinds `_handoff_chain_var` to a fresh per-task copy on entr
 
 - Safety-rejected handoffs are chain-neutral: a handoff blocked by a safety check never consumes a chain slot, so the parent's cycle and `max_depth` counters stay accurate for its remaining handoffs in the same turn.
 
+### Output singleton (trace/status) lock (PR #5219)
+
+`output="status"` and `output="trace"` route through a shared per-process singleton in `praisonaiagents.output.status` / `praisonaiagents.output.trace`. Both modules declared a `_output_lock` that, before this fix, was **never acquired**.
+
+<Note>
+**Fix reference:** [PraisonAI PR #5219](https://github.com/MervinPraison/PraisonAI/pull/5219), fixes [#5162](https://github.com/MervinPraison/PraisonAI/issues/5162).
+</Note>
+
+The lock is now actually acquired around every read-modify-write on the singleton's shared state:
+
+- the timing dicts `_llm_start_time`, `_tool_start_times`, and `_agent_start_times`,
+- the call counter `_ai_call_count`,
+- the session accumulators `_session_tokens_in`, `_session_tokens_out`, `_session_cost`, and `_session_llm_calls`.
+
+Concrete before/after: an `asyncio.gather` over two `agent.achat(...)`s used to let one agent's `llm_end` compute its duration from the *other* agent's `_llm_start_time` (or crash on `None` once the first `llm_end` reset it), and the session token summary silently under-counted because `+=` on shared counters raced. After the fix, both the per-call timings routed through the singleton and the aggregate token/cost totals stay consistent under concurrency.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+
+# Distinct names → accurate per-agent status/trace attribution (see the note below).
+writer = Agent(name="Writer", instructions="Write a blurb.", output="status")
+summarizer = Agent(name="Summarizer", instructions="Summarise notes.", output="status")
+
+async def main():
+    # The shared status singleton's metrics no longer corrupt under gather.
+    await asyncio.gather(
+        writer.achat("Blurb for the new dashboard"),
+        summarizer.achat("Summarise v2.0 release notes"),
+    )
+
+asyncio.run(main())
+```
+
+<Note>
+The fix removes the data-race corruption on the singleton — it does **not** remove the cross-agent aliasing when two concurrent tool calls share a tool name, or two default-named `Agent()` instances share the name `"Agent"`. `_tool_start_times` and `_agent_start_times` are still keyed by name only, so two concurrent `read_file` calls can still pop each other's timestamps. Give each agent a distinct `name=` for accurate per-agent status/trace attribution.
+</Note>
+
+Cross-links: [Output](/features/output#concurrent-execution-pr-5219) and [Output Styles](/features/output-styles#concurrent-execution-pr-5219).
+
 ---
 
 ## Related
@@ -878,5 +920,11 @@ Each gathered task rebinds `_handoff_chain_var` to a fresh per-task copy on entr
 </Card>
 <Card title="Rate Limiter" icon="gauge" href="/features/rate-limiter">
   Thread-safe rate limiting across agents
+</Card>
+<Card title="Output" icon="display" href="/features/output">
+  output="status" / "trace" presets and their concurrency guarantees
+</Card>
+<Card title="Import Safety (Python)" icon="shield-check" href="/features/python-import-safety">
+  Fork-safe imports and untouched host state
 </Card>
 </CardGroup>
