@@ -146,11 +146,12 @@ sequenceDiagram
 
 ## Configuration Options
 
-The three fields live on `GatewayConfig` (read from `praisonaiagents/gateway/config.py`):
+These fields live on `GatewayConfig` (read from `praisonaiagents/gateway/config.py`):
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `max_concurrent_runs` | `int` | `0` | Max concurrent inbound agent runs across all users. `0` disables the gate (legacy behaviour). |
+| `max_concurrent_runs_per_scope` | `int` | `0` | Optional per-tenant/per-scope sub-limit **within** the global ceiling. A tenant already at its sub-limit is queued/shed against its own slice even when a global slot is free, so a noisy tenant cannot starve quiet ones. `0` disables it (concurrency-only global behaviour). See [Per-tenant fairness](#per-tenant-fairness). |
 | `queue_depth` | `int` | `128` | Max number of inbound turns that can wait when at the ceiling. |
 | `overflow_policy` | `str` | `"reject"` | Behaviour when at the ceiling and the queue is full: `reject`, `queue`, or `shed_oldest`. |
 | `max_rss_mb` | `float` | `0.0` | Hard RSS ceiling in MiB for [memory-aware admission](#memory-aware-admission). `0` disables it (concurrency-only, legacy behaviour). |
@@ -169,6 +170,7 @@ bot = BotOS(
     agent=agent,
     platforms=["telegram"],
     max_concurrent_runs=32,
+    max_concurrent_runs_per_scope=4,   # per-tenant cap within the ceiling
     queue_depth=128,
     overflow_policy="reject",
 )
@@ -181,6 +183,7 @@ gateway:
   host: "127.0.0.1"
   port: 8765
   max_concurrent_runs: 32
+  max_concurrent_runs_per_scope: 4   # per-tenant cap within the ceiling
   queue_depth: 128
   overflow_policy: reject   # reject | queue | shed_oldest
 ```
@@ -194,7 +197,7 @@ praisonai gateway start \
   --overflow-policy reject
 ```
 
-CLI flags override YAML, which overrides Python defaults.
+CLI flags override YAML, which overrides Python defaults. Set `max_concurrent_runs_per_scope` via YAML or the Python surface.
 
 ---
 
@@ -236,6 +239,19 @@ bot = BotOS(
 )
 ```
 
+**Multi-tenant fair-share** — a global ceiling of 32 with a per-tenant cap of 4, so no single tenant monopolises the gateway even under a burst:
+
+```python
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram", "discord", "slack"],
+    max_concurrent_runs=32,
+    queue_depth=128,
+    overflow_policy="reject",
+    max_concurrent_runs_per_scope=4,
+)
+```
+
 ---
 
 ## Observability
@@ -246,6 +262,7 @@ bot = BotOS(
 print(bot.admission_stats)
 # {
 #   "max_concurrent_runs": 32, "queue_depth": 128,
+#   "max_concurrent_runs_per_scope": 4,   # ← per-tenant sub-limit (0 when disabled)
 #   "in_flight": 12, "queued": 3,
 #   "admitted": 1247, "rejected": 0, "shed": 0,
 #   "max_rss_mb": 0.0,   # ← memory-aware ceiling (0.0 when disabled)
@@ -409,11 +426,124 @@ bot.admission_stats
 
 ---
 
+## Per-tenant fairness
+
+Cap concurrency per tenant so a single noisy tenant can't monopolise every run slot.
+
+```mermaid
+graph LR
+    subgraph "Per-tenant fairness"
+        A[📥 Tenant A<br/>4 in-flight] --> Gate{🚦 Per-scope<br/>decide}
+        B[📥 Tenant B<br/>1 in-flight] --> Gate
+        Gate -->|A at sub-limit| Queue[⏳ Queue A]
+        Gate -->|B under sub-limit| Global{🚦 Global<br/>decide}
+        Global -->|slot free| Run[🤖 Run B]
+    end
+
+    classDef tenant fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef gate fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef queue fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,B tenant
+    class Gate,Global gate
+    class Queue queue
+    class Run agent
+```
+
+The per-scope gate runs **first** and is the tighter, per-tenant ceiling; the global ceiling still bounds aggregate concurrency second. A tenant already at `max_concurrent_runs_per_scope` is queued (or shed by the declared `overflow_policy`) against its own slice — even when the global ceiling has free slots — so its burst can never consume another tenant's capacity.
+
+<Note>
+`scope` is the caller's `session_id` at the wrapper call site — the per-tenant profile scope, mirroring the `scope` axis of [rate-limit](/features/gateway-rate-limit) and spend-budget admission. Unscoped callers (`scope=""`) fall through to the global decision, so the option is safe to enable incrementally.
+</Note>
+
+<Tabs>
+<Tab title="Python">
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import BotOS
+
+agent = Agent(name="Support", instructions="Help users")
+
+bot = BotOS(
+    agent=agent,
+    platforms=["telegram", "discord"],
+    max_concurrent_runs=32,             # global ceiling
+    max_concurrent_runs_per_scope=4,    # per-tenant cap within the ceiling
+    queue_depth=128,
+    overflow_policy="reject",
+)
+bot.start()
+```
+
+</Tab>
+<Tab title="YAML">
+
+```yaml
+gateway:
+  host: "127.0.0.1"
+  port: 8765
+  max_concurrent_runs: 32
+  max_concurrent_runs_per_scope: 4
+  queue_depth: 128
+  overflow_policy: reject
+```
+
+</Tab>
+<Tab title="CLI">
+
+```bash
+# Set the per-scope sub-limit via gateway.yaml, then start:
+praisonai gateway start --config gateway.yaml
+```
+
+</Tab>
+</Tabs>
+
+### How per-scope admission decides
+
+```mermaid
+sequenceDiagram
+    participant User as Tenant A user
+    participant Gateway
+    participant Admission
+    participant Agent
+
+    User->>Gateway: Inbound turn (session=A)
+    Gateway->>Admission: decide(scope="A", scope_in_flight=4, ...)
+    alt scope_in_flight >= max_concurrent_runs_per_scope
+        Admission-->>Gateway: QUEUE (against tenant A's slice)
+        Note right of Admission: Tenant B's slots are<br/>unaffected — fairness preserved
+    else scope_in_flight < sub-limit and global slot free
+        Admission-->>Gateway: ADMIT
+        Gateway->>Agent: Run turn
+        Agent-->>User: Reply
+    end
+```
+
+With `max_concurrent_runs=32` and `max_concurrent_runs_per_scope=4`:
+
+1. **Quiet tenant B** sends a turn — its scope has 0 in-flight, well under 4, and the global count is under 32, so the turn is **admitted immediately**.
+2. **Noisy tenant A** bursts 10 concurrent turns: the first 4 are admitted (they fill A's per-scope slice); turns 5–10 are **queued against A's slice** — even though the global ceiling still has 28 free slots.
+3. **Tenant B** sends a second turn while A's burst is queued: it is **admitted immediately**, because B's per-scope count is 1 and the global ceiling has room. No starvation.
+4. As A's in-flight turns complete, its queued turns dispatch one at a time, keeping A at most 4 concurrent.
+
+<Note>
+`max_concurrent_runs_per_scope = 0` (the default) or an empty `scope` makes the decision byte-for-byte the current global-only behaviour — no existing configuration changes. The option is fail-open.
+</Note>
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
   <Accordion title="Start with max_concurrent_runs ≈ 2× expected steady-state">
     Set `max_concurrent_runs` to roughly twice your expected concurrent-user baseline. Watch `admission_stats.rejected` — if rejections are non-zero under normal load, raise the ceiling.
+  </Accordion>
+
+  <Accordion title="Size max_concurrent_runs_per_scope for your tenant count">
+    On a multi-tenant hosted gateway, set `max_concurrent_runs_per_scope` to roughly `max_concurrent_runs / expected_active_tenants`. Rate-limit and spend-budget admission are already per-tenant; this closes the last global-only axis of the admission triad.
   </Accordion>
 
   <Accordion title="Default to overflow_policy='reject' for multi-user deployments">
@@ -434,6 +564,9 @@ bot.admission_stats
 ## Related
 
 <CardGroup cols={2}>
+  <Card title="Per-tenant fairness" icon="users" href="#per-tenant-fairness">
+    Cap concurrency per tenant so one noisy tenant can't monopolise the gateway
+  </Card>
   <Card title="Memory-aware admission" icon="memory" href="#memory-aware-admission">
     Queue under soft RSS pressure, shed under hard pressure — before the OOM killer fires
   </Card>
