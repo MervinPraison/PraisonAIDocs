@@ -540,13 +540,18 @@ test_thread_safety()
 
 ### Multi-team HTTP launch
 
-PraisonAI provides comprehensive thread-safety for HTTP server deployment:
+PraisonAI's launch server is now fully thread-safe **and** unified across `Agent.launch()`, `AgentTeam.launch()`, and `PraisonAIAgents.launch()`. All three share one process-wide `_server_registry` in `praisonaiagents/agent/server_registry.py`, so mixing them on the same port is safe.
 
 - Multiple `Agent` / `Agents` instances may call `.launch(port=N)` concurrently from different threads — registration is atomic.
 - If two launch calls use the same path on the same port, the second gets an auto-suffixed path (`/path_abc123`) and a warning is logged.
 - Server readiness is signalled deterministically (no fixed sleep); `.launch()` returns only after the port is accepting connections. The wait defaults to **5 seconds** and is configurable via the `PRAISONAI_SERVER_READY_TIMEOUT` environment variable. If the server doesn't become ready in time, `.launch()` still returns and a warning is logged — check server logs for startup errors.
+- A bind failure (`Address already in use`, missing FastAPI/uvicorn) clears the port's `_started` flag so a later `.launch()` call re-attempts the bind. The launcher returns the true bound state, so callers can distinguish a live server from a poisoned port.
 - `aworkflow()` state lock is created inside the running async context, so workflows remain stable when invoked under pytest-asyncio or when nested inside another loop.
 - Per-turn tool tracking (`_turn_tools_used`) is now protected by the same lock that guards `chat_history`, so concurrent `chat()` / `achat()` turns on one `Agent` no longer corrupt hook or self-improve tool data. No new public API — the buffer stays private; the read/append helpers were made async-safe internally.
+
+<Note>
+**Fix reference:** [PraisonAI PR #5204](https://github.com/MervinPraison/PraisonAI/pull/5204) unified the launch registry across `Agent.launch()` and `AgentTeam.launch()` and replaced `Agent.launch()`'s heuristic sleeps with the shared readiness `Event`.
+</Note>
 
 ```python
 import threading
@@ -761,6 +766,40 @@ graph LR
 ```
 
 Under 10-thread concurrency, loaders can no longer double-run or be skipped mid-iteration. Reference: [PR #2738](https://github.com/MervinPraison/PraisonAI/pull/2738).
+
+### PluginManager (PR #5204)
+
+`PluginManager`'s "thread-safe for concurrent access" contract is now fully honoured. Every method that iterates or mutates `_plugins` / `_enabled` acquires the same `RLock`:
+
+| Method | Lock behaviour |
+|---|---|
+| `register()` | already held the lock — unchanged |
+| `unregister()` | now holds the lock while mutating; plugin `on_shutdown()` runs outside |
+| `enable()` / `disable()` | now hold the lock while mutating |
+| `execute_hook()` | snapshots `(name, plugin)` pairs under the lock, then dispatches outside |
+
+Concurrent `register()` / `unregister()` on one thread and `execute_hook()` on another can no longer raise `RuntimeError: dictionary changed size during iteration`. Because `_lock` is an `RLock`, a plugin whose `on_shutdown()` re-enters the manager (e.g. via `shutdown()`) is safe.
+
+```mermaid
+graph LR
+    T1[register / unregister thread] --> L[🔒 RLock]
+    T2[execute_hook thread] --> L
+    L --> SNAP[📸 snapshot enabled pairs]
+    SNAP --> D[▶️ dispatch outside lock]
+    D --> OK[✅ no dictionary-changed-size error]
+
+    classDef caller fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef lock fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef snap fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class T1,T2 caller
+    class L lock
+    class SNAP,D snap
+    class OK ok
+```
+
+Fix reference: [PraisonAI PR #5204](https://github.com/MervinPraison/PraisonAI/pull/5204).
 
 ### Multi-agent context safety (PR #1723)
 
