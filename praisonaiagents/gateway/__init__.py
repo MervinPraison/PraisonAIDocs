@@ -37,6 +37,8 @@ _LAZY_IMPORTS = {
     "GATEWAY_METHODS": ("praisonaiagents.gateway.protocols", "GATEWAY_METHODS"),
     "register_gateway_method": ("praisonaiagents.gateway.protocols", "register_gateway_method"),
     "resolve_required_scope": ("praisonaiagents.gateway.protocols", "resolve_required_scope"),
+    "authorize_method": ("praisonaiagents.gateway.protocols", "authorize_method"),
+    "GatewayUnauthorized": ("praisonaiagents.gateway.protocols", "GatewayUnauthorized"),
     # Config hot-reload observability (Issue #3049)
     "ReloadStatus": ("praisonaiagents.gateway.protocols", "ReloadStatus"),
     "compute_config_revision": ("praisonaiagents.gateway.protocols", "compute_config_revision"),
@@ -207,6 +209,9 @@ _LAZY_IMPORTS = {
     "ConnectRecoveryStep": ("praisonaiagents.gateway.protocols", "ConnectRecoveryStep"),
     "is_recoverable": ("praisonaiagents.gateway.protocols", "is_recoverable"),
     "MessageParams": ("praisonaiagents.gateway.protocols", "MessageParams"),
+    # First-class attachment contract (Issue #5207)
+    "AttachmentRef": ("praisonaiagents.gateway.protocols", "AttachmentRef"),
+    "AttachmentStoreProtocol": ("praisonaiagents.gateway.protocols", "AttachmentStoreProtocol"),
     "LeaveParams": ("praisonaiagents.gateway.protocols", "LeaveParams"),
     "JoinParams": ("praisonaiagents.gateway.protocols", "JoinParams"),
     "FrameDecodeError": ("praisonaiagents.gateway.protocols", "FrameDecodeError"),
@@ -244,6 +249,8 @@ _LAZY_IMPORTS = {
     "SessionConfig": ("praisonaiagents.gateway.config", "SessionConfig"),
     "ApiConfig": ("praisonaiagents.gateway.config", "ApiConfig"),
     "EmergencyStopConfig": ("praisonaiagents.gateway.config", "EmergencyStopConfig"),
+    # Attachment ceilings config (Issue #5207)
+    "AttachmentConfig": ("praisonaiagents.gateway.config", "AttachmentConfig"),
     "ChannelRouteConfig": ("praisonaiagents.gateway.config", "ChannelRouteConfig"),
     "MultiChannelGatewayConfig": ("praisonaiagents.gateway.config", "MultiChannelGatewayConfig"),
     # Config version stamp + doctor-driven migration (Issue #3841)
@@ -268,6 +275,12 @@ _LAZY_IMPORTS = {
     # Reload scope classification (Issue #3440)
     "ReloadScope": ("praisonaiagents.gateway.config", "ReloadScope"),
     "classify_reload": ("praisonaiagents.gateway.config", "classify_reload"),
+    # Candidate validation + rollback contract (Issue #5144)
+    "CandidateReport": ("praisonaiagents.gateway.config", "CandidateReport"),
+    "ReloadValidationProtocol": (
+        "praisonaiagents.gateway.config",
+        "ReloadValidationProtocol",
+    ),
 }
 
 # Lazy loading cache (shared with wrapper-backed implementations below)
@@ -362,6 +375,8 @@ __all__ = [
     "GATEWAY_METHODS",
     "register_gateway_method",
     "resolve_required_scope",
+    "authorize_method",
+    "GatewayUnauthorized",
     # Config hot-reload observability (Issue #3049)
     "ReloadStatus",
     "compute_config_revision",
@@ -524,6 +539,9 @@ __all__ = [
     "ConnectRecoveryStep",
     "is_recoverable",
     "MessageParams",
+    # First-class attachment contract (Issue #5207)
+    "AttachmentRef",
+    "AttachmentStoreProtocol",
     "LeaveParams",
     "JoinParams",
     "FrameDecodeError",
@@ -561,6 +579,8 @@ __all__ = [
     "SessionConfig",
     "ApiConfig",
     "EmergencyStopConfig",
+    # Attachment ceilings config (Issue #5207)
+    "AttachmentConfig",
     "ChannelRouteConfig",
     "MultiChannelGatewayConfig",
     # Config version stamp + doctor-driven migration (Issue #3841)
@@ -583,6 +603,8 @@ __all__ = [
     "is_hot_appliable",
     "ReloadScope",
     "classify_reload",
+    "CandidateReport",
+    "ReloadValidationProtocol",
     # Implementations (lazy loaded from praisonai wrapper)
     "WebSocketGateway",
     "GatewaySession",

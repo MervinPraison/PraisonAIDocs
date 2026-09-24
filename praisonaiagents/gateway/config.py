@@ -297,6 +297,74 @@ class SupportsHotReload(Protocol):
         ...
 
 
+# ---------------------------------------------------------------------------
+# Candidate reload validation + rollback contract (Issue #5144)
+# ---------------------------------------------------------------------------
+#
+# ``classify_reload``/``ReloadScope`` decide *what* a config change touches; a
+# structural (``FULL``) change makes the runtime tear the live channels down
+# and bring the new config up. A config that passes the schema but fails at
+# *runtime* (unreachable model, an adapter that throws on load, bad wiring) is
+# not caught before that cutover, and there is no rollback — a single bad edit
+# can take a healthy always-on gateway offline.
+#
+# This is the small, canonical contract that makes a reload an *atomic,
+# validated cutover*: build/boot the candidate runtime in isolation and run the
+# existing readiness/turn pre-flight *before* the live one is withdrawn; only
+# swap when the candidate is proven healthy, otherwise keep the old config
+# serving. Core owns only the *shape* (a report + a protocol, no heavy
+# imports); the wrapper/bot gateway performs the concrete build+pre-flight.
+
+
+@dataclass
+class CandidateReport:
+    """Outcome of validating a candidate config *before* cutover.
+
+    Produced by :meth:`ReloadValidationProtocol.validate_candidate`: the
+    gateway builds/boots the candidate runtime in isolation (or a pre-flight)
+    and reports whether it is healthy enough to swap in. When ``ok`` is False
+    the live config keeps serving and the failures feed
+    :class:`~praisonaiagents.gateway.protocols.ReloadStatus.error` / ``health()``.
+
+    Attributes:
+        ok: Whether the candidate built and passed pre-flight — only then may
+            the live runtime be drained and the candidate swapped in.
+        failures: Human-readable reasons the candidate was rejected (empty when
+            ``ok``); joined into the reload ``error`` an operator sees.
+        candidate: Optional opaque handle to the already-built candidate runtime
+            the wrapper activates on success. Left untyped so core carries no
+            heavy runtime import; ``None`` when the runtime validates in place.
+    """
+
+    ok: bool
+    failures: "List[str]" = field(default_factory=list)
+    candidate: Optional[Any] = None
+
+
+@runtime_checkable
+class ReloadValidationProtocol(Protocol):
+    """Protocol a gateway implements for atomic, validated config cutover.
+
+    The invariant: **never drain the live runtime until**
+    :meth:`validate_candidate` **returns a report with** ``ok=True``. Owning
+    this contract in core keeps the "never cut over to an unvalidated
+    candidate" guarantee canonical so every gateway build honours it, rather
+    than being re-implemented per entry point (SIGHUP, ``gateway reload``,
+    ``gateway restart``).
+    """
+
+    async def validate_candidate(
+        self, new_config: Mapping[str, Any]
+    ) -> CandidateReport:
+        """Build/boot the candidate from ``new_config`` and pre-flight it.
+
+        Must not stop or mutate the live runtime; on any failure return a
+        report with ``ok=False`` and the reason(s) so the caller keeps the
+        previous config serving.
+        """
+        ...
+
+
 @dataclass
 class SessionConfig:
     """Configuration for gateway sessions.
@@ -776,6 +844,96 @@ class EmergencyStopConfig:
 
 
 @dataclass
+class AttachmentConfig:
+    """Attachment/media ceilings for the gateway wire protocol (Issue #5207).
+
+    The gateway is the control plane custom ``/ws`` clients build on, but the
+    ``message`` frame had no attachment contract and no per-attachment size/type
+    policy — only the whole-frame ``max_payload``. These ceilings are advertised
+    to clients in the ``hello`` handshake (folded into ``HelloResult.policy``) so
+    a well-behaved client self-limits — inlining small files, chunking larger
+    ones at ``chunk_bytes`` — instead of discovering the limit by being
+    disconnected. All fields are advisory limits; enforcement lives wherever the
+    gateway materialises attachments (a wrapper/bot concern).
+
+    Backward-compatible: attachments are opt-in per turn, and a client that
+    never sends one is unaffected by these values.
+
+    Attributes:
+        max_attachment_bytes: Largest single attachment (inline or stored) the
+            gateway accepts, in bytes. Default 10 MiB.
+        max_attachments: Maximum number of attachments on one ``message`` turn.
+        chunk_bytes: Advertised chunk size a client should use when streaming a
+            large file into the attachment store (reserve → put chunk → close).
+        allowed_types: Optional allow-list of MIME types / prefixes (e.g.
+            ``image/`` or ``application/pdf``). Empty (default) means no type
+            restriction is advertised.
+    """
+
+    max_attachment_bytes: int = 10 * 1024 * 1024  # 10 MiB
+    max_attachments: int = 10
+    chunk_bytes: int = 256 * 1024  # 256 KiB
+    allowed_types: List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.max_attachment_bytes < 0:
+            raise ValueError(
+                "max_attachment_bytes must be >= 0 (use 0 to disable attachments)"
+            )
+        if self.max_attachments < 0:
+            raise ValueError("max_attachments must be >= 0")
+        if self.chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be > 0")
+
+    @property
+    def enabled(self) -> bool:
+        """Whether the gateway advertises any attachment capacity."""
+        return self.max_attachment_bytes > 0 and self.max_attachments > 0
+
+    def to_policy(self) -> Dict[str, Any]:
+        """Build the policy fragment advertised in ``HelloResult.policy``.
+
+        Only advertises the attachment ceilings when enabled, so a gateway with
+        attachments disabled advertises exactly today's policy shape. The type
+        allow-list is included only when configured.
+        """
+        if not self.enabled:
+            return {}
+        policy: Dict[str, Any] = {
+            "max_attachment_bytes": self.max_attachment_bytes,
+            "max_attachments": self.max_attachments,
+            "chunk_bytes": self.chunk_bytes,
+        }
+        if self.allowed_types:
+            policy["allowed_attachment_types"] = list(self.allowed_types)
+        return policy
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "max_attachment_bytes": self.max_attachment_bytes,
+            "max_attachments": self.max_attachments,
+            "chunk_bytes": self.chunk_bytes,
+            "allowed_types": list(self.allowed_types),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "AttachmentConfig":
+        """Create from a parsed ``gateway.attachments`` mapping (tolerant of None)."""
+        if not isinstance(data, dict):
+            return cls()
+        allowed = data.get("allowed_types")
+        return cls(
+            max_attachment_bytes=int(
+                data.get("max_attachment_bytes", 10 * 1024 * 1024)
+            ),
+            max_attachments=int(data.get("max_attachments", 10)),
+            chunk_bytes=int(data.get("chunk_bytes", 256 * 1024)),
+            allowed_types=[str(t) for t in allowed] if isinstance(allowed, (list, tuple)) else [],
+        )
+
+
+@dataclass
 class GatewayConfig:
     """Configuration for the gateway server.
     
@@ -830,6 +988,10 @@ class GatewayConfig:
     max_concurrent_runs: int = 0  # Aggregate concurrency ceiling (0 = unlimited)
     queue_depth: int = 0  # Bounded wait queue when at the ceiling
     overflow_policy: str = "reject"  # reject | queue | shed_oldest
+    # Issue #5168: per-tenant/per-scope concurrency sub-limit within the global
+    # ceiling so one tenant cannot occupy every run slot. 0 disables the
+    # sub-limit (today's global-only behaviour).
+    max_concurrent_runs_per_scope: int = 0
     # Issue #2620: pre-auth edge protections for internet-exposed deployments.
     # Cap concurrent *unauthenticated* WebSocket connections per source IP so a
     # hostile client cannot park many half-open sockets up to max_connections
@@ -858,6 +1020,12 @@ class GatewayConfig:
     control: "EmergencyStopConfig" = field(
         default_factory=lambda: EmergencyStopConfig()
     )
+    # Issue #5207: first-class attachment ceilings for the gateway wire
+    # protocol, advertised to clients via HelloResult.policy so a custom /ws
+    # client can self-limit/chunk before sending a file. Defaults keep a
+    # sensible 10 MiB / 10-file / 256 KiB-chunk policy; attachments remain
+    # opt-in per turn so a client that never sends one is unaffected.
+    attachments: "AttachmentConfig" = field(default_factory=lambda: AttachmentConfig())
     # Issue #4766: per-session turn-execution seam. Selects *where* a session's
     # agent turn runs (see ``TurnExecutorProtocol``). ``None`` (the default)
     # resolves to ``InProcessTurnExecutor`` at runtime — today's on-loop
@@ -898,6 +1066,11 @@ class GatewayConfig:
         if self.overflow_policy not in ("reject", "queue", "shed_oldest"):
             raise ValueError(
                 "overflow_policy must be one of 'reject', 'queue', 'shed_oldest'"
+            )
+        if self.max_concurrent_runs_per_scope < 0:
+            raise ValueError(
+                "max_concurrent_runs_per_scope must be >= 0 "
+                "(use 0 to disable the per-scope sub-limit)"
             )
         if self.preauth_max_connections_per_ip < 0:
             raise ValueError(
@@ -981,6 +1154,7 @@ class GatewayConfig:
             "max_concurrent_runs": self.max_concurrent_runs,
             "queue_depth": self.queue_depth,
             "overflow_policy": self.overflow_policy,
+            "max_concurrent_runs_per_scope": self.max_concurrent_runs_per_scope,
             "preauth_max_connections_per_ip": self.preauth_max_connections_per_ip,
             "max_unauthorized_frames": self.max_unauthorized_frames,
             "push": self.push.to_dict(),
@@ -989,6 +1163,7 @@ class GatewayConfig:
             "liveness": self.liveness.to_dict(),
             "turn_lock": self.turn_lock.to_dict(),
             "control": self.control.to_dict(),
+            "attachments": self.attachments.to_dict(),
             # Report the active executor type so ``gateway doctor`` can surface
             # it; ``None`` means the in-process default (today's behaviour).
             "executor": (
@@ -1177,6 +1352,9 @@ class MultiChannelGatewayConfig:
             max_concurrent_runs=int(gw_data.get("max_concurrent_runs", 0) or 0),
             queue_depth=int(gw_data.get("queue_depth", 0) or 0),
             overflow_policy=str(gw_data.get("overflow_policy", "reject") or "reject"),
+            max_concurrent_runs_per_scope=int(
+                gw_data.get("max_concurrent_runs_per_scope", 0) or 0
+            ),
             preauth_max_connections_per_ip=int(
                 gw_data.get("preauth_max_connections_per_ip", 32)
             ),
@@ -1188,6 +1366,7 @@ class MultiChannelGatewayConfig:
             liveness=LivenessConfig.from_dict(gw_data.get("liveness")),
             turn_lock=TurnLockConfig.from_dict(gw_data.get("turn_lock")),
             control=EmergencyStopConfig.from_dict(gw_data.get("control")),
+            attachments=AttachmentConfig.from_dict(gw_data.get("attachments")),
         )
         
         # Parse agents section (pass through as dicts)

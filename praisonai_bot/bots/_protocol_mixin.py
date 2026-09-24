@@ -452,6 +452,18 @@ class MessageHookMixin:
         content = getattr(message, 'content', '')
         if not isinstance(content, str):
             content = str(content)
+        # Resolved reply/quote context (Issue #5223) must pass through the same
+        # inbound gate as ordinary content: a redaction/deny hook has to be able
+        # to inspect (and veto) quoted text too, otherwise quoted secrets or
+        # blocked text bypass the hook and reach the agent. Expose the fully
+        # rendered turn (content + quoted block) to the hook as ``content``.
+        quoted = getattr(message, 'quoted', None)
+        has_quote = bool(quoted is not None and getattr(quoted, 'text', '').strip())
+        hook_content = (
+            message.prompt_text
+            if has_quote and hasattr(message, 'prompt_text')
+            else content
+        )
         result: Dict[str, Any] = {"content": content, "drop": False}
         runner = self._get_hook_runner()
         if runner is None:
@@ -471,7 +483,7 @@ class MessageHookMixin:
                 timestamp=str(time.time()),
                 agent_name=getattr(getattr(self, '_agent', None), 'agent_name', 'bot'),
                 platform=platform,
-                content=content,
+                content=hook_content,
                 sender_id=getattr(sender, 'user_id', '') if sender else '',
                 channel_id=getattr(channel, 'channel_id', '') if channel else '',
                 channel_type=getattr(channel, 'channel_type', '') if channel else '',
@@ -491,6 +503,15 @@ class MessageHookMixin:
                     message.content = new_content
                 except Exception:
                     pass
+                # The hook was shown the rendered turn (content + quoted block)
+                # and rewrote it, so the returned text is now authoritative for
+                # the whole turn. Drop the separately-resolved quoted ref to
+                # avoid re-appending unredacted quoted text after the hook ran.
+                if has_quote:
+                    try:
+                        message.quoted = None
+                    except Exception:
+                        pass
         except Exception as e:
             logger.debug(f"MESSAGE_RECEIVED hook error (non-fatal): {e}")
         return result
@@ -640,6 +661,72 @@ class MessageHookMixin:
             runner.execute_sync(HookEvent.MESSAGE_SENT, event_input)
         except Exception as e:
             logger.debug(f"MESSAGE_SENT hook error (non-fatal): {e}")
+
+    @staticmethod
+    def _platform_event_hook(kind: str) -> Any:
+        """Map a normalised ``PlatformEvent.kind`` onto the HookEvent it fires.
+
+        Reaction add/remove both fire ``REACTION_RECEIVED`` (the ``kind`` field
+        on the payload disambiguates); the rest are 1:1. Referencing each
+        member explicitly (not via ``getattr``) keeps them visible to the
+        dead-hook-event ratchet that greps for real emission sites.
+        """
+        from praisonaiagents.hooks.types import HookEvent
+
+        return {
+            "reaction_added": HookEvent.REACTION_RECEIVED,
+            "reaction_removed": HookEvent.REACTION_RECEIVED,
+            "message_edited": HookEvent.MESSAGE_EDITED,
+            "message_deleted": HookEvent.MESSAGE_DELETED,
+            "member_joined": HookEvent.MEMBER_JOINED,
+            "member_left": HookEvent.MEMBER_LEFT,
+            "thread_created": HookEvent.THREAD_CREATED,
+        }.get(kind)
+
+    def fire_platform_event(self, event: Any) -> None:
+        """Fire the hook for a normalised inbound :class:`PlatformEvent`.
+
+        The single DRY emission site every adapter calls after translating a
+        native SDK event (reaction/edit/delete/membership/thread) into a
+        core ``PlatformEvent``. Routes to the matching ``HookEvent`` so an
+        agent, guardrail or plugin can subscribe uniformly across platforms
+        (Issue #5161). Best-effort and non-fatal — a hook error never breaks
+        the adapter's event loop, and when no hook runner is present this is a
+        cheap no-op (zero overhead unless a hook is registered).
+
+        Args:
+            event: A :class:`~praisonaiagents.bots.protocols.PlatformEvent`.
+        """
+        runner = self._get_hook_runner()
+        if runner is None:
+            return
+        try:
+            from praisonaiagents.hooks.events import PlatformEventInput
+
+            kind = getattr(event, 'kind', '') or ''
+            hook_event = self._platform_event_hook(kind)
+            if hook_event is None:
+                logger.debug("Unknown PlatformEvent.kind %r; not emitting", kind)
+                return
+
+            event_input = PlatformEventInput(
+                session_id="",
+                cwd=os.getcwd(),
+                event_name=hook_event,
+                timestamp=str(time.time()),
+                agent_name=getattr(getattr(self, '_agent', None), 'agent_name', 'bot'),
+                kind=kind,
+                platform=getattr(event, 'platform', getattr(self, 'platform', 'unknown')),
+                chat_id=getattr(event, 'chat_id', ''),
+                user_id=getattr(event, 'user_id', ''),
+                message_id=getattr(event, 'message_id', None),
+                emoji=getattr(event, 'emoji', None),
+                new_text=getattr(event, 'new_text', None),
+                thread_id=getattr(event, 'thread_id', None),
+            )
+            _emit(runner, hook_event, event_input)
+        except Exception as e:  # noqa: BLE001 — hooks must never break the loop
+            logger.debug(f"platform-event hook error (non-fatal): {e}")
 
 
 def _resolve_runner_from_agent(agent: Any) -> Any:

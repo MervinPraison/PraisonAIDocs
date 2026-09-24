@@ -10,7 +10,69 @@ and integrates with Gap 2 (parallel tool execution).
 
 from ..protocols import LLMProviderAdapterProtocol
 import json
+import logging
+import re
 from typing import Dict, Any, List, Optional
+
+_logger = logging.getLogger(__name__)
+
+
+def resolve_ollama_chained_arguments(
+    arguments: Dict[str, Any],
+    tool_result_mapping: Dict[str, Any],
+    *,
+    correlation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve exact Ollama function-name references without coercing values.
+
+    Weak local models sometimes emit the name of an earlier function as a
+    later argument.  Keep the complete result (including mappings, lists,
+    negative numbers, and decimals) so the destination tool receives exactly
+    what the first tool returned.
+    """
+    if not tool_result_mapping:
+        return arguments
+    resolved = dict(arguments)
+    for arg_name, arg_value in resolved.items():
+        if isinstance(arg_value, str) and arg_value in tool_result_mapping:
+            replacement = tool_result_mapping[arg_value]
+            resolved[arg_name] = replacement
+            extra = {"correlation_id": correlation_id} if correlation_id else {}
+            _logger.debug(
+                "[OLLAMA_FIX] Replaced %s with a prior result in %s arguments",
+                arg_value,
+                arg_name,
+                extra=extra,
+            )
+    return resolved
+
+
+def record_ollama_tool_result(
+    tool_result_mapping: Dict[str, Any],
+    function_name: str,
+    tool_result: Any,
+) -> None:
+    """Record an Ollama tool result exactly as returned by the callback."""
+    if not function_name:
+        return
+    # Some execution paths return a ToolResult-like object rather than the
+    # callback's raw payload.  Never expose its failure diagnostic as a
+    # successful same-turn value.
+    if getattr(tool_result, "error", None) is not None:
+        return
+    # The agent executor represents failures as an ``error`` mapping (or a
+    # one-item list containing one). Never feed that diagnostic back as a
+    # successful value to a dependent call in the same turn.
+    if isinstance(tool_result, dict) and tool_result.get("error"):
+        return
+    if (
+        isinstance(tool_result, list)
+        and tool_result
+        and isinstance(tool_result[0], dict)
+        and tool_result[0].get("error")
+    ):
+        return
+    tool_result_mapping[function_name] = tool_result
 
 
 def collapse_union_param_types(tools):
@@ -55,42 +117,146 @@ def collapse_union_param_types(tools):
     return [fix(tool) for tool in tools]
 
 
+def _advertised_tool_names(tools: List[Dict[str, Any]]) -> set:
+    """The set of tool names the model was actually offered.
+
+    Salvage must never invent a tool: a text-format call is only promoted when
+    its name matches something advertised, so a model hallucinating a plausible
+    name in prose cannot trigger an unexpected execution.
+    """
+    names = set()
+    for tool in tools or []:
+        if isinstance(tool, dict):
+            name = tool.get("function", {}).get("name") or tool.get("name")
+            if name:
+                names.add(name)
+    return names
+
+
+_FENCE_RE = re.compile(
+    r"(?P<fence>`{3,}|~{3,})"   # opening fence: >=3 backticks or tildes
+    r"[\s\S]*?"                  # body (lazy)
+    r"(?:(?P=fence)|\Z)",       # matching closing fence OR end-of-string
+    re.MULTILINE,
+)
+
+
+def _mask_protected_ranges(text: str) -> str:
+    """Blank out fenced code blocks so a call *shown* as an example is not run.
+
+    Only the span content is replaced (with spaces of equal length) -- offsets
+    are preserved, so nothing outside a fence shifts. Legitimate prose that
+    merely contains angle brackets is untouched because it is not a tool-call
+    dialect; the fence guard specifically protects documentation of a call.
+
+    Both Markdown fence styles are recognised (``` and ~~~), and an *unclosed*
+    fence is treated as running to end-of-text: a truncated example that opens
+    a fence and names a real tool must not slip through as an executable call.
+    """
+    def blank(match):
+        return " " * len(match.group(0))
+    return _FENCE_RE.sub(blank, text)
+
+
+def _make_tool_call(name: str, arguments: Any, seed: str, idx: int) -> Dict[str, Any]:
+    return {
+        "id": f"call_{name}_{idx}_{hash(seed) % 10000}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json.dumps(arguments) if isinstance(arguments, (dict, list)) else str(arguments),
+        },
+    }
+
+
+# <tool_call>{"name": ..., "arguments": ...}</tool_call>
+_TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>", re.IGNORECASE)
+# <function=name>{...}</function>
+_FUNCTION_TAG_RE = re.compile(r"<function=([a-zA-Z0-9_\-]+)>\s*(\{[\s\S]*?\})\s*</function>", re.IGNORECASE)
+
+
 def _recover_json_tool_calls(response_text: str, tools: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-    """Recover a tool call a local model emitted as JSON text.
+    """Salvage a tool call a local model emitted as text instead of natively.
 
     Shared by every locally-served engine: small models routinely answer with
     the call as content instead of using the tool_calls field. Deliberately NOT
     on DefaultAdapter -- a hosted model returning JSON prose must never have it
     parsed as a tool call.
+
+    Three dialects are recovered, in-process, with no extra LLM round trip:
+      1. the whole content is a JSON object/array of ``{"name", "arguments"}``;
+      2. one or more ``<tool_call>{...}</tool_call>`` blocks embedded in prose;
+      3. one or more ``<function=name>{...}</function>`` blocks embedded in prose.
+
+    Every recovered name is checked against the advertised tool allowlist so a
+    call is never invented, and fenced code blocks are masked first so a call
+    shown as a documentation example is never executed.
     """
     if not response_text or not tools:
         return None
-    
+
+    allowed = _advertised_tool_names(tools)
+    if not allowed:
+        return None
+
+    # Fast path: a clean full-content JSON payload (the common case, unchanged).
     try:
-        import json
         response_json = json.loads(response_text.strip())
-        
-        # Normalize to list so both single and multi-tool payloads are supported
         if isinstance(response_json, dict):
             response_json = [response_json]
-
         if isinstance(response_json, list):
             tool_calls: List[Dict[str, Any]] = []
             for idx, tool_json in enumerate(response_json):
-                if isinstance(tool_json, dict) and "name" in tool_json:
-                    tool_calls.append({
-                        "id": f"call_{tool_json['name']}_{idx}_{hash(response_text) % 10000}",
-                        "type": "function",
-                        "function": {
-                            "name": tool_json["name"],
-                            "arguments": json.dumps(tool_json.get("arguments", {}))
-                        }
-                    })
-            return tool_calls if tool_calls else None
+                if isinstance(tool_json, dict) and tool_json.get("name") in allowed:
+                    tool_calls.append(_make_tool_call(
+                        tool_json["name"], tool_json.get("arguments", {}), response_text, idx))
+            if tool_calls:
+                return tool_calls
     except (json.JSONDecodeError, TypeError, KeyError):
         pass
-    
-    return None
+
+    # Embedded dialects: only scan when a marker is present, and only outside
+    # fenced code so an example call in documentation is never run. The marker
+    # probe is case-insensitive to match the tag regexes -- a model that emits
+    # <TOOL_CALL> or <FUNCTION=...> must recover just like the lowercase form.
+    lowered = response_text.lower()
+    if not any(marker in lowered for marker in ("<tool_call>", "<function=")):
+        return None
+
+    scan_text = _mask_protected_ranges(response_text)
+
+    # Scan both dialects in a single pass ordered by position in the text, so a
+    # model that interleaves <tool_call> and <function=> blocks yields calls in
+    # the order it actually wrote them -- a dependent or side-effecting call is
+    # never reordered ahead of one it relies on.
+    matches = []
+    for match in _TOOL_CALL_TAG_RE.finditer(scan_text):
+        try:
+            data = json.loads(match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(data, dict):
+            name = data.get("name") or data.get("tool")
+            if name in allowed:
+                args = data.get("arguments", data.get("parameters", {}))
+                matches.append((match.start(), name, args))
+
+    for match in _FUNCTION_TAG_RE.finditer(scan_text):
+        name = match.group(1)
+        if name in allowed:
+            try:
+                args = json.loads(match.group(2))
+            except (json.JSONDecodeError, TypeError):
+                continue
+            matches.append((match.start(), name, args))
+
+    matches.sort(key=lambda m: m[0])
+    salvaged = [
+        _make_tool_call(name, args, response_text, idx)
+        for idx, (_, name, args) in enumerate(matches)
+    ]
+
+    return salvaged if salvaged else None
 
 
 class DefaultAdapter:
@@ -99,6 +265,25 @@ class DefaultAdapter:
     def format_tools(self, tools):
         """Hosted providers get the schema untouched -- they support all of it."""
         return tools
+
+    def resolve_chained_arguments(
+        self,
+        arguments: Dict[str, Any],
+        tool_result_mapping: Dict[str, Any],
+        *,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Provider hook for same-turn tool-result references."""
+        return arguments
+
+    def record_tool_result(
+        self,
+        tool_result_mapping: Dict[str, Any],
+        function_name: str,
+        tool_result: Any,
+    ) -> None:
+        """Provider hook for recording results used by later tool calls."""
+        return None
 
     def supports_prompt_caching(self) -> bool:
         return False
@@ -178,6 +363,25 @@ class OllamaAdapter(DefaultAdapter):
     def supports_streaming_with_tools(self) -> bool:
         # Ollama doesn't reliably support streaming with tools
         return False
+
+    def resolve_chained_arguments(
+        self,
+        arguments: Dict[str, Any],
+        tool_result_mapping: Dict[str, Any],
+        *,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return resolve_ollama_chained_arguments(
+            arguments, tool_result_mapping, correlation_id=correlation_id
+        )
+
+    def record_tool_result(
+        self,
+        tool_result_mapping: Dict[str, Any],
+        function_name: str,
+        tool_result: Any,
+    ) -> None:
+        record_ollama_tool_result(tool_result_mapping, function_name, tool_result)
     
     
     

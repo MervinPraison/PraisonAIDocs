@@ -86,8 +86,12 @@ def _normalize_yaml_config(config: dict) -> dict:
 
     tasks = config.get("tasks")
     if isinstance(tasks, list):
-        bucket_from_roles = "roles" in config
-        bucket = config.get("roles") or config.get("agents") or {}
+        # An empty ``roles: {}`` must behave like a missing one, otherwise the
+        # grafted bucket (below) is never merged back and the run silently ends
+        # with zero agents.
+        existing_roles = config.get("roles") if isinstance(config.get("roles"), dict) else None
+        bucket_from_roles = bool(existing_roles)
+        bucket = existing_roles or config.get("agents") or {}
         if not isinstance(bucket, dict):
             bucket = {}
         for i, task in enumerate(tasks):
@@ -116,8 +120,10 @@ def _normalize_yaml_config(config: dict) -> dict:
             entry[task_name] = {
                 k: v for k, v in task.items() if k != "agent"
             }
+        # Always merge the grafted bucket back into ``roles`` so an initially
+        # empty ``roles: {}`` never leaves the run with zero agents.
         if not bucket_from_roles and bucket:
-            config["roles"] = {k: v for k, v in bucket.items()}
+            config["roles"] = {**(existing_roles or {}), **bucket}
         config.pop("tasks", None)
 
     return config
@@ -729,8 +735,22 @@ class AgentsGenerator:
                 break
 
         # Handle agent-level overrides using unified approach
-        agent_level_fields = ['tool_timeout', 'tool_retry_policy', 'planning_tools', 'autonomy', 'planning', 'web', 'web_fetch']
-        agent_overrides = {k: v for k, v in cli_config.items() if k in agent_level_fields}
+        agent_level_fields = ['tool_timeout', 'tool_retry_policy', 'planning_tools', 'autonomy', 'planning', 'web', 'web_fetch', 'max_tokens']
+        agent_overrides = {}
+        for key in agent_level_fields:
+            if key not in cli_config:
+                continue
+            # The legacy parser always supplies 16000, even when the user did
+            # not pass --max-tokens. Do not let that default overwrite a
+            # per-agent or nested YAML budget; only a marked explicit value or
+            # a non-default value is a real CLI override.
+            if (
+                key == 'max_tokens'
+                and not cli_config.get('_max_tokens_explicit')
+                and cli_config[key] == 16000
+            ):
+                continue
+            agent_overrides[key] = cli_config[key]
 
         if "tool_retry_policy" in agent_overrides:
             policy = agent_overrides["tool_retry_policy"]
@@ -819,7 +839,9 @@ class AgentsGenerator:
         selection, and adapter resolution. Used by BOTH sync and async.
         """
         # Canonical format conversion: 'agents' -> 'roles', 'instructions' -> 'backstory'
-        if 'agents' in config and 'roles' not in config:
+        # Treat an empty ``roles: {}`` the same as a missing one so populated
+        # ``agents:`` is still promoted instead of running with zero agents.
+        if 'agents' in config and not config.get('roles'):
             config['roles'] = {}
             for agent_name, agent_config in config['agents'].items():
                 role_config = dict(agent_config) if agent_config else {}
@@ -1435,6 +1457,7 @@ class AgentsGenerator:
         config = await self._aload_config()
         import asyncio
         from .observability.hooks import observability_session
+        from ._async_bridge import async_scoped_bridge
         if self._is_workflow_yaml(config):
             # Bracket the async workflow run in the same observability session
             # the sequential/hierarchical path uses so AgentOps init/finalize
@@ -1445,8 +1468,15 @@ class AgentsGenerator:
             workflow_label = self._adapter_registry.resolve_or_default(
                 self.framework or config.get('framework')
             ).lower()
+            # Isolate sync→async fan-out (tools, delivery router, blueprint
+            # dispatch) onto this run's own loop+thread, matching the sync path
+            # so a stuck coroutine in one tenant does not park the shared default
+            # bridge for the rest. ``async_scoped_bridge`` tears the per-run
+            # bridge down off-loop so scope exit never parks the event loop for
+            # other tenants.
             with observability_session(workflow_label):
-                return await self._arun_yaml_workflow(config)
+                async with async_scoped_bridge():
+                    return await self._arun_yaml_workflow(config)
 
         # Use shared preparation logic (off the event loop to avoid blocking imports)
         prep = await self._aprepare_for_run(config)
@@ -1455,20 +1485,27 @@ class AgentsGenerator:
         self.logger.info(f"Using framework: {prep['adapter'].name}")
         # Own the observability lifecycle here so init and finalize are always
         # paired for every adapter (the CM finalizes on success and error alike).
+        # Isolate this run's sync→async work (adapter internals, tools, delivery
+        # router and blueprint dispatch call run_sync) onto its own loop+thread,
+        # matching generate_crew_and_kickoff, so a stuck coroutine in one
+        # agent/tenant does not park the shared default loop for the rest.
+        # ``async_scoped_bridge`` tears the per-run bridge down off-loop so scope
+        # exit never parks the event loop for other tenants.
         with observability_session(prep['adapter'].name):
-            # Run setup INSIDE the session (off the event loop, as it may block)
-            # so setup events and any setup/import failure are recorded and
-            # finalized, not dropped outside observability.
-            await asyncio.to_thread(self._run_adapter_setup, prep['adapter'])
-            return await prep['adapter'].arun(
-                prep['config'],
-                self.config_list,
-                prep['topic'],
-                tools_dict=prep['tools_dict'],
-                agent_callback=getattr(self, 'agent_callback', None),
-                task_callback=getattr(self, 'task_callback', None),
-                cli_config=getattr(self, 'cli_config', None),
-            )
+            async with async_scoped_bridge():
+                # Run setup INSIDE the session (off the event loop, as it may
+                # block) so setup events and any setup/import failure are
+                # recorded and finalized, not dropped outside observability.
+                await asyncio.to_thread(self._run_adapter_setup, prep['adapter'])
+                return await prep['adapter'].arun(
+                    prep['config'],
+                    self.config_list,
+                    prep['topic'],
+                    tools_dict=prep['tools_dict'],
+                    agent_callback=getattr(self, 'agent_callback', None),
+                    task_callback=getattr(self, 'task_callback', None),
+                    cli_config=getattr(self, 'cli_config', None),
+                )
 
 
     def _build_yaml_workflow(self, config):

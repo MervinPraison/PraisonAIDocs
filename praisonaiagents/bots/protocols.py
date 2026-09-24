@@ -21,6 +21,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Mapping,
     Optional,
     Protocol,
@@ -497,6 +498,43 @@ class BotChannel:
 
 
 @dataclass
+class QuotedRef:
+    """Resolved content of a message a user replied to or quoted.
+
+    Chat platforms carry only the *id* of a quoted message on the admission
+    path; the referenced text/media must be resolved and attached so the agent
+    can honour the referent ("do the second one", "why?"). This is that
+    resolved reference, rendered into the prompt as a compact quoted block.
+
+    Attributes:
+        message_id: Platform-specific id of the quoted message.
+        text: Resolved text of the quoted message ("" if unavailable).
+        author: ``"bot"`` when quoting the bot's own message, else ``"user"``.
+    """
+
+    message_id: str = ""
+    text: str = ""
+    author: str = ""  # "bot" | "user"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "message_id": self.message_id,
+            "text": self.text,
+            "author": self.author,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "QuotedRef":
+        """Create from dictionary."""
+        return cls(
+            message_id=data.get("message_id", ""),
+            text=data.get("text", ""),
+            author=data.get("author", ""),
+        )
+
+
+@dataclass
 class BotMessage:
     """Represents a message in a messaging platform.
     
@@ -510,6 +548,11 @@ class BotMessage:
         reply_to: ID of message being replied to
         thread_id: Thread identifier (for threaded conversations)
         attachments: List of attachment URLs or data
+        quoted: Resolved reply/quote context (see :class:`QuotedRef`). When a
+            user replies to or quotes an earlier message the adapter resolves
+            the referenced content and attaches it here so the agent sees the
+            referent instead of answering context-blind. Rendered into the
+            prompt as a quoted block by :meth:`prompt_text`.
         metadata: Additional platform-specific metadata
         allow_control: Control-trust primitive. ``True`` (the default) only for
             interactive human turns; producers set it ``False`` for content of
@@ -530,6 +573,7 @@ class BotMessage:
     reply_to: Optional[str] = None
     thread_id: Optional[str] = None
     attachments: List[Dict[str, Any]] = field(default_factory=list)
+    quoted: Optional[QuotedRef] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
     allow_control: bool = True
     
@@ -545,6 +589,7 @@ class BotMessage:
             "reply_to": self.reply_to,
             "thread_id": self.thread_id,
             "attachments": self.attachments,
+            "quoted": self.quoted.to_dict() if self.quoted else None,
             "metadata": self.metadata,
             "allow_control": self.allow_control,
         }
@@ -571,6 +616,7 @@ class BotMessage:
             reply_to=data.get("reply_to"),
             thread_id=data.get("thread_id"),
             attachments=data.get("attachments", []),
+            quoted=QuotedRef.from_dict(data["quoted"]) if data.get("quoted") else None,
             metadata=data.get("metadata", {}),
             allow_control=data.get("allow_control", True),
         )
@@ -581,6 +627,31 @@ class BotMessage:
         if isinstance(self.content, str):
             return self.content
         return self.content.get("text", "")
+
+    @property
+    def prompt_text(self) -> str:
+        """Text for the agent turn, with any resolved quote rendered inline.
+
+        When the user replied to or quoted an earlier message, the resolved
+        reference (:attr:`quoted`) is rendered as a compact quoted block above
+        the new text so the model can honour the referent, e.g.::
+
+            [In reply to: "Here are three options: 1) …  2) …  3) …"]
+            do the second one
+
+        With no quote this is identical to :attr:`text`. The quoted content is
+        injected as context only, never as a control frame — consistent with
+        the ``allow_control`` primitive.
+        """
+        body = self.text
+        quoted = self.quoted
+        if not quoted or not quoted.text.strip():
+            return body
+        snippet = " ".join(quoted.text.split())
+        if len(snippet) > 500:
+            snippet = snippet[:497] + "…"
+        block = f'[In reply to: "{snippet}"]'
+        return f"{block}\n{body}" if body else block
     
     @property
     def is_command(self) -> bool:
@@ -618,6 +689,76 @@ class BotMessage:
         text = self.text
         parts = text.split()
         return parts[1:] if len(parts) > 1 else []
+
+
+# Normalised inbound platform-event kinds. Mirrors how ``MessageType`` normalises
+# inbound messages: a small, portable vocabulary every adapter maps its native
+# event onto (Telegram ``MessageReactionUpdated`` / Discord ``on_raw_reaction_add``
+# / Slack ``reaction_added`` all become ``"reaction_added"``), so hooks/plugins
+# have one uniform surface to subscribe to (Issue #5161).
+PlatformEventKind = Literal[
+    "reaction_added",
+    "reaction_removed",
+    "message_edited",
+    "message_deleted",
+    "member_joined",
+    "member_left",
+    "thread_created",
+]
+
+
+@dataclass
+class PlatformEvent:
+    """A normalised inbound platform event that is not a text/media message.
+
+    Reactions, edits, deletions, membership changes and thread lifecycle are
+    delivered by the platform SDK but are not messages. This is the single
+    shared, protocol-only contract every adapter emits into and every hook or
+    plugin consumes — the inbound counterpart to the outbound ``ReactionResult``
+    / message-action surface the bot already ships.
+
+    Adapters build one of these from the native event and emit it via
+    ``MessageHookMixin.fire_platform_event`` (praisonai-bot), which routes it to
+    the matching :class:`~praisonaiagents.hooks.types.HookEvent`
+    (``REACTION_RECEIVED``/``MESSAGE_EDITED``/``MESSAGE_DELETED``/
+    ``MEMBER_JOINED``/``MEMBER_LEFT``/``THREAD_CREATED``). Platforms that cannot
+    deliver a given event simply never build one — graceful, capability-gated,
+    exactly like the outbound ``capabilities["reactions"]`` gate.
+
+    Attributes:
+        kind: Which normalised event this is (see :data:`PlatformEventKind`).
+        platform: Emitting platform name (``"telegram"``/``"discord"``/…).
+        chat_id: Channel/chat the event occurred in.
+        user_id: The user who caused the event (reactor, editor, joiner, …).
+        message_id: The message the event targets (reactions/edits/deletes).
+        emoji: The reaction emoji, for reaction add/remove.
+        new_text: The new content, for an edit.
+        thread_id: The thread identifier, for thread creation / threaded events.
+        raw: Escape hatch to the native SDK payload for adapter-specific needs.
+    """
+
+    kind: PlatformEventKind
+    platform: str
+    chat_id: str
+    user_id: str
+    message_id: Optional[str] = None
+    emoji: Optional[str] = None
+    new_text: Optional[str] = None
+    thread_id: Optional[str] = None
+    raw: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary (native ``raw`` payload intentionally omitted)."""
+        return {
+            "kind": self.kind,
+            "platform": self.platform,
+            "chat_id": self.chat_id,
+            "user_id": self.user_id,
+            "message_id": self.message_id,
+            "emoji": self.emoji,
+            "new_text": self.new_text,
+            "thread_id": self.thread_id,
+        }
 
 
 @runtime_checkable

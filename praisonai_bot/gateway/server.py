@@ -18,7 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from praisonaiagents import Agent
@@ -48,6 +48,20 @@ from praisonaiagents.gateway.protocols import (
     HealthPressure,
     evaluate_pressure,
 )
+
+try:  # Central registry-driven authorization guard (Issue #5166).
+    from praisonaiagents.gateway.protocols import (
+        authorize_method,
+        GatewayUnauthorized,
+    )
+except ImportError:  # pragma: no cover - core predates the central guard
+    authorize_method = None  # type: ignore[assignment]
+
+    class GatewayUnauthorized(PermissionError):  # type: ignore[no-redef]
+        def __init__(self, method=None, required=None):
+            self.method = method
+            self.required = required
+            super().__init__("insufficient scope")
 
 try:  # Scoped-stop primitive (Issue #5129); optional at import time.
     from praisonaiagents.gateway.protocols import StopScope, StopResult
@@ -1203,6 +1217,18 @@ class WebSocketGateway:
         self._lifecycle_task: Optional[asyncio.Task] = None
         self._drain_marker_task: Optional[asyncio.Task] = None
         self._lifecycle_drain_timeout: Optional[float] = None
+
+        # Issue #5170: opt-in out-of-band idle-session compaction. A background
+        # sweep compacts sessions that have been idle beyond a threshold off the
+        # turn critical path, so a returning user resumes an already-compacted
+        # session with no first-message latency spike and idle transcripts stay
+        # bounded. All off unless ``lifecycle.idle_compaction.enabled`` is set,
+        # so always-on gateways are unchanged. ``_idle_compaction_cooldown`` is a
+        # per-session backoff (session_id -> retry-not-before ts) so a session we
+        # cannot shrink is not re-compacted every sweep.
+        self._idle_compaction_cfg: Optional[Dict[str, Any]] = None
+        self._idle_compaction_task: Optional[asyncio.Task] = None
+        self._idle_compaction_cooldown: Dict[str, float] = {}
 
         # Issue #4603: durable, boot-scoped process-lifecycle ledger. Detects an
         # unclean/OOM death of the *previous* process (which runs no signal
@@ -2638,6 +2664,63 @@ class WebSocketGateway:
                 logger.warning("Invalid scale_to_zero config; disabling: %s", e)
                 self._idle_policy = None
 
+        # Issue #5170: opt-in out-of-band idle-session compaction. Parse the
+        # config into a plain dict of validated numbers; the sweep itself lives
+        # in ``_run_idle_compaction_loop`` beside the other lifecycle loops. Off
+        # unless ``enabled`` is truthy and a durable session store is bound
+        # (nothing to enumerate/persist otherwise).
+        ic = lifecycle_cfg.get("idle_compaction")
+        if isinstance(ic, dict) and _as_bool(ic.get("enabled")):
+            if self._session_store is None:
+                logger.warning(
+                    "Gateway idle_compaction requires a persistent session "
+                    "store; disabling"
+                )
+                self._idle_compaction_cfg = None
+            else:
+                try:
+                    parsed = {
+                        "idle_after_seconds": float(
+                            ic.get("idle_after_seconds", 1800.0)
+                        ),
+                        "min_tokens": int(ic.get("min_tokens", 8000)),
+                        "sweep_interval_seconds": float(
+                            ic.get("sweep_interval_seconds", 300.0)
+                        ),
+                        "cooldown_seconds": float(
+                            ic.get("cooldown_seconds", 3600.0)
+                        ),
+                        "max_per_sweep": int(ic.get("max_per_sweep", 20)),
+                        # How many sessions to enumerate per sweep. Stores return
+                        # newest-first, so a small cap would starve older idle
+                        # sessions on a busy gateway (Issue #5170 review).
+                        "scan_limit": int(ic.get("scan_limit", 5000)),
+                    }
+                    # Reject non-positive numbers instead of starting a broken
+                    # loop: a zero/negative sweep interval would busy-spin or
+                    # make ``asyncio.sleep`` raise and kill the task, and
+                    # non-positive token/cooldown/limit values disable the
+                    # safeguards the sweep depends on (Issue #5170 review).
+                    invalid = [k for k, v in parsed.items() if v <= 0]
+                    if invalid:
+                        raise ValueError(
+                            "non-positive values not allowed: "
+                            + ", ".join(sorted(invalid))
+                        )
+                    self._idle_compaction_cfg = parsed
+                    logger.info(
+                        "Gateway idle_compaction enabled "
+                        "(idle_after=%ss, min_tokens=%s, sweep=%ss)",
+                        self._idle_compaction_cfg["idle_after_seconds"],
+                        self._idle_compaction_cfg["min_tokens"],
+                        self._idle_compaction_cfg["sweep_interval_seconds"],
+                    )
+                except (TypeError, ValueError) as e:
+                    logger.warning(
+                        "Invalid idle_compaction config; disabling: %s", e
+                    )
+                    self._idle_compaction_cfg = None
+
         # Epoch-aware external drain marker.
         drain = lifecycle_cfg.get("drain")
         if isinstance(drain, dict) and drain.get("marker_path"):
@@ -2910,6 +2993,229 @@ class WebSocketGateway:
         except asyncio.CancelledError:
             raise
 
+    def _idle_compaction_candidates(
+        self, cfg: Dict[str, Any], now: float, listing: Any = None
+    ) -> List[Tuple[str, Optional[int]]]:
+        """Select persisted sessions eligible for off-path compaction.
+
+        Pure selection over the durable store's session listing: a session is a
+        candidate when it has been idle at least ``idle_after_seconds``, its
+        transcript is at least ``min_tokens``, it is not currently held live and
+        executing in this gateway, and it is not inside its per-session cooldown.
+        Kept separate from the loop so the decision stays testable.
+
+        Returns ``(session_id, message_count)`` pairs. The message count is the
+        transcript length observed at selection time; the loop rechecks it before
+        committing a checkpoint so a turn that arrives during summarisation is
+        never silently dropped (Issue #5170 review). ``listing`` may be supplied
+        by the caller (e.g. fetched off-thread); otherwise it is read here.
+        """
+        store = self._session_store
+        if store is None or not hasattr(store, "list_sessions"):
+            return []
+        idle_after = cfg["idle_after_seconds"]
+        min_tokens = cfg["min_tokens"]
+        if listing is None:
+            try:
+                listing = store.list_sessions(limit=cfg.get("scan_limit", 5000))
+            except Exception as e:
+                logger.debug("idle_compaction list_sessions failed: %s", e)
+                return []
+        candidates: List[Tuple[str, Optional[int]]] = []
+        for row in listing:
+            sid = row.get("session_id") or row.get("id")
+            if not sid:
+                continue
+            not_before = self._idle_compaction_cooldown.get(sid)
+            if not_before is not None and now < not_before:
+                continue
+            live = self._sessions.get(sid)
+            if live is not None and getattr(live, "_is_executing", False):
+                continue
+            updated_at = row.get("updated_at")
+            idle_seconds = self._seconds_since_iso(updated_at, now)
+            if idle_seconds is None or idle_seconds < idle_after:
+                continue
+            total_tokens = row.get("total_tokens")
+            if isinstance(total_tokens, (int, float)) and total_tokens < min_tokens:
+                continue
+            mc = row.get("message_count")
+            candidates.append((sid, mc if isinstance(mc, int) else None))
+        return candidates
+
+    @staticmethod
+    def _seconds_since_iso(value: Any, now: float) -> Optional[float]:
+        """Seconds elapsed since an ISO-8601 timestamp, or ``None`` if unparsable."""
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            from datetime import datetime
+
+            ts = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return now - ts.timestamp()
+        except (ValueError, OverflowError):
+            return None
+
+    async def _run_idle_compaction_loop(self) -> None:
+        """Compact idle sessions out-of-band so returning users pay no penalty.
+
+        Only scheduled when ``lifecycle.idle_compaction.enabled`` is set and a
+        durable session store is bound (Issue #5170). Each sweep selects idle,
+        over-budget sessions, rebuilds their cheap working history (summary +
+        tail), runs the reusable ``ContextCompactor`` off the turn critical
+        path, and persists a compaction checkpoint so the next user message
+        resumes an already-compacted session. A per-session cooldown prevents
+        re-compacting a session that could not be shrunk every sweep.
+        """
+        cfg = self._idle_compaction_cfg
+        store = self._session_store
+        if cfg is None or store is None:
+            return
+        if not hasattr(store, "get_working_history") or not hasattr(
+            store, "append_compaction_checkpoint"
+        ):
+            logger.info(
+                "Gateway idle_compaction: session store lacks working-history/"
+                "checkpoint support; disabling"
+            )
+            return
+        try:
+            from praisonaiagents.compaction.compactor import ContextCompactor
+            from praisonaiagents.compaction.strategy import CompactionStrategy
+        except ImportError as e:
+            logger.warning("Gateway idle_compaction unavailable: %s", e)
+            return
+
+        min_tokens = cfg["min_tokens"]
+        cooldown_seconds = cfg["cooldown_seconds"]
+        max_per_sweep = cfg["max_per_sweep"]
+        # Target a comfortable fraction of the budget so a compacted session
+        # stays under threshold for a while rather than re-tripping next sweep.
+        compactor = ContextCompactor(
+            max_tokens=min_tokens,
+            target_tokens=int(min_tokens * 0.75),
+            strategy=CompactionStrategy.SUMMARIZE,
+        )
+        scan_limit = cfg.get("scan_limit", 5000)
+        logger.info("Gateway idle-compaction sweep armed")
+        try:
+            while self._is_running:
+                await asyncio.sleep(cfg["sweep_interval_seconds"])
+                if self._is_dormant:
+                    continue
+                now = time.time()
+                # Store I/O is synchronous; run it off the gateway event loop so
+                # websocket and turn handling are never paused by a sweep
+                # (Issue #5170 review).
+                try:
+                    listing = await asyncio.to_thread(
+                        store.list_sessions, limit=scan_limit
+                    )
+                except Exception as e:
+                    logger.debug("idle_compaction list_sessions failed: %s", e)
+                    continue
+                candidates = self._idle_compaction_candidates(cfg, now, listing)
+                processed = 0
+                for sid, seen_count in candidates:
+                    if processed >= max_per_sweep:
+                        break
+                    try:
+                        messages = await asyncio.to_thread(
+                            store.get_working_history, sid
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "idle_compaction get_working_history(%s) failed: %s",
+                            sid, e,
+                        )
+                        continue
+                    if not compactor.needs_compaction(messages):
+                        continue
+                    processed += 1
+                    try:
+                        _, result = await compactor.compact_async(messages)
+                    except Exception as e:
+                        logger.debug(
+                            "idle_compaction compact(%s) failed: %s", sid, e
+                        )
+                        self._idle_compaction_cooldown[sid] = now + cooldown_seconds
+                        continue
+                    shrank = (
+                        result.compacted_tokens < result.original_tokens
+                        and not result.was_skipped_due_to_low_savings
+                        and bool((result.summary or "").strip())
+                    )
+                    if shrank:
+                        # Guard against the stale-checkpoint race: if a turn was
+                        # persisted while we were summarising, the transcript
+                        # grew and the summary no longer covers the whole log.
+                        # ``append_compaction_checkpoint`` anchors to the *current*
+                        # length, so committing now would drop the new turn from
+                        # resume context. Re-read the length and skip if it moved
+                        # (Issue #5170 review); the session is cooled down and
+                        # retried on a later sweep.
+                        grew = False
+                        if seen_count is not None:
+                            grew = await asyncio.to_thread(
+                                self._session_grew, store, sid, seen_count,
+                                scan_limit,
+                            )
+                        if grew:
+                            logger.debug(
+                                "idle_compaction skip(%s): transcript grew "
+                                "during compaction; will retry",
+                                sid,
+                            )
+                        else:
+                            try:
+                                await asyncio.to_thread(
+                                    store.append_compaction_checkpoint,
+                                    sid,
+                                    result.summary,
+                                    tokens_before=result.original_tokens,
+                                    tokens_after=result.compacted_tokens,
+                                    metadata={"source": "idle_compaction"},
+                                )
+                                logger.info(
+                                    "[idle-compaction] %s: %s->%s tokens",
+                                    sid,
+                                    result.original_tokens,
+                                    result.compacted_tokens,
+                                )
+                            except Exception as e:
+                                logger.debug(
+                                    "idle_compaction checkpoint(%s) failed: %s",
+                                    sid, e,
+                                )
+                    # Cool the session down either way: if it shrank we do not
+                    # need to revisit it soon; if it could not shrink we must
+                    # not retry it every sweep.
+                    self._idle_compaction_cooldown[sid] = now + cooldown_seconds
+        except asyncio.CancelledError:
+            raise
+
+    @staticmethod
+    def _session_grew(
+        store: Any, session_id: str, seen_count: int, scan_limit: int = 5000
+    ) -> bool:
+        """Return True if the persisted transcript grew past ``seen_count``.
+
+        Used to detect a turn appended while we were summarising off-path, so a
+        stale checkpoint is not committed over it. Unknown length (store cannot
+        report a fresh count) is treated as "not grown" to avoid starving
+        compaction on stores lacking a cheap length probe.
+        """
+        try:
+            listing = store.list_sessions(limit=scan_limit)
+        except Exception:
+            return False
+        for row in listing:
+            sid = row.get("session_id") or row.get("id")
+            if sid == session_id:
+                mc = row.get("message_count")
+                return isinstance(mc, int) and mc > seen_count
+        return False
+
     def _read_drain_marker(self) -> Optional[Dict[str, Any]]:
         """Read + parse the external drain marker file, or ``None`` if absent."""
         path = self._drain_marker_path
@@ -2987,9 +3293,11 @@ class WebSocketGateway:
         # corresponding feature rather than leaving stale state.
         prev_idle = self._idle_policy is not None
         prev_drain = self._drain_marker_policy is not None
+        prev_idle_compaction = self._idle_compaction_cfg is not None
         self._idle_policy = None
         self._drain_marker_policy = None
         self._drain_marker_path = None
+        self._idle_compaction_cfg = None
         self._configure_lifecycle(lifecycle_cfg)
 
         try:
@@ -2999,6 +3307,7 @@ class WebSocketGateway:
 
         now_idle = self._idle_policy is not None
         now_drain = self._drain_marker_policy is not None
+        now_idle_compaction = self._idle_compaction_cfg is not None
 
         if now_idle != prev_idle:
             if self._lifecycle_task is not None:
@@ -3018,6 +3327,16 @@ class WebSocketGateway:
                 self._drain_marker_task = loop.create_task(
                     self._run_drain_marker_watch(self._lifecycle_drain_timeout),
                     name="gateway-drain-marker",
+                )
+
+        if now_idle_compaction != prev_idle_compaction:
+            if self._idle_compaction_task is not None:
+                self._idle_compaction_task.cancel()
+                self._idle_compaction_task = None
+            if now_idle_compaction:
+                self._idle_compaction_task = loop.create_task(
+                    self._run_idle_compaction_loop(),
+                    name="gateway-idle-compaction",
                 )
 
     async def _drain_active_sessions(self, reason: str = "shutdown", timeout: float = 10.0) -> None:
@@ -3210,6 +3529,34 @@ class WebSocketGateway:
         if msg_type == EventType.PONG.value:
             return
 
+        # Issue #5166: central, default-deny authorization gate. Resolve the
+        # scope this method requires from the declarative registry (the single
+        # source of truth) and deny before dispatch when the client lacks it.
+        # A method nobody classified is ADMIN-only by omission rather than
+        # reachable ungated, and plugin-registered methods are gated too. The
+        # per-endpoint ``_client_has_scope`` checks below become a redundant
+        # (harmless) second line rather than the sole gate. ``PING``/``PONG``
+        # are transport frames handled above and never reach here. If the core
+        # is too old to expose the guard, fall through to the legacy checks.
+        if authorize_method is not None:
+            try:
+                params = data if isinstance(data, dict) else None
+                authorize_method(
+                    msg_type, self._client_scope_set(client_id), params
+                )
+            except GatewayUnauthorized as exc:
+                await self._send_to_client(client_id, {
+                    "type": "error",
+                    "code": "insufficient_scope",
+                    "message": "insufficient scope",
+                    "required_scope": (
+                        exc.required.value
+                        if getattr(exc, "required", None) is not None
+                        else None
+                    ),
+                })
+                return True
+
         # Handle versioned handshake
         if msg_type == "hello":
             agent_id = data.get("agent_id")
@@ -3364,6 +3711,13 @@ class WebSocketGateway:
                 "max_queued_frames": getattr(self.config, 'max_queued_frames', 1000),
                 "heartbeat_ms": heartbeat_ms,
             }
+            # Issue #5207: fold the attachment ceilings into the advertised policy
+            # so any /ws client can self-limit/chunk before sending. Only adds
+            # keys when attachments are enabled, so a gateway with attachments
+            # disabled advertises exactly today's policy shape (backward compatible).
+            attachments = getattr(self.config, 'attachments', None)
+            if attachments is not None and hasattr(attachments, 'to_policy'):
+                policy.update(attachments.to_policy())
             
             # Send successful handshake response
             result = HelloResult(
@@ -5395,6 +5749,25 @@ class WebSocketGateway:
         if scopes is None:
             return True
         return OperatorScope.ADMIN.value in scopes or scope.value in scopes
+
+    def _client_scope_set(self, client_id: str) -> "Set[OperatorScope]":
+        """Return the ``OperatorScope`` set a connected client holds.
+
+        Clients connected before scopes were tracked, or when no scope policy
+        is configured, hold every scope — preserving prior binary-auth
+        behaviour so the central guard changes nothing for those callers.
+        Unknown scope strings are ignored rather than crashing the gate.
+        """
+        raw = self._client_scopes.get(client_id)
+        if raw is None:
+            return set(OperatorScope.all())
+        resolved: "Set[OperatorScope]" = set()
+        for value in raw:
+            try:
+                resolved.add(OperatorScope(value))
+            except ValueError:
+                continue
+        return resolved
 
     @staticmethod
     def _event_required_scope(event: GatewayEvent) -> OperatorScope:
@@ -7582,6 +7955,17 @@ class WebSocketGateway:
                 except Exception:  # pragma: no cover — defensive
                     pass
 
+            # Carry the inbound platform-event opt-in (Issue #5161) through the
+            # same metadata passthrough so ``events: [reactions, edits, …]`` in
+            # gateway.yaml actually reaches the adapter's ``_event_classes()``.
+            # Off by default; BotConfig has no native field for it.
+            _raw_events = ch_cfg.get("events")
+            if _raw_events is not None:
+                try:
+                    config.metadata["events"] = _raw_events
+                except Exception:  # pragma: no cover — defensive
+                    pass
+
             # Warn if no allowlist is configured. Issue #2855: the message must
             # reflect the effective ``unknown_user_policy`` — an empty allowlist
             # with the default ``deny`` policy SILENTLY DROPS unknown DMs, so the
@@ -8542,7 +8926,15 @@ class WebSocketGateway:
                 return  # Message was dropped by security checks
 
             user_id = message.sender.user_id if message.sender else "unknown"
-            message_text = message.content
+            # Render any resolved reply/quote context (Issue #5223) so gateway
+            # agents honour the referent too, matching the standalone adapter.
+            # ``prompt_text`` folds the (post-hook, possibly redacted) quoted
+            # block above the content; with no quote it is just the content.
+            message_text = (
+                message.prompt_text
+                if hasattr(message, "prompt_text")
+                else message.content
+            )
 
             # Determine routing context
             chat_type = update.message.chat.type if update.message.chat else "private"
@@ -9155,6 +9547,16 @@ class WebSocketGateway:
             except Exception:  # pragma: no cover — defensive
                 pass
 
+        # Issue #5161: carry the inbound platform-event opt-in through metadata
+        # on hot-reload too, so a reloaded channel keeps subscribing to the same
+        # ``events: [...]`` classes as start_channels().
+        _raw_events = ch_cfg.get("events")
+        if _raw_events is not None:
+            try:
+                config.metadata["events"] = _raw_events
+            except Exception:  # pragma: no cover — defensive
+                pass
+
         # Warn if no allowlist is configured (Issue #2855: deny-aware message).
         if not config.allowed_users:
             self._warn_empty_allowlist(channel_name, config.unknown_user_policy)
@@ -9242,6 +9644,157 @@ class WebSocketGateway:
             error=error,
         )
 
+    async def validate_candidate(
+        self, new_config: "Mapping[str, Any]"
+    ) -> "CandidateReport":
+        """Public :class:`ReloadValidationProtocol` entry point (Issue #5144).
+
+        Build/pre-flight the candidate from ``new_config`` *without* stopping or
+        mutating the live runtime, so ``isinstance(gateway,
+        ReloadValidationProtocol)`` holds and every reload entry point (SIGHUP,
+        ``gateway reload``/``restart``) honours the same "never cut over to an
+        unvalidated candidate" contract. Delegates to the synchronous
+        :meth:`_validate_candidate`, which does no blocking I/O (it only
+        constructs Agent objects), so it is safe to await directly.
+        """
+        return self._validate_candidate(dict(new_config))
+
+    def _validate_candidate(self, new_cfg: Dict[str, Any]) -> "CandidateReport":
+        """Build candidate agents from ``new_cfg`` *without* activating them live.
+
+        Issue #5144: a structural (full-restart) reload tears the live channels
+        down before the new config is proven to work, and on a build/start
+        failure there is no rollback — a schema-valid but runtime-invalid edit
+        (bad tool/model/guardrails wiring) takes a healthy always-on gateway
+        offline. This performs the agent-build pre-flight *first*, so the
+        highest-risk step is proven before any live channel is drained.
+
+        Crucially, the candidate agents are built into an *isolated* registry
+        and returned via :attr:`CandidateReport.candidate` — the live
+        ``self._agents`` map is snapshotted and restored, so traffic in-flight
+        during the drain window can never observe the not-yet-committed
+        candidate. The caller activates the candidate with
+        :meth:`_activate_candidate` only after ingress is quiesced
+        (``stop_channels``). ``_create_agents_from_config`` writes into
+        ``self._agents``, so this temporarily borrows it, captures the built
+        maps, then restores the live snapshot exactly.
+
+        Returns a :class:`CandidateReport`; ``ok=False`` means the caller must
+        keep the previous config serving and never drain the live channels.
+        """
+        from praisonaiagents.gateway.config import CandidateReport
+
+        agents_cfg = new_cfg.get("agents", {})
+        if not agents_cfg:
+            # Nothing to build/prove for agents; channel start remains
+            # per-channel fault-tolerant, so the candidate is trivially ok.
+            return CandidateReport(ok=True, candidate={"agents": {}, "shell": {}})
+
+        provider_cfg = new_cfg.get("provider", {})
+        default_model = provider_cfg.get("model") if provider_cfg else None
+        guardrails_cfg = (new_cfg.get("guardrails") or {}).get("registry")
+        durable_runs = self._durable_runs_from_config(new_cfg)
+
+        # Borrow the live registries to reuse the existing builder, but always
+        # restore them so the live runtime is byte-for-byte untouched until the
+        # caller explicitly activates the candidate after ingress is quiesced.
+        prev_agents = dict(self._agents)
+        prev_shell = dict(self._shell_routed_agents)
+        try:
+            self._agents.clear()
+            self._shell_routed_agents.clear()
+            self._create_agents_from_config(
+                agents_cfg,
+                default_model=default_model,
+                guardrails_cfg=guardrails_cfg,
+                durable_runs=durable_runs,
+            )
+            candidate = {
+                "agents": dict(self._agents),
+                "shell": dict(self._shell_routed_agents),
+            }
+        except Exception as e:
+            logger.error(f"Candidate reload rejected — agent build failed: {e}")
+            return CandidateReport(
+                ok=False, failures=[f"agent build failed: {e}"]
+            )
+        finally:
+            # Restore live agents so no cutover has happened yet — the candidate
+            # only goes live via _activate_candidate() after stop_channels().
+            self._agents.clear()
+            self._agents.update(prev_agents)
+            self._shell_routed_agents.clear()
+            self._shell_routed_agents.update(prev_shell)
+        return CandidateReport(ok=True, candidate=candidate)
+
+    def _activate_candidate(self, candidate: Optional[Dict[str, Any]]) -> None:
+        """Install a validated candidate agent registry as the live one.
+
+        Called only after ``stop_channels`` has quiesced ingress, so the swap
+        from the previous agents to the proven candidate is atomic from the
+        perspective of any new turn. ``None``/empty candidate is a no-op (the
+        no-agents-config case), leaving the existing agents in place.
+        """
+        if not candidate:
+            return
+        agents = candidate.get("agents")
+        if not agents:
+            return
+        self._agents.clear()
+        self._agents.update(agents)
+        self._shell_routed_agents.clear()
+        self._shell_routed_agents.update(candidate.get("shell", {}))
+
+    async def _restore_previous_config(
+        self, error: str, changed_paths: Set[str]
+    ) -> None:
+        """Last-resort restore of the last-known-good config after a failed swap.
+
+        Issue #5144: if a full-restart cutover has already drained the live
+        channels and the new channels fail to start, bring the previous working
+        config back up so the gateway is never left down. The previous config +
+        agents are still stored in ``self._loaded_config``, so this rebuilds
+        agents and restarts channels from it, and records a ``rolled_back``-style
+        ``failed`` outcome (with the original error) via ``health()``.
+        """
+        prev_cfg = self._loaded_config
+        if not prev_cfg:
+            self._record_reload_status(
+                "failed",
+                changed_paths=tuple(sorted(changed_paths)),
+                error=error,
+            )
+            return
+        try:
+            prev_agents_cfg = prev_cfg.get("agents", {})
+            if prev_agents_cfg:
+                provider_cfg = prev_cfg.get("provider", {})
+                default_model = provider_cfg.get("model") if provider_cfg else None
+                guardrails_cfg = (prev_cfg.get("guardrails") or {}).get("registry")
+                durable_runs = self._durable_runs_from_config(prev_cfg)
+                self._agents.clear()
+                self._shell_routed_agents.clear()
+                self._create_agents_from_config(
+                    prev_agents_cfg,
+                    default_model=default_model,
+                    guardrails_cfg=guardrails_cfg,
+                    durable_runs=durable_runs,
+                )
+            prev_channels_cfg = prev_cfg.get("channels", {})
+            if prev_channels_cfg:
+                await self.start_channels(prev_channels_cfg)
+            logger.info("Restored previous config after failed reload")
+        except Exception as restore_err:  # pragma: no cover - defensive
+            logger.error(
+                f"Failed to restore previous config after reload failure: "
+                f"{restore_err}"
+            )
+        self._record_reload_status(
+            "failed",
+            changed_paths=tuple(sorted(changed_paths)),
+            error=error,
+        )
+
     async def _reload_config_locked(self, config_path: str) -> None:
         """Perform the actual hot-reload. Callers must hold ``_reload_lock``."""
         logger.info(f"Hot-reloading gateway config from {config_path}...")
@@ -9324,30 +9877,69 @@ class WebSocketGateway:
         # Execute reload plan
         if plan.full_restart:
             logger.info("Performing full restart due to structural changes")
+            # Issue #5144: validate the candidate (build the new agents) BEFORE
+            # draining the live channels. If the build fails, the previous
+            # config keeps serving — a schema-valid but runtime-invalid edit is
+            # a *rejected* reload, not an outage. The candidate is built into an
+            # isolated registry and is NOT yet live: in-flight turns during the
+            # drain window keep resolving the previous agents until the cutover
+            # commits.
+            report = self._validate_candidate(new_cfg)
+            if not report.ok:
+                error = "; ".join(report.failures) or "candidate validation failed"
+                logger.error(f"Reload rejected — {error}; keeping previous config")
+                self._record_reload_status(
+                    "failed",
+                    changed_paths=tuple(sorted(changed_paths)),
+                    error=error,
+                )
+                return
+
+            # Candidate proved; drain live channels first so ingress is quiesced,
+            # then atomically activate the candidate agents and bring the new
+            # channels up. If channel start raises OR every configured channel
+            # fails to start, restore the previous working config so the gateway
+            # is never left down.
             # Issue #2533: drain in-flight turns before bouncing all channels.
             await self.stop_channels(drain_timeout=self._reload_drain_timeout)
-            
-            # Recreate agents
-            agents_cfg = new_cfg.get("agents", {})
-            provider_cfg = new_cfg.get("provider", {})
-            default_model = provider_cfg.get("model") if provider_cfg else None
-            guardrails_cfg = (new_cfg.get("guardrails") or {}).get("registry")
-            durable_runs = self._durable_runs_from_config(new_cfg)
-            if agents_cfg:
-                self._agents.clear()
-                # Recreating agents invalidates id()-keyed shell clones.
-                self._shell_routed_agents.clear()
-                self._create_agents_from_config(
-                    agents_cfg,
-                    default_model=default_model,
-                    guardrails_cfg=guardrails_cfg,
-                    durable_runs=durable_runs,
-                )
-            
-            # Restart all channels
+
+            # Cutover point: candidate agents become live only now that no
+            # channel is accepting turns (greptile #1 — never expose the
+            # candidate before the cutover commits).
+            self._activate_candidate(report.candidate)
+
             channels_cfg = new_cfg.get("channels", {})
-            if channels_cfg:
-                await self.start_channels(channels_cfg)
+            try:
+                if channels_cfg:
+                    await self.start_channels(channels_cfg)
+            except Exception as e:
+                logger.error(
+                    f"Channel start failed during full restart: {e}; "
+                    "restoring previous config"
+                )
+                await self._restore_previous_config(str(e), changed_paths)
+                return
+
+            # Issue #5144 (greptile #3): start_channels() is per-channel
+            # fault-tolerant — missing credentials / adapter-construction
+            # failures are marked *degraded* and skipped rather than raised. So
+            # a wholly-broken replacement set returns normally, leaving the old
+            # channels stopped while the reload would otherwise commit as ``ok``.
+            # If channels were configured but none came up live, treat the
+            # cutover as failed and restore the previous config.
+            if channels_cfg and not self._channel_bots:
+                degraded = "; ".join(
+                    f"{name}: {reason}"
+                    for name, reason in self._degraded_channels.items()
+                ) or "no channels started"
+                logger.error(
+                    f"All configured channels failed to start ({degraded}); "
+                    "restoring previous config"
+                )
+                await self._restore_previous_config(
+                    f"all channels failed to start ({degraded})", changed_paths
+                )
+                return
         else:
             # Selective reload
             if plan.reload_agents:
@@ -9954,6 +10546,17 @@ class WebSocketGateway:
                 f"(max_concurrent_runs/queue_depth must be integers): {e}"
             ) from e
         _overflow = str(_ovr("_overflow_policy_override", "overflow_policy", "reject") or "reject")
+        # Issue #5168: optional per-tenant/per-scope concurrency sub-limit within
+        # the global ceiling (0 = disabled, global-only behaviour).
+        try:
+            _max_runs_per_scope = int(
+                gw_cfg.get("max_concurrent_runs_per_scope", 0) or 0
+            )
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Invalid gateway admission config "
+                f"(max_concurrent_runs_per_scope must be an integer): {e}"
+            ) from e
 
         # Issue #2531: single reliability posture. A ``reliability`` preset
         # (CLI ``--reliability`` override wins over ``gateway.reliability``)
@@ -9987,12 +10590,14 @@ class WebSocketGateway:
             max_concurrent_runs=_max_runs,
             queue_depth=_queue_depth,
             overflow_policy=_overflow,
+            max_concurrent_runs_per_scope=_max_runs_per_scope,
         )
         if self._admission_gate is not None:
             logger.info(
                 "Gateway admission control enabled "
-                "(max_concurrent_runs=%d queue_depth=%d overflow=%s)",
-                _max_runs, _queue_depth, _overflow,
+                "(max_concurrent_runs=%d queue_depth=%d overflow=%s "
+                "per_scope=%d)",
+                _max_runs, _queue_depth, _overflow, _max_runs_per_scope,
             )
 
         # Parse health monitoring configuration
@@ -10077,6 +10682,14 @@ class WebSocketGateway:
                 self._drain_marker_task = asyncio.create_task(
                     self._run_drain_marker_watch(drain_timeout_cfg),
                     name="gateway-drain-marker",
+                )
+            # Issue #5170: launch the opt-in idle-session compaction sweep.
+            # No-op when unconfigured; polls on ``_is_running`` after an initial
+            # sleep, so starting it here is safe.
+            if self._idle_compaction_cfg is not None:
+                self._idle_compaction_task = asyncio.create_task(
+                    self._run_idle_compaction_loop(),
+                    name="gateway-idle-compaction",
                 )
             await self.start()
 
@@ -10241,6 +10854,9 @@ class WebSocketGateway:
                     self._lifecycle_task.cancel()
                 if self._drain_marker_task:
                     self._drain_marker_task.cancel()
+                # Issue #5170: stop the idle-compaction sweep on shutdown.
+                if self._idle_compaction_task:
+                    self._idle_compaction_task.cancel()
                 # Issue #2375: drain in-flight agent turns (channel bots) and
                 # websocket sessions before final teardown when a drain timeout
                 # is configured. The configured timeout bounds the *total*
