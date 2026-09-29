@@ -91,6 +91,28 @@ Hook return values:
 - `"reason"` → Deny with custom message
 </Step>
 
+<Step title="Order with priority">
+Set `priority` to control which hook runs first — lower runs earlier, default is `100`:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import add_hook
+
+@add_hook('after_llm', priority=10)
+def redact(event_data):
+    return None  # runs first — allow
+
+@add_hook('after_llm', priority=90)
+def trace(event_data):
+    print("emitted after redaction")  # runs after — sees redacted payload
+
+agent = Agent(name="Assistant", instructions="Help with anything.")
+agent.start("Say hi")
+```
+
+Hooks in the same priority bucket keep registration order.
+</Step>
+
 <Step title="With HooksConfig">
 Attach a `HooksConfig` to a specific agent for scoped hooks:
 
@@ -125,7 +147,7 @@ The simplified API covers registering, inspecting, and emitting hooks — all im
 
 | Function | Purpose |
 |----------|---------|
-| `add_hook(event, callback)` | Register a callback for an event |
+| `add_hook(event, callback, priority=100)` | Register a callback for an event; `priority=100` by default (lower runs earlier) |
 | `remove_hook(hook_id)` | Remove a hook by its id |
 | `has_hook(event)` | Check whether any hook is registered for an event |
 | `fire_hook(event, data)` | **Emit** an event so subscribers run — the counterpart to `add_hook` |
@@ -266,6 +288,8 @@ A hook's execution mode decides whether it can rewrite the payload.
 
 **Sequential hooks** run one after another and their `modified_input` is applied back to the payload. **Parallel hooks** run concurrently and cannot mutate the payload — use them for read-only observers (metrics, logging, tracing). If your hook needs to rewrite the request (redact secrets, inject headers, edit messages), register it with `sequential=True`.
 
+`priority` applies **before** the sequential/parallel split, so a lower-priority sequential hook runs before a higher-priority parallel one — a redact (`sequential=True`, `priority=10`) now runs ahead of a trace (`priority=20`), closing the redact-then-trace leak the runner previously had. See [Ordering hooks with priority](#ordering-hooks-with-priority) below.
+
 ```mermaid
 graph TB
     Start([Does your hook need to mutate input?])
@@ -306,6 +330,59 @@ registry.register_function(
 <Warning>
 Registering a mutating hook without `sequential=True` looks correct but silently no-ops — the runner runs it in parallel with sibling hooks, so its `modified_input` is discarded. As of PraisonAI [PR #4034](https://github.com/MervinPraison/PraisonAI/pull/4034) the runtime **logs a warning** when a parallel hook returns a non-empty `modified_input`: `"Parallel hook '<name>' returned modified_input which is discarded; register it with sequential=True to apply it."` Watch your logs when adopting a new mutating hook.
 </Warning>
+
+### Ordering hooks with priority
+
+`priority` decides which hook on the same event runs first — **lower runs earlier**, and the default bucket is **100**.
+
+Ties fall back to deterministic registration order via a monotonic `_seq` counter, so ordering is reproducible across environments and processes. Every registration API accepts `priority=`: `register_function(..., priority=100)`, `register_command(..., priority=100)`, `@registry.on(..., priority=100)`, and `add_hook(event, callback, priority=100)`. The `add_hook` default is `100` — the same bucket as `register_function` and `@on`.
+
+The runner honors priority across the parallel/sequential boundary. It walks the priority-sorted list and runs each *contiguous* run of same-mode hooks together, so a redact (`sequential=True`, `priority=10`) that must precede a trace (`priority=20`) still runs first. Adjacent parallel hooks are still gathered concurrently. A denial inside a sequential run breaks the whole chain — later groups do not run after a deny.
+
+```mermaid
+graph TB
+    A[Hooks for event] --> B{Sort by priority, _seq}
+    B --> C[Walk sorted list]
+    C --> D{Same mode<br/>as previous?}
+    D -->|Yes| E[Extend current group]
+    D -->|No| F[Run current group<br/>then start new one]
+    E --> G{Sequential<br/>denial?}
+    F --> G
+    G -->|Yes| H[Stop chain]
+    G -->|No| I[Continue to next group]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class B,D,G question
+    class A,C,E,F,I process
+    class H stop
+```
+
+`list_hooks()` returns each hook dict with a `"priority"` key, and the list is already in effective execution order — an operator can see the exact sequence the runner will use.
+
+```python
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+@registry.on(HookEvent.AFTER_LLM, priority=90)
+def trace(event_data):
+    return HookResult.allow()
+
+@registry.on(HookEvent.AFTER_LLM, sequential=True, priority=10)
+def redact(event_data):
+    return HookResult.allow()
+
+# Returned in execution order: redact (10) before trace (90)
+for hook in registry.list_hooks()["after_llm"]:
+    print(hook["name"], hook["priority"])
+```
+
+<Note>
+As of PraisonAI [PR #5263](https://github.com/MervinPraison/PraisonAI/pull/5263), `priority` is honored — the parameter is no longer *"Reserved for future use"*. Hooks registered without an explicit priority land in the default bucket (`100`) and keep registration order, so existing code behaves the same. The `add_hook` default was aligned from `10` → `100` to match `register_function` / `@on`, so a hook added via `add_hook` with no `priority=` no longer jumps in front of one added via `register_function` with no `priority=`.
+</Note>
 
 ### Thread Safety
 
@@ -426,6 +503,34 @@ agent = Agent(
 )
 
 agent.start("Clean up the old log files")
+```
+
+### Guardrails before tracing
+
+Order a redaction hook ahead of an observer so the tracer only ever sees the scrubbed payload — set the redactor to a lower priority.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry, HookEvent, HookResult
+
+registry = HookRegistry()
+
+# Runs FIRST — redacts secrets in-place, sequential to apply modified_input
+@registry.on(HookEvent.AFTER_LLM, sequential=True, priority=10)
+def redact_pii(event_data):
+    return HookResult.allow()
+
+# Runs AFTER redaction — cheap observer, parallel
+@registry.on(HookEvent.AFTER_LLM, priority=90)
+def add_trace_span(event_data):
+    return HookResult.allow()
+
+agent = Agent(
+    name="SafeAgent",
+    instructions="Answer using the fetch tool.",
+    hooks=registry,
+)
+agent.start("Fetch the user profile")
 ```
 
 ### Audit Logging
@@ -626,6 +731,9 @@ See [Redact / Block Tool Output](/features/redact-tool-output) for the plugin-st
   </Accordion>
   <Accordion title="Sequential for rewriters, parallel for observers">
     Parallel is the default and is faster. Only mark a hook `sequential=True` when it needs to mutate the payload via `modified_input`.
+  </Accordion>
+  <Accordion title="Use priority to order guardrails before observers">
+    Register security/redaction hooks with a lower priority (e.g. `10`) and tracers/loggers with a higher priority (e.g. `90`) so redaction always runs before the observer sees the payload. Hooks in the same bucket keep registration order. Default priority is `100`.
   </Accordion>
   <Accordion title="Hooks fail closed on error, timeout, missing callable, or unexpected exit">
     A `BEFORE_TOOL` (or any) hook fails closed — returns `HookResult(decision="deny", reason=...)` and the tool does **not** execute — on any of four triggers:
