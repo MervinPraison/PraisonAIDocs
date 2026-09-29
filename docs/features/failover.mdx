@@ -233,7 +233,60 @@ config = FailoverConfig(
 | `max_retry_delay` | `float` | `60.0` | Maximum retry delay |
 | `cooldown_on_rate_limit` | `float` | `60.0` | Rate limit cooldown (seconds) |
 | `cooldown_on_error` | `float` | `30.0` | Error cooldown (seconds) |
-| `rotate_on_success` | `bool` | `False` | Rotate profiles on success |
+| `rotate_on_success` | `bool` | `False` | Spread successful traffic across the current highest-priority tier (round-robin). Only equal-priority profiles at the top rotate — lower-priority profiles remain pure fallback. Off by default; see the "Load spreading across equal-priority credentials" section below. Wired into `LLM` in [PR #5330](https://github.com/MervinPraison/PraisonAI/pull/5330). |
+
+---
+
+## Load spreading across equal-priority credentials
+
+If you have two API keys of the same priority — say, two OpenAI keys for redundancy — turn on `rotate_on_success` and PraisonAI will spread traffic across them one call at a time instead of hammering one until it hits a rate limit.
+
+When you have multiple credentials of the same priority — e.g. two OpenAI keys — set `rotate_on_success=True` so each successful call moves to the next key in the tier.
+
+```mermaid
+graph LR
+    Agent[🤖 Agent] --> Manager{🔒 FailoverManager}
+    Manager -->|call 1, 3| KeyA[🟢 key-a priority 0]
+    Manager -->|call 2, 4| KeyB[🟢 key-b priority 0]
+    Backup[🔵 backup priority 1<br/>pure fallback]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef manager fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef top fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fallback fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Agent agent
+    class Manager manager
+    class KeyA,KeyB top
+    class Backup fallback
+```
+
+```python
+import os
+from praisonaiagents import Agent, AuthProfile, FailoverConfig, FailoverManager
+
+manager = FailoverManager(FailoverConfig(rotate_on_success=True))
+
+# Two equal-priority keys share the top tier and get round-robin traffic
+manager.add_profile(AuthProfile(name="key-a", provider="openai",
+    api_key=os.getenv("OPENAI_KEY_A"), priority=0))
+manager.add_profile(AuthProfile(name="key-b", provider="openai",
+    api_key=os.getenv("OPENAI_KEY_B"), priority=0))
+
+# A lower-priority key is used only when the top tier is exhausted
+manager.add_profile(AuthProfile(name="backup", provider="anthropic",
+    api_key=os.getenv("ANTHROPIC_KEY"), priority=1))
+
+agent = Agent(name="assistant", llm={"model": "gpt-4o-mini", "failover_manager": manager})
+for _ in range(4):
+    agent.start("Hi")   # alternates key-a → key-b → key-a → key-b
+```
+
+**How rotation is scoped:** Rotation only cycles within the top available priority. If `key-a` gets rate-limited into cooldown, both remaining calls go to `key-b` until `key-a` recovers, then rotation resumes.
+
+<Note>
+**Shared `LLM` instances rotate too.** A single long-lived `LLM` shared across agents used to pin the profile it was constructed with. Since [PR #5330](https://github.com/MervinPraison/PraisonAI/pull/5330), when `rotate_on_success=True` the LLM re-selects the profile on every call via `FailoverManager.get_next_profile()` (per-call kwargs only — the shared instance state is never mutated), so concurrent calls remain safe and traffic actually spreads across the tier.
+</Note>
 
 ---
 
@@ -460,6 +513,10 @@ Benches key on `AuthProfile.credential_id` — a stable, non-secret hash of `pro
 
   <Accordion title="Keep API keys out of source">
     Load keys from environment variables or a secrets manager — never commit credentials to version control.
+  </Accordion>
+
+  <Accordion title="Spread load across equal-priority keys">
+    When you configure two or more credentials at the same priority to spread rate-limit exposure, set `rotate_on_success=True`. Without it, one profile silently absorbs all traffic until it errors out. Rotation is scoped to the current top tier, so lower-priority profiles remain pure fallback.
   </Accordion>
 </AccordionGroup>
 
