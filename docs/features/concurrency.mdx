@@ -145,6 +145,40 @@ PraisonAI's concurrency controls at a glance:
 **Global cap across loops and threads.** Each agent's limit is backed by a loop-neutral `threading.Semaphore` keyed by agent name, so the configured cap holds across **every** event loop and thread. Sync and async callers share the **same** per-agent permit pool. Multi-loop / multi-thread deployments no longer crash with "bound to a different event loop". See [PR #5050](https://github.com/MervinPraison/PraisonAI/pull/5050).
 </Note>
 
+### Dynamic reconfiguration safety
+
+Since [PR #5258](https://github.com/MervinPraison/PraisonAI/pull/5258), `set_limit()` and `remove_limit()` are safe to call while permits are still outstanding. Each `acquire()` / `acquire_sync()` now returns the exact semaphore it obtained, and the matching `release()` frees that same instance — so a runtime cap change never redirects a release onto a fresh semaphore and never silently inflates the effective cap.
+
+Before the fix, calling `set_limit("agent", N)` or `remove_limit("agent")` while a permit was outstanding could permanently corrupt the cap: the outstanding release landed on a newer semaphore, which `threading.Semaphore` (unlike `BoundedSemaphore`) accepts without raising. From that point on the configured cap was meaningless and the drift was undetectable from the public API.
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Registry as ConcurrencyRegistry
+    participant S1 as Semaphore (old)
+    participant S2 as Semaphore (new)
+
+    Caller->>Registry: acquire("agent")
+    Registry->>S1: acquire permit
+    Registry-->>Caller: return S1 handle
+    Note over Registry,S2: set_limit("agent", N) mid-flight → S2 replaces S1
+    Caller->>Registry: release("agent")
+    Registry->>S1: release the acquired handle (S1), not S2
+    Note over S2: new cap stays intact — no silent inflation
+
+    classDef reg fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef old fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef new fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Registry reg
+    class S1 old
+    class S2 new
+```
+
+<Note>
+`release(name)` remains backward-compatible: passing only a name still works via a name-lookup fallback. The exact-handle path is used automatically when you release the pair returned by `acquire()` / `acquire_sync()`.
+</Note>
+
 ---
 
 ## Sync vs Async Rule
@@ -284,6 +318,15 @@ async def chat_endpoint(message: str):
         return {"response": response}
     finally:
         registry.release("chat_agent")
+```
+
+Calling `registry.set_limit("chat_agent", N)` again on a running server — a config reload or hot re-tune — is now correct even with requests in flight. Each in-flight request releases the exact semaphore it acquired, so the new cap takes effect for subsequent acquires without the old outstanding releases inflating it ([PR #5258](https://github.com/MervinPraison/PraisonAI/pull/5258)).
+
+```python
+@app.post("/admin/retune")
+async def retune(new_limit: int):
+    registry.set_limit("chat_agent", new_limit)  # safe with permits outstanding
+    return {"chat_agent_limit": new_limit}
 ```
 
 ### Async Context Manager Helper
