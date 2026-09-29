@@ -76,16 +76,17 @@ Each request resolves a per-request agent, resets its transcript, binds the sess
 sequenceDiagram
     participant Client
     participant AgentOS as AgentOS /chat
-    participant Helper as _clone_agent
+    participant Helper as bind_session
     participant Agent as Cloned Agent
 
     Client->>AgentOS: POST {message, session_id, agent_name?}
     AgentOS->>AgentOS: resolve template (name lookup or agents[0])
     AgentOS->>AgentOS: _supports_session_isolation(template) and no handoffs?
     alt Isolate
-        AgentOS->>Helper: _clone_agent(template)
-        Helper-->>AgentOS: clone
-        AgentOS->>Agent: chat_history=[], _session_id=session_id
+        AgentOS->>Helper: bind_session(clone, session_id)
+        Helper->>Agent: chat_history=[]  (must not raise)
+        Helper->>Agent: _session_id, _history_session_id
+        Helper-->>AgentOS: bound clone
         AgentOS->>Agent: achat(message)
         Agent-->>AgentOS: reply
     else Fall back
@@ -95,7 +96,7 @@ sequenceDiagram
     AgentOS-->>Client: {response, agent_name, session_id}
 ```
 
-The handler reuses the wrapper's existing helpers (`_supports_session_isolation`, `_clone_agent` from `praisonai.api.agent_invoke`) rather than reinventing cloning.
+The `/chat` handler and the `/invoke` router share one session-isolation contract: both call `_supports_session_isolation` → `_clone_agent` → `bind_session(agent, session_id)` from `praisonai.api.agent_invoke`. Any behaviour change to session binding lands in `bind_session()` and both surfaces pick it up together.
 
 ---
 
@@ -105,6 +106,7 @@ The handler reuses the wrapper's existing helpers (`_supports_session_isolation`
 |---------|-----------|
 | `session_id` supplied | Bound to `agent._session_id` (and `_history_session_id` when the attribute exists). Follow-up calls with the same id continue that conversation. |
 | `session_id` omitted / falsy | Both cleared to `None` on the clone — each such call is a fresh session, not a sticky default. |
+| Clone reset raises | HTTP 500 — the request is refused rather than delivering a clone that still holds the template's transcript. |
 | Any request | The response echoes the supplied `session_id` back verbatim. |
 
 The response model is unchanged: `{response, agent_name, session_id}`. Only the internal binding of `session_id` and the concurrency semantics changed.
@@ -116,6 +118,10 @@ An agent configured with `handoffs=[…]` is not cloned per request. It stays on
 <Note>
 If cloning fails, `/api/chat` returns HTTP `500` with detail `"Failed to isolate agent for session: {reason}"`. It is retry-safe and typically indicates a non-copyable custom object on the agent (e.g. a live socket).
 </Note>
+
+<Warning>
+`bind_session()` fails loudly. If the clone's `chat_history` setter raises (e.g. a custom `chat_history` backed by a locked store), the whole request returns HTTP `500` with detail `"Failed to isolate agent for session: Cannot reset chat_history for session isolation: ..."`. This is deliberate: silently continuing would leave the clone holding the template's previous transcript and leak it to whoever the incoming `session_id` belongs to. If you see this in production, replace the offending `chat_history` descriptor with a plain list assignment path.
+</Warning>
 
 ---
 
@@ -160,6 +166,10 @@ A `500 — Failed to isolate agent for session` means the clone step raised, usu
 
 <Accordion title="Isolation is in-process only">
 This clone model isolates concurrent in-process requests. It does not persist sessions across process restarts — use a session store backend for durable history.
+</Accordion>
+
+<Accordion title="Don't swap in a chat_history whose setter can raise">
+`bind_session()` treats a raised setter as a fatal cross-tenant hazard and refuses the request. If you attach a custom `chat_history` descriptor (e.g. one that locks a backing store on assignment), make its setter always succeed — either accept `[]` unconditionally or replace it with a plain attribute.
 </Accordion>
 </AccordionGroup>
 
