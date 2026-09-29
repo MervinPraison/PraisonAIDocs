@@ -115,7 +115,101 @@ agent = Agent(
 agent.start("Write a haiku about Python")
 ```
 </Step>
+
+<Step title="Per-agent event-hook isolation">
+Pass a private `HookRegistry()` so an agent's event hooks only fire on that agent:
+
+```python
+from praisonaiagents import Agent, HooksConfig
+from praisonaiagents.hooks import HookRegistry, HookEvent
+
+# Private registry — hooks registered here only fire on this agent.
+private = HookRegistry()
+
+@private.on(HookEvent.BEFORE_TOOL)
+def audit(event):
+    print(f"[secure-agent] tool: {event.tool_name}")
+    return event
+
+secure_agent = Agent(
+    name="SecureAgent",
+    instructions="Handle sensitive data.",
+    hooks=HooksConfig(registry=private),
+)
+
+other_agent = Agent(name="OtherAgent", instructions="Help with coding.")
+# other_agent uses the shared default registry — audit() never fires here.
+```
+
+Without `registry=`, every agent shares the process-wide default registry, so a `BEFORE_TOOL` hook registered for one agent fires on all of them. `registry=HookRegistry()` keeps them isolated. Available since PraisonAI [PR #5247](https://github.com/MervinPraison/PraisonAI/pull/5247).
+</Step>
 </Steps>
+
+---
+
+## Per-agent event-hook isolation
+
+Pick the widest scope that still keeps unrelated agents clean.
+
+```mermaid
+graph TB
+    Q{Do hooks apply to every agent?}
+    Q -->|Yes, global rule| A[add_hook / default registry]
+    Q -->|No, per agent| B{Different agents need different hooks?}
+    B -->|One shared set| C[HooksConfig middleware= / on_step]
+    B -->|Fully isolated| D[HooksConfig registry=HookRegistry]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q,B question
+    class A,C,D answer
+```
+
+A "SecureAgent" audits every tool call while a plain "HelperAgent" runs untouched — the audit hook fires only on the agent that owns the private registry.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant SecureAgent
+    participant HelperAgent
+    participant Audit as audit() (private registry)
+
+    User->>SecureAgent: "read the customer record"
+    SecureAgent->>Audit: BEFORE_TOOL(read_record)
+    Audit-->>SecureAgent: logged
+    User->>HelperAgent: "format this snippet"
+    Note over HelperAgent,Audit: HelperAgent uses the default<br/>registry — audit() never fires
+    HelperAgent-->>User: formatted snippet
+```
+
+```python
+from praisonaiagents import Agent, HooksConfig
+from praisonaiagents.hooks import HookRegistry, HookEvent
+
+private = HookRegistry()
+fired_on = []
+
+@private.on(HookEvent.BEFORE_TOOL)
+def audit(event):
+    fired_on.append(event.tool_name)   # only records SecureAgent's tools
+    return event
+
+secure_agent = Agent(
+    name="SecureAgent",
+    instructions="Handle sensitive data.",
+    hooks=HooksConfig(registry=private),
+)
+helper_agent = Agent(name="HelperAgent", instructions="Help with coding.")
+
+secure_agent.start("Read the customer record")
+helper_agent.start("Format this code snippet")
+# audit() recorded only SecureAgent's tools — HelperAgent never triggered it.
+```
+
+<Note>
+The default registry stays the fallback, so plugins bridged into it still fire on every agent. `registry=` only isolates the event hooks **you** register on that private registry.
+</Note>
 
 ---
 
@@ -392,6 +486,7 @@ agent = Agent(
 | `on_step` | `Callable \| None` | `None` | Observer called once per model call |
 | `on_tool_call` | `Callable \| None` | `None` | Observer called before each tool execution |
 | `middleware` | `List` | `[]` | Middleware list applied to all events |
+| `registry` | `HookRegistry \| None` | `None` | Private per-agent event-hook registry. When set, this agent's `BEFORE_TOOL` / `AFTER_AGENT` / … hooks only fire on this agent — they never leak onto unrelated agents that share the process-wide default registry. |
 
 <Note>
 `on_step` and `on_tool_call` are **observers**, wired into the same middleware chain that powers `middleware=[...]`:
@@ -623,6 +718,8 @@ See [Redact / Block Tool Output](/features/redact-tool-output) for the plugin-st
   </Accordion>
   <Accordion title="Use add_hook for global rules, HooksConfig for per-agent rules">
     `add_hook` registers hooks globally — all agents in the process obey them. Use `HooksConfig` when you need different rules per agent.
+
+    Prefer `HooksConfig(registry=HookRegistry())` when different agents in the same process need genuinely independent hook wiring — e.g. a security agent whose `BEFORE_TOOL` audit should never fire on unrelated agents. The default registry remains the fallback, so plugins bridged into it still fire. Available since PraisonAI [PR #5247](https://github.com/MervinPraison/PraisonAI/pull/5247).
   </Accordion>
   <Accordion title="Sequential for rewriters, parallel for observers">
     Parallel is the default and is faster. Only mark a hook `sequential=True` when it needs to mutate the payload via `modified_input`.
