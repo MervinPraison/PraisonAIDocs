@@ -1,0 +1,230 @@
+---
+title: "Gateway Cross-Replica Idempotency"
+sidebarTitle: "Cross-Replica Idempotency"
+description: "Exactly-once webhook admission across every gateway replica via a Redis-backed idempotency store"
+icon: "shield-check"
+---
+
+Turn on `store_backend: redis` and every replica of your gateway admits the same webhook exactly once, so a duplicate delivery never runs your agent twice.
+
+```mermaid
+graph LR
+    subgraph "Cross-Replica Idempotency"
+        W1[📥 Webhook<br/>replica A] --> R{🔐 reserve<br/>Redis SET NX PX}
+        W2[📥 Same webhook<br/>replica B] --> R
+        R -->|first claim| OK[✅ Admit · run once]
+        R -->|duplicate| DROP[🚫 Reject]
+    end
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef drop fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class W1,W2 input
+    class R process
+    class OK ok
+    class DROP drop
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Single replica — nothing to do">
+
+One gateway process dedups with the durable SQLite default. Nothing to set.
+
+```python
+from praisonaiagents import Agent
+from praisonai_bot.gateway import WebSocketGateway
+
+agent = Agent(name="Support", instructions="Help users")
+WebSocketGateway(agent=agent).start()   # store_backend defaults to durable sqlite
+```
+
+</Step>
+
+<Step title="Multiple replicas — set store_backend: redis">
+
+Two or more gateway processes need a shared claim so the same webhook fanned to both is admitted only once. Set it in `gateway.yaml` and make sure a Redis URL is configured — the store reuses the gateway's push `RedisConfig`.
+
+```yaml
+gateway:
+  push:
+    redis:
+      url: redis://localhost:6379   # reused for the idempotency store
+hooks:
+  idempotency:
+    store_backend: redis            # cluster-wide exactly-once admission
+  hooks:
+    - path: gmail
+      agent: assistant
+```
+
+</Step>
+
+<Step title="Or wire it in Python">
+
+Pass the same `store_backend` through the gateway's hooks config where you construct it.
+
+```python
+from praisonaiagents import Agent
+from praisonai_bot.gateway import WebSocketGateway
+
+agent = Agent(name="Support", instructions="Help users")
+
+gateway = WebSocketGateway(
+    agent=agent,
+    config={
+        "push": {"redis": {"url": "redis://localhost:6379"}},
+        "hooks": {"idempotency": {"store_backend": "redis"}},
+    },
+)
+gateway.start()
+```
+
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+Each replica claims the key `(platform, account, channel_id, message_id)` with a single `SET NX PX`; the first wins and the duplicate is rejected.
+
+```mermaid
+sequenceDiagram
+    participant A as Replica A
+    participant B as Replica B
+    participant Redis as Redis<br/>(key: hookidem:msg-42)
+
+    A->>Redis: SET NX PX (token=A, inflight lease)
+    Redis-->>A: OK — claim acquired (admit)
+    B->>Redis: SET NX PX (token=B, inflight lease)
+    Redis-->>B: nil — already claimed (reject duplicate)
+    A->>Redis: record (upgrade to "recorded", 24h TTL)
+    Note over A,Redis: A crashes before record?<br/>claim expires after the lease → provider retry re-runs
+```
+
+| Call | What it does | Atomicity |
+|------|--------------|-----------|
+| `reserve(key)` | Single `SET NX PX` — atomic claim + owner token + inflight-lease TTL (default 900s). Rejects a redelivery and a concurrent duplicate on another replica. | Native `SET NX PX` |
+| `record(key)` | Owner-checked upgrade to a long-lived `recorded` value (TTL 86400s / 24h). A late `record` from a replica whose lease expired is a no-op when another replica reclaimed the key. | Lua `EVAL`, with a `WATCH`/`MULTI` fallback |
+| `release(key)` | Compare-and-del on the owner token, so it never drops another replica's live claim. | Lua `EVAL`, with a `WATCH`/`MULTI` fallback |
+
+---
+
+## Fail-Open on Redis Outage
+
+The store never wedges inbound delivery — it degrades to best-effort and surfaces the fact, never a silent green.
+
+```mermaid
+graph TB
+    Set[⚙️ store_backend: redis] --> Build{🔍 Redis reachable<br/>at build time?}
+    Build -->|Yes| Live[🔐 RedisIdempotencyStore<br/>cluster-wide exactly-once]
+    Build -->|No — missing pkg / unreachable| SQ[🗄️ Durable SQLite fallback<br/>per-replica]
+    Live -->|drops later| RT[⚠️ Runtime outage<br/>admits · best-effort]
+    SQ --> Deg[⚠️ durability:idempotency<br/>degraded fact]
+    RT --> Deg
+    RT -->|recovers| Live
+
+    classDef op fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Set op
+    class Build check
+    class Live ok
+    class SQ store
+    class RT,Deg warn
+```
+
+Two failure modes, both surfaced under the `durability:idempotency` degraded owner:
+
+| Mode | When | Reason string | Recovery |
+|------|------|---------------|----------|
+| Build-time | The `redis` package is missing or Redis is unreachable at construction | `"redis idempotency backend not available (running per-replica)"` | Falls back to durable SQLite; clears when Redis is reachable on the next build / hot-reload |
+| Runtime | Redis was reachable at build but dropped later | `"redis idempotency backend unreachable at runtime (dedup best-effort until it recovers)"` | Admits (fails open); **auto-clears** on the next successful Redis op |
+
+<Warning>
+On a build-time fallback to SQLite, if a message is fanned to two replicas that do **not** share the SQLite state file, the agent turn can run twice. Watch `health()["degraded_owners"]` and restore Redis.
+</Warning>
+
+---
+
+## When to Enable
+
+```mermaid
+graph TB
+    Q{replicas > 1?}
+    Q -->|Yes| Redis[⚙️ store_backend: redis<br/>cluster-wide exactly-once]
+    Q -->|No| Default[🗄️ default durable sqlite]
+
+    classDef choice fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef redis fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef sql fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q choice
+    class Redis redis
+    class Default sql
+```
+
+---
+
+## Configuration Options
+
+The operator selects the backend and the store reuses the gateway's push `RedisConfig` — no separate idempotency Redis knob.
+
+| Option | Where | Purpose |
+|--------|-------|---------|
+| `store_backend` | `hooks.idempotency.store_backend` | Set to `redis` for cluster-wide exactly-once admission |
+| `url` | `push.redis.url` | Redis connection URL, reused by the store |
+| `host` / `port` / `db` / `password` | `push.redis.*` | Field-wise connection when no `url` is given |
+| `prefix` | `push.redis.prefix` | Namespaces keys as `{prefix}hookidem:{key}` so environments sharing one Redis do not collide |
+
+<Card title="Gateway Turn Lock" icon="lock" href="/features/gateway-turn-lock">
+  The sibling shared-state knob that wires the same `RedisConfig`.
+</Card>
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Enable the turn lock and idempotency together">
+For a multi-replica gateway, set both `turn_lock.backend: redis` and `hooks.idempotency.store_backend: redis` — one serialises a session's turns, the other admits each webhook exactly once.
+</Accordion>
+
+<Accordion title="Reuse the gateway's push RedisConfig">
+The store auto-shares `push.redis`. Configure Redis once; do not duplicate the connection for idempotency.
+</Accordion>
+
+<Accordion title="Watch for durability:idempotency">
+A `durability:idempotency` entry in `gateway doctor` / `GET /health` means dedup fell back or is best-effort. Alert on it the same way you alert on a degraded channel.
+</Accordion>
+
+<Accordion title="Enable it before raising the replica count">
+Switch to `store_backend: redis` before scaling past one replica, so a fanned-out webhook is deduped from the first extra pod.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Gateway Turn Lock" icon="lock" href="/features/gateway-turn-lock">
+  Sibling shared state — a distributed lease that serialises a session's turns.
+</Card>
+<Card title="Gateway State Durability" icon="database" href="/features/gateway-durability">
+  The default SQLite dedup path and the degraded surface it joins.
+</Card>
+<Card title="Gateway Inbound Hooks" icon="webhook" href="/features/gateway-inbound-hooks">
+  Where `store_backend` is configured on the inbound hook surface.
+</Card>
+<Card title="Degraded Capabilities" icon="stethoscope" href="/features/gateway-degraded-capabilities">
+  Where the `durability:idempotency` fact surfaces.
+</Card>
+</CardGroup>
