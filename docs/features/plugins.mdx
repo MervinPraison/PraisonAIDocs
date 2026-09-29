@@ -244,11 +244,31 @@ graph LR
     class TOOL,LLM process
 ```
 
+On Agent construction the plugin manager feeds more than the hook registry: a plugin declared `PluginType.GUARDRAIL` / `POLICY` / `SKILL` is routed into the Agent's typed subsystems — `GuardrailChain`, `PolicyEngine`, and `SkillManager` — via `_merge_plugin_subsystems()`:
+
+```mermaid
+graph TB
+    Mgr["🔌 PluginManager"] --> Hooks["🪝 Hook Registry<br/>(HOOK plugins)"]
+    Mgr --> GC["🛡️ GuardrailChain<br/>(GUARDRAIL plugins)"]
+    Mgr --> PE["📜 PolicyEngine<br/>(POLICY plugins)"]
+    Mgr --> SM["🧩 SkillManager<br/>(SKILL plugins)"]
+
+    classDef mgr fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef hook fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef sub fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Mgr mgr
+    class Hooks hook
+    class GC,PE,SM sub
+```
+
 | Plugin type | What it adds |
 |-------------|--------------|
-| **Tool** | Functions registered via `@tool` in a single-file plugin, **or** returned from `Plugin.get_tools()` (see [Tool Plugins](#tool-plugins-subclass-plugin-with-get-tools)) |
-| **Hook** | Lifecycle callbacks (`before_tool`, `before_tool_definitions`, `after_llm`, …) |
-| **Guardrail** | Output validation on `after_agent` |
+| **Tool** (`PluginType.TOOL`) | Functions registered via `@tool` in a single-file plugin, **or** returned from `Plugin.get_tools()` (see [Tool Plugins](#tool-plugins-subclass-plugin-with-get-tools)) |
+| **Hook** (`PluginType.HOOK`) | Lifecycle callbacks (`before_tool`, `before_tool_definitions`, `after_llm`, …) — the default type |
+| **Guardrail** (`PluginType.GUARDRAIL`) | An object returned from `Plugin.as_guardrail()` that joins the Agent's `GuardrailChain` — sees `validate_input` / `validate_output` / **`validate_tool_call`** / **`validate_tool_result`**, not just `after_agent`. See [Typed Plugins](#typed-plugins-guardrail--policy--skill). |
+| **Policy** (`PluginType.POLICY`) | `Policy` rules returned from `Plugin.get_policies()` and added to the Agent's `PolicyEngine`. See [Typed Plugins](#typed-plugins-guardrail--policy--skill). |
+| **Skill** (`PluginType.SKILL`) | Filesystem paths returned from `Plugin.get_skills()` and appended to the Agent's `_skills` so `SkillManager` discovers them as real, loadable `SKILL.md` skills. See [Typed Plugins](#typed-plugins-guardrail--policy--skill). |
 
 ---
 
@@ -556,6 +576,181 @@ discover_and_load_plugins()
 agent = Agent(name="Assistant", instructions="Help users")
 agent.start("Search for Python tutorials")
 ```
+
+---
+
+## Typed Plugins (Guardrail / Policy / Skill)
+
+Declaring `PluginInfo(plugin_type=PluginType.GUARDRAIL)` (or `POLICY` / `SKILL`) moves a plugin off the generic lifecycle-hook path and into the Agent's **typed subsystem**. A guardrail plugin then sees the raw tool call and the raw tool result — the blind spot the `after_llm` hook could never cover, because `after_llm` only ever saw the model's paraphrase.
+
+On `Agent.__init__`, right after `_setup_guardrail()` runs and `_skills` / `_policy` are set, `_merge_plugin_subsystems()` collects the typed plugins and folds them in:
+
+```mermaid
+sequenceDiagram
+    participant Plugin as GUARDRAIL Plugin
+    participant Mgr as PluginManager
+    participant Init as Agent.__init__
+    participant Chain as GuardrailChain
+    participant Tool
+
+    Plugin->>Mgr: as_guardrail() → PIIGuardrail()
+    Init->>Mgr: get_all_guardrails()
+    Mgr-->>Init: [PIIGuardrail()]
+    Init->>Chain: fold into GuardrailChain
+    Note over Init: chain appended to<br/>_tool_call_guardrails +<br/>_tool_result_guardrails
+    Tool-->>Chain: raw tool result "a SECRET value"
+    Chain-->>Tool: "a [REDACTED] value"
+```
+
+Each collector dispatches on the declared `plugin.info.plugin_type` and iterates **enabled** plugins only, snapshotting `(name, plugin)` pairs under the manager's lock:
+
+| Collector | Calls | Returns |
+|-----------|-------|---------|
+| `PluginManager.get_all_guardrails()` | `as_guardrail()` on every enabled `PluginType.GUARDRAIL` plugin | Non-`None` guardrail objects |
+| `PluginManager.get_all_skills()` | `get_skills()` on every enabled `PluginType.SKILL` plugin | Filesystem path strings |
+| `PluginManager.get_all_policies()` | `get_policies()` on every enabled `PluginType.POLICY` plugin | `Policy` objects |
+
+### Quick Start
+
+<Steps>
+<Step title="Guardrail plugin — redact a raw tool result">
+
+A `PluginType.GUARDRAIL` plugin returns a guardrail object from `as_guardrail()`. The object joins the Agent's `GuardrailChain` and sees `validate_tool_result` — the raw tool output, before the model paraphrases it.
+
+```python
+from praisonaiagents import Agent, Plugin, PluginInfo, PluginType
+from praisonaiagents.plugins import get_plugin_manager
+
+class PIIGuardrail:
+    """Sees the raw tool result, not the model's paraphrase."""
+    def validate_tool_result(self, tool_name, result, **kw):
+        if isinstance(result, str) and "SECRET" in result:
+            return True, result.replace("SECRET", "[REDACTED]")
+        return True, result
+
+class PIIGuardrailPlugin(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="pii_redactor",
+            plugin_type=PluginType.GUARDRAIL,   # the dispatch key
+        )
+    def as_guardrail(self):
+        return PIIGuardrail()
+
+get_plugin_manager().register(PIIGuardrailPlugin())
+get_plugin_manager().enable("pii_redactor")
+
+agent = Agent(name="Assistant", instructions="Help users.", llm="gpt-4o-mini")
+# The plugin's PIIGuardrail is now on agent._tool_result_guardrails.
+# Any tool that returns "a SECRET value" becomes "a [REDACTED] value"
+# before the model or the user ever sees it.
+```
+
+The same effect through `after_llm` (the pre-PR pattern) **could not intercept the raw tool result** — only the model's paraphrase — so a secret leaked whenever the model quoted a tool verbatim or a downstream tool consumed the raw output.
+
+</Step>
+
+<Step title="Policy plugin — add execution rules">
+
+A `PluginType.POLICY` plugin returns `Policy` objects from `get_policies()`. They are added to the Agent's `PolicyEngine` (one is created if the Agent has no `policy=`).
+
+```python
+from praisonaiagents import Agent, Plugin, PluginInfo, PluginType
+from praisonaiagents.plugins import get_plugin_manager
+from praisonaiagents.policy import Policy, PolicyRule, PolicyAction
+
+class NoDeletePlugin(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="no_delete", plugin_type=PluginType.POLICY)
+    def get_policies(self):
+        return [Policy(
+            name="no_delete",
+            rules=[PolicyRule(
+                action=PolicyAction.DENY,
+                resource="tool:delete_*",
+                reason="Delete operations blocked by plugin",
+            )],
+        )]
+
+get_plugin_manager().register(NoDeletePlugin())
+get_plugin_manager().enable("no_delete")
+
+agent = Agent(name="Assistant", instructions="Manage files safely.")
+# agent.policy now denies tool:delete_* before dispatch.
+agent.start("Please delete /etc/passwd")
+```
+
+</Step>
+
+<Step title="Skill plugin — contribute loadable skills">
+
+A `PluginType.SKILL` plugin returns filesystem path strings from `get_skills()`. They are appended to the Agent's `_skills` so `SkillManager` loads them as real `SKILL.md` skills.
+
+```python
+from praisonaiagents import Agent, Plugin, PluginInfo, PluginType
+from praisonaiagents.plugins import get_plugin_manager
+
+class PdfSkillPlugin(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="pdf_skill", plugin_type=PluginType.SKILL)
+    def get_skills(self):
+        return ["./skills/pdf-processing"]   # a dir containing SKILL.md
+
+get_plugin_manager().register(PdfSkillPlugin())
+get_plugin_manager().enable("pdf_skill")
+
+agent = Agent(name="PDF Assistant", instructions="You are a helpful assistant.")
+# ./skills/pdf-processing is now on agent._skills — discovered like a user-configured dir.
+agent.start("Extract the main findings from report.pdf")
+```
+
+</Step>
+</Steps>
+
+### Composition and precedence rules
+
+These rules are locked in by the PR's `TestPluginTypedSubsystems` suite:
+
+| Situation | Behaviour |
+|---|---|
+| Agent has no user guardrail; plugin guardrail exists | Plugin chain becomes the Agent's guardrail directly (`self.guardrail = chain`; `self._guardrail_fn = chain`). |
+| Agent has a user guardrail callable; plugin guardrail exists | Both run in composition: `GuardrailChain([_CallableGuardrailAdapter(user_fn), plugin_chain])`. Neither is dropped. |
+| Plugin guardrail's `validate_tool_call` / `validate_tool_result` | Appended to `_tool_call_guardrails` / `_tool_result_guardrails` — runs on **raw tool call args** and **raw tool results**, before the model paraphrases. |
+| User policy has a rule named `X`; plugin policy tries to add another `X` | Plugin's `X` is **skipped with a warning** — the user always wins. |
+| Plugin has two policies both named `X` | The **first** wins; the second is skipped with a warning. |
+| Plugin skill path is not a string | Skipped with a warning (`SkillManager` loads by path). |
+| Plugin skill path already in `_skills` | Silently de-duplicated on merge. |
+| A plugin raises inside `as_guardrail()` / `get_policies()` / `get_skills()` | Warning logged, other plugins keep loading, Agent construction succeeds — a fail-open per-plugin boundary. |
+| A plugin is **disabled** | Not collected — enabled-only iteration under the manager lock. |
+| A plugin is registered but not declared with the matching `PluginType` | Not collected — the collector dispatches on `plugin.info.plugin_type`. A `PluginType.HOOK` plugin returning an `as_guardrail()` object is ignored on the guardrail path. |
+
+### User Interaction Flow
+
+A PII guardrail plugin redacts a secret from the **raw** tool result — before the model or the user sees it:
+
+```
+$ python app.py
+User: fetch the demo token
+Agent → tool call: fetch_token()
+Tool  → "your token is SECRET-abc-123"    (raw)
+Guardrail chain (plugin) → "your token is [REDACTED]-abc-123"
+Agent → your token is [REDACTED]-abc-123
+```
+
+Before this wiring the redaction only ran on the model's final paraphrase; if the model quoted the tool verbatim, or a downstream tool used the raw result, the secret leaked.
+
+<Note>
+Each typed collector returns `[]` when no plugin declares the matching type, and each merge step early-outs — zero cost when unused. See [Guardrails from Plugins](/features/guardrails#guardrails-from-plugins), [Policies from Plugins](/features/policy-engine#policies-from-plugins), and [Skills from Plugins](/features/skills#skills-from-plugins) for how each subsystem receives the contribution.
+</Note>
+
+### Backward compatibility
+
+- Every new base method (`as_guardrail()`, `get_skills()`, `get_policies()`) is a **no-op by default** — existing `Plugin` subclasses that don't override them behave identically.
+- The default `PluginInfo.plugin_type` is `PluginType.HOOK`, so existing plugins that don't set the field are **not** collected by the typed collectors and keep routing through the generic lifecycle-hook path.
+- No new required parameters on `Agent(...)` or `Plugin(...)`.
 
 ---
 
