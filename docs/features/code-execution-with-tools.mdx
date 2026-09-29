@@ -164,23 +164,91 @@ sequenceDiagram
     participant Agent
     participant LLM
     participant Executor
-    participant ApprovalGate
+    participant PolicyGate as PolicyEngine + guardrails
+    participant Approval
     participant Tool
 
     User->>Agent: Request
     Agent->>LLM: Prompt with tool signatures
     LLM-->>Agent: Python script
-    Agent->>Executor: execute_code_with_tools(script, allowed_tools)
+    Agent->>Executor: execute_code_with_tools(script, allowed_tools, policy_hook)
     Executor->>Executor: Inject tool proxies into namespace
-    Executor->>ApprovalGate: tool call (e.g. fetch(url))
-    ApprovalGate-->>Executor: approved / PermissionError
-    Executor->>Tool: Call real tool function
+    Executor->>PolicyGate: policy_hook(name, kwargs)
+    PolicyGate-->>Executor: allow / rewrite / deny
+    Executor->>Approval: request_approval(name, effective_kwargs)
+    Approval-->>Executor: approved / modified_args
+    alt approval modified args
+        Executor->>PolicyGate: re-authorise on modified_args
+        PolicyGate-->>Executor: allow / deny
+    end
+    Executor->>Tool: call with final kwargs
     Tool-->>Executor: Result
     Executor-->>Agent: Final value only
     Agent-->>User: Response
 ```
 
-Intermediate tool results stay inside the executor and never re-enter the model's context.
+Intermediate tool results stay inside the executor and never re-enter the model's context. The `PolicyEngine + guardrails` step runs the **same** policy/guardrail chain as the normal tool-call loop — see [Same gates as direct tool calls](#same-gates-as-direct-tool-calls) below.
+
+---
+
+## Same gates as direct tool calls
+
+A code-mode tool call now goes through the **exact same** policy/guardrail chain as the normal tool-call loop. Before dispatch, the agent threads a `policy_hook` into every code-mode call that runs, in order:
+
+1. **`_check_permission_manager_deny`** — any `PermissionManager` / `PolicyEngine.check_tool(...)` deny-rule.
+2. **`_check_tool_policy_and_guardrails`** — agent-wide `guardrails=` on `Agent(...)` (the `_tool_call_guardrails` list) **and** per-tool `@tool(input_guardrails=[...])` / `@tool(output_guardrails=[...])`.
+3. **Approval gate** — `require_approval`, allow-lists, and `PRAISON_AUTO_APPROVE` on **each** call.
+
+Before this landed, only the approval gate ran on the code-mode path — a model could reach an allow-listed tool from a `code_mode="unsafe"` / `"isolated"` snippet and bypass a guardrail that blocks the same call on the direct path.
+
+### Before / after: a guardrail is no longer bypassable
+
+```python
+from praisonaiagents import Agent, ExecutionConfig
+from praisonaiagents.tools import tool
+
+def internal_recipients_only(arguments):
+    if not arguments.get("to", "").endswith("@corp.com"):
+        return False, "outside company domain"
+    return True, arguments
+
+@tool(input_guardrails=[internal_recipients_only])
+def send_email(to: str, body: str) -> str:
+    """Send an email."""
+    return f"sent to {to}"
+
+agent = Agent(
+    instructions="Send emails on request.",
+    tools=[send_email],
+    execution=ExecutionConfig(
+        code_execution=True,
+        code_mode="unsafe",     # or "isolated"
+        code_tools=True,
+        code_tools_allow=["send_email"],
+    ),
+)
+# A code-mode snippet calling send_email(to="attacker@evil.com", ...)
+# now raises PermissionError with "denied by policy: outside company domain".
+# Before the fix it silently ran the send.
+```
+
+### Guardrail rewrite is honoured
+
+A sanitising `input_guardrail` that **rewrites** arguments is applied to the actual tool call — the rewritten args are dispatched, not discarded. This works for both positional (`fetch("a")`) and keyword (`fetch(url="a")`) call forms, because positional args are bound to parameter names via `inspect.signature.bind_partial` before the hook runs.
+
+### Approval rewrite is re-authorised
+
+If the approval backend rewrites arguments (`decision.modified_args`), the policy/guardrail hook is **re-run** on the final args before dispatch — an approval rewrite cannot smuggle a call past an argument-scoped policy. This mirrors the direct path.
+
+<Note>
+**BYPASS mode carve-out.** In `Agent._is_bypass_mode()` the permission-deny gate is skipped (matching the direct path), so a call permitted directly is not rejected only in code mode. The tool-policy / guardrails gate still runs.
+</Note>
+
+<Note>
+**Backward compatibility.** Third-party `CodeToolBridge` transports whose `run_code()` predates the new `policy_hook=` kwarg keep working — the kwarg is only forwarded when set. Custom bridges gain the same gating if they thread the kwarg into their own `serve_tool_call(...)` calls.
+</Note>
+
+See [Per-Tool Guardrails](/features/per-tool-guardrails), [Guardrails](/features/guardrails), and the [Security](/security) advisory for the same fix from each angle.
 
 ---
 
@@ -311,7 +379,8 @@ Code mode is **opt-in** and requires an explicit allow-list. Tools not on the al
 
 - **Opt-in only** — `code_tools=False` by default; no tools are exposed unless you set `code_tools=True`.
 - **Explicit allow-list required** — `code_tools_allow=None` (the default) exposes zero tools. You must name each tool.
-- **Every tool-proxy call passes the approval gate** — the gate fires on **each** invocation, not once per run. `require_approval`, allow-lists, and `PRAISON_AUTO_APPROVE` env var all apply on every call the model's code makes.
+- **Same gates as direct tool calls** — every code-mode call runs the full policy/guardrail chain (`_check_permission_manager_deny` → `_check_tool_policy_and_guardrails` → approval), identical to the normal tool-call loop. Agent-wide `guardrails=`, per-tool `@tool(input_guardrails=/output_guardrails=)`, `PolicyEngine`, and `PermissionManager` deny-rules all apply. See [Same gates as direct tool calls](#same-gates-as-direct-tool-calls).
+- **Every tool-proxy call passes the approval gate** — the gate fires on **each** invocation, not once per run. `require_approval`, allow-lists, and `PRAISON_AUTO_APPROVE` env var all apply on every call the model's code makes. An approval that rewrites arguments is **re-authorised** through the policy/guardrail hook before dispatch.
 - **Approval is not sticky** — a single approval does not silently unlock later calls in the same script.
 - **Disallowed tool → `PermissionError`** — attempting to call a tool not on the allow-list raises `PermissionError`.
 - **Unregistered tool → `NameError`** — calling a name that isn't registered raises `NameError`.
@@ -354,11 +423,15 @@ sequenceDiagram
     User->>Agent: Request
     Agent->>LLM: Prompt with tool signatures
     LLM-->>Agent: Python script
-    Agent->>Bridge: execute_code_with_tools(script, bridge=...)
+    Agent->>Bridge: execute_code_with_tools(script, bridge=..., policy_hook=...)
     Bridge->>Child: run script in isolation
     Child->>Bridge: tool call (e.g. fetch(url))
-    Bridge->>Parent: serve_tool_call(name, args, allowed, registry)
+    Bridge->>Parent: serve_tool_call(name, args, allowed, registry, policy_hook)
+    Parent->>Parent: policy_hook (PolicyEngine + guardrails) → allow / rewrite / deny
     Parent->>Parent: allow-list + approval gate
+    alt approval modified args
+        Parent->>Parent: re-authorise policy_hook on modified_args
+    end
     Parent->>Tool: call real tool
     Tool-->>Parent: result
     Parent-->>Bridge: value
