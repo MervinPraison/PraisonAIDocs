@@ -1,12 +1,31 @@
 ---
 title: "Google Cloud Storage"
-description: "GCS for file storage"
+description: "Bucket-scoped state store for PraisonAI agents on GCS"
 icon: "cloud"
 ---
 
-# Google Cloud Storage
+Store agent state in a Google Cloud Storage bucket — cheap, durable, and fully wired to the `StateStore` contract.
 
-GCS for file-based storage.
+```mermaid
+graph LR
+    Agent[🤖 Agent] --> Config[⚙️ MemoryConfig<br/>db=gs://…]
+    Config --> Store[🗄️ GCSStateStore]
+    Store --> Bucket[✅ GCS Bucket]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Agent agent
+    class Config config
+    class Store store
+    class Bucket result
+```
+
+<Note>
+**GCS state store is fully functional as of PraisonAI PR [#5332](https://github.com/MervinPraison/PraisonAI/pull/5332).** Earlier releases raised `TypeError: Can't instantiate abstract class GCSStateStore with abstract methods expire, hdel, hget, hgetall, hset, keys, ttl` before any GCS call. `GCSStateStore` now implements the complete `StateStore` protocol.
+</Note>
 
 ## Setup
 
@@ -17,6 +36,11 @@ export GOOGLE_APPLICATION_CREDENTIALS=path/to/service-account.json
 
 ## Quick Start
 
+<Steps>
+<Step title="Enable via memory config">
+
+Point an agent at a bucket path — persistence is automatic.
+
 ```python
 from praisonaiagents import Agent
 
@@ -25,7 +49,7 @@ agent = Agent(
     instructions="You are a helpful assistant.",
     memory={
         "backend": "gcs",
-        "db": "gs://your-bucket/sessions",
+        "db": "gs://your-bucket/state",
         "session_id": "my-session"
     }
 )
@@ -33,3 +57,97 @@ agent = Agent(
 response = agent.start("Hello!")
 print(response)
 ```
+
+</Step>
+<Step title="Use the store directly">
+
+`GCSStateStore` now instantiates and covers the full `StateStore` protocol.
+
+```python
+from praisonai.persistence.state.gcs import GCSStateStore
+
+store = GCSStateStore(
+    bucket_name="your-bucket",
+    prefix="state/",
+    credentials_path="path/to/service-account.json",
+)
+
+store.set("user:42", {"name": "Ada", "plan": "pro"})
+print(store.get("user:42"))      # {'name': 'Ada', 'plan': 'pro'}
+print(store.keys("user:*"))      # ['user:42']
+store.close()
+```
+
+</Step>
+</Steps>
+
+---
+
+## Supported Operations
+
+`GCSStateStore` covers every method on the `StateStore` ABC end-to-end.
+
+| Op | Supported | Notes |
+|----|-----------|-------|
+| `get` / `set` / `delete` / `exists` | ✅ | Any JSON-native value (str/int/list/dict); scalars are wrapped internally so they round-trip. |
+| `keys(pattern="*")` | ✅ | Glob patterns via `fnmatch`. |
+| TTL: `set(..., ttl=seconds)`, `ttl(key)`, `expire(key, ttl)` | ✅ | Expired keys are lazily deleted on read. |
+| Hash ops: `hget` / `hset` / `hgetall` / `hdel` | ✅ | Read-modify-write of one JSON blob per key; not field-atomic. |
+| `close()` | ✅ | Closes the underlying `google-cloud-storage` client. |
+
+Scalars round-trip because non-dict values are wrapped internally as `{"__value__": ...}` and unwrapped on `get()`, so `set()` matches the ABC (`Any -> None`) and `get()` returns `Optional[Any]`. TTL expiry survives hash rewrites — `hset` / `hdel` / `expire` carry the existing expiry through the read-modify-write. `hdel` returns the count of fields actually removed; a failed rewrite reports `0` rather than falsely claiming success.
+
+<Warning>
+GCS hash ops are a read-modify-write of one JSON blob per key, **not field-atomic**. For high-contention field-level concurrency, prefer [Firestore](/databases/firestore) or Redis.
+</Warning>
+
+---
+
+## When to Choose GCS
+
+Pick GCS for cheap, bucket-scoped state on a Cloud Run or GKE deployment where you already have a bucket and want durable state without running a separate database.
+
+```mermaid
+graph TB
+    Q{High-contention<br/>hash updates?} -->|No| GCS[✅ GCS<br/>cheap bucket-scoped state]
+    Q -->|Yes| Other[⚠️ Firestore or Redis<br/>field-atomic updates]
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Q question
+    class GCS ok
+    class Other warn
+```
+
+Not the right tool for high-concurrency hash updates — reach for [Firestore](/databases/firestore) or Redis there.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+<Accordion title="Authenticate via GOOGLE_APPLICATION_CREDENTIALS">
+Set `GOOGLE_APPLICATION_CREDENTIALS` to your service-account JSON, or pass `credentials_path=` explicitly. On Cloud Run / GKE, the attached service account is picked up automatically.
+</Accordion>
+<Accordion title="Use a prefix per environment">
+Give each environment its own `prefix` (`prod/state/`, `staging/state/`) so keys never collide inside one bucket.
+</Accordion>
+<Accordion title="Don't hammer hash fields concurrently">
+Each `hset` / `hdel` rewrites the whole JSON blob for a key. Concurrent writers to different fields of the same key can lose updates — use Firestore or Redis for field-level concurrency.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="Firestore" icon="fire" href="/databases/firestore">
+  Field-atomic state store for high-concurrency updates.
+</Card>
+<Card title="Persistence Overview" icon="database" href="/persistence/overview">
+  How state, conversation, and knowledge stores fit together.
+</Card>
+</CardGroup>
