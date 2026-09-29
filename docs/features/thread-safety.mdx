@@ -61,6 +61,14 @@ sequenceDiagram
     Feature-->>Agent: Result    Agent-->>User: Response
 ```
 
+<Note>
+**`DualLock` real mutual exclusion (PraisonAI [PR #5338](https://github.com/MervinPraison/PraisonAI/pull/5338)):** `DualLock.sync()` and `DualLock.async_lock()` now back onto one shared `threading.Lock`, so a sync caller and a concurrent async caller are genuinely mutually exclusive. Same-thread `sync()` reentrancy is preserved via an explicit owner/depth guard, and the async acquire is offloaded to a worker thread so the event loop is never blocked while waiting for the mutex. Older releases used a `threading.RLock` for `sync()` and a per-event-loop `asyncio.Lock` for `async_lock()`, and the two never coordinated — upgrade to pick up the fix.
+</Note>
+
+<Note>
+`AsyncSafeState.async_lock()` and `__aenter__` now fail fast with `RuntimeError("Cannot access AsyncSafeState during synchronous deepcopy")` when a synchronous deepcopy is holding the mutex, instead of blocking on it — preserving the documented "deepcopy fences off async access" contract even under the shared mutex.
+</Note>
+
 
 ## Quick Start
 
@@ -283,7 +291,7 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 
 | Component | Lock Type | Reason |
 |-----------|-----------|--------|
-| `chat_history` | `AsyncSafeState` (DualLock: RLock + per-loop `asyncio.Lock`) | Re-entrant on same thread; non-blocking in async contexts |
+| `chat_history` | `AsyncSafeState` (DualLock: one shared `threading.Lock` for sync + async, [PR #5338](https://github.com/MervinPraison/PraisonAI/pull/5338)) | Genuine cross-context mutual exclusion; same-thread reentrant via owner/depth guard; async acquire offloaded so the event loop never blocks |
 | Handoff history seeding | per-target-agent `DualLock` attached lazily as `agent._handoff_seed_lock` | Serialises seed + chat per target agent so overlapping handoffs to one specialist can't interleave `chat_history` — see [Handoff seeding](#handoff-history-seeding) |
 | `_cache_lock` | `threading.RLock` | Allows reentrant access from cached helpers |
 | `PersistenceOrchestrator._cache_lock` | `threading.RLock` | Protects `_session_cache` reads/writes; the store is a bounded `OrderedDict` LRU (not a plain dict), and reads return `deepcopy()` to prevent shared mutable state |
@@ -461,31 +469,30 @@ async def main():
 PraisonAI's own fan-out (`PraisonAIAgents.arun_all_tasks`) uses `return_exceptions=True` internally, so it awaits every sibling to completion before re-raising the first exception. Your own `asyncio.gather` over your tasks still behaves the standard way (raise on first exception) unless you opt in with `return_exceptions=True`.
 </Note>
 
-<Warning>
-Since PR #1567, `DualLock.sync()` and `DualLock.async_lock()` use **independent** locks. A sync caller holding the lock will **not** block an async caller from acquiring it, and vice versa. Within a single context (all-sync or all-async) the lock works as expected; across contexts it does not coordinate. If you mutate `agent.chat_history` from both sync and async code paths, serialise the boundary yourself.
-</Warning>
+<Note>
+As of [PR #5338](https://github.com/MervinPraison/PraisonAI/pull/5338), `DualLock.sync()` and `DualLock.async_lock()` back onto **one shared `threading.Lock`**, so a sync caller and a concurrent async caller are genuinely mutually exclusive across contexts. Same-thread `sync()` reentrancy is preserved via an owner/depth guard, and async acquisition is offloaded to a worker thread so the event loop is never blocked. Older releases (PR #1567) used independent locks that did not coordinate across contexts.
+</Note>
 
 ```mermaid
 graph TB
     subgraph "Sync Context"
-        SyncCaller[👨‍💻 Sync Caller] --> SyncLock[🔒 threading.RLock]
-        SyncLock --> ChatHistory[💬 chat_history]
+        SyncCaller[👨‍💻 Sync Caller] --> SharedLock[🔒 shared threading.Lock]
     end
-    
+
     subgraph "Async Context"
-        AsyncCaller[🚀 Async Caller] --> AsyncLock[🔄 asyncio.Lock<br/>per event loop]
-        AsyncLock --> ChatHistory
+        AsyncCaller[🚀 Async Caller] --> Worker[🧵 Worker thread]
+        Worker --> SharedLock
     end
-    
-    SyncLock -.->|no cross-context<br/>coordination| AsyncLock
-    
+
+    SharedLock --> ChatHistory[💬 chat_history]
+
     classDef sync fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef async fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef shared fill:#10B981,stroke:#7C90A0,color:#fff
-    
-    class SyncCaller,SyncLock sync
-    class AsyncCaller,AsyncLock async
-    class ChatHistory shared
+
+    class SyncCaller sync
+    class AsyncCaller,Worker async
+    class SharedLock,ChatHistory shared
 ```
 
 An external lock **is** still useful for serialising chat-history mutations from a thread pool that mixes sync and async callers:
