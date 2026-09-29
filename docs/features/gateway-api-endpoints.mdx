@@ -92,7 +92,10 @@ sequenceDiagram
 | Surface | Method + Path | Notes |
 |---------|---------------|-------|
 | OpenAI chat | `POST /v1/chat/completions` | SSE streaming supported (`stream: true`); real `usage` returned; opt-in streamed usage via `stream_options.include_usage`; opt-in token-level `delta.content` frames via `gateway.api.stream` (default off keeps single-chunk buffered behaviour) |
-| OpenAI responses | `POST /v1/responses` | Accepts string or messages-style `input`; returns `usage` in Responses-native shape |
+| OpenAI responses (sync) | `POST /v1/responses` | Default — blocks for the whole turn; accepts string or messages-style `input`; returns `status: "completed"` with `usage` in Responses-native shape |
+| OpenAI responses (async) | `POST /v1/responses` with `background: true` or `store: true` | Returns `202` immediately with `status: "queued"` and a persisted `id` |
+| OpenAI response retrieve | `GET /v1/responses/{id}` | Fetches the current status + output of a background/stored run |
+| OpenAI response cancel | `POST /v1/responses/{id}/cancel` | Stops an in-flight background run cooperatively |
 | OpenAI models | `GET /v1/models` | Lists gateway-registered agent IDs |
 | MCP JSON-RPC | `POST /mcp` | Methods: `initialize`, `tools/list`, `tools/call` |
 
@@ -108,6 +111,163 @@ reply = client.chat.completions.create(
 )
 print(reply.choices[0].message.content)
 ```
+
+---
+
+## Background Runs
+
+Submit long agent turns in the background, retrieve the result by id, and cancel in-flight runs — over the same OpenAI-compatible surface.
+
+```mermaid
+graph LR
+    subgraph "Background Response Lifecycle"
+        Submit[📝 POST /v1/responses<br/>background: true] -->|202 queued| Store[💾 Response<br/>store]
+        Store --> Poll[🔍 GET /v1/responses/id]
+        Poll -->|status: completed| Result[✅ output_text]
+        Store --> Cancel[⏹ POST cancel]
+        Cancel -->|status: cancelled| Result
+    end
+
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef store fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef cancel fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Submit,Poll request
+    class Store store
+    class Result result
+    class Cancel cancel
+```
+
+The synchronous path is unchanged and remains the default — omit `background` and `store` to keep the exact previous behaviour.
+
+### Which mode fits
+
+```mermaid
+graph TB
+    Q1{Turn takes<br/>&lt; 30 seconds?}
+    Q1 -->|Yes| Sync[POST /v1/responses<br/>omit background/store]
+    Q1 -->|No| Q2{Client can<br/>reconnect?}
+    Q2 -->|Yes| Async[POST /v1/responses<br/>background: true]
+    Q2 -->|No| Store[POST /v1/responses<br/>store: true<br/>keeps result retrievable]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef choice fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q1,Q2 question
+    class Sync,Async,Store choice
+```
+
+### Quick Start
+
+<Steps>
+<Step title="Submit in the background">
+```python
+import requests
+
+resp = requests.post(
+    "http://127.0.0.1:8765/v1/responses",
+    headers={"Authorization": "Bearer gateway-token"},
+    json={"model": "assistant", "input": "Write me a long essay", "background": True},
+)
+run_id = resp.json()["id"]
+print(resp.status_code, resp.json()["status"])   # 202 queued
+```
+</Step>
+
+<Step title="Poll until terminal">
+```python
+import time, requests
+
+while True:
+    got = requests.get(
+        f"http://127.0.0.1:8765/v1/responses/{run_id}",
+        headers={"Authorization": "Bearer gateway-token"},
+    ).json()
+    if got["status"] in ("completed", "cancelled", "failed"):
+        break
+    time.sleep(2)
+print(got["output_text"])
+```
+</Step>
+
+<Step title="Cancel if needed">
+```python
+import requests
+
+requests.post(
+    f"http://127.0.0.1:8765/v1/responses/{run_id}/cancel",
+    headers={"Authorization": "Bearer gateway-token"},
+)
+```
+</Step>
+</Steps>
+
+### User Flow
+
+```mermaid
+sequenceDiagram
+    participant App as App / Backend
+    participant GW as Gateway (/v1/responses)
+    participant Agent as Live agent
+
+    App->>GW: POST /v1/responses {background: true}
+    GW-->>App: 202 {id: resp-..., status: queued}
+    GW->>Agent: Spawn asyncio.Task
+    App->>GW: GET /v1/responses/{id}
+    GW-->>App: {status: in_progress}
+    Agent-->>GW: Turn complete
+    App->>GW: GET /v1/responses/{id}
+    GW-->>App: {status: completed, output_text: "..."}
+
+    Note over App,GW: Or cancel:
+    App->>GW: POST /v1/responses/{id}/cancel
+    GW->>Agent: InterruptController.request("cancel")
+    GW-->>App: {status: cancelled}
+```
+
+### Status Vocabulary
+
+| Status | Meaning |
+|--------|---------|
+| `queued` | Submitted; the driving task has not started yet (immediately after `202`) |
+| `in_progress` | Task is running the agent turn |
+| `completed` | Turn finished; `output`, `output_text`, `usage` are populated |
+| `cancelled` | The run's cancel route (or task cancel) fired before completion |
+| `failed` | The turn raised an exception, or the admission gate rejected it (`error.message` explains) |
+
+A `completed` response always carries an assistant message (even with empty `text`), so a client reading `output[0]` keeps working. Polling the same completed response returns the same `output[0].id` each time.
+
+### Response Object
+
+```json
+{
+  "id": "resp-<hex>",
+  "object": "response",
+  "created_at": 1727612345,
+  "model": "<agent_id>",
+  "status": "queued|in_progress|completed|cancelled|failed",
+  "output": [
+    { "id": "msg-<hex>", "type": "message", "role": "assistant",
+      "content": [{"type": "output_text", "text": "..."}] }
+  ],
+  "output_text": "...",
+  "usage": { "input_tokens": 0, "output_tokens": 0, "total_tokens": 0 },
+  "error": { "message": "..." }
+}
+```
+
+The `error` block appears only when `status` is `failed`. A `GET` on an unknown id returns `404` with `{"error": {"type": "invalid_request_error", "message": "No such response: resp-…"}}`.
+
+<Note>
+When the caller uses a stable identity (a bearer token, or an `OpenAI-Session` / `X-Session-Id` header), only that caller can retrieve or cancel their own background runs. A different token receives `404` (not `403`, to avoid leaking id existence). Anonymous callers on auth-disabled gateways are looked up by id alone — the same open posture that applies to every `/v1/*` route without auth.
+</Note>
+
+<Warning>
+Background responses live in a bounded in-process store (cap: 1024 entries). When full, the oldest terminal entry (completed/cancelled/failed) is evicted first; in-flight runs are never evicted. Results do not survive a gateway restart — this is intentional for now; durable cross-restart persistence is tracked separately.
+</Warning>
+
+Both new routes go through the same `_api_guarded` wrapper as `POST /v1/responses` (gated by `gateway.auth_token`) and only mount when `gateway.api.openai = true`.
 
 ---
 
@@ -317,6 +477,18 @@ Pass `stream_options={"include_usage": True}` when using `stream=True` if your c
 
 <Accordion title="Usage is per-turn, even under concurrent sessions">
 The gateway snapshots the agent's per-turn token metrics in the same execution context that produced the reply, so a `usage` field returned to one caller cannot be corrupted by a concurrent turn on the same shared agent. No configuration required.
+</Accordion>
+
+<Accordion title="Run long turns in the background">
+Any turn that could exceed the client's HTTP timeout is a candidate. `POST /v1/responses` with `background: true` returns a persisted id in ~milliseconds; poll `GET /v1/responses/{id}` at a comfortable interval (2–5s) until `status` is terminal. If the caller loses connectivity, the run keeps going and the result is still retrievable by id (subject to the in-process store cap).
+</Accordion>
+
+<Accordion title="Set a bearer token to scope background runs">
+Owner-scoped retrieval only kicks in when the caller has a stable identity. Anonymous callers on auth-disabled gateways are looked up by id alone. Set `gateway.auth_token` in any deployment where multiple clients share the same gateway.
+</Accordion>
+
+<Accordion title="Cancel is cooperative">
+`/cancel` fires the same interrupt seam as the WebSocket `/stop` path — the agent checks it at its own checkpoints and stops between LLM calls / tool calls. A tight, non-yielding loop inside a tool won't stop until it yields; the task-cancel fallback covers most cases but not synchronous CPU-bound work.
 </Accordion>
 </AccordionGroup>
 
