@@ -265,9 +265,41 @@ Internal caches use `threading.RLock` for reentrant locking:
 
 Telemetry counting is thread-safe as of PraisonAI [#4235](https://github.com/MervinPraison/PraisonAI/pull/4235): the re-entrancy guard is a per-agent `contextvars.ContextVar`, so concurrent `chat()`/`run()`/`start()` calls on one shared agent are each counted independently. See [Telemetry — Concurrent-execution accuracy](/features/telemetry#concurrent-execution-accuracy).
 
-### LLM Token Attribution
+### Concurrent token/cost attribution on a shared LLM (PraisonAI #5233)
 
-`LLM.current_agent_name` is task-local via a `contextvars.ContextVar` as of PR [#5357](https://github.com/MervinPraison/PraisonAI/pull/5357) (issue #5052). Sharing one `LLM` instance across concurrent agents is safe — each reads its own agent name, so token attribution never clobbers across a concurrent completion. See [Token Tracking → Multi-agent breakdown](/features/token-tracking).
+A single `LLM` instance can back two `Agent`s (`Agent(llm=shared_llm)` on both). Under `PraisonAIAgents.arun_all_tasks` those tasks are dispatched via `asyncio.gather` on one thread — so before this fix, task A's `set_current_agent("Researcher")` was overwritten by task B's `set_current_agent("Writer")` on the **same** LLM object, and when A's awaited response returned it read `"Writer"`. A's tokens got attributed to B in the collector's `by_agent` map.
+
+`LLM.current_agent_name` is now backed by a per-instance `contextvars.ContextVar` (`self._current_agent_name_var`), exposed via a backward-compatible property + `set_current_agent()` method. `asyncio.gather` copies the context per task at dispatch time, so each concurrently-gathered coroutine keeps its own value across the `await`. This guarantee was further extended in PR [#5357](https://github.com/MervinPraison/PraisonAI/pull/5357).
+
+Per-instance (not class-level) is deliberate: two distinct `LLM` instances — including an original and its `copy.deepcopy` clone — must keep independent attribution state within the same context, otherwise the last writer's agent name would leak across LLMs. (Same reasoning as `_tools_scope_depths` in `agents/agents.py`.)
+
+**User impact:** no API change. If you use the `Agent(llm=shared_llm)` pattern (single `LLM` object shared across a team), your per-agent `by_agent` totals in `get_token_collector().get_session_summary()` and `PraisonAIAgents.get_token_usage_summary()` are now correct under concurrent execution.
+
+```python
+from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents.llm import LLM
+
+# One LLM instance shared across two agents
+shared_llm = LLM(model="gpt-4o-mini")
+
+researcher = Agent(name="Researcher", llm=shared_llm, instructions="Research the topic")
+writer     = Agent(name="Writer",     llm=shared_llm, instructions="Write from the research")
+
+r = Task(name="research", description="Research quantum computing", agent=researcher, async_execution=True)
+w = Task(name="write",    description="Write an article",           agent=writer,     async_execution=True, context=[r])
+
+team = PraisonAIAgents(agents=[researcher, writer], tasks=[r, w])
+team.start()  # arun_all_tasks under the hood — concurrent asyncio.gather
+
+# by_agent now correctly attributes tokens to Researcher vs Writer
+print(team.get_token_usage_summary()["by_agent"])
+```
+
+See also [Token Tracking — Multi-agent breakdown](/features/token-tracking#multi-agent-breakdown).
+
+<Note>
+**Fix reference:** [PraisonAI PR #5233](https://github.com/MervinPraison/PraisonAI/pull/5233), fixes [#5052](https://github.com/MervinPraison/PraisonAI/issues/5052). Extended in PR [#5357](https://github.com/MervinPraison/PraisonAI/pull/5357).
+</Note>
 
 ## LiteAgent Thread Safety
 
