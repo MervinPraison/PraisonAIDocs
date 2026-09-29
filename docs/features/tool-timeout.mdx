@@ -208,6 +208,63 @@ Read-only names such as `read_file`, `web_search`, and `search_memory` already s
 
 ---
 
+## `AgentsGenerator` is a closable resource
+
+The wrapper-level tool-timeout guard runs inside an `AgentsGenerator`, and closing that generator closes its worker pool permanently.
+
+That generator owns a `ThreadPoolExecutor` for sync tool workers. A tool invoked after `close()` no longer silently resurrects the pool — it raises an actionable `RuntimeError` naming the fix.
+
+Prefer the context-manager form so cleanup is not conditional:
+
+```python
+from praisonai.agents_generator import AgentsGenerator
+
+with AgentsGenerator(agent_file="agents.yaml", framework="praisonai", config_list=cfg) as gen:
+    gen.generate_crew_and_kickoff()
+# Pool is torn down here. A tool held past this line raises RuntimeError.
+```
+
+If a background hook, framework lifecycle callback, or shared registry keeps a wrapped tool alive past the `with … as gen:` block, invoking it now raises:
+
+```text
+RuntimeError: AgentsGenerator is closed; refusing to construct a new tool-timeout executor. This tool was invoked after close(); hold a live generator (e.g. keep the `with ... as gen:` block open) for the lifetime of any tool it wraps.
+```
+
+<Note>
+**Why this changed (PR #5260).** Previously `close()` cleared the executor slot but left ownership as `True` and no `_closed` flag, so a background invocation rebuilt an **unowned** daemon-thread pool and leaked its threads per request in `praisonai serve`. The generator now permanently refuses resurrection.
+</Note>
+
+### Concurrent recycle races are absorbed
+
+A concurrent recycle can shut the captured pool down between capture and submit, or cancel a queued future before it runs. The wrapper now retries once against a freshly-minted pool. A **second** failure surfaces as `ToolTimeoutError` (with `background_work_may_continue=False` when the tool never executed), preserving the module contract so `RuntimeError` / `CancelledError` never leak to caller code.
+
+```mermaid
+graph TB
+    Call[🛠️ Sync tool call] --> Cap[Capture pool]
+    Cap --> Submit{submit?}
+    Submit -->|OK| Run[▶️ Run tool]
+    Submit -->|RuntimeError<br/>or CancelledError| Retry[Retry against fresh pool]
+    Retry --> Submit2{submit?}
+    Submit2 -->|OK| Run
+    Submit2 -->|Fails again| Timeout[⏱️ ToolTimeoutError]
+    Run --> Result[✅ result]
+
+    classDef req fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+    class Call req
+    class Cap,Retry,Submit,Submit2 proc
+    class Run,Result ok
+    class Timeout warn
+```
+
+<Note>
+There are two `ToolTimeoutError` classes: the executor-level `praisonaiagents.tools.ToolTimeoutError` (in the reference table below) and the wrapper-level `praisonai.agents_generator.ToolTimeoutError`. The wrapper-level `ToolTimeoutError` is now also raised when a concurrent pool recycle exhausts the single retry attempt — see **`AgentsGenerator` is a closable resource** above.
+</Note>
+
+---
+
 ## `error_kind` Reference
 
 `ToolResult.error_kind` is a discriminated tag; `ToolResult.structured_error` is `None` on success and a discriminated dict on failure.
