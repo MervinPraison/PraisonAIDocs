@@ -150,6 +150,7 @@ Two distinct concepts affect whether an AutoGen-family adapter will actually wor
 |---|---|
 | "Is the underlying package importable?" | `is_available("autogen")` from `_framework_availability` |
 | "Will calling `adapter.run(...)` actually work?" | `AutoGenV4Adapter().is_available()` (folds `implemented` flag) |
+| "Is the adapter usable *right now*?" | `get_default_registry().is_available("<name>")` — folds in `implemented` markers AND applies the transient-failure TTL |
 
 For AutoGen v0.4 and AG2 today: the package may import successfully, but the adapter still reports `False` because `implemented = False`. This is the safety-by-default behaviour added in PR #2086.
 
@@ -188,7 +189,9 @@ if is_available("ag2"):
 
 ---
 
-## Cache Management
+## Cache Management (module-level probes)
+
+These semantics apply to `praisonai._framework_availability.is_available()` — the low-level, per-package probe. The higher-level `FrameworkAdapterRegistry.is_available()` used by `pick_default()` and `list_available_frameworks()` follows the TTL rules in the next section.
 
 Results are cached indefinitely until explicitly invalidated:
 
@@ -207,6 +210,54 @@ result3 = is_available("crewai")  # Slow: re-checks import
 
 # Invalidate entire cache
 invalidate()  # Clear all cached results
+```
+
+---
+
+## Cache Management (adapter registry)
+
+`FrameworkAdapterRegistry.is_available(name)` uses a two-tier cache designed to survive transient boot-time flakes without permanently hiding a framework:
+
+| Probe outcome | Cache lifetime | Reason |
+|---|---|---|
+| Returned `True` | Whole process | The framework is installed; nothing will change until restart. |
+| Raised `ImportError` / `ValueError` / `TypeError` | Whole process | Structural — the optional dep is not installed. |
+| Raised any other exception | 60 s (`_NEG_CACHE_TTL`) | Transient — a racing entry-point scan, a boot-time network probe timeout, an in-flight config write. The next call after the TTL reprobes. |
+
+```mermaid
+graph TB
+    Probe[🔬 registry.is_available] --> Result{Outcome?}
+    Result -->|True| Perm1[💾 Cache for process]
+    Result -->|ImportError / ValueError / TypeError| Perm2[💾 Cache for process]
+    Result -->|Other exception| TTL[⏱️ Cache 60 s then reprobe]
+    Perm1 --> Return[✅ Return]
+    Perm2 --> Return
+    TTL --> Return
+
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef ttl fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Probe process
+    class Result decision
+    class Perm1,Perm2 result
+    class TTL ttl
+    class Return result
+```
+
+The TTL is anchored to *after* the probe returns, so a probe that itself blocks for ≥ 60 s does not write an already-expired deadline. Call `registry.invalidate_availability(name)` (or with no argument) to force a reprobe sooner.
+
+```python
+from praisonai.framework_adapters import get_default_registry
+
+registry = get_default_registry()
+
+# Transient probe failure at boot: next call after ~60s will reprobe automatically.
+available = registry.is_available("crewai")
+
+# Or force an immediate reprobe:
+registry.invalidate_availability("crewai")
 ```
 
 ---
