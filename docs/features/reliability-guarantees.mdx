@@ -35,6 +35,13 @@ Long tool-using conversations and mixed async task batches used to fail in three
 - A tool returning a non-JSON-serializable value (`set`, `datetime`, `bytes`, custom class) no longer raises `TypeError` and kills the turn.
 </Note>
 
+<Note>
+**Behaviour changes (PraisonAI PR #5233).** Two silent data-correctness defects are fixed automatically by upgrading:
+
+- **Streaming tool serialization:** a streaming tool call that succeeds but returns a non-JSON-serializable value (`datetime`, `set`, `bytes`, DataFrame, custom class) is no longer mislabelled `"Error executing function: ..."` to the model. It now stringifies into `{"result": "..."}` — parity with the sync/async loops' `except (TypeError, ValueError)` fallback. Real tool execution failures still surface as `{"error": str(e)}` on the streaming path.
+- **Concurrent token/cost attribution on a shared LLM:** two `Agent`s sharing one `LLM` instance (`Agent(llm=shared_llm)`) executed concurrently via `PraisonAIAgents.arun_all_tasks` (which dispatches with `asyncio.gather`) no longer swap each other's `current_agent_name` mid-await. `LLM.current_agent_name` is now backed by a per-instance `contextvars.ContextVar` — each gathered task keeps its own value across the `await`, so tokens are attributed to the agent that actually spent them. See [Thread-Safe Agent State — Concurrent token/cost attribution on a shared LLM](/features/thread-safety#concurrent-tokencost-attribution-on-a-shared-llm-praisonai-5233).
+</Note>
+
 ```python
 from praisonaiagents import Agent, Task, PraisonAIAgents
 
@@ -68,7 +75,7 @@ graph LR
         C[Window trim] --> D[Tool-call ↔ tool-result pair preserved]
         E[Async batch dependency] --> F[Dependency flushed before dependent]
         G[Async turn failure] --> H[chat_history rolled back to pre-turn snapshot]
-        I[Tool returns non-serializable value] --> J[Fed to model as str(value), turn continues]
+        I[Tool returns non-serializable value] --> J[Fed to model as str value on every path incl. streaming, turn continues]
         K[Tool returns list-of-errors] --> L[Surfaced as role=tool error on every path]
     end
 
@@ -250,7 +257,7 @@ The uniform behaviour is:
 
 - A tool returning `[{"error": "..."}]` is **always** surfaced as an error to the model.
 - The error sentence is the same everywhere: `Error: <msg>. Please inform the user that the operation could not be completed.`
-- A non-JSON-serializable value (`set`, `datetime`, `bytes`, custom class) falls back to `str(result)` instead of raising `TypeError`.
+- A non-JSON-serializable value (`set`, `datetime`, `bytes`, DataFrame, custom class) falls back to a stringified result instead of raising `TypeError` — on **every** path, including streaming (since PR #5233).
 
 | Execution path | Coverage |
 |---|---|
@@ -258,10 +265,12 @@ The uniform behaviour is:
 | Sync batch (non-Ollama) | Same message; list-error surfaced; non-serializable safe |
 | Async sequential | Same message; **list-error now surfaced** (previously dumped as data); non-serializable safe |
 | Async batch (non-Ollama) | Same message; list-error surfaced; non-serializable safe |
-| Streaming | Unchanged behaviour — already the reference implementation |
+| Streaming | Non-serializable safe (PR #5233); real execution failures still surfaced as `{"error": ...}` |
 | Ollama (`OllamaAdapter`) | Intentional divergence: `role: "user"`, natural-language shape |
 
 The Ollama path keeps its natural-language `role: "user"` shape — the one genuine divergence, unchanged.
+
+Before PR #5233 the streaming path did **not** have this parity. `chat_completion_with_tools_stream` wrapped tool *execution* and JSON *serialization* in one `try` with a single generic `except Exception`, so a tool that **succeeded** but returned a `datetime`, `set`, `bytes`, DataFrame, or custom object was reported to the model as `"Error executing function: <TypeError…>"`. PR #5233 splits execution and serialization into two `try` blocks: the serialization block uses the same `except (TypeError, ValueError)` fallback the sync/async loops already used and stringifies into `{"result": "..."}`. A tool that genuinely raises still surfaces as `{"error": str(e)}` — the split does not swallow real failures.
 
 ### Tool-pair-safe window trim
 
