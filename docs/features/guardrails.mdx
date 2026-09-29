@@ -856,6 +856,78 @@ sequenceDiagram
 
 ---
 
+## Guardrails from Plugins
+
+A plugin declared `PluginType.GUARDRAIL` that returns an object from `as_guardrail()` **automatically** joins the Agent's `GuardrailChain` — no `guardrails=` parameter, no `plugins.enable()` call beyond registering and enabling the plugin. The plugin's guardrail sees the **full** `GuardrailProtocol` surface, including `validate_tool_call` and `validate_tool_result` — the same tool-surface hooks a user-passed `GuardrailProtocol` object gets.
+
+```python
+from praisonaiagents import Agent, Plugin, PluginInfo, PluginType
+from praisonaiagents.plugins import get_plugin_manager
+
+class PIIGuardrail:
+    def validate_tool_result(self, tool_name, result, **kw):
+        if isinstance(result, str) and "SECRET" in result:
+            return True, result.replace("SECRET", "[REDACTED]")
+        return True, result
+
+class PIIGuardrailPlugin(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="pii_redactor", plugin_type=PluginType.GUARDRAIL)
+    def as_guardrail(self):
+        return PIIGuardrail()
+
+get_plugin_manager().register(PIIGuardrailPlugin())
+get_plugin_manager().enable("pii_redactor")
+
+agent = Agent(name="Assistant", instructions="Help users.", llm="gpt-4o-mini")
+# No guardrails= needed — the plugin's guardrail is folded into agent.guardrail
+# and appended to agent._tool_result_guardrails on construction.
+```
+
+On `Agent.__init__`, `_merge_plugin_subsystems()` calls `PluginManager.get_all_guardrails()`, wraps the returned objects in a `GuardrailChain`, and appends that chain to the `_tool_call_guardrails` / `_tool_result_guardrails` lists the runtime iterates:
+
+```mermaid
+graph LR
+    In["📥 Input"] --> VIn{"🛡️ validate_input"}
+    VIn -->|allow| Agent["🤖 Agent"]
+    Agent --> VTC{"🛡️ validate_tool_call"}
+    VTC -->|allow| Tool["🔧 Tool"]
+    Tool --> VTR{"🛡️ validate_tool_result"}
+    VTR -->|allow / redact| Agent
+    Agent --> VOut{"🛡️ validate_output"}
+    VOut -->|allow| Out["📤 Output"]
+
+    Plugin["🔌 GUARDRAIL plugin<br/>as_guardrail()"] -.->|folded into chain| VTC
+    Plugin -.->|folded into chain| VTR
+
+    classDef guard fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef node fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef plugin fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class VIn,VTC,VTR,VOut guard
+    class In,Out,Agent node
+    class Tool tool
+    class Plugin plugin
+```
+
+### Composition with a user guardrail
+
+When `Agent(guardrails=user_fn)` and a plugin guardrail both exist, **both** run — the user's callable is wrapped in a `_CallableGuardrailAdapter` and chained with the plugin chain (`GuardrailChain([user_adapter, plugin_chain])`). Neither is silently dropped.
+
+| Situation | Behaviour |
+|---|---|
+| No user guardrail; plugin guardrail exists | Plugin chain becomes the Agent's guardrail directly (`self.guardrail = chain`). |
+| User guardrail callable; plugin guardrail exists | Composed: `GuardrailChain([_CallableGuardrailAdapter(user_fn), plugin_chain])`. |
+| Plugin declared `PluginType.HOOK` (not `GUARDRAIL`) | Not collected — `as_guardrail()` output is ignored on the guardrail path. |
+| Plugin disabled | Not collected — enabled-only iteration under the manager lock. |
+| `as_guardrail()` raises | Warning logged, other plugins keep loading, Agent construction succeeds. |
+
+See [Typed Plugins (Guardrail / Policy / Skill)](/features/plugins#typed-plugins-guardrail--policy--skill) for the full plugin-side reference.
+
+---
+
 ## Configuration Options
 
 <Card title="GuardrailConfig SDK Reference" icon="code" href="/sdk/reference/praisonaiagents/modules/feature_configs">
