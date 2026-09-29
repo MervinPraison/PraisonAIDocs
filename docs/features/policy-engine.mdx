@@ -180,6 +180,129 @@ An explicit `ALLOW` rule at higher priority still wins — a deny does not silen
 
 ---
 
+## Network egress
+
+Gate outbound requests by destination host using `check_network()` and the `create_network_policy()` preset.
+
+```mermaid
+graph LR
+    Agent[🤖 Agent] --> Engine[🛡️ PolicyEngine]
+    Engine --> Net["check_network(host)"]
+    Net -->|deny| Block[🚫 Blocked]
+    Net -->|allow| Out[🌐 Request sent]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef policy fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef deny fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Agent agent
+    class Engine,Net policy
+    class Out result
+    class Block deny
+```
+
+Attach a network policy, then consult the engine before any outbound call:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.policy import PolicyEngine, create_network_policy
+
+engine = PolicyEngine()
+engine.add_policy(create_network_policy(
+    allow_hosts=["api.mycorp.com", "*.docs.mycorp.com"],
+    deny_hosts=["169.254.169.254"],  # block cloud metadata
+))
+
+agent = Agent(
+    name="Fetcher",
+    instructions="Fetch pages only from approved hosts.",
+)
+agent.policy = engine
+
+# Before any outbound request, the caller consults:
+assert engine.check_network("api.mycorp.com").allowed is True
+assert engine.check_network("docs.mycorp.com").allowed is False        # not on the allow-list
+assert engine.check_network("169.254.169.254").allowed is False        # deny wins
+assert engine.check_network("API.mycorp.com.").allowed is True         # case/dot normalized
+```
+
+<Warning>
+**Scope: decision seam only.** The runtime does not yet automatically call `check_network()` before every tool, MCP, or LLM request. Callers integrating outbound HTTP must invoke it themselves. See [PraisonAI#5333](https://github.com/MervinPraison/PraisonAI/issues/5333) for the wider egress-enforcement roadmap.
+</Warning>
+
+### Which policy shape fits
+
+```mermaid
+graph TB
+    Start{Egress goal?} --> DenyOnly[Block specific hosts]
+    Start --> AllowOnly[Only these hosts]
+    Start --> Both[Allowlist + blocklist]
+
+    DenyOnly --> D["deny_hosts=[...]<br/>others fall through"]
+    AllowOnly --> A["allow_hosts=[...]<br/>default-deny the rest"]
+    Both --> B["allow + deny<br/>deny wins"]
+
+    classDef q fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef opt fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef res fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start q
+    class DenyOnly,AllowOnly,Both opt
+    class D,A,B res
+```
+
+| Policy shape | Behaviour |
+|---|---|
+| `deny_hosts` only | Listed hosts blocked; everything else falls through to the engine default (allow unless `strict_mode`). |
+| `allow_hosts` (non-empty) | Default-deny: only listed hosts allowed, everything else denied. |
+| `allow_hosts` + `deny_hosts` | Deny wins; allow-list is the explicit allowlist; everything else denied. |
+
+### Resource format
+
+`check_network(host)` normalizes the host and evaluates a `net:<host>` resource.
+
+| Step | Rule |
+|---|---|
+| Whitespace | Leading/trailing whitespace stripped |
+| Trailing dot | A single trailing `.` removed (`api.example.com.` → `api.example.com`) |
+| Case | Lowercased (`API.Example.COM` → `api.example.com`) |
+
+The destination host is authoritative — a caller-supplied `context["host"]` cannot override it.
+
+### Wildcards
+
+Host patterns support fnmatch wildcards.
+
+```python
+from praisonaiagents.policy import PolicyEngine, create_network_policy
+
+engine = PolicyEngine()
+engine.add_policy(create_network_policy(allow_hosts=["*.mycorp.com"]))
+
+assert engine.check_network("api.mycorp.com").allowed is True     # subdomain matches
+assert engine.check_network("evil.example.com").allowed is False  # net:* default-deny row
+```
+
+When an allow-list is present, `create_network_policy` adds an implicit `net:*` default-deny rule at priority `0`.
+
+### Case / trailing-dot normalization
+
+`API.Example.COM.`, `api.example.com`, and `api.example.com.` all match the same rule.
+
+```python
+from praisonaiagents.policy import PolicyEngine, create_network_policy
+
+engine = PolicyEngine()
+engine.add_policy(create_network_policy(deny_hosts=["api.example.com"]))
+
+assert engine.check_network("API.EXAMPLE.COM").allowed is False
+assert engine.check_network("Api.Example.Com.").allowed is False
+assert engine.check_network("api.example.com").allowed is False
+```
+
+---
+
 ## How It Works
 
 ```mermaid
@@ -213,7 +336,7 @@ Pattern examples: `tool:read_file`, `tool:delete_*`, `tool:*`.
 |--------|------|---------|-------------|
 | `strict_mode` | `bool` | `False` | Deny operations not explicitly allowed |
 | `action` | `PolicyAction` | — | `ALLOW`, `DENY`, `ASK`, `LOG`, `RATE_LIMIT` |
-| `resource` | `str` | `None` | Glob pattern (e.g. `tool:shell_*`) |
+| `resource` | `str` | `None` | Glob pattern by resource type: `tool:<name>`, `file:<op>`, or `net:<host>` (e.g. `net:*.mycorp.com`) |
 | `priority` | `int` | `0` | Higher priority rules evaluate first |
 
 ---
