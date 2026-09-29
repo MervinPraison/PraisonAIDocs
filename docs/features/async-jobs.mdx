@@ -419,6 +419,8 @@ finally:
 
 ## Webhook Callback
 
+PraisonAI validates every webhook URL at submit time **and again immediately before delivery**, and pins the delivery connection to the exact IP it just screened.
+
 ```python
 response = httpx.post(
     "http://127.0.0.1:8005/api/v1/runs",
@@ -427,6 +429,52 @@ response = httpx.post(
         "webhook_url": "https://example.com/callback"
     }
 )
+```
+
+### What gets rejected
+
+A `webhook_url` is refused whenever the target — or any address its hostname resolves to (A **or** AAAA) — points at a non-public destination.
+
+| Rejected because | Example |
+|---|---|
+| Non-http(s) scheme | `ftp://example.com/hook` |
+| Localhost / loopback literals | `http://localhost/x`, `http://127.0.0.1/x`, `http://[::1]/x`, `http://0.0.0.0/x` |
+| Private / RFC1918 | `http://10.0.0.5/x`, `http://192.168.1.1/x`, `http://172.16.0.1/x` |
+| Link-local (incl. cloud metadata) | `http://169.254.169.254/latest/...` |
+| Multicast / reserved / unspecified | `http://224.0.0.1/x`, `http://[fe80::1]/x` |
+| Hostname resolves to any of the above (A **or** AAAA) | `attacker.example` whose AAAA is `::1` |
+
+### Why it's re-validated at delivery
+
+Jobs can run for minutes or hours, so a hostname that looked public at submit time could be flipped to an internal address before the result is sent (DNS rebinding). PraisonAI re-resolves and re-screens the target just before delivery, then connects to that exact screened IP.
+
+```mermaid
+sequenceDiagram
+    participant Attacker as Attacker DNS
+    participant Jobs as Jobs API
+    participant Exec as JobExecutor
+    participant Target as Attacker webhook
+
+    Note over Jobs: submit_time
+    Jobs->>Attacker: Resolve attacker.example
+    Attacker-->>Jobs: 1.2.3.4 (public — passes)
+    Jobs-->>Target: 202 Accepted (job queued)
+
+    Note over Jobs,Exec: job runs for minutes/hours
+
+    Note over Exec: delivery_time
+    Exec->>Attacker: Resolve attacker.example AGAIN
+    Attacker-->>Exec: 169.254.169.254 (rebind attempt)
+    Exec--xExec: rejected (link-local)
+    Note over Exec: no request sent — job.result NOT exfiltrated
+```
+
+### What you see when a redirect is refused
+
+A `3xx` response is never chased past the screened target — this is deliberate. Instead of following the redirect, the executor logs (so you can grep for it) and does not deliver the result:
+
+```
+Webhook for {id} returned redirect {status}; not followed, result not delivered
 ```
 
 ## Session Grouping
@@ -534,6 +582,9 @@ praisonai run cancel <job_id>
   </Accordion>
   <Accordion title="Handle 503 backpressure on the client">
     Size `max_queued` to your worker capacity and retry on `503` using the `Retry-After` header with the same `Idempotency-Key`. The rejected `QUEUED` row is deleted, so the retry starts clean instead of colliding with a stranded record.
+  </Accordion>
+  <Accordion title="Public reachable host only">
+    Webhook URLs are re-validated at delivery time and the connection is pinned to the screened IP. Point `webhook_url` at a **public** hostname reachable from the Jobs API host; internal/private/loopback targets and hostnames that rebind to them are rejected, and `3xx` redirects are not followed.
   </Accordion>
 </AccordionGroup>
 
