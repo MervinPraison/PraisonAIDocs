@@ -175,6 +175,8 @@ stateDiagram-v2
 | **OPEN** | Tool calls blocked - returns error dict |
 | **HALF_OPEN** | Recovery mode - limited probe calls allowed |
 
+The `OPEN → HALF_OPEN` transition is driven by `recovery_timeout` **or** by an `enable_health_check=True` probe reporting healthy — whichever fires first. Since [PR #5330](https://github.com/MervinPraison/PraisonAI/pull/5330), the probe runs on both sync and async paths.
+
 The async path (`achat()` / `astart()`) performs the same OPEN → HALF_OPEN → CLOSED transitions through the shared helpers — `_circuit_breaker_precheck` runs the pre-check, `_circuit_breaker_record` records the outcome — so this diagram applies uniformly to `chat`/`start` and `achat`/`astart`.
 
 <Note>
@@ -221,13 +223,15 @@ graph TB
 | `success_threshold` | `int` | `2` | Successes in half-open to close |
 | `timeout` | `float` | `30.0` | Per-call timeout |
 | `monitor_window` | `float` | `300.0` | Failure-rate window |
-| `enable_health_check` | `bool` | `True` | Periodic health checks |
+| `enable_health_check` | `bool` | `True` | Enable periodic health probes. Triggered automatically when the circuit opens (works on **both** sync `call()` and async `acall()` paths, from [PR #5330](https://github.com/MervinPraison/PraisonAI/pull/5330)). Requires a running event loop; pure-sync callers with no loop fall back to `recovery_timeout`. |
 | `health_check_interval` | `float` | `30.0` | Health-check interval |
 | `graceful_degradation` | `bool` | `True` | Return error dict instead of raising |
 
 ---
 
 ## Custom Health Checks
+
+Circuit breakers close themselves as soon as the backing service is healthy again — you just tell the breaker how to check. Provide any object with a `health_check()` method (sync) or `ahealth_check()` method (async), and the breaker will probe it on the interval you configured. It now works the same way whether your agent calls tools via `agent.start()` or `await agent.astart()`.
 
 Pass a health check that implements `HealthCheckProtocol` and the breaker (or `HealthMonitor`) probes it on the configured interval.
 
@@ -259,6 +263,39 @@ breaker = CircuitBreaker("database", health_check=DatabaseHealth())
 <Note>
 As of [PR #5050](https://github.com/MervinPraison/PraisonAI/pull/5050), `HealthMonitor` dispatches on the canonical `health_check` / `ahealth_check` names. Classes written against the public protocol are no longer silently reported unhealthy.
 </Note>
+
+<Note>
+**Health checks now recover the circuit on both sync and async paths ([PR #5330](https://github.com/MervinPraison/PraisonAI/pull/5330)).** Earlier releases only wired the probe into `acall()`, and it self-disabled after the first async call by pinning a completed Task forever — so a caller relying on `health_check` for fast recovery silently fell back to the full `recovery_timeout` wall-clock wait, no matter how the config was set. The probe is now started when the circuit flips OPEN (from `_on_failure()`), restarts cleanly on each new OPEN episode, and — for a synchronous callable — runs off the event loop so a blocking probe does not stall unrelated coroutines. Pure-sync callers with no running loop keep the pre-#5330 behaviour: recovery is driven by `recovery_timeout` alone.
+</Note>
+
+---
+
+## What triggers health-check recovery
+
+A health probe recovers an open circuit as soon as it reports healthy, on both sync and async paths.
+
+```mermaid
+graph LR
+    Open[🚫 Circuit OPEN] --> Probe[🔧 Probe every health_check_interval]
+    Probe --> Healthy{✅ Healthy?}
+    Healthy -->|No| Probe
+    Healthy -->|Yes| Half[⚙️ HALF_OPEN]
+    Half --> Met{success_threshold met?}
+    Met -->|Yes| Closed[✅ CLOSED]
+    Met -->|No| Half
+
+    classDef open fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef probe fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef half fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef closed fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Open open
+    class Probe probe
+    class Healthy,Met decision
+    class Half half
+    class Closed closed
+```
 
 ---
 
