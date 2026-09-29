@@ -344,6 +344,66 @@ sequenceDiagram
 **What changed in PR [#3812](https://github.com/MervinPraison/PraisonAI/pull/3812).** The per-app `asyncio.Lock` that used to serialise every request on the shared `cli_config` is gone. Each request now runs on its own per-request `AgentsGenerator` that borrows the cached generator's warm pieces, so concurrent requests are no longer serialised. Behaviour is otherwise unchanged — same routes, same YAML pipeline.
 </Note>
 
+## Per-tenant validation strictness and timeout pool
+
+Scope YAML validation strictness and the sync-tool timeout pool per request instead of per process. Tenant A migrating strict configs no longer forces strictness on tenant B's legacy YAMLs.
+
+Pass `strict_validation` / `tool_timeout_workers` through the per-request generator's `cli_config` — the same DI seam the fast-path already uses to borrow the cached generator's warm pieces. No `os.environ` mutation, no cross-tenant bleed.
+
+```python
+# Per-request generator borrows warm pieces from the cached generator
+# (adapter, config_list, tool_resolver, tool-timeout pool ownership)
+# and carries its own cli_config — no os.environ mutation, no cross-tenant bleed.
+per_request = AgentsGenerator(
+    agent_file=tenant_agent_file,
+    framework=framework,
+    config_list=cached.config_list,
+    cli_config={
+        **base_cli_config,
+        "strict_validation": tenant.strict,          # True/False per tenant
+        "tool_timeout_workers": tenant.pool_size,    # e.g. 128 for a heavy tenant
+    },
+    tool_timeout_executor=cached._get_tool_timeout_executor(),  # borrowed
+    tool_resolver=cached.tool_resolver,
+    adapter=cached.framework_adapter,
+)
+```
+
+Each toggle resolves the same way: explicit constructor arg first, then the matching `cli_config` key, then the env var, then the built-in default.
+
+```mermaid
+graph LR
+    subgraph "Per-run toggle resolution"
+        Arg[🎯 Constructor arg] -->|highest| Pick{Pick first non-None}
+        Cli[🧩 cli_config key] --> Pick
+        Env[🌐 Env var] --> Pick
+        Default[⚙️ Built-in default] --> Pick
+        Pick --> Value[✅ Value for this run]
+    end
+
+    classDef high fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef mid fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef low fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Arg,Cli high
+    class Env mid
+    class Default low
+    class Pick,Value result
+```
+
+```
+strict_validation:
+  explicit arg  >  cli_config["strict_validation"]  >  PRAISONAI_VALIDATE_STRICT env  >  False (default)
+
+tool_timeout_workers:
+  explicit arg  >  cli_config["tool_timeout_workers"]  >  PRAISONAI_TOOL_TIMEOUT_WORKERS env  >  32 (default)
+```
+
+<Note>
+Env vars still work. Set the per-run override only when you need multi-tenant isolation.
+</Note>
+
 ## Environment Variables
 
 | Variable | Default | Description |
