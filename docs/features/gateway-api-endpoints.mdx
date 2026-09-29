@@ -91,7 +91,7 @@ sequenceDiagram
 
 | Surface | Method + Path | Notes |
 |---------|---------------|-------|
-| OpenAI chat | `POST /v1/chat/completions` | SSE streaming supported (`stream: true`); real `usage` returned; opt-in streamed usage via `stream_options.include_usage` |
+| OpenAI chat | `POST /v1/chat/completions` | SSE streaming supported (`stream: true`); real `usage` returned; opt-in streamed usage via `stream_options.include_usage`; opt-in token-level `delta.content` frames via `gateway.api.stream` (default off keeps single-chunk buffered behaviour) |
 | OpenAI responses | `POST /v1/responses` | Accepts string or messages-style `input`; returns `usage` in Responses-native shape |
 | OpenAI models | `GET /v1/models` | Lists gateway-registered agent IDs |
 | MCP JSON-RPC | `POST /mcp` | Methods: `initialize`, `tools/list`, `tools/call` |
@@ -141,7 +141,7 @@ Each surface reports usage in its own OpenAI-native shape:
 
 When an agent exposes no LLM metrics, `usage` falls back to zeros in the correct spec shape, so clients never need to special-case a missing block.
 
-### Streaming Usage
+### Streamed usage
 
 Opt in with `stream_options.include_usage: true` to receive a streamed `usage` chunk — the same contract OpenAI's own API uses.
 
@@ -160,22 +160,90 @@ for chunk in stream:
         print(chunk.usage)  # final chunk: real prompt/completion/total tokens
 ```
 
-The `usage`-only chunk is emitted right before `data: [DONE]`. Without `include_usage`, the stream frames are unchanged and no extra chunk is sent.
+The `usage`-only chunk is emitted right before `data: [DONE]`. Without `include_usage`, the stream frames are unchanged and no extra chunk is sent. This is orthogonal to token-level streaming below — it works with or without it.
 
-<Note>
-Streaming is still buffered: content is delivered once the full turn completes, so time-to-first-content matches non-streaming. Only the trailing `usage` chunk is new — this is not incremental token streaming.
-</Note>
+### Token-level streaming (opt-in)
+
+Enable `gateway.api.stream` to emit each `DELTA_TEXT` / `FIRST_TOKEN` piece as its own `chat.completion.chunk` with `delta.content`, so time-to-first-content matches token latency instead of full-turn latency.
+
+```mermaid
+sequenceDiagram
+    participant Client as OpenAI SDK
+    participant SSE as /v1/chat/completions
+    participant Agent as Agent (stream_emitter)
+
+    Client->>SSE: POST stream=true
+    SSE-->>Client: role prelude
+    Agent-->>SSE: FIRST_TOKEN "Hel"
+    SSE-->>Client: delta.content "Hel"
+    Agent-->>SSE: DELTA_TEXT "lo "
+    SSE-->>Client: delta.content "lo "
+    Agent-->>SSE: DELTA_TEXT "world"
+    SSE-->>Client: delta.content "world"
+    SSE-->>Client: finish_reason=stop
+    SSE-->>Client: [DONE]
+```
+
+Default is **off**: without opt-in the SSE surface is byte-for-byte the previous single buffered chunk, so existing clients keep working unchanged.
+
+Enable it in `gateway.yaml`:
+
+```yaml
+gateway:
+  api:
+    openai: true
+    stream: true   # opt-in token-level SSE on /v1/chat/completions
+```
+
+Or in Python:
+
+```python
+from praisonai.gateway import WebSocketGateway
+from praisonaiagents.gateway import ApiConfig
+
+WebSocketGateway(
+    config=cfg,
+    api=ApiConfig(openai=True, stream=True),
+).start()
+```
+
+Consume it from any standard OpenAI client — no client-side change needed:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8765/v1", api_key="gateway-token")
+stream = client.chat.completions.create(
+    model="assistant",
+    messages=[{"role": "user", "content": "Write a haiku about the sea"}],
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta.content:
+        print(delta.content, end="", flush=True)  # arrives token-by-token
+```
+
+Behaviour guarantees:
+
+| Guarantee | What it means |
+|-----------|---------------|
+| **Same frame envelope** | The role prelude, `finish_reason: "stop"` terminator, `stream_options.include_usage`, and `[DONE]` sentinel are all preserved. |
+| **No-delta fallback** | If the agent emits no token deltas, the buffered reply is still delivered as one `delta.content` frame — nothing is lost, even for an empty reply. |
+| **Reasoning filtered** | Thinking/reasoning deltas are excluded from the answer stream. |
+| **Concurrent isolation** | A per-turn guard ensures two callers sharing one agent never receive each other's tokens. |
 
 ---
 
 ## Configuration Options
 
-The `gateway.api` block maps to the `ApiConfig` dataclass. Both surfaces are opt-in; when both are `False` (default), no extra routes are mounted.
+The `gateway.api` block maps to the `ApiConfig` dataclass. All three flags are opt-in; when `openai` and `mcp` are both `False` (default), no extra routes are mounted.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `openai` | `bool` | `False` | Serve `/v1/chat/completions`, `/v1/responses`, `/v1/models` backed by the gateway's live agents and sessions. |
 | `mcp` | `bool` | `False` | Serve an MCP JSON-RPC endpoint at `/mcp` exposing registered agents as callable tools. |
+| `stream` | `bool` | `False` | Emit true token-level `delta.content` frames on `/v1/chat/completions` SSE by wiring the agent's `stream_emitter` through the gateway hot path. Off by default: streaming responses stay byte-for-byte the buffered single-chunk path. |
 
 `ApiConfig` also exposes an `enabled` property (true if either surface is on), plus `to_dict()` and `from_dict()`.
 
