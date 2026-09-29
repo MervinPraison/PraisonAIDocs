@@ -1,7 +1,7 @@
 ---
 title: "Send Message Tool"
 sidebarTitle: "Send Message"
-description: "Let agents proactively message the user through Telegram, Slack, Discord, and other gateways mid-task"
+description: "Let agents manage the live conversation — send, react, open a thread, or edit / retract their own messages — through Telegram, Slack, Discord, and other gateways"
 icon: "paper-plane"
 ---
 
@@ -133,6 +133,26 @@ sequenceDiagram
 | **SessionContext** | Task-local registry — no globals, safe for concurrent handlers |
 | **Gateway** | Delivers to Telegram, Slack, Discord, WhatsApp, etc. |
 
+The verbs `react`, `thread`, `edit`, and `delete` add a capability-gate step: the router checks the adapter's `supports_*` flag before dispatch and returns a typed `unsupported` when the channel lacks the primitive — it never raises.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant SendMessage as send_message
+    participant Router as DeliveryRouter
+    participant Adapter
+
+    Agent->>SendMessage: send_message(..., action="edit"/"delete"/"react"/"thread")
+    SendMessage->>Router: dispatch verb
+    alt adapter supports primitive
+        Router->>Adapter: edit / delete / react / create_thread
+        Adapter-->>Router: MessageActionResult(status="ok")
+        Router-->>Agent: {"status": "ok"}
+    else primitive unavailable
+        Router-->>Agent: {"status": "unsupported"}
+    end
+```
+
 ---
 
 ## Targets
@@ -251,6 +271,167 @@ graph LR
 
 ---
 
+## Threads
+
+Open a topic or thread under a target so a long-running effort has its own space.
+
+```python
+from praisonaiagents.tools import send_message
+
+# Open a topic titled "Rollout 2026-09" under the current Slack channel
+send_message("slack:#ops", "Rollout 2026-09", action="thread")
+```
+
+The thread title rides in the `message` argument. An empty title returns `{"status": "failed", "detail": "no thread title provided"}`.
+
+### Thread outcomes
+
+Threads return a JSON `ThreadResult` with a typed `status` (plus `thread_id` on success):
+
+| `status` | Meaning |
+|----------|---------|
+| `"ok"` | A new thread/topic was opened; `thread_id` carries its id |
+| `"unsupported"` | The channel can't open threads — degrade gracefully to the parent channel |
+| `"failed"` | Topics mode off, missing permission, or empty title |
+| `"no_route"` | Target could not be resolved to a reachable channel |
+
+```json
+{"status": "ok", "target": "slack:#ops", "thread_id": "T789"}
+{"status": "unsupported", "detail": "the active gateway does not support threads"}
+{"status": "failed", "detail": "no thread title provided"}
+```
+
+```mermaid
+graph LR
+    A[🤖 Agent] --> B[📤 send_message action=thread]
+    B --> C{🔍 Channel supports threads?}
+    C -->|no| U[⚠️ unsupported]
+    C -->|yes| G[🛰️ Gateway]
+    G --> D[🧵 Thread opened]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fail fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class B tool
+    class C check
+    class G,D ok
+    class U fail
+```
+
+Thread-aware routing across platforms is covered in [Gateway Threads](/features/gateway-threads).
+
+---
+
+## Edit and Delete (own messages)
+
+Update a status in place, or retract a message the agent shouldn't have sent — instead of spamming follow-ups.
+
+```python
+from praisonaiagents.tools import send_message
+
+# Post a live status, then update it in place instead of spamming follow-ups
+send_message("origin", "Working…", action="send")
+# ... later:
+send_message("origin", "Done ✅", action="edit", message_id="98")
+
+# Retract a message the agent shouldn't have sent
+send_message("origin", "", action="delete", message_id="77")
+```
+
+- **Authority**: `edit` and `delete` are the most-restricted class — `own-prior-message`. They only work on messages this agent/session sent.
+- **Capability gate**: powered by the adapter's `supports_edit` / `supports_delete`. Channels that can't edit/delete return a typed `unsupported` outcome — the tool never raises.
+- **Send-policy** still guards `edit`/`delete` — a steered agent cannot mutate messages on channels the operator hasn't allowed.
+- **Required `message_id`**: a missing id returns `{"status": "failed", "detail": "no message_id provided"}`.
+- **Result shape**: a JSON `MessageActionResult` with `status` (`ok` / `unsupported` / `failed` / `no_route`), optional `target`, and optional `detail`.
+
+```json
+{"status": "ok", "target": "telegram:12345"}
+{"status": "unsupported", "detail": "the active gateway does not support edit"}
+{"status": "unsupported", "detail": "the active gateway does not support delete"}
+{"status": "failed", "detail": "no message_id provided"}
+```
+
+### Channel support today
+
+| Channel | `supports_edit` | `supports_delete` |
+|---------|-----------------|-------------------|
+| Telegram | ✅ | ✅ |
+| Slack | ✅ | ✅ |
+| Discord | ✅ | ✅ |
+| WhatsApp / Signal / email / agentmail / Linear | `unsupported` | `unsupported` |
+
+```mermaid
+graph LR
+    A[🤖 Agent] --> B[📤 send_message action=edit/delete]
+    B --> P{🛡️ Send Policy}
+    P -->|deny| F[❌ failed]
+    P -->|allow| C{🔍 supports_edit / supports_delete?}
+    C -->|no| U[⚠️ unsupported]
+    C -->|yes| G[🛰️ Adapter primitive]
+    G --> D[✅ ok]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fail fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class B tool
+    class P,C check
+    class G,D ok
+    class F,U fail
+```
+
+Per-channel capability flags live in [Bot Platform Capabilities](/features/bot-platform-capabilities).
+
+---
+
+## Action Vocabulary and Authority
+
+Every verb the tool accepts declares one of three authority classes — a closed set that keeps a steered agent from inventing new mutation verbs.
+
+| Authority | Verbs | What it means |
+|-----------|-------|---------------|
+| `read-only` | `list` | Inspects reachable targets, sends nothing |
+| `current-conversation` | `send`, `react`, `unreact`, `thread` | Writes to the current conversation (or an operator-permitted target) |
+| `own-prior-message` | `edit`, `delete` | Mutates a specific earlier message the agent sent — the most sensitive class |
+
+Any verb missing from the map is rejected — the agent cannot "invent" a new mutation verb that silently inherits `send`'s guard:
+
+```
+Unknown action '<verb>'. Use 'send', 'list', 'react', 'unreact', 'thread', 'edit', or 'delete'.
+```
+
+```mermaid
+graph TB
+    RO[read-only] --> L[list]
+    CC[current-conversation] --> S[send]
+    CC --> R[react]
+    CC --> UN[unreact]
+    CC --> T[thread]
+    OPM[own-prior-message] --> E[edit]
+    OPM --> DEL[delete]
+
+    classDef readonly fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef current fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef own fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef verb fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class RO readonly
+    class CC current
+    class OPM own
+    class L,S,R,UN,T,E,DEL verb
+```
+
+The same [Send Policy](/features/send-policy) guards every write verb. Per-channel primitives are listed in [Bot Platform Capabilities](/features/bot-platform-capabilities).
+
+---
+
 ## Listing Targets
 
 `action="list"` returns a JSON array of all reachable targets so the agent can pick the right one before sending.
@@ -347,28 +528,47 @@ sequenceDiagram
     Gateway->>User: ✅ swapped in — done, no extra reply
 ```
 
+An agent posts "Working…" on Telegram, keeps working, then edits that same message to "Done ✅" — the user sees a single evolving status line on their phone, not a stream of noisy follow-ups.
+
+```mermaid
+sequenceDiagram
+    participant User as 📱 User (Telegram)
+    participant Bot as 🤖 Agent
+    participant Gateway
+
+    Bot->>Gateway: send_message("origin", "Working…")
+    Gateway->>User: 📬 "Working…" (message id 98)
+    Bot->>Bot: Works on the task...
+    Bot->>Gateway: send_message("origin", "Done ✅", action="edit", message_id="98")
+    Gateway->>User: ✏️ same message now reads "Done ✅"
+```
+
+The agent notices it posted a message with the wrong figure and calls `send_message("origin", "", action="delete", message_id="…")` to unsend it before the user reads it.
+
 ---
 
 ## Configuration Reference
 
-`send_message` takes three arguments. All are optional:
+`send_message` takes four arguments. All are optional:
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `target` | `str` | `"origin"` | Symbolic destination (see Targets table) |
-| `message` | `str` | `""` | Text to send; append `" MEDIA:<path>"` to attach files. Attachments are parsed today but not yet delivered through bot transports — the result detail reports how many were skipped. |
-| `action` | `str` | `"send"` | `"send"` to deliver, `"list"` to enumerate reachable targets, `"react"` to add an emoji reaction, `"unreact"` to remove one |
-
-When `action` is `"react"` or `"unreact"`, pass the emoji as the `message` argument.
+| `message` | `str` | `""` | Text (for `send`), emoji (for `react`/`unreact`), thread title (for `thread`), or new text (for `edit`). Append `" MEDIA:<path>"` on `send` to attach files. |
+| `action` | `str` | `"send"` | One of `"send"`, `"list"`, `"react"`, `"unreact"`, `"thread"`, `"edit"`, `"delete"` |
+| `message_id` | `str` | `""` | The id of the message to react to / edit / delete. Optional for `react`/`unreact` on `origin` (the inbound message is used). Required for `edit`/`delete`. |
 
 `action` values at a glance:
 
-| `action` | `message` carries | Returns |
-|----------|-------------------|---------|
-| `"send"` | text (`" MEDIA:<path>"` optional) | Short summary string, e.g. `"Delivered to slack:#ops"` |
-| `"list"` | ignored | JSON array of `{target, platform, kind, label}` objects |
-| `"react"` | the emoji, e.g. `"👍"` | JSON string of a `ReactionResult`, e.g. `{"status": "ok"}` |
-| `"unreact"` | the emoji to remove | JSON string of a `ReactionResult`, e.g. `{"status": "ok"}` |
+| `action` | `message` carries | `message_id` | Returns |
+|----------|-------------------|--------------|---------|
+| `"send"` | text (`" MEDIA:<path>"` optional) | — | Short summary string |
+| `"list"` | ignored | — | JSON array of `{target, platform, kind, label}` |
+| `"react"` | the emoji | optional (defaults to inbound msg on `origin`) | JSON `ReactionResult` |
+| `"unreact"` | the emoji to remove | optional | JSON `ReactionResult` |
+| `"thread"` | the thread title | — | JSON `ThreadResult` |
+| `"edit"` | the new text | **required** | JSON `MessageActionResult` |
+| `"delete"` | ignored | **required** | JSON `MessageActionResult` |
 
 ---
 
@@ -418,6 +618,26 @@ agent = Agent(
 )
 ```
 
+### Post-then-edit a live status line
+
+```python
+agent = Agent(
+    name="Deployer",
+    instructions="""
+    When a deploy starts, post 'Deploying…' with send_message("origin", "Deploying…").
+    Remember the returned message id, and when done, edit it to 'Deployed ✅' with
+    send_message("origin", "Deployed ✅", action="edit", message_id="<id>").
+    """,
+    tools=[send_message],
+)
+```
+
+### Open a thread for a long-running rollout
+
+```python
+send_message("slack:#ops", "Q4 rollout — sub-thread", action="thread")
+```
+
 ---
 
 ## Best Practices
@@ -437,6 +657,18 @@ Include a note like _"If send_message returns a 'No active gateway' message, ski
 
 <Accordion title="Keep messages short — they hit a phone">
 Mobile push notifications truncate long text. Send a one-line summary; attach details as a file with `MEDIA:`.
+</Accordion>
+
+<Accordion title="Edit your own status instead of spamming replies">
+On channels that support it, `edit` keeps the chat clean; on channels that don't, you'll get `unsupported` and can post a follow-up.
+</Accordion>
+
+<Accordion title="Only edit / delete your own messages">
+Adapters reject mutating anyone else's message with a transport `failed`.
+</Accordion>
+
+<Accordion title="Always check the returned status">
+Never assume `ok`. On `unsupported` or `failed`, fall back to a plain `send`.
 </Accordion>
 </AccordionGroup>
 
@@ -467,5 +699,13 @@ Run the gateway server
 
 <Card title="Bot Routing" icon="route" href="/features/bot-routing">
 Route messages by channel and platform
+</Card>
+
+<Card title="Gateway Threads" icon="comments" href="/features/gateway-threads">
+Thread-aware routing and creation across platforms
+</Card>
+
+<Card title="Bot Platform Capabilities" icon="grid-2" href="/features/bot-platform-capabilities">
+Per-channel `supports_edit` / `supports_delete` / `supports_reactions` matrix
 </Card>
 </CardGroup>
