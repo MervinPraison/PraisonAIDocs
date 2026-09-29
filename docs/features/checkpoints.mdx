@@ -14,6 +14,14 @@ page is about **file-level undo** via shadow git — a different feature with
 separate storage.
 </Note>
 
+<Note>
+**Large-repo friendly.** Since PR [#5310](https://github.com/MervinPraison/PraisonAI/pull/5310),
+the shadow git store reuses the project's existing objects (via
+`objects/info/alternates`), applies large-repo git tuning at init, and skips
+files above `max_file_size` (default 2 MB) so the first checkpoint on a big
+repo is proportional to **changed** files, not total files.
+</Note>
+
 
 ```python
 from praisonaiagents import Agent
@@ -453,16 +461,99 @@ service = CheckpointService(
     storage_dir="~/.praisonai/checkpoints",
     enabled=True,
     auto_checkpoint=True,
-    max_checkpoints=100
+    max_checkpoints=100,
+    max_file_size=2 * 1024 * 1024,   # 2 MB; 0 disables the cap
 )
 ```
 
 **Parameters:**
-- `workspace_dir`: Directory to track
-- `storage_dir`: Where to store checkpoint data (default: `~/.praisonai/checkpoints`)
-- `enabled`: Enable/disable checkpoints
-- `auto_checkpoint`: Auto-checkpoint before file modifications
-- `max_checkpoints`: Maximum checkpoints to keep
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `workspace_dir` | `str` | — | Directory to track. |
+| `storage_dir` | `str` | `~/.praisonai/checkpoints` | Where the shadow-git store lives. |
+| `enabled` | `bool` | `True` | Enable / disable checkpoints. |
+| `auto_checkpoint` | `bool` | `True` | Auto-checkpoint before file modifications. |
+| `max_checkpoints` | `int` | `100` | Maximum logical checkpoints to keep in the in-memory listing. |
+| `user_name` | `str` | `"PraisonAI Checkpoints"` | Git `user.name` for shadow commits (env: `PRAISONAI_GIT_USER_NAME`). |
+| `user_email` | `str` | `"checkpoints@praison.ai"` | Git `user.email` for shadow commits (env: `PRAISONAI_GIT_USER_EMAIL`). |
+| `max_file_size` | `int` | `2 * 1024 * 1024` (2 MB) | Skip files larger than this from the shadow commit (they stay on disk). `0` disables the cap. |
+
+## Large-repo performance
+
+On a large repository the first checkpoint used to hash and store every tracked file from scratch, even though identical objects already lived in the project's real `.git`. Since PR [#5310](https://github.com/MervinPraison/PraisonAI/pull/5310), the shadow store reuses those objects — so the first checkpoint is proportional to changed files, not total files.
+
+```mermaid
+graph TB
+    Init[🚀 Init CheckpointService] --> Repo{Inside a real<br/>git repo?}
+    Repo -->|Yes| Seed[🔗 Write alternates<br/>→ project /objects]
+    Repo -->|No| Standalone[📦 Standalone git init<br/>unchanged path]
+    Seed --> Tune[⚙️ Apply large-repo config<br/>manyFiles / index.v4 / untrackedCache]
+    Standalone --> Tune
+    Tune --> Ready[✅ Ready]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef tune fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    class Init start
+    class Repo decision
+    class Seed,Standalone,Tune tune
+    class Ready ok
+```
+
+**Object seeding via `alternates`.** When the workspace is inside a real git repo, `CheckpointService` writes `<shadow>/objects/info/alternates` pointing at the project's object store (resolved via `git rev-parse --git-common-dir` / `--git-dir`). New blobs resolve against existing objects instead of being re-hashed. A file is used (not the `GIT_ALTERNATE_OBJECT_DIRECTORIES` env var) because the checkpoint service already sanitises that variable out of its environment. With no real git repo, the standalone `git init` path is unchanged.
+
+**Large-repo git tuning.** `feature.manyFiles=true`, `index.version=4`, `core.untrackedCache=true`, and best-effort `core.fsmonitor=true` are applied once at init. Older git versions that don't support a key silently skip that setting — nothing fails the turn.
+
+**Oversized-file skip.** Files above `max_file_size` bytes (default 2 MB; `0` disables) are dropped from the index during staging but stay on disk. Symlinks are measured by the link itself (`os.lstat`), so a small link pointing at a large file still snapshots.
+
+**Bounded gc.** Every 20 saves the service runs `git repack -a -d --quiet` followed by `git gc --auto --quiet` on the shadow store. The `repack` (without `--local`) copies borrowed objects into a local pack, so `/undo` / `/revert` stay valid even if the project repo later prunes or repacks. The `gc --auto` prunes loose objects. Both are best-effort — a gc failure never breaks a turn.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Service as CheckpointService
+    participant Shadow as Shadow git
+
+    Agent->>Service: save("before turn N")
+    Service->>Shadow: git add -A
+    Service->>Service: skip files > max_file_size<br/>(git rm --cached, keep on disk)
+    Service->>Shadow: git commit
+    Service->>Shadow: prune old checkpoints
+    alt every 20 saves
+        Service->>Shadow: git repack -a -d
+        Service->>Shadow: git gc --auto
+    end
+    Service-->>Agent: CheckpointResult
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef service fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef shadow fill:#6366F1,stroke:#7C90A0,color:#fff
+    class Agent agent
+    class Service service
+    class Shadow shadow
+```
+
+Users often ask which files get snapshotted the moment they see the 2 MB default.
+
+```mermaid
+graph TB
+    Q[📝 File staged by git add -A] --> Ignored{Matches .gitignore<br/>or built-in ignore?}
+    Ignored -->|Yes| Skip1[⏭️ Never snapshotted<br/>never pruned by restore]
+    Ignored -->|No| Sym{Symlink?}
+    Sym -->|Yes| Keep1[✅ Snapshotted<br/>measured by lstat]
+    Sym -->|No| Size{Size > max_file_size?}
+    Size -->|Yes| Skip2[⏭️ Dropped from commit<br/>stays on disk]
+    Size -->|No| Keep2[✅ Snapshotted]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef skip fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q,Ignored,Sym,Size q
+    class Skip1,Skip2 skip
+    class Keep1,Keep2 ok
+```
 
 ## Step-Indexed Checkpoints
 
@@ -536,6 +627,12 @@ class CheckpointDiff:
   </Accordion>
   <Accordion title="Ignored files survive restore/rewind">
     Checkpoint restore mirrors `.gitignore` + built-in ignore rules (`.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.pytest_cache`, `.mypy_cache`). Ignored files are never snapshotted and never pruned by restore/rewind — a `.env` sitting outside version control survives every `praisonai checkpoint rewind` / `restore`.
+  </Accordion>
+  <Accordion title="Snapshot large fixtures with max_file_size">
+    By default, files above **2 MB** are skipped from checkpoints (they stay on disk). If your project deliberately versions large fixtures inside the workspace and you want them snapshotted, pass `max_file_size=0` (disabled) or a larger byte cap to `CheckpointService`. On projects with model weights or build outputs, the default keeps the shadow store small.
+  </Accordion>
+  <Accordion title="Long-running sessions don't leak disk">
+    Every 20 saves, the shadow store runs `git repack -a -d` (which pulls borrowed objects into a local pack) followed by `git gc --auto`. That means the shadow repo becomes fully self-contained shortly after seeding — even if the project repo is later pruned or repacked, `/undo` and `/revert` history stays readable.
   </Accordion>
 </AccordionGroup>
 
@@ -732,7 +829,10 @@ The checkpoint system is designed for minimal overhead:
 
 - **Lazy loading**: All imports via `__getattr__`
 - **Async operations**: Non-blocking git operations
-- **Incremental commits**: Only changed files are tracked
+- **Object reuse via `alternates`**: on a real git repo, the first checkpoint reuses existing objects — proportional to *changed* files, not total files.
+- **Large-repo tuning**: `feature.manyFiles`, `index.version 4`, `core.untrackedCache`, and best-effort `core.fsmonitor` are applied once at init so index writes and untracked scans stay fast.
+- **Oversized-file skip**: files above `max_file_size` (default 2 MB) are not committed into the shadow store, keeping build outputs and model weights out.
+- **Bounded gc**: `git repack -a -d` + `git gc --auto` runs every 20 saves so the shadow store doesn't grow unbounded and no longer depends on borrowed project objects.
 - **Configurable limits**: Control max checkpoints to manage storage
 
 ---
