@@ -1264,6 +1264,329 @@ def create_plugin():
     return TokenInjector()
 ```
 
+## Gateway, Schedule & Runtime Lifecycle Plugins
+
+Override `gateway_start`, `schedule_trigger`, `before_compaction`, `subagent_stop`, `model_fallback` (and their siblings) to observe the framework's runtime lifecycle from a plugin — no low-level `HookRegistry` needed.
+
+### Choosing a lifecycle event
+
+```mermaid
+graph TB
+    Q[What do you want to observe?] --> A[Bot / gateway starts or stops]
+    Q --> B[Scheduled job is added, removed, or fires]
+    Q --> C[Conversation memory is compacted]
+    Q --> D[A spawned subagent finishes]
+    Q --> E[Runtime falls back to a secondary model]
+    Q --> F[Kanban board state changes]
+    A --> R1[gateway_start / gateway_stop]
+    B --> R2[schedule_add / schedule_remove / schedule_trigger]
+    C --> R3[before_compaction / after_compaction]
+    D --> R4[subagent_stop]
+    E --> R5[model_fallback]
+    F --> R6[kanban_task_created / kanban_task_moved / kanban_task_done]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef option fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q decision
+    class A,B,C,D,E,F option
+    class R1,R2,R3,R4,R5,R6 result
+```
+
+<Warning>
+All nine methods (`gateway_start`, `gateway_stop`, `schedule_add`, `schedule_remove`, `schedule_trigger`, `before_compaction`, `after_compaction`, `subagent_stop`, `model_fallback`) are **observe-only**. Returning a value has no effect on the runtime. For rewrite/deny semantics on any of these events, register a low-level hook via `HookRegistry.register_function` — see [Hooks](/features/hooks).
+</Warning>
+
+### Observe gateway lifecycle
+
+`gateway_start` and `gateway_stop` fire when the gateway (`BotOS`) starts and stops.
+
+```python
+from praisonaiagents import Agent, plugins
+
+plugins.enable()   # bridges plugin methods into the runtime hook registry
+
+agent = Agent(name="Assistant", instructions="Help users.")
+agent.start("Hello!")
+```
+
+Create `~/.praisonai/plugins/gateway_watch.py`:
+
+```python
+"""
+Plugin Name: Gateway Watch
+Description: Observes gateway start / stop
+Version: 1.0.0
+"""
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class GatewayWatch(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="gateway_watch",
+            hooks=[PluginHook.GATEWAY_START, PluginHook.GATEWAY_STOP],
+        )
+
+    def gateway_start(self, context):
+        print(f"gateway_start platforms={context.get('platforms')} bots={context.get('bot_count')}")
+
+    def gateway_stop(self, context):
+        print(f"gateway_stop reason={context.get('reason')}")
+
+def create_plugin():
+    return GatewayWatch()
+```
+
+### Observe schedule lifecycle
+
+`schedule_add`, `schedule_remove`, and `schedule_trigger` fire when a job is persisted, deleted, or fires.
+
+```python
+from praisonaiagents import Agent, plugins
+
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Help users.")
+agent.start("Schedule a daily report.")
+```
+
+Create `~/.praisonai/plugins/schedule_watch.py`:
+
+```python
+"""
+Plugin Name: Schedule Watch
+Description: Observes schedule add / remove / trigger
+Version: 1.0.0
+"""
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class ScheduleWatch(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="schedule_watch",
+            hooks=[
+                PluginHook.SCHEDULE_ADD,
+                PluginHook.SCHEDULE_REMOVE,
+                PluginHook.SCHEDULE_TRIGGER,
+            ],
+        )
+
+    def schedule_add(self, context):
+        print(f"schedule_add job={context.get('job_name')} id={context.get('job_id')}")
+
+    def schedule_remove(self, context):
+        print(f"schedule_remove job={context.get('job_name')} id={context.get('job_id')}")
+
+    def schedule_trigger(self, context):
+        print(f"schedule_trigger job={context.get('job_name')} message={context.get('message')}")
+
+def create_plugin():
+    return ScheduleWatch()
+```
+
+### Observe compaction
+
+`before_compaction` sees the pre-compaction snapshot; `after_compaction` sees the post-compaction summary.
+
+```python
+from praisonaiagents import Agent, plugins
+
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Help users.")
+agent.start("Have a long conversation that triggers compaction.")
+```
+
+Create `~/.praisonai/plugins/compaction_watch.py`:
+
+```python
+"""
+Plugin Name: Compaction Watch
+Description: Observes conversation memory compaction
+Version: 1.0.0
+"""
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class CompactionWatch(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="compaction_watch",
+            hooks=[PluginHook.BEFORE_COMPACTION, PluginHook.AFTER_COMPACTION],
+        )
+
+    def before_compaction(self, context):
+        print(f"before_compaction session={context.get('session_id')} messages={context.get('message_count')}")
+
+    def after_compaction(self, context):
+        print(f"after_compaction {context.get('messages_before')} → {context.get('messages_after')}")
+
+def create_plugin():
+    return CompactionWatch()
+```
+
+<Note>
+This is the **observability** path. For a memory backend that reacts to compaction with an actual write (summary, table switch), subclass `Memory` — see [Memory Lifecycle Hooks](/features/memory-lifecycle-hooks). The `Memory` callbacks mutate; the plugin method observes.
+</Note>
+
+### Observe subagent completion
+
+`subagent_stop` fires when a spawned subagent reaches a terminal state — useful for audit and metrics.
+
+```python
+from praisonaiagents import Agent, plugins
+
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Delegate work to subagents.")
+agent.start("Research three topics in parallel.")
+```
+
+Create `~/.praisonai/plugins/subagent_watch.py`:
+
+```python
+"""
+Plugin Name: Subagent Watch
+Description: Observes spawned subagent completion
+Version: 1.0.0
+"""
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class SubagentWatch(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="subagent_watch",
+            hooks=[PluginHook.SUBAGENT_STOP],
+        )
+
+    def subagent_stop(self, context):
+        print(f"subagent_stop task={context.get('task')} success={context.get('success')}")
+
+def create_plugin():
+    return SubagentWatch()
+```
+
+### Observe model fallback
+
+`model_fallback` fires when the runtime falls back to a secondary model — log the `primary_model` → `fallback_model` transition and its `reason`.
+
+```python
+from praisonaiagents import Agent, plugins
+
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Help users.")
+agent.start("Answer even if the primary model is unavailable.")
+```
+
+Create `~/.praisonai/plugins/fallback_watch.py`:
+
+```python
+"""
+Plugin Name: Fallback Watch
+Description: Observes runtime model fallback
+Version: 1.0.0
+"""
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class FallbackWatch(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="fallback_watch",
+            hooks=[PluginHook.MODEL_FALLBACK],
+        )
+
+    def model_fallback(self, context):
+        print(f"model_fallback {context.get('primary_model')} → {context.get('fallback_model')} ({context.get('reason')})")
+
+def create_plugin():
+    return FallbackWatch()
+```
+
+### Observe kanban board changes
+
+Declare one or more of `KANBAN_TASK_CREATED`, `KANBAN_TASK_MOVED`, `KANBAN_TASK_DONE` and define the matching `kanban_task_*(context)` methods.
+
+```python
+from praisonaiagents import Agent, plugins
+
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Manage a kanban board.")
+agent.start("Create and move tasks on the board.")
+```
+
+Create `~/.praisonai/plugins/kanban_watch.py`:
+
+```python
+"""
+Plugin Name: Kanban Watch
+Description: Observes kanban board transitions
+Version: 1.0.0
+"""
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook
+
+class KanbanWatch(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(
+            name="kanban_watch",
+            hooks=[
+                PluginHook.KANBAN_TASK_CREATED,
+                PluginHook.KANBAN_TASK_MOVED,
+                PluginHook.KANBAN_TASK_DONE,
+            ],
+        )
+
+    def kanban_task_created(self, context):
+        print(f"kanban_task_created {context.get('task_id')}")
+
+    def kanban_task_moved(self, context):
+        print(f"kanban_task_moved {context.get('task_id')} → {context.get('column')}")
+
+    def kanban_task_done(self, context):
+        print(f"kanban_task_done {context.get('task_id')}")
+
+def create_plugin():
+    return KanbanWatch()
+```
+
+<Note>
+Kanban events have **no base no-op method** on `Plugin`. A plugin doesn't need the base class to define them — the bridge treats "no base counterpart" as a genuine override, so a declared `KANBAN_TASK_*` hook with a matching `kanban_task_*` method is wired.
+</Note>
+
+### How the declaration-driven bridge works
+
+A `Plugin` method is bridged when **both** of these are true:
+
+1. The matching `HookEvent` is listed in `PluginInfo.hooks`.
+2. The method is either a genuine override of the base no-op, or the event has no base counterpart at all (e.g. `kanban_*`).
+
+Declaring the hook in `info.hooks` without overriding the method registers **nothing** (no dead hooks). Overriding the method without declaring the hook also registers nothing — the runtime is strictly declaration-driven so authors keep control of what fires.
+
+```mermaid
+graph TB
+    Dec{Declared in info.hooks?} -->|No| N1[Registers nothing]
+    Dec -->|Yes| Ovr{Method overridden - or no base?}
+    Ovr -->|No| N2[Registers nothing]
+    Ovr -->|Yes| B[✅ Bridged as observe-only hook]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef nothing fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    class Dec,Ovr decision
+    class N1,N2 nothing
+    class B result
+```
+
+<Note>
+The bundled `GatewayForensicsPlugin` in `praisonai-plugins` fires as designed once this bridge is present. Operators upgrading past this fix will see their forensics plugin start emitting gateway/schedule/kanban signals that were previously silently inert.
+</Note>
+
 ## Message-Lifecycle Plugins
 
 Override `before_message`, `after_message`, `message_sent`, or `message_undelivered` to react to every hop of a message's lifecycle — per-user policy, per-channel redaction, delivery telemetry, or dead-letter escalation.
