@@ -120,6 +120,8 @@ The PR #4107 fix above only fires when a finalizer actually runs. On `ComputeMan
 - For `docker`, that was one container per script.
 - For `e2b`, `modal`, `daytona`, `tenki`, `flyio`, that was a **billed cloud instance** whose only other reaper is the provider's idle timer.
 - **Docker and Fly.io have no idle timer**, so those instances lived indefinitely.
+
+The specific *"cannot schedule new futures after interpreter shutdown"* failure mode is now doubly defended by [PR #5348](https://github.com/MervinPraison/PraisonAI/pull/5348): the release routes through the shared bridge (no per-teardown executor) and blocks on a bounded wait while `sys.is_finalizing()`.
 </Warning>
 
 Your `run_on=` instance is now reclaimed when your script exits — no code change:
@@ -144,17 +146,29 @@ self._finalizer = weakref.finalize(self, _release, provider, self._instance, sel
 - It runs on **garbage collection** *and* at **interpreter exit** — not one or the other.
 - It deliberately does **not** close over the backend `self` — closing over `self` would keep the backend alive and prevent the very collection it waits for.
 
-`_release(provider, instance_id, place)` is a module-level function that shuts the instance down safely on any thread:
+`_release(provider, instance_id, place)` is a module-level function that shuts the instance down safely on any thread. As of [PR #5348](https://github.com/MervinPraison/PraisonAI/pull/5348) it routes through the wrapper's shared [AsyncBridge](/features/async-bridge) instead of spinning a fresh loop per teardown:
 
-- No running loop (`asyncio.get_running_loop()` raises) → `asyncio.run(_shutdown())`.
-- A loop is already running → it bridges through `concurrent.futures.ThreadPoolExecutor(max_workers=1)` so the shutdown coroutine runs on its own loop instead of `RuntimeError`-ing. Without this bridge, GC landing inside async workflow code would raise and silently leak — the same class of bug PR #4107 fixed one layer down. This matches the pattern `SharedCompute` already uses.
-- Errors are logged at **warning** and swallowed — teardown stays quiet.
+- **Shared bridge, never a fresh loop.** It submits the shutdown coroutine to `praisonai._async_bridge.current_bridge().submit(_shutdown())` — one long-lived background loop, never an `asyncio.run` loop per teardown and never a per-teardown `ThreadPoolExecutor`.
+- **Fire-and-forget during live GC.** The future is not `.result()`-ed on the caller's thread, so a GC-triggered release inside async workflow code never pins the caller's event loop for the cloud round-trip. Completion is logged via `add_done_callback`.
+- **Blocking (bounded) at interpreter exit.** When `sys.is_finalizing()` is `True`, `_release` blocks on `fut.result(timeout=_RELEASE_EXIT_TIMEOUT)` so the cloud instance is actually reclaimed before the bridge's own `atexit` teardown cancels the in-flight shutdown or its daemon loop thread is killed. `sys.is_finalizing()` is only true during shutdown, so live GC never takes the blocking path.
+- **Bridge unavailable → logged as leaked.** If the bridge is poisoned or already gone at interpreter exit, the instance is logged as leaked at **warning** level instead of raising.
+
+### Environment Variables
+
+| Env Var | Default | Description |
+|---|---|---|
+| `PRAISONAI_COMPUTE_RELEASE_EXIT_TIMEOUT` | `10` | Seconds `_release()` will block on the shared bridge at interpreter exit before giving up. Long enough for a normal provider `shutdown` round-trip, short enough that a hung provider cannot stall process exit indefinitely. Read once at import; non-numeric values fall back to `10.0`. Only affects the interpreter-exit path — live-GC releases stay fire-and-forget. |
+
+```bash
+# Give a slow cloud provider more room to reclaim on exit
+export PRAISONAI_COMPUTE_RELEASE_EXIT_TIMEOUT=30
+```
 
 <Note>
 **Explicit `ashutdown()` detaches the finalizer.** An intentional teardown calls `self._finalizer.detach()` before shutting down, so the finalizer that fires shortly after never double-reclaims the same instance.
 </Note>
 
-PR #4107 made the release path survive interpreter shutdown; PR #4109 made sure the release path is actually invoked on `run_on=`. Together they close the container-leak story end to end for both `sandbox=` and `run_on=`.
+PR #4107 made the release path survive interpreter shutdown; PR #4109 made sure the release path is actually invoked on `run_on=`; [PR #5348](https://github.com/MervinPraison/PraisonAI/pull/5348) routed that release through the shared bridge and added the bounded exit-time wait. Together they close the container-leak story end to end for both `sandbox=` and `run_on=`.
 
 ---
 
@@ -223,5 +237,8 @@ Since [PR #4071](https://github.com/MervinPraison/PraisonAI/pull/4071), this lis
 </Card>
 <Card title="Managed CLI" icon="terminal" href="/features/managed-cli">
   Full `praisonai managed` command reference
+</Card>
+<Card title="Async Bridge" icon="bridge" href="/features/async-bridge">
+  The shared background loop `_release` now uses for teardown
 </Card>
 </CardGroup>

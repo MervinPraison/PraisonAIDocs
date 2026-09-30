@@ -123,6 +123,59 @@ WebSocket endpoint for real-time audio streaming between Twilio and OpenAI.
 
 The realtime WebSocket runs with bounded connect / heartbeat / close so a dead upstream cannot hold a Twilio media leg indefinitely: `open_timeout=10`, `ping_interval=20`, `ping_timeout=20`, `close_timeout=5`, `max_size=1 MiB`. These are hardcoded, not env-tunable. See [Point the realtime endpoint elsewhere](/docs/call#point-the-realtime-endpoint-elsewhere-azure-self-hosted) for the override flow.
 
+### Rate Limiting & Multi-Tenant Isolation
+
+Each `build_call_app()` tenant enforces per-IP request rate limiting and a total concurrent-connection cap. As of [PR #5348](https://github.com/MervinPraison/PraisonAI/pull/5348), both counters live on that app's `CallAppState` — co-hosted tenants in a single process no longer cross-consume each other's connection budget.
+
+**Rate Limiting**
+
+| Env Var | Default | Description |
+|---|---|---|
+| `MAX_REQUESTS_PER_WINDOW` | `100` | Requests allowed per IP per hour. Exceeding it closes the WebSocket with code `4029` ("Rate limit exceeded"). |
+| `MAX_CONCURRENT_CONNECTIONS` | `5` | Total concurrent media-stream connections per app. Exceeding it closes the WebSocket with code `1013` ("Server busy"). |
+
+**Bounded IP tracking**
+
+The per-IP request-timestamp map is an **LRU-bounded `OrderedDict`** (default cap `10_000` IPs, configurable via the `max_tracked_ips` argument to `CallAppState(...)`):
+
+- Expired timestamps are pruned eagerly on read (`touch_ip`), and an IP whose window has emptied is dropped from the map immediately — a rejected caller leaves no residue.
+- On admit (`record_ip`), the IP is pinned MRU and the oldest entries are evicted so the map never exceeds `max_tracked_ips`. Provision above your realistic distinct-IP working set (the 10k default is generous) so eviction only bites under a rotating-IP flood — exactly the unbounded-growth case the bound exists to contain.
+
+Prior to PR #5348, `client_ips` was a plain module-global `defaultdict(list)` — a caller rotating source IPs could grow it without bound.
+
+**Custom `max_tracked_ips`:**
+
+```python
+from praisonai.api.call import build_call_app, CallAppState
+
+app = build_call_app()
+# CallAppState is built inside build_call_app(); override by replacing
+# app.state.call_state with a state that carries a different IP cap.
+app.state.call_state = CallAppState(max_tracked_ips=50_000)
+```
+
+```mermaid
+sequenceDiagram
+    participant Client as WebSocket Client
+    participant State as CallAppState
+    participant OAI as OpenAI Realtime
+
+    Client->>State: connect + session token
+    State->>State: touch_ip(ip, now) → prune expired
+    alt window ≥ MAX_REQUESTS_PER_WINDOW
+        State-->>Client: close 4029 (rate limited)
+    else
+        State->>State: record_ip(ip, window, now) → pin MRU, evict LRU
+    end
+    State->>State: active_connections check
+    alt ≥ MAX_CONCURRENT_CONNECTIONS
+        State-->>Client: close 1013 (server busy)
+    else
+        State-->>Client: accept + connect to OpenAI
+        Client->>OAI: media stream
+    end
+```
+
 ### Custom Tools
 
 Create a `tools.py` file in the working directory:
