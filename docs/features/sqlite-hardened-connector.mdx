@@ -1,7 +1,7 @@
 ---
 title: "Hardened SQLite Storage"
 sidebarTitle: "Hardened SQLite"
-description: "WAL-with-safe-fallback SQLite connector that keeps agent memory intact on Docker, NFS, and Kubernetes volumes"
+description: "WAL-with-safe-fallback SQLite connector with opt-in corruption detection and repair — keeps agent memory intact on Docker, NFS, and Kubernetes volumes"
 icon: "database"
 ---
 
@@ -102,6 +102,102 @@ sequenceDiagram
 
 ---
 
+## Integrity Guard
+
+When `guard=True`, the connector runs a cheap `quick_check` on open and — on a malformed file — forensically backs up the bad bytes and attempts a bounded, least-destructive repair before returning a usable connection. `SqliteSessionStore` and `SqliteTranscriptStore` opt in by default so a corrupt `sessions.db` no longer takes the durable path down.
+
+```mermaid
+graph LR
+    O[🔌 Open] --> Q{🔍 quick_check}
+    Q -->|ok| U[✅ Use connection]
+    Q -->|locked/busy| U
+    Q -->|corrupt| B[💾 Forensic backup<br/>.corrupt-&lt;epoch&gt;]
+    B --> R{🛠 Online-backup<br/>repair}
+    R -->|verified intact| P[⚛ atomic os.replace]
+    R -->|failed| QN[📦 Quarantine<br/>fresh empty DB]
+    P --> U
+    QN --> U
+
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class O,B step
+    class U,P good
+    class QN warn
+    class Q,R q
+```
+
+### Corruption on open
+
+A malformed database is detected, backed up, and repaired in place — or quarantined so a fresh empty DB opens instead of crashing.
+
+```mermaid
+sequenceDiagram
+    participant Store as SqliteTranscriptStore
+    participant Connector as sqlite_connect(guard=True)
+    participant DB as sessions.db
+
+    Store->>Connector: connect(guard=True)
+    Connector->>DB: PRAGMA quick_check(1)
+    DB-->>Connector: "malformed"
+    Connector->>DB: copy → sessions.db.corrupt-1717082000000 (+sidecars)
+    Connector->>DB: online-backup into sessions.db.repair-tmp-<pid>-<id>
+    Connector->>DB: PRAGMA quick_check on snapshot
+    alt snapshot intact
+        Connector->>DB: os.replace(snapshot, sessions.db)
+    else snapshot still bad
+        Connector->>DB: os.remove(sessions.db) (+ stale -wal/-shm)
+    end
+    Connector-->>Store: usable connection
+```
+
+The guard treats a transient `database is locked` / `database is busy` on the probe as healthy-but-busy — a peer momentarily holding the file is left exactly as-is, with no backup and no repair.
+
+### What lands on disk
+
+| File | When it appears | Purpose | Retention |
+|------|-----------------|---------|-----------|
+| `<file>.corrupt-<epoch_ms>` (+`-wal`/`-shm`) | On every corruption event with backup capacity | Preserves malformed bytes for forensics | Newest 3 per DB (older pruned) |
+| `<file>.repair-tmp-<pid>-<id>` | During a repair attempt only | In-flight snapshot for online-backup rebuild | Deleted on success or failure |
+| `<file>.repair` (sidecar ledger) | After a repair attempt | Counts attempts so a permanently-bad file is not re-repaired on every boot | Cleared when a repair succeeds |
+
+The forensic backup **fails closed on low disk** — it needs `2 × file_size + 1 MiB` free, so a corruption event never itself fills the disk. Backups are retention-capped at `_MAX_FORENSIC_BACKUPS = 3` per file, and repairs are bounded at `_MAX_REPAIR_ATTEMPTS = 3` per file (tracked in the `.repair` sidecar) so a boot-loop cannot churn a permanently-bad file. These are internal capacity constants — reason about them, but don't override them.
+
+### Public helpers
+
+`sqlite_quick_check` is a cheap `PRAGMA quick_check(1)` wrapper that returns `False` on any malformed-image / I/O error and re-raises transient lock/busy errors so callers can tell "locked" (leave alone) apart from "corrupt" (back up + repair).
+
+```python
+from praisonaiagents.storage import sqlite_quick_check
+import sqlite3
+
+conn = sqlite3.connect("./state.db")
+if not sqlite_quick_check(conn):
+    print("This file failed the structural probe — consider guard=True on connect.")
+```
+
+### Should I turn guard on?
+
+```mermaid
+graph TB
+    Q{Am I building a durable store<br/>whose corruption would crash boot?}
+    Q -->|Yes — durable path,<br/>can't afford a crash| G[guard=True<br/>+repair=True +backup=True]
+    Q -->|Building a scratch/tmp store<br/>where a bad file is OK to lose| N[guard=False<br/>default]
+    Q -->|Low-disk environment where<br/>forensic copies could hurt| BOnly["guard=True, backup=True,<br/>repair=False (still fails closed<br/>on low disk)"]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef on fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef off fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class G,BOnly on
+    class N off
+```
+
+---
+
 ## Configuration Options
 
 The `sqlite_connect` factory forwards unknown keyword arguments to `sqlite3.connect`.
@@ -113,6 +209,9 @@ The `sqlite_connect` factory forwards unknown keyword arguments to `sqlite3.conn
 | `isolation_level` | `Optional[str]` | `""` (sqlite3 default) | `None` for autocommit |
 | `busy_timeout_ms` | `int` | `5000` | `PRAGMA busy_timeout` in milliseconds |
 | `synchronous` | `str` | `"FULL"` | `PRAGMA synchronous`; pass `"NORMAL"` for throughput under WAL |
+| `guard` | `bool` | `False` | Run `quick_check` on open and, on a malformed file, forensically back it up and attempt a bounded least-destructive repair before connecting. Off by default so existing callers are unchanged. |
+| `repair` | `bool` | `True` | Attempt an online-backup repair on corruption. Only takes effect when `guard=True`. Bounded by a sidecar attempt-ledger (`<file>.repair`). |
+| `backup` | `bool` | `True` | Take a retention-capped, disk-space-aware forensic backup of the malformed file before repair. Only takes effect when `guard=True`. |
 
 ---
 
@@ -166,6 +265,10 @@ graph TB
 
 <Note>
 The core memory (STM/LTM), session, transcript, and generic `SQLiteBackend` stores use the hardened factory today. The bot/gateway wrapper stores (`_outbox`, `_dlq`, `_ingress`, approval, delivery-control, and kanban) are not wired in yet.
+
+**Integrity guard (`guard=True`) opt-in:**
+- **Guard on**: `SqliteSessionStore` (session index), `SqliteTranscriptStore` (transcript store).
+- **Guard off (unchanged)**: `SQLiteBackend`, memory STM, memory LTM, and the wrapper stores in `praisonai-bot/` and `praisonai/persistence`. These can opt in later by passing `guard=True` to `sqlite_connect`.
 </Note>
 
 ---
@@ -184,6 +287,18 @@ For any SQLite-backed store you build, call `sqlite_connect` instead of `sqlite3
 </Accordion>
 <Accordion title="Expect DELETE on hostile filesystems">
 On Docker Desktop, NFS, or network volumes the on-disk journal mode may be `DELETE`. This is correct behaviour, not a regression, and does not change any API.
+</Accordion>
+<Accordion title="Let the guard classify a locked file — it won't back it up">
+A transient `database is locked` / `database is busy` on the `quick_check` probe is treated as healthy-but-busy, and the file is left untouched. Only a genuinely malformed image triggers a backup or repair.
+</Accordion>
+<Accordion title="Never rely on <file>.corrupt-* for a live copy of your data">
+Those are forensic snapshots of malformed bytes, not backups. If you need real backups, run `sqlite3 .backup` or your platform's snapshotting.
+</Accordion>
+<Accordion title="Don't delete <file>.repair yourself">
+The ledger caps repair attempts so a permanently-bad file doesn't churn on every boot. Deleting it resets the budget.
+</Accordion>
+<Accordion title="Turn guard=True on for any custom durable store you build with sqlite_connect">
+This is what the shipped session/transcript stores do; anything else that must open reliably should follow.
 </Accordion>
 </AccordionGroup>
 
