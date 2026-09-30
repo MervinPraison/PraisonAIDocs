@@ -153,6 +153,45 @@ Advanced features layer onto the base recipe server from [Recipe Serve](/feature
 
 ---
 
+## Rate limiter internals
+
+The middleware buckets requests by the strongest identity the auth layer has already validated — never by a raw client header — so rotating a header cannot defeat the limit.
+
+| Auth mode | Bucket id | Notes |
+|-----------|-----------|-------|
+| `jwt` | `jwt:<sub>` from the validated JWT payload | Falls through to `ip:` if no valid JWT |
+| `api-key` | `apikey:<validated-key>` | Only in this mode is `X-API-Key` used as a bucket — because the auth middleware has already validated it |
+| `none` | `ip:<client-host>` | Or `"anonymous"` if the request has no client host |
+
+`RateLimiter` exposes two entry points:
+
+- `check(client_id)` — **synchronous, thread-safe** (backward-compatible). `check_sync` remains as an alias.
+- `check_async(client_id)` — **async**, guarded by an `asyncio.Lock`. Used by the middleware hot path so overlapping requests can never both pass the length check before either appends.
+
+```mermaid
+graph TB
+    Req["📥 Request arrives"] --> HasJwt{"Validated JWT<br/>on request.state.user?"}
+    HasJwt -->|Yes| BJwt["Bucket: jwt:&lt;sub&gt;"]
+    HasJwt -->|No| IsApi{"auth == 'api-key'<br/>and X-API-Key present?"}
+    IsApi -->|Yes| BKey["Bucket: apikey:&lt;key&gt;"]
+    IsApi -->|No| HasClient{"request.client<br/>available?"}
+    HasClient -->|Yes| BIp["Bucket: ip:&lt;host&gt;"]
+    HasClient -->|No| BAnon["Bucket: anonymous"]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef bucket fill:#189AB4,stroke:#7C90A0,color:#fff
+    class Req,HasJwt,IsApi,HasClient q
+    class BJwt,BKey,BIp,BAnon bucket
+```
+
+<Note>
+If you rely on rate limiting in `auth: none` or `auth: jwt` mode, the bucket id is derived from the **validated** identity (JWT sub or client IP), never from the raw `X-API-Key` header. A client cannot rotate `X-API-Key` values to escape the limit. In `auth: api-key` mode the validated key is the bucket, so distinct valid keys naturally get distinct buckets — this is intentional.
+</Note>
+
+Precedence: `jwt:<sub>` > `apikey:<key>` (only in `api-key` mode) > `ip:<host>` > `"anonymous"`.
+
+---
+
 ## Configuration Options
 
 | Key | Type | Default | Description |
@@ -167,21 +206,48 @@ Advanced features layer onto the base recipe server from [Recipe Serve](/feature
 | `service_name` | `str` | `"praisonai-recipe"` | Service name for tracing |
 | `workers` | `int` | `1` | Worker processes (`serve()` argument) |
 
+<Warning>
+`rate_limit` is enforced **per worker process**. When `workers > 1`, `serve()` splits the configured value across workers (`rate_limit // workers`, minimum 1) and emits a `UserWarning` at startup. This is best-effort — for exact cross-process limiting, use a shared store.
+</Warning>
+
 ---
 
 ## Common Patterns
 
 ### Programmatic rate limiter
 
+<Tabs>
+<Tab title="Sync">
 ```python
 from praisonai.recipe.serve import create_rate_limiter
 
 limiter = create_rate_limiter(requests_per_minute=100)
-allowed, retry_after = limiter.check("client-ip-or-key")
 
+# Backward-compatible sync API. Guarded by a threading.Lock.
+allowed, retry_after = limiter.check("ip:127.0.0.1")
+# `check_sync` is retained as an alias of `check`.
 if not allowed:
     print(f"Rate limited. Retry after {retry_after} seconds")
 ```
+</Tab>
+<Tab title="Async">
+```python
+import asyncio
+from praisonai.recipe.serve import create_rate_limiter
+
+limiter = create_rate_limiter(requests_per_minute=5)
+
+async def burst():
+    # 100 concurrent checks — exactly 5 succeed (async race closed).
+    results = await asyncio.gather(
+        *[limiter.check_async("burst") for _ in range(100)]
+    )
+    return sum(1 for allowed, _ in results if allowed)
+
+print(asyncio.run(burst()))  # -> 5
+```
+</Tab>
+</Tabs>
 
 ### Admin reload
 
@@ -217,13 +283,17 @@ OpenTelemetry is lazily imported — if packages are missing, the server logs a 
     Set `enable_admin=True` only alongside `auth: api-key` and load the key from `PRAISONAI_API_KEY`. Admin reload can change live behaviour — protect it.
   </Accordion>
   <Accordion title="Use workers for CPU-bound recipe loads">
-    Set `workers` to roughly `2 × CPU cores + 1`. Workers above 1 disable hot reload automatically.
+    Set `workers` to roughly `2 × CPU cores + 1`. Workers above 1 disable hot reload automatically. Under the hood, `serve(workers=N>1)` hands uvicorn an app-factory import string (`praisonai.recipe.serve:_app_factory`) and ships the config to each worker through the `PRAISONAI_RECIPE_SERVE_CONFIG` environment variable. Previously, passing `workers=N` silently degraded to a single worker — that regression is fixed.
   </Accordion>
   <Accordion title="Exempt health and metrics from rate limits">
     Keep `/health` and `/metrics` in `rate_limit_exempt_paths` so orchestrators and Prometheus can poll without consuming quota.
   </Accordion>
   <Accordion title="Use Redis for distributed rate limiting">
-    The built-in limiter is in-memory per worker. For multi-node deployments, place a shared rate limiter in front of the service (API gateway or Redis-backed middleware).
+    The built-in limiter is in-memory per worker. When you set `workers > 1`, `serve()` automatically divides the configured `rate_limit` across workers (`rate_limit // workers`, floor 1) so the aggregate rate stays close to the value you configured — and prints a `warnings.warn` at startup explaining exactly what it did.
+
+    Example: `serve(workers=4, config={"rate_limit": 100})` → each worker enforces `25/min` locally, so the OS-load-balanced aggregate is ≈ `100/min`.
+
+    For **exact** cross-process enforcement, front the service with an API gateway or a Redis-backed limiter — the built-in in-memory limiter cannot share state across worker processes.
   </Accordion>
 </AccordionGroup>
 
