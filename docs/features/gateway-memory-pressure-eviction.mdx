@@ -1,11 +1,25 @@
 ---
 title: "Gateway Memory-Pressure Cache Eviction"
 sidebarTitle: "Memory-Pressure Eviction"
-description: "Soft-evict the coldest warm per-session agent caches before the kernel OOM-kills the gateway."
+description: "Soft-evict the coldest warm agent caches and cold live gateway sessions before the kernel OOM-kills the gateway."
 icon: "memory"
 ---
 
-The eviction planner names the coldest idle warm caches to reclaim under memory pressure, so a busy gateway on a small host survives instead of being OOM-killed.
+One pure planner names the coldest idle memory to reclaim under pressure across **two layers** — warm per-session agent caches **and** live gateway sessions — so a busy gateway on a small host survives instead of being OOM-killed.
+
+```python
+from praisonaiagents import Agent
+from praisonai_bot.gateway import WebSocketGateway
+
+# On a cgroup-aware Linux host with a session store (SQLite is the default),
+# the gateway automatically soft-evicts the coldest idle sessions under memory
+# pressure — both the agent's warm cache AND its live gateway session, before
+# the OOM killer fires. No config needed.
+gateway = WebSocketGateway()
+gateway.register_agent(Agent(name="Support", instructions="Help users"))
+```
+
+The same guard runs behind a multi-channel `BotOS` deployment:
 
 ```python
 from praisonaiagents import Agent
@@ -13,16 +27,13 @@ from praisonai.bots import BotOS
 
 agent = Agent(name="Support", instructions="Help users")
 
-# On a memory-limited host (a $5 VPS, a Fly machine, a k8s cgroup),
-# the gateway automatically soft-evicts the coldest warm caches under
-# pressure before the OOM killer fires — no config needed.
 # A persistent session store (SQLite, Postgres) is what makes soft
 # eviction rebuildable, so it must be configured for eviction to be active.
 bot = BotOS(agent=agent, platforms=["telegram"])
 bot.start()
 ```
 
-Each evicted session is transparently rebuilt from the persisted session store on its next turn — cheap and lossless, with no user-visible impact.
+Each evicted cache or session is transparently rebuilt from the persisted session store on its next turn or `join` — cheap and lossless, with no user-visible impact.
 
 ```mermaid
 graph LR
@@ -49,6 +60,41 @@ graph LR
 <Note>
 `MemoryPressurePolicy` sheds *new* turns under pressure; this planner reclaims memory from *idle warm* caches. See [Admission Control · Memory-aware admission](/features/gateway-admission-control#memory-aware-admission) for the sibling admission-side control.
 </Note>
+
+## Two eviction layers, one planner
+
+Two enactors share one decision core — the same pure planner and the same cgroup probe drive both.
+
+```mermaid
+graph LR
+    subgraph Core["Pure decision"]
+        Plan[🧠 plan_pressure_evictions]
+    end
+
+    subgraph WarmCaches["Layer 1 — Warm agent caches"]
+        WMgr[📦 BotSessionManager] --> Plan
+        Plan --> WEnact[🧹 BotSessionManager.sweep_under_pressure]
+    end
+
+    subgraph LiveSessions["Layer 2 — Live WebSocket sessions (NEW, PR #5237)"]
+        Gw[🛰️ WebSocketGateway._sessions] --> Plan
+        Plan --> GEnact[🧹 WebSocketGateway._sweep_sessions_under_pressure]
+    end
+
+    classDef planner fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef enact fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Plan planner
+    class WMgr,Gw store
+    class WEnact,GEnact enact
+```
+
+**Layer 1** (existing) sheds warm per-session **agent caches** — the chat history plus agent object held by `BotSessionManager`. **Layer 2** (new in PR #5237) sheds live **`WebSocketGateway` session objects** — the `GatewaySession` with its pending inbox, protocol cursors, executing-turn flag, and event log. Both call the **same** pure planner ([`plan_pressure_evictions`](#plan-pressure-evictions)) with [`WarmSession`](#warmsession) facts, and both read the **same** [`CgroupMemoryPressure`](#using-cgroupmemorypressure) probe. The decision is central; the enactors are layer-local.
+
+**Which layer sheds first?** On a running gateway both sweeps run on the housekeeping tick — the warm-cache one from `BotSessionManager` (inside `BotOS`) and the gateway-session one from `WebSocketGateway._liveness_loop`. Together they cover both memory sources.
+
+---
 
 ## Quick Start
 
@@ -231,6 +277,75 @@ Reads the real cgroup budget/RSS from `memory_pressure`, calls `plan_pressure_ev
 
 ---
 
+## Live gateway sessions (`WebSocketGateway._sweep_sessions_under_pressure`)
+
+The gateway's own enactor sheds cold live `GatewaySession` objects before the kernel does — the second layer, new in PR #5237.
+
+**What it evicts.** A `GatewaySession` in `WebSocketGateway._sessions` that is (a) not currently executing a turn, (b) has no live WebSocket bound to it, and (c) whose transcript is durably persisted. When shed it is closed with `persist=True`, dropped from the live set, and its `resume_window` TTL is stamped so the next `join` transparently rehydrates it from the store.
+
+**Guards** — a session is skipped (never evicted) when:
+
+| Guard | Why | Test |
+|---|---|---|
+| No session store configured | The transcript isn't rebuildable, so evicting would lose data. Sweep returns `0` — a no-op. | `test_gateway_noop_without_session_store` |
+| No cgroup limit reported (`cgroup_limit_mb() is None`) | The host isn't running under a memory ceiling; today's behaviour is preserved exactly. | `test_gateway_noop_when_no_cgroup_budget` |
+| `_is_executing=True` on the session | An executing turn must not be aborted. Re-checked at enact time. | `test_gateway_never_evicts_executing_session` |
+| Live WebSocket bound (`session_id ∈ _client_sessions.values()`) | Ordinary `message` frames look the session up in `_sessions` directly and would be silently dropped (only `hello`/`join` rehydrate) — evicting a bound session would strand its client. Re-checked at enact time. | `test_gateway_never_evicts_session_with_live_client`, `test_gateway_sheds_disconnected_but_keeps_bound_session` |
+| Failed final persist (`store.add_message` raises **or** returns `False`) | Under pressure the live session may hold the only copy of recent messages/events. If persisting the final snapshot fails, the session is retained in memory and the sweep counts it as un-shed. | `test_gateway_keeps_session_when_persist_fails`, `test_gateway_keeps_session_when_store_returns_false` |
+
+**Interaction with `close_session(persist=True)`.** The sweep does not call `close_session` directly — it uses a stricter helper (`_evict_persisted_session`) that only drops the in-memory session **after** the final `store.add_message` write returns truthy (or `None`, for legacy stores that don't report).
+
+<Warning>
+`_evict_persisted_session` is **stricter** than the ordinary `close_session(persist=True)` path. `close_session` best-effort persists but still drops the in-memory object even when the store write fails; under memory pressure that would be data loss, because the live session may hold the only copy of recent messages. The pressure enactor therefore retains the session in memory on any failed persist — a raised exception **or** a falsy `add_message` return — and counts it as un-shed.
+</Warning>
+
+**Headroom.** The gateway sweeper uses `_pressure_headroom = 0.9` (matching the warm-cache default). It sheds until RSS ≤ `headroom × budget`, re-sampling anonymous RSS after each eviction and stopping as soon as it fits — never more (`test_gateway_sheds_coldest_session_first_until_within_budget`, `test_gateway_noop_when_within_budget`, `test_gateway_noop_when_no_sessions`).
+
+### How it works — live sessions
+
+The gateway builds a candidate list of disconnected sessions, asks the planner for the LRU order, then persists-then-drops each victim while re-sampling RSS.
+
+```mermaid
+sequenceDiagram
+    participant Loop as _liveness_loop tick
+    participant Probe as CgroupMemoryPressure
+    participant Planner as plan_pressure_evictions
+    participant GW as WebSocketGateway
+    participant Store as SessionStore
+
+    Loop->>GW: _sweep_sessions_under_pressure()
+    GW->>Probe: cgroup_limit_mb() + anon_rss_mb()
+    Probe-->>GW: budget, rss
+    GW->>GW: build WarmSession list<br/>(exclude bound sessions)
+    GW->>Planner: budget, rss, warm
+    Planner-->>GW: LRU-ordered session_ids
+    loop for each victim
+        GW->>GW: skip if executing / now bound
+        GW->>Store: add_message(session_data)
+        alt persisted OK
+            GW->>GW: session.close() + stamp resume TTL
+            GW->>Probe: re-sample anon_rss_mb()
+            alt back within headroom × budget
+                GW-->>Loop: stop
+            end
+        else raised / returned False
+            GW-->>GW: retain in memory (no data loss)
+        end
+    end
+```
+
+The `resume_window` TTL stamped on each eviction is the persistence contract that keeps the session resumable — see `test_gateway_evict_persisted_session_sets_resume_ttl`.
+
+---
+
+## Runs even when liveness is disabled
+
+Since PR #5237, the housekeeping loop that drives this sweep no longer exits when `LivenessConfig(enabled=False)` / `interval_ms=0` — only the `PING`/reap logic is gated. When liveness is disabled the loop falls back to the config's default interval so the pressure sweep still fires. This preserves the OOM guard as a hard invariant that does not depend on any other feature being enabled.
+
+See [Gateway Liveness](/features/gateway-liveness) for how the always-on housekeeping tick composes with the ping/reap logic.
+
+---
+
 ## How It Works
 
 The gateway samples its own memory, asks the planner for the order to evict, then enacts it — re-sampling RSS as it goes.
@@ -297,6 +412,8 @@ assert plan_pressure_evictions(1000.0, 800.0, warm, headroom_ratio=0.7) == ["a"]
 
 ## User Interaction Flow
 
+### Warm agent caches (Layer 1)
+
 A Fly machine with a **512 MiB** cgroup limit hosts a Telegram bot that has accumulated **60 warm session caches**. A burst pushes RSS to **490 MiB** — over `0.9 × 512 ≈ 460 MiB`.
 
 1. `CgroupMemoryPressure` reads `cgroup_limit_mb() = 512`, `anon_rss_mb() = 490`.
@@ -305,6 +422,17 @@ A Fly machine with a **512 MiB** cgroup limit hosts a Telegram bot that has accu
 4. Those users get their cache rebuilt transparently on their next turn.
 
 No user-visible impact. No OOM kill.
+
+### Live WebSocket sessions (Layer 2)
+
+A gateway with a **512 MiB** cgroup limit is serving **80 concurrent WebSocket clients**. 25 of them idle out (no live socket bound; transcripts already persisted to the SQLite store from ordinary turn completions). A tool-heavy burst on the remaining 55 pushes RSS to **490 MiB** — over `0.9 × 512 ≈ 460 MiB`.
+
+1. On the next housekeeping tick, `_sweep_sessions_under_pressure()` reads `cgroup_limit_mb() = 512`, `anon_rss_mb() = 490`.
+2. It builds a `WarmSession` list of the disconnected sessions only — bound sessions and executing turns are excluded.
+3. `plan_pressure_evictions` returns the 25 evictable session IDs LRU-first.
+4. `_evict_persisted_session` closes them one by one — each final snapshot written, then dropped from `_sessions`, with a `resume_window` TTL stamped so they remain resumable.
+5. It re-samples RSS after each eviction and stops when RSS is back inside the target, well before it exhausts the 25 candidates.
+6. When one of those users re-joins, the gateway rehydrates the session from the store transparently — no user-visible impact, no OOM kill, no dropped socket.
 
 On each periodic tick the gateway already runs `reap_stale`; the new sweep sits alongside it and is a no-op when the host has no cgroup limit:
 
@@ -399,8 +527,14 @@ assert victims == ["s"]
   <Card title="Gateway Graceful Drain" icon="power-off" href="/features/gateway-graceful-drain">
     The other "avoid dropping live sessions" primitive
   </Card>
+  <Card title="Gateway Liveness" icon="heart-pulse" href="/features/gateway-liveness">
+    Housekeeping tick that drives the sweep — runs even when disabled
+  </Card>
+  <Card title="Gateway Session Continuity" icon="arrows-rotate" href="/features/gateway-session-continuity">
+    What survives an eviction — the resume path
+  </Card>
 </CardGroup>
 
 <Note>
-Core planner introduced in [PraisonAI PR #3805](https://github.com/MervinPraison/PraisonAI/pull/3805) (fixes [#3804](https://github.com/MervinPraison/PraisonAI/issues/3804)). Wrapper-side wiring (`CgroupMemoryPressure`, `BotSessionManager.warm_sessions` / `sweep_under_pressure`, per-turn in-flight and flushed guards) added in [PR #4296](https://github.com/MervinPraison/PraisonAI/pull/4296) (fixes [#4294](https://github.com/MervinPraison/PraisonAI/issues/4294)).
+Core planner introduced in [PraisonAI PR #3805](https://github.com/MervinPraison/PraisonAI/pull/3805) (fixes [#3804](https://github.com/MervinPraison/PraisonAI/issues/3804)). Wrapper-side wiring (`CgroupMemoryPressure`, `BotSessionManager.warm_sessions` / `sweep_under_pressure`, per-turn in-flight and flushed guards) added in [PR #4296](https://github.com/MervinPraison/PraisonAI/pull/4296) (fixes [#4294](https://github.com/MervinPraison/PraisonAI/issues/4294)). Live-session shedding (`WebSocketGateway._sweep_sessions_under_pressure`, bound-client guard, failed-persist retention, always-on housekeeping tick) added in [PR #5237](https://github.com/MervinPraison/PraisonAI/pull/5237) (fixes [#5153](https://github.com/MervinPraison/PraisonAI/issues/5153)).
 </Note>
