@@ -938,8 +938,61 @@ graph TB
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `context_compaction` | `bool` | `False` | Enable automatic compaction of `chat_history` before each LLM call. Zero overhead when `False`. |
-| `max_context_tokens` | `Optional[int]` | `None` (auto-detect from model) | Token limit before compaction triggers (via litellm's `model_cost` registry when available, otherwise the built-in `MODEL_LIMITS` table). |
+| `max_context_tokens` | `Optional[int]` | `None` (auto-detect from model window) | Token limit before compaction triggers. When unset, the in-run compaction path resolves the budget from the active model's context window via `budgeter.get_model_limit(model)` at an 80% safety fraction, minus `get_output_reserve(model)` for completion headroom. An explicit int always wins unchanged. Falls back to a static `8000` only for the offline / unknown-model case. Fixed in [PR #5382](https://github.com/MervinPraison/PraisonAI/pull/5382). |
 | `compaction_strategy` | `Optional[CompactionStrategy]` | `None` (resolves to `TRUNCATE`) | Which strategy to use when compaction runs. |
+
+### Auto-sized trigger (the new default)
+
+When `max_context_tokens` is left unset, the in-run compactor derives its budget from the active model's context window instead of a flat 8000-token trigger, so a 128k model does not compact at 8k.
+
+```python
+from praisonaiagents import Agent, ExecutionConfig
+
+# No max_context_tokens set — trigger auto-sizes to the model window
+agent = Agent(
+    name="LongChat",
+    instructions="You are a helpful assistant.",
+    llm="gpt-4o",   # 128k window → trigger ~= 128000 × 0.8 − output_reserve
+    execution=ExecutionConfig(context_compaction=True),
+)
+```
+
+<Note>
+This lands in time for `ExecutionConfig.context_compaction` defaulting to `True` in the next release — unconfigured agents on large-context models no longer over-compact at ~8k. See [PR #5382](https://github.com/MervinPraison/PraisonAI/pull/5382).
+</Note>
+
+The budget resolves through the same `budgeter` the in-loop path uses — an explicit int always wins, otherwise the model window drives the trigger.
+
+```mermaid
+graph LR
+    A[📋 ExecutionConfig<br/>max_context_tokens] --> B{Explicit int?}
+    B -->|Yes| C[✅ Use that int<br/>unchanged]
+    B -->|No / None| D[🔍 budgeter.get_model_limit model]
+    D --> E[🧮 int limit × 0.8<br/>− get_output_reserve model]
+    E --> F[✅ Effective trigger]
+    D -.->|Offline / unknown model| G[⚠️ Static fallback 8000]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fallback fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A input
+    class B decision
+    class D,E process
+    class C,F output
+    class G fallback
+```
+
+| Situation | Effective trigger |
+|---|---|
+| `max_context_tokens=8000` (explicit) | `8000` — unchanged, fully backward compatible |
+| Unset, `llm="gpt-4o"` (128k window) | `int(128000 × 0.8) − output_reserve` — far above 8000 |
+| Unset, 1M-token model (Gemini-class) | `int(1_000_000 × 0.8) − output_reserve` — scales with the model |
+| Unset, unknown / offline model | `8000` static fallback |
+
+The `0.8` fraction matches the in-loop path convention; `output_reserve` comes from [`get_output_reserve(model)`](/features/context-budgeter) and reserves headroom for the completion.
 
 ### CompactionConfig Options
 
