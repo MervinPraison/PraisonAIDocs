@@ -104,7 +104,11 @@ agent = Agent(
 |---------|-------------|----------|
 | **mem0** (default) | Long-term memory with semantic search | Multi-user apps, persistent memory |
 | **chroma** | Local vector database | Development, single-user apps |
+| **sqlite** | Zero-dependency local store | Lightweight fallback, tests |
+| **mongodb** | Document store with Atlas `$vectorSearch` | Multi-tenant production, existing MongoDB |
 | **internal** | Built-in lightweight storage | Simple use cases |
+
+All four external backends (`mem0`, `chroma`, `sqlite`, `mongodb`) share the same tenant-scope contract — see the Warning below.
 
 ## Scope Identifiers
 
@@ -121,15 +125,21 @@ The **mem0 backend requires at least one scope identifier**. If none is provided
 </Warning>
 
 <Warning>
-**`delete_all()` requires a scope.** The Chroma and SQLite backends now enforce the same contract as mem0: an **unscoped** `delete_all()` raises `ScopeRequiredError` instead of silently wiping the entire (typically shared) collection or table. Scoped deletes are unchanged.
+**Scope is required on every read and write** for the `chroma`, `sqlite`, and `mongodb` backends — not just `delete_all()`. Since PR [#5320](https://github.com/MervinPraison/PraisonAI/pull/5320) the shared `require_scope(...)` contract is enforced at the top of `search()`, `add()`, `get_all()`, and `delete_all()` on all three backends, matching what mem0 already did. Unscoped calls raise `ScopeRequiredError` instead of silently returning or wiping every tenant's data.
 
 ```python
-# ✅ Scoped — deletes only Alice's items
+# ✅ Scoped
+knowledge.search("query", user_id="alice")
+knowledge.add("hello", user_id="alice")
+knowledge.get_all(user_id="alice")
 knowledge.delete_all(user_id="alice")
 
-# ❌ Unscoped — raises ScopeRequiredError (no data-loss / cross-tenant wipe)
-knowledge.delete_all()
+# ❌ Unscoped — raises ScopeRequiredError (no cross-tenant leak / wipe)
+knowledge.search("query")
+knowledge.get_all()
 ```
+
+The raised message is: `search requires at least one of 'user_id', 'agent_id', or 'run_id' to scope the search.` (the operation name changes per method).
 </Warning>
 
 ### Example with Scope
@@ -203,6 +213,68 @@ graph LR
 <Note>
 When you pass more than one scope identifier, PraisonAI automatically combines them using ChromaDB's `$and` operator. A single identifier is passed through unchanged. You don't need to write the `$and` yourself.
 </Note>
+
+### Filters vs Scope
+
+<Note>
+On Chroma, a caller-supplied `filters={...}` cannot overwrite a tenant-scope key already set by `user_id` / `agent_id` / `run_id`. `filters={"user_id": "bob"}` on a `search(..., user_id="alice")` is ignored for the `user_id` key — the `alice` scope wins. Non-conflicting filter keys still merge in. This prevents a `filters` argument from accidentally widening an already-scoped query onto another tenant's data.
+</Note>
+
+### Metadata Filters
+
+Use `filters=` on `search()` to narrow results by any metadata field.
+
+```python
+from praisonaiagents import Agent
+
+# Agent-first: the agent's memory scope carries user_id; filters narrow by metadata
+agent = Agent(
+    name="PolicyBot",
+    instructions="Answer policy questions from the knowledge base.",
+    knowledge=["./policies/"],
+    memory={"user_id": "customer_42"},
+)
+agent.start("What is the refund policy?")
+```
+
+```python
+from praisonaiagents import Knowledge
+
+kb = Knowledge(config={"vector_store": {"provider": "sqlite"}})
+
+# Direct API — scope + metadata filter together
+kb.search("refund policy", user_id="customer_42", filters={"category": "policy"})
+```
+
+Since PR [#5320](https://github.com/MervinPraison/PraisonAI/pull/5320) all four adapters (`chroma`, `sqlite`, `mongodb`, `mem0`) honor the `filters=` kwarg on `search()`. Previously SQLite and MongoDB silently dropped `filters`, returning an unfiltered superset without any warning.
+
+- **Chroma** — merged into the ChromaDB `where` clause (as `$and` when combined with scope; scope keys are protected from being overwritten).
+- **SQLite** — applied as `AND json_extract(metadata, '$."<key>"') = ?`; a key that itself contains a dot (e.g. `"source.type"`) is matched literally, not as a nested JSON path.
+- **MongoDB** — folded into the scope filter as `metadata.<key>` alongside `user_id` / `agent_id` / `run_id`, on both Atlas `$vectorSearch` and the text-search fallback.
+- **mem0** — unchanged; already forwarded to the mem0 backend.
+
+```mermaid
+graph TB
+    F[🔎 search#40;query, user_id, filters#41;] --> B{Which backend?}
+    B -->|chroma| C["where clause<br/>scope keys protected"]
+    B -->|sqlite| S["json_extract#40;metadata, '$.key'#41;"]
+    B -->|mongodb| M["metadata.key in scope filter"]
+    B -->|mem0| E["forwarded to mem0"]
+    C --> R[✅ Filtered + scoped results]
+    S --> R
+    M --> R
+    E --> R
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class F input
+    class B decision
+    class C,S,M,E process
+    class R output
+```
 
 ### MongoDB backend
 
