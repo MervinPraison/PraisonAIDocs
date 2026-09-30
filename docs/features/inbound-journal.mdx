@@ -125,7 +125,7 @@ agent = Agent(name="Support Bot", instructions="Help users with their questions"
 </Steps>
 
 <Note>
-You don't need to call `complete()` yourself when using `BotSessionManager.chat()` — successful chats mark the journal entry as completed automatically. You only need to call `complete()` manually if you're driving `InboundJournal` directly without `BotSessionManager`.
+**Default behaviour:** `BotSessionManager.chat()` marks the journal entry complete for you on clean exit — no `complete()` call needed. **Deferred mode (opt-in, safer):** construct `BotSessionManager(defer_journal_completion=True)` and `chat()` leaves the entry pending; your adapter then calls `complete_last_journal_entry(journal_key)` **after** it has durably delivered the reply. This closes the crash window where the agent finished, the inbound was settled, and a crash before send lost the user's reply with no replay. See [Defer completion until reply is delivered](#defer-completion-until-reply-is-delivered-opt-in). You only call `complete()` directly if you drive `InboundJournal` without `BotSessionManager`.
 </Note>
 
 ---
@@ -169,6 +169,78 @@ sequenceDiagram
 | **receive** | Deduplication & retry | Returns a key for new messages, retries pending or stale-claimed duplicates, returns `None` only for already-completed or actively-claimed entries |
 | **claim** | Crash protection | Marks the entry as being processed (auto-released on stale timeout) |
 | **complete** | Cleanup | Marks successful processing — `BotSessionManager.chat()` calls this for you automatically |
+
+---
+
+## Defer completion until reply is delivered (opt-in)
+
+By default `chat()` settles the inbound entry the instant the agent finishes — **before** your adapter sends the reply. A crash in that window loses the user's answer *and* marks the inbound complete, so `replay()` never re-drives it ([Issue #5152](https://github.com/MervinPraison/PraisonAI/issues/5152)).
+
+Set `defer_journal_completion=True` to keep the entry pending until your adapter confirms the reply was durably delivered.
+
+```mermaid
+sequenceDiagram
+    participant Adapter
+    participant Session as BotSessionManager
+    participant Journal as InboundJournal
+    participant Agent
+    participant Platform
+
+    Note over Session,Journal: defer_journal_completion=True (opt-in, safe)
+    Adapter->>Session: chat(prompt)
+    Session->>Journal: claim(key)
+    Session->>Agent: chat(prompt)
+    Agent-->>Session: reply
+    Note over Session,Journal: Entry stays PENDING — not completed yet
+    Session-->>Adapter: reply
+    Adapter->>Platform: send(reply)
+    Platform-->>Adapter: ack
+    Adapter->>Session: complete_last_journal_entry(key)
+    Session->>Journal: complete(key)
+```
+
+Enable it on the manager:
+
+```python
+session = BotSessionManager(
+    platform="telegram",
+    ingress_journal=journal,
+    defer_journal_completion=True,
+)
+```
+
+Then your adapter owns settlement: after `session.chat()` returns, capture the deferred key from `session._last_journal_key`, send the reply, and only on durable delivery call `session.complete_last_journal_entry(journal_key)`. If the process dies between `chat()` returning and delivery, the entry stays `pending`, so `replay()` on the next boot (or platform redelivery) resurfaces it.
+
+<Warning>
+Always pass the explicit `journal_key` when your adapter can handle concurrent turns. Different users run under different per-storage-key locks, so two turns can be in flight at once — the no-arg convenience path settles the manager-wide "last" slot, which is ambiguous under concurrency and can settle another turn's still-undelivered inbound.
+</Warning>
+
+| Aspect | `defer_journal_completion=False` (default) | `defer_journal_completion=True` (opt-in) |
+|--------|--------------------------------------------|------------------------------------------|
+| When inbound is settled | On agent clean exit, **before** send | On adapter's explicit call **after** durable send |
+| Crash between agent-done and send | Reply permanently lost, `replay()` won't re-drive | Entry stays pending, `replay()` / redelivery re-drives it |
+| Adapter responsibility | None | Call `complete_last_journal_entry(journal_key)` after send |
+| Concurrent-turn safety | N/A | Must pass explicit `journal_key` argument |
+| Backward compatibility | Byte-for-byte legacy behaviour | New opt-in path |
+
+### When to opt in
+
+```mermaid
+graph TB
+    Start{Adapter delivers<br/>replies durably?} -->|Yes, and I own the send path| Enable[Enable defer_journal_completion=True]
+    Start -->|No, adapter is fire-and-forget| Keep[Keep default False]
+    Enable --> Contract{Concurrent turns<br/>from multiple users?}
+    Contract -->|Yes| Explicit[Always pass explicit journal_key]
+    Contract -->|Single-user bot| Convenience[No-arg complete_last_journal_entry OK]
+
+    classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef action fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start,Contract question
+    class Enable,Explicit action
+    class Keep,Convenience safe
+```
 
 ---
 
@@ -460,11 +532,63 @@ session = BotSessionManager(
 # Flow: webhook → journal.receive() → agent.chat() → dlq on exception
 ```
 
+### Pattern 4: Defer inbound completion until reply is delivered (opt-in, safest)
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import InboundJournal, BotSessionManager
+
+journal = InboundJournal(path="~/.praisonai/state/telegram/ingress.sqlite")
+session = BotSessionManager(
+    platform="telegram",
+    ingress_journal=journal,
+    defer_journal_completion=True,  # opt in
+)
+
+agent = Agent(name="Support Bot", instructions="Help users with their questions")
+
+# In your adapter's webhook handler:
+reply = await session.chat(
+    agent=agent,
+    user_id=update.effective_user.id,
+    prompt=update.message.text,
+    message_id=str(update.message.message_id),
+    account="my_telegram_bot",
+)
+
+# Capture the deferred key BEFORE sending (single-turn slot).
+journal_key = session._last_journal_key
+
+# Deliver the reply durably (retry, DLQ-park, etc.).
+await telegram.send_message(chat_id=..., text=reply)
+
+# Settle the inbound ONLY after delivery succeeded.
+session.complete_last_journal_entry(journal_key)
+```
+
+<Warning>
+Always pass the explicit `journal_key` when your adapter can handle concurrent turns (different users under different per-storage-key locks). The no-arg convenience path settles the manager-wide "last" slot, which is ambiguous under concurrency and can settle another turn's still-undelivered inbound.
+</Warning>
+
 ---
 
 ## Best Practices
 
 <AccordionGroup>
+<Accordion title="Defer completion when your send path is durable">
+When your adapter's send path is durable (retry + DLQ-park, or `DurableAdapterMixin`), enable `defer_journal_completion=True`. This closes the crash window between agent completion and reply delivery — a crash mid-send leaves the inbound pending and `replay()` will re-drive it, instead of silently losing the user's answer.
+
+```python
+session = BotSessionManager(
+    platform="slack",
+    ingress_journal=journal,
+    defer_journal_completion=True,
+)
+```
+
+Then call `session.complete_last_journal_entry(journal_key)` from your adapter after each successful send.
+</Accordion>
+
 <Accordion title="Use the same path across restarts">
 The journal's SQLite file must survive restarts for crash recovery to work. Use an absolute path or a location that persists across deployments.
 
