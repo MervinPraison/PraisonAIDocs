@@ -14,26 +14,55 @@ agent = Agent(name="fetcher", instructions="Fetch URLs safely from sync or async
 agent.start("Summarise https://example.com")
 ```
 
-The user calls a sync tool that needs async I/O; the bridge runs the coroutine safely or surfaces a clear error if called from a running loop.
+The user calls a sync tool that needs async I/O; the bridge runs the coroutine safely whether or not an event loop is already running.
 
 ```mermaid
 graph LR
     subgraph "Async Bridge"
         A[📋 Sync Caller] --> B{🔍 Loop Check}
-        B -->|No Loop| C[🚀 Run Coroutine]
-        B -->|Loop Running| D[❌ RuntimeError]
+        B -->|No Loop| C[🚀 asyncio.run + wait_for]
+        B -->|Loop Running| W[🧵 Worker thread<br/>copies contextvars<br/>own loop]
         C --> E[✅ Result]
-        
-        F[📋 Async Caller] --> G[🧵 Executor]
-        G --> H[✅ Result]
+        W --> E
     end
-    
-    classDef agent fill:#8B0000,color:#fff
-    classDef tool fill:#189AB4,color:#fff
-    
-    class A,F agent
-    class B,C,D,E,G,H tool
+
+    classDef caller fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef bridge fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A caller
+    class B,C,W bridge
+    class E result
 ```
+
+An async guardrail on a plain `Agent`, reached from a FastAPI route, runs on a worker thread with the caller's contextvars — the timeout is enforced inside that worker's loop.
+
+```python
+from fastapi import FastAPI
+from praisonaiagents import Agent, TaskOutput
+
+async def content_check(output: TaskOutput):
+    # async because it hits a moderation API
+    ok = await moderation_service.is_safe(output.raw)
+    return (ok, output if ok else "flagged by moderation")
+
+agent = Agent(
+    name="writer",
+    instructions="Write a short reply.",
+    guardrails=content_check,   # async guardrail
+)
+
+app = FastAPI()
+
+@app.post("/reply")
+async def reply(prompt: str):
+    # Before PR #5377 this raised "Agent guardrail validation error".
+    # Now the async guardrail runs on a worker thread with the caller's
+    # contextvars and returns its real result.
+    return {"answer": agent.start(prompt)}
+```
+
+The user posts a prompt from a FastAPI route; the agent's async guardrail runs on a worker thread with the caller's contextvars, and the timeout is enforced inside that worker's loop.
 
 ## Quick Start
 
@@ -121,39 +150,85 @@ async def smart_fetch_async(url: str) -> str:
 sequenceDiagram
     participant Caller
     participant Bridge
-    participant EventLoop
-    participant Executor
-    
+    participant Worker as Worker Thread
+    participant Coro as Coroutine
+
     Caller->>Bridge: run_coroutine_from_any_context(coro)
-    Bridge->>EventLoop: get_running_loop()
-    EventLoop-->>Bridge: RuntimeError (no loop)
-    Bridge->>EventLoop: asyncio.run(coro)
-    EventLoop-->>Bridge: Result
+    Bridge->>Bridge: asyncio.get_running_loop() ?
+
+    alt No running loop
+        Bridge->>Coro: asyncio.run(wait_for(coro, timeout))
+        Coro-->>Bridge: Result
+    else Running loop
+        Bridge->>Bridge: contextvars.copy_context()
+        Bridge->>Worker: submit(ctx.run, asyncio.run, wait_for(coro, timeout))
+        Worker->>Coro: run on own loop with copied context
+        Coro-->>Worker: Result
+        Worker-->>Bridge: Result (future.result(timeout))
+    end
+
     Bridge-->>Caller: Result
-    
-    Note over Bridge,EventLoop: If loop exists, raises RuntimeError
-    
-    Caller->>Bridge: await run_sync_in_executor(func, args)
-    Bridge->>Executor: submit(func, args)
-    Executor-->>Bridge: Result
-    Bridge-->>Caller: Result
+
+    Note over Bridge,Worker: TimeoutError enforced inside the worker loop AND on the caller's future — a stuck worker cannot pin the caller past timeout.
 ```
 
-The bridge probes for a running event loop using `asyncio.get_running_loop()`. If no loop exists, it safely creates one with `asyncio.run()`. If a loop is already running, it raises `RuntimeError` to prevent deadlocks.
+The bridge probes for a running event loop. If no loop exists, it drives the coroutine directly on the caller's thread via `asyncio.run` (wrapped in `asyncio.wait_for` when a timeout is set). If a loop is already running (FastAPI, Jupyter, a bot handler calling `agent.chat()` from inside `async def`), it offloads onto a dedicated worker thread with its own loop — never a deadlock, never a `RuntimeError`. The caller's `contextvars` are copied into the worker thread with `contextvars.copy_context()`, so trace, session, and approval context set by the caller stays visible inside the coroutine.
+
+---
+
+## Which helper do I call?
+
+Pick between `await`, `run_coroutine_from_any_context`, and the wrapper-layer `run_sync`:
+
+```mermaid
+graph TB
+    Q1{Am I inside<br/>async def?} -->|Yes| A1[await the coroutine directly]
+    Q1 -->|No — plain sync| Q2{Which layer?}
+    Q2 -->|"praisonaiagents.*<br/>(guardrail, task callback,<br/>agent tool)"| A2[run_coroutine_from_any_context]
+    Q2 -->|"praisonai.*<br/>(CLI, gateway, scheduler)"| A3[praisonai._async_bridge.run_sync]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q1,Q2 question
+    class A1,A2,A3 answer
+```
+
+---
+
+## Async guardrails, callbacks, and approvals inside a running loop (PR #5377)
+
+Prior to [PR #5377](https://github.com/MervinPraison/PraisonAI/pull/5377), `run_coroutine_from_any_context` raised `RuntimeError` when reached from inside a running event loop (FastAPI async route, Jupyter cell, Discord/Slack bot handler, any `async def` calling `agent.start()`, `task.execute_callback_sync()`, or an approval callback). That surfaced as a spurious "Agent guardrail validation error" and burned LLM retries on a valid async guardrail. It also masked real summariser errors as an "event loop already running" fallback to naive truncation. From that PR onwards:
+
+- **Async guardrails on `Agent(...)` and `Task(...)`** return their real result inside a running loop.
+- **Async task callbacks reached via `Task.execute_callback_sync`** run to completion instead of raising.
+- **Async `ApprovalCallback(approve_fn=<async fn>)`** works from FastAPI / Textual / Jupyter without the caller having to opt in.
+- **`ContextVar`s set by the caller** (trace ids, session ids, approval context) are visible inside the coroutine.
+- **The timeout is enforced.** A coroutine that ignores cancellation (e.g. a blocking C call) can no longer pin the caller past `timeout` — the worker is abandoned (`shutdown(wait=False)`).
+- **`LLM_SUMMARIZE` context compaction** runs the real async summariser under a running loop instead of silently falling back to naive truncation, and provider errors from the summariser now surface instead of being masked.
+
+The five previously-broken sync→async call sites (`Agent._process_guardrail`, `Task._process_guardrail`, `Task.execute_callback_sync`, `planning/approval.py`, `bus/bus.py`) all keep their existing code and now work correctly. The sync tool-calling helper `run_async_in_sync_context` is a thin delegate to `run_coroutine_from_any_context(coro, timeout=None)`.
 
 ---
 
 ## Configuration Options
 
+`run_coroutine_from_any_context` (the `praisonaiagents.utils.async_bridge` helper) takes two arguments:
+
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `timeout` | `float \| None` | `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s) | Maximum seconds to wait for coroutine completion. The default is **resolved per call** — see [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number) for the omitted / `None` / number distinction. |
+| `coro` | `Awaitable[T]` | — | The coroutine to run to completion. |
+| `timeout` | `float \| None` | `300` (5 minutes) | Maximum seconds to wait for the coroutine. `None` disables the timeout entirely — used by the sync tool-calling path (`run_async_in_sync_context`) so a tool's own timeout policy governs the wait. On expiry, raises `TimeoutError`. |
+
+<Note>
+This is a literal `300` default baked into `run_coroutine_from_any_context` — it does **not** read `PRAISONAI_RUN_SYNC_TIMEOUT`. That env var applies to the wrapper-layer `praisonai._async_bridge` helpers documented [below](#timeout-resolution-omitted-vs-none-vs-number).
+</Note>
 
 ---
 
 ## Timeout resolution: omitted vs `None` vs number
 
-The `timeout` argument on `run_sync`, `run_sync_or_offload`, `arun_sync_or_offload`, and `AsyncBridge.run_sync` uses a private `_UNSET` sentinel as its default, so the bridge can tell "argument omitted" apart from an explicit `timeout=None`.
+The `timeout` argument on the **wrapper-layer** helpers — `run_sync`, `run_sync_or_offload`, `arun_sync_or_offload`, and `AsyncBridge.run_sync` — uses a private `_UNSET` sentinel as its default, so the bridge can tell "argument omitted" apart from an explicit `timeout=None`.
 
 | Caller passes | Effective timeout |
 |---|---|
@@ -231,14 +306,14 @@ def universal_helper(data):
 
 <AccordionGroup>
 <Accordion title="Prefer await when you're already async">
-Calling `run_coroutine_from_any_context` inside an `async def` raises `RuntimeError` by design. If you're in a coroutine, use `await` instead:
+Calling `run_coroutine_from_any_context` inside `async def` now works — it offloads to a worker thread rather than raising. But `await` is still the right choice from an existing coroutine: it keeps the work on the caller's loop and avoids the worker-thread and context-copy overhead the bridge takes on to stay safe.
 
 ```python
-# Good
+# Good — no bridge overhead, work stays on the caller's loop
 async def my_async_tool():
     result = await my_coroutine()
-    
-# Bad - will raise RuntimeError
+
+# Works, but takes a worker thread — reserve for sync callers
 async def my_async_tool():
     result = run_coroutine_from_any_context(my_coroutine())
 ```
@@ -322,17 +397,11 @@ The shared default's `atexit` teardown hook is also registered lazily, on the fi
 
 ### RuntimeError: run_coroutine_from_any_context() cannot be called from async context
 
-You're trying to use the bridge inside a coroutine. Use `await` instead:
+This specific `RuntimeError` no longer exists. [PR #5377](https://github.com/MervinPraison/PraisonAI/pull/5377) removed it — previously-broken async guardrails, callbacks, and approvals now succeed inside a running loop by offloading to a worker thread. If you still see this message, you are on an older release; upgrade to the version that ships PR #5377.
 
-```python
-# Bad
-async def my_coroutine():
-    return run_coroutine_from_any_context(other_coroutine())
+### My async guardrail / callback / approval now works but I'd rather await it directly
 
-# Good
-async def my_coroutine():
-    return await other_coroutine()
-```
+You can. Inside `async def` code, `await` the coroutine yourself instead of routing through the bridge. The bridge is there for the sync-only surfaces (`Agent.start`, `Task.execute_callback_sync`, sync tool functions) that cannot `await`.
 
 ### asyncio.run() cannot be called from a running event loop
 
