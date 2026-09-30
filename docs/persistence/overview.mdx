@@ -212,6 +212,82 @@ export PRAISONAI_SESSION_CACHE_MAX=8192
 Reference: PraisonAI PR #3792. Eviction is least-recently-used — reads and writes mark recency, and the oldest session is dropped once the cap is reached.
 </Note>
 
+## Shutting Down the Orchestrator
+
+Close the orchestrator to release each store's pooled connections when your app or script ends.
+
+The shortest way an agent user reclaims stores is a context manager:
+
+```python
+from praisonaiagents import Agent
+from praisonai.persistence import PersistenceOrchestrator
+
+# Sync agent / script: context manager
+with PersistenceOrchestrator.from_env() as orch:
+    agent = Agent(name="Assistant", memory={"orchestrator": orch})
+    agent.start("Hello!")
+# stores closed on exit, per-store errors isolated
+```
+
+Async agents use `async with` — this is why `aclose()` was added:
+
+```python
+import asyncio
+from praisonaiagents import Agent
+from praisonai.persistence import PersistenceOrchestrator
+
+async def main():
+    async with PersistenceOrchestrator.from_env() as orch:
+        agent = Agent(name="Assistant", memory={"orchestrator": orch})
+        await agent.astart("Hello!")
+    # stores closed on exit — never blocks the event loop
+
+asyncio.run(main())
+```
+
+FastAPI lifespans call `aclose()` from the async shutdown handler. Before PR [#5348](https://github.com/MervinPraison/PraisonAI/pull/5348), calling `close()` here raised `"would block the running loop"` from `run_sync_or_offload`:
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from praisonai.persistence import PersistenceOrchestrator
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.orch = PersistenceOrchestrator.from_env()
+    yield
+    await app.state.orch.aclose()  # non-blocking, isolates per-store errors
+
+app = FastAPI(lifespan=lifespan)
+```
+
+Pick the shutdown path that matches how your process runs:
+
+```mermaid
+graph TB
+    Q{"How are you<br/>shutting down?"}
+    Q -->|"Sync script"| S1["with PersistenceOrchestrator(...)"]
+    Q -->|"FastAPI lifespan<br/>async shutdown handler"| A1["async with ... / await orch.aclose()"]
+    Q -->|"atexit / no context"| C1["orch.close()  (sync)"]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef path fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q question
+    class S1,A1,C1 path
+```
+
+**How it works:**
+
+- **`close()` (sync)** — closes each of `conversation` / `knowledge` / `state` in turn. Per-store errors are **isolated** so one failing store never strands the others' pooled connections. A store's attribute is reset to `None` only on a *successful* close, so a re-close is idempotent; a store that raised keeps its reference and can be retried by a later `close()` / `aclose()` instead of silently leaking its pooled connections.
+- **`aclose()` (async, new in PR #5348)** — awaits each store's native `aclose` when available, else offloads `close` via `asyncio.to_thread`. Same per-store error isolation and idempotence as `close()`. Safe to call from a live event loop — `close()` is not (it routes through `run_sync_or_offload`, which raises from a running loop).
+- **Async context manager (`async with`, new in PR #5348)** — `__aenter__` returns `self`, `__aexit__` calls `aclose()`. Pair with FastAPI lifespans or async agent runners.
+- **Sync context manager (`with`)** — already existed and continues to call `close()` on exit.
+
+<Note>
+Reference: PraisonAI PR [#5348](https://github.com/MervinPraison/PraisonAI/pull/5348). The `aclose()` method and async context manager are new; both share `close()`'s per-store isolation. See [Thread Safety](/features/thread-safety) for the sync-from-any-context wrappers these close paths build on.
+</Note>
+
 ## Schema Versioning (PR #1829)
 
 **New unified schema system**: All SQL conversation stores now inherit from `_SQLConversationStoreBase` with consistent `SCHEMA_VERSION = "1.0.0"`. This applies to PostgreSQL, MySQL (new), and all existing SQL backends uniformly.
