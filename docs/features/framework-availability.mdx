@@ -150,7 +150,7 @@ Two distinct concepts affect whether an AutoGen-family adapter will actually wor
 |---|---|
 | "Is the underlying package importable?" | `is_available("autogen")` from `_framework_availability` |
 | "Will calling `adapter.run(...)` actually work?" | `AutoGenV4Adapter().is_available()` (folds `implemented` flag) |
-| "Is the adapter usable *right now*?" | `get_default_registry().is_available("<name>")` — folds in `implemented` markers AND applies the transient-failure TTL |
+| "Is the adapter usable *right now*?" | `get_default_registry().is_available("<name>")` — folds in `implemented` markers AND applies the 30 s transient-negative cool-down |
 
 For AutoGen v0.4 and AG2 today: the package may import successfully, but the adapter still reports `False` because `implemented = False`. This is the safety-by-default behaviour added in PR #2086.
 
@@ -216,23 +216,29 @@ invalidate()  # Clear all cached results
 
 ## Cache Management (adapter registry)
 
-`FrameworkAdapterRegistry.is_available(name)` uses a two-tier cache designed to survive transient boot-time flakes without permanently hiding a framework:
+`FrameworkAdapterRegistry.is_available(name)` caches results so hot-path callers (`pick_default`, `list_available_frameworks`) do not re-probe. Only positives and structural failures are pinned for the process; every other negative is **transient** and expires after a 30-second cool-down (`_avail_retry_cooldown`) so a mid-life `pip install` is picked up without a restart ([PraisonAI PR #5307](https://github.com/MervinPraison/PraisonAI/pull/5307)).
 
 | Probe outcome | Cache lifetime | Reason |
 |---|---|---|
-| Returned `True` | Whole process | The framework is installed; nothing will change until restart. |
-| Raised `ImportError` / `ValueError` / `TypeError` | Whole process | Structural — the optional dep is not installed. |
-| Raised any other exception | 60 s (`_NEG_CACHE_TTL`) | Transient — a racing entry-point scan, a boot-time network probe timeout, an in-flight config write. The next call after the TTL reprobes. |
+| Returned `True` | Whole process | The framework is installed; nothing changes until restart. |
+| Returned `False` (built-in `is_available()` check via `find_spec`) | 30 s cool-down, then reprobe | An operator may `pip install` an optional extra mid-life; the negative expires so `praisonai serve` / daemons pick it up without a restart. |
+| Raised `ImportError` | 30 s cool-down, then reprobe | Same as above — a missing optional dep is transient. |
+| Raised `ValueError` / `TypeError` | Whole process | Structural — a mis-registered adapter can't be fixed by reprobing. |
+| Raised any other exception | 30 s cool-down, then reprobe | Transient — racing entry-point scan, boot-time network probe timeout, in-flight config write. |
 
 ```mermaid
 graph TB
     Probe[🔬 registry.is_available] --> Result{Outcome?}
     Result -->|True| Perm1[💾 Cache for process]
-    Result -->|ImportError / ValueError / TypeError| Perm2[💾 Cache for process]
-    Result -->|Other exception| TTL[⏱️ Cache 60 s then reprobe]
+    Result -->|False via find_spec| TTL1[⏱️ 30 s cool-down then reprobe]
+    Result -->|ImportError| TTL2[⏱️ 30 s cool-down then reprobe]
+    Result -->|ValueError / TypeError| Perm2[💾 Cache for process]
+    Result -->|Other exception| TTL3[⏱️ 30 s cool-down then reprobe]
     Perm1 --> Return[✅ Return]
     Perm2 --> Return
-    TTL --> Return
+    TTL1 --> Return
+    TTL2 --> Return
+    TTL3 --> Return
 
     classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
@@ -242,18 +248,22 @@ graph TB
     class Probe process
     class Result decision
     class Perm1,Perm2 result
-    class TTL ttl
+    class TTL1,TTL2,TTL3 ttl
     class Return result
 ```
 
-The TTL is anchored to *after* the probe returns, so a probe that itself blocks for ≥ 60 s does not write an already-expired deadline. Call `registry.invalidate_availability(name)` (or with no argument) to force a reprobe sooner.
+<Note>
+**Mid-life install recovery:** `praisonai serve` / long-running daemons no longer need a restart after `pip install 'praisonai[crewai]'`. The registry re-probes any transient negative after ~30 s (`_avail_retry_cooldown`) and invalidates the process-wide `_framework_availability` cache before re-probing, so both cache tiers see the newly-installed dep on the next call.
+</Note>
+
+The cool-down is anchored to *after* the probe returns, so a probe that itself blocks for ≥ 30 s does not write an already-expired deadline. Call `registry.invalidate_availability(name)` (or with no argument) to force a reprobe sooner.
 
 ```python
 from praisonai.framework_adapters import get_default_registry
 
 registry = get_default_registry()
 
-# Transient probe failure at boot: next call after ~60s will reprobe automatically.
+# Transient negative (missing optional dep): the next call after ~30s reprobes automatically.
 available = registry.is_available("crewai")
 
 # Or force an immediate reprobe:
