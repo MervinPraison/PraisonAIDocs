@@ -207,7 +207,7 @@ graph TB
 |------|----------|----------|
 | `off` | Single final message after completion | Default behavior, zero impact |
 | `draft` | Progressive edits with growing answer | Long responses, platforms like Telegram |
-| `progress` | Tool status updates, then final answer | Tool-heavy agents, user wants progress |
+| `progress` | Tool status updates, then final answer. When [`activity_phrases`](#privacy-safe-activity-surface) is configured, the raw tool name is replaced with a curated phrase drawn only from that catalogue | Tool-heavy agents, user wants progress |
 | `auto` | Resolves to `draft` where the channel can edit, else `off`; other config fields are preserved | Multi-channel bots where you don't want to hard-code per-channel modes |
 
 <Note>
@@ -311,6 +311,7 @@ graph TB
 | `flood_backoff_factor` | `float` | `2.0` | Multiplier applied to the edit interval on each recoverable (flood / 429 / transient) failure |
 | `max_interval` | `float` | `30.0` | Cap in seconds for the adaptively widened edit interval — backoff stops growing past this |
 | `strip_reasoning_tags` | `bool` | `True` | Strip `<think>…</think>` and `<reasoning>…</reasoning>` spans from streamed and final output. Default ON — set to `false` to opt out |
+| `activity_phrases` | `Optional[Dict[str, str]]` | `None` | Opt-in privacy-safe activity surface for `progress` mode. When set, the progress line is drawn exclusively from this catalogue (keyed by tool *category*: `web`, `search`, `shell`, `code`, `file`, `mcp`, `default`). Tool names, args, command strings, URLs and file paths are never interpolated. Unset (default) preserves today's `Running <tool>...` behaviour — see [Privacy-safe activity surface](#privacy-safe-activity-surface) |
 
 ---
 
@@ -422,6 +423,225 @@ The `feed` style activates only when `mode: progress` **and** `progress_style: f
 
 ---
 
+## Privacy-safe activity surface
+
+During a long, output-silent tool run in `progress` mode, show a curated phrase like *"Searching the web…"* instead of the raw tool name (`Running web_fetch...`) — tool names, args, command strings, URLs and file paths are never surfaced.
+
+```mermaid
+graph LR
+    subgraph "Privacy-safe activity surface"
+        A[🔧 Tool runs<br/>web_fetch_secret_url] --> B[🗂️ resolve_activity_category<br/>name only → web]
+        B --> C[🔒 Curated phrase<br/>Searching the web…]
+        C --> D[💬 User sees phrase<br/>not the tool name]
+    end
+
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef cfg fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A tool
+    class B cfg
+    class C,D safe
+```
+
+### Quick Start
+
+<Steps>
+<Step title="Enable in YAML">
+
+```yaml
+channels:
+  telegram:
+    token: ${TELEGRAM_BOT_TOKEN}
+    streaming:
+      mode: progress
+      activity_status:
+        enabled: true
+        phrases:
+          web:     "Searching the web…"
+          search:  "Looking that up…"
+          shell:   "Running a command…"
+          code:    "Writing and running code…"
+          file:    "Reading files…"
+          mcp:     "Talking to a tool…"
+          default: "Working on it…"
+```
+
+`enabled: false` disables the surface (yields `activity_phrases=None`). An inline `activity_phrases: {...}` shorthand is also accepted in place of the `activity_status` block.
+
+</Step>
+
+<Step title="Enable in Python">
+
+```python
+from praisonaiagents import Agent, BotConfig
+from praisonai.bots import TelegramBot, StreamingConfig, StreamingMode
+
+agent = Agent(name="assistant", instructions="Be helpful and concise.")
+
+bot = TelegramBot(token="...", agent=agent, config=BotConfig(token="..."))
+bot.configure_streaming(StreamingConfig(
+    mode=StreamingMode.PROGRESS,
+    activity_phrases={
+        "web":     "Searching the web…",
+        "shell":   "Running a command…",
+        "default": "Working on it…",
+    },
+))
+bot.start()
+```
+
+</Step>
+</Steps>
+
+### Category → phrase mapping
+
+Each tool name is lowercased and matched by substring against these hints — the first match wins, and anything unmatched falls to `default`.
+
+| Category  | Substrings that map to it (lowercased tool name) |
+|-----------|--------------------------------------------------|
+| `web`     | `web`, `browser`, `fetch`, `url`, `http`, `crawl`, `scrape` |
+| `search`  | `search`, `google`, `duckduckgo`, `tavily`, `serper`, `wiki` |
+| `shell`   | `shell`, `bash`, `command`, `terminal`, `exec`, `subprocess` |
+| `code`    | `code`, `python`, `interpreter`, `repl`, `compile`, `script` |
+| `file`    | `file`, `read`, `write`, `open`, `save`, `load`, `csv`, `pdf`, `doc` |
+| `mcp`     | `mcp` |
+| `default` | anything else (also the fallback when a matched category has no phrase) |
+
+`resolve_activity_category(None)` and `resolve_activity_category("")` both return `"default"`.
+
+### What the user sees
+
+A tool named `web_fetch_secret_url` maps to `web`, so the user only ever sees the curated phrase — never the tool name.
+
+```mermaid
+graph TB
+    subgraph "Before (unconfigured)"
+        B1["🤔 Running web_fetch_secret_url..."]
+    end
+
+    subgraph "After (activity_status.enabled: true)"
+        A1["Searching the web…"]
+    end
+
+    classDef before fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef after fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class B1 before
+    class A1 after
+```
+
+### Interaction flow
+
+The tool name never reaches the chat surface when a catalogue is configured — the phrase is chosen from the category alone.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Bot
+    participant Agent
+    participant Tool as Tool (silent)
+    participant Streamer as DraftStreamer
+
+    User->>Bot: Send message
+    Bot->>Agent: Run
+    Agent->>Tool: Call web_fetch(secret_url)
+    Agent->>Streamer: TOOL_CALL_START (name=web_fetch)
+    Streamer->>Streamer: resolve_activity_category("web_fetch") → web
+    Streamer->>Bot: edit_message("Searching the web…")
+    Bot-->>User: Searching the web…
+    Tool-->>Agent: result
+    Agent->>Streamer: finalize(answer)
+    Streamer->>Bot: edit_message(answer)
+    Bot-->>User: Final answer
+```
+
+### Which progress rendering to choose
+
+Three renderings live on this page — pick per channel.
+
+```mermaid
+graph TB
+    A{Who reads<br/>this channel?} --> B[Public / support users]
+    A --> C[Internal ops team]
+    A --> D[Just want the default]
+
+    B --> E["activity_status<br/>curated phrase<br/>hides tool identity"]
+    C --> F["progress_style: feed<br/>per-step audit trail"]
+    D --> G["progress_style: line<br/>raw tool name (default)"]
+
+    classDef question fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef feed fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef line fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A,B,C,D question
+    class E safe
+    class F feed
+    class G line
+```
+
+| Rendering | Shows | Choose when |
+|-----------|-------|-------------|
+| `line` (default) | Raw tool name — `🤔 Running web_search…` | Internal bot; tool names are safe to show |
+| `feed` | Per-step audit trail with `⏳`/`✓`/`✗` glyphs | Internal ops bot; you want the full step history |
+| `activity_status` | Curated phrase only — `Searching the web…` | Public/support bot; tool identity must not leak |
+
+### Precedence with `progress_style: feed`
+
+When `activity_phrases` is set, the raw feed is **not** rendered — showing it would fold tool names/summaries into the output and bypass the privacy guarantee. The curated single-line phrase is shown instead. Opting into the catalogue therefore disables the multi-line feed on that channel; choose one per channel.
+
+### Partial-catalogue safety
+
+If a phrase for the matched category is missing **and** no `default` is configured, the surface falls back to the safe generic line `Working on it…` — never the raw tool name. A catalogue with only `{"web": "Searching the web…"}` shows `Working on it…` for a `shell` tool, not `Running bash...`.
+
+### Best practices
+
+<AccordionGroup>
+<Accordion title="Always set a `default` phrase">
+`default` covers every unmapped tool with your own wording. Without it, unmatched categories fall back to the safe generic `Working on it…` — correct, but not your voice.
+
+```yaml
+streaming:
+  mode: progress
+  activity_status:
+    enabled: true
+    phrases:
+      web:     "Searching the web…"
+      default: "Working on it…"   # covers everything else
+```
+</Accordion>
+
+<Accordion title="Keep phrases generic — the whole point is not to leak">
+A phrase is broadcast to every user whose tool falls in that category. Never put a URL, filename, argument, or command name in a phrase — that reintroduces exactly the leak the surface prevents. Write `"Reading files…"`, not `"Reading /etc/secrets.env…"`.
+</Accordion>
+
+<Accordion title="Use `activity_status` for public bots; `progress_style: feed` for internal ops">
+The curated surface hides tool identity — right for public and support bots. The `feed` style exposes a per-step audit trail — right for internal ops bots where operators want to see exactly which tool ran. They are mutually exclusive per channel.
+</Accordion>
+
+<Accordion title="Opting in disables the multi-line feed">
+When a catalogue is set, the SDK renders the curated single line, not the feed. If you need both a curated phrase and a feed, split them across channels/profiles — one per channel.
+</Accordion>
+</AccordionGroup>
+
+<CardGroup cols={2}>
+<Card title="Streaming Tool Events" icon="wrench" href="/features/streaming-tool-events">
+  Where the tool events that trigger the activity line come from
+</Card>
+<Card title="Bot Status Reactions" icon="face-smile" href="/features/bot-status-reactions">
+  The emoji-reaction equivalent for run progress
+</Card>
+<Card title="Outbound Secret Scrub" icon="shield" href="/features/outbound-secret-scrub">
+  Related privacy surface that scrubs outbound text
+</Card>
+<Card title="Channel Capabilities" icon="list-check" href="/features/channel-capabilities">
+  Which channels support the live edits `progress` needs
+</Card>
+</CardGroup>
+
+---
+
 ## Flood-control
 
 Your Telegram bot is streaming a long answer during peak hours. Telegram starts returning 429 after the third edit. The streamer doubles its edit interval (1.5s → 3s → 6s → capped at `max_interval`). After `disable_progressive_edits_after` consecutive failures it stops editing entirely and waits — when `finalize()` fires it delivers the completed answer as a fresh message. The user never sees a stuck placeholder, never sees a partial reply, and the rest of your bot's chats are unaffected because the backoff is per-stream.
@@ -504,6 +724,18 @@ channels:
       flood_backoff_factor: 2.0
       max_interval: 30.0
       strip_reasoning_tags: true
+      # Privacy-safe activity surface (opt-in). Draws the progress line
+      # exclusively from these phrases; tool names/args/URLs never leak.
+      activity_status:
+        enabled: true
+        phrases:
+          web:     "Searching the web…"
+          search:  "Looking that up…"
+          shell:   "Running a command…"
+          code:    "Writing and running code…"
+          file:    "Reading files…"
+          mcp:     "Talking to a tool…"
+          default: "Working on it…"
 ```
 
 ### Python API
@@ -591,6 +823,8 @@ bot.configure_streaming(StreamingConfig(
     progress_prefix="🔧 "
 ))
 ```
+
+On a public or support bot, pair `progress` mode with the [Privacy-safe activity surface](#privacy-safe-activity-surface) so users see a curated phrase (`Searching the web…`) instead of the raw tool name.
 </Accordion>
 
 <Accordion title="Use `feed` when your agent chains many tools">
@@ -669,6 +903,18 @@ That channel probably can't edit messages. `draft`/`progress` on a channel witho
 
 <Accordion title="How do I tell whether `auto` resolved to `draft` or `off`?">
 Check the bot log for `Channel <id> streaming mode 'auto' resolved to '<mode>' (can_edit=<bool>)`. It's logged at **INFO** when it resolves to `draft` (`can_edit=True`) and at **WARNING** when it resolves to `off` (`can_edit=False`).
+</Accordion>
+
+<Accordion title="Chat users are seeing tool names like `Running web_fetch...` — how do I hide them?">
+Enable `activity_status` under the channel's `streaming:` block. Once set, the progress line is drawn exclusively from your curated phrases and the raw tool name never reaches the chat. See [Privacy-safe activity surface](#privacy-safe-activity-surface).
+</Accordion>
+
+<Accordion title="I set `activity_status.enabled: true` but the placeholder still shows the tool name">
+Confirm `mode: progress` (the catalogue only applies to `progress` mode), confirm `enabled` is truthy, and confirm the YAML block reached the config. The schema validator retains `activity_status` (introduced in [PR #5315](https://github.com/MervinPraison/PraisonAI/pull/5315)); a typo above the block that fails validation can prevent it from loading.
+</Accordion>
+
+<Accordion title="My curated phrases work, but the multi-line feed disappeared">
+Expected. When a catalogue is set, the raw feed is not rendered — folding tool names/summaries into the feed would bypass the privacy-safe surface. Choose one per channel: curated `activity_status` **or** `progress_style: feed`.
 </Accordion>
 </AccordionGroup>
 
