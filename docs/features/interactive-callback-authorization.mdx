@@ -174,13 +174,14 @@ graph TB
     Q -->|Group chat, only requester decides| B["Pass allowed_actors=[requester_id]"]
     Q -->|Group chat, requester + admins decide| C["Pass allowed_actors=[requester_id, *admin_users]<br/>Default in _presentation_approval"]
     Q -->|Custom button in public chat| D["registry.register with authorize= callback"]
+    Q -->|Out-of-band dashboard / webhook, shared network| E["HTTPApproval / WebhookApproval<br/>with allowed_approvers=[...]"]
 
     classDef default fill:#10B981,stroke:#7C90A0,color:#fff
     classDef config fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef custom fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class A default
-    class B,C config
+    class B,C,E config
     class D custom
 ```
 
@@ -297,6 +298,80 @@ The env var equivalents are `TELEGRAM_APPROVERS`, `SLACK_APPROVERS`, and `DISCOR
 
 ---
 
+## Out-of-band backends
+
+`HTTPApproval` (local web dashboard) and `WebhookApproval` (POST + poll) are out-of-band — they do not run inside a chat. Since [PR #5612](https://github.com/MervinPraison/PraisonAI/pull/5612) both accept an `allowed_approvers=` allowlist on the same `is_authorized_actor` primitive the chat backends use.
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import HTTPApproval, WebhookApproval
+
+# Local dashboard — only Alice or Bob may click Approve
+http = HTTPApproval(host="127.0.0.1", port=8899, allowed_approvers=["alice", "bob"])
+
+# External webhook — only enterprise-dashboard-authorised approvers may resolve
+webhook = WebhookApproval(
+    webhook_url="https://your-app.com/api/approvals",
+    allowed_approvers=["alice", "bob"],
+)
+```
+
+An agent-centric setup — the approval URL printed to the console carries the single-use token, so only Alice or Bob (holding that URL) can resolve it:
+
+```python
+from praisonaiagents import Agent
+from praisonai.bots import HTTPApproval
+
+agent = Agent(
+    name="ops",
+    instructions="Only run destructive commands when a human approves.",
+    tools=["execute_command"],
+    approval=HTTPApproval(
+        host="127.0.0.1",
+        port=8899,
+        allowed_approvers=["alice", "bob"],   # only these operators may click Approve
+    ),
+)
+agent.start("Delete the old release artifacts")
+```
+
+| Backend | Enforcement mechanism | Rejection behaviour |
+|---|---|---|
+| `HTTPApproval` | Single-use `secrets.token_urlsafe(32)` embedded only in the private URL; both page `GET` and decide `POST` validate it (`secrets.compare_digest`); plus the decision body's `approver` must be in the allowlist | `403` on missing/invalid token; `403` on unauthorised `approver`; approval stays pending |
+| `WebhookApproval` | The responder's `approver` field (immediate POST response **and** polled status) is checked against the allowlist | Decision is **dropped silently** (warning logged); polling continues until a legitimate approver resolves it or the request times out |
+
+The operator-facing flow for `HTTPApproval` — an intruder without the token is locked out:
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant HTTPApproval
+    participant Operator as Authorised operator
+    participant Intruder
+
+    Agent->>HTTPApproval: request_approval(execute_command, …)
+    HTTPApproval->>HTTPApproval: mint single-use token (allowlist configured)
+    HTTPApproval-->>Operator: 🔗 http://host:port/approve/<id>?token=<token>
+    Intruder->>HTTPApproval: GET /approve/<id>  (no token)
+    HTTPApproval-->>Intruder: 403 Not authorized
+    Operator->>HTTPApproval: POST /approve/<id>/decide?token=<token><br/>{approver: "alice", decision: "approve"}
+    HTTPApproval->>HTTPApproval: compare_digest(token) + alice ∈ allowlist
+    HTTPApproval-->>Agent: ApprovalDecision(approved=True, approver="alice")
+```
+
+Env-var fallbacks mirror the chat backends:
+
+```bash
+export HTTP_APPROVERS=alice,bob
+export WEBHOOK_APPROVERS=alice,bob
+```
+
+<Note>
+With `allowed_approvers=None` (the default), both backends preserve legacy "any responder" behaviour for backward compatibility. **Set `allowed_approvers` explicitly** whenever the dashboard URL or the webhook status endpoint is reachable by more than one trusted operator.
+</Note>
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
@@ -341,5 +416,8 @@ The in-memory log is bounded by `history_limit` (default 1000). For compliance o
   </Card>
   <Card title="Text-keyword Backends" icon="shield-check" href="/features/approval-protocol#slack-approval">
     Text-keyword backends and their allowed_approvers allowlist
+  </Card>
+  <Card title="Out-of-band Backends" icon="globe" href="/features/interactive-callback-authorization#out-of-band-backends">
+    HTTPApproval and WebhookApproval allowlists with single-use URL tokens
   </Card>
 </CardGroup>
