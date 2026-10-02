@@ -222,6 +222,51 @@ Each session dict is the `SessionData.to_dict()` shape, so `SessionData.from_dic
 
 ---
 
+## Concurrency & no-clobber guarantee
+
+Concurrent importers racing on the same `session_id` are safe: one wins, the other is reported — never silently overwritten.
+
+```python
+from praisonaiagents.session import SqliteSessionStore
+
+store = SqliteSessionStore(db_path="~/.praisonai/sessions.db")
+
+# Safe: concurrent importers cannot clobber each other.
+# One wins; the other sees it in report.skipped.
+report = store.import_sessions(payload, overwrite=False)
+print(report.imported, report.skipped)
+```
+
+Both `DefaultSessionStore` and `SqliteSessionStore` enforce this guarantee identically.
+
+`overwrite=False` is checked twice. The import loop first scans with `session_exists`, then `_save_imported_session` rechecks `os.path.exists` **inside the per-file write lock** — so a peer that creates the same session between the two checks still cannot be clobbered.
+
+```mermaid
+sequenceDiagram
+    participant A as Importer A
+    participant B as Peer writer B
+    participant S as Store (lock + disk)
+
+    A->>S: session_exists("shared")? false
+    B->>S: write "shared" (creates file)
+    A->>S: _save_imported_session("shared", overwrite=False)
+    Note over S: acquire FileLock
+    S-->>A: FileExistsError (recheck inside lock)
+    Note over S: release lock
+    A-->>A: skip with reason "already exists (use overwrite)"
+
+    classDef importer fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef lock fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef outcome fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,B importer
+    class S lock
+```
+
+The loser lands in `ImportReport.skipped` as `{"session_id": "shared", "reason": "already exists (use overwrite)"}`. As of [PraisonAI PR #5631](https://github.com/MervinPraison/PraisonAI/pull/5631), `SqliteSessionStore` honours `overwrite` end-to-end, so this protection holds identically whether the destination is JSON-on-disk or the SQLite-indexed store.
+
+---
+
 ## Common Patterns
 
 **Daily backup** — schedule a cron job that writes one dated file per day.
@@ -273,6 +318,16 @@ A skipped record — already-exists, malformed, or over the cap — is listed wi
 
 <Accordion title="Mind payload version compatibility">
 `PORTABLE_VERSION = 1`. Older/unversioned payloads are accepted best-effort; a payload with a newer version is rejected wholesale rather than partially applied.
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Troubleshooting
+
+<AccordionGroup>
+<Accordion title="import error: ... unexpected keyword argument 'overwrite'">
+Fixed in [PraisonAI PR #5631](https://github.com/MervinPraison/PraisonAI/pull/5631). Upgrade `praisonaiagents` and re-run the import; `SqliteSessionStore` now accepts and honours the `overwrite` flag end-to-end.
 </Accordion>
 </AccordionGroup>
 
