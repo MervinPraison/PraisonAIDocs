@@ -450,6 +450,49 @@ There are **two distinct `FileLock` classes** with different histories — do no
 
 This closes a corruption bug: previously, staleness was measured as `time.time() - start`, where `start` was when *this waiter* began waiting. A live holder legitimately in a long critical section (large JSON write, slow disk) had its lock file `unlink()`ed out from under it as soon as one waiter's `timeout` elapsed — admitting two writers into the same read-modify-write save concurrently and silently clobbering one another's writes. The mtime + heartbeat scheme keeps a long-held lock exclusive. Added in [PR #5136](https://github.com/MervinPraison/PraisonAI/pull/5136).
 
+### BaseJSONStore — atomic save even on serialization failure
+
+`BaseJSONStore._save` writes to a `.tmp` staging file next to the store and `os.replace`s it over the real file so partial content is never observable. As of [PR #5582](https://github.com/MervinPraison/PraisonAI/pull/5582), the atomic guarantee extends to **failures inside `json.dump` itself** — a circular dict, a UTF-8-unencodable surrogate string, or any other serialization or encoding error.
+
+| Case | Guarantee |
+|---|---|
+| `json.dump` succeeds | `.tmp` is atomically renamed over the real store (unchanged) |
+| `json.dump` raises (circular dict, `"\ud800"`, etc.) | Original error propagates, the pre-existing store is left intact, and the `.tmp` staging file is removed — no partial artifact left behind |
+| `os.replace` after a successful dump raises | Same as before — the `.tmp` is removed, the original store is left intact |
+
+Previously, `temp_path = f.name` was assigned **after** `json.dump` succeeded, so a serialization failure left `temp_path` unbound and the existing cleanup branch couldn't identify the staging file. Both locked and unlocked save paths were affected. Fix reference: [PraisonAI PR #5582](https://github.com/MervinPraison/PraisonAI/pull/5582), fixes [#5580](https://github.com/MervinPraison/PraisonAI/issues/5580).
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Store as BaseJSONStore
+    participant Tmp as session.json.tmp
+    participant Real as session.json
+
+    Caller->>Store: save(data_with_circular_ref)
+    Store->>Tmp: create NamedTemporaryFile
+    Store->>Store: temp_path = f.name  (recorded first)
+    Store->>Tmp: json.dump(data, …)
+    Tmp-->>Store: ValueError: Circular reference
+    Store->>Tmp: os.unlink(temp_path)   ← cleanup now identifies the file
+    Store-->>Caller: re-raise original error
+    Note over Real: untouched — no partial write ever reached it
+
+    classDef caller fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef tmp fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef real fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Caller caller
+    class Store store
+    class Tmp tmp
+    class Real real
+```
+
+<Note>
+This matches the behaviour `AsyncBaseJSONStore.save_async` already had — the sync path now has parity. No API change; upgrade to pick up the fix.
+</Note>
+
 ### SqliteTranscriptStore — cross-process safety
 
 `SqliteTranscriptStore` is the **default** gateway transcript backend as of PraisonAI PR #3409. It replaces the `FileLock` above with a SQLite transaction: every read-modify-write runs its `SELECT` + `INSERT OR REPLACE` inside a single `BEGIN IMMEDIATE` transaction, which grabs the database RESERVED write lock and holds it until COMMIT.
