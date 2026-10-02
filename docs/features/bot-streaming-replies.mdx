@@ -19,7 +19,7 @@ agent = Agent(name="assistant", instructions="You are a helpful assistant.")
 agent.start("Explain quantum computing in simple terms.")
 ```
 
-The user waits on Telegram or Discord; a placeholder message updates in place as the agent streams its answer.
+The user waits on Telegram, Discord, or Slack; a placeholder message updates in place as the agent streams its answer.
 
 <Info>
 Session-level `streaming: true` is a shortcut. For unified per-platform defaults and overrides, use [Display Policy](/features/display-policy).
@@ -63,16 +63,29 @@ channels:
     token: ${TELEGRAM_BOT_TOKEN}
     streaming: true
     stream_edit_interval_ms: 700
+  discord:
+    token: ${DISCORD_BOT_TOKEN}
+    streaming: true
+    stream_edit_interval_ms: 700
+  slack:
+    token: ${SLACK_BOT_TOKEN}
+    app_token: ${SLACK_APP_TOKEN}
+    streaming: true
+    stream_edit_interval_ms: 700
 ```
 
 </Step>
 
 <Step title="Enable in Python">
 
+The API is identical across all three bots — create an `Agent`, then pass it to the bot with `streaming=True`.
+
+<Tabs>
+<Tab title="Telegram">
+
 ```python
-from praisonaiagents import Agent
+from praisonaiagents import Agent, BotConfig
 from praisonai.bots import TelegramBot
-from praisonaiagents import BotConfig
 
 agent = Agent(name="assistant", instructions="Be helpful and concise.")
 
@@ -87,6 +100,51 @@ bot = TelegramBot(
 )
 bot.start()
 ```
+
+</Tab>
+<Tab title="Discord">
+
+```python
+from praisonaiagents import Agent, BotConfig
+from praisonai.bots import DiscordBot
+
+agent = Agent(name="assistant", instructions="Be helpful and concise.")
+
+bot = DiscordBot(
+    token="...",
+    agent=agent,
+    config=BotConfig(
+        token="...",
+        streaming=True,
+        stream_edit_interval_ms=700,
+    ),
+)
+bot.start()
+```
+
+</Tab>
+<Tab title="Slack">
+
+```python
+from praisonaiagents import Agent, BotConfig
+from praisonai.bots import SlackBot
+
+agent = Agent(name="assistant", instructions="Be helpful and concise.")
+
+bot = SlackBot(
+    token="...",
+    agent=agent,
+    config=BotConfig(
+        token="...",
+        streaming=True,
+        stream_edit_interval_ms=700,
+    ),
+)
+bot.start()
+```
+
+</Tab>
+</Tabs>
 
 </Step>
 </Steps>
@@ -160,13 +218,13 @@ sequenceDiagram
 
 ### Per-channel streaming support
 
-| Channel | Live edits | Default edit interval | Text limit |
-|---------|------------|----------------------|------------|
-| Telegram | Yes | platform default | 4096 |
-| Slack | Yes | 1.0s | 40000 |
-| Discord | Yes | platform default | 2000 |
-| WhatsApp | No (single message) | — | 4096 |
-| Email | No (single message) | — | unlimited |
+| Channel | Live edits | Default edit interval | Text limit | Notes |
+|---------|------------|----------------------|------------|-------|
+| Telegram | Yes | platform default | 4096 | — |
+| Slack | Yes | 1.0s | 40000 | Threaded replies (`thread_ts` set, or `reply_in_thread: true`) bypass streaming and use the standard thread-aware send path. |
+| Discord | Yes | platform default | 2000 | Replies longer than 2000 chars auto-chunk via `_send_long_message` (placeholder deleted first, reply reference preserved). |
+| WhatsApp | No (single message) | — | 4096 | Single message. |
+| Email | No (single message) | — | unlimited | Single message. |
 
 See [Channel Capabilities](/features/channel-capabilities) for the full matrix including reactions and typing.
 
@@ -312,6 +370,99 @@ graph TB
 | `max_interval` | `float` | `30.0` | Cap in seconds for the adaptively widened edit interval — backoff stops growing past this |
 | `strip_reasoning_tags` | `bool` | `True` | Strip `<think>…</think>` and `<reasoning>…</reasoning>` spans from streamed and final output. Default ON — set to `false` to opt out |
 | `activity_phrases` | `Optional[Dict[str, str]]` | `None` | Opt-in privacy-safe activity surface for `progress` mode. When set, the progress line is drawn exclusively from this catalogue (keyed by tool *category*: `web`, `search`, `shell`, `code`, `file`, `mcp`, `default`). Tool names, args, command strings, URLs and file paths are never interpolated. Unset (default) preserves today's `Running <tool>...` behaviour — see [Privacy-safe activity surface](#privacy-safe-activity-surface) |
+
+### Per-bot configure_streaming
+
+`configure_streaming` has the same shape on every bot — pass a `StreamingConfig` and the override sticks.
+
+<Tabs>
+<Tab title="Telegram">
+
+```python
+from praisonai.bots import TelegramBot, StreamingConfig, StreamingMode
+
+bot = TelegramBot(token="...", agent=agent)
+bot.configure_streaming(StreamingConfig(
+    mode=StreamingMode.DRAFT,
+    min_interval=1.0,
+    min_delta=120,
+))
+```
+
+</Tab>
+<Tab title="Discord">
+
+```python
+from praisonai.bots import DiscordBot, StreamingConfig, StreamingMode
+
+bot = DiscordBot(token="...", agent=agent)
+bot.configure_streaming(StreamingConfig(
+    mode=StreamingMode.DRAFT,
+    min_interval=2.0,          # Discord — stricter edit rate limits
+    min_delta=120,
+))
+```
+
+</Tab>
+<Tab title="Slack">
+
+```python
+from praisonai.bots import SlackBot, StreamingConfig, StreamingMode
+
+bot = SlackBot(token="...", agent=agent)
+bot.configure_streaming(StreamingConfig(
+    mode=StreamingMode.DRAFT,
+    min_interval=1.0,          # Slack chat.update is more generous
+    min_delta=120,
+))
+```
+
+</Tab>
+</Tabs>
+
+### Discord: long replies auto-chunk
+
+Discord enforces a **2000-character cap per message** — a streamed answer above the cap can't be delivered by editing a single placeholder, so the adapter switches to the chunked send path automatically.
+
+When a streamed answer exceeds `min(config.max_message_length, 2000)` characters, the adapter:
+
+1. deletes the placeholder, and
+2. sends the full answer via the existing `_send_long_message` chunker, preserving the Discord reply reference to the user's original message.
+
+The user sees one coherent reply split across multiple messages, not a truncated or dropped answer. No config needed — this fallback is on whenever Discord streaming is enabled.
+
+```mermaid
+graph TB
+    A["✨ Draft placeholder"] --> B["Agent produces answer"]
+    B --> C{"len(answer) > min(max_message_length, 2000)?"}
+    C -->|No| D["streamer.finalize(answer)"]
+    C -->|Yes| E["delete placeholder"]
+    E --> F["_send_long_message(channel, answer, reference=message)"]
+
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class A,D ok
+    class E,F warn
+    class B,C q
+```
+
+### Slack: threaded replies skip streaming (by design)
+
+Slack's shared `DraftStreamer` posts and edits a placeholder at the **channel root**, so a reply that must land in a thread bypasses streaming — streaming at the root would strand the answer in the main channel.
+
+For a reply destined for a thread — either the inbound message was itself in a thread (`thread_ts` is set) or the bot is configured with `reply_in_thread: true` — the adapter falls back to the existing thread-aware single-message send path (`_send_response_with_media`), which honours `thread_ts` and uploads any `MEDIA:` attachments correctly. A threaded answer is never stranded in the main channel.
+
+<Note>
+If you want streamed thread replies on Slack, open a feature request against `praisonai` — it needs a thread-aware streamer, not just an adapter wiring change.
+</Note>
+
+### Slack: `MEDIA:` directives still upload audio
+
+A `MEDIA:/path/to/reply.mp3` directive still works in streamed Slack replies — the text is edited into the placeholder and the audio is uploaded afterwards.
+
+The final content is parsed via `split_media_from_output(...)`, the text portion is edited into the placeholder, and any audio files are uploaded via `files_upload_v2(channel=..., file=...)`. The directive line itself is never written literally into the chat.
 
 ---
 
@@ -915,6 +1066,18 @@ Confirm `mode: progress` (the catalogue only applies to `progress` mode), confir
 
 <Accordion title="My curated phrases work, but the multi-line feed disappeared">
 Expected. When a catalogue is set, the raw feed is not rendered — folding tool names/summaries into the feed would bypass the privacy-safe surface. Choose one per channel: curated `activity_status` **or** `progress_style: feed`.
+</Accordion>
+
+<Accordion title="Discord/Slack ignored `streaming: true` — one wall of text landed at the end">
+Before [PR #5417](https://github.com/MervinPraison/PraisonAI/pull/5417) (merged 2026-10-02) the `DraftStreamer` was wired only into Telegram — Discord and Slack silently fell back to a single final message. Upgrade `praisonai`/`praisonai-bot` to pick up the fix. The YAML / Python surface is unchanged (`streaming: true` or `BotConfig(streaming=True)`); you just needed the newer package.
+</Accordion>
+
+<Accordion title="My Slack reply in a thread didn't stream">
+By design. The shared `DraftStreamer` posts/edits its placeholder at the channel root, so when the reply must land in a thread (`thread_ts` set, or `reply_in_thread: true` configured) the adapter falls back to the standard thread-aware send path. Streaming at the channel root would strand the threaded answer in the main channel. If you need streamed thread replies, open a feature request against `praisonai`.
+</Accordion>
+
+<Accordion title="My long Discord answer arrived as several messages instead of one live edit">
+Expected. Discord enforces a hard 2000-character cap per message. When a streamed answer exceeds `min(config.max_message_length, 2000)`, the adapter deletes the placeholder and delivers the full answer via `_send_long_message`, which chunks it across multiple messages while preserving the reply reference. Editing a single placeholder with >2000 chars would 400 and drop the whole reply.
 </Accordion>
 </AccordionGroup>
 
