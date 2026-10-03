@@ -324,6 +324,36 @@ Prior to PR #4477, ACP/LSP agent-centric tools injected by `PraisonAIAdapter._ma
 <Accordion title="Tool middleware async path now honours tool_timeout">
 Prior to [PR #5080](https://github.com/MervinPraison/PraisonAI/pull/5080), an async tool invoked through the tool middleware chain (`@wrap_tool_call` / `@before_tool` / `@after_tool`, or any plugin-registered tool middleware such as audit/guardrail wrappers) scheduled its coroutine on the running loop and blocked a thread-pool worker on `future.result()` with no timeout. A hung async tool blocked the middleware chain indefinitely and `ToolConfig.timeout` was silently ignored on this path. The worker wait is now bounded by the same `ToolConfig.timeout` the direct async path uses (with a small grace so the inner `asyncio.wait_for` surfaces its typed timeout first when configured). On timeout the future is cancelled and the same structured error dict the direct async path returns is surfaced (`{"error": "Tool timed out after Ns", "timeout": True, "_praison_retryable": False}`). No new API — set `tool_config=ToolConfig(timeout=...)` on the agent as before.
 </Accordion>
+
+<Accordion title="Native tools now delegate tool_timeout to core (PR #5652)">
+On `framework: praisonai`, a plain-callable native tool's per-tool timeout is now enforced by core directly (`Agent(tool_config=ToolConfig(timeout=…))`) instead of by a duplicated wrapper-side executor. [#5650](https://github.com/MervinPraison/PraisonAI/issues/5650) removes the second abandon-on-expiry pool and the second `ToolTimeoutError` that the wrapper kept in lock-step with core.
+
+What stays the same: `tool_timeout:` in YAML, `--tool-timeout` on the CLI, and `tool_config=ToolConfig(timeout=…)` in Python all work exactly as before — no migration needed.
+
+What subtly changes: on the native path with a plain callable, a timeout now surfaces core's structured dict `{"error": "Tool timed out after Ns", "timeout": True, "_praison_retryable": False}` rather than the wrapper's `praisonai.agents_generator.ToolTimeoutError`. Framework tool objects (CrewAI/LangChain `BaseTool`) still raise the wrapper `ToolTimeoutError`, as do non-native frameworks (`crewai`, `autogen`, `ag2`). Subsecond budgets (`tool_timeout: 0.4`) are forwarded to core intact instead of being rounded to `0`.
+
+```python
+from praisonaiagents import Agent, ToolConfig
+
+def slow_lookup(symbol: str) -> float:
+    ...  # takes a while
+
+agent = Agent(
+    name="Trader",
+    instructions="Look up prices.",
+    tools=[slow_lookup],
+    tool_config=ToolConfig(timeout=5),   # core enforces — single pool
+)
+
+# A timeout now returns core's structured dict rather than raising
+# the wrapper ToolTimeoutError:
+#   {"error": "Tool timed out after 5s", "timeout": True,
+#    "_praison_retryable": False}
+agent.start("Price of X")
+```
+
+See [PR #5652](https://github.com/MervinPraison/PraisonAI/pull/5652) for the rationale.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -331,6 +361,10 @@ Prior to [PR #5080](https://github.com/MervinPraison/PraisonAI/pull/5080), an as
 ## YAML `tool_timeout` precedence (multi-agent configs)
 
 When you declare `tool_timeout` on agents or roles in YAML, PraisonAI now honours each agent's declared budget independently.
+
+<Note>
+Resolution is unchanged — only who ultimately enforces the resolved value changed. On `framework: praisonai` with plain callables, the resolved budget is forwarded to core; see **Native tools now delegate `tool_timeout` to core (PR #5652)** above.
+</Note>
 
 Precedence (per agent):
 
