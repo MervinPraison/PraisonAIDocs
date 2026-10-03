@@ -188,9 +188,62 @@ Variable **types** are part of the key, so `True` and `"True"` (or `1` and `"1"`
   <Accordion title="Deep-copied snapshots">
     Values are deep-copied on `set` and on `get`, so a caller mutating a returned value cannot corrupt future hits.
   </Accordion>
+  <Accordion title="A hit replays the full step delta">
+    On a cache hit the full step delta is replayed — `output`, the step's `output_variable` (or `{step_name}_output`), any handler-supplied `variables`, the step's `status` and `retries`, and the `StepResult.stop_workflow` signal. Downstream `{{step_name_output}}` substitutions, `ctx.variables[...]` reads, and `result["steps"][...]` metadata all resolve the same way on cold and cached runs.
+  </Accordion>
+  <Accordion title="A cached stop still stops">
+    A handler that returned `StepResult(stop_workflow=True)` on the cold run also stops the workflow on the cached run — downstream steps never execute on the second run. With `verbose=True` the cache hit prints `🛑 Workflow stopped at: {step.name}`, matching the cold-run message.
+  </Accordion>
+  <Accordion title="Handler variables survive a hit">
+    `StepResult.variables` returned by the handler are cached and re-applied on a hit, so a downstream consumer reading `ctx.variables["answer"]` sees the same value on cold and cached runs. If guardrails rejected one attempt and accepted the next, the **union** of their `variables` is cached — matching what the live run accumulated, not just the last attempt's keys.
+  </Accordion>
+  <Accordion title="No spurious output variable on early stop">
+    If the cold run stopped before writing `<step>_output` (because `stop_workflow=True`), the cached hit does not insert it either — `variables` keeps the exact shape the cold run produced.
+  </Accordion>
 </AccordionGroup>
 
-On a cache hit, both `output` and the step's `output_variable` (or `{step_name}_output`) are restored, so downstream `{{step_name_output}}` substitutions still resolve on a fully-cached re-run.
+A hit replays the whole payload the cold run produced, not just the output.
+
+| Replayed on a hit | Where it lands |
+|---|---|
+| `output` | `result["output"]`, next step's context |
+| `<step>_output` (or `output_variable`) | `all_variables` — only when the cold run did not stop first |
+| Handler-supplied `variables` | `all_variables` — union across guardrail-retried attempts |
+| `StepResult.stop_workflow` | Stops the cached run at this step |
+| Step `status`, `retries` | `result["steps"][...]` metadata |
+
+```python
+from praisonaiagents import AgentFlow
+from praisonaiagents.workflows.workflows import StepResult
+
+def finish(ctx):
+    return StepResult(output="done", stop_workflow=True)
+
+def downstream(ctx):
+    return "unexpected"   # never reached, cold or cached
+
+flow = AgentFlow(steps=[finish, downstream], cache=True)
+flow.run("same")   # cold: stops at finish
+flow.run("same")   # cached: also stops at finish
+```
+
+```python
+from praisonaiagents import AgentFlow
+from praisonaiagents.workflows.workflows import StepResult
+
+def producer(ctx):
+    return StepResult(output="p", variables={"answer": 42})
+
+def consumer(ctx):
+    return f"answer={ctx.variables.get('answer')}"
+
+flow = AgentFlow(steps=[producer, consumer], cache=True)
+first  = flow.run("same")   # "answer=42"
+second = flow.run("same")   # "answer=42" (cached)
+assert second["output"] == first["output"]
+```
+
+<Note>These examples do not call an LLM — they exercise the handler-only path to make the guarantee concrete.</Note>
 
 ---
 
