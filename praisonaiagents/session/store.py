@@ -979,6 +979,12 @@ class DefaultSessionStore:
         except Exception:  # pragma: no cover - observability must never break load
             logger.debug("SESSION corruption hook failed", exc_info=True)
 
+    def _report_unreadable_session(self, session_id: str, filepath: str, error: Exception) -> None:
+        """Report decode failures during scans without modifying the source file."""
+        if isinstance(error, (UnicodeDecodeError, json.JSONDecodeError)):
+            logger.warning("Skipping unreadable session file %s: %s", filepath, error)
+            self._fire_corruption_hook(session_id, str(error), None)
+
     def _atomic_write_json(self, filepath: str, data: Any) -> bool:
         """Atomically write JSON data to disk (temp file + os.replace)."""
         temp_path = None
@@ -1622,6 +1628,27 @@ class DefaultSessionStore:
             session_id, _apply, error_label="update session metadata"
         )
 
+    def merge_session_metadata_map(
+        self, session_id: str, key: str, updates: Dict[str, Any],
+        *, defaults: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Merge nested metadata entries using the freshest map under FileLock.
+
+        Defaults fill missing entries; persisted entries win over defaults,
+        and the supplied updates win over both.
+        """
+        def _apply(session: SessionData) -> None:
+            merged = dict(defaults or {})
+            current = session.metadata.get(key)
+            if isinstance(current, dict):
+                merged.update(current)
+            merged.update(updates)
+            session.metadata[key] = merged
+
+        return self._modify_session_locked(
+            session_id, _apply, error_label="merge session metadata map"
+        )
+
     def rename_session(self, session_id: str, title: str) -> bool:
         """Give a session a human-readable title (Issue #3737).
 
@@ -1693,7 +1720,8 @@ class DefaultSessionStore:
                             "total_tokens": data.get("total_tokens") or data.get("token_count") or (data.get("metadata") or {}).get("total_tokens"),
                             "cost": data.get("cost") or (data.get("metadata") or {}).get("cost"),
                         })
-                    except (json.JSONDecodeError, IOError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                        self._report_unreadable_session(filename[:-5], filepath, exc)
                         continue
         except (IOError, OSError):
             pass
@@ -1727,7 +1755,8 @@ class DefaultSessionStore:
                             data = json.load(f)
                         if data.get("agent_name") == agent_name:
                             session_ids.append(data.get("session_id", filename[:-5]))
-                    except (json.JSONDecodeError, IOError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                        self._report_unreadable_session(filename[:-5], filepath, exc)
                         continue
         except (IOError, OSError):
             pass
@@ -1835,7 +1864,8 @@ class DefaultSessionStore:
                             data = json.load(f)
                         if data.get("gateway_session_id") == gateway_session_id:
                             return SessionData.from_dict(data)
-                    except (json.JSONDecodeError, IOError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                        self._report_unreadable_session(filename[:-5], filepath, exc)
                         continue
         except (IOError, OSError):
             pass
@@ -1865,7 +1895,8 @@ class DefaultSessionStore:
                             data = json.load(f)
                         if data.get("agent_id") == agent_id:
                             session_ids.append(data.get("session_id", filename[:-5]))
-                    except (json.JSONDecodeError, IOError):
+                    except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                        self._report_unreadable_session(filename[:-5], filepath, exc)
                         continue
         except (IOError, OSError):
             pass
@@ -2075,7 +2106,8 @@ class DefaultSessionStore:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (json.JSONDecodeError, IOError):
+            except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
+                self._report_unreadable_session(filename[:-5], filepath, exc)
                 continue
 
             messages = self._searchable_messages(data)
@@ -2256,12 +2288,9 @@ class DefaultSessionStore:
         return {"version": self.PORTABLE_VERSION, "sessions": sessions}
 
     def export_all(self) -> Dict[str, Any]:
-        """Export every stored session to a portable, versioned payload."""
+        """Export every stored session; raise OSError for an incomplete backup."""
         sessions: List[Dict[str, Any]] = []
-        try:
-            filenames = os.listdir(self.session_dir)
-        except (IOError, OSError):
-            filenames = []
+        filenames = os.listdir(self.session_dir)
         for filename in filenames:
             if not filename.endswith(".json"):
                 continue
@@ -2269,8 +2298,9 @@ class DefaultSessionStore:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     sessions.append(json.load(f))
-            except (json.JSONDecodeError, IOError, OSError):
-                continue
+            except (UnicodeDecodeError, json.JSONDecodeError, IOError, OSError) as exc:
+                self._report_unreadable_session(filename[:-5], filepath, exc)
+                raise OSError(f"Incomplete session export: cannot read {filename}") from exc
         return {"version": self.PORTABLE_VERSION, "sessions": sessions}
 
     def _collect_lineage(
@@ -2282,15 +2312,13 @@ class DefaultSessionStore:
         (``lineage_id`` / ``root_session_id`` / ``thread_id``) so a compacted /
         rotated continuation exports alongside its logical session. Returns the
         raw session dicts (already portable). Empty when no lineage is known.
+        Raises OSError when an unreadable record makes lineage coverage unknown.
         """
         lineage = self._lineage_key(session.to_dict())
         if not lineage:
             return []
         out: List[Dict[str, Any]] = []
-        try:
-            filenames = os.listdir(self.session_dir)
-        except (IOError, OSError):
-            return []
+        filenames = os.listdir(self.session_dir)
         for filename in filenames:
             if not filename.endswith(".json"):
                 continue
@@ -2298,15 +2326,16 @@ class DefaultSessionStore:
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (json.JSONDecodeError, IOError, OSError):
-                continue
+            except (UnicodeDecodeError, json.JSONDecodeError, IOError, OSError) as exc:
+                self._report_unreadable_session(filename[:-5], filepath, exc)
+                raise OSError(f"Incomplete session export: cannot read {filename}") from exc
             if data.get("session_id") == exclude:
                 continue
             if self._lineage_key(data) == lineage:
                 out.append(data)
         return out
 
-    def _save_imported_session(self, session: SessionData) -> bool:
+    def _save_imported_session(self, session: SessionData, *, overwrite: bool = True) -> bool:
         """Persist a restored session verbatim (no retention/window applied).
 
         Mirrors ``_save_session`` (timestamp + atomic, file-locked write) but
@@ -2317,6 +2346,10 @@ class DefaultSessionStore:
         filepath = self._get_session_path(session.session_id)
         session.updated_at = datetime.now(timezone.utc).isoformat()
         with FileLock(filepath, self.lock_timeout):
+            # The initial import check can race with a peer creating this file.
+            # Check again inside the same lock that protects the replacement.
+            if not overwrite and os.path.exists(filepath):
+                raise FileExistsError(filepath)
             if not self._atomic_write_json(filepath, session.to_dict()):
                 logger.error(f"Failed to save imported session {session.session_id}")
                 return False
@@ -2416,7 +2449,7 @@ class DefaultSessionStore:
                 # Persist the imported record verbatim: an import is a restore,
                 # so the destination's retention/active_window must not truncate
                 # or compact a valid larger export before it lands on disk.
-                if not self._save_imported_session(session):
+                if not self._save_imported_session(session, overwrite=overwrite):
                     report.skipped.append(
                         {"session_id": session_id, "reason": "write failed"}
                     )
@@ -2424,6 +2457,10 @@ class DefaultSessionStore:
                 with self._lock:
                     self._cache[session_id] = session
                 report.imported += 1
+            except FileExistsError:
+                report.skipped.append(
+                    {"session_id": session_id, "reason": "already exists (use overwrite)"}
+                )
             except Exception as e:  # pragma: no cover - defensive; one bad record
                 report.skipped.append(
                     {"session_id": session_id, "reason": f"import error: {e}"}
