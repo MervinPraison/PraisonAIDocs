@@ -493,6 +493,59 @@ sequenceDiagram
 This matches the behaviour `AsyncBaseJSONStore.save_async` already had — the sync path now has parity. No API change; upgrade to pick up the fix.
 </Note>
 
+### BaseJSONStore — read failures block ordinary saves on the same instance
+
+`BaseJSONStore` and `AsyncBaseJSONStore` share a per-instance read-failure guard: when `_load()` / `load_async()` catches an `UnicodeDecodeError`, a `json.JSONDecodeError`, or a non-missing `IOError`, the instance returns defaults **and** sets `_read_failed = True`. A subsequent `save()` / `save_async()` then raises `OSError: Refusing to overwrite unreadable record: <path>` for as long as the source file still exists. Neighbouring stores and other keys on a shared backend are unaffected — the guard is per-instance / per-path.
+
+Clearing the guard requires one of these:
+
+| Trigger | API |
+|---|---|
+| Explicit atomic reset | `store.clear()` — writes `_default_data()` through `_reset`, rolls back on failure |
+| Delete the source file (and reset the cache) | `store.delete()` |
+| Successfully reload (bytes were repaired out-of-band) | `store.load()` / `await store.load_async()` returning real data |
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Store as BaseJSONStore
+    participant Disk as session.json (bad bytes)
+
+    Caller->>Store: load()
+    Store->>Disk: open + json.load
+    Disk-->>Store: UnicodeDecodeError
+    Store-->>Caller: {} (defaults)
+    Note over Store: _read_failed = True
+
+    Caller->>Store: save({"ok": 1})
+    Store->>Disk: exists? yes
+    Store-->>Caller: OSError<br/>Refusing to overwrite<br/>unreadable record
+
+    Caller->>Store: clear()   OR   delete()   OR   fix bytes + load()
+    Note over Store: _read_failed = False
+    Caller->>Store: save({"ok": 1})
+    Store->>Disk: tmp + os.replace
+    Disk-->>Store: ok
+
+    classDef caller fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef disk fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Caller caller
+    class Store store
+    class Disk disk
+```
+
+**Backend-delegated stores:** when `BaseJSONStore` is constructed with a `FileBackend` (`BaseJSONStore(path, backend=FileBackend(...))`), the per-path guard lives on the **backend**, not the store. The contract is the same from the caller's point of view: the first failed `load()` makes further `save()` calls on that key refuse to overwrite the file until the key is deleted, successfully reloaded, or the file is removed out-of-band.
+
+**Cross-instance / cross-process:** no guarantee is claimed. A fresh instance pointed at the same bad file goes through the same recovery on its first `load()`.
+
+Fix references: [PraisonAI PR #5578](https://github.com/MervinPraison/PraisonAI/pull/5578), [PR #5579](https://github.com/MervinPraison/PraisonAI/pull/5579), fixes [#5577](https://github.com/MervinPraison/PraisonAI/issues/5577).
+
+<Note>
+`clear()` is the one path that intentionally overwrites an unreadable file. It routes through `_reset`, which captures the previous cache and guard state and restores them if the write fails — so a failed reset leaves the instance exactly as it was.
+</Note>
+
 ### SqliteTranscriptStore — cross-process safety
 
 `SqliteTranscriptStore` is the **default** gateway transcript backend as of PraisonAI PR #3409. It replaces the `FileLock` above with a SQLite transaction: every read-modify-write runs its `SELECT` + `INSERT OR REPLACE` inside a single `BEGIN IMMEDIATE` transaction, which grabs the database RESERVED write lock and holds it until COMMIT.
