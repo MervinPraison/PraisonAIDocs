@@ -25,7 +25,6 @@ import json
 import copy
 import time
 import logging
-import threading
 from praisonaiagents._logging import get_logger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Tuple, Union
@@ -48,10 +47,7 @@ DEFAULT_MAX_PARALLEL_WORKERS = 3
 # summarisation request consumes roughly as many tokens as it saves.
 MIN_BRANCHES_FOR_LLM_SUMMARY = 3
 
-# Guards lazy creation of each Workflow's per-instance _run_lock so two threads
-# entering run()/astart() concurrently on a fresh instance cannot each create
-# and acquire a *different* lock object (which would defeat the run guard).
-_RUN_LOCK_INIT_GUARD = threading.Lock()
+from .._run_lock import ensure_run_lock
 
 
 class _WriteTrackingDict(dict):
@@ -796,14 +792,7 @@ class AgentFlow:
         first reach run()/astart() concurrently observe the *same* lock object
         (double-checked locking) rather than each minting and acquiring its own.
         """
-        lock = self._run_lock
-        if lock is None:
-            with _RUN_LOCK_INIT_GUARD:
-                lock = self._run_lock
-                if lock is None:
-                    lock = threading.Lock()
-                    self._run_lock = lock
-        return lock
+        return ensure_run_lock(self)
 
     def __post_init__(self):
         """Resolve consolidated params to internal values."""
@@ -1633,6 +1622,14 @@ class AgentFlow:
                     if verbose:
                         print(f"↩︎  cache hit: {step.name}")
                     previous_output = _cached.get("output")
+                    # Replay the full step delta recorded on the cold run so a
+                    # hit is indistinguishable from re-executing: the step's
+                    # status/retries, any handler-supplied variables (and the
+                    # generated output variable, present only when the cold run
+                    # did not stop first), and -- crucially -- the stop signal.
+                    # A hit that only appended {step, output} and continued lost
+                    # the stop flag and the handler's variables, so a workflow
+                    # that stopped on the cold run ran on through the cached one.
                     cached_record = _cached.get("step_record") or {
                         "step": step.name, "output": previous_output,
                         "status": "completed", "retries": 0,
@@ -1644,6 +1641,8 @@ class AgentFlow:
                     if _cached.get("variables"):
                         all_variables.update(_cached["variables"])
                     if _cached.get("stop"):
+                        if verbose:
+                            print(f"🛑 Workflow stopped at: {step.name}")
                         break
                     i += 1
                     continue
@@ -1702,6 +1701,11 @@ class AgentFlow:
                             output = result.output
                             stop = result.stop_workflow
                             if result.variables:
+                                # Accumulate across retries so the cached
+                                # snapshot matches the cold run: a rejected
+                                # attempt that wrote {a, b} followed by an
+                                # accepted attempt that wrote {a} leaves both
+                                # keys in the live run, so both must be cached.
                                 all_variables.update(result.variables)
                                 if cached_variable_updates is not None:
                                     cached_variable_updates.update(result.variables)
