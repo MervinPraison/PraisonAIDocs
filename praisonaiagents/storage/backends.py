@@ -324,9 +324,9 @@ class SQLiteBackend:
         if prefix:
             cur.execute(f"""
                 SELECT key FROM {self._quoted_table}
-                WHERE key LIKE ?
+                WHERE instr(key, ?) = 1
                 ORDER BY key
-            """, (f"{prefix}%",))
+            """, (prefix,))
         else:
             cur.execute(f"""
                 SELECT key FROM {self._quoted_table}
@@ -351,10 +351,8 @@ class SQLiteBackend:
         conn = self._get_conn()
         cur = conn.cursor()
         
-        cur.execute(f"SELECT COUNT(*) as count FROM {self._quoted_table}")
-        count = cur.fetchone()["count"]
-        
         cur.execute(f"DELETE FROM {self._quoted_table}")
+        count = cur.rowcount
         conn.commit()
         
         return count

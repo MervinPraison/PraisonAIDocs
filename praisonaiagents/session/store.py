@@ -1038,6 +1038,10 @@ class DefaultSessionStore:
             logger.warning("Skipping unreadable session file %s: %s", filepath, error)
             self._fire_corruption_hook(session_id, str(error), None)
 
+    def _dump_session_json(self, data: Any, stream) -> None:
+        """Write durable JSON; subclasses can format private storage records."""
+        json.dump(data, stream, indent=2, ensure_ascii=False)
+
     def _atomic_write_json(self, filepath: str, data: Any) -> bool:
         """Atomically write JSON data to disk (temp file + os.replace)."""
         temp_path = None
@@ -1052,7 +1056,7 @@ class DefaultSessionStore:
                 suffix=".tmp",
             ) as f:
                 temp_path = f.name
-                json.dump(data, f, indent=2, ensure_ascii=False)
+                self._dump_session_json(data, f)
 
             os.replace(temp_path, filepath)
             return True
@@ -1212,16 +1216,55 @@ class DefaultSessionStore:
         except (IOError, OSError):
             return
 
-        seen = {
-            (m.role, m.content, m.timestamp) for m in session.messages
-        }
+        def _freeze(value: Any) -> Any:
+            # A flat, iterative key avoids recursion both while converting and
+            # hashing deeply nested JSON. Sort object keys to preserve equality
+            # independently of insertion order; keep scalar types distinct.
+            tokens = []
+            stack = [("visit", value)]
+            ancestors = set()
+            while stack:
+                operation, item = stack.pop()
+                if operation == "leave":
+                    ancestors.remove(item)
+                elif operation == "key":
+                    tokens.append(("key", type(item), item))
+                elif isinstance(item, (list, dict)):
+                    identity = id(item)
+                    if identity in ancestors:
+                        raise ValueError("cyclic spill content")
+                    ancestors.add(identity)
+                    stack.append(("leave", identity))
+                    tokens.append((type(item), len(item)))
+                    if isinstance(item, list):
+                        stack.extend(("visit", child) for child in reversed(item))
+                    else:
+                        for key in sorted(item, reverse=True):
+                            stack.append(("visit", item[key]))
+                            stack.append(("key", key))
+                else:
+                    tokens.append((type(item), item))
+            return tuple(tokens)
+
+        def _key(message: SessionMessage) -> tuple:
+            return tuple(_freeze(value) for value in (
+                message.role, message.content, message.timestamp,
+            ))
+
+        seen = set()
+        for message in session.messages:
+            try:
+                seen.add(_key(message))
+            except (RecursionError, TypeError, ValueError):
+                # An unsupported existing value must not stop other salvage.
+                continue
         recovered: List[tuple] = []  # (filepath, [SessionMessage])
         for filename in candidates:
             filepath = os.path.join(spill_dir, filename)
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except (json.JSONDecodeError, IOError, OSError):
+            except (json.JSONDecodeError, UnicodeDecodeError, RecursionError, IOError, OSError):
                 continue
             # A syntactically valid spill can still carry an unexpected shape
             # (non-object root, non-list messages, non-object message). Guard
@@ -1235,15 +1278,21 @@ class DefaultSessionStore:
             if not isinstance(raw_messages, list):
                 continue
             msgs = []
-            for raw in raw_messages:
-                if not isinstance(raw, dict):
-                    continue
-                msg = SessionMessage.from_dict(raw)
-                key = (msg.role, msg.content, msg.timestamp)
-                if key in seen:
-                    continue
-                seen.add(key)
-                msgs.append(msg)
+            pending_keys = set()
+            try:
+                for raw in raw_messages:
+                    if not isinstance(raw, dict):
+                        continue
+                    msg = SessionMessage.from_dict(raw)
+                    key = _key(msg)
+                    if key in seen or key in pending_keys:
+                        continue
+                    pending_keys.add(key)
+                    msgs.append(msg)
+            except (RecursionError, TypeError, ValueError):
+                # Retain the entire spill, without poisoning neighbor dedup.
+                continue
+            seen.update(pending_keys)
             recovered.append((filepath, msgs))
 
         if not recovered:
@@ -1260,7 +1309,7 @@ class DefaultSessionStore:
             # expose an oversized transcript that stays inconsistent until a
             # later mutation happens to compact it.
             self._enforce_window(session)
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 # Could not fold the salvage back in durably — leave the spill
                 # files in place so a later load can retry.
                 return
@@ -1278,6 +1327,7 @@ class DefaultSessionStore:
         mutator: Callable[[SessionData], None],
         *,
         error_label: str = "modify session",
+        apply_retention: bool = True,
     ) -> bool:
         """Apply mutator after reloading from disk under FileLock."""
         filepath = self._get_session_path(session_id)
@@ -1293,9 +1343,10 @@ class DefaultSessionStore:
             mutator(session)
             session.updated_at = datetime.now(timezone.utc).isoformat()
 
-            self._enforce_window(session)
+            if apply_retention:
+                self._enforce_window(session)
 
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 logger.error(f"Failed to {error_label} {session_id}")
                 return False
 
@@ -1304,6 +1355,10 @@ class DefaultSessionStore:
 
             return True
     
+    def _session_to_storage(self, session: SessionData) -> Dict[str, Any]:
+        """Serialize a durable record; subclasses may retain portable exports."""
+        return session.to_dict()
+
     def _save_session(self, session: SessionData) -> bool:
         """Save session to disk with atomic write."""
         filepath = self._get_session_path(session.session_id)
@@ -1313,7 +1368,7 @@ class DefaultSessionStore:
         self._enforce_window(session)
         
         with FileLock(filepath, self.lock_timeout):
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 logger.error(f"Failed to save session {session.session_id}")
                 return False
             return True
@@ -1380,7 +1435,7 @@ class DefaultSessionStore:
             self._enforce_window(session)
             
             # Write atomically
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 logger.error(f"Failed to save session {session_id}")
                 # Issue #3597: durable write failed (disk-full / corruption).
                 # Spill just this turn to a fallback file and fire the
@@ -2403,10 +2458,30 @@ class DefaultSessionStore:
             # Check again inside the same lock that protects the replacement.
             if not overwrite and os.path.exists(filepath):
                 raise FileExistsError(filepath)
-            if not self._atomic_write_json(filepath, session.to_dict()):
+            if not self._atomic_write_json(filepath, self._session_to_storage(session)):
                 logger.error(f"Failed to save imported session {session.session_id}")
                 return False
+            session._import_file_identity = self._session_file_identity(filepath)
+            # Persistence hooks own their cache value; a subclass may refresh
+            # it from a newer durable generation before returning to import.
+            with self._lock:
+                self._cache[session.session_id] = session
             return True
+
+    @staticmethod
+    def _session_file_identity(filepath):
+        """Identify an atomic file generation without depending on wall-clock ordering."""
+        try:
+            stat = os.stat(filepath)
+        except OSError:
+            # A path metadata failure need not make the atomic generation
+            # unknowable: an opened descriptor can still identify that file.
+            try:
+                with open(filepath, "rb") as current:
+                    stat = os.fstat(current.fileno())
+            except OSError:
+                return None
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
 
     def import_sessions(
         self,
@@ -2507,8 +2582,6 @@ class DefaultSessionStore:
                         {"session_id": session_id, "reason": "write failed"}
                     )
                     continue
-                with self._lock:
-                    self._cache[session_id] = session
                 report.imported += 1
             except FileExistsError:
                 report.skipped.append(
