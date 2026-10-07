@@ -111,7 +111,7 @@ That unlocks the full `run` surface for plain YAML invocations:
 | Capability | Flags |
 |-----------|-------|
 | Session continuity | `--continue`, `--session <id>`, `--fork` |
-| Output modes | `--output silent\|actions\|verbose\|json\|stream` |
+| Output modes | `--output silent\|actions\|verbose\|json\|stream\|stream-json` |
 | First-run credential gate | Ollama detection + setup wizard rescue |
 | Permissions & approval | `--allow`, `--deny`, `--approval`, `--permission-default` |
 
@@ -141,7 +141,7 @@ praisonai agents.yaml --allow "bash:git *" --approval console
 
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
-| `--output` | `-o` | Output mode: `text`, `json`, `stream-json`, `silent`, `verbose` | `text` |
+| `--output` | `-o` | Output mode: `text`, `plain`, `verbose`, `silent`, `actions`, `json`, `stream`, `stream-json` | `text` |
 | `--model` | `-m` | LLM model to use | `gpt-4o-mini` |
 | `--framework` | `-f` | Framework: praisonai, crewai, autogen | `praisonai` |
 | `--interactive` | `-i` | Enable interactive mode | `false` |
@@ -459,11 +459,31 @@ praisonai run "What is the capital of France?"
 ```
 </Tab>
 
+<Tab title="actions">
+Runs in-process with the core `actions` preset — a structured event stream written by the core preset. Standalone-safe (`pip install praisonai-code`).
+
+```bash
+praisonai run --output actions "What is the capital of France?"
+```
+</Tab>
+
 <Tab title="json">
-Emits a single JSON object at the end of the run containing the final result.
+Emits one single-line `{"result": "<text or null>", "status": "<outcome>"}` envelope on stdout for every outcome — `ok` on success, `truncated` on a step-limit cutoff, `failed` on an empty-result failure, and `content_filtered` / `refused` / `length_truncated` on a provider block.
 
 ```bash
 praisonai run --output json "What is the capital of France?"
+# {"result": "Paris", "status": "ok"}
+```
+
+A `--output json | script` pipe never sees empty stdout — the envelope is written before the exit-2 reporters run (fixes [#5665](https://github.com/MervinPraison/PraisonAI/issues/5665) via [PR #5685](https://github.com/MervinPraison/PraisonAI/pull/5685)). Standalone-safe.
+</Tab>
+
+<Tab title="stream">
+Prints the final answer text on stdout. On exit `2` (blocked / truncated) it also prints the partial answer, unless `--quiet` is set. Standalone-safe.
+
+```bash
+praisonai run --output stream "What is the capital of France?"
+# Paris
 ```
 </Tab>
 
@@ -480,7 +500,7 @@ Transient rate limits surface as a `run.retry` event **before** the wait, so a r
 {"event":"run.retry","data":{"schema_version":1,"attempt":2,"max_attempts":5,"delay":4.0,"reason":"rate_limit"}}
 ```
 
-See [Stream Events](/features/run-stream-events) for the full event protocol reference.
+On exit `2` raw partial text is deliberately **not** printed (it would corrupt the NDJSON protocol); the terminal `run.result` event carries `ok: false` instead. See [Stream Events](/features/run-stream-events) for the full event protocol reference.
 </Tab>
 
 <Tab title="silent">
@@ -499,6 +519,40 @@ praisonai run --output verbose "What is the capital of France?"
 ```
 </Tab>
 </Tabs>
+
+### Partial-answer stdout on exit 2
+
+On a blocked / truncated run (exit `2`), the mode-specific stdout payload is written **before** the exit reporter runs, so a pipe or redirect never loses it.
+
+```mermaid
+graph LR
+    Req[📝 run --output] --> Decide{🔍 outcome}
+    Decide -->|ok| Done[✅ stdout payload]
+    Decide -->|blocked / truncated| Emit[✅ stdout payload first]
+    Emit --> Exit[⚠️ exit-2 reporter]
+    Decide -->|stream + --quiet| Quiet[🚫 suppress partial print]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef write fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef reporter fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef suppress fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Req input
+    class Decide gate
+    class Done,Emit write
+    class Exit reporter
+    class Quiet suppress
+```
+
+| Mode | Exit-2 stdout | Notes |
+|------|---------------|-------|
+| `--output json` | `{"result": "<partial text or null>", "status": "truncated\|content_filtered\|refused\|length_truncated"}` | Single-line envelope; always printed |
+| `--output stream` | The partial answer text | Suppressed when `--quiet` is set |
+| `--output stream-json` | Terminal `run.result` event with `ok: false` (no raw text) | Raw text would corrupt the NDJSON protocol |
+| `--output actions` | Structured events already emitted by the core preset | No extra CLI write |
+
+The `--output stream` quiet-mode suppression keeps `--quiet` honest in the exit-2 path. The `--output json` envelope writes on every outcome (`ok`, `failed`, `truncated`, `content_filtered`, `refused`, `length_truncated`), so a scripting consumer can always parse `.status` out of stdout (via [PR #5685](https://github.com/MervinPraison/PraisonAI/pull/5685)).
 
 ---
 
@@ -551,6 +605,16 @@ graph LR
 <Note>
 Exit `2` covers several independent cases: **step-limit truncation** (`status: "truncated"`, PR [#4100](https://github.com/MervinPraison/PraisonAI/pull/4100)), the three **provider blocks** (`status: "content_filtered" \| "refused" \| "length_truncated"`, PR [#4472](https://github.com/MervinPraison/PraisonAI/pull/4472)), and the pre-existing **reserved-command guard**. They share the exit code but are unrelated — each incomplete-run case emits its specific `status` under `--output json`, while the guard fails fast before any run.
 </Note>
+
+### Unified envelope (`--output json`)
+
+Every outcome prints a single-line `{"result": "<text or null>", "status": "<outcome>"}` envelope on stdout — success included:
+
+```json
+{"result": "Paris", "status": "ok"}
+```
+
+The subsections below document each non-`ok` outcome; they all share this envelope shape.
 
 ### Failure payload (`--output json` / `--output stream-json`)
 
@@ -643,18 +707,18 @@ if ! praisonai run "Summarise yesterday's PRs"; then
 fi
 ```
 
-Branch on the JSON `status` to handle all three outcomes — `success`, `truncated`, and `failed`:
+Branch on the `.status` field of the unified envelope — every outcome carries one:
 
 ```bash
 result=$(praisonai run --output json "Refactor the auth module and add tests")
-status=$(echo "$result" | jq -r '.status // "success"')
+status=$(echo "$result" | jq -r '.status')
 case "$status" in
-  success)          echo "done" ;;
-  truncated)        echo "hit the step limit; raise ExecutionConfig(max_steps=…) in the YAML and re-run"; exit 2 ;;
+  ok)               echo "done" ;;
+  truncated)        echo "hit the step limit; raise ExecutionConfig(max_steps=…) and re-run"; exit 2 ;;
   content_filtered) echo "provider blocked the response; try rephrasing"; exit 2 ;;
   refused)          echo "model declined; try a different model"; exit 2 ;;
   length_truncated) echo "response cut off; re-run with a higher --max-tokens"; exit 2 ;;
-  failed)           echo "$result" | jq -r '.message'; exit 1 ;;
+  failed)           echo "$result" | jq -r '.result // "run failed"'; exit 1 ;;
 esac
 ```
 
@@ -687,7 +751,7 @@ praisonai-code code "Refactor this function"
 Pre-PR-#3818 `praisonai-code` builds emitted `Error: chat requires the praisonai wrapper` on a standalone install. Upgrading to a build with the resident TUI removes that hint — `chat` and `code` now run without the wrapper.
 </Note>
 
-Every text mode — default `run "…"` and `--output plain|verbose|silent|actions|json|stream|stream-json` — plus interactive `chat`/`code` runs with no wrapper. The wrapper (`pip install praisonai`) still adds the gateway, channel bots, and the richer legacy interactive dispatch. See the [PraisonAI Code CLI standalone-limits table](/docs/features/praisonai-code-cli#standalone-limits) for the full command matrix.
+Every text mode — default `run "…"` and `--output plain|verbose|silent|actions|json|stream|stream-json` — plus interactive `chat`/`code` runs with no wrapper. The structured-mode in-process dispatch and the per-mode stdout contract (the `{result, status}` envelope for `json`, partial-answer-before-exit for `stream`) were cemented by PR [#5685](https://github.com/MervinPraison/PraisonAI/pull/5685). The wrapper (`pip install praisonai`) still adds the gateway, channel bots, and the richer legacy interactive dispatch. See the [PraisonAI Code CLI standalone-limits table](/docs/features/praisonai-code-cli#standalone-limits) for the full command matrix.
 
 <Note>
 **`run --output actions` honours `--tools` and `--toolset`.** These flags were previously dropped in actions mode; they now reach parity with the default, YAML, and Python surfaces. The same [ToolResolver](/features/tool-resolver) path resolves comma-separated names, and `tools.py` file paths continue to load as before.
@@ -1482,12 +1546,14 @@ The format is:
 - **Suppressed in JSON mode** (`--output json`, `--output stream-json`). There is no `--no-usage` flag.
 - Usage is persisted to `~/.praisonai/sessions/<id>.json` so resuming with `--continue` or `--session <id>` rehydrates the totals and keeps accumulating.
 
-**JSON mode** — the footer is suppressed but usage is included in the payload:
+**JSON mode** — the footer is suppressed; the stdout envelope carries `result` and `status`, and usage is attached when the run records it:
 
 ```bash
 $ praisonai run --output json "Summarise yesterday's PRs"
-{"session_id":"abc12345","output":"...","usage":{"input_tokens":1240,"output_tokens":3980,"total_tokens":5220,"cost":0.0140,"requests":1}}
+{"result":"...","status":"ok","session_id":"abc12345","usage":{"input_tokens":1240,"output_tokens":3980,"total_tokens":5220,"cost":0.0140,"requests":1}}
 ```
+
+The minimal envelope is `{"result": "...", "status": "ok"}`; `session_id` and `usage` are added on paths that record them.
 
 ### Troubleshooting session continuity
 
@@ -1511,6 +1577,10 @@ Also fixed by [PR #1963](https://github.com/MervinPraison/PraisonAI/pull/1963) �
 
 <Accordion title="`--no-save` together with `--session <id>`">
 `--no-save` wins — the run still resumes from the named session (agent has context), but new messages are not persisted. Useful for read-only follow-ups on an existing thread.
+</Accordion>
+
+<Accordion title="`praisonai-code run --output json '…' | script` prints nothing on standalone">
+Pre-PR [#5685](https://github.com/MervinPraison/PraisonAI/pull/5685) (merged 2026-10-07), `--output json/stream/stream-json` on a `pip install praisonai-code`-only install fell through to the wrapper's `handle_direct_prompt` and failed with `praisonai.cli.legacy.direct_prompt requires the praisonai wrapper`. Upgrade to a build with #5685 — the three structured modes now dispatch in-process and `--output json` writes the `{result, status}` envelope on every outcome.
 </Accordion>
 
 </AccordionGroup>
