@@ -149,6 +149,101 @@ This occurs when the mem0ai package is installed but the API key is missing.
 
 ---
 
+## Why am I seeing `TypeError: MemoryConfig.db must be a DbAdapter instance`?
+
+This error fires at agent construction when `memory={"db": ...}` (or `MemoryConfig(db=...)`) receives something that isn't a real database adapter — most commonly a bare file-path string.
+
+### The Problem
+
+```python
+from praisonaiagents import Agent
+
+# ❌ Was silently broken before PR #5679 — now raises TypeError at construct
+agent = Agent(memory={"db": "/tmp/sessions.db"})
+# TypeError: MemoryConfig.db must be a DbAdapter instance (e.g. db(...) /
+# db.SQLiteDB(path=...)) implementing the on_agent_start/on_user_message/
+# on_agent_message hooks, not str. For a SQLite file use
+# db(database_url="sqlite:///path/to.db") or
+# MemoryConfig(backend="sqlite", config={"short_db": "short.db", "long_db": "long.db"}).
+```
+
+Earlier releases accepted the string, warned on each hook call (`'str' object has no attribute 'on_agent_start'`), and silently dropped every message — memory looked enabled while no turns were ever stored. Fix landed in [PR #5679](https://github.com/MervinPraison/PraisonAI/pull/5679) (fixes [#5668](https://github.com/MervinPraison/PraisonAI/issues/5668)).
+
+### Behavior change at a glance
+
+| Input                                              | Before PR #5679               | After PR #5679             |
+|----------------------------------------------------|-------------------------------|----------------------------|
+| `memory={"db": "/path/x.db"}`                      | Warning + silent persist loss | `TypeError` at construct   |
+| `memory=MemoryConfig(db="/path/x.db")`             | Warning + silent persist loss | `TypeError` at construct   |
+| `memory=MemoryConfig(db="")`                       | Warning + silent persist loss | `TypeError` at construct   |
+| `memory=MemoryConfig(db=123)`                      | Warning + silent persist loss | `TypeError` at construct   |
+| `memory=MemoryConfig(db=db(database_url="…"))`     | Works                         | Works (unchanged)          |
+| `memory=MemoryConfig(db=None)` *(default)*         | Works                         | Works (unchanged)          |
+
+### The Fix
+
+Pick one of the two supported shapes depending on how you want to point to a SQLite file (or any backing store):
+
+<Tabs>
+  <Tab title="db() factory with a URL">
+    Use the `db` factory for URL-based stores. Works for `sqlite`, `postgresql`, and more.
+
+    ```python
+    from praisonaiagents import Agent, MemoryConfig, db
+
+    agent = Agent(
+        name="Assistant",
+        instructions="You are a helpful assistant.",
+        memory=MemoryConfig(db=db(database_url="sqlite:///tmp/sessions.db")),
+    )
+
+    agent.start("Remember my favourite colour is teal.")
+    ```
+  </Tab>
+  <Tab title="backend + config">
+    Use `backend="sqlite"` and put file paths inside `config={}`. The `config` dict is the correct home for path strings — `db=` is for adapter instances only.
+
+    ```python
+    from praisonaiagents import Agent, MemoryConfig
+
+    agent = Agent(
+        name="Assistant",
+        instructions="You are a helpful assistant.",
+        memory=MemoryConfig(
+            backend="sqlite",
+            config={"short_db": "./mem/short.db", "long_db": "./mem/long.db"},
+        ),
+    )
+
+    agent.start("Remember my favourite colour is teal.")
+    ```
+  </Tab>
+</Tabs>
+
+### Interaction flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Cfg as MemoryConfig
+    participant Mix as memory_mixin
+
+    User->>Agent: Agent(memory={"db": "/path/x.db"})
+    Agent->>Cfg: resolve dict → MemoryConfig(**value)
+    Note over Cfg: __post_init__ validates db
+    Cfg-->>Agent: TypeError (clear message + fix hint)
+    Agent-->>User: Fails fast at construct — no LLM turn billed, no silent data loss
+```
+
+### Why the hook check, not just a type check?
+
+The memory bridge drives `db` through three hooks: `on_agent_start`, `on_user_message`, `on_agent_message`. A valid `db` is either a `DbAdapter` or a `db(...)` backend instance — both expose these hooks. The guard requires the hooks themselves (callable), not a weaker signal like `database_url` that a half-built object could expose while still dropping every message.
+
+See also [Database Persistence](/features/database-persistence) and [Session Persistence](/features/session-persistence) for custom `DbAdapter` implementations.
+
+---
+
 ## Why is `memory="mem0"` returning empty search results? (MongoDB vector store)
 
 Search results come back empty because mem0's MongoDB vector store has an upstream signature-mismatch bug.
