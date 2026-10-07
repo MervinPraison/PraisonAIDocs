@@ -108,6 +108,8 @@ sequenceDiagram
 | `fork_session()` | Yes — reloads parent first |
 | `create_snapshot()` / `revert_to_snapshot()` | Yes — atomic under lock |
 
+Writes are no longer silent on failure — see [Error Handling](#error-handling) for the APIs that now raise `OSError`.
+
 <Note>
 Object identity is not a stable API — expect either a fresh `ExtendedSessionData` object or a cached one. When the file on disk is unchanged, consecutive `get_extended_session()` calls can return the same cached object; when it has changed, you get a fresh one. Use the returned data, not `session_a is session_b`. Changed in [PR #4958](https://github.com/MervinPraison/PraisonAI/pull/4958).
 </Note>
@@ -120,6 +122,84 @@ from praisonaiagents.session import get_hierarchical_session_store
 store = get_hierarchical_session_store()
 session = store.get_extended_session(session_id, force_reload=True)  # bypass cache
 ```
+
+---
+
+## Error Handling
+
+Creation APIs raise `OSError` when a durable write or parent registration fails — they never return a success-shaped ID after a silent failure.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.session import get_hierarchical_session_store
+
+store = get_hierarchical_session_store()
+
+try:
+    session_id = store.create_session(title="Trip plan")
+except OSError as e:
+    # Disk failure; nothing was saved — safe to retry or report.
+    raise
+
+agent = Agent(
+    name="Planner",
+    instructions="Plan a trip",
+    memory={"session_id": session_id},
+)
+agent.start("Visit Japan in spring")
+```
+
+When forking under a parent, catch `OSError` and recover with the saved ID the message carries:
+
+```python
+from praisonaiagents.session import get_hierarchical_session_store
+
+store = get_hierarchical_session_store()
+
+try:
+    session_id = store.create_session(title="New plan", parent_id="parent-123")
+except OSError as e:
+    # The write to disk or the parent-registration step failed.
+    # If the message contains an ID, the child was saved but its parent
+    # was not updated — retry with that same ID to recover.
+    print(f"Could not create session: {e}")
+```
+
+| API | Raises | On |
+|---|---|---|
+| `create_session()` | `OSError` | Child save failed, or child saved but parent registration failed |
+| `create_session()` | `ValueError` | `parent_id == session_id` |
+| `fork_session()` | `OSError` | Fork save failed, or fork saved but parent registration failed |
+| `fork_session()` | `ValueError` | `from_message_index` out of range |
+| `create_snapshot()` | `OSError` | Snapshot persistence failed |
+| `import_session()` | `OSError` | Imported session persistence failed |
+
+<Note>
+If a child/fork is persisted but parent registration fails, the saved child ID is surfaced in the `OSError` message. Retry with that same `session_id` to recover the existing child rather than creating a duplicate.
+</Note>
+
+### Save order guarantees
+
+For `create_session` and `fork_session`, the child is written to disk before the parent's `children_ids` list is updated — a parent never references a child JSON that was never written.
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Store
+    participant Disk
+
+    App->>Store: create_session(parent_id=P)
+    Store->>Disk: save child.json
+    Disk-->>Store: ok
+    Store->>Disk: update parent.children_ids (locked)
+    Disk-->>Store: ok
+    Store-->>App: child_id (str)
+
+    Note over Store,Disk: On child-save failure: raises OSError, parent untouched
+    Note over Store,Disk: On parent-register failure: raises OSError, child retained, saved child_id in message
+```
+
+A crash between the two steps leaves an orphan child on disk, not a phantom reference.
 
 ---
 
