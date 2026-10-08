@@ -484,6 +484,136 @@ The doc lists only the common knobs — see the SDK reference for the full, curr
   Full typed field list for the gateway server block
 </Card>
 
+<Note>
+The validation above is the **wrapper** schema (Pydantic, `gateway:` block only, strict by default). The **core SDK** has a separate, lower-level opt-in strict mode that also covers top-level sections and channel-key typos — see [Strict unknown-key validation (core SDK)](#strict-unknown-key-validation-core-sdk) below.
+</Note>
+
+---
+
+## Strict unknown-key validation (core SDK)
+
+The core config loader now surfaces typos in gateway and channel keys instead of silently dropping them ([#5723](https://github.com/MervinPraison/PraisonAI/issues/5723)).
+
+A misspelled key used to be dropped without a trace — the gateway started, reported success, and the affected channel was silently dead:
+
+```yaml
+# Before #5725: silently dropped — gateway starts, channel is dead.
+channels:
+  telegram:
+    tokenn: "123:ABC"   # typo of 'token'
+```
+
+### Default (non-strict) behaviour
+
+Unknown keys are still tolerated for backward compatibility, but each one now logs a prominent WARNING via `praisonaiagents.gateway.config` so a typo surfaces before it costs you an outage:
+
+```
+WARNING  Ignoring channels.telegram key 'tokenn' which looks like a typo of 'token'; if intentional this is passed through as metadata
+```
+
+### Opt-in strict mode
+
+Pass the keyword-only `strict=True` to turn that warning into a hard, actionable failure:
+
+```python
+from praisonaiagents.gateway import (
+    ConfigValidationError,
+    MultiChannelGatewayConfig,
+)
+import yaml
+
+with open("gateway.yaml") as f:
+    raw = yaml.safe_load(f)
+
+try:
+    cfg = MultiChannelGatewayConfig.from_dict(raw, strict=True)
+except ConfigValidationError as exc:
+    print(f"{exc.path}: {exc.keys} (did you mean '{exc.suggestion}'?)")
+    raise
+```
+
+```mermaid
+graph LR
+    Y[📄 gateway config] --> V{🔍 from_dict<br/>strict?}
+    V -->|strict=True| Reject[🛑 ConfigValidationError<br/>path-scoped + did-you-mean]
+    V -->|strict=False default| Warn[⚠ WARNING log<br/>key tolerated]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef warn fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Y input
+    class V gate
+    class Reject stop
+    class Warn warn
+```
+
+### What gets validated
+
+Validation runs at three paths — the dotted `path` is shown in the error.
+
+| Path | What's validated | What passes through |
+|------|------------------|---------------------|
+| `<root>` | Top-level sections; allowed: `gateway`, `agents`, `channels`, `hooks`, `config_version`. | — |
+| `gateway` | Every key in the `gateway:` block against the known set (`host`, `port`, `auth_token`, `auth`, `cors_origins`, `allowed_origins`, `max_connections`, `session_config`, `heartbeat_interval`, `reconnect_timeout`, `per_turn_timeout`, `ssl_cert`, `ssl_key`, …). | Derived read-only keys (`ssl_enabled`, `scope_policy_enabled`, `executor`) stay strict-clean on a `GatewayConfig.to_dict()` → `from_dict()` round-trip. |
+| `channels.<name>` | Only near-miss typos of reserved keys (`token`, `app_token`, `routes`, `enabled`), using a `difflib` cutoff of `0.8`. | **Every other key is channel-specific metadata** (e.g. Telegram's `allowed_updates`) and is kept in `ChannelRouteConfig.metadata`. |
+
+<Note>
+Channels reject **typos only**, not unknown keys. A key is flagged solely when it closely resembles a reserved key (`tokenn` → `token`). Genuine channel metadata keeps working untouched.
+</Note>
+
+### Channel-key decision flow
+
+```mermaid
+graph TB
+    Key[channel key] --> R{reserved?<br/>token / app_token /<br/>routes / enabled}
+    R -->|yes| Use[use as reserved]
+    R -->|no| T{difflib close match<br/>cutoff 0.8?}
+    T -->|yes, strict| Err[🛑 ConfigValidationError]
+    T -->|yes, non-strict| Warn[⚠ WARNING log]
+    T -->|no| Meta[✅ ChannelRouteConfig.metadata]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef meta fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef stop fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Key input
+    class R,T gate
+    class Use,Meta,Warn ok
+    class Err stop
+```
+
+### Example error messages
+
+One per path, all in the form `<path>: unknown key(s): <keys> (did you mean '<suggestion>'?)`:
+
+```
+gateway: unknown key(s): prt (did you mean 'port'?)
+<root>: unknown key(s): channelz (did you mean 'channels'?)
+channels.telegram: unknown key(s): tokenn (did you mean 'token'?)
+```
+
+### `ConfigValidationError` reference
+
+A `ValueError` subclass carrying everything an operator needs to fix the config.
+
+| Attribute | Type | What it carries |
+|-----------|------|-----------------|
+| `path` | `str` | Dotted path to the offending section (`"<root>"`, `"gateway"`, `"channels.telegram"`). |
+| `keys` | `List[str]` | The offending key(s) as strings. |
+| `suggestion` | `Optional[str]` | Closest known key, or `None` when no near match exists. |
+
+<Card icon="code" href="/docs/sdk/reference/praisonaiagents/classes/ConfigValidationError">
+  Attributes and raise-sites for the strict validation exception
+</Card>
+
+<Warning>
+`strict=True` is opt-in today for backward compatibility. A future release may flip the default to strict; configs that trip the WARNING logs now will fail hard then — fix them to stay forward-compatible.
+</Warning>
+
 ---
 
 ## Best Practices
