@@ -30,6 +30,29 @@ workflow = AgentFlow(agents=[coordinator], steps=[parallel([task_a, task_b])])
 workflow.start("Run independent tasks in parallel")
 ```
 
+A real agent fanning its output into three branch workers. By default (`context="full"`) each branch receives the **full** answer the planner produced, not a lossy excerpt.
+
+```python
+from praisonaiagents import Agent, AgentFlow, parallel
+
+planner  = Agent(name="Planner",  instructions="Produce a detailed plan.")
+reviewer = Agent(name="Reviewer", instructions="Review the plan critically.")
+writer   = Agent(name="Writer",   instructions="Rewrite the plan clearly.")
+scorer   = Agent(name="Scorer",   instructions="Score the plan 0–100 with reasons.")
+
+flow = AgentFlow(steps=[
+    planner,
+    parallel([reviewer, writer, scorer]),   # context="full" by default
+])
+
+flow.start("Draft a GTM plan for a developer tool launch.")
+```
+
+```python
+# Token-saving opt-in — WARNS whenever it drops the middle:
+parallel([reviewer, writer, scorer], context="truncate")
+```
+
 The user starts one workflow; independent steps run concurrently and merge results.
 
 ```mermaid
@@ -110,6 +133,7 @@ parallel(
     max_workers: Optional[int] = None,
     on_failure: str = "partial_ok",
     timeout: Optional[float] = None,
+    context: str = "full",
 ) -> Parallel
 ```
 
@@ -121,6 +145,7 @@ parallel(
 | `max_workers` | `Optional[int]` | `None` | Cap on `ThreadPoolExecutor` workers. Defaults to `min(3, len(steps))` |
 | `on_failure` | `"partial_ok" \| "fail_fast" \| "fail_all"` | `"partial_ok"` | Failure-handling strategy |
 | `timeout` | `Optional[float]` | `None` | Wall-clock bound (seconds) for the whole parallel block. Must be positive, or `None` for no bound (`0` / negatives raise `ValueError`). Raises `WorkflowStepError` if any branch is still running when the clock elapses. The clock starts when the block begins, including context-preparation work. |
+| `context` | `"full" \| "truncate" \| "summarize"` | `"full"` | How the upstream step's output reaches each branch. `"full"` (default) passes the exact bytes to every branch — no data loss. `"truncate"` reduces to a head+tail excerpt when the output exceeds ~3,000 chars (middle dropped). `"summarize"` LLM-summarises for large fan-outs, falls back to truncate for small ones. Both reducing modes emit a `logger.warning` whenever they drop content. Invalid values raise `ValueError`. |
 
 ### Accessing Results
 
@@ -439,6 +464,61 @@ sequenceDiagram
     Now that `fail_fast` actually fails fast (post-[#5718](https://github.com/MervinPraison/PraisonAI/pull/5718)), it is the right default for user-facing paths where returning quickly on first error beats collecting every error.
   </Accordion>
 </AccordionGroup>
+
+## Context pass-through to branches
+
+Every branch sees the exact upstream output by default. Opt in to token savings with `context="truncate"` or `context="summarize"` — those drop the middle of large outputs and warn when they do.
+
+```mermaid
+graph TB
+    Q{Branches need the<br/>exact upstream output?} -->|Yes default| Full["context='full'"]
+    Q -->|No, save tokens| Big{Many branches &<br/>very large output?}
+    Big -->|Yes, LLM budget available| Summ["context='summarize'"]
+    Big -->|No, cheap excerpt is enough| Trunc["context='truncate'"]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef option fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q,Big decision
+    class Full,Summ,Trunc option
+```
+
+```python
+# Default — lossless (new default as of #5719)
+parallel([worker_a, worker_b, worker_c])
+# equivalent to:
+parallel([worker_a, worker_b, worker_c], context="full")
+
+# Opt in to the head+tail excerpt (and warn on drop)
+parallel([worker_a, worker_b, worker_c], context="truncate")
+
+# Opt in to the LLM summariser (large fan-outs); falls back to truncate
+parallel([worker_a, worker_b, worker_c], context="summarize")
+```
+
+| Mode | What each branch receives | When it reduces | Warns on drop |
+|------|---------------------------|-----------------|:-------------:|
+| `"full"` (default) | The exact upstream output, byte-for-byte | Never | — |
+| `"truncate"` | Head+tail excerpt (middle dropped) | Output > ~3,000 chars / ~1,000 tokens | ✅ |
+| `"summarize"` | LLM summary for ≥ 3 branches; else truncate | Large fan-outs; falls back to truncate on failure or small fan-outs | ✅ |
+
+<Note>
+**Before PraisonAI [#5719](https://github.com/MervinPraison/PraisonAI/pull/5719):** large `previous_output` was **always** reduced to a head+tail excerpt before fan-out, with no opt-out and no default-level warning — branches silently received partial data. Upgrade to get lossless-by-default; if you relied on the token savings, opt in with `context="truncate"` or `context="summarize"`.
+</Note>
+
+The two paths differ only in what each branch receives — lossless by default, excerpted (with a `WARNING`) when you opt in.
+
+```mermaid
+sequenceDiagram
+    participant P as parallel()
+    participant B as each branch
+
+    Note over P: context="full" (default)
+    P->>B: exact upstream output (no loss)
+
+    Note over P: context="truncate"
+    P->>P: ⚠️ WARNING: dropping middle of large output
+    P->>B: head+tail excerpt only
+```
 
 ## Failure Handling
 
