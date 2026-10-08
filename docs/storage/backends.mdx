@@ -274,8 +274,61 @@ runs.load("s1")      # -> {"result": "ok"}
 ```
 
 <Note>
-`table_name` is validated at construction and then used as a quoted SQLite identifier (`"table_name"`) in every statement, so SQL keywords and digit-leading names are safe. Only names matching `[a-zA-Z0-9_]+` are accepted; anything else raises `ValueError` before any SQL runs. SQLite's own `sqlite_` prefix restriction still applies.
+`table_name` is validated at construction and then used as a quoted SQLite identifier (`"table_name"`) in every statement, so SQL keywords and digit-leading names are safe. Only names matching `[a-zA-Z0-9_]+` are accepted; anything else raises `ValueError` before any SQL runs. SQLite's own `sqlite_` prefix restriction still applies — see [Construction failure modes](#construction-failure-modes) for what happens when a reserved name slips past validation.
 </Note>
+
+### Construction failure modes
+
+When `SQLiteBackend(...)` raises during construction, the opened SQLite connection is closed before the error propagates, and the database file is left exactly as it was before the call.
+
+| Failure | When it raises | What propagates | Opened connection | Existing database file |
+|---------|----------------|-----------------|-------------------|------------------------|
+| `table_name` with invalid characters (space, quote, hyphen, SQL-injection payload) | **Before** any SQL runs | `ValueError` | Never opened | Unchanged |
+| `table_name` with SQLite-reserved prefix (e.g. `sqlite_private`) | During `CREATE TABLE` | `sqlite3.OperationalError` | **Closed** | Unchanged |
+| Pre-existing table of the same name missing the `key` column | During `CREATE INDEX` | `sqlite3.OperationalError` | **Closed** | Unchanged — existing table and its data survive |
+| Parent directory cannot be created (permissions, read-only FS) | **Before** any connection opens | `OSError` / `PermissionError` | Never opened | Unchanged |
+
+This makes construction safe to retry — inspect or replace the `.db` file, fix the offending argument, and reconstruct.
+
+```python
+from praisonaiagents.storage import SQLiteBackend
+import sqlite3
+
+# Pre-existing table with incompatible schema → construction fails cleanly
+try:
+    backend = SQLiteBackend(db_path="data.db")
+except sqlite3.OperationalError:
+    # Connection was closed on our behalf; the .db file is untouched
+    # and immediately removable / reopenable (safe on Windows).
+    ...
+```
+
+<Note>
+`SQLiteBackend(..., auto_create=False)` skips schema creation entirely, so none of these schema-init paths run. Validation of `table_name` still applies.
+</Note>
+
+```mermaid
+graph LR
+    subgraph "SQLiteBackend construction"
+        A["📝 SQLiteBackend(...)"] --> V{"🔒 Validate<br/>table_name"}
+        V -->|invalid chars| X["❌ ValueError<br/>no connection opened"]
+        V -->|ok| O["🔌 Open connection"]
+        O --> S{"🏗️ _create_table"}
+        S -->|success| R["✅ Backend ready"]
+        S -->|OperationalError| C["🧹 close()<br/>DB untouched"]
+        C --> E["❌ Re-raise<br/>original error"]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A input
+    class V,S check
+    class O,R ok
+    class X,C,E bad
+```
 
 ## Using with Training Storage
 
