@@ -7092,12 +7092,18 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         for msg in messages:
             role = msg.get("role", "")
             if role in ("system", "developer"):
-                # Accumulate system / developer messages as instructions
-                content = msg.get("content", "")
+                # Accumulate system / developer messages as instructions.
+                # Normalise Chat Completions-style text-part content into a
+                # plain string before combining so we never mutate the
+                # caller-owned list nor send raw parts as instructions.
+                from .openai_client import OpenAIClient
+                content = OpenAIClient._normalise_instruction_content(
+                    msg.get("content", "")
+                )
                 if instructions is None:
                     instructions = content
                 else:
-                    instructions += "\n" + content
+                    instructions = instructions + "\n" + content
             else:
                 # user / assistant / tool messages become input items
                 # Special handling for Chat Completions→Responses API format:
@@ -7105,13 +7111,21 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # Assistant message with tool_calls → emit text (if any)
                     # then emit function_call items for each tool call
                     content = msg.get("content")
-                    if content and content.strip():
+                    if isinstance(content, list):
+                        from .openai_client import OpenAIClient
+                        converted = OpenAIClient._build_responses_content(content)
+                        if converted:
+                            input_items.append({"role": "assistant", "content": converted})
+                    elif content and content.strip():
                         input_items.append({"role": "assistant", "content": content})
                     for tc in msg["tool_calls"]:
-                        fn = tc.get("function", tc) if isinstance(tc, dict) else tc
+                        fn = tc.get("function", tc) if isinstance(tc, dict) else getattr(tc, "function", tc)
                         fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
                         fn_args = fn.get("arguments", "{}") if isinstance(fn, dict) else getattr(fn, "arguments", "{}")
                         tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+                        # Skip items with empty name — API rejects them
+                        if not fn_name:
+                            continue
                         input_items.append({
                             "type": "function_call",
                             "call_id": tc_id,
