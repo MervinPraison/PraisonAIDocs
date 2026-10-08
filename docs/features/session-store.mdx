@@ -316,10 +316,56 @@ graph LR
 | Backfill | Legacy JSON transcripts are indexed once, on first `search()` **or** first routing lookup. A session is treated as indexed only if it appears in **both** `session_meta` **and** `session_route`, so stores upgraded from a prior release re-populate route rows on first read. |
 | Indexed content | `_flatten` concatenates `archived_messages` (compacted turns) ahead of the active `messages`, so compacted history stays searchable (Issue #5031). |
 | Content version | `INDEX_CONTENT_VERSION = 2`. Persisted in the `session_index_meta` table (`content_version` key). A stale version forces a one-time FTS rebuild on startup. |
-| Write sync | `_save_session`, `add_message`, `_modify_session_locked` (covers `set_chat_history`, `set_gateway_info`, `append_compaction_checkpoint`), `clear_session`, and `delete_session` all keep both indexes in sync. Route rows are `INSERT OR REPLACE`d when either `gateway_session_id` or `agent_id` is set, and `DELETE`d when both are cleared. |
+| Write sync | `_save_session`, `add_message`, and `_modify_session_locked` (covers `set_chat_history`, `set_gateway_info`, `append_compaction_checkpoint`, and `clear_session`) all re-index the retained content and routes. `delete_session` is the only operation that deindexes a session (removes rows from `session_meta`, `session_fts`, and `session_route`). Route rows are `INSERT OR REPLACE`d when either `gateway_session_id` or `agent_id` is set, and `DELETE`d (via `delete_session`) when the session is removed. |
 | Query rewrite | Free text is tokenised on alphanumerics into an `OR` of quoted terms for a safe FTS5 `MATCH` expression. |
 | Candidate fan-out | Over-fetches `max(limit * 5, limit)` candidates so lineage dedup / automated demotion can still promote the right sessions into the final `limit`. |
 | Corrupt-transcript tolerance | `search()` skips unreadable candidates — `OSError`, `JSONDecodeError`, and `UnicodeDecodeError` — on both the FTS5 and `LIKE` candidate paths, so one bad transcript on disk cannot abort recall across the remaining valid sessions. See [Cross-Session Recall → Resilience to Corrupt Transcripts](/features/cross-session-recall#resilience-to-corrupt-transcripts). |
+
+<Note>
+**`clear_session` preserves routing and archive on `SqliteSessionStore`** (parity with `DefaultSessionStore`, PraisonAI PR [#5681](https://github.com/MervinPraison/PraisonAI/pull/5681) / issue [#5521](https://github.com/MervinPraison/PraisonAI/issues/5521)). Clearing a session empties only the active turns — the JSON transcript, `archived_messages`, and gateway/agent bindings all remain on disk, and the matching rows in `session_meta`, `session_fts`, and `session_route` are retained. `get_by_gateway_session`, `list_sessions_by_gateway_agent`, and archived-only `search` continue to return the session as an indexed lookup. Only `delete_session` deindexes a session.
+</Note>
+
+A long-lived gateway bot can reset the active window without losing its route:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.session import SqliteSessionStore
+
+store = SqliteSessionStore(db_path="~/.praisonai/sessions.db")
+agent = Agent(name="Gateway", session_store=store)
+
+# Session is bound to a gateway event and handles a conversation
+agent.start("Hello", session_id="chat-42")
+store.set_gateway_info("chat-42", gateway_session_id="gw-abc", agent_id="support")
+
+# Operator clears the active window to start a fresh chat for the same user
+store.clear_session("chat-42")
+
+# The next inbound gateway event still routes to the same local session —
+# the route index survives clear_session (PR #5681).
+same = store.get_by_gateway_session("gw-abc")   # SessionData for "chat-42"
+assert same.session_id == "chat-42"
+```
+
+```mermaid
+graph LR
+    subgraph "clear_session on SqliteSessionStore"
+        C[🧹 clear_session] --> A[Active turns emptied]
+        C --> K1[📦 archived_messages retained]
+        C --> K2[🌐 gateway_session_id retained]
+        C --> K3[🤖 agent_id retained]
+        C --> K4[🔎 FTS + route indexes retained]
+    end
+    D[🗑️ delete_session] --> R[All of the above removed]
+
+    classDef op fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef kept fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef gone fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class C,D op
+    class A,K1,K2,K3,K4 kept
+    class R gone
+```
 
 ### Fallback matrix
 
@@ -375,7 +421,7 @@ history = store.get_working_history("chat-42")   # summary + tail
 | `get_working_history(max_messages=None)` | Reconstruct `[summary_message, *tail]`; falls back to `get_chat_history` with no checkpoint |
 
 <Note>
-`set_chat_history()` and `clear_session()` both clear `last_compaction` — replacing or clearing the transcript invalidates the anchor.
+`set_chat_history()` and `clear_session()` both clear `last_compaction` — replacing or clearing the active transcript invalidates the anchor. Raw turns already moved into `archived_messages` by prior compactions are **not** removed, and stay searchable through `search()` and `session_search` (PraisonAI PR [#5681](https://github.com/MervinPraison/PraisonAI/pull/5681)).
 </Note>
 
 ## Task-Local Context
