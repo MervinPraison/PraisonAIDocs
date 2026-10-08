@@ -211,6 +211,37 @@ The five previously-broken sync→async call sites (`Agent._process_guardrail`, 
 
 ---
 
+## Internal sync surfaces now routed through the shared bridge (PR #5589)
+
+[PR #5589](https://github.com/MervinPraison/PraisonAI/pull/5589) routes ~11 internal sync→async call sites that used to hand-roll their own `asyncio.run` + `ThreadPoolExecutor` dance through the shared `run_coroutine_from_any_context` helper. The hand-rolled copies had two defects the shared helper does not:
+
+- Their `try/except RuntimeError` wrapped the worker's `future.result()`, so a provider `RuntimeError` was replaced by a misleading `"asyncio.run() cannot be called from a running event loop"`. Fixed.
+- They never copied `contextvars.copy_context()`, so trace / session / approval context set by the caller was invisible inside the coroutine. Fixed — the shared helper copies the context.
+
+If you call `agent.start(...)` from a FastAPI route and your async guardrail, backend, aggregator, or tool used to lose trace context or report an opaque loop error, PR #5589 fixes that. The converted user-reachable surfaces:
+
+| Surface | What it is for you |
+|---------|--------------------|
+| `OpenAIAdapter.chat_completion` | Sync OpenAI adapter call inside a running loop |
+| `Agent._execute_backend_sync` | Sync agent delegating to an async backend |
+| `call_executor._resolve_value` | Sync tool returning an awaitable |
+| `agents._resolve_coroutine_sync` | `async def` sync-marked task handler on `astart` |
+| `SharedCompute._run_sync` | Shared compute from sync code |
+| `ContextAggregator.aggregate_sync` | Aggregating context from inside a loop |
+| `compactor` (no-loop path) | Context compaction sync path (in-loop naive fallback preserved) |
+| `approval.run_coroutine_safely` | Approval callback helper |
+| `eval.run_trials` | Trials engine sync entry point |
+| `parallel_executor.execute_sync` / `execute_turn_sync` | Fast parallel tool executor sync path |
+| `lsp_tools._run_lsp` | LSP tool runner |
+
+Three sites are intentionally **not** converted because they have distinct semantics: `hooks/runner.py` (raises on an in-loop call), `tools/edit_tools.py` (defers to a fallback), and `tools/messaging_tools.py` (routes via `run_coroutine_threadsafe` to a registered gateway loop).
+
+<Note>
+A regression test (`tests/unit/test_async_bridge_invariants.py::test_no_handrolled_async_bridges_outside_helper`) AST-scans the SDK and fails if any module under `praisonaiagents/` other than `utils/async_bridge.py` re-implements the bridge. New hand-rolled copies cannot creep back in.
+</Note>
+
+---
+
 ## Configuration Options
 
 `run_coroutine_from_any_context` (the `praisonaiagents.utils.async_bridge` helper) takes two arguments:

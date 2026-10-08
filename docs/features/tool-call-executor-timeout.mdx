@@ -27,8 +27,10 @@ graph LR
         Exec -->|within budget| Body[▶️ Run Tool]
         Body --> OK[✅ ToolResult ok]
         Exec -->|timeout_ms exceeded| Timeout[⏰ ToolTimeoutError]
+        Exec -->|orphan pool full| Capacity[🚧 ToolCapacityError]
         Exec -->|cancel_token set| Cancel[🛑 ToolCancelledError]
         Timeout --> Struct[📦 structured_error kind=timeout]
+        Capacity --> Struct3[📦 structured_error kind=capacity]
         Cancel --> Struct2[📦 structured_error kind=cancelled]
     end
 
@@ -40,7 +42,7 @@ graph LR
     class Call input
     class Exec,Body process
     class OK output
-    class Timeout,Cancel,Struct,Struct2 fail
+    class Timeout,Capacity,Cancel,Struct,Struct2,Struct3 fail
 ```
 
 <Warning>
@@ -131,18 +133,35 @@ sequenceDiagram
 | Condition | Behaviour |
 |---|---|
 | `timeout_ms is None` or `<= 0` | Tool runs directly with zero wrapping overhead. |
-| `timeout_ms > 0` | Tool runs on a dedicated `ThreadPoolExecutor(max_workers=1)`; on expiry the worker is abandoned and a typed timeout result is returned. |
+| `timeout_ms > 0` | Tool runs on a dedicated **daemon** worker thread (`tool-timeout`); on expiry the worker is abandoned (daemon, so it never blocks interpreter exit) and a typed timeout result is returned. Healthy concurrent timed calls are not capped; only workers that outlive their deadline count against a shared `_TIMEOUT_POOL_MAX = 32` orphan cap. |
 | `cancel_token` signalled | Tool never runs; returns a typed cancelled result. |
 
 <Warning>
-A timed-out **sync** tool's worker is abandoned, not killed — Python threads cannot be force-killed. The tool may keep running in the background. Do not rely on the timeout for security-critical bounds.
+A timed-out **sync** tool's worker is abandoned, not killed — Python threads cannot be force-killed. It runs on a **daemon** thread, so a hung tool never blocks interpreter exit, but it may keep running in the background. Do not rely on the timeout for security-critical bounds.
 </Warning>
 
 <Note>
-**After a wall-clock timeout:** the orphaned worker thread keeps running, the single-worker executor is retired, and the agent-level retry loop is **skipped unless the tool is idempotent**. Re-driving a mutating tool while its body is still executing would duplicate side effects, so only tools marked idempotent are retried — unknown tools default to non-idempotent (safe). See [Tool Timeouts → Retry-on-timeout is opt-in](/features/tool-timeout#retry-on-timeout-is-opt-in-for-mutating-tools).
+**After a wall-clock timeout:** the orphaned daemon worker keeps running, the agent-level retry loop is **skipped unless the tool is idempotent**. Re-driving a mutating tool while its body is still executing would duplicate side effects, so only tools marked idempotent are retried — unknown tools default to non-idempotent (safe). See [Tool Timeouts → Retry-on-timeout is opt-in](/features/tool-timeout#retry-on-timeout-is-opt-in-for-mutating-tools).
 
-Once the orphan cap of `_MAX_ORPHANED_TOOL_EXECUTORS = 4` is reached **and** no worker in the current pool is free, the next tool call fails fast with `{"tool_pool_exhausted": True}` (PR [#5357](https://github.com/MervinPraison/PraisonAI/pull/5357)) instead of queuing behind hung threads and reporting a spurious timeout. The pool is **self-healing**: as hung threads eventually exit, the orphan count decrements (via a `future.add_done_callback`) and healthy tools can queue again.
+**Two orphan caps, two layers.** The agent-level cap `_MAX_ORPHANED_TOOL_EXECUTORS = 4` (`agent/tool_execution.py`, PR [#5357](https://github.com/MervinPraison/PraisonAI/pull/5357)) refuses the next call with `{"tool_pool_exhausted": True}` once four executors are orphaned and no worker is free. The call-executor-level cap `_TIMEOUT_POOL_MAX = 32` (PR [#5589](https://github.com/MervinPraison/PraisonAI/pull/5589)) is distinct: a shared `BoundedSemaphore` caps only **abandoned** workers (those still running past their deadline). A slot is charged **lazily** at expiry — not up front — so healthy concurrency is never capped; the slot is released when the worker finally exits. The two layers compose: a refused call surfaces as `tool_pool_exhausted: True` at the agent layer and as `error_kind="capacity"` at the executor layer.
 </Note>
+
+A timed call lands in one of three terminal states: the worker finished (`success`), the deadline hit and a slot was charged lazily (`timeout`), or the orphan pool is saturated and the call never ran (`capacity`).
+
+```mermaid
+graph TB
+    Call[📞 Timed tool call<br/>timeout_ms > 0]:::input --> Slot{🚧 Orphan pool<br/>saturated?}
+    Slot -->|Yes — 32 abandoned workers| Cap[🚧 capacity<br/>call refused, never ran]:::fail
+    Slot -->|No| Run[▶️ Run on daemon worker]:::process
+    Run --> Fin{⏱️ Finished before<br/>deadline?}
+    Fin -->|Yes| OK[✅ success]:::ok
+    Fin -->|No| TO[⏰ timeout<br/>worker abandoned, slot charged lazily]:::fail
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+```
 
 ---
 
@@ -174,13 +193,29 @@ The cancel token is duck-typed — it supports both `threading.Event` and `Inter
 | Field | Type | Values |
 |---|---|---|
 | `error` | `bool` | Always `true` when present |
-| `kind` | `str` | `"timeout"` \| `"cancelled"` \| `"error"` |
-| `type` | `str` | Exception class name (`ToolTimeoutError`, `ToolCancelledError`, or the tool's own exception) |
+| `kind` | `str` | `"timeout"` \| `"cancelled"` \| `"capacity"` \| `"error"` |
+| `type` | `str` | Exception class name (`ToolTimeoutError`, `ToolCancelledError`, `ToolCapacityError`, or the tool's own exception) |
 | `message` | `str` | `str(exc)` |
 | `tool` | `str` | Tool function name |
 | `tool_pool_exhausted` | `bool` | `True` when the tool worker pool is saturated by hung earlier tool calls; the healthy tool was refused rather than queued behind them. |
 
-The `kind` discriminant lets the model retry a `timeout`, abort on a `cancelled`, and report a plain `error` differently.
+A `capacity` kind carries `ToolResult.result == {"error": "capacity", "tool": "<name>"}`, `error_kind == "capacity"`, and `ToolResult.error` is a `ToolCapacityError` ("too many hung tool workers; refusing to abandon another"):
+
+```json
+{
+  "error": true,
+  "kind": "capacity",
+  "type": "ToolCapacityError",
+  "message": "too many hung tool workers; refusing to abandon another",
+  "tool": "fetch_url"
+}
+```
+
+The `kind` discriminant lets the model retry a `timeout`, abort on a `cancelled` or `capacity`, and report a plain `error` differently.
+
+<Warning>
+**Seeing `error_kind="capacity"`?** Different from `tool_pool_exhausted` (agent-level, PR [#5357](https://github.com/MervinPraison/PraisonAI/pull/5357)): this means the **call-executor's** orphan pool (`_TIMEOUT_POOL_MAX = 32`) is saturated by hung workers — the new call never ran. Fix the hung tools; don't raise the timeout.
+</Warning>
 
 <Warning>
 **Seeing `tool_pool_exhausted`?** One or more of your earlier tool calls exceeded `tool_timeout` and are still running in background threads. Fix the hung tool — do **not** raise `tool_timeout` in response. The result means "your hung tools have starved the executor; investigate them", not "reduce your tool timeout".
@@ -194,9 +229,10 @@ The `kind` discriminant lets the model retry a `timeout`, abort on a `cancelled`
 |---|---|---|
 | `ToolTimeoutError` | `praisonaiagents.tools` | Sync worker exceeded `timeout_ms` |
 | `ToolCancelledError` | `praisonaiagents.tools` | `cancel_token` was signalled before / between calls |
+| `ToolCapacityError` | `praisonaiagents.tools` (exposed via `tools.call_executor`) | Too many tool workers are already orphaned (timed out). Distinct from `ToolTimeoutError`: the new call never ran because the process is already saturated with abandoned workers (`_TIMEOUT_POOL_MAX = 32`). |
 
 ```python
-from praisonaiagents.tools import ToolTimeoutError, ToolCancelledError
+from praisonaiagents.tools import ToolTimeoutError, ToolCancelledError, ToolCapacityError
 ```
 
 These are surfaced as `ToolResult.error` with the matching `error_kind` — they are not thrown to your calling code.
