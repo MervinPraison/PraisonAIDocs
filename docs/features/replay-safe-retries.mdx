@@ -5,7 +5,7 @@ description: "PraisonAI never silently retries a mid-response failure on a tool-
 icon: "shield-check"
 ---
 
-On a tool-calling turn, PraisonAI never silently retries a failure that happened after the request was dispatched — it surfaces `provider_outcome_unknown` so you decide.
+On a tool-calling turn, PraisonAI never silently retries a failure that happened after the request was dispatched — not from the retry driver, and not from the streaming → non-streaming fallback. The post-dispatch error surfaces to your code so you decide what to do.
 
 ```mermaid
 graph TB
@@ -106,6 +106,69 @@ sequenceDiagram
 
 ---
 
+## Streaming → Non-Streaming Fallback is Gated Too
+
+When streaming fails, PraisonAI used to silently retry the same request with `stream=False`. On a tool-calling turn that is still a provider replay — the tool may already have run server-side mid-response. The fallback now respects the same replay-safety gate.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Agent
+    participant LLM as LLM (streaming)
+    participant Tool
+
+    Agent->>LLM: request (stream=True, tools exposed)
+    Note right of LLM: streaming started…<br/>bytes on the wire
+    LLM--xAgent: read timeout mid-stream
+    Note over Agent: provider may already have<br/>run a side-effecting tool call
+    Agent-->>Agent: is_replay_unsafe_chain(err) == True<br/>+ side_effecting == True
+    Agent-->>Agent: surface original error
+    Note right of Agent: NO second request with stream=False
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef llm fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef tool fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Agent agent
+    class LLM llm
+    class Tool tool
+```
+
+Both fallback sites are gated:
+
+| Site | Where | What was happening before | What happens now |
+|------|-------|---------------------------|------------------|
+| `LLM.get_response` streaming branch | `praisonaiagents/llm/llm.py` | `use_streaming = False` on any streaming exception | On a tool turn (`formatted_tools` or `execute_tool_fn`), a replay-unsafe streaming failure re-raises instead of reissuing with `stream=False` |
+| `ChatMixin._stream_fallback_chat` | `praisonaiagents/agent/chat_mixin.py` | Reissued `chat()` unconditionally | On a tool turn (request `tools` or instance `self.tools`), a replay-unsafe streaming failure surfaces instead of reissuing |
+
+Tool-less turns and pre-dispatch failures (connect / DNS / TLS) still fall back to non-streaming exactly as before.
+
+### Agent example
+
+```python
+from praisonaiagents import Agent
+
+def book_flight(destination: str) -> str:
+    """Side-effecting tool — charges a card, calls an API."""
+    ...
+
+agent = Agent(
+    name="Bookings",
+    instructions="Book flights on request.",
+    tools=[book_flight],
+)
+
+try:
+    # Streams by default; if the stream drops mid-response AFTER
+    # the request reached the provider, you get the original error
+    # instead of a silent stream=False retry that could book twice.
+    agent.start("Book me on the next flight to Tokyo", stream=True)
+except Exception as e:
+    print("Streaming failed mid-response; verifying booking state before retrying.")
+```
+
+---
+
 ## What Counts as Post-Dispatch (Replay-Unsafe)
 
 Failures that happen once bytes are on the wire — the provider may already have produced output.
@@ -176,6 +239,30 @@ except Exception as e:
 
 `is_replay_unsafe(error)` returns `True` when the failure signals the provider may already have processed the request.
 
+### Walk the Exception Chain
+
+The streaming path re-raises wrapping the cause (`raise Exception(...) from read_timeout`), so the replay-unsafe signal lives on `__cause__` / `__context__` rather than the outermost exception. Use `is_replay_unsafe_chain()` to walk the chain:
+
+```python
+from praisonaiagents.llm.error_classifier import is_replay_unsafe_chain
+
+try:
+    call_provider_stream(...)
+except Exception as e:
+    # Even if `e` is a wrapper, is_replay_unsafe_chain finds the
+    # read-timeout underneath via __cause__/__context__.
+    if is_replay_unsafe_chain(e) and turn_has_tools:
+        raise  # surface — do not fall back to non-streaming or retry
+    # otherwise: safe to retry / fall back
+```
+
+| Helper | Walks cause chain? | Use when |
+|--------|-------------------|----------|
+| `is_replay_unsafe(error)` | ❌ | You hold the original exception |
+| `is_replay_unsafe_chain(error)` | ✅ | The exception may wrap the real signal (streaming paths, re-raise with `from`) |
+
+The chain is treated as unsafe if **any** link is unsafe — a pre-dispatch (safe) link does not override an unsafe one found elsewhere in the chain.
+
 ---
 
 ## Common Patterns
@@ -216,7 +303,7 @@ Tool-less completions have no external side effects. Replaying a post-dispatch f
 </Accordion>
 
 <Accordion title="Trust the classifier over message text">
-`is_replay_unsafe` walks the exception's class hierarchy first, so provider SDK subclasses are matched even when their messages vary.
+`is_replay_unsafe` walks the exception's class hierarchy first, so provider SDK subclasses are matched even when their messages vary. For paths that re-raise with `from` (streaming is one), use `is_replay_unsafe_chain()` so a wrapped cause is still detected.
 </Accordion>
 </AccordionGroup>
 
@@ -230,5 +317,8 @@ Author side-effecting tools that behave well under replay-safety.
 </Card>
 <Card title="LLM Error Classification" icon="rotate" href="/features/llm-error-classification">
 How PraisonAI categorises provider errors for retry decisions.
+</Card>
+<Card icon="bolt" href="/features/streaming">
+How tool turns stay safe when a stream drops mid-response.
 </Card>
 </CardGroup>
