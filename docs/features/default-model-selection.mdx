@@ -5,21 +5,22 @@ description: "The CLI auto-selects the best available model from your credential
 icon: "list-check"
 ---
 
-When you don't specify a model, the CLI picks the best one automatically based on which API keys you have. A one-line notice tells you what was chosen and why. The same resolver drives the SDK `Agent(llm=None)` path — construct an `Agent` with no `llm=` and it picks from your credentials too.
+When you don't specify a model, the CLI ranks every model your credential unlocks by capability and picks the best one. A one-line notice tells you what was chosen and why. The same resolver drives the SDK `Agent(llm=None)` path — construct an `Agent` with no `llm=` and it picks from your credentials too.
 
 <Note>
-[PR #4795](https://github.com/MervinPraison/PraisonAI/pull/4795) fixed the SDK path so it matches the CLI. Setting only `OLLAMA_HOST`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, or `COHERE_API_KEY` now yields a working `Agent()` without any further config.
+[PR #5412](https://github.com/MervinPraison/PraisonAI/pull/5412) made the credential default **capability-ranked best-available** per provider. A run with only `OPENAI_API_KEY` now lands on `gpt-4o`, not `gpt-4o-mini`. The `provider/` prefix is preserved so routing is unchanged.
 </Note>
 
 ```python
 import os
 from praisonaiagents import Agent
 
-os.environ["OLLAMA_HOST"] = "http://localhost:11434"
+os.environ["OPENAI_API_KEY"] = "sk-..."
 
-# No llm= argument — the Agent picks ollama/llama3.2 and routes through litellm.
-agent = Agent(instructions="Answer briefly.")
-agent.start("2+2")
+# No llm= and only OPENAI_API_KEY set — picks the best OpenAI chat model
+# available in the catalogue (e.g. gpt-4o), not gpt-4o-mini.
+agent = Agent(instructions="Summarise the latest release notes.")
+agent.start("Give me the top three changes in the last PR.")
 ```
 
 
@@ -112,13 +113,11 @@ graph TB
         R -->|Not found| ENV["3️⃣ MODEL_NAME or\nOPENAI_MODEL_NAME env var"]
         ENV -->|Set| USE
         ENV -->|Not set| CRED{"4️⃣ Credential scan"}
-        CRED -->|ANTHROPIC_API_KEY| CL["claude-sonnet-4-5"]
-        CRED -->|GEMINI_API_KEY| GM["gemini/gemini-2.0-flash"]
-        CRED -->|OPENAI_API_KEY| GP["gpt-4o"]
+        CRED -->|First present credential| RANK["🏅 Rank that provider's\nmodels by capability"]
         CRED -->|Nothing found| FB["gpt-4o-mini (fallback)"]
-        CL --> USE
-        GM --> USE
-        GP --> USE
+        RANK -->|Best id, prefix preserved| USE
+        RANK -->|Ranking yields nothing| REP["Degrade to fixed\nrepresentative"]
+        REP --> USE
         FB --> USE
     end
 
@@ -131,9 +130,46 @@ graph TB
     class E explicit
     class R mru
     class ENV env
-    class CRED,CL,GM,GP,FB cred
+    class CRED,RANK,REP,FB cred
     class USE use
 ```
+
+### How the ranking works
+
+When only a credential is set, the CLI ranks every model that credential unlocks by capability (tool-use, context, reasoning, vision) and uses the best-available one — not a fixed cheap default.
+
+- Prefers tool-use (essential for agentic work).
+- De-prioritises unstable preview / experimental / dated snapshot / `-auto` ids.
+- De-prioritises `-mini` / `nano` / `small` / `lite` / `haiku` / `flash` / `3.5-turbo` class ids.
+- Then larger `max_context`, then reasoning, then vision.
+- Non-chat ids (embeddings, rerankers, speech, image, moderation, vision-encoder, clip) are excluded from the chat default.
+- Google/Gemini aliasing: a `GEMINI_API_KEY`-only run still ranks litellm's `google`-labelled Gemini models (and vice-versa).
+
+The ranking returns a bare id, but the **provider prefix is preserved** — `anthropic/<id>`, `gemini/<id>`, `cohere/<id>`, `openrouter/openai/<id>`, etc. keep their prefix so runtime routing is unchanged. If ranking yields nothing, selection degrades to the historical fixed representative.
+
+```mermaid
+graph LR
+    subgraph "Capability Ranking"
+        T[🔧 Tool-use] --> S[🧱 Stable / non-preview]
+        S --> M[📈 Non-mini class]
+        M --> C[📐 Larger context]
+        C --> R[🧠 Reasoning]
+        R --> V[👁️ Vision]
+        V --> B[✅ Best id]
+    end
+
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef filter fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef best fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class T tool
+    class S,M,C,R,V filter
+    class B best
+```
+
+<Tip>
+Keep the catalogue current so a newly released flagship is ranked — run [`praisonai models refresh`](/features/models-cli#praisonai-models-refresh).
+</Tip>
 
 ## Quick Start
 
@@ -195,7 +231,7 @@ Shows which credentials are present and which model would be selected on the nex
 | 1 (highest) | `--model` flag / config / YAML | ✅ Yes |
 | 2 | Most-recently-used (`~/.praisonai/state/model.json`) | — |
 | 3 | `MODEL_NAME` or `OPENAI_MODEL_NAME` env var | ✅ Yes |
-| 4 | Provider credential probe (ANTHROPIC → GEMINI → OPENAI) | ❌ No |
+| 4 | Provider credential probe — capability-ranked best-available for the first present credential (prefix preserved) | ❌ No |
 | 5 (lowest) | `gpt-4o-mini` hard fallback | ❌ No |
 
 Provider-inferred defaults (priority 4) and the `gpt-4o-mini` fallback (priority 5) are **intentionally not persisted** as MRU. Persisting them would let a stale default win over fresh credential-based inference on a later run when your available providers have changed.
