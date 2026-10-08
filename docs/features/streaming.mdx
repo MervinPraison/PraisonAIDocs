@@ -413,7 +413,7 @@ LM Studio, vLLM, and llama.cpp stream tool calls correctly — the `LocalOpenAIA
 </Note>
 
 <Note>
-**Where the two-phase flow lives.** The follow-up completion after tools is issued by the custom-LLM streaming path (`praisonaiagents/llm/llm.py::get_response_stream`), which most providers route through. The follow-up **keeps** `tools` available and is fetched non-streamed, then yielded as a single block — so the model can call another tool if it needs to. This is not bounded to a single round.
+**Follow-up loops through chained tool calls.** The follow-up completion after tools is issued by the custom-LLM streaming path (`praisonaiagents/llm/llm.py::get_response_stream`). It is non-streamed, keeps `tools` available, and now **loops** — if the model responds with another `tool_calls`, those tools are executed with the same executor path as the first turn and the follow-up repeats until the model returns plain content. Loop bound: `kwargs["max_iterations"]` (fallback `self.max_iter`, default 20). Fixed in PraisonAI [PR #5400](https://github.com/MervinPraison/PraisonAI/pull/5400) (closes [#5399](https://github.com/MervinPraison/PraisonAI/issues/5399)).
 </Note>
 
 <Note>
@@ -423,6 +423,67 @@ LM Studio, vLLM, and llama.cpp stream tool calls correctly — the `LocalOpenAIA
 <Warning>
 This fix is scoped to the custom-LLM path (`llm.py::get_response_stream`). The native sync-OpenAI streaming path (`agent/chat_mixin.py::_start_stream_impl`) is a **separate** path that PR #4757 does not touch: it does **not** yet issue a follow-up completion after a tool runs — the streamed generator ends once tool results are appended to chat history. If you rely on `start(stream=True)` with tools on the sync OpenAI adapter and see no synthesized answer, use the non-streaming path (`chat()` / `start()` without `stream=True`) for that turn.
 </Warning>
+
+### Chained follow-up tool calls
+
+Streaming agents can now chain tool calls through the follow-up turn — a second tool call returned by the follow-up is executed, its result is fed back to the model, and the loop continues until the model answers with plain content.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Researcher",
+    instructions="Call step1 first, then step2 with step1's result.",
+    tools=[step1, step2],
+)
+
+for chunk in agent.start("Run the pipeline", stream=True):
+    print(chunk, end="", flush=True)
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Model
+    participant Tools
+
+    User->>Agent: start(stream=True)
+    Agent->>Model: stream turn
+    Model-->>Agent: tool_calls
+    Agent->>Tools: execute batch
+    Tools-->>Agent: results → messages
+    loop until plain content
+        Agent->>Model: follow-up turn (tools kept)
+        Model-->>Agent: tool_calls?
+        Agent->>Tools: execute batch
+        Tools-->>Agent: results → messages
+    end
+    Model-->>Agent: final content
+    Agent-->>User: yield answer
+```
+
+- **Bounds.** The total tools-executed count is capped by `max_tool_calls_per_turn` (seeded with the first streamed batch, so the cap spans every follow-up batch); the follow-up iteration count is capped by `max_iterations` (fallback `self.max_iter`, default 20).
+- **Ollama.** In the single-shot (non-parallel) mode, follow-up batches resolve chained-arg placeholders and run one call at a time, mirroring the first streamed batch so an argument that references an earlier call's result in the same batch is resolved before dispatch.
+- **Cancellation.** A Stop between follow-up iterations short-circuits with the existing stream-cancel sentinel.
+
+<Warning>
+This loop lives on the custom-LLM path (`llm.py::get_response_stream`). The native sync-OpenAI streaming path (`agent/chat_mixin.py::_start_stream_impl`) is a **separate** path this fix does not touch.
+</Warning>
+
+### Parallel tool calls under streaming
+
+The streaming accumulator now handles the three cases providers hit in practice — a tool-call `index` greater than the current list, parallel calls that reuse `index=0` with different `id`s, and `id`/`name` fields that arrive in a later chunk.
+
+| Streaming chunk shape | Previous | Now |
+|---|---|---|
+| First-seen `index` past the end of the list | `IndexError` | List is padded with placeholder slots up to `index` |
+| Two different non-empty `id`s at the same `index` (parallel calls reusing `index=0`) | Argument strings concatenated into one invalid-JSON blob | A new slot is appended; subsequent id-less argument chunks for that index are routed to the new slot |
+| `id` / `name` arrives in a later chunk than the first delta for that index | Ignored (the `id` was never updated) | Filled in on the appropriate slot |
+
+<Note>
+The per-accumulation routing map (`_stream_index_route`) is scoped to the `tool_calls` list identity and is reset whenever a fresh empty list begins a new stream — no cross-turn leakage.
+</Note>
 
 ### Stopping a streamed tool batch
 
