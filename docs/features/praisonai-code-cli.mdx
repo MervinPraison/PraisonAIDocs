@@ -59,6 +59,7 @@ As of [PR #3818](https://github.com/MervinPraison/PraisonAI/pull/3818), `chat` a
 ```mermaid
 graph TB
     Start{What do you run?} -->|Any text prompt: default run or --output plain/verbose/silent/actions/json/stream/stream-json| Structured[run "…"]
+    Start -->|Vision prompt with --image| Image[run --image]
     Start -->|Interactive terminal chat or coding: resident TUI| Interactive[chat · code]
     Start -->|Bots · gateway · dashboard| Wrapper3[gateway · bot · …]
     Start -->|Warm runtime daemon| Daemon[daemon start]
@@ -66,7 +67,8 @@ graph TB
     Structured --> Code[pip install praisonai-code]
     Interactive --> Code
     Daemon --> Code
-    Wrapper3 --> Full[pip install praisonai]
+    Image --> Full[pip install praisonai]
+    Wrapper3 --> Full
 
     classDef question fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef code fill:#189AB4,stroke:#7C90A0,color:#fff
@@ -74,7 +76,7 @@ graph TB
     classDef install fill:#10B981,stroke:#7C90A0,color:#fff
     class Start question
     class Structured,Interactive,Daemon code
-    class Wrapper3 wrapper
+    class Image,Wrapper3 wrapper
     class Code,Full install
 ```
 
@@ -195,7 +197,7 @@ Deep dives: [Rules](/features/rules), [Instruction Sources](/features/instructio
 
 ## How It Works
 
-Text-mode `run` always executes in-process via the `Agent` path on a standalone install. When the wrapper **is** present, human-readable modes delegate to its `handle_direct_prompt`; when it is absent, they route through the in-process `Agent` with the matching output preset. `chat` and `code` open their resident TUI standalone (PR #3818); when the wrapper is installed, `code` prefers the richer legacy dispatch (`PraisonAI._start_interactive_mode`). Plugin discovery is vendored inside `praisonai-code`, so plugin-related flows keep working without the wrapper.
+Every text-mode `run` reaches the in-process `Agent` path on a standalone install. The sole carve-out is `--image`: vision routes through the wrapper's `ImageHandler`, so `run --image` fails fast with a targeted hint when the wrapper is absent. For every other text run the CLI checks `wrapper_available()` — when the wrapper **is** present it delegates to the richer `handle_direct_prompt` (existing users see zero change, including vision); when it is absent it renders in-process from the same `Agent` the structured `--output` modes already build. `chat` and `code` open their resident TUI standalone (PR #3818); when the wrapper is installed, `code` prefers the richer legacy dispatch (`PraisonAI._start_interactive_mode`). Plugin discovery is vendored inside `praisonai-code`, so plugin-related flows keep working without the wrapper.
 
 ```mermaid
 sequenceDiagram
@@ -206,20 +208,27 @@ sequenceDiagram
     participant Wrapper as praisonai (optional)
 
     User->>CLI: praisonai-code run "…"
-    CLI->>Bridge: wrapper_available()
-    alt wrapper installed
-        Bridge-->>CLI: True
-        CLI->>Wrapper: handle_direct_prompt
-        Wrapper-->>CLI: result
-        CLI-->>User: normal output
-    else wrapper missing — default / plain / verbose / silent / actions / json / stream / stream-json
-        Bridge-->>CLI: False
-        CLI->>Agent: in-process run (output preset)
-        Agent-->>CLI: result
-        CLI-->>User: final text (silent-style presets print the answer)
+    CLI->>CLI: --image given?
+    alt --image
+        CLI-->>User: exit 1 — install praisonai (vision ImageHandler is wrapper-only)
+    else text run (default / plain / verbose / silent / actions / json / stream / stream-json)
+        CLI->>Bridge: wrapper_available()
+        alt wrapper installed
+            Bridge-->>CLI: True
+            CLI->>Wrapper: handle_direct_prompt (richer surface, incl. vision)
+            Wrapper-->>CLI: result
+            CLI-->>User: normal output
+        else wrapper absent
+            Bridge-->>CLI: False
+            CLI->>Agent: in-process Agent with matching output preset
+            Agent-->>CLI: result
+            CLI-->>User: final text (silent-style presets print the answer)
+        end
     end
     Note over User,CLI: chat / code run resident standalone — wrapper only adds richer legacy dispatch
 ```
+
+The `--image` carve-out is enforced by `_require_wrapper_for_default_run`; every other text-mode run reaches the in-process `Agent` branch when the wrapper is absent (PR #5687).
 
 Output presets map as `plain` → `plain`, `silent`/default → `silent`, `verbose` → `verbose`; silent-style presets print the final text. `chat` and `code` open their resident interactive TUI standalone (PR #3818) — `pip install praisonai-code` alone delivers full interactive sessions. When the `praisonai` wrapper is installed, `code` prefers its richer legacy dispatch (`PraisonAI._start_interactive_mode`):
 
@@ -230,6 +239,41 @@ praisonai-code code "Refactor this function"
 ```
 
 The vendored `_registry` module means plugins work even without the wrapper installed. Version resolution reads from the `praisonai-code` package metadata directly, not the wrapper.
+
+## Standalone agent parity
+
+Default `run "…"` and the structured `--output` modes share one agent surface (`_wire_run_agent_config`), so the same inputs reach the in-process Agent on a standalone install (PR #5687).
+
+```python
+# Standalone install — no wrapper needed
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="DevHelper",
+    instructions="Diagnose developer errors",
+    tools=["file.read", "shell.run"],
+)
+agent.start("Explain this stack trace")
+```
+
+```bash
+# Same inputs the CLI wires into the in-process Agent (PR #5687)
+pip install praisonai-code
+praisonai-code run \
+  --tools file.read,shell.run \
+  --session my-debug \
+  --instructions ./AGENTS.md \
+  "Explain this stack trace"
+```
+
+| Input | Default `run "…"` | `--output actions` | `--output json/stream/stream-json` |
+|-------|:-----------------:|:------------------:|:----------------------------------:|
+| `--tools` / `--toolset` | ✅ | ✅ | ✅ |
+| `--mcp` + config MCP servers | ✅ | ✅ | ✅ |
+| `--session` / `--continue` | ✅ | ✅ | ✅ |
+| `--instructions` | ✅ | ✅ | ✅ |
+| `--approval` + `--permissions` | ✅ | ✅ | ✅ |
+| `--image` | ❌ wrapper only | ❌ wrapper only | ❌ wrapper only |
 
 ## Command matrix
 
@@ -265,12 +309,15 @@ On a `pip install praisonai-code`-only install:
 | `run --output stream-json "…"` | Yes | In-process `Agent`. NDJSON event framing on stdout (no raw partial text on exit 2 — would corrupt the protocol). |
 | `run "…"` (default) | Yes | In-process `Agent` (silent preset; prints final text) |
 | `run --output plain/verbose/silent "…"` | Yes | In-process `Agent` (plain/verbose/silent presets) |
+| `run --image <path> "…"` | No | Vision routes through the wrapper's `ImageHandler`. Fails fast on standalone with a targeted hint: `--image requires the praisonai wrapper. Install with: pip install praisonai`. |
 | `chat`, `code` | Yes | Run resident on the built-in split-pane TUI (PR #3818); the `praisonai` wrapper adds a richer dispatch mode for `code` |
 | `daemon start` (foreground) | Yes | |
 | `daemon start --background` | Yes | Spawns `python -m praisonai_code.runtime` |
 | Piped stdin (`type file.log \| praisonai-code run "…"`) | Yes | Works on Windows as of 2026-07-07 (PR #2705) via a stat-based pipe classifier; also supports `Get-Content file.log \| praisonai-code run "…"`. Interactive terminals skip the stdin read. See [Piped Input](/docs/features/cli-piped-stdin#size-cap--platform-notes). |
 
-`chat`, `code`, and every `run` output mode work on a `praisonai-code`-only install (PR #2853, PR #3818, PR [#5685](https://github.com/MervinPraison/PraisonAI/pull/5685)). Installing the wrapper (`pip install praisonai`) adds the richer legacy dispatch for `code`, the gateway, and channel bots — it is no longer required for the baseline interactive experience.
+`chat`, `code`, and every `run` output mode work on a `praisonai-code`-only install (PR #2853, PR #3818, PR [#5685](https://github.com/MervinPraison/PraisonAI/pull/5685), PR [#5687](https://github.com/MervinPraison/PraisonAI/pull/5687)). [PR #5687](https://github.com/MervinPraison/PraisonAI/pull/5687) completed the picture by making the **default** `run "…"` (no `--output` flag) self-sufficient — previously it hard-failed with an install hint on a standalone install. Installing the wrapper (`pip install praisonai`) adds the richer legacy dispatch for `code`, the gateway, and channel bots — it is no longer required for the baseline interactive experience.
+
+`--image` is the only text-mode feature that still requires `pip install praisonai`. Every other `run` text mode — default / `plain` / `verbose` / `silent` / `actions` / `json` / `stream` / `stream-json` — runs in-process via the shared `_wire_run_agent_config` surface, so `--tools`, `--toolset`, MCP servers, `--session`/`--continue`, `--instructions`, and the approval surface all reach the standalone Agent (PR #5687).
 
 `praisonai-code doctor` returns exit **0** on a healthy standalone install — wrapper-presence checks (`performance_praisonai_import`, `acp_module`, `praisonai_package_structure`, `console_script_execution`) SKIP rather than FAIL ([PR #2851](https://github.com/MervinPraison/PraisonAI/pull/2851)).
 
@@ -412,7 +459,7 @@ Queries PyPI and returns update status:
     Use `praisonai-code` for any `run "…"` prompt (default or any `--output` mode), interactive `chat`/`code` (resident TUI, PR #3818), `config`, `doctor`, or the warm-runtime daemon — smaller install, no gateway/bot deps.
   </Accordion>
   <Accordion title="When to install the full wrapper">
-    Install `praisonai` for the richer legacy `code` dispatch (`PraisonAI._start_interactive_mode`), Telegram/Discord/Slack bots, the WebSocket gateway, `kanban`/`dashboard`, and `RunPolicy` for unattended runs. Baseline interactive `chat`/`code` run standalone (PR #3818).
+    Install `praisonai` for vision prompts (`run --image`), the richer legacy `code` dispatch (`PraisonAI._start_interactive_mode`), Telegram/Discord/Slack bots, the WebSocket gateway, `kanban`/`dashboard`, and `RunPolicy` for unattended runs. Baseline interactive `chat`/`code` and the full `run` text-mode matrix (default + `--output *`) run standalone (PR #3818, PR #5687).
   </Accordion>
   <Accordion title="Monorepo dev install order">
     In dev, `pip install -e src/praisonai-agents && pip install -e src/praisonai-code && pip install -e src/praisonai` (this exact order) — matches the release publish order in `pypi-release.yml`.
