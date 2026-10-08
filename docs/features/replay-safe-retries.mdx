@@ -9,9 +9,13 @@ On a tool-calling turn, PraisonAI never silently retries a failure that happened
 
 ```mermaid
 graph TB
-    A[⚠️ Transient failure] --> B{Pre-dispatch?<br/>DNS · connect · TLS}
-    B -- yes --> R[🔁 Retry as before]
-    B -- no --> C{Turn has tools?}
+    A[⚠️ Transient failure] --> P{Phase signal?<br/>handshake · cert verify}
+    P -- yes --> R[🔁 Retry as before]
+    P -- no --> B{Post-dispatch signal?<br/>read timeout · reset · peer closed}
+    B -- yes --> C{Turn has tools?}
+    B -- no --> D{Pre-dispatch?<br/>DNS · connect · timeout}
+    D -- yes --> R
+    D -- no --> R
     C -- no --> R
     C -- yes --> S[🚦 provider_outcome_unknown<br/>surface_error / is_retryable=false]
 
@@ -20,7 +24,7 @@ graph TB
     classDef retry fill:#10B981,stroke:#7C90A0,color:#fff
     classDef surface fill:#6366F1,stroke:#7C90A0,color:#fff
     class A fail
-    class B,C check
+    class P,B,C,D check
     class R retry
     class S surface
 ```
@@ -80,6 +84,10 @@ On a tool-calling turn, a **post-dispatch** transient failure surfaces as `provi
 
 Replaying a post-dispatch failure on a tool-calling turn could **double-execute** the tool — double billing, or a re-run of a side-effecting action. The gate stops that.
 
+<Note>
+Extended in [PR #5443](https://github.com/MervinPraison/PraisonAI/pull/5443) — generic TLS/SSL labels no longer mask explicit post-dispatch signals. The replay-safety contract was first introduced for [#3860](https://github.com/MervinPraison/PraisonAI/pull/3860).
+</Note>
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -113,7 +121,7 @@ Failures that happen once bytes are on the wire — the provider may already hav
 | Protocol error mid-response | `urllib3.ProtocolError` |
 | Provider request timeout (post-send) | `APITimeoutError` |
 
-Message patterns treated as post-dispatch: `read timeout`, `connection reset`, `peer closed`, `incomplete read`, `chunked`, `response ended prematurely`, `server disconnected`.
+Message patterns treated as post-dispatch: `read timeout`, `connection reset`, `reset by peer`, `peer closed`, `incomplete read`, `chunked`, `response ended prematurely`, `server disconnected`.
 
 ## What Counts as Pre-Dispatch (Replay-Safe)
 
@@ -126,9 +134,24 @@ Failures that prove the request never reached the provider — always safe to re
 | Connect error (httpx) | `ConnectError` |
 | Connection never established | `NewConnectionError` |
 | DNS resolution failure | `socket.gaierror` |
-| TLS handshake failure | `ssl.SSLError` / `SSLCertVerificationError` |
+| TLS handshake failure *(message must mention `handshake`)* | `ssl.SSLError` |
+| Certificate verification failure | `ssl.SSLError` (with `certificate verify failed` / `cert verif` in message) or `ssl.SSLCertVerificationError` |
 
-Message patterns treated as pre-dispatch: `connect timed out`, `connection refused`, `name resolution`, `getaddrinfo`, `ssl`, `handshake`, `tls`.
+Message patterns treated as pre-dispatch: `connect timed out`, `connection refused`, `name resolution`, `getaddrinfo`, `handshake`, `certificate verify failed`, `cert verif`.
+
+The bare `ssl` and `tls` tokens are **not** pre-dispatch signals — `ssl.SSLError` is raised for both handshake failures *and* mid-response read/reset failures, so a transport label alone does not establish that the request failed before dispatch. Use the phase-specific `handshake` or `certificate verify` message to mark a TLS error as pre-dispatch.
+
+### Phase-Specific Precedence
+
+A TLS **handshake** or **certificate verification** phase completes before any request byte is written, so an error naming either phase wins over a post-dispatch token.
+
+| Example message | Classified as | Why |
+|-----------------|---------------|-----|
+| `connection reset by peer during TLS handshake` | pre-dispatch (safe) | handshake phase wins over `reset` |
+| `server disconnected during TLS handshake` | pre-dispatch (safe) | handshake phase wins over `disconnected` |
+| `certificate verify failed; connection reset` | pre-dispatch (safe) | cert-verify phase wins over `reset` |
+| `SSL connection reset by peer` | post-dispatch (unsafe) | no phase signal — generic transport label does not win |
+| `TLS transport: read timeout` | post-dispatch (unsafe) | no phase signal — generic transport label does not win |
 
 <Info>
 Ambiguous transient errors — plain 5xx or "service unavailable" — default to **safe**, preserving existing auto-retry behaviour.
@@ -152,6 +175,28 @@ except Exception as e:
 ```
 
 `is_replay_unsafe(error)` returns `True` when the failure signals the provider may already have processed the request.
+
+---
+
+## Common Patterns
+
+A TLS-labelled read timeout or mid-response reset on a tool turn now surfaces instead of silently retrying.
+
+```python
+import ssl
+from praisonaiagents.llm.error_classifier import is_replay_unsafe
+
+# Fixed in PR #5443 — previously returned False, retrying twice could re-run the tool.
+assert is_replay_unsafe(Exception("TLS transport: read timeout")) is True
+assert is_replay_unsafe(ssl.SSLError("SSL connection reset by peer")) is True
+
+# Phase-specific pre-dispatch signals still auto-retry safely.
+assert is_replay_unsafe(ssl.SSLError("TLS handshake failed")) is False
+assert is_replay_unsafe(ssl.SSLError("certificate verify failed")) is False
+assert is_replay_unsafe(ssl.SSLError(
+    "connection reset by peer during TLS handshake"
+)) is False  # phase signal wins over reset token
+```
 
 ---
 
