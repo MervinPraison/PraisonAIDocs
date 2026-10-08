@@ -271,6 +271,131 @@ Both new routes go through the same `_api_guarded` wrapper as `POST /v1/response
 
 ---
 
+## Safe Retries (`Idempotency-Key`)
+
+Send the same `Idempotency-Key` header on a retry and the gateway returns the first run instead of starting a second — no duplicate LLM spend, no duplicate tool calls.
+
+```mermaid
+graph LR
+    subgraph "Idempotency-Key Flow"
+        Req1[📨 POST + key: abc] --> Check{🔍 Key seen?}
+        Check -->|No| Run[🤖 Run agent]
+        Run --> Store[💾 Store<br/>key → run id]
+        Store --> Resp1[✅ Return result]
+        Req2[🔁 Retry + key: abc] --> Check
+        Check -->|Yes, same body| Resp2[⚡ Replay first result]
+        Check -->|Yes, different body| Conflict[🚫 409 Conflict]
+    end
+
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Req1,Req2 request
+    class Check,Store,Run check
+    class Resp1,Resp2 result
+    class Conflict error
+```
+
+Opt-in, backward-compatible: **no header → unchanged behaviour** (every POST starts a fresh run, as before).
+
+### Quick Start
+
+<Steps>
+<Step title="Send a key with /v1/responses">
+Any UUID-shaped string works. Reuse the exact same value on every retry of the same logical request.
+
+```python
+import uuid, requests
+
+key = str(uuid.uuid4())
+body = {"model": "assistant", "input": "Write a short poem"}
+headers = {
+    "Authorization": "Bearer gateway-token",
+    "Idempotency-Key": key,
+}
+
+resp = requests.post("http://127.0.0.1:8765/v1/responses", json=body, headers=headers)
+print(resp.json()["output_text"])
+```
+</Step>
+
+<Step title="Retry safely with the same key">
+If the first POST timed out or your load balancer re-sent it, replay with the same key and body — you'll get the first run's answer back, not a second run.
+
+```python
+# Same key + same body → first run's response, no second agent run
+retry = requests.post("http://127.0.0.1:8765/v1/responses", json=body, headers=headers)
+assert retry.json()["id"] == resp.json()["id"]  # same run id
+```
+</Step>
+
+<Step title="Works on /v1/chat/completions too">
+```python
+import uuid, requests
+
+key = str(uuid.uuid4())
+body = {
+    "model": "assistant",
+    "messages": [{"role": "user", "content": "Hello"}],
+}
+headers = {"Authorization": "Bearer gateway-token", "Idempotency-Key": key}
+
+requests.post("http://127.0.0.1:8765/v1/chat/completions", json=body, headers=headers)
+```
+</Step>
+</Steps>
+
+### What happens on each case
+
+| Case | Behaviour |
+|------|-----------|
+| **No header** | Unchanged — every POST starts a fresh run. |
+| **First use of a key** | Run is created; the key is recorded with a fingerprint of the request body. |
+| **Retry, same key + equivalent body** | The original run is returned. For `/v1/responses` background runs, you see the run's **current** state (`completed` with the real `output_text` once it finishes), not the stale `queued` snapshot. |
+| **Same key + materially different body** | `409 Conflict` with `error.type: "invalid_request_error"` — the gateway refuses to silently honour either request. |
+| **Concurrent retry while the first run is still working** | The second POST waits for the first run and gets the same response — not a second run. |
+
+### User Flow
+
+```mermaid
+sequenceDiagram
+    participant Client as 💻 Client
+    participant LB as 🔀 Load balancer
+    participant GW as 🌐 Gateway
+    participant Agent as 🤖 Live agent
+
+    Client->>LB: POST /v1/responses<br/>Idempotency-Key: abc
+    LB->>GW: Forward (attempt 1)
+    GW->>Agent: Run turn
+    Note over LB,GW: Connection drops before response
+    LB->>GW: Forward (attempt 2, same key)
+    GW-->>LB: Replay first run's response
+    Agent-->>GW: (first run finishes)
+    LB-->>Client: 200 OK — one agent run, one response
+```
+
+### Scoping and limits
+
+| Rule | Why |
+|------|-----|
+| **Per route** | A key reused across `/v1/responses` and `/v1/chat/completions` never replays one route's response shape on the other — a `chat.completion` is never returned for a `response` request. |
+| **Per caller** | Keys scoped by bearer token or `OpenAI-Session` / `X-Session-Id` header. Two different callers using the same key get independent runs on a shared gateway. Anonymous callers on auth-disabled gateways share one "anon" scope — the client's own key is the handle. |
+| **Streaming excluded** | `stream: true` chat completions bypass the idempotency check — streamed responses are not replayable. Use the buffered (non-stream) path when you need safe retries. |
+| **In-process, bounded** | Up to 1024 keys in RAM; evicts only entries whose run is terminal, so a long-running run is never evicted mid-flight. Does **not** survive a gateway restart. |
+| **No request bodies stored** | The gateway stores a SHA-256 fingerprint of the canonicalised body plus the public run id/status — never your request body or credentials. |
+
+<Note>
+The feature activates automatically whenever `gateway.api.openai = true`. There is no YAML config knob, no CLI flag, and no new dependency.
+</Note>
+
+<Warning>
+Because the key store is in-process and bounded (cap 1024), a flood of unkeyed background submissions can evict older keyed entries once their runs reach a terminal state. A retry of a key whose underlying run was evicted still replays the **stored terminal result** (the gateway refreshes the committed payload at completion) — it never replays the stale `queued` snapshot.
+</Warning>
+
+---
+
 ## Token Usage
 
 Every response reports real per-turn token counts from the agent's LLM instance.
@@ -489,6 +614,10 @@ Owner-scoped retrieval only kicks in when the caller has a stable identity. Anon
 
 <Accordion title="Cancel is cooperative">
 `/cancel` fires the same interrupt seam as the WebSocket `/stop` path — the agent checks it at its own checkpoints and stops between LLM calls / tool calls. A tight, non-yielding loop inside a tool won't stop until it yields; the task-cancel fallback covers most cases but not synchronous CPU-bound work.
+</Accordion>
+
+<Accordion title="Set an Idempotency-Key for safe retries">
+Any production client should set `Idempotency-Key: <uuid>` on every `POST /v1/responses` and `POST /v1/chat/completions`. The gateway dedupes the retry at the API boundary, so a timeout or load-balancer re-send never starts a second agent run or doubles your LLM spend. Reuse the same key on every retry of the same logical request. Applies to the buffered (non-stream) path only — streaming responses are not replayable.
 </Accordion>
 </AccordionGroup>
 
