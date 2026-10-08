@@ -1114,6 +1114,78 @@ agent = Agent(
 | `backend` | `str` | `"file"` | Storage backend (`file`, `sqlite`, `chroma`, `mongodb`, `mem0`, `dakera`, `in_memory`) |
 | `user_id` | `str` | `None` | User ID for scoping memories |
 
+### Previews and retry semantics
+
+A preview call extracts memories without consuming the dedup hash, so a later real store for the same text still writes, and a failed store also leaves dedup un-consumed so a retry after the backend recovers stores the extracted memories.
+
+```python
+from praisonaiagents.memory import FileMemory, AutoMemory
+
+base = FileMemory(user_id="user123")
+auto = AutoMemory(base, enabled=True)
+
+# Preview — extraction only, no state change
+auto.process_interaction("I prefer dark mode.", store=False)
+
+# Real store — writes because the preview did not consume dedup
+auto.process_interaction("I prefer dark mode.", store=True)
+
+# Repeated real store — deduplicated (returns [])
+auto.process_interaction("I prefer dark mode.", store=True)
+```
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 Caller
+    participant A as 🔍 AutoMemory
+    participant M as 💾 Base memory
+
+    U->>A: process_interaction(text, store=False)
+    A->>A: extract (hash NOT recorded)
+    A-->>U: memories (deepcopy)
+
+    U->>A: process_interaction(text, store=True)
+    A->>A: hash check → miss
+    A->>M: store memories
+    M-->>A: ok
+    A->>A: hash recorded
+    A-->>U: memories
+
+    U->>A: process_interaction(text, store=True)
+    A->>A: hash check → hit
+    A-->>U: [] (deduped)
+```
+
+Retry resumes after a transient backend outage because dedup is recorded only after a successful write.
+
+```python
+# A failed store leaves dedup un-consumed — retry after recovery stores
+original_add_long_term = base.add_long_term
+base.add_long_term = lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full"))
+
+try:
+    auto.process_interaction("I like concise answers.", store=True)
+except OSError:
+    pass
+
+base.add_long_term = original_add_long_term  # backend recovers
+
+retried = auto.process_interaction("I like concise answers.", store=True)
+assert retried != []   # stores on retry
+```
+
+<Note>
+Fixed in [PraisonAI PR #5689](https://github.com/MervinPraison/PraisonAI/pull/5689) (fixes [#5500](https://github.com/MervinPraison/PraisonAI/issues/5500)). On earlier releases, `process_interaction(..., store=False)` consumed the dedup hash and silently blocked a subsequent real store for the same text; a failed store left the hash consumed and blocked retry.
+</Note>
+
+<Note>
+Overlapping callers sharing one `AutoMemory` instance (such as a shared agent across worker threads) are serialised by an internal `RLock` — the dedup check and the store are atomic, so the same interaction stores exactly once.
+</Note>
+
+<Warning>
+`AutoMemory` tracks at most 1000 in-flight interactions (`_MAX_PENDING_INTERACTIONS = 1000`). On overflow, the oldest pending write is retried before a new interaction is admitted — nothing is evicted silently. If that retry fails, `process_interaction` raises `RuntimeError("AutoMemory pending interaction limit reached; pending retry failed")`.
+</Warning>
+
 ---
 
 ## Related
