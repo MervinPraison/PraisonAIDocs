@@ -97,6 +97,8 @@ graph TB
     class C c
 ```
 
+On the Responses branch, sync callers (`agent.chat` / `agent.start`) use the same transparent routing — the client rebinds its async transport across `asyncio.run` loops, so a sync turn and the next sync turn stay on the Responses endpoint rather than silently swapping to Chat Completions.
+
 ### Supplying history with tool calls
 
 If you pass conversation history that includes an assistant turn with `tool_calls`, the `content` field may be any of:
@@ -106,6 +108,81 @@ If you pass conversation history that includes an assistant turn with `tool_call
 - empty — `""`, `None`, `[]`, or whitespace — in which case only the tool call is emitted
 
 Multimodal list `content` was [fixed in PraisonAI PR #5695](https://github.com/MervinPraison/PraisonAI/pull/5695) (merged 2026-10-08). On earlier versions the same history raised `AttributeError` and silently fell back to Chat Completions.
+
+### Fallback is quieter now
+
+Two spurious `Responses API failed, falling back to Chat Completions: …` WARNING lines were fixed in [PraisonAI PR #5682](https://github.com/MervinPraison/PraisonAI/pull/5682) (merged 2026-10-08):
+
+- **Orphan tool outputs no longer 400.** If your history contains a `role="tool"` message whose `tool_call_id` has no matching assistant `function_call` in the same payload — e.g. history trimming dropped the assistant turn, or a user turn follows a tool round from an earlier session — the client now **drops** that `function_call_output` before sending. Before #5682 the Responses API rejected the payload with `No tool call found for function call output with call_id …` and the client logged a fallback WARNING for every such turn.
+- **Sync callers no longer see "Event loop is closed".** The cached `AsyncOpenAI` instance is rebuilt whenever the running loop differs from the one it was bound to (the common case for sync `agent.chat()` / `agent.start()` which bridge into the async path via a fresh `asyncio.run` per call). Before #5682 the stale httpx transport raised `Event loop is closed` on reuse and the client logged a fallback WARNING for every turn.
+
+```python
+# export OPENAI_API_KEY=...
+from praisonaiagents import Agent
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+agent = Agent(
+    name="ToolProbe",
+    role="Assistant",
+    goal="Use tools",
+    llm="gpt-4o-mini",
+    tools=[add],
+)
+agent.chat("What is 19 + 23? Use the add tool.")
+agent.chat("Say done.")   # second turn — no fallback WARNING on stderr
+```
+
+<Note>
+The fallback **mechanism** is unchanged — on a real Responses failure the client still falls back to Chat Completions, so answers are not lost. #5682 only stops the two spurious triggers above from firing.
+</Note>
+
+Orphan `function_call_output` items are dropped while the Responses input is built — the client scans assistant `tool_calls` first, then keeps only the tool outputs whose `call_id` matches one it emitted.
+
+```mermaid
+graph LR
+    subgraph "Build Responses input"
+        H[📜 History] --> S[🧮 Scan assistant tool_calls]
+        S --> E[(🗂️ emitted_call_ids)]
+        H --> T[🔧 role=tool]
+        T --> M{🔍 call_id in<br/>emitted_call_ids?}
+        M -->|Yes| K[✅ keep function_call_output]
+        M -->|No| D[🗑️ drop orphan]
+    end
+
+    classDef in fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef dec fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class H,T in
+    class S,E proc
+    class M dec
+    class K ok
+    class D warn
+```
+
+The cached `AsyncOpenAI` is rebound whenever the running loop changes, so each sync turn gets a client bound to its own `asyncio.run` loop.
+
+```mermaid
+sequenceDiagram
+    participant Sync as agent.chat() (sync)
+    participant Run as asyncio.run (loop N)
+    participant Prop as OpenAIClient.async_client
+    participant Client as AsyncOpenAI (cached)
+
+    Sync->>Run: asyncio.run(coro)
+    Run->>Prop: get_running_loop() = loop N
+    Prop->>Prop: cached loop == loop N?
+    alt Different loop (loop N-1 is closed)
+        Prop->>Client: drop stale
+        Prop->>Client: build new AsyncOpenAI, bind to loop N
+    end
+    Prop-->>Run: fresh client on loop N
+    Run-->>Sync: response (no "Event loop is closed")
+```
 
 ## CLI
 
