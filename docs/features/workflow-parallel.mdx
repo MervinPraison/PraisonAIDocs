@@ -171,7 +171,7 @@ print(result["variables"]["branch_b_output"])  # "B"
 
 The branch's own `output_variable` is stored under that exact name; the ordered `parallel_outputs` list is still there for aggregators that want positional access.
 
-Each branch runs against its own deep copy of the variables, so branches never race on one shared dict. After the block, only the keys a branch actually wrote merge back into the shared scope — untouched variables keep the parent's own object.
+Each branch runs against its own isolated copy of the variables scope, so branches never race on one shared dict and a branch's in-place mutation of a list or dict is invisible to its siblings. Values that cannot be deep-copied — a `threading.Lock`, a DB connection, an HTTP or LLM client, an open file, a live `Agent`, a generator — are shared by reference across branches instead of aborting the run (as of PraisonAI [#5717](https://github.com/MervinPraison/PraisonAI/pull/5717)). After the block, only the keys a branch actually wrote merge back into the shared scope — untouched variables keep the parent's own object.
 
 ```mermaid
 graph TB
@@ -233,6 +233,79 @@ graph TB
     class W warn
     class S scope
 ```
+
+## Sharing resources across branches
+
+A `threading.Lock`, DB/HTTP/LLM client, open file, live `Agent`, or generator can sit in `variables` even when a branch reads it — the un-copyable leaf is shared by reference, everything around it is still isolated.
+
+```python
+import threading
+from praisonaiagents import AgentFlow, Task, WorkflowContext, StepResult, parallel
+
+client = threading.Lock()   # stands in for an HTTP/DB/LLM client
+
+def append_row(label):
+    def run(ctx: WorkflowContext) -> StepResult:
+        # The surrounding dict and its 'rows' list ARE branch-local.
+        ctx.variables["state"]["rows"].append(label)
+        # The 'client' leaf is SHARED by reference across branches.
+        with ctx.variables["state"]["client"]:
+            pass
+        return StepResult(
+            output=label,
+            variables={f"rows_{label}": list(ctx.variables["state"]["rows"])},
+        )
+    return run
+
+wf = AgentFlow(
+    steps=[parallel([
+        Task(name="a", handler=append_row("A")),
+        Task(name="b", handler=append_row("B")),
+    ])],
+    variables={"state": {"client": client, "rows": []}},
+)
+result = wf.start("go")
+# Each branch saw only its own append — rows_A == ["A"], rows_B == ["B"].
+# The lock in state["client"] is the one real object, usable for coordination.
+```
+
+```mermaid
+graph TB
+    S["variables = { state: { client, rows } }"] --> Iso{isolate per branch}
+    Iso --> BA["branch A scope<br/>state(copy) → rows(copy), client(shared ref)"]
+    Iso --> BB["branch B scope<br/>state(copy) → rows(copy), client(shared ref)"]
+    BA --> C((client))
+    BB --> C
+
+    classDef shared fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef branch fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef split fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class S,C shared
+    class BA,BB branch
+    class Iso split
+```
+
+<Note>
+Branches share the un-copyable leaf **by reference**. A `Lock`/connection/client is designed to be shared; a mutable list or dict that happens to be un-copyable (rare) is also shared — mutations through it will be visible to siblings. Keep ordinary mutable state in a copyable container (plain `list` / `dict`) so the isolation guarantee applies to it.
+</Note>
+
+### Values that degrade to shared-by-reference
+
+Pass any of these through `AgentFlow(variables=...)` and sibling branches share one reference instead of crashing.
+
+| Example value | Why it couldn't be deep-copied |
+|---|---|
+| `threading.Lock()` / `threading.RLock()` / `multiprocessing.Lock()` | C-level primitives, un-picklable |
+| A `psycopg` / `sqlalchemy` / `sqlite3` connection or cursor | Owns an OS socket/file handle |
+| `httpx.Client()` / `requests.Session()` / an OpenAI/Anthropic LLM client | Holds a pool, event loop refs, locks |
+| An open file (`open(path, "r")`) | Owns an OS fd |
+| A live `Agent` with mid-conversation state | ContextVar / locks inside the LLM |
+| A generator / iterator | Un-picklable by Python |
+
+<Note>
+Cross-variable aliasing inside one branch is preserved. If `variables={"records": shared, "state": {"records": shared}}` passes the same list under both names, a branch still sees one shared list — a write through `records` is visible through `state["records"]` within that branch.
+</Note>
 
 ## Examples
 
@@ -353,6 +426,9 @@ sequenceDiagram
   </Accordion>
   <Accordion title="Give sibling branches distinct output_variable names">
     Two branches writing the same `output_variable` collide — the later-declared branch silently overwrites the earlier one (with a warning). That class of silent loss is exactly what [#4932](https://github.com/MervinPraison/PraisonAI/pull/4932) fixes; distinct names (`branch_a_score`, `branch_b_score`) avoid it entirely.
+  </Accordion>
+  <Accordion title="Inject shared resources through variables">
+    A `Lock`, DB connection, HTTP/LLM client, open file, or live `Agent` can be injected via `AgentFlow(variables=...)` and used from branch steps. The un-copyable leaf is shared by reference, so coordination (locking, connection pooling) works as expected; everything around it is still branch-local, so your ordinary mutable state stays isolated. See [Sharing resources across branches](#sharing-resources-across-branches).
   </Accordion>
 </AccordionGroup>
 
