@@ -106,9 +106,10 @@ print(result["output"])
 
 ```python
 parallel(
-    steps: List, 
+    steps: List,
     max_workers: Optional[int] = None,
-    on_failure: str = "partial_ok"
+    on_failure: str = "partial_ok",
+    timeout: Optional[float] = None,
 ) -> Parallel
 ```
 
@@ -119,6 +120,7 @@ parallel(
 | `steps` | `List` | — | List of steps to execute concurrently |
 | `max_workers` | `Optional[int]` | `None` | Cap on `ThreadPoolExecutor` workers. Defaults to `min(3, len(steps))` |
 | `on_failure` | `"partial_ok" \| "fail_fast" \| "fail_all"` | `"partial_ok"` | Failure-handling strategy |
+| `timeout` | `Optional[float]` | `None` | Wall-clock bound (seconds) for the whole parallel block. Must be positive, or `None` for no bound (`0` / negatives raise `ValueError`). Raises `WorkflowStepError` if any branch is still running when the clock elapses. The clock starts when the block begins, including context-preparation work. |
 
 ### Accessing Results
 
@@ -430,6 +432,12 @@ sequenceDiagram
   <Accordion title="Inject shared resources through variables">
     A `Lock`, DB connection, HTTP/LLM client, open file, or live `Agent` can be injected via `AgentFlow(variables=...)` and used from branch steps. The un-copyable leaf is shared by reference, so coordination (locking, connection pooling) works as expected; everything around it is still branch-local, so your ordinary mutable state stays isolated. See [Sharing resources across branches](#sharing-resources-across-branches).
   </Accordion>
+  <Accordion title="Bound external calls with timeout">
+    LLM / HTTP / tool calls can hang. `parallel(..., timeout=N)` is the cheapest hung-branch bound — the run raises `WorkflowStepError` at the deadline instead of waiting forever on a stuck thread. See [Timing out hung branches](#timing-out-hung-branches).
+  </Accordion>
+  <Accordion title="Prefer fail_fast for latency-critical fan-outs">
+    Now that `fail_fast` actually fails fast (post-[#5718](https://github.com/MervinPraison/PraisonAI/pull/5718)), it is the right default for user-facing paths where returning quickly on first error beats collecting every error.
+  </Accordion>
 </AccordionGroup>
 
 ## Failure Handling
@@ -456,8 +464,12 @@ graph TB
 | Strategy | Behavior | Use Case |
 |----------|----------|----------|
 | `partial_ok` | Continue with partial results. Failed branches contribute `None` at the same index in `parallel_outputs`, index-aligned with the step. | Data aggregation where some sources may be unavailable |
-| `fail_fast` | Cancel remaining branches and raise `WorkflowStepError` on first failure | Critical workflows where any failure invalidates results |
+| `fail_fast` | Raise `WorkflowStepError` as soon as any branch fails. Remaining branches are cancelled where possible; threads already running cannot be force-killed, so they are abandoned but the caller is not blocked on them. As of PraisonAI [#5718](https://github.com/MervinPraison/PraisonAI/pull/5718), the raise happens in completion order — a failure in a later-declared branch no longer waits for earlier siblings to finish. | Latency-critical workflows where any failure invalidates results |
 | `fail_all` | Wait for all branches, then raise `WorkflowStepError` if any failed | Comprehensive error reporting and debugging |
+
+<Note>
+**Before PraisonAI [#5718](https://github.com/MervinPraison/PraisonAI/pull/5718):** `fail_fast` consumed results in submission order and left the thread pool via a `with` block whose `__exit__` called `shutdown(wait=True)`, so the exception was held until every earlier-declared *and* every still-running branch finished. If you observe a `fail_fast` block hanging on a slow sibling, upgrade.
+</Note>
 
 <Note>
 **Variable merging on failure.** Under `partial_ok`, the variables a failed branch had already written before it failed are preserved — its own `output_variable` is never set (the failure path returns before that write), so a downstream reader cannot pick up a value the failure invented. Under `fail_fast` / `fail_all`, **nothing from any branch is merged**: the block raises before the merge runs. See [Named outputs from branches](#named-outputs-from-branches).
@@ -561,6 +573,84 @@ except WorkflowStepError as e:
     print(f"Root cause: {e.cause}")
     for error in e.errors:
         print(f"  Branch {error['step']}: {error['error']}")
+```
+
+## Timing out hung branches
+
+Bound the whole parallel block with `timeout` so a stuck branch no longer blocks the run.
+
+```python
+from praisonaiagents import Agent, AgentFlow, parallel
+
+# Bound the whole block at 10 seconds — a stuck branch no longer blocks the run.
+flow = AgentFlow(steps=[
+    parallel([researcher, analyst, writer], timeout=10),
+    summarizer,
+])
+flow.start("Analyse Q3 numbers")
+```
+
+- The clock starts when the block begins, **including context preparation** (the summarisation path can make a blocking `litellm.completion` call — a deadline started only at submission time would let `timeout=N` wait far longer than `N` before its clock even begins).
+- `timeout` combines with any `on_failure` mode. `fail_fast + timeout` is the common "give up on the whole fan-out quickly" pattern.
+- A timed-out branch is cancelled where possible; threads running user code **cannot be force-killed in Python**, so the branch may keep running in the background. The caller is no longer blocked on it, and its late failure cannot corrupt a later run (see [Running the same workflow more than once](#running-the-same-workflow-more-than-once)).
+- `timeout=0` and negatives raise `ValueError` at construction — the only way to mean "no bound" is `None`.
+
+```mermaid
+sequenceDiagram
+    participant WF as Workflow
+    participant P as parallel(timeout=10)
+    participant B1 as branch 1 (fast)
+    participant B2 as branch 2 (hung)
+
+    WF->>P: start clock (t=0)
+    par
+        P->>B1: run
+        B1-->>P: ok (t=1s)
+    and
+        P->>B2: run
+        Note over B2: still running at t=10s
+    end
+    P-->>WF: raise WorkflowStepError (t=10s)
+    Note over P: B2 keeps running in background; caller unblocked
+```
+
+## Running the same workflow more than once
+
+Reusing one `Workflow` instance across many inputs is safe even when a previous run abandoned a branch — a late failure from an abandoned branch cannot flip a later run's status.
+
+```python
+# Same Workflow instance used across many inputs
+wf = AgentFlow(steps=[
+    parallel([slow_branch, quick_fail_branch], on_failure="fail_fast"),
+    report,
+])
+
+wf.start("job 1")   # fail_fast raises; slow_branch is abandoned
+wf.start("job 2")   # run 2 begins; the abandoned branch finally fails afterwards
+# Result: run 2 completes with status="completed".
+# The late failure from run 1's abandoned branch cannot flip run 2's status.
+```
+
+- Each `run()` stamps a monotonic "generation" into a `contextvars.ContextVar`; branches capture it at submit time.
+- When a branch finally raises after its owning run has moved on, the engine suppresses the shared-status write.
+- This matters when you reuse one `Workflow` instance across many inputs (common for long-running services) and combine it with `fail_fast` or `timeout`.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant W as Workflow
+    participant R1 as run 1 (gen=1)
+    participant R2 as run 2 (gen=2)
+    participant B as abandoned branch (gen=1)
+
+    U->>W: start("job 1")
+    W->>R1: generation = 1
+    R1->>B: submit (captures gen=1)
+    R1-->>U: fail_fast raise
+    U->>W: start("job 2")
+    W->>R2: generation = 2
+    R2-->>U: completed
+    B-->>W: late failure (gen=1 ≠ 2) → suppressed
 ```
 
 ## Related
