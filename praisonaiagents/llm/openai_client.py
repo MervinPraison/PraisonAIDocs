@@ -920,9 +920,9 @@ class OpenAIClient:
         """Normalise system/developer content into a plain instruction string.
 
         Accepts a plain string or a Chat Completions-style list of text parts
-        (``[{"type": "text", "text": "..."}]``) and returns the concatenated
-        text. Non-text parts are rejected explicitly rather than silently
-        discarded. The caller-owned content is never mutated.
+        (``[{"type": "text", "text": "..."}]`` or ``input_text``) and returns
+        the concatenated text. Non-text parts are rejected explicitly rather
+        than silently discarded. The caller-owned content is never mutated.
         """
         if content is None:
             return ""
@@ -931,17 +931,24 @@ class OpenAIClient:
         if isinstance(content, list):
             texts: List[str] = []
             for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    texts.append(part.get("text", ""))
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") in ("text", "input_text")
+                    and isinstance(part.get("text"), str)
+                ):
+                    texts.append(part["text"])
                 else:
                     raise ValueError(
-                        "Unsupported system/developer instruction content part: "
-                        f"{part!r}. Only plain strings or text parts "
-                        "({'type': 'text', 'text': ...}) are supported."
+                        "Unsupported system/developer instruction: "
+                        "System/developer instructions must contain text parts; "
+                        f"unsupported content part: {part!r}. Only plain strings "
+                        "or text parts ({'type': 'text', 'text': ...}) are supported."
                     )
             return "\n".join(texts)
         raise ValueError(
-            f"Unsupported system/developer instruction content: {content!r}"
+            "Unsupported system/developer instruction: "
+            "System/developer instructions must be text or a list of text parts; "
+            f"unsupported content: {content!r}"
         )
 
     @classmethod
@@ -2230,7 +2237,7 @@ class OpenAIClient:
                         history_sink=deferred_history_sink,
                     )
                     try:
-                        results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
+                        results_str = json.dumps(tool_result) if tool_result is not None else "Function returned an empty output"
                     except (TypeError, ValueError):
                         tool_result = {"result": str(tool_result)}
                         results_str = json.dumps(tool_result)
@@ -2604,7 +2611,7 @@ class OpenAIClient:
                         history_sink=deferred_history_sink,
                     )
                     try:
-                        results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
+                        results_str = json.dumps(tool_result) if tool_result is not None else "Function returned an empty output"
                     except (TypeError, ValueError):
                         tool_result = {"result": str(tool_result)}
                         results_str = json.dumps(tool_result)
@@ -2833,7 +2840,7 @@ class OpenAIClient:
                         # sync/async non-streaming loops' (TypeError, ValueError)
                         # fallback.
                         try:
-                            results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
+                            results_str = json.dumps(tool_result) if tool_result is not None else "Function returned an empty output"
                         except (TypeError, ValueError):
                             tool_result = {"result": str(tool_result)}
                             results_str = json.dumps(tool_result)
