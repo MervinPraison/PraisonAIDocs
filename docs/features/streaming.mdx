@@ -282,6 +282,8 @@ graph TB
 | `run()` | ❌ No | ❌ No | Production, batch processing |
 | `chat(stream=True)` | Configurable | Configurable | Low-level control |
 
+Since [PR #5739](https://github.com/MervinPraison/PraisonAI/pull/5739), `chat(stream=True)` mirrors `start(stream=True)`'s sync-adapter behaviour: on adapters that cannot stream, it falls back to a non-streaming call and returns the completed text — it no longer returns `None`.
+
 ---
 
 ## Common Patterns
@@ -296,6 +298,19 @@ agent = Agent(instructions="You are a helpful assistant")
 # Tokens appear as they arrive
 for chunk in agent.start("Explain quantum computing", stream=True):
     print(chunk, end="", flush=True)
+```
+
+### `chat(stream=True)` Sync-Adapter Fallback
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="You are a helpful assistant")
+
+# chat(stream=True) on the default sync OpenAI adapter used to return None.
+# Since PR #5739 it transparently falls back to non-streaming — you get text.
+reply = agent.chat("Summarise streaming in one sentence.", stream=True)
+print(reply)   # -> a complete answer, never None
 ```
 
 ### App Integration with `iter_stream()`
@@ -1104,7 +1119,7 @@ TTFT is the time before the first token arrives. This is provider latency — th
 | Mode | Behavior | Use Case |
 |------|----------|-----------|
 | `stream=None` (default) | Try streaming, fall back to non-streaming if unsupported | **Recommended** — works across all providers |
-| `stream=True` | Force streaming (errors on sync adapters that don't support it) | When you definitely want tokens |
+| `stream=True` | Try streaming; on sync adapters that don't support it, fall back transparently to non-streaming (never returns `None`). Both `start(stream=True)` and `chat(stream=True)` share this fallback. | When you prefer tokens but still want text on sync-only providers |
 | `stream=False` | Force non-streaming | Batch jobs, structured output, sync providers |
 | **Multi-agent** `output=None` (default) | `stream=True` — auto streaming | Default streaming behavior |
 | **Multi-agent** `output="verbose"` / `"minimal"` | `stream=True` by default | Display with streaming |
@@ -1285,7 +1300,15 @@ Fixed in PraisonAI PR [#4757](https://github.com/MervinPraison/PraisonAI/pull/47
 
 ### "Streaming is not supported in sync OpenAIAdapter" / Deepseek multi-agent crash
 
-Fixed with single-agent smart-fallback in PR #1734. Since [PR #4731](https://github.com/MervinPraison/PraisonAI/pull/4731) the fallback filters kwargs (`max_tokens`, `top_p`, and anything else `chat()` doesn't declare) and chains the original streaming exception via `raise ... from streaming_error`; [PR #4734](https://github.com/MervinPraison/PraisonAI/pull/4734) factored the whole fallback into `ChatMixin._stream_fallback_chat` (signature-driven, so it is robust to future `chat()` changes) and added the `_praisonai_stream_fallback_exhausted` sentinel so the outer handler does not run the fallback twice. If you were previously catching `TypeError: chat() got an unexpected keyword argument 'max_tokens'` as a proxy for "streaming failed", switch to inspecting `exc.__cause__` instead — the real cause is now preserved. For multi-agent teams that use sync-only providers, explicitly disable streaming with `output=["verbose", {"stream": False}]` or similar. See [Multi-Agent Output](/features/multi-agent-output) for configuration options.
+Fixed on `start(stream=True)` with single-agent smart-fallback in PR #1734. Since [PR #4731](https://github.com/MervinPraison/PraisonAI/pull/4731) the fallback filters kwargs (`max_tokens`, `top_p`, and anything else `chat()` doesn't declare) and chains the original streaming exception via `raise ... from streaming_error`; [PR #4734](https://github.com/MervinPraison/PraisonAI/pull/4734) factored the whole fallback into `ChatMixin._stream_fallback_chat` (signature-driven, so it is robust to future `chat()` changes) and added the `_praisonai_stream_fallback_exhausted` sentinel so the outer handler does not run the fallback twice. If you were previously catching `TypeError: chat() got an unexpected keyword argument 'max_tokens'` as a proxy for "streaming failed", switch to inspecting `exc.__cause__` instead — the real cause is now preserved. For multi-agent teams that use sync-only providers, explicitly disable streaming with `output=["verbose", {"stream": False}]` or similar. See [Multi-Agent Output](/features/multi-agent-output) for configuration options.
+
+**`chat(stream=True)` was not covered by that fallback until [PR #5739](https://github.com/MervinPraison/PraisonAI/pull/5739) (fixes [#5737](https://github.com/MervinPraison/PraisonAI/issues/5737)).** Before #5739, an explicit `chat(prompt, stream=True)` against the sync OpenAI adapter raised `ValueError("Streaming is not supported in sync OpenAIAdapter…")` inside `_chat_completion`, which the outer `except` handler swallowed — so the call returned `None`. Since #5739, `_chat_completion` catches that specific `ValueError` and retries once with `stream=False`, so the caller receives the completed text. Any other `ValueError` (and any unrelated error) is still re-raised and surfaces as the normal typed `LLMError` — the fix is scoped to the "Streaming is not supported" message, so error signals are never swallowed into `None`.
+
+If you were previously branching on `result is None` from `chat(stream=True)` as a proxy for "the sync adapter can't stream", switch to one of:
+
+- rely on the new fallback — the returned string is the real response;
+- call `achat()` for native async streaming when you need streaming semantics;
+- call `chat(stream=False)` explicitly if you want to skip the streaming attempt entirely.
 
 ### Routed Claude / Gemini crash on the async path
 
