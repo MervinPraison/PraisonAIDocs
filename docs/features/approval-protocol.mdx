@@ -892,6 +892,74 @@ The predicate the SDK supplies follows the effective per-turn cancel token — t
 
 ---
 
+## Context Isolation
+
+Approvals are scoped to the Python [context](https://docs.python.org/3/library/contextvars.html) they are granted in. An approval granted inside an `asyncio` task, a `copy_context().run(...)` worker, or a thread spawned with `asyncio.to_thread(...)` stays in that worker — it does not appear in the parent task, and it does not appear in sibling workers copied from the same parent.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+
+agent = Agent(name="ops", instructions="Run shell commands", tools=["execute_command"])
+
+async def main():
+    # Worker A approves `execute_command` for its own context only.
+    # Worker B still gets its own approval prompt — the approval does not leak.
+    await asyncio.gather(
+        asyncio.to_thread(agent.start, "list /tmp"),
+        asyncio.to_thread(agent.start, "list /var/log"),
+    )
+
+asyncio.run(main())
+```
+
+This is the behaviour you want for anything that fans out: a single human approval must not silently unlock every parallel branch.
+
+```mermaid
+sequenceDiagram
+    participant Parent as Parent context
+    participant Worker_A as Worker A (copy_context)
+    participant Worker_B as Worker B (copy_context)
+    participant Registry
+
+    Parent->>Worker_A: run(agent.start, …)
+    Parent->>Worker_B: run(agent.start, …)
+    Worker_A->>Registry: mark_approved(execute_command, {"cmd": "ls /tmp"})
+    Note over Registry: Copy-on-write — new set stored in Worker A's context only
+    Worker_B->>Registry: is_already_approved(execute_command, {"cmd": "ls /var/log"})
+    Registry-->>Worker_B: False — Worker A's grant stays in Worker A
+```
+
+Fixed in PraisonAI [PR #5757](https://github.com/MervinPraison/PraisonAI/pull/5757). Before #5757, `mark_approved` mutated the set stored in the per-context approval cache in place; because `contextvars.copy_context()` copies the mapping and not the set, an approval granted in a child context appeared in the parent and in every sibling copied from it. Multi-threaded and `asyncio.to_thread` users of `approval=` therefore saw a sibling worker's approval silently unlock their own tool call. The registry now stores a **new** set each time, so approvals stay in the context that granted them.
+
+### Garbage-collected agents are safe
+
+Letting an `Agent` be collected without calling `.close()` is safe on any thread. `Agent.__del__` releases the agent's process-global registry grants (`auto_approve_tool` entries, session-scoped targets) but **never writes the per-context approval cache** — a finalizer can run on any thread, in any context, so touching a ContextVar from there would clobber an unrelated worker's approvals.
+
+- `Agent.close()` / `Agent.aclose()` — called by your code on the context that owned the agent — still evict that context's approval cache for the agent's scope. Interactive behaviour is unchanged.
+- `Agent.__del__` — called by the garbage collector on an unspecified thread — leaves every context's cache alone, and reclaims only the process-global grants.
+
+```python
+from praisonaiagents import Agent
+
+# OK on any thread, in any context — finalizer only reclaims
+# process-global grants, never writes a ContextVar.
+agent = Agent(name="worker", instructions="…", tools=["execute_command"])
+agent.start("…")
+del agent
+
+# Explicit close() still clears this context's approval cache for the agent's scope.
+agent2 = Agent(name="worker", instructions="…", tools=["execute_command"])
+try:
+    agent2.start("…")
+finally:
+    agent2.close()
+```
+
+Fixed in PraisonAI [PR #5757](https://github.com/MervinPraison/PraisonAI/pull/5757). The pre-fix finalizer rewrote the per-context approval cache from inside the garbage collector, which could wipe an unrelated context's approval cache.
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
