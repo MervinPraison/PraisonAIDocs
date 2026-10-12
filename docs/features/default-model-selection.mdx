@@ -8,7 +8,7 @@ icon: "list-check"
 When you don't specify a model, the CLI ranks every model your credential unlocks by capability and picks the best one. A one-line notice tells you what was chosen and why. The same resolver drives the SDK `Agent(llm=None)` path — construct an `Agent` with no `llm=` and it picks from your credentials too.
 
 <Note>
-[PR #5412](https://github.com/MervinPraison/PraisonAI/pull/5412) made the credential default **capability-ranked best-available** per provider. A run with only `OPENAI_API_KEY` now lands on `gpt-4o`, not `gpt-4o-mini`. The `provider/` prefix is preserved so routing is unchanged.
+[PR #5412](https://github.com/MervinPraison/PraisonAI/pull/5412) made the credential default **capability-ranked best-available** per provider; [PR #5750](https://github.com/MervinPraison/PraisonAI/pull/5750) hardened the ranking to **exclude Responses-API-only models** (like `gpt-5-pro`) and **rank dated snapshots below stable ids** (e.g. `gpt-5` beats `gpt-5-2025-08-07`). A run with only `OPENAI_API_KEY` now lands on the best **stable, Chat-Completions-callable** model your catalogue advertises. The `provider/` prefix is preserved so routing is unchanged.
 </Note>
 
 ```python
@@ -17,8 +17,8 @@ from praisonaiagents import Agent
 
 os.environ["OPENAI_API_KEY"] = "sk-..."
 
-# No llm= and only OPENAI_API_KEY set — picks the best OpenAI chat model
-# available in the catalogue (e.g. gpt-4o), not gpt-4o-mini.
+# No llm= and only OPENAI_API_KEY set — picks the best stable, chat-callable
+# OpenAI model in the catalogue (not gpt-5-pro, not gpt-5-2025-08-07).
 agent = Agent(instructions="Summarise the latest release notes.")
 agent.start("Give me the top three changes in the last PR.")
 ```
@@ -116,7 +116,7 @@ graph TB
         CRED -->|First present credential| RANK["🏅 Rank that provider's\nmodels by capability"]
         CRED -->|Nothing found| FB["gpt-4o-mini (fallback)"]
         RANK -->|Best id, prefix preserved| USE
-        RANK -->|Ranking yields nothing| REP["Degrade to fixed\nrepresentative"]
+        RANK -->|Ranking yields nothing| REP["Degrade to fixed\nrepresentative\n(gpt-4o-mini for OpenAI)"]
         REP --> USE
         FB --> USE
     end
@@ -139,18 +139,22 @@ graph TB
 When only a credential is set, the CLI ranks every model that credential unlocks by capability (tool-use, context, reasoning, vision) and uses the best-available one — not a fixed cheap default.
 
 - Prefers tool-use (essential for agentic work).
-- De-prioritises unstable preview / experimental / dated snapshot / `-auto` ids.
+- **Excludes models whose LiteLLM `mode` is not `chat`** (e.g. OpenAI Responses-API-only ids like `gpt-5-pro` are filtered out — the Chat Completions path can't call them). Entries with no `mode` are kept, so older cached catalogues still work.
+- De-prioritises unstable preview / experimental / `-auto` ids.
+- **De-prioritises dated snapshot ids** matching `-YYYY-MM-DD` or `-YYYYMMDD` (e.g. `gpt-5-2025-08-07`, `claude-3-5-haiku-20241022`) so the stable alias wins.
 - De-prioritises `-mini` / `nano` / `small` / `lite` / `haiku` / `flash` / `3.5-turbo` class ids.
 - Then larger `max_context`, then reasoning, then vision.
-- Non-chat ids (embeddings, rerankers, speech, image, moderation, vision-encoder, clip) are excluded from the chat default.
+- Non-chat ids by **name** (embeddings, rerankers, speech, image, moderation, vision-encoder, clip) are also excluded from the chat default.
 - Google/Gemini aliasing: a `GEMINI_API_KEY`-only run still ranks litellm's `google`-labelled Gemini models (and vice-versa).
 
-The ranking returns a bare id, but the **provider prefix is preserved** — `anthropic/<id>`, `gemini/<id>`, `cohere/<id>`, `openrouter/openai/<id>`, etc. keep their prefix so runtime routing is unchanged. If ranking yields nothing, selection degrades to the historical fixed representative.
+The ranking returns a bare id, but the **provider prefix is preserved** — `anthropic/<id>`, `gemini/<id>`, `cohere/<id>`, `openrouter/openai/<id>`, etc. keep their prefix so runtime routing is unchanged. If ranking yields nothing — including when every candidate was filtered out by the mode or name gates — `best_available()` returns `None` and selection degrades to the historical fixed representative (`gpt-4o-mini` for OpenAI).
 
 ```mermaid
 graph LR
     subgraph "Capability Ranking"
-        T[🔧 Tool-use] --> S[🧱 Stable / non-preview]
+        MODE["🚫 Non-chat mode\nexcluded"] --> NAME["🚫 Non-chat names\nexcluded"]
+        NAME --> T[🔧 Tool-use]
+        T --> S["🧱 Stable + non-dated\nnon-preview"]
         S --> M[📈 Non-mini class]
         M --> C[📐 Larger context]
         C --> R[🧠 Reasoning]
@@ -158,10 +162,12 @@ graph LR
         V --> B[✅ Best id]
     end
 
+    classDef gate fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef filter fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef best fill:#10B981,stroke:#7C90A0,color:#fff
 
+    class MODE,NAME gate
     class T tool
     class S,M,C,R,V filter
     class B best
@@ -288,6 +294,16 @@ The transparency notice (`No model set; using X because Y is present.`) only fir
 <Accordion title="OPENAI_MODEL_NAME is still honoured">
 
 For backward compatibility, the `OPENAI_MODEL_NAME` environment variable still overrides credential-based inference. If you have a legacy `.env` with this variable, it takes priority over the credential probe.
+</Accordion>
+
+<Accordion title="Why your zero-config default isn't the newest flagship">
+
+Two safety filters keep the default stable and callable:
+
+- **LiteLLM `mode` filter.** Ids the catalogue marks `mode: "responses"` (Responses API only) are excluded, e.g. `gpt-5-pro` / `gpt-5-pro-2025-10-06`. [PR #5750](https://github.com/MervinPraison/PraisonAI/pull/5750).
+- **Dated snapshot filter.** `gpt-5-2025-08-07` and `claude-3-5-haiku-20241022` style ids rank below their stable aliases.
+
+To force a specific id anyway, use `Agent(llm="…")`, `--model`, or `MODEL_NAME` / `OPENAI_MODEL_NAME`.
 </Accordion>
 </AccordionGroup>
 
