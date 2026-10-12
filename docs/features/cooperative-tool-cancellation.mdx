@@ -101,7 +101,7 @@ sequenceDiagram
     Agent-->>User: run stops promptly
 ```
 
-The event is scoped to the current turn: the controller clears its flag when an interrupted turn ends, so a stale request cannot abort tools launched by the next turn.
+The event is scoped to the current turn: the controller clears its flag when an interrupted turn ends, so a stale request cannot abort tools launched by the next turn. Overlapping turns on the same Agent each live in their own `ContextVar` scope, so clearing one turn's flag never clears another's.
 
 ---
 
@@ -214,6 +214,50 @@ for chunk in agent.start("Find the largest file under /var/log and summarise it"
 
 ---
 
+## Concurrent turns on one Agent
+
+Two threads (or two asyncio tasks) can call `chat()` / `achat()` on the **same `Agent`** with **different** `cancel_token`s, and each turn's tools and approvals see their own token.
+
+```mermaid
+sequenceDiagram
+    participant ThreadA as Thread A
+    participant ThreadB as Thread B
+    participant Agent
+    participant ToolA as Tool (turn A)
+    participant ToolB as Tool (turn B)
+
+    ThreadA->>Agent: chat("A", cancel_token=tokenA)
+    ThreadB->>Agent: chat("B", cancel_token=tokenB)
+    Agent->>ToolA: run under tokenA
+    Agent->>ToolB: run under tokenB
+    Note over ToolA,ToolB: each tool / approval sees its own turn's token
+    ThreadB->>Agent: tokenB.request("user_stop")
+    Note over ToolA: turn A is unaffected
+```
+
+Internally the active turn is bound to a `ContextVar` (`_active_turn_cancel`) that is copied into tool-executor threads and asyncio tasks, so a second `chat()` call does not overwrite the first turn's cancel token. The legacy `self._active_turn_token` is still set for backward compatibility; `_current_turn_liveness()` prefers the ContextVar and falls back.
+
+```python
+import threading
+from praisonaiagents import Agent
+from praisonaiagents.agent import InterruptController
+
+agent = Agent(name="Shared", instructions="Answer concurrently.")
+
+tokenA, tokenB = InterruptController(), InterruptController()
+
+threading.Thread(target=agent.chat, kwargs={"prompt": "A", "cancel_token": tokenA}).start()
+agent.chat("B", cancel_token=tokenB)
+
+tokenB.request("user_stop")   # only turn B is cancelled; A keeps running
+```
+
+<Note>
+Available as of [PR #5764](https://github.com/MervinPraison/PraisonAI/pull/5764) (merged 2026-10-12, fixes [#5763](https://github.com/MervinPraison/PraisonAI/issues/5763)). Before this PR, the second concurrent `chat()` overwrote `self._active_turn_token`, so turn A's approvals read turn B's token — cancelling B could mark A's pending approval stale, and cancelling A was effectively a no-op for its own tools.
+</Note>
+
+---
+
 ## Custom `InterruptController` implementations
 
 Exposing the `event` is optional — a controller without it keeps working, giving loop-level cancellation only.
@@ -267,6 +311,10 @@ Use `state.cancel_event.wait(timeout=0.1)` for idle waits instead of a tight `is
 
 <Accordion title="Keep the poll window short">
 Poll roughly every ~100ms — the same cadence the built-in `shell` tool uses — so `/stop` feels instant to the user.
+</Accordion>
+
+<Accordion title="Safe to reuse one Agent across concurrent turns">
+One `Agent` can serve many concurrent `chat()` / `achat()` calls, each with its own `cancel_token`. Each turn's tools and approvals read the token that was passed to that call — a stop on one turn never bleeds into another.
 </Accordion>
 
 <Accordion title="Do not persist the event across turns">
