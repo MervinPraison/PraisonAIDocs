@@ -372,6 +372,7 @@ Framework adapters must implement the `FrameworkAdapter` protocol:
 | `is_router` | ❌ | `bool`, default `False`. Set `True` for router adapters that delegate to concrete siblings — skips `run()` protocol validation at registration time. |
 | `SUPPORTS_WORKFLOW` | ❌ | `bool`, default `False`. Set `True` (class-level) to accept native workflow YAML dispatch. See [Capability Flags](#capability-flags). |
 | `SUPPORTS_RUNTIME_FEATURES` | ❌ | `bool`, default `False`. Set `True` (class-level) to accept `cli_backend` / `runtime` config keys. See [Capability Flags](#capability-flags). |
+| `SUPPORTS_CORE_TOOL_TIMEOUT` | ❌ | `bool`, default `False`. Set `True` (class-level) if the adapter forwards per-agent `tool_timeout` to a core `Agent` through `tool_config=ToolConfig(timeout=…)`. The wrapper then stops wrapping plain callables and lets core enforce the budget. See [Capability Flags](#capability-flags). |
 | `SUPPORTED_YAML_FIELDS` | ❌ | `frozenset[str]`, default `frozenset()`. Extended YAML fields this backend honours beyond the structural keys. Empty set = "supports everything". See [Capability Flags](#capability-flags). |
 | `is_available()` | ✅ | Check framework dependencies |
 | `resolve(*, config=None)` | ❌ | Pick the concrete adapter variant from YAML config (keyword-only `config`; default returns `self`) |
@@ -491,7 +492,7 @@ Only `PraisonAIAdapter` sets `SUPPORTS_ASYNC = True` today — its `arun()` awai
 
 Capability flags are class-level booleans that tell PraisonAI which features your adapter can execute.
 
-Three flags gate distinct wrapper features. All default to `False`, so an adapter opts in only to what it can actually run.
+Four flags gate distinct wrapper features. All default to `False`, so an adapter opts in only to what it can actually run.
 
 ```python
 from praisonaiagents import BaseFrameworkAdapter
@@ -501,6 +502,7 @@ class MyWorkflowFrameworkAdapter(BaseFrameworkAdapter):
     SUPPORTS_ASYNC = True              # native async run() path
     SUPPORTS_WORKFLOW = True           # accept workflow YAML dispatch
     SUPPORTS_RUNTIME_FEATURES = True   # accept cli_backend / runtime keys
+    SUPPORTS_CORE_TOOL_TIMEOUT = True  # only if run() forwards tool_config to a core Agent
 
     def is_available(self) -> bool:
         return True
@@ -511,14 +513,30 @@ class MyWorkflowFrameworkAdapter(BaseFrameworkAdapter):
         return f"myframework ran: {topic}"
 ```
 
+<Warning>
+Setting `SUPPORTS_CORE_TOOL_TIMEOUT = True` without forwarding `tool_config=ToolConfig(timeout=…)` to a core `Agent` inside your adapter's `_build_agents_and_tasks` (or equivalent) silently drops every per-tool timeout. The flag declares behaviour your adapter already implements — it does not create it.
+</Warning>
+
 | Flag | Type | Default | What it grants |
 |------|------|---------|----------------|
 | `SUPPORTS_ASYNC` | `bool` | `False` | Adapter has a native `async` `run` path; skips the bounded thread-pool offload in `arun()`. |
 | `SUPPORTS_WORKFLOW` | `bool` | `False` | Adapter can execute native workflow YAML. Read by `validate_workflow_framework()` and `JobExecutor._framework_supports_native`. |
 | `SUPPORTS_RUNTIME_FEATURES` | `bool` | `False` | Adapter supports `cli_backend`, `runtime`, `models.*.runtime`, and `providers.*.runtime_default`. Read by `AgentsGenerator._validate_cli_backend_compatibility`. |
+| `SUPPORTS_CORE_TOOL_TIMEOUT` | `bool` | `False` | Set `True` **only** if the adapter forwards the resolved per-agent `tool_timeout` to a core `Agent` via `tool_config=ToolConfig(timeout=…)`, the way the built-in `PraisonAIAdapter` does. When `True`, the wrapper leaves plain callables unwrapped and core enforces the timeout (single enforcement path). When `False`, the wrapper wraps every tool itself. See [Tool Timeout](/features/tool-timeout) and PraisonAI PR #5798. |
 | `SUPPORTED_YAML_FIELDS` | `frozenset[str]` | `frozenset()` | Extended YAML fields this backend honours beyond the structural keys (`tools`, `tasks`, `role`, `goal`, `backstory`). Empty set = "supports everything" (the `praisonai` adapter). Otherwise any per-agent YAML key not in this set — after structural keys are removed — is logged as `framework=%r ignores YAML field(s) %s for agent %r; these are only honoured by framework=praisonai.` Read by `warn_unsupported_fields(adapter, extras)`. |
 
-The built-in `PraisonAIAdapter` sets both `SUPPORTS_WORKFLOW` and `SUPPORTS_RUNTIME_FEATURES` to `True`. Third-party adapters registered via the `praisonai.framework_adapters` entry-point group opt in by setting the flags on their subclass.
+The built-in `PraisonAIAdapter` sets `SUPPORTS_WORKFLOW`, `SUPPORTS_RUNTIME_FEATURES`, and `SUPPORTS_CORE_TOOL_TIMEOUT` to `True`. Third-party adapters registered via the `praisonai.framework_adapters` entry-point group — and any subclass of `PraisonAIAdapter`, such as a renamed fork — opt in by setting the flags on their class.
+
+A renamed fork inherits every flag with no extra work:
+
+```python
+from praisonai.framework_adapters.praisonai_adapter import PraisonAIAdapter
+
+class CompanyNativeAdapter(PraisonAIAdapter):
+    # Inherits SUPPORTS_WORKFLOW, SUPPORTS_RUNTIME_FEATURES, SUPPORTS_ASYNC,
+    # SUPPORTS_CORE_TOOL_TIMEOUT, SUPPORTS_SESSION_CONTINUITY, SUPPORTS_STREAM_BRIDGE
+    name = "company_native"
+```
 
 Each flag maps to the wrapper call site that reads it:
 
@@ -1435,6 +1453,16 @@ class MyAdapter(BaseFrameworkAdapter):
                    agent_callback=None, task_callback=None, cli_config=None) -> str:
         return await my_native_async_call(config, topic)
 ```
+
+</Accordion>
+
+<Accordion title="Tool timeout enforced twice on a renamed native adapter">
+
+**Problem:** A renamed or forked native-style adapter's plain-callable tools hit `tool_timeout` twice — once in core, once in the wrapper — and you see wrapper `ToolTimeoutError` exceptions the built-in adapter never raises.
+
+**Cause:** Before PraisonAI PR #5798 the wrapper hardcoded the native path to `framework == "praisonai"`. A renamed or forked adapter missed that branch, so its plain callables were double-wrapped.
+
+**Fix:** Upgrade to a release containing PR #5798 and set `SUPPORTS_CORE_TOOL_TIMEOUT = True` on your adapter class, or subclass `PraisonAIAdapter`, which already sets it.
 
 </Accordion>
 </AccordionGroup>
