@@ -1221,7 +1221,40 @@ graph TB
 ```
 
 <Note>
-Closing the generator early signals the producer to stop. The internal queue is bounded (`maxsize=64`), so an abandoned consumer applies back-pressure instead of leaking memory, and the producer thread is a daemon — a stalled backend cannot block interpreter shutdown.
+Closing the generator (`await gen.aclose()` or `contextlib.aclosing(...)`) sets a stop event that the producer thread checks between chunks and calls the backend's `interrupt()` on a daemon thread, so the upstream run is torn down — on Anthropic that sends `user.interrupt` to the active session, stopping token billing. A bare `break` on a retained generator reference only triggers the same teardown once the generator is garbage-collected; prefer `contextlib.aclosing(...)` to make the teardown deterministic. The internal queue is unbounded, so the producer never deadlocks on `queue.put` after the consumer stops reading.
+</Note>
+
+### Stopping a managed stream early
+
+Explicitly closing the stream tears down the upstream run — on Anthropic that stops the server-side session and stops token billing.
+
+```python
+import asyncio
+import contextlib
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", backend=my_managed_backend)
+
+async def main():
+    async with contextlib.aclosing(agent.astart("Write a long report.", stream=True)) as stream:
+        async for chunk in stream:
+            print(chunk, end="", flush=True)
+            if user_disconnected():
+                break
+    # Leaving the `async with` closes the generator deterministically, which
+    # sets the stop event and calls backend.interrupt() on a daemon thread.
+
+asyncio.run(main())
+```
+
+| Close method | Producer stops promptly? | Billing stops promptly? |
+|---|---|---|
+| `async with contextlib.aclosing(gen)` / explicit `await gen.aclose()` | ✅ | ✅ (interrupt fires in the `finally`) |
+| Bare `break` on a retained reference | Only on GC of the generator | Only on GC of the generator |
+| Task cancellation (`task.cancel()`) | ✅ (`CancelledError` propagates through `finally`) | ✅ |
+
+<Note>
+**Fixed in PraisonAI [PR #5774](https://github.com/MervinPraison/PraisonAI/pull/5774) ([issue #5773](https://github.com/MervinPraison/PraisonAI/issues/5773)).** Before #5774, the producer thread in `ManagedBackendBase.stream()` had no signalling path from the async consumer — a `break` / `aclose()` / `CancelledError` on the caller side only exited the async generator; the producer kept iterating SSE events and, on Anthropic, kept the server-side session running until `session.status_idle`, with every token billable. #5774 adds a `threading.Event` the consumer sets in its `finally` block, checks it at two points inside the producer (after `_ensure_session()` and at the top of every `_iter_events` chunk), and interrupts the backend from a daemon thread so the upstream run is torn down even when the producer is blocked waiting on a tool call.
 </Note>
 
 This path streams like any other `start(stream=True)` call — see [Choosing the Right Method](#choosing-the-right-method) and [Managed Runtime Protocol](/features/managed-runtime-protocol) for the backend contract.
