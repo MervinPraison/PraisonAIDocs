@@ -541,7 +541,7 @@ graph LR
 |------------------|-----------|-------------|
 | `AsyncBridge` | `class AsyncBridge` | Per-instance async runner; create one per tenant or service. |
 | `AsyncBridge.run_sync` | `(self, coro, *, timeout=_UNSET) -> T` | Run a coroutine on this bridge's background loop. Omitted → `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s); `None` → unbounded; number → verbatim. See [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number). |
-| `AsyncBridge.shutdown` | `(self, timeout=5.0, *, permanent=False) -> None` | Cancel pending tasks and stop this bridge's loop. With `permanent=True`, the bridge cannot be reused; later `run_sync`/`submit` raise `RuntimeError`. `scoped_bridge()` uses `permanent=True` for scope-owned bridges. PR #2122: releases the bridge lock before awaiting cancellation. |
+| `AsyncBridge.shutdown` | `(self, timeout=5.0, *, permanent=False) -> None` | Cancel pending tasks and stop this bridge's loop. With `permanent=True`, the bridge cannot be reused; later `run_sync`/`submit` raise `RuntimeError`. `scoped_bridge()` uses `permanent=True` for scope-owned bridges. **Since [PR #5774](https://github.com/MervinPraison/PraisonAI/pull/5774):** a task that ignores `CancelledError` no longer makes `shutdown()` raise — it logs a warning (`"AsyncBridge: tasks ignored cancellation for {timeout}s during shutdown"`), signals the loop to stop, and if the loop thread does not exit it is **left alive** rather than calling `loop.close()` on a still-running loop (which would raise `RuntimeError: Cannot close a running loop` and, because `shutdown()` runs inside `scoped_bridge.__exit__`, mask the caller's real exception). A leaked daemon loop thread is the deliberate trade-off. PR #2122: releases the bridge lock before awaiting cancellation. |
 | `AsyncBridge.submit` | `(self, coro) -> concurrent.futures.Future` | Submit without waiting; returns a `concurrent.futures.Future`. |
 | `AsyncBridge.get` | `(self) -> asyncio.AbstractEventLoop` | Get (lazily spawn) the bridge's event loop. |
 | `run_sync` (module-level) | `(coro, *, timeout=_UNSET) -> T` | Routes through the shared default `AsyncBridge`. Omitted → `PRAISONAI_RUN_SYNC_TIMEOUT` (300 s); `None` → unbounded; number → verbatim. See [Timeout resolution](#timeout-resolution-omitted-vs-none-vs-number). |
@@ -1153,6 +1153,10 @@ Do **not** use the sync `scoped_bridge()` from inside `async def`. Its teardown 
 ### Teardown internals
 
 A scope-owned bridge (no argument) is torn down via `asyncio.to_thread(bridge.shutdown, permanent=True)` under `asyncio.shield`, so the blocking cancel-and-join runs on a worker thread instead of the event loop. `asyncio.shield` keeps that teardown running to completion even when the surrounding scope is being cancelled, so the loop+thread is neither leaked nor blocked. A caller-provided bridge is left untouched — the caller owns its lifecycle.
+
+<Note>
+**Hardened in PraisonAI [PR #5774](https://github.com/MervinPraison/PraisonAI/pull/5774) ([issue #5773](https://github.com/MervinPraison/PraisonAI/issues/5773)).** `AsyncBridge.shutdown()` runs from `scoped_bridge.__exit__` / `async_scoped_bridge.__aexit__`, so any exception it raises **masks the caller's original exception**. Before #5774, a task that caught and ignored `CancelledError` made the `.result(timeout=5)` wait raise `TimeoutError` from the `finally`, which then triggered `loop.close()` on a **still-running** loop and raised `RuntimeError: Cannot close a running loop` — the user saw that `RuntimeError` **instead of their actual error**. #5774 catches the timeout, logs a warning, and leaves the loop open when the thread is still alive — a leaked daemon loop thread is strictly preferable to corrupting the caller's error signal.
+</Note>
 
 ### Behavioural contract
 

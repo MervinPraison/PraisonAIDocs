@@ -227,7 +227,37 @@ sequenceDiagram
 |--------|---------|---------|
 | `send_event(session_id, event)` | Send message to session | `None` |
 | `stream_events(session_id)` | Stream responses | `AsyncIterator[Dict[str, Any]]` |
-| `interrupt(session_id)` | Stop current processing | `None` |
+| `interrupt(session_id)` | Stop current processing. `ManagedBackendBase.interrupt()` is a public no-op default on the base mixin, so subclasses that don't override it still satisfy the protocol — the stream-cancel path depends on it | `None` |
+
+### Per-call `execute()` kwargs
+
+`AnthropicManagedAgent.execute()` and `LocalManagedAgent.execute()` honour two per-call keyword arguments that `ComputeManagedAgent` has always honoured.
+
+```python
+import asyncio
+from praisonai.integrations.managed_agents import AnthropicManagedAgent
+
+async def main():
+    backend = AnthropicManagedAgent()
+    # On expiry the backend is interrupted (best-effort) before asyncio.TimeoutError re-raises.
+    answer = await backend.execute("Summarise today's news", timeout=30)
+    live = await backend.execute("Write a report", stream_live=True)
+
+asyncio.run(main())
+```
+
+| Kwarg | Type | Default | Behaviour |
+|---|---|---|---|
+| `stream_live` | `bool` | `False` | Forwarded to `_execute_sync(prompt, stream_live=...)` — drives incremental stdout and `emitter.llm_response` events on both Anthropic and Local backends. |
+| `timeout` | `float \| None` | `None` (unbounded; the per-instance `self.timeout` still governs the inner SDK call where applicable) | Enforced by `asyncio.wait_for` around the thread-pool future. On timeout, `interrupt()` is called on a daemon thread (best-effort) and `asyncio.TimeoutError` re-raises. |
+
+<Note>
+**Fixed in PraisonAI [PR #5774](https://github.com/MervinPraison/PraisonAI/pull/5774) ([issue #5773](https://github.com/MervinPraison/PraisonAI/issues/5773)).** Before #5774, both `execute()` methods were one-liners of the shape `await loop.run_in_executor(None, self._execute_sync, prompt)`, so every caller-supplied kwarg was silently discarded. `ComputeManagedAgent` honoured `timeout`, `AnthropicManagedAgent` used its instance-level `self.timeout`, and `LocalManagedAgent` was effectively unbounded. #5774 routes both through a shared `ManagedBackendBase._execute_in_executor` helper that honours `stream_live` and `timeout` and calls `interrupt()` on timeout. Unknown kwargs are still accepted (not raised as `TypeError`) to avoid breaking existing callers.
+</Note>
+
+<Warning>
+`timeout=` on `execute()` bounds the **async** wait, not the worker thread. On timeout the backend is interrupted (`AnthropicManagedAgent.interrupt` sends `user.interrupt` to the active session) but the Python thread already dispatched into `_execute_sync` cannot be killed.
+</Warning>
 
 <Note>
 Since PraisonAI PR [#3908](https://github.com/MervinPraison/PraisonAI/pull/3908), `agent.start(prompt, stream=True)` yields chunks from `backend.stream()` as they arrive, on both async and sync callers. Earlier releases buffered the full response in the sync (no running event loop) path. See [Streaming → Managed-backend streaming](/features/streaming#managed-backend-streaming-backend).
