@@ -44,6 +44,37 @@ graph LR
 **Interactive CLI users get this automatically.** Running `praison "prompt"` or `praisonai tui launch` now includes `clarify` in the default toolset (the new `clarify` group in [Interactive Tools](/cli/interactive-tools)). No manual `tools=[clarify]` needed. The tool is auto-gated on a live interactive TTY, and withheld in headless / non-TTY / CI / JSON runs so scripted runs never block — the core best-judgment fallback then handles ambiguity. Set `PRAISON_TOOLS_DISABLE=clarify`, `PRAISON_NO_CLARIFY=1`, or `ToolConfig(enable_clarify=False)` to opt out.
 </Note>
 
+## Behavior by Surface
+
+`clarify` behaves differently on each surface.
+
+```mermaid
+graph TB
+    subgraph "Surface"
+        CLI[💻 CLI / TUI]
+        BOT[💬 Bot / Gateway]
+        HEAD[📦 Headless / no TTY]
+    end
+    subgraph "clarify behavior"
+        CLI --> P1[Reads answer from terminal<br/>via create_cli_clarify_handler]
+        BOT --> P2[Delivers question to user<br/>as this turn's reply<br/>choices render as reply buttons]
+        HEAD --> P3[Returns best-judgment fallback<br/>agent proceeds without blocking]
+    end
+
+    classDef surface fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef behavior fill:#189AB4,stroke:#7C90A0,color:#fff
+    class CLI,BOT,HEAD surface
+    class P1,P2,P3 behavior
+```
+
+| Surface | How the user sees it | Who wires it |
+|---|---|---|
+| **CLI / TUI** (`praison "..."`, `praisonai tui launch`) | Numbered menu or free-text prompt in the terminal; `Ctrl+C` / EOF returns `"skip"` | Auto-wired by the CLI interactive toolset (see [Interactive Tools](/cli/interactive-tools)) |
+| **Bot / Gateway** (Telegram, Discord, Slack, etc.) | The agent ends its turn by restating the question; `choices` render as tappable reply buttons; the tap or typed reply arrives as the next turn's input | Auto-wired by `BotSessionManager` on every turn |
+| **Headless** (no TTY, no bound handler, batch/CI) | Returns `"No interactive channel available. Please proceed with your best judgment for: <question>"` so scripted runs never block | Fallback, nothing to wire |
+
+---
+
 ## Quick Start
 
 <Steps>
@@ -130,19 +161,83 @@ handler = create_cli_clarify_handler()
 
 ### Bot Usage
 
+On a bot turn `clarify` is already wired. The bot session binds a turn-scoped handler automatically, so no handler setup is needed.
+
+When the agent calls `clarify(...)`:
+
+1. The question and choices are recorded for this turn's reply.
+2. The agent is told to **end its turn by restating the question** instead of guessing.
+3. If the agent did not emit its own `MessagePresentation`, the choices are attached as `MessagePresentation.question(question, choices)` and render as native **reply buttons**.
+4. The user's tap or typed reply arrives as the next turn's input.
+
 ```python
-from praisonaiagents.tools.clarify import create_bot_clarify_handler
+from praisonaiagents import Agent
+from praisonaiagents.tools.clarify import clarify
 
-async def send_message(channel_id, text):
-    # Send to Telegram/Discord/Slack
-    pass
-
-async def wait_for_reply():
-    # Wait for user response
-    return "python"
-
-handler = create_bot_clarify_handler(send_message, wait_for_reply)
+agent = Agent(
+    name="Deployer",
+    instructions="If the user doesn't say which environment, ask with clarify before deploying.",
+    tools=[clarify],
+)
+# On a bot session, a call like
+#   clarify(question="Which environment?", choices=["staging", "production"])
+# ends this turn restating the question. The two choices render as tappable
+# buttons; the tap becomes the next turn's input.
 ```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Bot as Bot (praisonai-bot)
+    participant Agent
+    participant Clarify
+
+    User->>Bot: "deploy it"
+    Bot->>Agent: turn 1 (binds clarify handler for this turn)
+    Agent->>Clarify: clarify("Which environment?", ["staging","production"])
+    Clarify-->>Agent: "Your question has been delivered… do not guess… end your turn"
+    Agent-->>Bot: "Which environment? staging / production"
+    Bot-->>User: text reply + reply buttons [staging] [production]
+    User->>Bot: taps [staging]
+    Bot->>Agent: turn 2 input = "staging"
+    Agent-->>User: proceeds with deploy to staging
+```
+
+<Warning>
+`create_bot_clarify_handler(send_message_fn, wait_for_reply_fn)` is **not** what bot sessions use. `BotSessionManager.chat` holds the per-user turn lock for the whole turn, and the user's reply arrives as another `chat()` for the same user, so a blocking "send and wait" deadlocks. Keep the factory for callers that have their own lock-free send-and-wait mechanism.
+</Warning>
+
+### Custom Surfaces: `set_clarify_handler`
+
+Bind a handler for one turn on any surface you own, such as a web UI or a custom chat adapter.
+
+```python
+from praisonaiagents.tools.clarify import (
+    ClarifyHandler,
+    set_clarify_handler,
+    reset_clarify_handler,
+)
+
+async def my_turn(user_input):
+    def ask(question, choices=None):
+        # Deliver the question through your UI; return the answer as a string.
+        return deliver_to_my_ui(question, choices)
+
+    token = set_clarify_handler(ClarifyHandler(ask_callback=ask))
+    try:
+        return await run_agent(user_input)
+    finally:
+        reset_clarify_handler(token)
+```
+
+| Function | Signature | Purpose |
+|---|---|---|
+| `set_clarify_handler` | `(handler: Optional[ClarifyHandler]) -> contextvars.Token` | Bind a handler for the current context |
+| `reset_clarify_handler` | `(token: contextvars.Token) -> None` | Restore the previous binding |
+
+- The binding is **turn-scoped** (a `ContextVar`), so concurrent `asyncio` tasks never see each other's handlers.
+- An explicitly configured handler (`ClarifyTool(handler=...)` or `ctx["clarify_handler"]`) **still wins**. The bound handler is used only by the shared default `clarify` instance.
+- Always call `reset_clarify_handler(token)` in a `finally` block.
 
 ### Custom Context Handler
 
@@ -165,33 +260,32 @@ agent = Agent(
 
 ## Handler Resolution
 
-The tool uses this priority order for handling questions:
+The tool resolves the handler in this order:
 
 ```mermaid
 graph TD
-    A[Clarify Called] --> B{ctx['clarify_handler']?}
-    B -->|Yes| C[Use Context Handler]
-    B -->|No| D{tool.handler exists?}
-    D -->|Yes| E[Use Tool Handler]
-    D -->|No| F[Fallback Message]
-    
-    C --> G[Execute Handler]
-    E --> G
-    F --> H["No interactive channel available"]
-    G --> I[Return Response]
-    
+    A[clarify called] --> B{ctx['clarify_handler']?}
+    B -->|yes| USE[Use that handler]
+    B -->|no| C{Explicit handler on ClarifyTool?}
+    C -->|yes| USE
+    C -->|no| D{set_clarify_handler bound<br/>in this ContextVar?}
+    D -->|yes| USE
+    D -->|no| F[Default ClarifyHandler<br/>best-judgment fallback string]
+    USE --> R[Return user's answer]
+
     classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef fallback fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
-    
-    class A,B,D,G process
-    class F,H fallback
-    class C,E,I result
+    classDef fallback fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class A,B,C,D process
+    class USE,R result
+    class F fallback
 ```
 
-1. **Context Handler**: `kwargs["ctx"]["clarify_handler"]` (highest priority)
-2. **Tool Handler**: `self.handler` (default `ClarifyHandler()`)
-3. **Fallback**: Returns guidance message when no interactive channel available
+1. **Context handler**: `kwargs["ctx"]["clarify_handler"]` (highest priority)
+2. **Explicit tool handler**: `ClarifyTool(handler=...)`
+3. **Bound handler**: set with `set_clarify_handler(...)`, used only when the tool has no explicit handler
+4. **Default**: `ClarifyHandler()` returns the best-judgment fallback string
 
 ---
 
@@ -280,16 +374,21 @@ async def smart_clarify_handler(question, choices):
 
 ### Fallback Behavior
 
-```python
-# When no interactive channel available:
-result = await clarify("Which database?", ["postgres", "mysql"])
-# Returns: "No interactive channel available. Please proceed with your best judgment for: Which database?"
+The `"No interactive channel"` string is returned only when no handler is configured and none is bound, which means a truly headless run.
 
-# Agent can handle this gracefully:
+```python
+result = await clarify("Which database?", ["postgres", "mysql"])
+# Headless: "No interactive channel available. Please proceed with your best judgment for: Which database?"
+# CLI with create_cli_clarify_handler() in ctx: the user is prompted.
+# Bot turn: "Your question has been delivered to the user. Do not guess an answer: end your turn now by restating the question and its choices. Their answer will arrive as their next message."
+
 if "no interactive channel" in result.lower():
-    # Use reasonable defaults
-    database = "postgres"  # Pick sensible default
+    database = "postgres"  # headless default
 ```
+
+<Note>
+On a bot turn the fallback string never appears, so a branch that keys off `"no interactive channel"` does not fire there. Use it as a headless-only default.
+</Note>
 
 ---
 
@@ -311,7 +410,7 @@ When possible, offer specific choices rather than open-ended questions.
 </Accordion>
 
 <Accordion title="Handle Fallbacks Gracefully" icon="shield-check">
-Always check if the response indicates no interactive channel and proceed with sensible defaults.
+For headless runs, check if the response indicates no interactive channel and proceed with a sensible default.
 
 ```python
 response = await clarify("Pick a color", ["blue", "red"])
@@ -345,6 +444,14 @@ Core tool system and custom tools
 
 <Card title="Agent Configuration" icon="cog" href="/features/agent-profiles">
 Agent setup and tool integration
+</Card>
+
+<Card title="Bot Default Tools" icon="robot" href="/features/bot-default-tools">
+Tools every messaging bot gets out of the box
+</Card>
+
+<Card title="Gateway Status Tool" icon="signal" href="/features/gateway-status-tool">
+Report gateway health from inside a bot turn
 </Card>
 
 <Card icon="toolbox" href="/cli/interactive-tools">
