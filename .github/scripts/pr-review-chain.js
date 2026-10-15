@@ -173,8 +173,18 @@ function claudeFinalReady(comments, reviews = [], options = {}) {
   return { ready: false, reason: copilot.reason };
 }
 
+/** A deleted fork has head.repo null; it counts as a fork. */
+function isForkPr(pr, owner, repo) {
+  return pr.head?.repo?.full_name !== `${owner}/${repo}`;
+}
+
 async function maybeTriggerClaudeFinal(github, owner, repo, prNumber, finalBody, core, options = {}) {
   const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+  // Never hand fork code to Claude automatically; a maintainer can still @claude by hand.
+  if (isForkPr(pr, owner, repo)) {
+    core?.info?.(`PR #${prNumber}: skip Claude FINAL — fork PR`);
+    return { posted: false, reason: 'fork PR' };
+  }
   const { comments, reviews } = await listCommentsAndReviews(github, owner, repo, prNumber);
   const gate = claudeFinalReady(comments, reviews, {
     prCreatedAt: pr.created_at,
@@ -277,6 +287,7 @@ module.exports = {
   isFinalClaudeTriggerComment,
   maybeTriggerCopilot,
   maybeTriggerClaudeFinal,
+  isForkPr,
   pollCopilotResponse,
   listCommentsAndReviews,
 };
