@@ -17,6 +17,23 @@ agent = Agent(
 agent.start("Show disk usage for the current project directory")
 ```
 
+Run long-lived commands without blocking the turn:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents import execute_command, get_command_output, stop_command
+
+agent = Agent(
+    name="Dev Runner",
+    instructions=(
+        "Start the dev server in the background, tail its output to confirm "
+        "it's up, run a quick smoke test against it, then stop it."
+    ),
+    tools=[execute_command, get_command_output, stop_command],
+)
+agent.start("Launch `npm run dev`, confirm it serves on :3000, then shut it down.")
+```
+
 The user requests a system check; the agent runs bounded shell commands and returns stdout safely.
 
 Shell tools let AI agents execute commands, manage processes, and monitor system resources.
@@ -234,11 +251,13 @@ from praisonaiagents import execute_command
 from praisonaiagents import list_processes
 from praisonaiagents import kill_process
 from praisonaiagents import get_system_info
+from praisonaiagents import get_command_output
+from praisonaiagents import stop_command
 ```
 
 ## Function Details
 
-### execute_command(command, cwd=None, timeout=30, env=None, max_output_size=10000, spill=True, spill_dir=None)
+### execute_command(command, cwd=None, timeout=30, env=None, max_output_size=10000, spill=True, spill_dir=None, run_in_background=False)
 
 Safely executes shell commands:
 - Timeout protection
@@ -252,11 +271,12 @@ Safely executes shell commands:
 |-----------|------|---------|-------------|
 | `command` | `str` | — | Command to execute (split with `shlex`, no shell). |
 | `cwd` | `Optional[str]` | `None` | Working directory. |
-| `timeout` | `int` | `30` | Maximum execution time in seconds. |
+| `timeout` | `int` | `30` | Maximum execution time in seconds. Ignored when `run_in_background=True`. |
 | `env` | `Optional[Dict[str, str]]` | `None` | Extra environment variables. |
 | `max_output_size` | `int` | `10000` | Byte/char budget for the inline preview. |
 | `spill` | `bool` | `True` | Save over-budget output to an artifact instead of dropping the middle. |
 | `spill_dir` | `Optional[str]` | `None` | Directory for artifacts (overrides `PRAISONAI_TOOL_OUTPUT_DIR`). |
+| `run_in_background` | `bool` | `False` | Start the command and return a `process_id` immediately instead of waiting. `timeout` is ignored. See [Non-Blocking Background Commands](#non-blocking-background-commands). |
 
 <Note>
 Commands always run with `shell=False` for security — the string is split with `shlex`, not handed to a shell. To keep agents from being told an unsupported redirect/pipe/chain succeeded, this tool now **refuses** those commands with an error naming the token. To combine steps, call `execute_command` once per step.
@@ -418,6 +438,68 @@ graph TB
     class S1,S2,S3,OK ok
 ```
 
+## Non-Blocking Background Commands
+
+Set `run_in_background=True` to start dev servers, watchers, and long builds without blocking the turn.
+
+```mermaid
+graph LR
+    A[execute_command<br/>run_in_background=True] --> H[process_id]
+    H --> G[get_command_output]
+    H --> S[stop_command]
+    G --> R[status + exit_code + output]
+    S --> R
+
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef step fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,G,S tool
+    class H step
+    class R result
+```
+
+```python
+from praisonaiagents import execute_command, get_command_output, stop_command
+
+h = execute_command("npm run dev", run_in_background=True)
+# {"success": True, "process_id": "3f9a1c2b", "pid": 4821, "status": "running",
+#  "log_file": "/tmp/praisonai-bg-xxxxxx.log"}
+
+print(get_command_output(h["process_id"], tail=20))
+# {"status": "running", "exit_code": None, "output": "...last lines..."}
+
+stop_command(h["process_id"])
+# {"success": True, "status": "exited", "exit_code": -15}
+```
+
+<Info>
+**Still enforced:** `shell=False`, the shell-syntax refusal (before the process starts), `DANGEROUS_COMMANDS`, and `critical`-risk approval.
+</Info>
+
+<Warning>
+**Not enforced:** `timeout` is ignored. Call `stop_command` or let the `atexit` hook reap the process.
+</Warning>
+
+On POSIX, `stop_command` sends `SIGTERM` to the process group, then `SIGKILL` after 5 seconds. On Windows it uses `psutil` or `taskkill /F /T`.
+
+```mermaid
+graph TB
+    Start[Need to run a command?] --> Q1{Finishes within 30 seconds?}
+    Q1 -->|Yes| FG[Foreground execute_command]
+    Q1 -->|No| BG[run_in_background=True<br/>get_command_output + stop_command]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef option fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1 decision
+    class FG,BG option
+```
+
+See [Background Shell Execution](/features/background-shell-execution) for patterns and limits.
+
 ### Large Output Handling
 
 When output exceeds `max_output_size`, the full buffer is saved to a disk artifact and the preview keeps a bounded head/tail plus a pointer to that file.
@@ -439,6 +521,41 @@ read_file("/tmp/praisonai_tool_output/stdout_xxxxx.txt")
 ```
 
 Set `spill=False` to keep the legacy middle-truncated preview with no persistence. See [Tool Output Spill](/features/tool-output-spill) for the full mechanism.
+
+### get_command_output(process_id, tail=200)
+
+Returns status and the latest output of a background command.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `process_id` | `str` | — | The `process_id` returned by `execute_command`. |
+| `tail` | `int` | `200` | Most-recent lines to return (read bounded to the last 64 KB). |
+
+```python
+{
+    "success": True,       # True while running or on clean exit
+    "process_id": "3f9a1c2b",
+    "pid": 4821,
+    "status": "running",   # or "exited"
+    "exit_code": None,     # int once exited
+    "output": "last N lines...",
+    "log_file": "/tmp/praisonai-bg-xxxxxx.log",
+}
+```
+
+### stop_command(process_id)
+
+Stops a background command and its child processes.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `process_id` | `str` | — | The `process_id` returned by `execute_command`. |
+
+```python
+{"success": True, "process_id": "3f9a1c2b", "status": "exited", "exit_code": -15}
+```
+
+An unknown id returns `{"success": False, "error": "No background command with process_id '...'"}`.
 
 ### list_processes()
 
@@ -661,6 +778,9 @@ Chaining these with `&&` or piping with `|` would be refused; run each command a
     )
     ```
   </Accordion>
+  <Accordion title="Always stop background commands you start">
+    A dev server left running at the end of a turn is reaped by the interpreter's `atexit` hook, but relying on that silently is bad hygiene. For every `execute_command(..., run_in_background=True)` call, write the matching `stop_command(process_id)` into the agent's instructions.
+  </Accordion>
 </AccordionGroup>
 
 ## Common Patterns
@@ -702,6 +822,9 @@ agents.start()
 ## Related
 
 <CardGroup cols={2}>
+  <Card title="Background Shell Execution" icon="play" href="/features/background-shell-execution">
+    Non-blocking `execute_command` for dev servers, watchers, long test suites
+  </Card>
   <Card title="Custom Tools" icon="wrench" href="/docs/tools/custom">
     Build your own agent tools
   </Card>
