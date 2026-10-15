@@ -74,4 +74,28 @@ assert(
 );
 process.env.REVIEW_CHAIN_SKIP_COPILOT = prev;
 
-process.exit(failed ? 1 : 0);
+// Fork code must never be handed to Claude automatically; a maintainer can still @claude.
+(async () => {
+  let posted = 0;
+  const fakeGithub = (head) => ({
+    rest: {
+      pulls: {
+        get: async () => ({ data: { created_at: '2020-01-01T00:00:00Z', head } }),
+        listReviews: async () => ({ data: [] }),
+      },
+      issues: {
+        listComments: async () => ({ data: [] }),
+        createComment: async () => { posted += 1; },
+      },
+    },
+  });
+  for (const [label, head] of [['fork', { repo: { full_name: 'someone/r' } }], ['deleted fork', { repo: null }]]) {
+    const res = await chain.maybeTriggerClaudeFinal(
+      fakeGithub(head), 'o', 'r', 1, 'BODY', null,
+      { skipCopilot: true, optionalWaitMs: 0, requiredWaitMs: 0 }
+    );
+    assert(`no automatic FINAL on a ${label} PR`, !res.posted && res.reason === 'fork PR');
+  }
+  assert('no comment posted on fork PRs', posted === 0);
+  process.exit(failed ? 1 : 0);
+})();
