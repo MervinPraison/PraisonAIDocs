@@ -25,7 +25,10 @@ graph LR
         LIT -->|Yes| LL["⚡ LiteLLM\n100+ providers"]
         LIT -->|No| OAI["🔑 OpenAI SDK"]
         LL -->|Success| YAML["✅ agents.yaml"]
-        LL -->|Error| FB["⚠️ Fallback\nto OpenAI"]
+        LL -->|Transient error| RT["🔁 Retry\nup to 2×"]
+        RT -->|Retry| LL
+        RT -->|Exhausted| FB["⚠️ Fallback\nto OpenAI"]
+        LL -->|Terminal error| FB
         FB --> OAI
         OAI --> YAML
     end
@@ -34,7 +37,7 @@ graph LR
     classDef tool fill:#189AB4,color:#fff
 
     class AG agent
-    class T,LIT,LL,OAI,FB,YAML tool
+    class T,LIT,LL,OAI,FB,RT,YAML tool
 ```
 
 ## Quick Start
@@ -224,7 +227,11 @@ sequenceDiagram
         AutoGenerator-->>CLI: agents.yaml
         CLI-->>User: agents created & executed
     else LiteLLM raises exception
-        LiteLLM-->>AutoGenerator: Exception (auth/timeout/unsupported)
+        opt Transient error (429 / 5xx / timeout)
+            LiteLLM-->>AutoGenerator: Exception
+            AutoGenerator->>LiteLLM: retry with backoff (up to 2×)
+        end
+        LiteLLM-->>AutoGenerator: Terminal error, or retries exhausted
         AutoGenerator->>AutoGenerator: log warning + keep LiteLLM error
         AutoGenerator->>OpenAI: core OpenAIClient.parse_structured_output(...)
         alt OpenAI fallback succeeds
@@ -245,7 +252,8 @@ The OpenAI fallback runs through the core-owned `praisonaiagents.llm.openai_clie
 | Step | What happens |
 |------|-------------|
 | **1. LiteLLM attempt** | Calls `litellm.completion(model=..., response_format=PydanticModel)` |
-| **2. Runtime fallback** | If LiteLLM raises (auth error, timeout, unsupported model), logs a warning and continues |
+| **1a. Transient-error retry** | HTTP 408/429/5xx, timeouts, and connection errors on the LiteLLM leg are retried up to 2× with 1s → 2s exponential backoff, capped at 30s. `Retry-After` is honoured. Terminal errors (auth, bad request, schema) fail fast. |
+| **2. Runtime fallback** | If LiteLLM still raises (terminal error, or retries exhausted), logs a warning and continues |
 | **3. OpenAI fallback** | Delegates to the core-owned `OpenAIClient.parse_structured_output(...)`, which calls `beta.chat.completions.parse` under the hood. Inherits `OPENAI_MAX_RETRIES` automatically. |
 | **3a. Both providers fail** | `OpenAIError` is raised with `__cause__ = LiteLLMError`. The traceback shows both provider failures via Python's `raise ... from` chaining, so users can debug the LiteLLM cause without inspecting log files. |
 | **4. No providers** | Raises `ImportError` with install instructions |
@@ -253,6 +261,54 @@ The OpenAI fallback runs through the core-owned `praisonaiagents.llm.openai_clie
 <Note>
 The fallback warning message is: `LiteLLM structured completion failed (...); falling back to OpenAI SDK.`
 Watch your logs for this — it means LiteLLM is degrading silently.
+</Note>
+
+---
+
+## Automatic Retries on LiteLLM
+
+A transient rate limit or server error no longer breaks `praisonai --auto` — the LiteLLM leg retries before anything else happens.
+
+```mermaid
+graph TB
+    Call["⚡ LiteLLM call"] -->|Success| Done["✅ agents.yaml"]
+    Call -->|Error| Kind{"Transient?"}
+    Kind -->|"No (auth, bad request, schema)"| Fail["⚠️ Fail fast → OpenAI fallback"]
+    Kind -->|Yes| Left{"Retries left?"}
+    Left -->|Yes| Wait["⏱️ Wait 1s, then 2s\n(max 30s)"]
+    Wait --> Call
+    Left -->|No| Fail
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Call tool
+    class Kind,Left,Wait warn
+    class Done ok
+    class Fail agent
+```
+
+| Setting | Value |
+|---------|-------|
+| **Retries** | 2 (3 attempts in total) |
+| **Backoff** | 1s, then 2s |
+| **Max delay** | 30s |
+| **Transient errors** | HTTP `408`, `429`, any `5xx`; `TimeoutError`; `ConnectionError`; any exception whose class name contains `Timeout` or `Connection` |
+| **Terminal errors** | Authentication (`401`), bad request (`400`), schema / validation — fail on the first attempt |
+| **`Retry-After`** | Honoured when the provider sends it, as delta-seconds (`"5"`) or an HTTP-date (`"Wed, 15 Oct 2026 09:00:00 GMT"`) |
+
+Each retry logs a warning:
+
+```text
+Transient LLM error (<exc>); retrying in <delay>s (attempt N/2).
+```
+
+When retries run out, the existing OpenAI fallback runs and the LiteLLM error is chained as the cause.
+
+<Note>
+The OpenAI leg is unchanged. It has its own SDK-level retries via `OPENAI_MAX_RETRIES` (see [OpenAI Client Retries](/features/openai-client-retries)). The two layers are separate mechanisms, so their attempts multiply rather than merge.
 </Note>
 
 ---
@@ -284,8 +340,8 @@ graph TB
 | Installed | Auto mode behaviour |
 |-----------|---------------------|
 | `openai` only | OpenAI SDK used directly via `beta.chat.completions.parse` |
-| `litellm` only | LiteLLM used; if it raises, the call fails (no fallback) |
-| both | LiteLLM first; on runtime error, falls back to OpenAI with a warning |
+| `litellm` only | LiteLLM used; transient errors retry 2× before raising (no fallback) |
+| both | LiteLLM first; transient errors retry 2× before falling back to OpenAI with a warning; terminal errors fall back immediately |
 | neither | `ImportError: Structured output requires either litellm or openai...` |
 
 ---
@@ -300,6 +356,10 @@ graph TB
 | `ANTHROPIC_API_KEY` | Required when `OPENAI_MODEL_NAME=anthropic/...` |
 | `GEMINI_API_KEY` | Required when `OPENAI_MODEL_NAME=gemini/...` |
 | `OPENAI_MAX_RETRIES` | Applied automatically to the OpenAI fallback leg (via the core `OpenAIClient`). See [OpenAI Client Retries](/features/openai-client-retries) for details. |
+
+<Note>
+The LiteLLM leg's retry policy (2 retries, 1s initial delay, ×2 backoff, 30s cap) is not configurable through environment variables or CLI flags.
+</Note>
 
 <Card title="Auto Module SDK Reference" icon="code" href="/sdk/reference/praisonai/modules/auto">
   Full API reference for AutoGenerator, WorkflowAutoGenerator, and BaseAutoGenerator
@@ -377,7 +437,7 @@ pip install litellm openai
 export ANTHROPIC_API_KEY=sk-ant-...
 export OPENAI_API_KEY=sk-...
 export OPENAI_MODEL_NAME=anthropic/claude-sonnet-4
-# LiteLLM runs first; transient errors fall back to OpenAI automatically
+# LiteLLM runs first; transient errors retry on LiteLLM, and only after retries are exhausted does the call fall back to OpenAI
 praisonai --auto "generate a weekly status report"
 ```
 
@@ -407,7 +467,7 @@ asyncio.run(run())
     pip install litellm openai
     ```
 
-    LiteLLM runs first; OpenAI silently catches any runtime errors.
+    LiteLLM retries transient errors first; OpenAI catches whatever is still failing.
   </Accordion>
 
   <Accordion title="Watch logs for the fallback warning">
@@ -415,6 +475,8 @@ asyncio.run(run())
     - Is your provider API key set correctly?
     - Does the model support `response_format` (structured output)?
     - Is the provider having an outage?
+
+    Retries log a separate, earlier warning on every attempt: `Transient LLM error (...); retrying in Ns (attempt N/2).` The fallback warning fires once — when retries are exhausted, or immediately on a terminal error.
 
     Investigate before relying on the fallback long-term.
 
@@ -462,7 +524,7 @@ asyncio.run(run())
   <Card title="YAML Workflows" icon="file-code" href="/features/yaml-workflows">
     The agents.yaml format generated by auto mode
   </Card>
-  <Card icon="rotate" href="/features/openai-client-retries">
+  <Card title="OpenAI Client Retries" icon="rotate" href="/features/openai-client-retries">
     Turn on SDK-level retries for the OpenAI fallback path
   </Card>
 </CardGroup>
