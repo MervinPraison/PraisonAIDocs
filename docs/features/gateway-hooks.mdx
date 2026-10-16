@@ -97,6 +97,7 @@ sequenceDiagram
     participant Sig as Signature Verify
     participant Ev as Event Filter
     participant Dedup as Idempotency Store
+    participant Coalescer as HookCoalescer
     participant Agent
     participant Chan as Delivery Channel
 
@@ -118,6 +119,11 @@ sequenceDiagram
     alt duplicate
         Dedup-->>GW: already in-flight
         GW-->>Ext: HTTP 200 (no-op)
+    end
+    opt coalesce configured and group_key non-empty
+        GW->>Coalescer: submit(group, payload)
+        GW-->>Ext: HTTP 202 {"coalesced":true,"pending":N}
+        Coalescer->>Agent: one run after quiet window (latest payload)
     end
     alt deliver_only
         GW->>Chan: rendered message (no LLM turn)
@@ -236,6 +242,7 @@ Only these nine options are exposed through the CLI. The full `HookConfig` (HMAC
 | `signature_prefix` | `str` | `None` | Optional signature prefix, e.g. `"sha256="`. |
 | `events` | `list[str]` | `None` | Allow-list of event types. Unmatched deliveries are ack'd (200) with no LLM turn. A string is coerced to a single-element list. |
 | `event_header` | `str` | `None` | Header carrying the event type, e.g. `"X-GitHub-Event"`. When omitted the event is read from the payload as a dotted path (defaulting to `"event"`). |
+| `coalesce` | `CoalesceConfig` \| `dict` | `None` | Opt-in burst coalescing. Deliveries whose `group_key` renders to the same value within `window_seconds` collapse into **one** agent run carrying the latest payload. `None` keeps one run per delivery. See [Burst Coalescing](#burst-coalescing). |
 | `deliver_only` | `bool` | `False` | When `True` the rendered `message` **is** the delivered content, routed straight through `deliver_to` with **no LLM turn**. |
 
 ### `hooks.idempotency` (gateway-level, not per-hook)
@@ -295,6 +302,10 @@ The gateway deduplicates concurrent and retried deliveries:
 2. When unset, the entire payload is JSON-canonicalized and hashed.
 3. The key is **reserved in-flight** atomically — concurrent identical POSTs dedup across the await boundary.
 4. The key is **committed only after a successful agent run** — transient failures remain retryable.
+
+<Note>
+With [`coalesce`](#burst-coalescing), the key is recorded when the delivery is accepted into the group (HTTP 202), not after the run.
+</Note>
 
 <Note>
 External services that retry on timeout (e.g. GitHub webhooks, Linear) are safe to point directly at inbound hooks without additional dedup logic on your side.
@@ -459,6 +470,167 @@ graph TB
 Enable both the turn lock and `store_backend: redis` together for a multi-replica gateway — see [Cross-Replica Idempotency](/features/gateway-redis-idempotency).
 
 **Hot-reload:** flipping `store_backend` via `reload_config` rebuilds the store lazily on the next `reserve`. See [Gateway Hot-Reload](/features/gateway-hot-reload).
+
+---
+
+## Burst Coalescing
+
+Set `coalesce` to collapse a burst of deliveries for the same entity into one agent run on the latest payload.
+
+```mermaid
+graph LR
+    subgraph "5 pushes → 1 agent run"
+        E1[📥 push #1] --> B[(🧺 group buffer<br/>key: repo#PR)]
+        E2[📥 push #2] --> B
+        E3[📥 push #3] --> B
+        E4[📥 push #4] --> B
+        E5[📥 push #5] --> B
+        B -->|quiet window elapsed| R[🤖 one agent run<br/>latest payload]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef buffer fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class E1,E2,E3,E4,E5 input
+    class B buffer
+    class R result
+```
+
+Without coalescing, five rapid pushes to one PR run the agent five times. With it, you get one run, fewer LLM calls, and no stale replies.
+
+<Tabs>
+<Tab title="Python">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.gateway import CoalesceConfig
+from praisonai.gateway import Gateway
+
+reviewer = Agent(name="reviewer", instructions="Summarise what changed on this PR.")
+
+gw = Gateway(agents=[reviewer])
+gw.register_hook({
+    "path": "github",
+    "agent": "reviewer",
+    "message": "Latest push: {{ payload.head_commit.message }}",
+    "coalesce": CoalesceConfig(
+        group_key="{repository.full_name}#{pull_request.number}",
+        window_seconds=30,
+        max_wait_seconds=300,
+    ),
+})
+gw.start()
+```
+</Tab>
+<Tab title="YAML">
+```yaml
+hooks:
+  - path: github
+    agent: reviewer
+    message: "Latest push: {{ payload.head_commit.message }}"
+    coalesce:
+      group_key: "{repository.full_name}#{pull_request.number}"
+      window_seconds: 30
+      max_wait_seconds: 300
+```
+</Tab>
+</Tabs>
+
+### How Coalescing Works
+
+```mermaid
+sequenceDiagram
+    participant Ext as External Service
+    participant GW as Gateway /hooks/github
+    participant Dedup as Idempotency Store
+    participant Buf as HookCoalescer
+    participant Agent
+
+    Ext->>GW: POST push #1
+    GW->>Dedup: reserve + record
+    GW->>Buf: submit(group=repo#PR, payload #1)
+    GW-->>Ext: 202 {"coalesced": true, "pending": 1}
+    Ext->>GW: POST push #2
+    GW->>Buf: submit(group=repo#PR, payload #2)
+    GW-->>Ext: 202 {"coalesced": true, "pending": 2}
+    Note over Buf: quiet window elapses<br/>(or max_wait reached)
+    Buf->>Agent: start("[2 events coalesced; only the latest is shown] ...")
+    Agent-->>Buf: reply
+    Buf->>GW: deliver
+```
+
+### Coalesce Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `group_key` | `str` | required | Template over the payload, e.g. `"{repository.full_name}#{pull_request.number}"`. A delivery whose rendered key is empty runs on its own (not coalesced). Groups are scoped per hook `path`. |
+| `window_seconds` | `float` | `30.0` | Debounce quiet window. The group fires after this many seconds with no new delivery. Must be `> 0`. |
+| `max_wait_seconds` | `float` | `300.0` | Hard cap from the first delivery in the group, so a steady stream still dispatches. Must be `>= window_seconds`. |
+
+Invalid values raise `ValueError` (empty `group_key`, non-finite durations, `window_seconds <= 0`, or `max_wait_seconds < window_seconds`).
+
+### Agent Message Prefix
+
+When a run absorbs more than one delivery, the agent sees:
+
+```text
+[N events coalesced; only the latest is shown]
+
+<rendered message from the latest payload>
+```
+
+### Response Shapes
+
+| Outcome | Status | Body |
+|---------|--------|------|
+| Delivery buffered into a coalesced group | **202** | `{"ok": true, "coalesced": true, "pending": N}` |
+| Pending-group cap (`10,000`) exceeded | **503** + `Retry-After: 30` | `{"ok": false, "error": "too many pending coalesced groups"}` |
+| `coalesce` not configured, or `group_key` renders empty | 200 after the run (unchanged) | existing shape |
+
+<Warning>
+Coalesced deliveries record their idempotency key **when accepted into the group**, not after the run completes. A sender retry of an absorbed delivery is deduped, but if the coalesced run fails the sender cannot retry it. Choose `window_seconds` and `max_wait_seconds` with that in mind.
+</Warning>
+
+<Note>
+On gateway shutdown, pending coalesced groups are **cancelled, not flushed**. Their idempotency keys are already recorded, so a provider retry inside the TTL window will not re-admit them. If your provider does not retry past the quiet window, those events are lost.
+</Note>
+
+### Choosing Options
+
+```mermaid
+graph TB
+    Start{Bursty traffic<br/>on the same entity?}
+    Start -->|No| Off[Leave coalesce unset<br/>one run per delivery]
+    Start -->|Yes| Key{Can the payload<br/>identify the entity?}
+    Key -->|No| Off
+    Key -->|Yes: PR number,<br/>user id, thread| On[Set coalesce with that<br/>template as group_key]
+    On --> Win{Freshness SLA?}
+    Win -->|Interactive| Short[window 5–10s<br/>max_wait 30–60s]
+    Win -->|Background batch| Long[window 30–120s<br/>max_wait 300–600s]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef off fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef on fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start,Key,Win q
+    class Off off
+    class On,Short,Long on
+```
+
+<AccordionGroup>
+<Accordion title="Key on the entity, not the event">
+For GitHub pushes to a PR use `"{repository.full_name}#{pull_request.number}"`, not `"{head_commit.id}"`. The commit sha changes every push, so nothing coalesces.
+</Accordion>
+<Accordion title="Keep window_seconds short for interactive bots">
+30s suits background triage; use 5–10s when a user is waiting.
+</Accordion>
+<Accordion title="Set max_wait_seconds to a multiple of the window">
+The default is 10×. A steady stream (CI logs, scrapers) still dispatches at the cap.
+</Accordion>
+<Accordion title="Prefer deliver_only when you don't need the LLM">
+Plain forwarding with [`deliver_only`](#deliver-only-mode-no-llm-turn) is already sub-second. Coalescing pays off by skipping repeated LLM turns on the same entity.
+</Accordion>
+</AccordionGroup>
 
 ---
 
