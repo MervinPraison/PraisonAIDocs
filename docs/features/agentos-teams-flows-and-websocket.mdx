@@ -5,7 +5,7 @@ description: "Invoke teams and flows over HTTP, and chat with agents over a WebS
 icon: "network-wired"
 ---
 
-AgentOS routes every team and flow you pass in as its own HTTP endpoint, and exposes a chat WebSocket that speaks the agent's native `achat`/`chat` surface.
+AgentOS routes every team and flow you pass in as its own HTTP endpoint, and exposes a chat WebSocket that streams token deltas from the agent.
 
 ```mermaid
 graph LR
@@ -66,10 +66,11 @@ curl -X POST http://localhost:8000/api/flows/writer_flow/run \
   -H "Content-Type: application/json" \
   -d '{"message": "Draft a one-line haiku"}'
 
-# WebSocket chat
+# WebSocket chat (streaming by default)
 websocat ws://localhost:8000/api/chat/stream
 > {"message": "Hello", "agent_name": "assistant"}
-< {"response": "Hi there!"}
+< {"delta": "Hi"}
+< {"delta": " there!"}
 < {"done": true}
 ```
 </Step>
@@ -99,7 +100,7 @@ sequenceDiagram
     AgentOS-->>Client: {"team": name, "result": ..., "session_id": ...}
 ```
 
-A WebSocket frame clones and binds a per-request agent, then speaks its native chat surface.
+A WebSocket frame clones and binds a per-request agent, then streams its reply as delta frames.
 
 ```mermaid
 sequenceDiagram
@@ -109,15 +110,22 @@ sequenceDiagram
 
     Client->>WS: {"message": ..., "agent_name": ..., "session_id": ...}
     WS->>Agent: _isolate_agent() → clone + bind_session
-    alt achat exists
-        WS->>Agent: await achat(message)
-    else chat
-        WS->>Agent: asyncio.to_thread(chat, message)
+    alt iter_stream and no output guardrail
+        loop each chunk
+            Agent-->>WS: chunk
+            WS-->>Client: {"delta": "..."}
+        end
+    else fallback (no iter_stream, or output guardrail attached)
+        alt achat exists
+            WS->>Agent: await achat(message)
+        else chat
+            WS->>Agent: asyncio.to_thread(chat, message)
+        end
+        Agent-->>WS: full reply
+        WS-->>Client: {"response": "..."}
     end
-    Agent-->>WS: reply
-    WS-->>Client: {"response": "..."}
     WS-->>Client: {"done": true}
-    Note over WS,Client: on a bad frame → {"error": "..."}; socket stays open
+    Note over WS,Client: on error → {"error": "..."}; socket stays open
 ```
 
 ---
@@ -174,8 +182,13 @@ Response:
 // client → server
 {"message": "...", "agent_name": "optional", "session_id": "optional"}
 
-// server → client (success)
-{"response": "..."}
+// server → client (streaming, default when the agent exposes iter_stream and has no output guardrail)
+{"delta": "He"}
+{"delta": "llo"}
+{"done": true}
+
+// server → client (single-frame fallback: no iter_stream, or an output guardrail is attached)
+{"response": "Hello"}
 {"done": true}
 
 // server → client (error)
@@ -197,8 +210,11 @@ async def main():
     url = "ws://localhost:8000/api/chat/stream?api_key=YOUR_TOKEN"
     async with websockets.connect(url) as ws:
         await ws.send(json.dumps({"message": "Hello", "agent_name": "assistant"}))
-        print(await ws.recv())  # {"response": "..."}
-        print(await ws.recv())  # {"done": true}
+        while True:
+            frame = json.loads(await ws.recv())  # {"delta": "..."} ... then {"done": true}
+            print(frame)
+            if frame.get("done") or "error" in frame:
+                break
 
 asyncio.run(main())
 ```
@@ -210,7 +226,7 @@ asyncio.run(main())
 Teams and flows serialise per instance; chat clones its agent per request.
 
 - Each team and flow has a lazy per-instance `asyncio.Lock` — concurrent calls to the *same* instance queue, while different instances run in parallel (teams/flows carry mutable run state and cannot run re-entrantly).
-- Per-request chat uses an isolated agent clone via `_isolate_agent()` (chat history is not shared across callers), except when `handoffs` are configured on the template — those agents stay on the shared template because `clone_for_channel` drops handoffs, so delegation isn't silently lost.
+- Per-request chat uses an isolated agent clone via `_isolate_agent()` (chat history is not shared across callers), including agents with `handoffs`. `clone_for_channel` tags `handoffs=[...]` tool closures with `_praison_handoff_source` and rebinds the delegation tool to the clone, so the handoff graph still works and `chat_history` is never shared across callers. Plain mocks and lightweight callables that don't support isolation still fall back to the template.
 - WebSocket calls use the exact same `_isolate_agent()` helper as `POST /chat`.
 
 ---
@@ -248,6 +264,14 @@ Set `AgentOSConfig(api_key=...)` (or `PRAISONAI_AGENTOS_API_KEY`) so the WebSock
 
 <Accordion title="Treat WebSocket errors as sticky">
 The socket stays open on `{"error": ...}`, so a retry can send another frame without a new handshake.
+</Accordion>
+
+<Accordion title="An agent with an output guardrail streams as one frame">
+Streaming yields tokens before the full response exists, so output guardrails cannot validate chunks. When `agent.guardrail` is set, `/api/chat/stream` falls back to `{"response": ...}` followed by `{"done": true}` to preserve validation.
+</Accordion>
+
+<Accordion title="When the client disconnects, the server stops the stream">
+The worker that pumps `iter_stream` is signalled to close as soon as the WebSocket is gone, so a stalled model or tool call does not pin the handler.
 </Accordion>
 
 <Accordion title="Construct one instance per concurrent caller">
