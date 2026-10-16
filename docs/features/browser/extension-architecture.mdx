@@ -82,6 +82,7 @@ praisonai browser launch "test" --debug
 | `status` | Server → Both | Session status updates |
 | `stop_session` | Any → Server | End session |
 | `cancel_session` | Any → Server | Cancel an in-flight session (routes through the same handler as `stop_session`). |
+| `register` | Ext/CLI → Server | Declares the socket's role (`extension` or `cli`) for sockets that connected without an `Origin` header. Returns `{"type": "status", "status": "registered", "role": "..."}`, or `{"type": "error", "code": "INVALID_ROLE"}` if rejected. See [Role Registration](#role-registration). |
 
 ## Extension Readiness Wait
 
@@ -111,6 +112,69 @@ The poll caps at `min(15.0, timeout)` seconds — a caller passing `timeout=2.0`
 <Warning>
 Skip the readiness poll only for tests or mocked bridges — never for live runs, where it exists to catch a disconnected extension before `start_session`.
 </Warning>
+
+## Role Registration
+
+Sockets that connect without an `Origin` header declare their role with a `register` message.
+
+Chrome MV3 offscreen documents often omit `Origin` on `ws://127.0.0.1:8765/ws`. The bridge classifies such sockets as CLI, so without `register` the extension pool stays empty and `start_session` returns `NO_EXTENSION`.
+
+```mermaid
+sequenceDiagram
+    participant OS as Offscreen doc
+    participant BR as BrowserServer :8765
+    OS->>BR: WS connect (no Origin)
+    Note over BR: is_cli=true, no_origin=true
+    OS->>BR: {"type":"register","client":"extension"}
+    BR-->>OS: {"type":"status","status":"registered","role":"extension"}
+    Note over BR: is_extension=true, is_cli=false
+    OS->>BR: {"type":"start_session","goal":"..."}
+    BR-->>OS: {"type":"status","status":"running","session_id":"..."}
+```
+
+Send it once, on open:
+
+```js
+ws.addEventListener("open", () => {
+  ws.send(JSON.stringify({ type: "register", client: "extension" }));
+});
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Connected: WS accept
+    Connected --> RegisteredExt: register client=extension
+    Connected --> RegisteredCli: register client=cli
+    Connected --> Unregistered: no register
+    RegisteredExt --> Running: start_session from panel
+    RegisteredCli --> DeliverAutomation: start_session client=cli
+    Unregistered --> Reject: start_session → NO_EXTENSION
+    Running --> ObsLoop: observation / action
+    ObsLoop --> Completed: done action
+```
+
+| Rule | Behavior |
+|------|----------|
+| `client: "extension"` | Accepted when the socket connected without `Origin` (or is already the extension). |
+| `client: "cli"` | Accepted when the socket connected without `Origin` and has no active session. |
+| Web-origin socket | Rejected with `INVALID_ROLE` — it cannot claim either role. |
+| Unregistered, no `Origin` | Stays CLI. This default blocks extension hijacking (advisory `GHSA-8x8f-54wf-vv92`). |
+
+Success response:
+
+```json
+{"type": "status", "status": "registered", "role": "extension"}
+```
+
+Rejection response:
+
+```json
+{"type": "error", "code": "INVALID_ROLE", "error": "Cannot register as client: extension"}
+```
+
+<Note>
+Sockets using a `chrome-extension://` origin (such as the side panel) are already classified as the extension and don't need to register. The existing Python CLI needs no changes.
+</Note>
 
 ## Troubleshooting
 
@@ -159,6 +223,18 @@ If you see "Extension did not connect after 15s":
    <Note>
    Servers older than PraisonAI #3115 don't return `extension_connections`. The CLI helpers (`doctor extension`, the `launch` poller) fall back to `connections` in that case.
    </Note>
+
+### `start_session` returns `NO_EXTENSION` even though the WebSocket is open
+
+The offscreen document has not registered. Add this to its `onopen` handler:
+
+```js
+ws.addEventListener("open", () => {
+  ws.send(JSON.stringify({ type: "register", client: "extension" }));
+});
+```
+
+Expect the server log line `[SERVER][REGISTER] Connection registered as extension`. Once the extension has sent `register`, `/health` (`extension_connections`) and session routing agree. If `/health` shows `extension_connections: 1` but `start_session` still returns `NO_EXTENSION`, check that the `start_session` is sent after the `registered` status and from the expected socket.
 
 ### No Observations Sent
 
