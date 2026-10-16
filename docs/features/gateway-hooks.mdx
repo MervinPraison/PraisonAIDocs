@@ -110,6 +110,10 @@ sequenceDiagram
     alt invalid / missing signature
         Sig-->>Ext: HTTP 401 {"error":"invalid signature"}
     end
+    GW->>Sig: freshness check (timestamped / structured schemes)
+    alt stale / missing timestamp
+        Sig-->>Ext: HTTP 401 {"error":"invalid signature"}
+    end
     GW->>Ev: event_allowed(payload, headers)
     alt event not in allow-list
         Ev-->>Ext: HTTP 200 {"ok":true,"skipped":"event"}
@@ -240,6 +244,9 @@ Only these nine options are exposed through the CLI. The full `HookConfig` (HMAC
 | `signature_header` | `str` | `None` | Header carrying the signature. Auto-defaults to `"X-Hub-Signature-256"` when `secret` is set with no explicit header. |
 | `signature_algo` | `str` | `"sha256"` | Digest for the HMAC. Any name `hashlib.new` accepts (e.g. `"sha1"`, `"sha512"`). |
 | `signature_prefix` | `str` | `None` | Optional signature prefix, e.g. `"sha256="`. |
+| `signature_scheme` | `str` | `"hmac_hex"` | How the provider signs — `"hmac_hex"` (default, hex HMAC of the body), `"hmac_base64"` (base64 HMAC of the body), `"hmac_timestamped"` (hex HMAC of `"{timestamp}.{body}"`), or `"structured"` (Stripe-style `t=…,v1=…` composite header; any `v1` may match). Invalid values raise `ValueError`. |
+| `timestamp_header` | `str` | `None` | Header carrying the provider timestamp (unix seconds). Only valid with `hmac_timestamped` or `structured`; required for `hmac_timestamped`. For `structured`, the `t=` component is read from the signature header when omitted. |
+| `signature_tolerance_seconds` | `int` | `300` | Replay window for timestamped and structured schemes — a request outside `±` this many seconds is rejected before any agent runs. `0` disables the freshness check (not recommended). Negative values raise `ValueError`. |
 | `events` | `list[str]` | `None` | Allow-list of event types. Unmatched deliveries are ack'd (200) with no LLM turn. A string is coerced to a single-element list. |
 | `event_header` | `str` | `None` | Header carrying the event type, e.g. `"X-GitHub-Event"`. When omitted the event is read from the payload as a dotted path (defaulting to `"event"`). |
 | `coalesce` | `CoalesceConfig` \| `dict` | `None` | Opt-in burst coalescing. Deliveries whose `group_key` renders to the same value within `window_seconds` collapse into **one** agent run carrying the latest payload. `None` keeps one run per delivery. See [Burst Coalescing](#burst-coalescing). |
@@ -653,79 +660,129 @@ Plain forwarding with [`deliver_only`](#deliver-only-mode-no-llm-turn) is alread
 
 ## Verifying Provider Signatures (HMAC)
 
-Set `secret` to have the gateway verify the provider's HMAC signature over the raw request body — a missing or invalid signature is rejected with `401` before any agent runs.
+Set `secret` to verify the provider's signature, and pick `signature_scheme` to match how they sign — a missing, invalid, or stale signature returns `401 {"error": "invalid signature"}` before any agent runs.
 
 ```mermaid
-graph LR
-    R[📥 Raw body + signature] --> V{🔐 HMAC valid?}
-    V -->|No| X[⛔ HTTP 401 invalid signature]
-    V -->|Yes| A[🤖 Run agent / deliver]
+graph TB
+    Q{🔐 Which signature format<br/>does the provider send?}
+    Q -->|hex HMAC of body| H[hmac_hex · default<br/>GitHub]
+    Q -->|base64 HMAC of body| B[hmac_base64]
+    Q -->|hex HMAC of 'timestamp.body'<br/>timestamp in own header| T[hmac_timestamped]
+    Q -->|Composite 't=…,v1=…' header| S[structured<br/>Stripe]
+    T --> R{🕒 Replay protection?}
+    S --> R
+    R -->|Keep default| On[signature_tolerance_seconds: 300]
+    R -->|Testing only| Off[signature_tolerance_seconds: 0]
 
-    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef reject fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef scheme fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
 
-    class R input
-    class V check
-    class X reject
-    class A ok
+    class Q,R decision
+    class H,B,T,S scheme
+    class On,Off config
 ```
 
-Verification is **fail-closed** and **opt-in**: with no `secret` set, nothing changes. When `secret` is set without an explicit `signature_header`, the header defaults to `X-Hub-Signature-256` (the GitHub/webhook convention) so a bare `secret` is a working config, not a 401 trap.
+Verification is **fail-closed** and **opt-in**: with no `secret` set, nothing changes. When `secret` is set without an explicit `signature_header`, the header defaults to `X-Hub-Signature-256` (the GitHub/webhook convention) so a bare `secret` is a working config, not a 401 trap. The default `signature_scheme` is `hmac_hex`, so existing hooks keep working unchanged.
 
 <Tabs>
-<Tab title="GitHub (Python)">
-```python
-from praisonaiagents import Agent
-from praisonai.gateway import Gateway
-
-triager = Agent(
-    name="triager",
-    instructions="Triage this GitHub issue and post a one-line action."
-)
-
-gw = Gateway(agents=[triager])
-gw.register_hook({
-    "path": "github",
-    "agent": "triager",
-    "secret": "${GITHUB_WEBHOOK_SECRET}",
-    "signature_prefix": "sha256=",          # X-Hub-Signature-256 is auto-defaulted
-    "deliver_to": "slack:#triage",
-    "message": "New {{ payload.action }} on #{{ payload.issue.number }}: {{ payload.issue.title }}",
-})
-gw.start()
-```
-</Tab>
-
-<Tab title="GitHub (YAML)">
+<Tab title="GitHub (hmac_hex)">
 ```yaml
 hooks:
   - path: github
     agent: triager
     secret: "${GITHUB_WEBHOOK_SECRET}"
     signature_prefix: "sha256="            # signature_header defaults to X-Hub-Signature-256
+    # signature_scheme: hmac_hex           # default — can be omitted
     deliver_to: "slack:#triage"
     message: "New {{ payload.action }} on #{{ payload.issue.number }}: {{ payload.issue.title }}"
 ```
 </Tab>
 
-<Tab title="Stripe (YAML)">
+<Tab title="Base64 (hmac_base64)">
+```yaml
+hooks:
+  - path: custom
+    agent: triager
+    secret: "${CUSTOM_WEBHOOK_SECRET}"
+    signature_header: "X-Signature"
+    signature_scheme: "hmac_base64"
+```
+</Tab>
+
+<Tab title="Timestamped (hmac_timestamped)">
+```yaml
+hooks:
+  - path: billing
+    agent: billing-support
+    secret: "${PROVIDER_WEBHOOK_SECRET}"
+    signature_header: "X-Signature"
+    signature_scheme: "hmac_timestamped"
+    timestamp_header: "X-Timestamp"
+    signature_tolerance_seconds: 300        # ±5 minutes — default
+```
+</Tab>
+
+<Tab title="Stripe (structured)">
 ```yaml
 hooks:
   - path: stripe
     agent: billing-support
     secret: "${STRIPE_WEBHOOK_SECRET}"
     signature_header: "Stripe-Signature"
-    signature_algo: "sha256"
+    signature_scheme: "structured"          # t=…,v1=… composite
+    # timestamp_header omitted — t= is read from Stripe-Signature itself
     deliver_to: "slack:#billing"
     message: "Stripe event {{ payload.type }} for {{ payload.data.object.customer }}"
 ```
 </Tab>
 </Tabs>
 
-Test locally by signing the exact body you POST:
+<Warning>
+Stripe sends `t=…,v1=…`, not a raw hex HMAC. Leaving `signature_scheme` on the `hmac_hex` default returns `401` for every Stripe event — use `structured`.
+</Warning>
 
+| Scheme | Signs | Signature format |
+|--------|-------|------------------|
+| `hmac_hex` (default) | raw body | hex digest, optionally with an `algo=` prefix |
+| `hmac_base64` | raw body | base64 digest |
+| `hmac_timestamped` | `"{timestamp}.{body}"` | hex digest; timestamp in `timestamp_header` |
+| `structured` | `"{t}.{body}"` | `t=…,v1=…,v1=…` header; any `v1` may match |
+
+### Replay Window
+
+A signed body captured from network logs can be replayed forever unless the timestamp is checked — `signature_tolerance_seconds` rejects requests older (or newer) than the window.
+
+```mermaid
+sequenceDiagram
+    participant Ext as External Service
+    participant GW as Gateway
+    participant Agent
+
+    Ext->>GW: POST (body + signature + timestamp)
+    GW->>GW: Verify signature over "timestamp.body"
+    alt invalid / missing signature
+        GW-->>Ext: HTTP 401
+    end
+    GW->>GW: Freshness check (|now − timestamp| ≤ tolerance)
+    alt stale / missing timestamp
+        GW-->>Ext: HTTP 401
+    end
+    GW->>Agent: Run
+```
+
+- The freshness check runs **only** for `hmac_timestamped` and `structured`, because only those sign the timestamp. `hmac_hex` and `hmac_base64` hooks behave exactly as before.
+- Default is `300` seconds (±5 minutes). `0` disables the check — use it for testing only.
+- A negative or non-integer `signature_tolerance_seconds` raises `ValueError` at config time.
+- `timestamp_header` on `hmac_hex` / `hmac_base64` is **refused at config time**: an unsigned timestamp would let an attacker replay an old body and signature with a fresh header.
+- `hmac_timestamped` without `timestamp_header` is also refused (nowhere to read the timestamp from).
+
+### Test Locally
+
+Sign the exact body you POST.
+
+<Tabs>
+<Tab title="hmac_hex (GitHub)">
 ```bash
 SECRET="my-signing-secret"
 BODY='{"action":"opened","issue":{"number":42,"title":"Bug"}}'
@@ -737,6 +794,37 @@ curl -X POST http://localhost:8765/hooks/github \
   -H "X-GitHub-Event: issues" \
   -d "$BODY"
 ```
+</Tab>
+
+<Tab title="hmac_timestamped">
+```bash
+SECRET="my-signing-secret"
+BODY='{"id":"evt_1"}'
+NOW=$(date +%s)
+SIG=$(printf '%s' "$NOW.$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
+
+curl -X POST http://localhost:8765/hooks/billing \
+  -H "Content-Type: application/json" \
+  -H "X-Signature: $SIG" \
+  -H "X-Timestamp: $NOW" \
+  -d "$BODY"
+```
+</Tab>
+
+<Tab title="structured (Stripe)">
+```bash
+SECRET="my-signing-secret"
+BODY='{"id":"evt_1","type":"invoice.paid"}'
+NOW=$(date +%s)
+V1=$(printf '%s' "$NOW.$BODY" | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.* //')
+
+curl -X POST http://localhost:8765/hooks/stripe \
+  -H "Content-Type: application/json" \
+  -H "Stripe-Signature: t=$NOW,v1=$V1" \
+  -d "$BODY"
+```
+</Tab>
+</Tabs>
 
 <Warning>
 The signature is computed over the **raw bytes** the provider signed. Do not re-serialize the payload before signing — sign the exact body you send.
