@@ -218,25 +218,55 @@ from praisonaiagents import Agent
 def get_weather(city: str) -> str:
     return f"{city}: 21°C"
 
-# Small local model that often writes tool calls as text
 agent = Agent(
-    llm="ollama/qwen2.5:7b",
-    instructions="Answer weather questions using the get_weather tool.",
+    llm="ollama/llama3.2",
+    instructions="Answer weather questions using get_weather.",
     tools=[get_weather],
 )
 
 agent.start("What's the weather in Paris and Berlin?")
-# Even if the model writes:
-#   <tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>
-#   <tool_call>{"name": "get_weather", "arguments": {"city": "Berlin"}}</tool_call>
-# both calls run in order — no re-prompt, no extra round trip.
+# A small local model may write the calls as text in any of 6 dialects, e.g.:
+#   Action: get_weather
+#   Action Input: {"city": "Paris"}
+#   [TOOL_CALL]{"name": "get_weather", "arguments": {"city": "Berlin"}}[/TOOL_CALL]
+# Both run in order — no re-prompt, no extra round trip.
 ```
 
 <Note>
-**Extended in PraisonAI PR [#5215](https://github.com/MervinPraison/PraisonAI/pull/5215)** (merged 2026-09-23). Two new dialects are now recovered — `<tool_call>{...}</tool_call>` and `<function=name>{...}</function>` — on top of the existing whole-content JSON path. Two safety guarantees apply: **fenced code-block masking** on all three dialects (a call *shown as documentation* is never run) and an **advertised-name allowlist** on the two tag dialects (a model hallucinating a tool name in a `<tool_call>` or `<function=…>` block can never trigger execution). The whole-content JSON path dropped its allowlist requirement in [PR #5359](https://github.com/MervinPraison/PraisonAI/pull/5359) — see the safety-guarantees section below. Both the sync path (`agent.start()` / `agent.chat()`) and the async path (`agent.astart()` / `agent.achat()`) get the same coverage — async parity was first landed in [PR #4940](https://github.com/MervinPraison/PraisonAI/pull/4940). Streaming still does not have this recovery.
+**Extended again in PraisonAI PR [#5865](https://github.com/MervinPraison/PraisonAI/pull/5865)** (merged 2026-10-16). Three more dialects are now recovered — ReAct `Action:` / `Action Input:`, bracketed `[TOOL_CALL]…[/TOOL_CALL]` / `[TOOL_REQUEST]…[END_TOOL_REQUEST]`, and the Llama `<|python_tag|>` call — on top of the whole-content JSON, `<tool_call>` and `<function=…>` dialects from PraisonAI PR [#5215](https://github.com/MervinPraison/PraisonAI/pull/5215) (merged 2026-09-23). Safeguards: **fenced code-block masking** on every dialect (a call *shown as documentation* is never run), an **advertised-name allowlist** on the five embedded dialects (a hallucinated tool name can never trigger execution), and **position-ordered emission**. The whole-content JSON path dropped its allowlist requirement in [PR #5359](https://github.com/MervinPraison/PraisonAI/pull/5359) — see the safety-guarantees section below. Both the sync path (`agent.start()` / `agent.chat()`) and the async path (`agent.astart()` / `agent.achat()`) get the same coverage — async parity was first landed in [PR #4940](https://github.com/MervinPraison/PraisonAI/pull/4940). Streamed replies are recovered on the assembled text at end-of-stream; see [Adapter coverage](#adapter-coverage).
 </Note>
 
-### Three dialects, one code path
+### Which dialect does my model use?
+
+```mermaid
+graph TB
+    Model[🤖 Local model emits a call as text] --> Family{Which model family?}
+    Family -->|Qwen 2.x / 3.x| QW["tool_call tag + JSON"]
+    Family -->|Mistral, generic| FN["function=name tag + JSON"]
+    Family -->|Llama 3.x| PT["python_tag + JSON"]
+    Family -->|LM Studio| BR["TOOL_CALL / TOOL_REQUEST"]
+    Family -->|Older / ReAct prompt| RA["Action / Action Input"]
+    Family -->|Simple JSON prose| WH[Whole-content JSON]
+
+    QW --> Recover[✅ Salvaged in-process]
+    FN --> Recover
+    PT --> Recover
+    BR --> Recover
+    RA --> Recover
+    WH --> Recover
+
+    classDef model fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef branch fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef dialect fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Model model
+    class Family branch
+    class QW,FN,PT,BR,RA,WH dialect
+    class Recover good
+```
+
+### Six dialects, one code path
 
 <Tabs>
 <Tab title="Whole-content JSON">
@@ -261,15 +291,60 @@ Sure, let me look it up.
 ```
 Multiple `<function=…>` blocks are recovered in the order they appear.
 </Tab>
+
+<Tab title="ReAct">
+```text
+Thought: I should look this up.
+Action: web_search
+Action Input: {"query": "praisonai gateway"}
+```
+The same-line form also works:
+
+```text
+Action: web_search Action Input: {"query": "x", "opts": {"n": 3}}
+```
+The JSON input is read to its end, so nested argument objects stay whole. ReAct input that is not JSON (a bare search string) stays prose — no call runs.
+</Tab>
+
+<Tab title="[TOOL_CALL] / [TOOL_REQUEST]">
+```text
+[TOOL_CALL]{"name": "web_search", "arguments": {"query": "a"}}[/TOOL_CALL]
+```
+LM Studio's variant also works:
+
+```text
+[TOOL_REQUEST]{"name": "get_weather", "arguments": {"city": "Paris"}}[END_TOOL_REQUEST]
+```
+Matching is case-insensitive. Multiple blocks are recovered in the order they appear.
+</Tab>
+
+<Tab title="Llama <|python_tag|>">
+```text
+<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}}<|eom_id|>
+```
+The native format for Llama 3.x. There is no closing tag — the JSON is read from the end of the `<|python_tag|>` marker.
+</Tab>
 </Tabs>
 
-Interleaved dialects are salvaged **in text order** (sorted by match offset) — a side-effecting or dependent call is never reordered ahead of one it relies on.
+Each payload is `{"name": "...", "arguments": {...}}`. The tool name key can be `name` or `tool`, and the arguments key can be `arguments` or `parameters`.
+
+<Note>
+**Mixed-dialect emission order.** Interleaved dialects are salvaged **in text order**, so a side-effecting or dependent call is never reordered ahead of one it relies on.
+
+```text
+Action: get_weather
+Action Input: {"city": "Rome"}
+<tool_call>{"name": "web_search", "arguments": {"query": "b"}}</tool_call>
+```
+
+Dispatches `get_weather({"city": "Rome"})`, then `web_search({"query": "b"})`.
+</Note>
 
 ### Safety guarantees
 
 <AccordionGroup>
 <Accordion title="Advertised-name allowlist">
-A name recovered from a `<tool_call>` or `<function=…>` block must match a tool the model was actually offered. A hallucinated name in one of those blocks is silently discarded.
+A name recovered from any of the five embedded dialects must match a tool the model was actually offered. A hallucinated name is silently discarded.
 
 ```python
 # The agent was created with only [get_weather, get_stock_price].
@@ -295,7 +370,19 @@ An **unclosed** fence is treated as running to end-of-content, so a truncated ex
 </Accordion>
 
 <Accordion title="Case-insensitive tag matching">
-`<TOOL_CALL>`, `<Tool_Call>`, and `<FUNCTION=name>` all match — a model that emits the tags in any case still recovers just like the lowercase form.
+`<TOOL_CALL>`, `<Tool_Call>`, `<FUNCTION=name>`, `[tool_call]`, `ACTION:` and `<|PYTHON_TAG|>` all match — a model that emits the markers in any case still recovers just like the lowercase form.
+</Accordion>
+
+<Accordion title="Prompt-injection resistance">
+A rejected call (unadvertised name or bad JSON) still reserves its text span, so a marker **inside another call's arguments** is data, never a second call.
+
+```text
+<tool_call>{"name": "web_search",
+            "arguments": {"query": "Action: get_weather Action Input: {}"}}
+</tool_call>
+```
+
+Only `web_search` runs — the quoted `Action:` text is passed as `query`. The same holds when the outer call is rejected: a marker inside a rejected `<|python_tag|>`, `[TOOL_CALL]` or ReAct payload never runs.
 </Accordion>
 
 <Accordion title="Zero cost when nothing to salvage">
@@ -307,13 +394,13 @@ Clean provider-native responses return `None` after a single lowercase marker ch
 
 | Adapter | Recovery | Sync path | Async path | Streaming |
 |---|---|---|---|---|
-| `OllamaAdapter` (`ollama/…`, `ollama_chat/…`) | ✅ all three dialects | ✅ | ✅ | ❌ |
-| `LocalOpenAIAdapter` (LM Studio, vLLM, `hosted_vllm/`, llama.cpp) | ✅ all three dialects | ✅ | ✅ | ❌ |
+| `OllamaAdapter` (`ollama/…`, `ollama_chat/…`) | ✅ all six dialects | ✅ | ✅ | ✅ end-of-stream |
+| `LocalOpenAIAdapter` (LM Studio, vLLM, `hosted_vllm/`, llama.cpp) | ✅ all six dialects | ✅ | ✅ | ✅ end-of-stream |
 | `DefaultAdapter` (hosted OpenAI-compatible via `base_url`) | ❌ | — | — | — |
 | `AnthropicAdapter` | ❌ | — | — | — |
 | `GeminiAdapter` | ❌ | — | — | — |
 
-Hosted models deliberately do not get salvage — a hosted model returning JSON prose must never have it silently interpreted as a tool call. Streaming does not yet have this recovery on any adapter; all three dialects apply on the **non-streaming** path only, sync and async.
+Hosted models deliberately do not get salvage — a hosted model returning JSON prose must never have it silently interpreted as a tool call. Streaming: the sync and async loops build the full response text, then run recovery on the assembled buffer at end-of-stream, so a salvaged call still dispatches. Raw call text is still visible while the reply streams.
 
 If the response also carries a native `tool_calls[]` entry, that is dispatched — text-based recovery only runs when `tool_calls[]` is empty. So a well-formed native call is never overridden by prose the model happened to also include.
 
@@ -326,7 +413,7 @@ graph TB
     Native -->|No| Marker{🔎 Any marker in content?}
     Marker -->|No| Prose[💬 Treat as prose]
     Marker -->|Yes| Mask[🧯 Mask fenced code]
-    Mask --> Parse[🧩 Scan 3 dialects]
+    Mask --> Parse[🧩 Scan 6 dialects]
     Parse --> Allow{🛡 In allowlist?}
     Allow -->|No| Drop[🚫 Discard]
     Allow -->|Yes| Order[🔢 Sort by text position]
