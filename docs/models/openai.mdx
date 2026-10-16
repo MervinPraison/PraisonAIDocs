@@ -138,6 +138,42 @@ agent.chat("Say done.")   # second turn — no fallback WARNING on stderr
 The fallback **mechanism** is unchanged — on a real Responses failure the client still falls back to Chat Completions, so answers are not lost. #5682 only stops the two spurious triggers above from firing.
 </Note>
 
+<Note>
+**Follow-up in [PR #5859](https://github.com/MervinPraison/PraisonAI/pull/5859) (merged 2026-10-16).** After #5682 rebinds the client on each sync turn, the *previous* loop's `AsyncOpenAI` is eventually garbage-collected. Before #5859 that GC fired `httpx.AsyncClient.aclose()` on whichever loop was running — raising `RuntimeError: Event loop is closed` and logging `Task exception was never retrieved` at ERROR level. The cached client is now built with `openai.DefaultAsyncHttpxClient()` (same timeouts, limits, redirects) so no cross-loop `aclose` task is scheduled from `__del__`.
+
+Sync `OpenAIClient.close()` also changed: it used to call `AsyncOpenAI.close()` without awaiting it (closing nothing). It now closes the sync client and drops the async client reference. Use `await client.aclose()` or `await agent.aclose()` for async teardown.
+</Note>
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="You are helpful", llm="gpt-4o-mini")
+agent.chat("Hi")
+agent.chat("Again")  # no asyncio ERROR lines on stderr
+```
+
+```mermaid
+sequenceDiagram
+    participant Sync as agent.chat() (sync)
+    participant Loop as asyncio.run (new loop)
+    participant GC as Python GC
+    participant Stale as Stale AsyncOpenAI
+
+    Sync->>Loop: start new sync turn
+    Loop->>GC: previous client dropped
+    GC->>Stale: __del__
+    alt Before #5859
+        Stale->>Loop: create_task(aclose())
+        Loop--xStale: RuntimeError: Event loop is closed
+    else After #5859
+        Stale-->>GC: no cross-loop task scheduled
+    end
+```
+
+<Tip>
+With `-W always::ResourceWarning`, dropped clients may still print `unclosed transport` lines. They are cosmetic — asyncio's transport finaliser releases the sockets, so nothing leaks.
+</Tip>
+
 Orphan `function_call_output` items are dropped while the Responses input is built — the client scans assistant `tool_calls` first, then keeps only the tool outputs whose `call_id` matches one it emitted.
 
 ```mermaid
