@@ -1,0 +1,30 @@
+/**
+ * Docs profile gate configuration — lighter merge gate (Sonnet assess, no FINAL chain required).
+ */
+module.exports = {
+  repoFullName: 'MervinPraison/PraisonAIDocs',
+  gitUser: 'MervinPraison',
+  gitEmail: '454862+MervinPraison@users.noreply.github.com',
+  triggerLogins: ['MervinPraison', 'github-actions[bot]'],
+  productPathPrefixes: ['docs/', 'src/'],
+  sensitivePathPatterns: [/^\.github\/workflows\//, /credentials\.json$/i],
+  requiredCheckPatterns: [/test/i, /lint/i, /nav/i, /build/i],
+  optionalCancelledChecks: ['detect-and-trigger'],
+  optionalCancelledWhenCoreGreen: [],
+  ciWorkflowFile: 'nav-check.yml',
+  ciWorkflowName: 'Navigation Consistency',
+  claudeWorkflowName: 'Claude Assistant',
+  mergeGateWorkflowRuns: ['Claude Assistant'],
+  ciFailureWorkflowRuns: [],
+  testCommand: "python3 scripts/check_nav.py",
+  docsUrl: 'https://docs.praison.ai',
+  architectureDoc: 'AGENTS.md',
+  finalClaudeScope: 'SCOPE: Focus ONLY on documentation and site content for PraisonAIDocs.',
+  finalClaudeProductValue: '4. Docs value: clear, accurate, beginner-friendly content only.',
+  mergeGateProductValue: 'Confirm docs change improves clarity without scope creep.',
+  mergeGateLayering: '',
+  agentPyChecks: false,
+  reviewBotLogins: ['coderabbitai[bot]', 'greptile-apps[bot]'],
+  orphanPrTitlePrefix: 'docs',
+  externalRepos: [],
+};
