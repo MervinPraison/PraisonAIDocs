@@ -1,7 +1,5 @@
 name: Auto PR Comment
 
-# Review chain: CodeRabbit (+ optional Greptile/Qodo/Gemini) → merge gate (no FINAL @claude PR comments).
-
 on:
   issue_comment:
     types: [created]
@@ -9,111 +7,29 @@ on:
     types: [submitted]
   pull_request:
     types: [opened, synchronize]
+  pull_request_target:
+    types: [opened, synchronize]
+  schedule:
+    # Hourly stale/missing-FINAL sweep. At push time the "wait for CI" debounce
+    # holds recovery back; this sweep re-posts the FINAL once the push settles.
+    - cron: '30 * * * *'
   workflow_dispatch:
-    inputs:
-      pr_number:
-        description: 'Optional PR number to sync pipeline labels'
-        required: false
-        type: string
 
 env:
   REVIEW_CHAIN_SKIP_COPILOT: '1'
-  GH_TOKEN: ${{ secrets.GH_TOKEN || github.token }}
+
+permissions:
+  issues: write
+  pull-requests: write
 
 jobs:
-  bot-pr-trigger-reviews:
-    if: |
-      github.event_name == 'pull_request' &&
-      github.event.action == 'opened' &&
-      (
-        github.event.pull_request.user.login == 'github-actions[bot]' ||
-        github.event.pull_request.user.login == 'praisonai-triage-agent[bot]' ||
-        github.event.pull_request.user.type == 'Bot'
-      )
-    runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Trigger CodeRabbit, Qodo, and Gemini reviews
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ env.GH_TOKEN }}
-          script: |
-            const path = require('path');
-            const chain = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/bot-pr-review-chain.js'));
-            const pr = context.payload.pull_request.number;
-            await chain.kickReviewChain(github, context.repo.owner, context.repo.repo, pr, core);
-            await github.rest.issues.createComment({
-              issue_number: pr,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: '@gemini review this PR',
-            });
-
-  pipeline-sync:
-    if: |
-      github.event_name == 'pull_request' ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
-      github.event_name == 'pull_request_review' ||
-      github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+  review-chain:
+    # Grant union of callee job permissions (repos with default_workflow_permissions: read
+    # reject reusable calls when the caller ceiling is lower than any callee job).
     permissions:
       issues: write
       pull-requests: write
-      actions: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Sync pipeline labels and dispatch merge gate when ready
-        uses: actions/github-script@v7
-        env:
-          PR_NUMBER_INPUT: ${{ github.event.inputs.pr_number }}
-        with:
-          github-token: ${{ env.GH_TOKEN }}
-          script: |
-            const path = require('path');
-            const mergeGate = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/merge-gate.js'));
-            const ps = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/pipeline-status.js'));
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const manual = (process.env.PR_NUMBER_INPUT || '').trim();
-
-            async function maybeDispatch(prNumber) {
-              const check = await mergeGate.evaluatePipelineQuiescent(
-                github, owner, repo, prNumber, core
-              );
-              await ps.syncPipelineLabels(github, owner, repo, prNumber, core);
-              if (!check.ready) {
-                core.info(`PR #${prNumber} not merge-ready: ${check.reasons.join(', ')}`);
-                return;
-              }
-              await github.rest.repos.createDispatchEvent({
-                owner,
-                repo,
-                event_type: 'claude-merge-gate',
-                client_payload: { pr_number: prNumber },
-              });
-              core.info(`Dispatched merge gate for PR #${prNumber}`);
-            }
-
-            if (manual) {
-              const prNumber = parseInt(manual, 10);
-              if (Number.isNaN(prNumber)) throw new Error(`Invalid pr_number: ${manual}`);
-              await ps.ensurePipelineLabels(github, owner, repo, core);
-              await maybeDispatch(prNumber);
-              return;
-            }
-
-            const prNumber =
-              context.payload.pull_request?.number ||
-              context.payload.issue?.number;
-            if (!prNumber) return;
-
-            await ps.ensurePipelineLabels(github, owner, repo, core);
-            await maybeDispatch(prNumber);
+    uses: MervinPraison/github-automation-template/.github/workflows/review-chain-callable.yml@v1.1.16
+    secrets: inherit
+    with:
+      hub_ref: v1.1.16
