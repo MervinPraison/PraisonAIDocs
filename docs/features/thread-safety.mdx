@@ -62,11 +62,15 @@ sequenceDiagram
 ```
 
 <Note>
-**`DualLock` real mutual exclusion (PraisonAI [PR #5338](https://github.com/MervinPraison/PraisonAI/pull/5338)):** `DualLock.sync()` and `DualLock.async_lock()` now back onto one shared `threading.Lock`, so a sync caller and a concurrent async caller are genuinely mutually exclusive. Same-thread `sync()` reentrancy is preserved via an explicit owner/depth guard, and the async acquire is offloaded to a worker thread so the event loop is never blocked while waiting for the mutex. Older releases used a `threading.RLock` for `sync()` and a per-event-loop `asyncio.Lock` for `async_lock()`, and the two never coordinated — upgrade to pick up the fix.
+**`DualLock` real mutual exclusion (PraisonAI [PR #5338](https://github.com/MervinPraison/PraisonAI/pull/5338)):** `DualLock.sync()` and `DualLock.async_lock()` now back onto one shared `threading.Lock`, so a sync caller and a concurrent async caller are genuinely mutually exclusive. Same-thread `sync()` reentrancy is preserved via an explicit owner/depth guard, and the async acquire is offloaded to a worker thread so the event loop is never blocked while waiting for the mutex. Older releases used a `threading.RLock` for `sync()` and a per-event-loop `asyncio.Lock` for `async_lock()`, and the two never coordinated — upgrade to pick up the fix. Since [PR #5879](https://github.com/MervinPraison/PraisonAI/pull/5879), an uncontended async acquire takes the mutex directly without a worker-thread hop; the offload only applies when the mutex is contended.
 </Note>
 
 <Note>
-**`AsyncSafeState.__enter__` reentrancy fix (PraisonAI [PR #5370](https://github.com/MervinPraison/PraisonAI/pull/5370)):** The backward-compatible `with state:` sync context-manager entry point now routes through `DualLock.sync()` instead of acquiring the underlying `threading.Lock` directly. This closes a self-deadlock: any same-thread code path that entered `AsyncSafeState` via `__enter__` and then triggered a nested `chat_history` mutation (which acquires the same lock via `DualLock.sync()`) would previously hang on the plain `threading.Lock`. After the fix, same-thread nested acquisitions are treated as re-entries, matching the `DualLock` reentrancy guarantee documented for #5338. No user-facing API changes — upgrade to pick up the fix.
+**`AsyncSafeState.__enter__` reentrancy fix (PraisonAI [PR #5370](https://github.com/MervinPraison/PraisonAI/pull/5370)):** The backward-compatible `with state:` sync context-manager entry point now routes through `DualLock.sync()` instead of acquiring the underlying `threading.Lock` directly. This closes a self-deadlock: any same-thread code path that entered `AsyncSafeState` via `__enter__` and then triggered a nested `chat_history` mutation (which acquires the same lock via `DualLock.sync()`) would previously hang on the plain `threading.Lock`. After the fix, same-thread nested acquisitions are treated as re-entries, matching the `DualLock` reentrancy guarantee documented for #5338. No user-facing API changes — upgrade to pick up the fix. **Follow-up in [PR #5879](https://github.com/MervinPraison/PraisonAI/pull/5879):** concurrent threads using `with state:` no longer overwrite each other's guard — see the note below.
+</Note>
+
+<Note>
+**`AsyncSafeState` concurrent-thread guard fix (PraisonAI [PR #5879](https://github.com/MervinPraison/PraisonAI/pull/5879)):** The `with state:` sync entry point now keeps a **per-thread guard stack** instead of one shared instance slot. Before #5879, two threads entering `with self._history_lock:` at the same time could overwrite each other's guard. One thread's `__exit__` then closed the other thread's half-entered guard, raising `ValueError: generator already executing` and dropping chat-history messages. In an 8-thread × 1500-iteration repro, `len(chat_history)` ended at ~16.5k instead of 24k (≈ 31% loss). With the fix, the same repro yields exactly `8 × N` entries with 0 errors. Nested same-thread `with state:` blocks still release correctly, and `copy.deepcopy(state)` stays safe because the `threading.local` is created lazily. No public API change — upgrade to pick up the fix.
 </Note>
 
 <Note>
@@ -332,6 +336,7 @@ with threading.ThreadPoolExecutor(max_workers=5) as executor:
 | Component | Lock Type | Reason |
 |-----------|-----------|--------|
 | `chat_history` | `AsyncSafeState` (DualLock: one shared `threading.Lock` for sync + async, [PR #5338](https://github.com/MervinPraison/PraisonAI/pull/5338)) | Genuine cross-context mutual exclusion; same-thread reentrant via owner/depth guard; async acquire offloaded so the event loop never blocks |
+| `AsyncSafeState.__enter__` / `__exit__` (sync `with state:`) | per-thread `threading.local` guard stack ([PR #5879](https://github.com/MervinPraison/PraisonAI/pull/5879)) | Each thread pops its own guard; nested same-thread entries still work; survives `copy.deepcopy` |
 | Handoff history seeding | per-target-agent `DualLock` attached lazily as `agent._handoff_seed_lock` | Serialises seed + chat per target agent so overlapping handoffs to one specialist can't interleave `chat_history` — see [Handoff seeding](#handoff-history-seeding) |
 | `_cache_lock` | `threading.RLock` | Allows reentrant access from cached helpers |
 | `PersistenceOrchestrator._cache_lock` | `threading.RLock` | Protects `_session_cache` reads/writes; the store is a bounded `OrderedDict` LRU (not a plain dict), and reads return `deepcopy()` to prevent shared mutable state |
@@ -606,7 +611,7 @@ PraisonAI's own fan-out (`PraisonAIAgents.arun_all_tasks`) uses `return_exceptio
 </Note>
 
 <Note>
-As of [PR #5338](https://github.com/MervinPraison/PraisonAI/pull/5338), `DualLock.sync()` and `DualLock.async_lock()` back onto **one shared `threading.Lock`**, so a sync caller and a concurrent async caller are genuinely mutually exclusive across contexts. Same-thread `sync()` reentrancy is preserved via an owner/depth guard, and async acquisition is offloaded to a worker thread so the event loop is never blocked. Older releases (PR #1567) used independent locks that did not coordinate across contexts.
+As of [PR #5338](https://github.com/MervinPraison/PraisonAI/pull/5338), `DualLock.sync()` and `DualLock.async_lock()` back onto **one shared `threading.Lock`**, so a sync caller and a concurrent async caller are genuinely mutually exclusive across contexts. Same-thread `sync()` reentrancy is preserved via an owner/depth guard, and contended async acquisition is offloaded to a worker thread so the event loop is never blocked (an uncontended acquire takes the mutex directly since [PR #5879](https://github.com/MervinPraison/PraisonAI/pull/5879)). Older releases (PR #1567) used independent locks that did not coordinate across contexts.
 </Note>
 
 ```mermaid
