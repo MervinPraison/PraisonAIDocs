@@ -1125,6 +1125,26 @@ agent = Agent(name="Assistant", instructions="Help users.")
 agent.start("My SSN is 123-45-6789")   # response is redacted before the user sees it
 ```
 
+Every lifecycle method may also be `async def` — the dispatcher awaits it. Reach for it when a hook does I/O, such as warming a cache at registration:
+
+```python
+from praisonaiagents import Plugin, PluginInfo
+
+class AsyncWarmup(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="warmup")
+
+    async def on_init(self, context):
+        # Awaited before the plugin receives any hook dispatch
+        self.cache = await warmup_cache()
+
+    async def on_shutdown(self):
+        await self.cache.aclose()
+```
+
+See [Sync or Async Hook Methods](#sync-or-async-hook-methods) for how async hooks run.
+
 <Warning>
 `PIIRedactor` uses `after_llm`, a conversation-content hook. If you install it from pip (third-party), it won't fire until you grant `plugins.pii_redactor.allow_conversation: true` — see [Conversation-Content Capability Gate](#security-conversation-content-capability-gate).
 </Warning>
@@ -1672,6 +1692,26 @@ Override `before_message`, `after_message`, `message_sent`, or `message_undelive
 <Warning>
 All four `message_*` methods are conversation-content hooks. A third-party plugin overriding them needs `allow_conversation: true` before they fire — see [Conversation-Content Capability Gate](#security-conversation-content-capability-gate). Bundled and first-party plugins are granted automatically.
 </Warning>
+
+<Tip>
+`before_message` may be `async def` — handy for calling an async policy service before the agent sees the message:
+
+```python
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, PluginDecision
+
+class AsyncMessagePolicy(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="async_message_policy", hooks=[PluginHook.BEFORE_MESSAGE])
+
+    async def before_message(self, msg):
+        if not await policy_allows(msg.get("sender_id"), msg.get("content")):
+            return PluginDecision.deny("Blocked by policy")
+        return None  # passthrough
+```
+
+Create any async client **inside** the hook — see the thread-isolation warning in [Sync or Async Hook Methods](#sync-or-async-hook-methods).
+</Tip>
 
 ### Choosing a message hook
 
@@ -2285,6 +2325,8 @@ Writing a `.toml` config requires `tomli_w`. Without it the CLI **fails fast** w
 The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `before_tool_definitions`, `before_message`) also accept a deny/block decision instead of a rewrite — see [Blocking Plugins](#blocking-plugins-guardrails--policies). `after_tool` additionally accepts a rewrite **or** block — see [Redact / Block Tool Output](/features/redact-tool-output).
 </Note>
 
+Every method in this table may be declared either `def` or `async def` — see [Sync or Async Hook Methods](#sync-or-async-hook-methods).
+
 | Plugin method | Hook event | Requires grant? | In-place mutation |
 |---------------|-----------|:---------------:|-------------------|
 | `before_agent(prompt, ctx)` | `BEFORE_AGENT` | 🔐 | Return a `str` → rewrites `data.prompt` |
@@ -2315,6 +2357,75 @@ The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `befor
 <Note>
 **`after_tool` is now a redaction / block seam, not an observer** (PraisonAI PRs [#3968](https://github.com/MervinPraison/PraisonAI/issues/3968) / [#3969](https://github.com/MervinPraison/PraisonAI/pull/3969)). A `Plugin.after_tool` return value is written back to the effective tool result before it reaches the model — mirroring `before_tool` (arg rewrite) and `after_llm` (response rewrite). Return a scrubbed value to redact, `PluginDecision.deny("reason")` to suppress, or raise `GuardrailBlocked("reason")` for the same effect via the exception form. See [Redact / Block Tool Output](/features/redact-tool-output).
 </Note>
+
+### Sync or Async Hook Methods
+
+Any method on `Plugin` — `before_tool`, `before_message`, `session_start`, `gateway_start`, `on_init`, `on_shutdown`, `on_config`, and the rest — may be `def` or `async def`. Sync hooks behave exactly as before; an async hook's coroutine is awaited before the next plugin's hook runs.
+
+```mermaid
+graph LR
+    subgraph "Plugin Hook Dispatcher"
+        H[📝 Hook Fires] --> M{🧠 Method Type?}
+        M -->|def| S[⚡ Call directly]
+        M -->|async def| B[🔁 Await on<br/>worker thread's loop]
+        S --> R[✅ Return value]
+        B --> R
+    end
+
+    classDef event fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class H event
+    class M,S,B check
+    class R result
+```
+
+```python
+import aiohttp
+from praisonaiagents import Agent, plugins
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, GuardrailBlocked
+
+class AsyncPolicyPlugin(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="async_policy", hooks=[PluginHook.BEFORE_TOOL])
+
+    async def before_tool(self, tool_name, args):
+        # Create the client inside the hook (see Warning below)
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://policy.example.com/check",
+                json={"tool": tool_name, "args": args},
+            ) as resp:
+                allowed = (await resp.json())["allowed"]
+        if not allowed:
+            raise GuardrailBlocked(f"{tool_name} denied by policy")
+        return args
+
+plugins.get_plugin_manager().register(AsyncPolicyPlugin())
+plugins.enable()
+
+agent = Agent(name="Policy-Guarded Agent", instructions="Help the user.", tools=["bash"])
+agent.start("Delete the temp folder")
+```
+
+`GuardrailBlocked` and `PluginDecision` from an async hook block exactly like their sync forms — the model sees the reason and the tool is skipped.
+
+<Note>
+An `async def` hook that doesn't finish within **60 seconds** is cancelled and its worker thread is freed; the timeout is handled like any other hook error and the run continues. Keep hook I/O bounded with an explicit client timeout.
+</Note>
+
+<Warning>
+Async hooks run on a **private event loop inside the hook-runner worker thread**, not on the gateway or async-agent loop. A long-lived client bound to the caller's loop (for example an `aiohttp.ClientSession` created at import time or in `gateway_start`) fails with *"attached to a different loop"*. Create async clients **inside** the hook, or use a thread-safe sync client.
+</Warning>
+
+Registration guarantees for an async `on_init`:
+
+- The plugin receives no hook dispatch until `on_init` finishes.
+- A failing `on_init` rolls the registration back — retrying with a fixed plugin works.
+- `on_init` may call back into the manager (`disable(name)`, `enable(name)`) without deadlocking, and a plugin that disables itself during `on_init` stays disabled.
 
 ---
 
@@ -2643,6 +2754,9 @@ Tools and guardrails work without `plugins.enable()`. But lifecycle-method plugi
 </Accordion>
 <Accordion title="Reach for PluginDecision before HookResult">
 `PluginDecision.deny(reason)` reads as one line and only needs the plugin import. Use `HookResult.deny(reason)` only when you already import it for another reason, and `raise GuardrailBlocked(reason)` only when you're inside a validator that already raises on failure. Prefer `block` over `deny` when the action is categorically forbidden; use `deny` when it's contextually refused (this input, this user, this time).
+</Accordion>
+<Accordion title="Use `async def` for I/O-bound hooks">
+Prefer `async def` when a hook calls an HTTP service, an async database, a queue, or a telemetry sink. Sync `def` is fine for pure-Python work (redaction, regex, local counters). Mixing both in one plugin is supported. Treat the 60-second per-hook deadline as a safety net — set your own client timeout.
 </Accordion>
 </AccordionGroup>
 
