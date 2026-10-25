@@ -5,7 +5,7 @@ description: "Build a new chat channel by subclassing BasePlatformAdapter — ch
 icon: "puzzle-piece"
 ---
 
-Subclass `BasePlatformAdapter` to add a new chat channel: implement four methods, declare capabilities, and inherit robust chunking, retry, typing, and edit-fallback delivery.
+Subclass `BasePlatformAdapter` to add a new chat channel: implement four methods, declare capabilities, and inherit robust chunking, retry, typing, and edit-fallback delivery. The runtime methods `Bot` / `BotOS` drive — `start`, `stop`, `send_message`, `probe`, `health` — are inherited too, so a four-method subclass runs under `Bot(...).run()` and `BotOS(...)` with no extra wiring.
 
 ```mermaid
 graph LR
@@ -117,6 +117,103 @@ class AcmeBot(BasePlatformAdapter):
 
 ---
 
+## Runtime methods you get for free
+
+A four-method adapter is a complete, runnable channel — register it and hand it an agent.
+
+```python
+from praisonaiagents import Agent, BasePlatformAdapter, SendResult
+from praisonaiagents.bots import PlatformCapabilities
+from praisonai.bots import Bot
+from praisonai.bots._registry import register_platform
+
+
+class AcmeBot(BasePlatformAdapter):
+    platform_name = "acme"
+    capabilities = PlatformCapabilities(max_message_length=4096)
+
+    def __init__(self, token=None, agent=None, config=None, **kwargs):
+        self.token, self.agent, self.config = token, agent, config
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True  # open the session and register your inbound listener
+
+    async def disconnect(self) -> None:
+        ...
+
+    async def send(self, chat_id, content, *, reply_to=None, metadata=None) -> SendResult:
+        message_id = await acme_api.send(chat_id, content, reply_to=reply_to)
+        return SendResult(ok=True, message_id=message_id, chat_id=chat_id)
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+register_platform("acme", AcmeBot)
+
+agent = Agent(name="Acme Assistant", instructions="Help the user.")
+Bot("acme", agent=agent, token="ACME_TOKEN").run()
+```
+
+<Note>
+`Bot` builds adapters with `token=` / `agent=` / `config=` keyword arguments, so your `__init__` must accept them.
+</Note>
+
+| Method | Inherited default |
+|--------|-------------------|
+| `start()` | Calls `connect(is_reconnect=...)`, raises `ConnectionError` if it returns `False` so the supervisor backs off, then holds until `stop()`. |
+| `stop()` | Releases the default `start()` wait, then calls `disconnect()`. A `stop()` that races a slow `connect()` is honoured. |
+| `send_message(channel_id, content, reply_to=None, thread_id=None)` | Routes through `deliver()` (format → chunk → typing → retry); `thread_id` is forwarded in `metadata`. |
+| `probe()` | `ProbeResult(ok=True)` while running; otherwise a `connect()` / `disconnect()` round-trip. |
+| `health()` | `HealthResult` with `ok`, `is_running`, and `uptime_seconds` from the default run state. |
+
+```mermaid
+graph TB
+    S[▶️ start] --> C{connect<br/>is_reconnect}
+    C -->|False| E[❌ ConnectionError<br/>supervisor backs off]
+    C -->|True| W[⏳ hold until stop]
+    W --> D[📴 disconnect]
+
+    classDef io fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef action fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class S io
+    class C decision
+    class E,W,D action
+```
+
+If `start()` is cancelled or fails, the default still calls `disconnect()`, so no half-open client is left behind.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Bot
+    participant Adapter as AcmeBot (defaults)
+    participant Platform as Acme API
+
+    User->>Platform: sends message
+    Platform->>Adapter: inbound (listener from connect())
+    Adapter->>Bot: route to agent
+    Bot->>Adapter: send_message(reply)
+    Note over Adapter: default send_message calls deliver()<br/>format + chunk + typing + retry
+    Adapter->>Platform: send() per chunk
+    Platform-->>User: reply chunks
+```
+
+### Probe and Health
+
+Gateway preflight and health checks work on any subclass without overrides.
+
+```python
+await adapter.probe()   # ProbeResult(ok=True, platform="acme", elapsed_ms=12.4, error=None)
+await adapter.health()  # HealthResult(ok=True, is_running=True, uptime_seconds=42.0, ...)
+```
+
+A failing `connect()` surfaces in `probe().error`, and the `platform` field reads your adapter's `platform_name` attribute when set. The default `probe()` opens and closes a real connection when the adapter is not running — override `probe()` with a cheaper credential check if your `connect()` is heavy.
+
+---
+
 ## How It Works
 
 `deliver()` formats, chunks, sends a typing heartbeat, then sends each chunk with retry — all keyed off capabilities.
@@ -154,14 +251,17 @@ graph TB
     Q1 -->|Long messages| Chunk[Keep default chunk<br/>or override for markdown]
     Q1 -->|Supports edits| Edit[Set supports_edit=True<br/>+ override edit_message]
     Q1 -->|Rate-limited| Retry[Return SendResult with<br/>retry_after from send]
+    Start --> Q2{Who owns the<br/>inbound loop?}
+    Q2 -->|Push / webhook / callback| Inherit[Inherit default start/stop<br/>connect registers the listener]
+    Q2 -->|Long-poll / library-owned loop| Own[Override start + stop<br/>run your loop until stopped]
 
     classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef action fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Start start
-    class Q1 decision
-    class Four,Chunk,Edit,Retry action
+    class Q1,Q2 decision
+    class Four,Chunk,Edit,Retry,Inherit,Own action
 ```
 
 ### Advertise honestly — the contract is verified at build time
@@ -222,6 +322,8 @@ Because a vanilla subclass already satisfies the protocol, hand the adapter itse
 
 ## Opting Out of Default Supervision
 
+The inherited `start()` is already a working push/callback loop, so most adapters never override it. Override `start()` (and `stop()` to unblock it) only when the platform has its own blocking loop — long-polling or a library-owned event loop.
+
 When `Bot(...)` runs your adapter, it wraps the inbound run loop in `ChannelSupervisor` by default — auto-reconnect with capped backoff plus health-based restart. Set the class attribute `supervised_inbound = False` when your adapter already manages its own reconnect loop:
 
 ```python
@@ -252,7 +354,7 @@ class MyAdapter(BasePlatformAdapter):
 | `True` (default, or unset) | Wraps `adapter.start()` in `ChannelSupervisor`. Your `start()` should raise on an unexpected drop so the supervisor can reconnect with backoff. |
 | `False` | Calls `adapter.start()` raw — no `ChannelSupervisor` wrap. Your adapter owns reconnect. |
 
-The supervised path drives the `start()`/`stop()` seam: `start()` runs the inbound source until stopped and raises on an unexpected drop; the default `stop()` delegates to `disconnect()` — override it if your `start()` blocks and needs an explicit unblock.
+The supervised path drives the `start()`/`stop()` seam: `start()` runs the inbound source until stopped and raises on an unexpected drop; the default `stop()` releases the default `start()` and calls `disconnect()` — override it if your own `start()` blocks and needs an explicit unblock.
 
 <Note>
 Built-in Telegram sets `supervised_inbound = False` because it already runs its own reconnect loop internally, and the relay transport opts out because the connector owns out-of-process reconnect.
@@ -328,6 +430,8 @@ graph TB
 ```
 
 An adapter that persists to a durable outbox returns `SendResult(ok=True, queued=True, ...)`, and one that re-sends after crash recovery returns `SendResult(ok=True, duplicate=True, ...)` — the `status` property derives automatically from those flags.
+
+`praisonai-bot`'s outbound delivery treats a `SendResult` with `status == "failed"` as a failed send, alongside a bare `False` return — so the default `send_message`, which returns `status="failed"` once `deliver()` exhausts retries, feeds the outbound retry router with no extra code. `None` returns still count as delivered. See [Send Error Taxonomy](/features/send-error-taxonomy).
 
 ---
 
