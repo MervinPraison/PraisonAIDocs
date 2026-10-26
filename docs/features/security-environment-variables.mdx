@@ -552,6 +552,29 @@ agent2.start("Summarise the project")
 # Prints: ⚠️ Output path outside project root: ../report.md
 ```
 
+### PRAISONAI_MAX_DOWNLOAD_BYTES
+
+Caps how many bytes `download_file` writes, so an endless or oversized response cannot fill the disk.
+
+**Security Risk**: Disk-exhaustion DoS from an unbounded download. This is a resource limit, not an SSRF gate — address checks are handled by the shared URL guard (see [`ALLOW_LOCAL_CRAWL`](#allow_local_crawl)).
+
+```bash
+# Tighten to 10 MiB
+export PRAISONAI_MAX_DOWNLOAD_BYTES=10485760
+
+# Loosen to 1 GiB
+export PRAISONAI_MAX_DOWNLOAD_BYTES=1073741824
+
+# Default - 100 MiB
+unset PRAISONAI_MAX_DOWNLOAD_BYTES
+```
+
+**Default**: unset → `104857600` bytes (100 MiB)  
+**Value shape**: integer bytes, read on every `download_file` call. A non-integer value makes the call fail with `{"success": False, "error": "Error downloading <url>: invalid literal for int() ..."}`.  
+**Affected Component**: `praisonaiagents.tools.file_tools.FileTools.download_file`
+
+**Over-cap behaviour**: writing stops and the call returns `{"success": False, "path": "", "size": 0, "error": "Download exceeds <N> bytes"}`. The partial `.part` temp file is removed and any existing file at the destination path is left untouched.
+
 ### ALLOW_LOCAL_CRAWL
 
 Bypasses SSRF protection for loopback, private, link-local, multicast, and unspecified IP addresses in web crawl tools, `OpenAPIToolset` and URL knowledge sources.
@@ -575,9 +598,15 @@ unset ALLOW_LOCAL_CRAWL
 - `praisonaiagents.tools.openapi_toolset.OpenAPIToolset._load` — `spec_url` is checked before fetch; a loopback/private URL raises `ValueError`.
 - `praisonaiagents.knowledge.knowledge.Knowledge._process_url` — URL knowledge sources go through `is_safe_http_url`; a loopback/private URL raises `ValueError("Refusing to fetch unsafe URL: ...")` before `MarkItDown.convert()` is called.
 - `praisonaiagents.tools.url_safety.is_safe_http_url` — accepts an explicit `allowlist` keyword; the web crawler, `OpenAPIToolset` and `Knowledge` use the no-allowlist path. SearXNG passes its own loopback allowlist (see [`SEARXNG_URL_ALLOWLIST`](#searxng-url-allowlist)).
+- `praisonaiagents.tools.url_safety.is_safe_http_url` also rejects any address where `not ip.is_global`, which covers shared/CGNAT space (`100.64.0.0/10`, e.g. Alibaba Cloud metadata at `100.100.100.200`) that the `is_private` check missed. Every caller above inherits this ([PR #5959](https://github.com/MervinPraison/PraisonAI/pull/5959)).
+- `praisonaiagents.tools.file_tools.FileTools.download_file` — uses the same guard with `allow_local=False` (see note below).
 
 <Note>
 `web_crawl` blocks loopback (`127.0.0.1`, `localhost`, `::1`) **by default** — set `ALLOW_LOCAL_CRAWL=true` to reach a local dev server. SearXNG reaches loopback **by design** and does **not** need this flag. That is why `localhost:32768` works for SearXNG search while `127.0.0.1` stays blocked for crawling.
+</Note>
+
+<Note>
+`download_file` does **not** honour `ALLOW_LOCAL_CRAWL`. The tool calls the shared guard with `allow_local=False` because it never had a local-access opt-in, so loopback/private hosts are refused even when `ALLOW_LOCAL_CRAWL=true`. (Fixed in [PR #5959](https://github.com/MervinPraison/PraisonAI/pull/5959).)
 </Note>
 
 `OpenAPIToolset` passes `follow_redirects=False` to `httpx.Client` for both the spec fetch and every operation call, so a 302 to an internal host cannot bypass the guard.
@@ -1050,6 +1079,7 @@ These environment variables address the following security vulnerabilities:
 | [#4189](https://github.com/MervinPraison/PraisonAI/issues/4189) | High | SSRF — loopback allowlist re-opened `web_crawl` to `127.0.0.1` | `SEARXNG_URL_ALLOWLIST` |
 | [#5943](https://github.com/MervinPraison/PraisonAI/pull/5943) | High | SSRF via `OpenAPIToolset` operation URLs, `spec_url` fetch, and `Knowledge._process_url` URL ingestion | `ALLOW_LOCAL_CRAWL` |
 | [#5820](https://github.com/MervinPraison/PraisonAI/issues/5820) | Medium | `.env` key leakage from the install tree — bare `load_dotenv()` loaded any `.env` above the module location, so API keys could silently come from a source checkout | n/a (fixed in-code; no opt-in required) |
+| [#5957](https://github.com/MervinPraison/PraisonAI/issues/5957) | High | SSRF via `download_file` (trailing-dot hosts, unresolvable hosts, ambiguous numeric IPs) + no byte cap + non-atomic destination write; CGNAT/shared space (`100.64.0.0/10`) not blocked by `is_safe_http_url` | `PRAISONAI_MAX_DOWNLOAD_BYTES`, `ALLOW_LOCAL_CRAWL` |
 
 **CVE IDs**: Pending assignment by GitHub Security Advisory system
 
