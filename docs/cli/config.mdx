@@ -56,7 +56,7 @@ praisonai config [OPTIONS] COMMAND [ARGS]...
 |---------|-------------|
 | `show` | Show fully resolved configuration |
 | `sources` | List configuration layers in precedence order |
-| `provenance [KEY]` | Show the resolved value of each key **and** which layer/file supplied it |
+| `provenance [KEY]` | Show the resolved value of each key **and** which layer/file supplied it, including a synthetic `run.model` key that reports the model a bare `run`/`chat`/`code` will actually dispatch |
 | `validate [FILE]` | Validate YAML syntax and schema |
 | `list` | List configuration values (`--scope all\|user\|project`) |
 | `get KEY` | Get a value by dotted path (e.g. `agent.model`) |
@@ -117,9 +117,10 @@ Prints the five-layer hierarchy and which global/project/env sources are current
 praisonai config provenance                     # all keys, text output
 praisonai config provenance agent.model         # one key
 praisonai config provenance agent.model --json  # machine-readable
+praisonai config provenance run.model           # the model a bare run will use
 ```
 
-Prints the reconciled resolved view: every key that survived the deep-merge, its winning value, its layer (`defaults` / `global` / `project` / `environment` / `cli`), and the absolute path of the file that supplied it (`(runtime)` for env / CLI / built-in defaults).
+Prints the reconciled resolved view: every key that survived the deep-merge, its winning value, its layer (`defaults` / `global` / `project` / `environment` / `cli`), and the absolute path of the file that supplied it (`(runtime)` for env / CLI / built-in defaults). It also adds a synthetic `run.model` key (below) which may report the extra `model-resolver` layer.
 
 Reach for this when `praisonai config show` returns a value you did not expect and you need to find *which* file set it.
 
@@ -163,6 +164,79 @@ JSON output (via the global `--json` flag):
 ```
 
 A missing key exits `1` with `Key not found: <key>`.
+
+#### The `run.model` key
+
+`run.model` reports the model that a bare `praisonai run`, `praisonai chat`, or `praisonai code` would actually dispatch — accounting for both the config layers above and the separate model-resolution chain used when no `agent.model` is set.
+
+```mermaid
+graph TB
+    A[praisonai config provenance run.model] --> B{agent.model configured?}
+    B -->|Yes| C[Mirror agent.model<br/>same value, layer, source]
+    B -->|No| D[Model resolver chain]
+    D --> E[layer: model-resolver<br/>source: winning rung]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A input
+    class B decision
+    class D process
+    class C,E output
+```
+
+When the `model-resolver` layer wins, `source` tells you which rung of the [default model ladder](/docs/features/local-first-run#detection-order) picked the model:
+
+| `source` | Meaning |
+|----------|---------|
+| `explicit` | Model passed explicitly — only from `explain_default_model(explicit=...)` in Python; `config provenance` never reports it |
+| `state:<path>` | Recent user-chosen model persisted at `<state_dir>/model.json` |
+| `env:MODEL_NAME` | `MODEL_NAME` env var is set |
+| `env:OPENAI_MODEL_NAME` | `OPENAI_MODEL_NAME` env var is set |
+| `local` | No cloud credential; a reachable local OpenAI-compatible server (e.g. Ollama) was detected |
+| `provider:<ENV_VAR>` | A provider credential (e.g. `provider:ANTHROPIC_API_KEY`) is present; its default model was picked |
+| `fallback` | None of the above; the terminal fallback (`gpt-4o-mini`) was picked |
+
+Configured in a project file:
+
+```
+$ praisonai config provenance run.model
+run.model = gpt-4o-mini
+  layer: project  source: /home/alice/proj/.praisonai/config.yaml
+```
+
+Set via `MODEL_NAME` (the environment layer feeds `agent.model`, exactly as `run` sees it):
+
+```
+$ MODEL_NAME=gpt-env praisonai config provenance run.model
+run.model = gpt-env
+  layer: environment  source: (runtime)
+```
+
+Nothing configured, Ollama running locally:
+
+```
+$ praisonai config provenance run.model
+run.model = ollama/llama3.2
+  layer: model-resolver  source: local
+```
+
+JSON output:
+
+```json
+{
+  "key": "run.model",
+  "value": "anthropic/claude-3-5-sonnet-latest",
+  "layer": "model-resolver",
+  "source": "provider:ANTHROPIC_API_KEY"
+}
+```
+
+<Note>
+**Why this exists ([PraisonAI #5906](https://github.com/MervinPraison/PraisonAI/issues/5906)).** The config layers alone do not reveal which model `praisonai run` picks, because the default model resolver has its own precedence chain. `run.model` makes that chain visible.
+</Note>
 
 ### `list`
 
@@ -333,6 +407,18 @@ print(provenance["agent.model"])
 # {'value': 'gpt-4o-mini', 'layer': 'project',
 #  'source': '/home/alice/proj/.praisonai/config.yaml'}
 ```
+
+To see which model a bare run would pick (and why) when `agent.model` is unset:
+
+```python
+from praisonai_code.cli.configuration.model_resolver import explain_default_model
+
+model, source = explain_default_model()
+print(model, source)
+# e.g. "anthropic/claude-3-5-sonnet-latest provider:ANTHROPIC_API_KEY"
+```
+
+`explain_default_model()` is side-effect free — it never persists a model or prints a notice.
 
 ---
 
