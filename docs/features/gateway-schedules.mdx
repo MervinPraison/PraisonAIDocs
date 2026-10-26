@@ -245,6 +245,49 @@ The gateway loads schedules best-effort so a single bad entry never blocks start
 
 ---
 
+## Tick Resilience
+
+The scheduler tick loop recovers from errors on its own, so one bad tick never stops your schedules.
+
+```mermaid
+sequenceDiagram
+    participant Loop as Tick loop
+    participant Policy as RunPolicy refresh
+    participant Tick as tick_all()
+    participant Log as Logger
+
+    Loop->>Policy: Rebuild policy from config
+    Policy-->>Loop: policy
+    Loop->>Tick: Run due jobs
+    alt tick ok
+        Tick-->>Loop: results
+        Note over Loop: failures = 0, sleep(interval)
+    else tick raises (e.g. EMFILE on store lock)
+        Tick-->>Log: Scheduler tick failed (N in a row)
+        Note over Loop: failures += 1, sleep with backoff
+    end
+    Note over Loop: Next tick runs, task stays alive
+```
+
+| Scenario | Behaviour |
+|----------|-----------|
+| Store lock `open()` fails with `EMFILE` | Logged with traceback; next tick retried with backoff |
+| `scheduler:` block hot-reloaded as a non-mapping (e.g. a list) | Warning logged; fail-closed defaults used; loop keeps ticking |
+| Any other exception in a tick | Logged with traceback; retried with backoff |
+| Gateway shutdown (`asyncio.CancelledError`) | Loop exits cleanly |
+
+- **Backoff** — after a failed tick the loop sleeps `min(interval * 2 ** min(failures, 10), 300)` seconds, so retries never wait longer than 5 minutes.
+- **Reset on success** — the first successful tick resets `failures` to `0` and the loop goes back to the normal `interval`.
+- **Visible, not silent** — each failure logs `Scheduler tick failed (N in a row)` with a full traceback, so a stuck store shows up in the logs even while chat channels and `/health` look fine.
+
+<Note>
+The startup log line reads `Scheduler tick started (interval=Ns)` and shows the real interval. Older releases always printed `15s`, whatever the interval was.
+</Note>
+
+> At 08:00 the `morning-brief` schedule is due, but the store lock file briefly hits `EMFILE`. The gateway logs the error, waits `interval × 2` seconds, retries, and the brief arrives a little late. No restart is needed.
+
+---
+
 ## CLI Reference
 
 ### `add`
