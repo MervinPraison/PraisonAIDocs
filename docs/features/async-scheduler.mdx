@@ -221,6 +221,8 @@ Since [PraisonAI PR #2628](https://github.com/MervinPraison/PraisonAI/pull/2628)
 
 <Note>
 **Persistence-failure safety** — If the schedule store can't persist the lease + advanced `last_run_at` for a due job (full disk, EIO, permission denied, failed atomic rename), `claim_due` releases the in-memory lease and returns an empty list instead of the claimed jobs. This preserves at-most-once on the exact failure path the lease exists to protect: without it, the runner would execute the job while the next poll — re-reading the unchanged file — would see the job as still due and fire a duplicate.
+
+Mutators fail loud on the same failure path — see [Store write durability](#store-write-durability).
 </Note>
 
 ```mermaid
@@ -266,6 +268,71 @@ The wrapper's `ScheduledAgentExecutor.tick()` does this automatically: it claims
 <Warning>
 `fcntl` / `msvcrt` locks are honored per host. Sharing one `FileScheduleStore` path across hosts only works on a filesystem that honors the lock — network filesystems like NFS do not reliably do so. Use a shared database-backed store for cross-host at-most-once instead.
 </Warning>
+
+---
+
+## Store write durability
+
+`FileScheduleStore` never silently loses run history or reports success for a write that didn't land. Introduced in [PraisonAI PR #5901](https://github.com/MervinPraison/PraisonAI/pull/5901) (fixes [#5899](https://github.com/MervinPraison/PraisonAI/issues/5899)).
+
+### Cross-process run history
+
+Two stores on the same `store_dir` — the scheduler daemon and a CLI process, or several gateway workers — can call `log_run()` concurrently and both records survive.
+
+- `log_run()` takes the cross-process file lock, reloads `history.json`, merges newest-first, trims to `max_history`, and writes atomically.
+- If `history.json` is unreadable (e.g. corrupt JSON), the new record stays in memory and is retried on the next `log_run()` instead of overwriting saved runs with a partial view.
+
+```python
+from praisonaiagents.scheduler import FileScheduleStore
+
+a = FileScheduleStore(store_dir="/tmp/schedules")
+b = FileScheduleStore(store_dir="/tmp/schedules")
+
+a.log_run("morning-brief", "succeeded", job_name="brief")
+b.log_run("digest", "succeeded", job_name="digest")
+
+# A fresh reader sees both records (newest first)
+reader = FileScheduleStore(store_dir="/tmp/schedules")
+print([r.job_id for r in reader.get_history()])  # ['digest', 'morning-brief']
+```
+
+```mermaid
+sequenceDiagram
+    participant Daemon
+    participant CLI
+    participant History as history.json
+
+    Daemon->>History: log_run() → lock, reload, merge, write
+    CLI->>History: log_run() → wait for lock
+    Note over History: CLI reloads the daemon's record before merging
+    CLI->>History: merge newest-first, trim, atomic write
+    Note over History: both records kept
+```
+
+### Fail-loud mutators
+
+`add(job)`, `update(job)`, `remove(job_id)`, and `remove_by_name(name)` **raise `OSError`** when the on-disk write fails (full disk, EIO, permission denied, serialisation error).
+
+- The store reloads its in-memory jobs from disk first, so `list()` / `get()` match what the next restart will see.
+- `SCHEDULE_ADD` / `SCHEDULE_REMOVE` hooks are not emitted for a failed write — see [Schedule Lifecycle Hooks](/features/schedule-lifecycle-hooks).
+- `ScheduleRunner.mark_run()` is the one exception: it catches and logs `OSError` from its post-run `remove` / `update`. The run already happened, and one bad write must not stop the scheduler loop.
+
+```python
+from praisonaiagents.scheduler import FileScheduleStore, ScheduleJob, Schedule
+
+store = FileScheduleStore(store_dir="/mnt/read-only")
+job = ScheduleJob(
+    name="brief",
+    schedule=Schedule(kind="every", every_seconds=3600),
+    message="Send Alice her morning brief",
+)
+
+try:
+    store.add(job)
+except OSError as e:
+    # SCHEDULE_ADD did not fire, and store.list() does not contain the job
+    print(f"schedule not saved: {e}")
+```
 
 ---
 
