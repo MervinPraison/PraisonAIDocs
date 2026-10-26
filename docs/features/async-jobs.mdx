@@ -152,8 +152,9 @@ app = create_app(store=SqliteJobStore(path="/var/lib/praisonai/jobs.db"))
 | `ENVIRONMENT` | *(unset)* | If `production` **and** `PRAISONAI_JOBS_DB_PATH` is unset, `create_app()` refuses to start (raises `RuntimeError`). |
 | `PRAISONAI_MAX_CONCURRENT_JOBS` | `10` | Executor concurrency cap. |
 | `PRAISONAI_JOB_TIMEOUT` | `3600` | Default per-job timeout, seconds. |
-| `PRAISONAI_JOBS_API_KEY` | *(unset)* | Required when binding to a non-loopback host. |
+| `PRAISONAI_JOBS_API_KEY` | *(unset)* | Required when binding to a non-loopback host. On loopback, an unset key logs a startup warning that any local process can submit jobs. |
 | `PRAISONAI_JOBS_BIND_HOST` | `127.0.0.1` | Listen address. |
+| `PRAISONAI_JOBS_AGENT_ROOT` | server cwd | Submitted `agent_file` paths must resolve under this directory, otherwise `400`. See [Jobs agent_file Root](/features/jobs-agent-file-root). |
 
 ### Which store should I use?
 
@@ -209,22 +210,41 @@ sequenceDiagram
 
 ### Restart Recovery
 
-On `SqliteJobStore` startup, `_reconcile_interrupted_jobs()` marks any row still in `QUEUED` or `RUNNING` as `FAILED`, with `error="Interrupted by service restart"` and `completed_at=now`.
+On `SqliteJobStore` startup, `_reconcile_interrupted_jobs()` marks rows still in `QUEUED` or `RUNNING` as `FAILED` (`error="Interrupted by service restart"`, `completed_at=now`) — but **only when the process that wrote the row is gone**.
 
-A crashed executor leaves no worker to resume its in-flight jobs, so those rows would otherwise poll forever and pin an idempotency key to a job that can never complete. Terminal reconciliation gives callers — and idempotent retries — a definitive outcome.
+A crashed executor leaves no worker to resume its in-flight jobs, so those rows would otherwise poll forever and pin an idempotency key to a job that can never complete. Every write stamps the row with an `owner` id (`<pid>:<proc_start>:<token>`), so a second worker sharing the same `jobs.db` leaves a live cohabiting worker's jobs alone.
+
+A row is reconciled when its owner is:
+
+- missing (a legacy row written before the `owner` column existed),
+- a pid that is no longer running, or
+- the same pid with a different process start time (the pid was reused, e.g. after a container restart).
 
 ```mermaid
 sequenceDiagram
-    participant Old as Process (crashed)
+    participant W1 as Worker 1 (live)
     participant DB as jobs.db
-    participant New as Process (restart)
+    participant Old as Worker 2 (crashed)
+    participant W2 as Worker 2 (restart)
 
-    Old->>DB: job J1 = RUNNING
-    Note over Old: crash — no executor left
-    New->>DB: _reconcile_interrupted_jobs()
-    DB-->>New: J1 was RUNNING
-    New->>DB: J1 = FAILED (error="Interrupted by service restart")
+    W1->>DB: J1 = RUNNING (owner = W1)
+    Old->>DB: J2 = RUNNING (owner = old W2)
+    Note over Old: crash
+    W2->>DB: _reconcile_interrupted_jobs()
+    DB-->>W2: J1 (owner alive), J2 (owner gone)
+    W2->>DB: J2 = FAILED (error="Interrupted by service restart")
+    Note over W1,DB: J1 keeps running untouched
 ```
+
+| Platform | Liveness probe | Reused-pid detection |
+|---|---|---|
+| Linux | `/proc/<pid>/stat` + `kill(pid, 0)` | Yes, via process start time |
+| Other POSIX (macOS, BSD) | `ps -o lstart=` + `kill(pid, 0)` | Yes, via `ps` start time |
+| Windows / unknown | No safe probe | Every non-terminal row is reconciled (pre-owner behaviour) |
+
+<Note>
+This is transparent to API callers: reconciled jobs still report `JobStatus.FAILED` through `/runs/<id>`. Existing databases gain the `owner` column automatically on the first `SqliteJobStore(...)` call.
+</Note>
 
 ## Backpressure & Admission Control
 
