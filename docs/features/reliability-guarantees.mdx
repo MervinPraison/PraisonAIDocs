@@ -327,15 +327,42 @@ sequenceDiagram
 
 ## Crash-safe persistence
 
-File-backed state is written atomically (PR [#5357](https://github.com/MervinPraison/PraisonAI/pull/5357)): the value is serialised first, written to a temp file in the same directory, `fsync`-ed, then swapped in with `os.replace`. A crash, OOM kill, or a non-serialisable value cannot truncate or corrupt the previous good file — the last-known-good state always survives.
+File-backed state is written atomically (PR [#5357](https://github.com/MervinPraison/PraisonAI/pull/5357), extended by PR [#5871](https://github.com/MervinPraison/PraisonAI/pull/5871)): the value is serialised first, written to a temp file in the same directory, `fsync`-ed, then swapped in with `os.replace`. A crash, OOM kill, or a non-serialisable value cannot truncate or corrupt the previous good file — the last-known-good state always survives.
 
 | State | Guarantee |
 |-------|-----------|
 | Permission rules & approvals | Atomic write — a downgraded `deny` rule after restart is impossible |
+| Learned policy rules (`policy/config.py`) | Atomic write with a unique temp file per write — safe for concurrent processes |
+| `PermissionAllowlist` | Atomic write; a corrupt file on load is quarantined and the allowlist starts empty (see below) |
 | Workflow checkpoints | Atomic write — a crash mid-write cannot force a restart from step 0 |
 | Plans & todos | Atomic write |
 | Cost reports | Atomic write |
 | Async JSON storage (`BaseJSONStorage.save_async`) | Serialise-first, then temp file + `os.replace` |
+| Knowledge incremental-index state | Atomic write |
+| Fast-context file index | Atomic write |
+| User YAML/TOML config | Atomic write; a symlinked config updates its target and the file mode is preserved |
+
+### Corrupt-allowlist quarantine (fail-closed)
+
+If `PermissionAllowlist.load(filepath)` reads a file that is not valid JSON (a torn write from an older build, a hand-edit, disk damage), the file is moved aside to `<filepath>.<pid>.<ns>.corrupt`, a warning is logged, and an **empty allowlist** is returned. No tool is implicitly allowed, so the agent fails closed — review the `.corrupt` file and re-add any rules you still want.
+
+```python
+from praisonaiagents.approval import PermissionAllowlist
+
+allowlist = PermissionAllowlist.load("allow.json")  # corrupt file → [] and allow.json.*.corrupt
+print(allowlist.list_tools())
+```
+
+### Remote calls have deadlines
+
+A stalled remote can no longer hang an agent indefinitely (PR [#5871](https://github.com/MervinPraison/PraisonAI/pull/5871)).
+
+| Call | Guarantee |
+|------|-----------|
+| Remote skill `git clone` / `rev-parse` | 120 s deadline and `GIT_TERMINAL_PROMPT=0`; on timeout the cached copy is used |
+| GitHub API requests in `ContextAgent` | 15 s socket timeout; the error reaches the caller's existing fallback |
+
+Local `git` operations (snapshots, worktrees) have no fixed deadline, so large repositories are not cut off mid-operation.
 
 <Note>
 No new imports or flags — the guarantee applies automatically to the built-in file-backed stores. See [Permissions](/features/permissions#crash-safe-rule-persistence), [Workflow Checkpoint Resume](/features/workflow-checkpoint-resume), and [JSON Persistence](/features/persistence-json).
