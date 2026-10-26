@@ -171,16 +171,16 @@ All LLM failures are classified into these 11 typed categories:
 
 | Kind | Triggers (examples) | Default Action | Retryable |
 |------|-------------------|----------------|-----------|
-| `auth` | `unauthorized`, `api key`, `authentication failed` | `rotate_profile` (if failover enabled) | Yes |
+| `auth` | `unauthorized`, `api key`, `authentication failed`, any HTTP `401` / `403` (even without the word "unauthorized") | `rotate_profile` (if failover enabled) | Yes |
 | `auth_permanent` | `invalid api key`, `incorrect api key` | `surface_error` | No |
-| `rate_limit` | `rate limit`, `429`, `resource_exhausted` | `retry` (with parsed/exponential backoff, max 60s) | Yes |
-| `overloaded` | `503`, `502`, `500`, `service unavailable` | `retry` (2s→4s→8s, capped at 30s) | Yes |
+| `rate_limit` | `rate limit`, `429`, `resource_exhausted`, `429 "Rate limit reached for API key …"` | `retry` (with parsed/exponential backoff, max 60s) | Yes |
+| `overloaded` | `503`, `502`, `500`, `service unavailable`, HTTP `503` with an empty body | `retry` (2s→4s→8s, capped at 30s) | Yes |
 | `context_overflow` | `maximum context length`, `context window is too long` | `surface_error` | No |
 | `idle_timeout` | `timeout`, `timed out`, `deadline exceeded` | `retry` until breaker hits 3, then `surface_error` | Yes (until breaker) |
-| `billing` | `insufficient quota`, `quota exceeded`, `payment required` | `surface_error` | No |
-| `model_not_found` | `model not found`, `unknown model` | `surface_error` | No |
+| `billing` | `insufficient quota`, `quota exceeded`, `payment required`, `credit balance`, `insufficient credit` | `surface_error` | No |
+| `model_not_found` | `model not found`, `unknown model`, HTTP `404` from a completion endpoint, exception named `NotFoundError` | `surface_error` | No |
 | `empty_response` | `empty response`, `json decode error` | `retry` (limited) | Limited |
-| `format_error` | `validation error`, `invalid json`, `schema error` | `surface_error` | No |
+| `format_error` | `validation error`, `invalid json`, `schema error`, a `400` whose body happens to contain digits like `500` / `8500` | `surface_error` | No |
 | `unknown` | anything else | `retry` for attempt ≤ 2, then `surface_error` | Limited |
 
 As of PR #1898, billing errors are explicitly added to the non-retryable list and are classified **before** rate-limit (so `quota exceeded` no longer double-matches as a rate-limit error). This means a quota-exhausted call now surfaces immediately instead of retrying with backoff.
@@ -193,6 +193,46 @@ An `auth` error with **no failover manager configured** now surfaces immediately
 
 <Note>
 `AgentErrorKind` (returned by `classify_error_kind()`) is the classifier the runtime consults for retry and failover decisions. A second, lower-level `classify_error()` in `praisonaiagents/llm/error_classifier.py` returns an older `ErrorCategory` enum used by some helpers and tests. The two can label the same phrase differently — for example, `quota exceeded` is `billing` here (non-retryable) but `RATE_LIMIT` in the lower-level classifier — because the higher-level one applies billing precedence. Read `AgentErrorKind` when deciding how a call will actually behave.
+</Note>
+
+### Status-code-first classification
+
+As of PraisonAI PR [#5841](https://github.com/MervinPraison/PraisonAI/pull/5841), `classify_error_kind` decides in two steps:
+
+1. **Category from the status code or exception type.** The HTTP status code (`401`, `404`, `429`, `503`, …) or the exception class picks the category — this is authoritative.
+2. **Kind refined by message text.** The message text can only pick a kind that is allowed for that category. A `400` can become `format_error`, `context_overflow`, `billing` and so on, but never `overloaded`.
+
+If the error has **no status code and no known exception type**, the message-text matching described above runs as before. Text matching is now the fallback, not the main path.
+
+If you upgraded, these errors now route differently:
+
+| Error | Before | Now | Effect |
+|-------|--------|-----|--------|
+| `400` whose body contains `8500` or `5003` | `overloaded` | `format_error` | A permanent bad request is surfaced, not retried |
+| `401` / `403` without the word "unauthorized" | `unknown` | `auth` | Profile rotation can now trigger |
+| `404` (e.g. `the model does not exist`) | `unknown` | `model_not_found` | Surfaced as a config error |
+| `503` with no body text | `unknown` | `overloaded` | Retried as an outage |
+| `429 Rate limit reached for API key …` | `auth` | `rate_limit` | Retried with rate-limit backoff |
+| `400` mentioning `credit card` (e.g. image content) | `billing` | `format_error` | No longer read as a quota problem |
+| `400` with `credit balance` / `insufficient credit` | `billing` | `billing` | Unchanged |
+
+The billing keyword was narrowed from the bare word `credit` to `credit balance` / `insufficient credit`, so text such as `credit card` no longer counts as a billing error.
+
+## Retry-After Header
+
+When a provider sends a `Retry-After` response header, the retry loop waits that long instead of the 1 s default. `resolve_failover_decision` passes the exception itself to the delay parser, so the header is read straight from the response.
+
+For example, a `429` with `Retry-After: 37` gives `FailoverDecision.backoff_ms == 37000` — the agent waits 37 s, not 1 s. The wait is still capped (300 s by default, or the rate limiter's `max_retry_delay`).
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Polite Agent", instructions="Summarise the report")
+agent.start("Summarise this quarter's sales")  # waits as long as the provider asks on a 429
+```
+
+<Note>
+If you write your own retry logic around `LLM._parse_retry_delay`, pass the exception rather than `str(error)` so the header is honoured. Passing a string still works.
 </Note>
 
 ## FailoverDecision Structure
