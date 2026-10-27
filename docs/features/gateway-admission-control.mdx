@@ -142,6 +142,10 @@ sequenceDiagram
 | `QUEUE` | At ceiling, queue has room | Brief wait, then response |
 | `REJECT` | Queue full and policy is `reject` (or `shed_oldest` can't evict) | Friendly busy acknowledgement |
 
+<Note>
+An admitted turn parked on a human approval releases its slot until the approver decides — see [Admission during human approval](#admission-during-human-approval).
+</Note>
+
 ---
 
 ## Configuration Options
@@ -264,6 +268,7 @@ print(bot.admission_stats)
 #   "max_concurrent_runs": 32, "queue_depth": 128,
 #   "max_concurrent_runs_per_scope": 4,   # ← per-tenant sub-limit (0 when disabled)
 #   "in_flight": 12, "queued": 3,
+#   "awaiting_human": 2,   # ← admitted turns parked on a human approval, not holding a slot
 #   "admitted": 1247, "rejected": 0, "shed": 0,
 #   "max_rss_mb": 0.0,   # ← memory-aware ceiling (0.0 when disabled)
 # }
@@ -415,6 +420,7 @@ bot.admission_stats
 # {
 #   "max_concurrent_runs": 32, "queue_depth": 128,
 #   "in_flight": 4, "queued": 0,
+#   "awaiting_human": 0,
 #   "admitted": 1247, "rejected": 3, "shed": 0,
 #   "max_rss_mb": 1024.0,     # ← the configured hard ceiling (0.0 when disabled)
 # }
@@ -535,6 +541,81 @@ With `max_concurrent_runs=32` and `max_concurrent_runs_per_scope=4`:
 
 ---
 
+## Admission during human approval
+
+A turn parked on a human approval does not hold its slot — other turns can run while the approver decides.
+
+```mermaid
+graph LR
+    subgraph "Admission during human approval"
+        A[📥 Turn admitted] --> B[🤖 Agent runs]
+        B --> C[🔧 Tool needs approval]
+        C --> D[⏸️ Slot released<br/>awaiting_human +1]
+        D --> E[🙋 Human decides]
+        E --> F[▶️ Resume<br/>free slot or borrow]
+        F --> G[✅ Turn finishes<br/>debt repaid first]
+    end
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef wait fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef done fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,B input
+    class C,F process
+    class D,E wait
+    class G done
+```
+
+No configuration is needed. With `max_concurrent_runs=1`, a single pending approval no longer blocks every other turn:
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Gateway
+    participant Admission
+    participant Agent
+    participant Human
+    User->>Gateway: Inbound turn (A)
+    Gateway->>Admission: admit()
+    Admission-->>Gateway: ADMIT (slot held)
+    Gateway->>Agent: Run turn A
+    Agent->>Human: request_approval
+    Note over Admission: awaiting_human += 1<br/>slot released
+    User->>Gateway: Inbound turn (B)
+    Gateway->>Admission: admit()
+    Admission-->>Gateway: ADMIT (slot now free)
+    Gateway->>Agent: Run turn B
+    Human-->>Agent: Allow
+    Note over Admission: slot taken or borrowed<br/>awaiting_human -= 1
+    Agent-->>Gateway: Reply A
+    Gateway-->>User: Reply A
+```
+
+- **Every approval backend** — the slot is released while `ApprovalRegistry.approve_sync` / `approve_async` waits on the backend, so presentation (gateway), Slack, Telegram, Discord, HTTP and webhook approvals all behave the same.
+- **Sync and async approvals** — async approvals flip the slot on the gate's event loop directly; sync approvals running in a worker thread hop onto that loop without blocking it.
+- **Non-blocking resume** — when the human decides (or the approval times out), the turn takes a free slot if one exists; otherwise it **borrows** one that the next released slot repays. A sync approval parked in a thread-pool worker therefore cannot deadlock against a turn waiting for that worker.
+- **Parallel approvals** — every branch of a turn that requests several approvals at once (e.g. `asyncio.gather`) resumes already counted in `in_flight`.
+- **Cancellation-safe** — cancelling a parked turn (`/stop`, turn timeout) never double-releases or leaks a slot. See [Approval Turn Liveness](/features/gateway-approval-turn-liveness).
+
+<Warning>
+While a borrow is outstanding, `in_flight` can briefly exceed `max_concurrent_runs` by the number of resumed turns. New turns stay queued (or rejected) until it drops back. Avoid alerting on `in_flight > max_concurrent_runs` alone.
+</Warning>
+
+<Note>
+The per-session turn lock is deliberately **not** released: a second turn on the same session still waits while the first is parked, so agent state is never mutated mid-approval.
+</Note>
+
+### Reading the counters
+
+| Pattern | Meaning |
+|---|---|
+| `awaiting_human` high, `in_flight` low | Many turns are waiting on approvers — check approver responsiveness |
+| `in_flight` > `max_concurrent_runs` | Borrows outstanding after resume — normal, transient |
+| `in_flight` + `awaiting_human` ≫ `max_concurrent_runs` | Expected — parked turns have released their slots |
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
@@ -593,5 +674,14 @@ With `max_concurrent_runs=32` and `max_concurrent_runs_per_scope=4`:
   </Card>
   <Card title="Spend Budget" icon="dollar-sign" href="/features/gateway-spend-budget">
     Cap cumulative per-identity USD spend at admission
+  </Card>
+  <Card title="Approval Turn Liveness" icon="hand" href="/features/gateway-approval-turn-liveness">
+    What happens when a turn parked on an approval is cancelled.
+  </Card>
+  <Card title="Approval" icon="user-check" href="/features/approval">
+    Require human approval before tools run.
+  </Card>
+  <Card title="Human-in-the-Loop Review" icon="user-check" href="/features/human-in-the-loop-review">
+    Review agent actions before they take effect.
   </Card>
 </CardGroup>
