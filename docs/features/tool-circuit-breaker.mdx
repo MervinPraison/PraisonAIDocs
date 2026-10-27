@@ -35,6 +35,10 @@ This tool-level circuit breaker is separate from the new [LLM idle-timeout circu
 **Caller errors are now neutral to the breaker** as of [PR #5861](https://github.com/MervinPraison/PraisonAI/pull/5861) (merged 2026-10-26, fixes [#5860](https://github.com/MervinPraison/PraisonAI/issues/5860)). A tool that raises `ValueError`, `TypeError`, or `AttributeError` — or returns an error dict tagged `_praison_retryable: False` (schema mismatches, caller programming errors) — is recorded as **neither** a failure **nor** a success, so it can neither open the breaker for other callers nor close a half-open one. A tool that raises `RuntimeError` or returns a plain `{"error": …}` dict still counts as a failure on both the sync and async paths. Before this PR, a few invalid user inputs to a shared agent's tool could open the breaker for every caller. No config change is required to pick this up.
 </Note>
 
+<Note>
+**Caller-error neutrality was broadened** in [PR #6073](https://github.com/MervinPraison/PraisonAI/pull/6073) (merged 2026-10-27, fixes [#6072](https://github.com/MervinPraison/PraisonAI/issues/6072)). Nine exception types are now neutral: `ValueError`, `TypeError`, `AttributeError`, `LookupError` (so `KeyError` and `IndexError` too), `FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, and `PermissionError`. A missing key or a bad path from the model is a caller error, not an outage, so it neither counts toward the breaker nor gets retried. A bare `OSError`, `ConnectionError`, `TimeoutError`, or `RuntimeError` still counts as a failure. Sync and async paths share the same list. No config change is required.
+</Note>
+
 <Warning>
 **Retrieving a breaker by tool name alone no longer returns the runtime instance.** Because the registry key is now `tool_{id(agent)}_{function_name}`, calling `get_circuit_breaker("tool_my_tool")` builds a **fresh, disconnected** breaker — not the one protecting live calls. Use `get_circuit_breaker(f"tool_{id(agent)}_my_tool")`, or enumerate this agent's breakers with the [Observability](#common-patterns) pattern below. Cleanup is covered in [Agent Lifecycle Cleanup](/features/agent-lifecycle-cleanup).
 </Warning>
@@ -103,6 +107,7 @@ When a tool fails 5 times consecutively, subsequent calls return an error dictio
 #     "circuit_open": True,
 #     "agent_name": "Researcher",
 #     "session_id": "...",
+#     # Reads the live recovery_timeout: "60s" by default, "30s" if you set 30.0
 #     "remediation": "Wait for recovery_timeout (60s) or investigate recent tool failures."
 # }
 ```
@@ -225,7 +230,7 @@ graph TB
 | `failure_threshold` | `int` | `5` | Failures before opening |
 | `recovery_timeout` | `float` | `60.0` | Seconds before half-open probe |
 | `success_threshold` | `int` | `2` | Successes in half-open to close |
-| `timeout` | `float` | `30.0` | Per-call timeout |
+| `timeout` | `float` | `30.0` | Per-call timeout for standalone `CircuitBreaker` use only — not read by the per-tool breaker. Set tool timeouts with [`ToolConfig(timeout=…)`](/features/tool-timeout) |
 | `monitor_window` | `float` | `300.0` | Failure-rate window |
 | `enable_health_check` | `bool` | `True` | Enable periodic health probes. Triggered automatically when the circuit opens (works on **both** sync `call()` and async `acall()` paths, from [PR #5330](https://github.com/MervinPraison/PraisonAI/pull/5330)). Requires a running event loop; pure-sync callers with no loop fall back to `recovery_timeout`. |
 | `health_check_interval` | `float` | `30.0` | Health-check interval |
@@ -331,7 +336,7 @@ These exclusions apply to **both the sync and async** execution paths. On the as
 
 The breaker also treats **caller programming errors** as neutral. They count as neither failures nor successes, so they can neither open the breaker nor close a half-open one. Two triggers:
 
-- The tool raises `ValueError`, `TypeError`, or `AttributeError` (only these three — `RuntimeError`, `KeyError`, `OSError`, etc. still count as failures).
+- The tool raises one of nine caller-error types: `ValueError`, `TypeError`, `AttributeError`, `LookupError` (so `KeyError` and `IndexError` too), `FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, or `PermissionError`. A bare `OSError`, `ConnectionError`, `TimeoutError`, `RuntimeError`, or any other exception still counts as a failure.
 - The tool returns an error dict carrying `_praison_retryable: False`. The retry layer tags schema mismatches with this flag, so the breaker and the retry policy agree on what is a caller error vs a service outage.
 
 This applies identically to the sync (`CircuitBreaker.call`) and async (`CircuitBreaker.acall`) paths. Under the hood, caller errors are carried through the breaker as a `_NeutralOutcome` sentinel (private to the module) and unwrapped before the result reaches your agent — you never need to touch it.

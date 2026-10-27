@@ -135,7 +135,7 @@ sequenceDiagram
 | **Approval checks** | ✅ | ✅ |
 | **Argument type casting** | ✅ | ✅ |
 | **Circuit breaker** | ✅ | ✅ (parity restored in PR #4469)[^cb-async] |
-| **Tool timeout** | ✅ | ✅ |
+| **Tool timeout** | ✅ | ✅ (same per-agent pool — see [Timeout Controls](#timeout-controls)) |
 | **Doom-loop tracking** | ✅ | ✅ |
 | **Doom-loop approval override** (critical verdict → `doom_loop` approval) | ✅ | ✅ (parity restored in PR #4858)[^doomloop-approve-async] |
 | **Trace events** | ✅ | ✅ |
@@ -231,6 +231,10 @@ await agent.achat("Call unreliable API")  # May be blocked if failure rate is hi
 
 1. A **raised exception** inside the tool, **except** `ValueError`, `TypeError`, `AttributeError` — these are caller/programming errors, raised through `breaker.acall()` wrapped in a private `_NeutralOutcome` sentinel, then unwrapped and re-raised to the caller without changing the breaker's counters ([PR #5861](https://github.com/MervinPraison/PraisonAI/pull/5861)).
 2. A tool **result dict carrying `error`** — surfaced to the breaker through a `_ToolFailure` sentinel so the dict is preserved — **except** when the dict is tagged `_praison_retryable: False` (schema mismatch / caller error). Tagged dicts are neutral and returned to the caller as-is ([PR #5861](https://github.com/MervinPraison/PraisonAI/pull/5861)).
+
+<Note>
+[PR #6073](https://github.com/MervinPraison/PraisonAI/pull/6073) (merged 2026-10-27) broadened case (1) to nine neutral types: `ValueError`, `TypeError`, `AttributeError`, `LookupError` (so `KeyError` / `IndexError` too), `FileNotFoundError`, `FileExistsError`, `IsADirectoryError`, `NotADirectoryError`, and `PermissionError`. A bare `OSError`, `ConnectionError`, `TimeoutError`, or `RuntimeError` still counts as a failure, as does a `tool_timeout` expiry. The sync and async paths share the same list.
+</Note>
 
 Approval / permission / policy / guardrail denials **never** count as failures either — the async path excludes the same keys the sync `_ToolFailure` wrapper does: `approval_denied`, `permission_denied`, `approval_error`, `policy_denied`, `guardrail_denied`. A tool that raises `RuntimeError` or returns a plain `{"error": …}` dict still counts as a failure, so repeated outages still open the breaker.
 
@@ -329,7 +333,7 @@ See [Loop Guard](/features/loop-guard) for the full threshold table, tool classi
 
 ### Retry parity on the async path
 
-Raised exceptions on `agent.achat(...)` / `agent.execute_tool_async(...)` are now retried under `ToolConfig(retry_policy=RetryPolicy(...))`, matching the sync path (PR #4141) — programming errors (`ValueError`, `TypeError`, `AttributeError`) and `ToolExecutionError(is_retryable=False)` (including Loop Guard HALT) stay terminal. See [Tool Retry Policy](/features/tool-retry-policy) for the full policy reference.
+Raised exceptions on `agent.achat(...)` / `agent.execute_tool_async(...)` are now retried under `ToolConfig(retry_policy=RetryPolicy(...))`, matching the sync path (PR #4141) — caller errors (`ValueError`, `TypeError`, `AttributeError`, `LookupError`, and file-path errors such as `FileNotFoundError` / `PermissionError`) and `ToolExecutionError(is_retryable=False)` (including Loop Guard HALT) stay terminal. See [Tool Retry Policy](/features/tool-retry-policy) for the full policy reference.
 
 The reverse direction — **not** retrying when the tool asked not to be retried — is also at parity as of PR [#4299](https://github.com/MervinPraison/PraisonAI/pull/4299). `@tool(restart_safe=False)` / `.idempotent = False` runs exactly once on `agent.achat(...)` / `agent.execute_tool_async(...)`, matching the sync path. See [Tool Retry & Backoff → Retrying Non-Idempotent Tools](/features/tool-retry-backoff#retrying-non-idempotent-tools) for the full veto rules.
 
@@ -354,6 +358,47 @@ agent = Agent(
 # Timeout enforced in async mode
 await agent.achat("Use slow tool")  # Will timeout after 5 seconds
 ```
+
+#### Timed sync tools don't starve `asyncio.to_thread`
+
+Since [PR #6073](https://github.com/MervinPraison/PraisonAI/pull/6073), when `achat()` runs a **sync** tool under `ToolConfig(timeout=…)`, it uses the same per-agent worker pool as the sync path — not asyncio's shared default executor. A tool hung past its timeout only ties up an agent-scoped worker, so unrelated `asyncio.to_thread(...)` calls elsewhere in your app keep running.
+
+If every pool worker is busy, a new timed call starts at once on a spill thread (up to 8 per agent) instead of queueing behind a hung worker. Past that cap, the call is refused fast:
+
+```python
+{
+    "error": "Tool worker pool exhausted: ... Refusing to queue 'slow_tool'.",
+    "tool_pool_exhausted": True,
+    "_praison_retryable": False,
+}
+```
+
+This is the same signal described in [Tool-Call Executor Timeout](/features/tool-call-executor-timeout#structured-error-envelope) — fix the hung tool rather than raising the timeout.
+
+```mermaid
+graph TB
+    Call[🔄 Timed sync tool<br/>via achat] --> Free{Pool worker<br/>free?}
+    Free -->|Yes| Pool[👷 Per-agent pool]
+    Free -->|No| Cap{8 spill threads<br/>running?}
+    Cap -->|No| Spill[🧵 Spill thread]
+    Cap -->|Yes| Refuse[🚫 tool_pool_exhausted]
+    Pool --> Ok[✅ Result]
+    Spill --> Ok
+
+    classDef call fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef pool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Call call
+    class Free,Cap q
+    class Pool,Spill pool
+    class Ok ok
+    class Refuse bad
+```
+
+With no `tool_timeout` set, nothing changes — async sync-tool calls still use the default executor and are not throttled.
 
 ---
 
