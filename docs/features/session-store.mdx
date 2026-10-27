@@ -117,6 +117,51 @@ This is a fix relative to older releases. Before PraisonAI PR #4125, `PRAISONAI_
 `DEFAULT_SESSION_DIR` remains a readable, assignable module attribute — but is now resolved at access time. Reading it returns the live directory; assigning it (`store_module.DEFAULT_SESSION_DIR = "/some/path"`) pins the root process-wide.
 </Note>
 
+### On-disk filenames (collision-safe)
+
+Two different session ids never share a file. Each user keeps their own history, even when ids differ only in `.`, `@`, `:`, `/`, `+`, or spaces.
+
+```python
+from praisonaiagents import Agent
+
+alice = Agent(name="Assistant", memory={"session_id": "alice.smith@example.com"})
+other = Agent(name="Assistant", memory={"session_id": "alice_smith_example_com"})
+# Separate files — neither agent sees the other's history.
+```
+
+```mermaid
+graph LR
+    Id[session_id] --> Q{Only A-Z a-z 0-9 _ - ?}
+    Q -->|Yes| Safe[Same filename as before]
+    Q -->|No| Hashed[readable prefix + ~ + digest]
+    Hashed --> L{Legacy file present?}
+    L -->|Stored id matches| Move[Migrated to new path]
+    L -->|Stored id differs| Keep[Left alone, never served]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Id input
+    class Q,L,Hashed process
+    class Safe,Move output
+    class Keep warn
+```
+
+| Session id | File |
+|------------|------|
+| `user-42-chat` (only `[A-Za-z0-9_-]`) | `user-42-chat.json` — unchanged, no migration |
+| `alice.smith@example.com` (any other character) | `alice.smith_example_com~7dcd3a39ad3a8d21.json` |
+
+Other ids use `<readable[:64]>~<sha256(id)[:16]>.json`: the readable prefix replaces unsafe characters with `_` and is capped at 64 characters; the 16 hex digest of the full id keeps the mapping injective.
+
+- **Legacy migration** — a file written by an older release under the old lossy name is moved to the new path on first read, **only when its stored `session_id` equals the requested id**. A legacy file owned by a different id is never adopted.
+- **Ownership check on read** — if a loaded file's stored `session_id` differs from the requested id, it is never returned. The store logs a warning, starts a fresh session, and moves the foreign file to its owner's path (or sets it aside as `<name>.json.corrupt-<ts>` when that path is taken).
+- **Spill files** from [write-failure salvage](/features/session-persistence#write-failure-salvage) use the same filename stem.
+
+No code change is needed — existing sessions with safe ids keep their files. See PraisonAI issue [#6024](https://github.com/MervinPraison/PraisonAI/issues/6024) and PR [#6061](https://github.com/MervinPraison/PraisonAI/pull/6061).
+
 ## Portable export/import
 
 `DefaultSessionStore`, `SqliteSessionStore`, and `SqliteTranscriptStore` all implement `PortableSessionStoreProtocol`, so you can back up, migrate, or restore live conversation state as a versioned JSON payload.
@@ -154,7 +199,7 @@ agent.start("Remember I like tea.")
 agent.start("What do I like?")
 ```
 
-Default files live at `~/.praisonai/sessions/{session_id}.json`.
+Default files live at `~/.praisonai/sessions/{session_id}.json` for ids made of `[A-Za-z0-9_-]` — see [On-disk filenames](#on-disk-filenames-collision-safe) for other ids.
 
 </Step>
 
