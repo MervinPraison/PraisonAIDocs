@@ -1275,6 +1275,41 @@ asyncio.run(main())
 **Fixed in PraisonAI [PR #5774](https://github.com/MervinPraison/PraisonAI/pull/5774) ([issue #5773](https://github.com/MervinPraison/PraisonAI/issues/5773)).** Before #5774, the producer thread in `ManagedBackendBase.stream()` had no signalling path from the async consumer — a `break` / `aclose()` / `CancelledError` on the caller side only exited the async generator; the producer kept iterating SSE events and, on Anthropic, kept the server-side session running until `session.status_idle`, with every token billable. #5774 adds a `threading.Event` the consumer sets in its `finally` block, checks it at two points inside the producer (after `_ensure_session()` and at the top of every `_iter_events` chunk), and interrupts the backend from a daemon thread so the upstream run is torn down even when the producer is blocked waiting on a tool call.
 </Note>
 
+### Closing a sync managed stream early
+
+Since [PR #6073](https://github.com/MervinPraison/PraisonAI/pull/6073) (merged 2026-10-27), the sync generator from `agent.start(prompt, stream=True)` uses one hardened bridge whether or not your code already has a running event loop. Closing it early stops the backend cleanly.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", backend=my_managed_backend)
+
+stream = agent.start("Write a long report.", stream=True)
+print(next(stream))   # read one chunk
+stream.close()        # producer stops; the backend's own cleanup runs
+```
+
+- **Bounded buffer** — at most 64 chunks are buffered; a slow consumer pauses the producer instead of growing memory.
+- **Early close stops the producer** — `close()` (or garbage collection) signals the producer thread, which stops within ~100 ms.
+- **Backend cleanup runs** — the bridge calls `aclose()` on the backend's async generator, so its `finally` blocks execute.
+- **No shutdown hangs** — the producer runs on a daemon thread.
+- **Errors surface once** — a `RuntimeError` from the backend is raised to you exactly once; `backend.stream()` is never re-run.
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant Bridge as Sync bridge
+    participant Backend as backend.stream()
+
+    You->>Bridge: next(stream)
+    Bridge->>Backend: async for chunk
+    Backend-->>Bridge: chunk
+    Bridge-->>You: chunk
+    You->>Bridge: stream.close()
+    Bridge->>Backend: aclose()
+    Backend-->>Bridge: cleanup done
+```
+
 This path streams like any other `start(stream=True)` call — see [Choosing the Right Method](#choosing-the-right-method) and [Managed Runtime Protocol](/features/managed-runtime-protocol) for the backend contract.
 
 ---
