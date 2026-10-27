@@ -19,6 +19,10 @@ Looking for **bot-to-bot** reply-loop protection? See [Bot-to-Bot Loop Protectio
 Loop Guard now resets its per-turn state at the start of every `chat()` / `achat()` turn as of [PR #5764](https://github.com/MervinPraison/PraisonAI/pull/5764) (merged 2026-10-12, fixes [#5763](https://github.com/MervinPraison/PraisonAI/issues/5763)). Before this PR, `max_time_per_turn` and the per-turn tool-count thresholds accumulated for the life of the Agent — a long-lived bot, gateway, or chat UI could silently halt with `ToolExecutionError: [loop-guard] Turn time limit exceeded` after ~2 minutes of agent life. No config change is required to pick this up; every `Agent` already gets it.
 </Note>
 
+<Note>
+**Overlapping turns on a shared Agent now each get their own per-turn `LoopGuard`** as of [PR #5861](https://github.com/MervinPraison/PraisonAI/pull/5861) (merged 2026-10-26, fixes [#5860](https://github.com/MervinPraison/PraisonAI/issues/5860)). Each turn's guard shares the agent-level `LoopGuardConfig` but has its own tool counts, no-progress streak, and turn clock, bound to the turn via a `ContextVar` that is copied into tool worker threads. Before this PR, a gateway or bot serving overlapping requests on one `Agent` could HALT a later request with `No progress detected` because the shared guard had already crossed the threshold on another caller's traffic. `chat()` / `achat()` / `start()` / `astart()` and streaming all get this behaviour. `agent.execute_tool(...)` called outside a chat turn still uses the agent-level guard. No config change is required to pick this up.
+</Note>
+
 ```python
 from praisonaiagents import Agent
 
@@ -103,6 +107,8 @@ agent._loop_guard = LoopGuard(LoopGuardConfig(
 ))
 ```
 
+Per-turn guards reuse this guard's config (created lazily on the turn's first tool call), so one `agent._loop_guard = ...` reconfiguration applies to every subsequent turn, streaming or non-streaming, sync or async.
+
 </Step>
 
 <Step title="Turn it off">
@@ -156,7 +162,7 @@ sequenceDiagram
 | `BLOCK` | Tool execution replaced | `{"error": "[loop-guard] ...", "loop_blocked": True}` |
 | `HALT` | Non-retryable exception raised | `ToolExecutionError` propagates out |
 
-`check()` is bracketed by a `reset_turn()` at `_chat_impl` / `_achat_impl` entry, so every turn starts with fresh counts and a fresh time budget. Overlapping concurrent turns on the same Agent do **not** reset each other — an internal `_turns_in_flight` counter guards this. Agents with no tools never get a Loop Guard force-created.
+`check()` is bracketed by a `reset_turn()` at `_chat_impl` / `_achat_impl` entry, so every turn starts with fresh counts and a fresh time budget. Overlapping concurrent turns on the same Agent each get their own `LoopGuard` (same config, independent counters), so one caller's traffic can no longer exhaust another caller's per-turn limits. `agent.execute_tool(...)` called outside a chat turn still uses the agent-level guard. Agents with no tools never get a Loop Guard force-created.
 
 ---
 
@@ -447,6 +453,30 @@ agent._loop_guard = LoopGuard(LoopGuardConfig(
     mutating_halt_threshold=4,
 ))
 ```
+
+### Shared agent on a web server / gateway
+
+```python
+import threading
+from praisonaiagents import Agent
+
+def write_file(path: str) -> str:
+    """Write a file (distinct path each call)."""
+    return f"wrote {path}"
+
+# One Agent, reused across many overlapping requests
+agent = Agent(name="svc", instructions="Write the requested file.", tools=[write_file])
+
+def handle_request(i: int) -> str:
+    # Each chat() call is one turn, and each turn gets its own LoopGuard
+    return agent.chat(f"Write /tmp/out_{i}.txt")
+
+threads = [threading.Thread(target=handle_request, args=(i,)) for i in range(20)]
+for t in threads: t.start()
+for t in threads: t.join()
+```
+
+Each `chat()` / `achat()` turn, and each streaming generator, binds its own `LoopGuard` on a `ContextVar` that is copied into tool worker threads — so twenty overlapping writes to twenty different paths neither warn nor HALT each other.
 
 ### Long-lived agents
 
