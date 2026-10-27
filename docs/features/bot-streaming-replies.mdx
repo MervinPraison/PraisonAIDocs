@@ -246,9 +246,9 @@ Turning on streaming at the gateway is enough — the recipe surface participate
 
 | Channel | Live edits | Default edit interval | Text limit | Notes |
 |---------|------------|----------------------|------------|-------|
-| Telegram | Yes | platform default | 4096 | — |
+| Telegram | Yes | platform default | 4096 (UTF-16) | Replies over the cap auto-chunk: the placeholder is edited with chunk 1, the rest arrive as follow-on messages. |
 | Slack | Yes | 1.0s | 40000 | Threaded replies (`thread_ts` set, or `reply_in_thread: true`) bypass streaming and use the standard thread-aware send path. |
-| Discord | Yes | platform default | 2000 | Replies longer than 2000 chars auto-chunk via `_send_long_message` (placeholder deleted first, reply reference preserved). |
+| Discord | Yes | platform default | 2000 | Replies over the cap auto-chunk: the placeholder is edited with chunk 1, the rest arrive as follow-on messages (not `reference=`-tagged — the placeholder is already in the conversation). |
 | WhatsApp | No (single message) | — | 4096 | Single message. |
 | Email | No (single message) | — | unlimited | Single message. |
 
@@ -446,33 +446,41 @@ bot.configure_streaming(StreamingConfig(
 </Tab>
 </Tabs>
 
-### Discord: long replies auto-chunk
+### Long streamed replies auto-chunk (every channel)
 
-Discord enforces a **2000-character cap per message** — a streamed answer above the cap can't be delivered by editing a single placeholder, so the adapter switches to the chunked send path automatically.
+Every platform caps message length (Telegram 4096 UTF-16 units, Discord 2000 characters). A streamed answer above the cap can't be delivered by editing a single placeholder, so the shared `DraftStreamer` splits it automatically — the same way on Telegram, Discord, Slack, and any future adapter.
 
-When a streamed answer exceeds `min(config.max_message_length, 2000)` characters, the adapter:
+When the final answer, measured in the adapter's `length_unit`, exceeds the channel's `text_limit`, `finalize()`:
 
-1. deletes the placeholder, and
-2. sends the full answer via the existing `_send_long_message` chunker, preserving the Discord reply reference to the user's original message.
+1. splits it with `chunk_message` + `enforce_hard_cap` (paragraph → newline → sentence boundaries),
+2. edits the placeholder with chunk 1 (falling back to a fresh `send_message` if the edit fails), and
+3. sends chunks 2..N as follow-on messages through `adapter.send_message`.
 
-The user sees one coherent reply split across multiple messages, not a truncated or dropped answer. No config needed — this fallback is on whenever Discord streaming is enabled.
+The user sees one coherent reply split across multiple messages, not a truncated or dropped answer. No config needed — this is on whenever streaming is enabled.
 
 ```mermaid
 graph TB
     A["✨ Draft placeholder"] --> B["Agent produces answer"]
-    B --> C{"len(answer) > min(max_message_length, 2000)?"}
-    C -->|No| D["streamer.finalize(answer)"]
-    C -->|Yes| E["delete placeholder"]
-    E --> F["_send_long_message(channel, answer, reference=message)"]
+    B --> C{"Longer than text_limit<br/>(in length_unit)?"}
+    C -->|No| D["edit_message(placeholder, answer)"]
+    C -->|Yes| E["chunk_message + enforce_hard_cap"]
+    E --> F["edit_message(placeholder, chunk 1)<br/>fallback: send_message(chunk 1)"]
+    F --> G["send_message(chunk 2..N)"]
 
     classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
     classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
 
-    class A,D ok
-    class E,F warn
+    class A,D,F,G ok
+    class E warn
     class B,C q
 ```
+
+Follow-on chunks are **not** wrapped in `deliver_with_retry` — the adapter's `send_message` already retries and parks exhausted sends in the DLQ, so wrapping again would re-send a parked chunk and duplicate it. A failing follow-on chunk is logged and the remaining chunks still ship.
+
+<Note>
+Before [PraisonAI PR #6081](https://github.com/MervinPraison/PraisonAI/pull/6081), Discord handled this in the adapter (deleting the placeholder and re-sending with a reply reference) and Telegram dropped over-cap replies entirely. Both now use the shared streamer.
+</Note>
 
 ### Slack: threaded replies skip streaming (by design)
 
@@ -855,7 +863,7 @@ graph TB
 | `fail_streak >= disable_progressive_edits_after` | Progressive editing turns OFF for the rest of this stream. Subsequent token events skip `_perform_update`. The placeholder is left in place until `finalize()` |
 | Non-recoverable edit failure | Logged at WARNING. Fail streak does NOT increment; progressive stays enabled |
 | Successful edit | `fail_streak` resets to 0 (recovery) |
-| `finalize(final_content)` | Strip reasoning tags (if enabled), try edit-in-place, fall back to `send_message` if edit fails |
+| `finalize(final_content)` | Strip reasoning tags (if enabled), chunk if over `text_limit`, try edit-in-place, fall back to `send_message` if edit fails, then send any follow-on chunks |
 
 ---
 
@@ -1031,23 +1039,28 @@ The feature has zero impact on existing bots. Only channels with explicit `strea
 </Accordion>
 
 <Accordion title="Final delivery is guaranteed even when edits are flooded">
-When `finalize()` runs, the streamer first tries to edit the placeholder with the full answer. If that edit fails (or progressive editing was already disabled by a flood-control strike), the streamer falls back to a fresh `send_message` so you always receive the completed answer. No stale "🤔 Thinking…" placeholder is left behind.
+When `finalize()` runs, the streamer first measures the final answer against the channel's `text_limit` in the adapter's `platform_capabilities.length_unit`. If it fits, the placeholder is edited in place; if the edit fails (or progressive editing was already disabled by a flood-control strike), a fresh `send_message` delivers the full answer. If the answer is **over the cap**, it is split at paragraph/newline/sentence boundaries, the placeholder is edited with chunk 1 (falling back to `send_message` if the edit fails), and the remaining chunks are posted as follow-on messages. A failing follow-on chunk is logged and the rest still ship. No stale "🤔 Thinking…" placeholder is left behind.
 
 ```mermaid
 sequenceDiagram
-    participant Streamer
+    participant Streamer as DraftStreamer
     participant Adapter
     participant User
 
     Note over Streamer: finalize(final_content)
     Streamer->>Streamer: strip_reasoning_tags(final_content)
-    Streamer->>Adapter: edit_message(placeholder_id, final_content)
-    alt edit succeeds
-        Adapter-->>User: ✅ placeholder replaced with full answer
-    else edit fails
-        Adapter-->>Streamer: error
-        Streamer->>Adapter: send_message(final_content)
-        Adapter-->>User: ✅ fresh message with full answer
+    Streamer->>Streamer: measure in length_unit
+    alt within text_limit
+        Streamer->>Adapter: edit_message(placeholder, final_content)
+        Adapter-->>User: ✅ placeholder replaced (send_message fallback on edit failure)
+    else over text_limit
+        Streamer->>Streamer: chunks = enforce_hard_cap(chunk_message(...))
+        Streamer->>Adapter: edit_message(placeholder, chunks[0])
+        Adapter-->>User: ✅ chunk 1 of N
+        loop chunks[1:]
+            Streamer->>Adapter: send_message(chunk)
+            Adapter-->>User: ✅ chunk k of N
+        end
     end
 ```
 </Accordion>
@@ -1103,7 +1116,11 @@ By design. The shared `DraftStreamer` posts/edits its placeholder at the channel
 </Accordion>
 
 <Accordion title="My long Discord answer arrived as several messages instead of one live edit">
-Expected. Discord enforces a hard 2000-character cap per message. When a streamed answer exceeds `min(config.max_message_length, 2000)`, the adapter deletes the placeholder and delivers the full answer via `_send_long_message`, which chunks it across multiple messages while preserving the reply reference. Editing a single placeholder with >2000 chars would 400 and drop the whole reply.
+Expected. Discord enforces a hard 2000-character cap per message. When a streamed answer exceeds the cap, the shared `DraftStreamer` edits the placeholder with chunk 1 and posts chunks 2..N as follow-on messages. Editing a single placeholder with >2000 chars would 400 and drop the whole reply. Before [PraisonAI PR #6081](https://github.com/MervinPraison/PraisonAI/pull/6081) this chunking lived in the Discord adapter and deleted the placeholder; the shared streamer now does it the same way on every channel.
+</Accordion>
+
+<Accordion title="My long Telegram answer never arrived">
+Fixed in [PraisonAI PR #6081](https://github.com/MervinPraison/PraisonAI/pull/6081). Previously a streamed Telegram reply over the 4096 UTF-16 cap failed the final edit and the send fallback, and was lost with only a `DraftStreamer final send fallback also failed: ...` warning in the log. The shared streamer now chunks over-cap answers (measured in UTF-16 units) with the same splitter the non-streamed path uses. Upgrade `praisonai-bot` to pick up the fix.
 </Accordion>
 </AccordionGroup>
 
