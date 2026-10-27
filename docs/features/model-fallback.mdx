@@ -320,12 +320,98 @@ sequenceDiagram
 **Sync path stays clean.** The sync fallback still recurses through the full chat wrapper (which reads the current model for `BEFORE_LLM` hook attribution and budget), so it temporarily swaps the model. That mutate/restore window is now serialised by a lazily-created per-instance lock; only fallback turns contend on it — non-fallback turns never acquire it.
 
 <Note>
-**Custom-LLM caveat.** For custom-LLM agents, the async fallback path continues to use the shared dispatcher (the throwaway builder returns `None`), matching prior behaviour, because the custom client owns its own model.
+Custom-LLM agents get the same guarantee: each fallback runs on a throwaway per-call `LLM`, so the shared `llm_instance` is never mutated. See [Custom LLMs & provider/model strings](#custom-llms--providermodel-strings).
 </Note>
 
 <Note>
 No new configuration or lock code is required on your side — share one `Agent` under `asyncio.gather` and both fallback and chat-history stay correct. Reference: PR [#4593](https://github.com/MervinPraison/PraisonAI/pull/4593), issue [#4592](https://github.com/MervinPraison/PraisonAI/issues/4592).
 </Note>
+
+## Custom LLMs & provider/model strings
+
+Fallback works for every way of passing an LLM — `provider/model` strings, `llm={...}` dicts, agents built with a `base_url`, and model objects — on sync, async, and streaming turns.
+
+<Tabs>
+<Tab title="provider/model string">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.config import LLMConfig
+
+agent = Agent(
+    instructions="You are a helpful assistant",
+    llm=LLMConfig(
+        model="anthropic/claude-3-5-sonnet",
+        fallback_models=["openai/gpt-4o-mini"],
+    ),
+)
+agent.start("Answer even during an Anthropic outage")
+```
+</Tab>
+<Tab title="Custom base_url">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.config import LLMConfig
+
+agent = Agent(
+    instructions="You are a helpful assistant",
+    llm=LLMConfig(
+        model="model-a",
+        fallback_models=["model-b"],
+        base_url="http://localhost:11434/v1",  # kept for bare-name fallbacks
+        api_key="ollama",
+    ),
+)
+agent.start("Hello from the custom server")
+```
+</Tab>
+<Tab title="Model object">
+```python
+from praisonaiagents import Agent
+from praisonaiagents.llm import LLM
+
+agent = Agent(instructions="You are a helpful assistant", llm=LLM(model="ollama/llama3"))
+agent.fallback_models = ["openai/gpt-4o-mini"]  # set after construction for model objects
+agent.start("Answer even if the primary is overloaded")
+```
+</Tab>
+</Tabs>
+
+<Note>
+**Credentials stay with their provider.** When a fallback entry has a different `provider/` prefix from the primary (e.g. `ollama/llama3` → `openai/gpt-4o-mini`), the primary's `base_url`, `api_key`, and `auth` are dropped before the fallback call — set that provider's key through its usual environment variable. Bare names without a prefix are treated as the same server, so `base_url` and `api_key` are kept.
+</Note>
+
+<Note>
+**No replay after a tool ran.** If a tool already executed during the turn and the model then errors, the error is raised as before — fallback is skipped so side effects (sending an email, charging a card) never repeat. Auth (401) and bad-request (400) errors, `ToolExecutionError`, `BudgetExceededError`, and `InterruptedError` are also raised unchanged.
+</Note>
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Primary as anthropic/claude-3-5-sonnet
+    participant Fallback as openai/gpt-4o-mini
+
+    User->>Agent: "Summarise today's news"
+    Agent->>Primary: get_response
+    Primary-->>Agent: 503 overloaded
+    Note over Agent: should_fallback_model?<br/>build throwaway LLM<br/>emit MODEL_FALLBACK
+    Agent->>Fallback: retry same messages
+    Fallback-->>Agent: response
+    Agent-->>User: answer from gpt-4o-mini
+```
+
+```mermaid
+graph TB
+    Q{How are you passing the model?}
+    Q -->|"string, dict, or base_url"| A["LLMConfig(model=..., fallback_models=[...])"]
+    Q -->|"Model object"| B["agent.fallback_models = [...] after Agent(llm=obj)"]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef answer fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q question
+    class A,B answer
+```
 
 ## Configuration Options
 
@@ -349,6 +435,8 @@ agent.start("Hello!")
 |--------|------|---------|-------------|
 | `model` | `str` | — | Primary model the turn starts on. |
 | `fallback_models` | `Optional[List[str]]` | `None` | Ordered backup chain; the runtime advances to the next entry on a retryable failure. |
+
+For model-object agents (`llm=my_llm`), assign `agent.fallback_models = [...]` after construction. Entries can be model-id strings or ready-made LLM instances. A string entry becomes a fresh `LLM(model=...)` that reads credentials from the provider's environment variable; pass an `LLM(...)` instance instead when the fallback needs its own `base_url` or `api_key`.
 
 The decision diagram below shows which chain shape fits which scenario.
 
