@@ -6,6 +6,7 @@ and response processing. Extracted from agent.py for maintainability.
 """
 
 import asyncio
+import contextvars
 import os
 import re
 import time
@@ -24,12 +25,17 @@ logger = logging.getLogger(__name__)
 
 _turns_lock = threading.Lock()
 
+# Per-turn loop guard: ``[agent, LoopGuard | None]`` bound by ``_enter_turn``. Copied
+# into tool worker threads with the context, so each turn has its own counters and
+# overlapping turns on a shared agent never exhaust each other's limits.
+_turn_loop_guard = contextvars.ContextVar("praisonai_turn_loop_guard", default=None)
+
 
 def _enter_turn(agent, cancel):
     """Mark a ``chat``/``achat`` turn in flight and bind its cancel token to this context."""
     with _turns_lock:
         agent._turns_in_flight = getattr(agent, "_turns_in_flight", 0) + 1
-    return _active_turn_cancel.set((agent, cancel))
+    return _active_turn_cancel.set((agent, cancel)), _turn_loop_guard.set([agent, None])
 
 
 def _exit_turn(agent, ctx_token):
@@ -38,18 +44,36 @@ def _exit_turn(agent, ctx_token):
         return
     with _turns_lock:
         agent._turns_in_flight = max(getattr(agent, "_turns_in_flight", 1) - 1, 0)
-    try:
-        _active_turn_cancel.reset(ctx_token)
-    except (ValueError, LookupError):
-        _active_turn_cancel.set(None)
+    cancel_token, guard_token = ctx_token
+    for var, token in ((_active_turn_cancel, cancel_token), (_turn_loop_guard, guard_token)):
+        try:
+            var.reset(token)
+        except (ValueError, LookupError):
+            var.set(None)
+
+
+def _current_turn_loop_guard(agent):
+    """Return this turn's loop guard for ``agent`` (lazily created, sharing the agent
+    guard's config), or ``None`` when not inside one of ``agent``'s chat turns."""
+    slot = _turn_loop_guard.get()
+    if slot is None or slot[0] is not agent:
+        return None
+    with _turns_lock:
+        if slot[1] is None:
+            from ..escalation.loop_guard import LoopGuard
+            slot[1] = LoopGuard(agent._loop_guard.config)
+        return slot[1]
 
 
 def _reset_loop_guard_for_turn(agent):
-    """Reset per-turn loop-guard limits unless another turn on this agent is still
-    running (the guard is shared; resetting it would restart that turn's limits).
-    Never force-creates the guard."""
+    """Start fresh per-turn loop-guard limits. Inside a chat turn this drops the turn's
+    own guard; outside one it resets the agent-level guard. Never force-creates a guard."""
+    slot = _turn_loop_guard.get()
+    if slot is not None and slot[0] is agent:
+        slot[1] = None
+        return
     guard = getattr(agent, "_loop_guard", None)
-    if guard is not None and getattr(agent, "_turns_in_flight", 0) <= 1:
+    if guard is not None:
         guard.reset_turn()
 
 
@@ -1888,6 +1912,105 @@ Your Goal: {self.goal}"""
             self._openai_client = get_openai_client(api_key=getattr(self, 'api_key', None))
         return create_llm_dispatcher(openai_client=self._openai_client, model=model)
 
+    def _fallback_llm_for(self, model):
+        """Build a throwaway LLM bound to fallback ``model`` for the custom-LLM path.
+
+        Never assigned to ``self.llm_instance``, so concurrent turns keep the
+        primary model. A fallback entry that is already a model object is used
+        as-is. Option params (metrics, max_iter, retries, ...) are inherited;
+        connection settings (base_url, api_key, auth) only when the fallback
+        targets the same provider prefix as the primary.
+        """
+        if not isinstance(model, str):
+            return model
+        from ..llm.llm import LLM
+        params = dict(getattr(self, '_llm_init_params', None) or {})
+        primary = str(params.get('model') or self.llm or '')
+        # Bare names (no "provider/" prefix) share the configured server.
+        prefix = lambda name: name.split('/', 1)[0] if '/' in name else ''
+        if prefix(primary) != prefix(model):
+            for key in ('base_url', 'api_key', 'auth'):
+                params.pop(key, None)
+        params['model'] = model
+        return LLM(**params)
+
+    def _classify_custom_llm_fallback(self, error, failed_model, fallback_index):
+        """Return ``(next_model, category)`` if ``error`` warrants a model fallback."""
+        next_model = self._get_next_fallback_model(fallback_index)
+        if next_model is None:
+            return None, None
+        from ..llm.error_classifier import classify_llm_error
+        model_name = str(failed_model)
+        provider = model_name.split('/', 1)[0] if '/' in model_name else "openai"
+        classification = classify_llm_error(error, provider=provider, model=model_name)
+        if not classification.should_fallback_model:
+            return None, None
+        logging.info(f"[{self.name}] {model_name} unavailable — falling back to {next_model}")
+        return next_model, classification.error_category
+
+    @staticmethod
+    def _track_tool_runs(llm_kwargs):
+        """Return ``(llm_kwargs, ran)``; ``ran`` becomes non-empty once a tool executes.
+
+        A fallback replays the whole turn from the original messages, so it is
+        only safe while no tool has run (otherwise side effects would repeat).
+        """
+        import functools
+        import inspect
+        ran = []
+        fn = llm_kwargs.get('execute_tool_fn')
+        if fn is None:
+            return llm_kwargs, ran
+        if inspect.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def tracked(*args, **kwargs):
+                ran.append(True)
+                return await fn(*args, **kwargs)
+        else:
+            @functools.wraps(fn)
+            def tracked(*args, **kwargs):
+                ran.append(True)
+                return fn(*args, **kwargs)
+        return {**llm_kwargs, 'execute_tool_fn': tracked}, ran
+
+    def _custom_llm_get_response(self, llm_kwargs):
+        """Call ``llm_instance.get_response`` walking ``fallback_models`` on outage."""
+        llm, index, current = self.llm_instance, 0, self.llm
+        stream_cb = self.stream_emitter.emit if hasattr(self, 'stream_emitter') else None
+        llm_kwargs, tools_ran = self._track_tool_runs(llm_kwargs)
+        while True:
+            try:
+                return llm.get_response(**llm_kwargs)
+            except (ToolExecutionError, BudgetExceededError, InterruptedError):
+                raise
+            except Exception as e:
+                if tools_ran:
+                    raise
+                next_model, category = self._classify_custom_llm_fallback(e, current, index)
+                if next_model is None:
+                    raise
+                self._emit_model_fallback(current, next_model, category, index, stream_cb)
+                llm, index, current = self._fallback_llm_for(next_model), index + 1, next_model
+
+    async def _custom_llm_get_response_async(self, llm_kwargs):
+        """Async twin of :meth:`_custom_llm_get_response`."""
+        llm, index, current = self.llm_instance, 0, self.llm
+        stream_cb = self.stream_emitter.emit if hasattr(self, 'stream_emitter') else None
+        llm_kwargs, tools_ran = self._track_tool_runs(llm_kwargs)
+        while True:
+            try:
+                return await llm.get_response_async(**llm_kwargs)
+            except (ToolExecutionError, BudgetExceededError, InterruptedError):
+                raise
+            except Exception as e:
+                if tools_ran:
+                    raise
+                next_model, category = self._classify_custom_llm_fallback(e, current, index)
+                if next_model is None:
+                    raise
+                await self._aemit_model_fallback(current, next_model, category, index, stream_cb)
+                llm, index, current = self._fallback_llm_for(next_model), index + 1, next_model
+
     def _get_model_fallback_lock(self):
         """Lazily create the per-instance lock guarding model-fallback swaps.
 
@@ -2312,6 +2435,7 @@ Your Goal: {self.goal}"""
                     messages=messages,
                     response=str(final_response),
                     model=self.llm if isinstance(self.llm, str) else str(self.llm),
+                    tokens_used=_prompt_tokens + _completion_tokens,
                     latency_ms=(time.time() - start_time) * 1000
                 )
                 self._hook_runner.execute_sync(HookEvent.AFTER_LLM, after_llm_input)
@@ -3013,6 +3137,7 @@ Your Goal: {self.goal}"""
                     messages=messages,
                     response=str(final_response),
                     model=self.llm if isinstance(self.llm, str) else str(self.llm),
+                    tokens_used=_prompt_tokens + _completion_tokens,
                     latency_ms=(time.time() - _achat_start_time) * 1000
                 )
                 await self._hook_runner.execute(HookEvent.AFTER_LLM, after_llm_input)
@@ -3825,7 +3950,7 @@ Your Goal: {self.goal}"""
                     if hasattr(self, '_drain_steering_messages') and getattr(self, '_message_steering', None) is not None:
                         llm_kwargs['steering_drain'] = self._drain_steering_messages
 
-                    response_text = self.llm_instance.get_response(**llm_kwargs)
+                    response_text = self._custom_llm_get_response(llm_kwargs)
 
                     self._add_to_chat_history("assistant", response_text)
                     # Persist assistant message to DB
@@ -4216,11 +4341,17 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             except Exception as e:
                 logger.warning(f"Steering check failed, continuing without steering: {e}")
 
-        # Input-side guardrail validation (parity with sync chat()). No-op
-        # unless the guardrail exposes validate_input; runs before any
-        # backend/LLM dispatch so a rejected prompt never reaches the model.
+        # Input-side validators may perform blocking LLM calls. Keep them off
+        # the event loop, before any backend/LLM dispatch, just like tool guards.
         if hasattr(self, '_validate_input_with_guardrail'):
-            _in_ok, _in_prompt, _in_err = self._validate_input_with_guardrail(prompt)
+            _input_guard = self._guardrail_fn
+            if (_input_guard is None or not hasattr(_input_guard, "validate_input")
+                    or getattr(_input_guard, "_praison_output_only", False)):
+                _in_ok, _in_prompt, _in_err = self._validate_input_with_guardrail(prompt)
+            else:
+                _in_ok, _in_prompt, _in_err = await asyncio.to_thread(
+                    self._validate_input_with_guardrail, prompt
+                )
             if not _in_ok:
                 logging.warning(f"Agent {self.name}: input blocked by guardrail: {_in_err}")
                 return None
@@ -4552,7 +4683,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if hasattr(self, '_drain_steering_messages') and getattr(self, '_message_steering', None) is not None:
                         llm_kwargs['steering_drain'] = self._drain_steering_messages
 
-                    response_text = await self.llm_instance.get_response_async(**llm_kwargs)
+                    response_text = await self._custom_llm_get_response_async(llm_kwargs)
 
                     # LLM call succeeded - now it's safe to commit any compacted history
                     if effective_history is not self.chat_history:
@@ -5291,6 +5422,19 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
     def _start_stream(self, prompt: str, **kwargs) -> Generator[str, None, None]:
         """Own the durable context for the complete streaming generator."""
+        # A stream is a turn too: give it its own loop guard (as chat/achat get
+        # via _enter_turn) so overlapping streams on a shared agent neither
+        # exhaust nor inherit each other's per-turn limits.
+        guard_token = _turn_loop_guard.set([self, None])
+        try:
+            yield from self._start_stream_turn(prompt, **kwargs)
+        finally:
+            try:
+                _turn_loop_guard.reset(guard_token)
+            except (ValueError, LookupError):
+                _turn_loop_guard.set(None)
+
+    def _start_stream_turn(self, prompt: str, **kwargs) -> Generator[str, None, None]:
         # Tools go to their sandbox before the first model call, once per
         # agent. Placed on chat/achat/_start_stream rather than run/start
         # because AgentTeam and AgentFlow call these three directly -- an

@@ -2174,22 +2174,25 @@ class ToolExecutionMixin:
         Returns:
             Estimated minimum cost in USD for the call.
         """
-        prompt_chars = 0
+        texts = []
         if messages:
             for _msg in messages:
                 _content = _msg.get("content") if isinstance(_msg, dict) else None
                 if isinstance(_content, str):
-                    prompt_chars += len(_content)
+                    texts.append(_content)
                 elif isinstance(_content, list):
                     for _part in _content:
                         if isinstance(_part, dict):
                             _text = _part.get("text")
                             if isinstance(_text, str):
-                                prompt_chars += len(_text)
+                                texts.append(_text)
                 elif _content is not None:
-                    prompt_chars += len(str(_content))
+                    texts.append(str(_content))
 
-        prompt_tokens = prompt_chars // 4
+        from ..context.tokens import estimate_tokens_heuristic
+        prompt_text = "".join(texts)
+        prompt_chars = len(prompt_text)
+        prompt_tokens = estimate_tokens_heuristic(prompt_text)
         if max_tokens:
             completion_tokens = int(max_tokens)
         elif prompt_chars > 0:
@@ -3298,7 +3301,7 @@ class ToolExecutionMixin:
         """
         # Import circuit breaker components first (lazy import for performance)
         try:
-            from ..tools.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig, CircuitBreakerException
+            from ..tools.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig, CircuitBreakerException, _NeutralOutcome
         except ImportError:
             # Circuit breaker not available - fallback to direct execution
             logging.debug("Circuit breaker not available, falling back to direct tool execution")
@@ -3327,6 +3330,13 @@ class ToolExecutionMixin:
             # Execute tool through circuit breaker with failure detection wrapper
             def _tool_wrapper():
                 result = self._execute_tool_impl(function_name, arguments)
+                # Caller errors (bad input: ValueError/TypeError/AttributeError,
+                # tagged non-retryable) say nothing about the tool's health: record
+                # them as neither failure nor success, so they can neither open the
+                # breaker for other callers nor close a half-open one.
+                if isinstance(result, dict) and result.get("error") and \
+                   result.get("_praison_retryable") is False:
+                    raise _NeutralOutcome(result)
                 # Convert error dicts to exceptions so circuit breaker can detect failures
                 # Don't treat approval/permission denials as circuit breaker failures
                 if isinstance(result, dict) and result.get("error") and \
@@ -3345,6 +3355,8 @@ class ToolExecutionMixin:
             
             try:
                 return breaker.call(_tool_wrapper)
+            except _NeutralOutcome as n:
+                return n.value
             except Exception as e:
                 # Check if this is our sentinel exception
                 if hasattr(e, 'error_dict'):

@@ -457,11 +457,20 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             self._wire_deferred_history_callback()
 
     def _ensure_loop_guard(self):
-        """Lazy-create loop guard on first tool execution."""
+        """Lazy-create loop guard on first tool execution.
+
+        Inside a chat turn, returns that turn's own guard (same config) so
+        concurrent turns on a shared agent do not share per-turn counters."""
         if self._loop_guard is None:
             from ..escalation.loop_guard import LoopGuard, LoopGuardConfig
-            self._loop_guard = LoopGuard(LoopGuardConfig(enabled=True))
-        return self._loop_guard
+            config = LoopGuardConfig(enabled=True)
+            limit = getattr(self, "max_execution_time", None)
+            if limit is not None:
+                config.max_time_per_turn = float(limit) if limit > 0 else float("inf")
+            self._loop_guard = LoopGuard(config)
+        from .chat_mixin import _current_turn_loop_guard
+        turn_guard = _current_turn_loop_guard(self)
+        return turn_guard if turn_guard is not None else self._loop_guard
 
     def _ensure_loop_detector(self):
         """Lazy-create the result-aware tool-loop detector on first tool call.
@@ -4761,6 +4770,11 @@ Summary:"""
         effective_promise = completion_promise
         if effective_promise is None:
             effective_promise = self.autonomy_config.get("completion_promise")
+        # The promise is the only success signal, so tell the model about it
+        # unless the caller already did (e.g. the `loop` CLI instructions).
+        _promise_tag = f"<promise>{effective_promise}</promise>"
+        if effective_promise and _promise_tag not in prompt and _promise_tag not in (self.instructions or ""):
+            prompt = f"{prompt}\n\nWhen the task is fully complete, include {_promise_tag} in your response."
         
         # Get clear_context from config if not explicitly set
         effective_clear_context = clear_context
@@ -5003,7 +5017,7 @@ Summary:"""
                 # the task naturally (model stopped calling tools = done).
                 # This is the same signal the CLI/wrapper path trusts.
                 # ─────────────────────────────────────────────────────────────
-                if self._autonomy_turn_tool_count > 0 and len(response_str) > 100:
+                if not effective_promise and self._autonomy_turn_tool_count > 0 and len(response_str) > 100:
                     # P3/G2: Emit completion callback
                     execute_sync_callback('autonomy_complete',
                         completion_reason="tool_completion",
@@ -5040,7 +5054,8 @@ Summary:"""
                         if obs is not None:
                             obs.emit(_EvtType.STAGE_ESCALATE, {"from": prev_stage, "to": stage})
                 
-                # Check for completion promise FIRST (structured signal)
+                # Completion promise: when configured, it is the only success signal
+                # (heuristic exits above/below are skipped in promise mode)
                 if effective_promise:
                     promise_tag = f"<promise>{effective_promise}</promise>"
                     if promise_tag in response_str:
@@ -5062,7 +5077,7 @@ Summary:"""
                         )
                 
                 # Check for keyword-based completion signals (word-boundary, G-COMPLETION-1 fix)
-                if self._is_completion_signal(response_str):
+                if not effective_promise and self._is_completion_signal(response_str):
                     # P3/G2: Emit completion callback
                     execute_sync_callback('autonomy_complete',
                         completion_reason="goal",
@@ -5081,7 +5096,7 @@ Summary:"""
                     )
                 
                 # For DIRECT stage, complete after first response
-                if stage == "direct":
+                if not effective_promise and stage == "direct":
                     # P3/G2: Emit completion callback
                     execute_sync_callback('autonomy_complete',
                         completion_reason="goal",
@@ -5109,7 +5124,7 @@ Summary:"""
                 # Suppressed when doom recovery is active — once a doom loop
                 # is detected, no_tool_calls (a success exit) should not fire;
                 # the doom loop system manages termination instead.
-                if (self._autonomy_turn_tool_count == 0 and iterations > 1
+                if (not effective_promise and self._autonomy_turn_tool_count == 0 and iterations > 1
                         and not self._doom_recovery_active):
                     self._consecutive_no_tool_turns += 1
                     if self._consecutive_no_tool_turns >= 2:
@@ -5248,6 +5263,11 @@ Summary:"""
         effective_promise = completion_promise
         if effective_promise is None:
             effective_promise = self.autonomy_config.get("completion_promise")
+        # The promise is the only success signal, so tell the model about it
+        # unless the caller already did (e.g. the `loop` CLI instructions).
+        _promise_tag = f"<promise>{effective_promise}</promise>"
+        if effective_promise and _promise_tag not in prompt and _promise_tag not in (self.instructions or ""):
+            prompt = f"{prompt}\n\nWhen the task is fully complete, include {_promise_tag} in your response."
         
         # Get clear_context from config if not explicitly set
         effective_clear_context = clear_context
@@ -5470,7 +5490,7 @@ Summary:"""
                 # produced a substantive response, the inner loop completed
                 # the task naturally (model stopped calling tools = done).
                 # ─────────────────────────────────────────────────────────────
-                if self._autonomy_turn_tool_count > 0 and len(response_str) > 100:
+                if not effective_promise and self._autonomy_turn_tool_count > 0 and len(response_str) > 100:
                     return AutonomyResult(
                         success=True,
                         output=response_str,
@@ -5493,7 +5513,8 @@ Summary:"""
                         if obs is not None:
                             obs.emit(_EvtType.STAGE_ESCALATE, {"from": stage_order[idx], "to": stage})
                 
-                # Check for completion promise FIRST (structured signal)
+                # Completion promise: when configured, it is the only success signal
+                # (heuristic exits above/below are skipped in promise mode)
                 if effective_promise:
                     promise_tag = f"<promise>{effective_promise}</promise>"
                     if promise_tag in response_str:
@@ -5509,7 +5530,7 @@ Summary:"""
                         )
                 
                 # Check for keyword-based completion signals (word-boundary, G-COMPLETION-1 fix)
-                if self._is_completion_signal(response_str):
+                if not effective_promise and self._is_completion_signal(response_str):
                     return AutonomyResult(
                         success=True,
                         output=response_str,
@@ -5522,7 +5543,7 @@ Summary:"""
                     )
                 
                 # For DIRECT stage, complete after first response
-                if stage == "direct":
+                if not effective_promise and stage == "direct":
                     return AutonomyResult(
                         success=True,
                         output=response_str,
@@ -5543,7 +5564,7 @@ Summary:"""
                 # Suppressed when doom recovery is active — once a doom loop
                 # is detected, no_tool_calls (a success exit) should not fire;
                 # the doom loop system manages termination instead.
-                if (self._autonomy_turn_tool_count == 0 and iterations > 1
+                if (not effective_promise and self._autonomy_turn_tool_count == 0 and iterations > 1
                         and not self._doom_recovery_active):
                     self._consecutive_no_tool_turns += 1
                     if self._consecutive_no_tool_turns >= 2:
@@ -6524,7 +6545,8 @@ Summary:"""
                     # In async context - prefer async hook if available
                     if hasattr(self._memory_instance, 'aon_memory_write'):
                         # Schedule async hook without blocking (fire and forget)
-                        asyncio.create_task(self._memory_instance.aon_memory_write(action, memory_type, content, metadata))
+                        from ..utils.async_bridge import spawn_background
+                        spawn_background(self._memory_instance.aon_memory_write(action, memory_type, content, metadata), "aon_memory_write")
                     elif hasattr(self._memory_instance, 'on_memory_write'):
                         self._memory_instance.on_memory_write(action, memory_type, content, metadata)
                 except RuntimeError:
@@ -7085,6 +7107,9 @@ Answer:"""
 
     def _process_handoffs(self):
         """Process handoffs and convert them to tools that can be used by the agent."""
+        if not self.handoffs and not (isinstance(self.tools, list) and self.tools):
+            return
+
         # Import here to avoid circular imports
         from .handoff import Handoff
 
