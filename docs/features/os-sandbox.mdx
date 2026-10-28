@@ -5,7 +5,7 @@ description: "Kernel-enforced containment for agent shell commands — Seatbelt 
 icon: "shield-check"
 ---
 
-The OS sandbox puts a real `/bin/sh -c` inside a kernel-enforced filesystem jail — `sandbox-exec` (Seatbelt) on macOS, `bwrap` (bubblewrap) on Linux — and refuses to run unless it has measured that the jail actually blocks writes.
+The OS sandbox puts a real `/bin/sh -c` inside a kernel-enforced filesystem jail — `sandbox-exec` (Seatbelt) on macOS, `bwrap` (bubblewrap) on Linux — and refuses to run unless it has measured that the jail actually blocks writes. Under `PRAISON_SHELL=sandboxed` this applies to **every** `execute_command`, not only commands with shell operators.
 
 ```mermaid
 graph LR
@@ -61,11 +61,31 @@ Each platform uses its native primitive; everywhere else, no wrapper is built.
 
 | Platform | Backend | How it confines |
 |---|---|---|
-| macOS | `sandbox-exec` (Seatbelt) | Generated profile denies `file-write*` outside the writable set |
-| Linux | `bwrap` (bubblewrap) | Read-only root, workspace bind-mounted writable, network unshared |
+| macOS | `sandbox-exec` (Seatbelt) | Generated profile denies `file-write*` outside the writable set, and denies reads and writes under the masked secret dirs |
+| Linux | `bwrap` (bubblewrap) | Read-only root, workspace bind-mounted writable, `--tmpfs` over the masked secret dirs, `--unshare-pid`, network unshared |
 | Other | none | `build_wrapper()` returns `None` — containment unavailable |
 
-The writable set always includes the workspace and the temp dir; `network=False` denies network by default.
+---
+
+## Workspace and cwd
+
+The writable set is `PRAISONAI_WORKSPACE` (or the process cwd) plus `$TMPDIR`. The tool's `cwd=` argument must be inside that set, or the command is refused — the model cannot promote a path to writable by passing it as `cwd`. Network is denied by default.
+
+---
+
+## Environment and masked paths
+
+**Env scrub.** Variables whose names match `KEY|TOKEN|SECRET|PASSW|CREDENTIAL` (case-insensitive) are not passed into the jail. Entries passed explicitly through `execute_command(env=...)` are the allow-list and still go through.
+
+**Env applied inside the jail.** Explicit `env=` entries are set by `/usr/bin/env k=v …` inside the jail, never on the `bwrap` / `sandbox-exec` launcher — otherwise `LD_PRELOAD` and friends would load code before containment starts.
+
+**Masked dirs.** `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gcloud` and `~/.azure` are hidden (`--tmpfs` on bwrap, `deny file-read* file-write*` on Seatbelt). The rest of the filesystem stays readable because toolchains need it.
+
+**Own PID namespace (Linux).** `--unshare-pid` makes the fresh `/proc` show only the jail, so `/proc/<host pid>/environ` cannot reveal the scrubbed env.
+
+<Note>
+**Model cannot override the jail.** The tool-facing `execute_command` drops `mode`, `writable_paths` and `network` from its arguments — the jail is an operator decision.
+</Note>
 
 ---
 
@@ -95,7 +115,7 @@ sequenceDiagram
     Probe-->>execute_command: (True, 'seatbelt', 'blocked out-of-jail write')
     execute_command->>Model: approve? (critical risk)
     Model-->>execute_command: yes
-    execute_command->>Kernel: /bin/sh -c inside jail
+    execute_command->>Kernel: /bin/sh -c inside jail (own PID namespace on Linux)
     Kernel-->>Model: exit=0, contained
 ```
 
@@ -124,7 +144,7 @@ If `sandboxed` mode refuses because containment can't be proven, install the pri
 </Accordion>
 
 <Accordion title="Scope the writable set">
-The workspace and temp dir are writable by default. Keep other paths out so an escape attempt is a real out-of-jail write the kernel can deny.
+Set `PRAISONAI_WORKSPACE` to the project root; only it and the temp dir are writable. Keep other paths out so an escape attempt is a real out-of-jail write the kernel can deny.
 </Accordion>
 
 <Accordion title="Leave network off unless needed">

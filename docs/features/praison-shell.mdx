@@ -1,31 +1,31 @@
 ---
 title: "PRAISON_SHELL Modes"
 sidebarTitle: "Shell Modes"
-description: "Choose how praisonai code runs shell operators — refuse, sandboxed, or unsafe"
+description: "Choose how praisonai code runs agent shell commands — refuse operators, contain every command, or run uncontained"
 icon: "terminal"
 ---
 
-`PRAISON_SHELL` decides what `praisonai code` does when a command contains a shell operator (`>`, `|`, `&&`, `$(...)`): refuse it, run it inside an OS sandbox, or run it uncontained.
+`PRAISON_SHELL` picks the containment posture for every `execute_command` call in `praisonai code`: refuse shell operators, run **every** command inside an OS sandbox, or run operators in an uncontained shell.
 
 ```mermaid
 graph TB
-    Q{{"Command has a shell operator?<br/>>, |, &&, $(...)"}}
-    Off["PRAISON_SHELL=off (default)<br/>Refused — run steps separately"]
-    Sandboxed["PRAISON_SHELL=sandboxed<br/>Real /bin/sh -c inside Seatbelt/bwrap"]
-    Unsafe["PRAISON_SHELL=unsafe<br/>Real /bin/sh -c, NO containment"]
+    Cmd["🖥️ execute_command"] --> Mode{{"PRAISON_SHELL"}}
+    Mode -->|unset / off (default)| Off["Plain command → plain executor<br/>Operator → refused with hint"]
+    Mode -->|sandboxed| Jail{"🛡️ Probe enforcement"}
+    Jail -->|enforcing| Contained["Every command runs as<br/>/bin/sh -c inside Seatbelt / bwrap<br/>workspace writable, secrets scrubbed"]
+    Jail -->|not enforcing| Refuse["🚫 Refused — never degrade"]
+    Mode -->|unsafe (opt-in only)| Unsafe["Plain command → plain executor<br/>Operator → real /bin/sh, NO containment"]
 
-    Q -->|default| Off
-    Q -->|opt in| Sandboxed
-    Q -->|opt in| Unsafe
-
+    classDef input fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
-    classDef refuse fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef safe fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef danger fill:#8B0000,stroke:#7C90A0,color:#fff
 
-    class Q decision
-    class Off refuse
-    class Sandboxed safe
+    class Cmd input
+    class Mode,Jail decision
+    class Contained,Off safe
+    class Refuse warn
     class Unsafe danger
 ```
 
@@ -49,8 +49,8 @@ does not interpret. Do one of these instead:
 ```
 </Step>
 
-<Step title="Enable a real, contained shell">
-Set `PRAISON_SHELL=sandboxed` to run a real `/bin/sh -c` inside OS-native containment (Seatbelt on macOS, `bwrap` on Linux).
+<Step title="Contain every command">
+Set `PRAISON_SHELL=sandboxed` to run every command — with or without operators — as a real `/bin/sh -c` inside OS-native containment (Seatbelt on macOS, `bwrap` on Linux).
 
 ```bash
 PRAISON_SHELL=sandboxed praisonai code
@@ -68,15 +68,82 @@ exit=0 success=True sandbox=seatbelt
 
 ## The Three Modes
 
-`PRAISON_SHELL` (or the `mode=` argument to `execute_command`) selects one behaviour.
+`PRAISON_SHELL` selects one behaviour. It is an operator decision — the model cannot change it from a tool call.
 
 | `PRAISON_SHELL` | Behaviour |
 |---|---|
 | unset / `off` (default) | Shell syntax is **refused** with an error naming the operator and listing alternatives. Plain commands run exactly as before. |
-| `sandboxed` | A real `/bin/sh -c` inside OS-native containment. Refuses to run if containment can't be proven — see [OS Sandbox](/features/os-sandbox). |
-| `unsafe` | A real `/bin/sh -c` with **no** containment. Opt-in only, never a fallback. |
+| `sandboxed` | A real `/bin/sh -c` inside OS-native containment runs **every** command (with or without shell operators). The writable set is `PRAISONAI_WORKSPACE` (or the process cwd) plus `$TMPDIR`; a `cwd` outside it is refused. Secret-looking env vars (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSW*`, `*CREDENTIAL*`, case-insensitive) are stripped from the child; `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.azure` are masked. Refuses to run if containment can't be proven — see [OS Sandbox](/features/os-sandbox). |
+| `unsafe` | Operator commands run in a real `/bin/sh -c` with **no** containment; plain commands run as in `off`. Opt-in only, never a fallback. |
 
 Aliases resolve to these three: `1`/`true`/`yes`/`sandbox`/`native` → `sandboxed`; `raw`/`host` → `unsafe`; empty/`0`/`false`/`no`/`none` → `off`.
+
+---
+
+## What `sandboxed` protects against
+
+Containment is a property of the mode, not of the command's syntax. `rm -rf build`, `python x.py`, `pip install pkg` or `curl -o x.sh URL` have no operator, yet all run inside the jail.
+
+```python
+from praisonaiagents import Agent
+import os
+
+# Operator decision: contained execution for every shell command
+os.environ["PRAISON_SHELL"] = "sandboxed"
+os.environ["PRAISONAI_WORKSPACE"] = "/path/to/workspace"
+
+agent = Agent(
+    name="Builder",
+    instructions="Build the project and run the tests.",
+)
+
+agent.start("Build and test the current workspace")
+```
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant execute_command
+    participant Jail as Seatbelt / bwrap
+    participant Host
+
+    Agent->>execute_command: rm -rf build (no operator)
+    execute_command->>execute_command: resolve_mode() == sandboxed
+    execute_command->>Jail: probe_enforcement()
+    Jail-->>execute_command: enforcing
+    execute_command->>Jail: /bin/sh -c "rm -rf build"
+    Jail->>Host: write ./build (inside workspace) → allowed
+    Jail->>Host: write $HOME → DENIED
+    Jail-->>execute_command: exit=0, sandbox=bubblewrap
+    execute_command-->>Agent: contained result
+```
+
+---
+
+## Workspace, env, and secret masking
+
+| What | Under `sandboxed` |
+|---|---|
+| Writable root | `PRAISONAI_WORKSPACE`, else the process cwd — plus `$TMPDIR`. Nothing else is writable. |
+| `cwd=` argument | Must be inside the writable set; `cwd="/"` or your home directory is refused instead of becoming writable. |
+| Environment | Any variable whose name matches `KEY\|TOKEN\|SECRET\|PASSW\|CREDENTIAL` (case-insensitive) is stripped, so `env \| grep KEY` shows nothing. |
+| Explicit `env=` | Acts as the allow-list. Entries are applied **inside** the jail via `/usr/bin/env k=v …`, never on the launcher, so `LD_PRELOAD` cannot load code before containment starts. Names must match `^[A-Za-z_][A-Za-z0-9_]*$`. |
+| Secret directories | `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gcloud`, `~/.azure` are masked — `cat ~/.aws/credentials` returns nothing. The rest of the filesystem stays readable for toolchains. |
+| Processes (Linux) | `bwrap --unshare-pid` gives the jail its own PID namespace, so `/proc/<host pid>/environ` cannot leak the scrubbed env or masked paths. |
+
+---
+
+## Guarantees against model misuse
+
+The tool-facing `execute_command` drops `mode`, `writable_paths` and `network` from its arguments. A tool call cannot pick `mode="unsafe"`, `writable_paths=["/"]` or `network=True` — the mode and the jail are set by the operator through env vars.
+
+<Note>
+`run_in_background=True` is refused under `sandboxed`. The contained runner has no process registry, so a background request would block until the timeout killed the process the caller expected back. Run such commands in the foreground.
+</Note>
+
+**Cancellation.** A contained command stops when the agent is interrupted: the process tree is killed, output is capped, and the result reports `exit_code=130` with `error="Command interrupted by user"`.
+
+**ACP in sandboxed mode.** Headless `praisonai code -p` exposes `acp_execute_command`. Under `sandboxed`, its approved plan steps run inside the same jail with the workspace as the writable root, without a second approval prompt. Under `off` and `unsafe`, the ACP path still refuses `;`, `&`, `|`, `$` and backticks.
 
 ---
 
@@ -113,11 +180,13 @@ Detection looks for operators **outside** quotes, so ordinary strings are never 
 
 ## Approval
 
-The real-shell path is wrapped in `require_approval(risk_level="critical")` under the tool name `execute_command`.
+The real-shell path used by `execute_command` is wrapped in `require_approval(risk_level="critical")` under the tool name `execute_command`.
 
 <Warning>
 Both `sandboxed` and `unsafe` route through the same `critical`-risk approval as the plain executor — same tool identity, so existing allowlists and `path_overlap` serialisation still apply. Denying approval raises `PermissionError` and no file is written.
 </Warning>
+
+ACP plan steps under `sandboxed` reuse the plan-level approval and do not re-prompt per command.
 
 The approval wrap fails closed: if the approval machinery can't be imported, the real shell does not run.
 
@@ -143,6 +212,14 @@ agent.start("Build the project and save the log to build.log")
 ```
 
 The operator can instead launch the session with `PRAISON_SHELL=sandboxed` to allow real operators inside a jail.
+
+Under `sandboxed`, a command can be refused even without an operator:
+
+| Refusal | Fix |
+|---|---|
+| `cwd '…' is outside the sandbox workspace` | Run from inside `PRAISONAI_WORKSPACE`, or point `PRAISONAI_WORKSPACE` at the right project. |
+| `run_in_background is not supported` | Run the command in the foreground. |
+| `containment could not be proven on this machine` | Install the OS primitive (`bwrap` on Linux); set `PRAISON_SHELL=unsafe` only to accept an uncontained shell deliberately. |
 
 ---
 
