@@ -188,7 +188,7 @@ The reason is reset to `"completed"` at the start of every turn, so an `"error"`
 
 ## Tool Failure Behavior
 
-On the sync path, a tool failure resolves down one of three branches:
+On both `chat()` and `achat()`, a tool failure resolves down one of three branches:
 
 1. **Tool raises an exception** → the framework wraps it as `ToolExecutionError` and propagates it.
 2. **Tool returns `{"error": "..."}`** → the error dict is handed back to the LLM as a normal tool result, so the model can self-correct (new behavior since PR [#4462](https://github.com/MervinPraison/PraisonAI/pull/4462), confirmed in [#4470](https://github.com/MervinPraison/PraisonAI/pull/4470) which fixes issue [#4446](https://github.com/MervinPraison/PraisonAI/issues/4446). The generic-exception branch in `openai_client.py` behaves the same way.).
@@ -196,8 +196,8 @@ On the sync path, a tool failure resolves down one of three branches:
 
 ```mermaid
 graph TB
-    subgraph "Tool failure — sync path"
-        SReq[👤 chat request] --> SLLM[🤖 Model calls tool]
+    subgraph "Tool failure — sync (chat) and async (achat)"
+        SReq[👤 chat / achat request] --> SLLM[🤖 Model calls tool]
         SLLM --> STool{🔧 Tool result}
         STool -->|raises exception| SRaise[🛑 ToolExecutionError propagates]
         STool -->|returns error dict| SReturn[📄 Error dict returned to LLM<br/>LLM self-corrects]
@@ -224,9 +224,10 @@ Only three cases still raise / short-circuit on the sync path:
 - The dict is a **retryable transient** (`_outer_timeout` on an idempotent tool, `circuit_open`, or a `_praison_retryable` marker outside the tool's retry policy).
 </Note>
 
-Wrap sync `chat()` / `start()` calls in `try / except ToolExecutionError` to catch a **raised** tool exception:
+If your tool raises, your agent's turn ends — the same way whether you call `chat()` or `achat()`. Wrap both in `try / except ToolExecutionError`:
 
 ```python
+import asyncio
 from praisonaiagents import Agent, tool, ToolExecutionError
 
 @tool
@@ -238,6 +239,12 @@ agent = Agent(instructions="Use fetch.", tools=[fetch])
 
 try:
     agent.start("Fetch https://example.com")
+except ToolExecutionError as e:
+    print(f"Tool {e.tool_name} failed: {e.message}")
+
+# Async — raises the same ToolExecutionError
+try:
+    asyncio.run(agent.achat("Fetch https://example.com"))
 except ToolExecutionError as e:
     print(f"Tool {e.tool_name} failed: {e.message}")
 ```
@@ -264,7 +271,7 @@ agent.start("Fetch example.com and summarise.")
 **Behavior change (fix in PraisonAI PR #4252):** On the sync path, a tool that **raises** now raises `ToolExecutionError`. Previously the sync `Agent.chat()` silently returned `None` and, worse, the tool's error text was treated as an LLM error — so a tool message resembling a rate limit made the framework sleep and re-drive the model with no tool result, then return that hallucinated answer as a success. Callers checking `if agent.chat(...) is None:` should switch to catching the exception — `None` cannot distinguish a guardrail rejection from a tool failure anyway.
 </Warning>
 
-Sync and async paths are aligned for plain tool-returned `{"error": ...}` dicts — both hand the error back to the LLM so it can retry with corrected arguments. The two paths still differ for **raised** exceptions: sync `chat()` raises `ToolExecutionError`; async `achat()` returns an error dict. See [Async Tool Safety](/features/async-tool-safety).
+Sync and async paths are aligned ([PR #6109](https://github.com/MervinPraison/PraisonAI/pull/6109)). A tool that **raises** ends the turn with `ToolExecutionError` on both `chat()` and `achat()` — previously `achat()` handed the error to the model and returned its "the operation failed" reply as a success, so side-effecting tools (email, payments) could fail silently. A tool that **returns** `{"error": "..."}` is handed to the LLM as a normal tool result on both. See [Async Tool Safety](/features/async-tool-safety).
 
 ---
 
