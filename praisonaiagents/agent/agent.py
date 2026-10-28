@@ -12,7 +12,7 @@ from collections import OrderedDict
 import inspect
 
 # Decomposed agent functionality - real implementations in mixin files
-from .chat_mixin import ChatMixin
+from .chat_mixin import ChatMixin, _deadline_scope
 from .execution_mixin import ExecutionMixin
 from .memory_mixin import MemoryMixin
 from .async_memory_mixin import AsyncMemoryMixin
@@ -1917,6 +1917,17 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 "Use Agent(policy=PolicyEngine(...)) for tool policy enforcement, "
                 "or pass a validator via GuardrailConfig(validator=...)."
             )
+        # GuardrailConfig.on_fail has a single implemented policy (retry, then
+        # return the blocked message); refuse "skip"/"raise" rather than
+        # silently behaving as "retry".
+        if isinstance(_guardrails_config, GuardrailConfig) and (
+            getattr(_guardrails_config.on_fail, "value", _guardrails_config.on_fail) != "retry"
+        ):
+            raise ValueError(
+                f"GuardrailConfig.on_fail={_guardrails_config.on_fail!r} is not supported; "
+                "only 'retry' is implemented. Remove on_fail, or handle a blocked "
+                "response via Agent.last_guardrail_error."
+            )
 
         # Fail loud when the value could not be turned into an enforceable
         # guardrail, instead of storing something that never runs. Silently
@@ -3287,6 +3298,12 @@ Your Goal: {self.goal}
             if k in ("_db_run_context", "_db_session_init_lock"):
                 # A clone starts outside the source agent's active DB turn.
                 continue
+            elif k == "_tool_executor":
+                # Thread pools can't be copied; the clone lazily builds its own.
+                continue
+            elif k == "_Agent__hook_runner":
+                # Holds locks; rebuilt lazily on first use.
+                object.__setattr__(result, k, None)
             elif k in ("_Agent__cache_lock",):
                 object.__setattr__(result, k, threading.RLock())
             elif k in ("_cost_lock", "_auto_save_lock"):
@@ -4113,7 +4130,9 @@ Summary:"""
         step budget from ``ExecutionConfig.max_steps`` was reached and the run was
         truncated), a provider block/refusal/truncation
         (``"content_filtered" | "refused" | "length_truncated"``) derived from the
-        LLM ``finish_reason``/refusal signal, or ``"error"``. Lets CLI/CI callers
+        LLM ``finish_reason``/refusal signal, ``"timeout"`` (the turn passed
+        ``ExecutionConfig.max_execution_time`` or the ``run_autonomous``
+        deadline), or ``"error"``. Lets CLI/CI callers
         branch on the terminal reason instead of parsing a magic string. Reads
         from whichever backend (OpenAI-native or LiteLLM) executed the last turn.
         """
@@ -4731,7 +4750,7 @@ Summary:"""
             if result.success:
                 print(result.output)
         """
-        from .autonomy import AutonomyResult
+        from .autonomy import AutonomyResult, _timeout_result
         import time as time_module
         from datetime import datetime, timezone
         
@@ -4805,17 +4824,10 @@ Summary:"""
                 )
                 
                 # Check timeout
-                if timeout_seconds and (time_module.time() - start_time) > timeout_seconds:
-                    return AutonomyResult(
-                        success=False,
-                        output="Task timed out",
-                        completion_reason="timeout",
-                        iterations=iterations,
-                        stage=stage,
-                        actions=actions_taken,
-                        duration_seconds=time_module.time() - start_time,
-                        started_at=started_at,
-                    )
+                _timed_out = _timeout_result(
+                    timeout_seconds, iterations, stage, actions_taken, start_time, started_at)
+                if _timed_out is not None:
+                    return _timed_out
                 
                 # G2: Check for interrupt request (cooperative cancellation) - sync version
                 if self.interrupt_controller and self.interrupt_controller.is_set():
@@ -4838,9 +4850,17 @@ Summary:"""
                 # Reset the per-turn warning latch and inject any queued nudge.
                 turn_prompt = self._consume_self_correction(prompt)
                 try:
-                    response = self.chat(turn_prompt)
+                    with _deadline_scope(timeout_seconds and timeout_seconds - (time_module.time() - start_time)):
+                        response = self.chat(turn_prompt)
                 except Exception as e:
-                    return AutonomyResult(
+                    # The run deadline cancels an overrunning turn; report it as a timeout.
+                    # A budget stop keeps its typed budget_exhausted result when a cap applies.
+                    return _timeout_result(
+                        timeout_seconds, iterations, stage, actions_taken, start_time, started_at
+                    ) or (isinstance(e, BudgetExceededError) and self._autonomy_budget_result(
+                        iterations, stage, actions_taken, start_time, started_at,
+                        "", spend_baseline
+                    )) or AutonomyResult(
                         success=False,
                         output=str(e),
                         completion_reason="error",
@@ -4851,6 +4871,14 @@ Summary:"""
                         error=str(e),
                         started_at=started_at,
                     )
+                
+                # A turn that overran the run deadline or max_execution_time
+                # must not count as progress.
+                _timed_out = _timeout_result(
+                    timeout_seconds, iterations, stage, actions_taken, start_time, started_at,
+                    turn_timed_out=getattr(self, "_last_stop_reason", None) == "timeout")
+                if _timed_out is not None:
+                    return _timed_out
                 
                 response_str = str(response)
                 
@@ -5236,7 +5264,7 @@ Summary:"""
             
             asyncio.run(main())
         """
-        from .autonomy import AutonomyResult
+        from .autonomy import AutonomyResult, _timeout_result
         import time as time_module
         from datetime import datetime, timezone
         import asyncio
@@ -5288,17 +5316,10 @@ Summary:"""
                 iterations += 1
                 
                 # Check timeout
-                if timeout_seconds and (time_module.time() - start_time) > timeout_seconds:
-                    return AutonomyResult(
-                        success=False,
-                        output="Task timed out",
-                        completion_reason="timeout",
-                        iterations=iterations,
-                        stage=stage,
-                        actions=actions_taken,
-                        duration_seconds=time_module.time() - start_time,
-                        started_at=started_at,
-                    )
+                _timed_out = _timeout_result(
+                    timeout_seconds, iterations, stage, actions_taken, start_time, started_at)
+                if _timed_out is not None:
+                    return _timed_out
                 
                 # G2: Check for interrupt request (cooperative cancellation)
                 if self.interrupt_controller and self.interrupt_controller.is_set():
@@ -5322,9 +5343,17 @@ Summary:"""
                 # Reset the per-turn warning latch and inject any queued nudge.
                 turn_prompt = self._consume_self_correction(prompt)
                 try:
-                    response = await self.achat(turn_prompt)
+                    with _deadline_scope(timeout_seconds and timeout_seconds - (time_module.time() - start_time)):
+                        response = await self.achat(turn_prompt)
                 except Exception as e:
-                    return AutonomyResult(
+                    # The run deadline cancels an overrunning turn; report it as a timeout.
+                    # A budget stop keeps its typed budget_exhausted result when a cap applies.
+                    return _timeout_result(
+                        timeout_seconds, iterations, stage, actions_taken, start_time, started_at
+                    ) or (isinstance(e, BudgetExceededError) and self._autonomy_budget_result(
+                        iterations, stage, actions_taken, start_time, started_at,
+                        "", spend_baseline
+                    )) or AutonomyResult(
                         success=False,
                         output=str(e),
                         completion_reason="error",
@@ -5335,6 +5364,14 @@ Summary:"""
                         error=str(e),
                         started_at=started_at,
                     )
+                
+                # A turn that overran the run deadline or max_execution_time
+                # must not count as progress.
+                _timed_out = _timeout_result(
+                    timeout_seconds, iterations, stage, actions_taken, start_time, started_at,
+                    turn_timed_out=getattr(self, "_last_stop_reason", None) == "timeout")
+                if _timed_out is not None:
+                    return _timed_out
                 
                 response_str = str(response)
                 
@@ -6678,10 +6715,19 @@ Summary:"""
                     if hasattr(self, 'llm_instance') and self.llm_instance:
                         llm = self.llm_instance
                     
+                    # rerank=True without rerank_model has no backend reranker,
+                    # so use the zero-dependency keyword reranker; with
+                    # rerank_model the vector store already reranks.
+                    reranker = None
+                    if rag_config_obj.rerank and not getattr(self._retrieval_config, "rerank_model", None):
+                        from praisonaiagents.rag.retriever import SimpleReranker
+                        reranker = SimpleReranker()
+
                     self._rag_instance = RAG(
                         knowledge=self.knowledge,
                         config=rag_config_obj,
                         llm=llm,
+                        reranker=reranker,
                     )
                 except ImportError:
                     logging.warning("RAG module not available. Install with: pip install 'praisonaiagents[rag]'")
