@@ -125,9 +125,9 @@ TypeScript also honours `maxContextTokens` — unlike Python, which declares the
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `context_policy` | `ContextPolicy` | `ContextPolicy.SUMMARY` | How much history to share: `FULL`, `LAST_N`, `SUMMARY`, or `NONE` |
-| `max_context_tokens` | `int` | `4000` | Token cap on shared context |
-| `max_context_messages` | `int` | `10` | Message cap used by `LAST_N` |
+| `context_policy` | `ContextPolicy` | `ContextPolicy.SUMMARY` | How much history to share. `FULL` sends everything, `LAST_N` sends the last `max_context_messages`, `SUMMARY` sends the first user message (the task goal) plus the last 3 messages, `NONE` sends nothing. `LAST_N` and `SUMMARY` drop any orphan `tool`/`tool_calls` message so providers do not reject the request. |
+| `max_context_tokens` | `int` | `4000` | Token cap on shared context. Python declares it but does not read it — only the TypeScript SDK honours it. |
+| `max_context_messages` | `int` | `10` | Message cap used by `LAST_N`. `0` means "no messages", not "all messages". |
 | `preserve_system` | `bool` | `True` | Keep system messages when building the shared context |
 
 `input_filter` is a `handoff()` / `Handoff` argument — a callable (or list of callables) applied to the shared messages before they reach the target.
@@ -139,6 +139,47 @@ A handoff's seeded history is **invocation-scoped** — it does not leak into su
 <Warning>
 On releases **before PR #4213**, `context_policy`, `max_context_messages`, `preserve_system`, and `input_filter` had **no runtime effect** — every handoff behaved as if there were no context sharing. If you "tuned" these on an older release and saw no change, they now take effect.
 </Warning>
+
+<Warning>
+`max_context_messages=0` used to be a no-op (Python's `list[-0:]` returns the whole list). Since [PR #6093](https://github.com/MervinPraison/PraisonAI/pull/6093) it means **"no history messages"** — only `system` messages survive. If you relied on `0` meaning "unlimited", use a large explicit cap or `ContextPolicy.FULL`.
+</Warning>
+
+### What `SUMMARY` actually does
+
+`SUMMARY` is the default. It is **not** an LLM-generated summary — that stays opt-in via `input_filter`. It ships:
+
+1. Any `system` messages (when `preserve_system=True`).
+2. The **first user message** — usually the task goal.
+3. The **last 3 messages**, trimmed so `tool_calls`/`tool` pairs stay intact.
+
+If the first user message is already in that tail, it is not duplicated. `LAST_N` uses the same tool-pair safe trim, so the target agent never receives an orphan tool result.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.agent.handoff import Handoff, HandoffConfig, ContextPolicy
+
+src = Agent(name="src", instructions="x")
+tgt = Agent(name="tgt", instructions="y")
+src.chat_history = [
+    {"role": "system", "content": "sys"},
+    {"role": "user", "content": "GOAL: book flight to Paris"},
+    {"role": "assistant", "content": "ok, searching"},
+    {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "c1", "type": "function",
+         "function": {"name": "search", "arguments": "{}"}},
+    ]},
+    {"role": "tool", "tool_call_id": "c1", "content": "results"},
+    {"role": "assistant", "content": "found 3 options"},
+]
+
+for pol in (ContextPolicy.SUMMARY, ContextPolicy.LAST_N):
+    cfg = HandoffConfig(context_policy=pol, max_context_messages=2)
+    msgs = Handoff(agent=tgt, config=cfg)._prepare_context(src, {}).messages
+    print(pol.value, [m["role"] for m in msgs])
+
+# summary ['system', 'user', 'assistant', 'tool', 'assistant']  # goal kept, pair intact
+# last_n  ['system', 'assistant']                               # orphan tool dropped
+```
 
 ## Handoff Filters
 
