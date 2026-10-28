@@ -131,6 +131,7 @@ graph TB
 | `no_change` | A watched source was unchanged — suppressed silently, no tokens, no delivery |
 | `failed` | The probe itself errored |
 | `missed` | A recurring occurrence landed while the process was down and fell outside `misfire_grace_seconds` — recorded instead of fired. See [Misfire Policy](/features/scheduler-misfire-policy). |
+| `abandoned` | The run was claimed but never completed (crash, OOM, or restart mid-run). A one-shot is retried once; a recurring job waits for its next slot. See [Crash Recovery](#crash-recovery-for-in-flight-runs). |
 
 `no_change` is distinct from `skipped` (a generic gate go/no-go) so you can tell "nothing changed" apart from "the gate said don't run".
 ---
@@ -202,6 +203,41 @@ GateResult(run=True, context="2 new releases", state_updates={"last_hash": "def4
 | `skipped` | A stateless gate said don't run |
 | `no_change` | A watched source was unchanged (monitor mode) |
 | `missed` | A recurring occurrence expired past `misfire_grace_seconds` — recorded, not fired |
+| `abandoned` | A claimed run's lease expired without completing (crash or restart mid-run) — see [Crash Recovery](#crash-recovery-for-in-flight-runs) |
+
+---
+
+## Crash Recovery for In-Flight Runs
+
+A run lost to a crash is recorded as `abandoned` and retried according to the job kind — no configuration needed.
+
+```mermaid
+graph LR
+    C[⏰ claim_due] --> R[🤖 Agent runs]
+    R -->|Completes| M[✅ mark_run — lease released]
+    R -->|Crash / restart| X[💥 Lease expires]
+    X --> A[📝 abandoned row]
+    A -->|One-shot, first crash| Retry[🔁 Retried once]
+    A -->|Recurring| Next[⏭️ Next slot]
+
+    classDef tick fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef proc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class C tick
+    class R,Retry,Next proc
+    class M ok
+    class X,A warn
+```
+
+| Job kind | First abandoned run | Retry abandoned too |
+|---|---|---|
+| One-shot (`once=True` / `delete_after_run`) or `max_runs` met | Re-offered once (at-least-once across crashes) | Retired — two `abandoned` rows in history |
+| Recurring (`every`, `cron`) | Waits for the next slot (at-most-once per slot) | Same on every slot |
+| Spent job whose `until` deadline passed meanwhile | Retired, not re-offered | — |
+
+A spent job is no longer deleted when it is claimed — it stays leased and is removed only once its run completes. A run that is still in flight in the same process is never re-offered by that process, even if it outlives its lease, so it cannot fire twice.
 
 ---
 
