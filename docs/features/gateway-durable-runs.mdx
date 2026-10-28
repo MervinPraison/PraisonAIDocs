@@ -1,11 +1,11 @@
 ---
 title: "Gateway Durable Runs"
 sidebarTitle: "Gateway Durable Runs"
-description: "Gateway agents journal every turn by default so a restart resumes without re-firing tools or re-billing LLM calls"
+description: "Gateway agents journal every turn so an interrupted turn can be resumed by run id — recorded tool results replay instead of re-firing side effects"
 icon: "rotate"
 ---
 
-Gateway agents journal every turn by default, so a gateway restart resumes an interrupted run instead of re-firing side-effecting tools or re-billing LLM calls. No flag needed — it auto-enables whenever your session store is durable (the shipped default). Two explicit opt-outs are supported for the zero-overhead path.
+Gateway agents journal every turn by default, so an interrupted turn can be resumed by run id without re-firing side-effecting tools or re-billing LLM calls. The gateway does **not** auto-resume on restart — you resume a turn yourself with `ExecutionConfig(durable=True, resume_run_id=..., journal_path=...)`, the same journal, and the recorded task (see [Resuming an interrupted turn](#resuming-an-interrupted-turn)). No flag needed for journalling — it auto-enables whenever your session store is durable (the shipped default). Two explicit opt-outs are supported for the zero-overhead path.
 
 ```mermaid
 graph LR
@@ -13,7 +13,7 @@ graph LR
         Conn[📡 WebSocket turn] --> Agent[🤖 Gateway agent]
         Agent --> Journal[(📒 RunJournal)]
         Journal --> Crash[💥 Restart]
-        Crash --> Resume[🔁 Resume]
+        Crash --> Resume[🔁 Resume by run id]
         Resume --> Done[✅ Same result, no re-billing]
     end
     classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -31,12 +31,12 @@ graph LR
 ## Quick Start
 
 <Note>
-**Migration (PR #4218).** Prior releases required `gateway.durable_runs: true` to opt in. The default is now on whenever your session store is durable — no config change needed to gain crash-safe resume. Want the old zero-overhead behaviour? Set `gateway.durable_runs: false` or `gateway.reliability: "off"`.
+**Migration (PR #4218).** Prior releases required `gateway.durable_runs: true` to opt in. The default is now on whenever your session store is durable — no config change needed to gain crash-safe journalling ([resume](#resuming-an-interrupted-turn) stays a manual step). Want the old zero-overhead behaviour? Set `gateway.durable_runs: false` or `gateway.reliability: "off"`.
 </Note>
 
 <Steps>
 
-<Step title="Zero-config default (crash-safe out of the box)">
+<Step title="Zero-config default (every turn is journalled)">
 
 Sessions persist by default, so durable runs are already on — no `gateway:` block required:
 
@@ -48,7 +48,7 @@ agents:
     tools: [charge_card, ship_order, notify_customer]
 ```
 
-Restart the gateway mid-run and the interrupted turn resumes — recorded tool results replay from the [`RunJournal`](/features/run-state-journal) instead of re-charging the card or re-billing the model.
+Restart the gateway mid-run; the interrupted turn is left `running` in the [`RunJournal`](/features/run-state-journal). To finish it without re-charging the card or re-billing the model, resume it by run id — see [Resuming an interrupted turn](#resuming-an-interrupted-turn).
 
 </Step>
 
@@ -108,7 +108,7 @@ gateway:
 
 ## How It Works
 
-Each gateway agent journals its turn to the core `RunJournal`; a restart re-drives the loop from the top, replaying journalled steps and running only the un-journalled ones. Whether journalling runs at all is decided from config plus the effective session store.
+Each gateway agent journals its turn to the core `RunJournal` whenever durable runs are on — decided from config plus the effective session store. Resuming is a separate, manual step: a turn resumed by run id replays journalled steps and runs only the un-journalled ones.
 
 ```mermaid
 sequenceDiagram
@@ -121,17 +121,17 @@ sequenceDiagram
     Gateway->>Agent: run (durable=True)
     Agent->>Journal: record tool result (auto)
     Note over Gateway,Journal: 💥 gateway restarts mid-turn
-    Gateway->>Agent: rebuild agent (durable_runs preserved)
+    Note over Journal: turn left "running"
+    Agent->>Journal: operator resumes with resume_run_id
     Journal-->>Agent: replay recorded result
-    Agent-->>Gateway: same result, no re-billing
-    Gateway-->>Client: response
+    Note over Agent: same result, no re-billing
 ```
 
 | Role | Responsibility |
 |------|----------------|
 | Gateway | Consults `gateway.durable_runs` when explicitly set; otherwise auto-enables when the effective session store is durable (`self._session_store is not None`) |
 | Agent | Journals every model and tool boundary to the core journal |
-| RunJournal | Records results so a restart replays instead of re-executing |
+| RunJournal | Records results so a turn resumed by run id replays instead of re-executing |
 | Per-agent `durable` | Overrides the gateway default for a single agent |
 
 ### Choosing whether durable runs run
@@ -143,7 +143,7 @@ graph TB
     Q1 -->|No| Q2{gateway.reliability<br/>== "off"?}
     Q2 -->|Yes| Off[⏸️ Off zero-overhead path]
     Q2 -->|No| Q3{Durable session store<br/>actually present?}
-    Q3 -->|Yes default| On[🔁 Auto-on crash-safe resume]
+    Q3 -->|Yes default| On[🔁 Auto-on crash-safe journalling]
     Q3 -->|No| Off
 
     classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -169,6 +169,31 @@ The durable-runs decision is re-evaluated on **every** load path — initial loa
 <Note>
 **Graceful degrade.** If `ExecutionConfig` can't be imported (an older core), the gateway logs a warning and the agent runs non-durably — the gateway never fails to start over durability.
 </Note>
+
+---
+
+## Resuming an interrupted turn
+
+Nothing resumes interrupted turns automatically. List them from the journal and resume each with its recorded task:
+
+```python
+from praisonaiagents import Agent, ExecutionConfig
+from praisonaiagents.runtime import RunJournal
+
+journal = RunJournal()  # default ~/.praisonai/runs/journal.db — pass the gateway's journal_path if set
+for run_id in journal.interrupted_runs():
+    meta = journal.run_meta(run_id)
+    agent = Agent(
+        name=meta.agent,
+        instructions="Charge the card and ship the order.",
+        execution=ExecutionConfig(durable=True, resume_run_id=run_id),
+    )
+    agent.chat(meta.task)  # must be the recorded task
+```
+
+<Warning>
+Autonomous and goal loops (`run_autonomous`, `run_goal`) cannot be resumed by run id — only a single `chat()` turn can. A crash inside those loops loses the loop cursor (iteration, stage, spend baseline). Treat gateway durability as per-turn resume, not per-loop resume.
+</Warning>
 
 ---
 
@@ -230,7 +255,7 @@ The default `~/.praisonai/runs/journal.db` is lost when a container is recreated
 </Accordion>
 
 <Accordion title="Verify the store actually initialised">
-Durable runs only auto-enable when the session store instantiates. On an absent or read-only home directory the store degrades to in-memory and durable runs silently stay off — check the gateway log for the fallback if you expected crash-safe resume.
+Durable runs only auto-enable when the session store instantiates. On an absent or read-only home directory the store degrades to in-memory and durable runs silently stay off — check the gateway log for the fallback if you expected crash-safe journalling.
 </Accordion>
 
 <Accordion title="Per-agent durable is your escape hatch">
@@ -238,7 +263,7 @@ Small-talk agents don't need journalling. Set `durable: false` on them, keeping 
 </Accordion>
 
 <Accordion title="Compose with session persistence">
-Durable gateway runs and [session persistence](/features/gateway-session-persistence) are different layers — one resumes the in-flight turn, the other restores conversation history. Both survive a restart and work together.
+Durable gateway runs and [session persistence](/features/gateway-session-persistence) are different layers — one journals the in-flight turn so it can be resumed, the other restores conversation history. Both survive a restart and work together.
 </Accordion>
 
 </AccordionGroup>
