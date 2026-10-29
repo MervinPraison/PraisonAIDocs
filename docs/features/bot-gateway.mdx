@@ -193,7 +193,7 @@ agents:
 |-------|------|---------|-------------|
 | **instructions** | string | `""` | System prompt for the agent |
 | **model** | string | `None` | LLM model (e.g., `gpt-4o-mini`, `gpt-4o`) |
-| **memory** | boolean | `false` | Enable conversation memory |
+| **memory** | `bool \| str \| dict` | `false` | Enable conversation memory. See [Gateway memory identity](#gateway-memory-identity) for the stable `gateway-<agent_id>` default and how to override it with an explicit `user_id`. |
 | **tools** | list | `[]` | Tool names resolved via ToolResolver |
 | **reflection** | boolean | `true` | Enable self-reflection / interactive mode |
 | **role** | string | `None` | Agent role (CrewAI-style) |
@@ -201,6 +201,95 @@ agents:
 | **backstory** | string | `None` | Agent backstory (CrewAI-style) |
 | **tool_choice** | string | `None` | `auto`, `required`, or `none` |
 | **allow_delegation** | boolean | `false` | Allow task delegation to other agents |
+
+### Gateway memory identity
+
+Every gateway agent gets a stable memory identity derived from its configured agent id, so facts learned through one chat survive restarts, hot-reloads, and channel clones.
+
+```mermaid
+graph LR
+    subgraph "Gateway Memory Identity"
+        A[📝 gateway.yaml<br/>agents.support-bot] --> B[🧮 Derive id]
+        B --> C[🆔 gateway-support-bot]
+        C --> D[💾 Memory store<br/>.praisonai/memory/gateway-support-bot/]
+    end
+
+    classDef cfg fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef derive fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef id fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A cfg
+    class B derive
+    class C id
+    class D store
+```
+
+| YAML `memory:` shape | Example | Resolved `user_id` |
+|---|---|---|
+| **Omitted** (no `memory:` key) or `memory: false` | — | Agent `user_id` is set to `gateway-<agent_id>`, so bot-injected memory keys off a stable id instead of the shared `"praison"` constant |
+| **`true`** | `memory: true` | `gateway-<agent_id>` |
+| **Preset string** | `memory: sqlite` or `memory: history` | Preset config + `user_id: gateway-<agent_id>` |
+| **Dict without `user_id`** | `memory: { history: true }` | Dict merged with `user_id: gateway-<agent_id>` |
+| **Dict with explicit `user_id`** | `memory: { user_id: billing-team }` | `billing-team` — **explicit always wins** |
+| **URL / connection string** | `memory: "sqlite:///m.db"` | Passed through unchanged |
+
+The same id is carried onto every per-channel clone, so Telegram, Slack, and other channels served by one agent share its memory.
+
+#### What `gateway-<agent_id>` looks like
+
+Memory directories only allow `A-Z`, `a-z`, `0-9`, `_` and `-`, so the gateway replaces any other character with `_`. When a replacement happens, an 8-character hash of the original id is appended so ids stay distinct: `support_bot` → `gateway-support_bot`, but `support.bot` → `gateway-support_bot-<hash>` — they live in **different** memory directories.
+
+```python
+from praisonaiagents import Agent
+
+# Plain Agent (outside the gateway) — still gets a random id, by design.
+agent = Agent(name="assistant", instructions="Help the user.", memory=True)
+# → memory user_id = agent-<random hex>
+```
+
+```yaml
+# gateway.yaml — gateway agents get a stable id for free.
+agents:
+  support-bot:
+    instructions: "Help the customer."
+    model: gpt-4o-mini
+    memory: true
+    # memory user_id = gateway-support-bot (stable across restarts)
+
+  billing-bot:
+    instructions: "Handle invoices."
+    model: gpt-4o-mini
+    memory:
+      user_id: billing-team        # explicit override wins
+```
+
+```mermaid
+sequenceDiagram
+    participant User as 👤 User
+    participant TG as 📱 Telegram
+    participant GW as 🛰️ Gateway (boot 1)
+    participant Mem as 💾 Memory (gateway-support-bot)
+    participant GW2 as 🛰️ Gateway (boot 2)
+
+    User->>TG: "Remember I prefer teal UIs."
+    TG->>GW: Inbound message
+    GW->>Mem: Store "prefers teal UIs"
+    GW-->>User: "Noted."
+
+    Note over GW,GW2: Gateway restarts / hot-reload / redeploy
+
+    User->>TG: "What UI style do I like?"
+    TG->>GW2: Inbound message
+    GW2->>Mem: Search "UI style"
+    Mem-->>GW2: "prefers teal UIs"
+    Note over GW2,Mem: Same user_id → recall works
+    GW2-->>User: "You prefer teal UIs."
+```
+
+<Warning>
+**Two gateways using the same agent id share memory.** The id derives from the configured agent id only. If you run two gateway processes with the same `gateway.yaml` from the same working directory, both read from and write to `.praisonai/memory/gateway-<agent_id>/`. To isolate them, set an explicit `memory.user_id` per environment (e.g. `gateway-support-bot-prod` and `gateway-support-bot-staging`).
+</Warning>
 
 ### Channels Section
 
@@ -846,6 +935,9 @@ if detect_code_skew(fingerprint):
   </Accordion>
   <Accordion title="Monitor via /health and /metrics">
     Poll the health endpoint during deploys and wire [Gateway Metrics](/features/gateway-metrics) into Prometheus for message-flow visibility.
+  </Accordion>
+  <Accordion title="Set an explicit user_id when you need isolation">
+    The default `gateway-<agent_id>` is right for most single-tenant bots. If you need to isolate memory per environment (prod vs staging), per tenant, or per channel, set `memory.user_id` explicitly in the agent block. An explicit `user_id` always wins over the default.
   </Accordion>
 </AccordionGroup>
 
