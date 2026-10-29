@@ -283,6 +283,46 @@ def _turn_error_payload(exc: BaseException) -> Dict[str, Any]:
     }
 
 
+def _gateway_memory_user_id(agent_id: str) -> str:
+    """Stable memory identity for a gateway agent (Issue #6033).
+
+    The core gives ``memory=`` without a ``user_id`` a random per-instance id,
+    so a gateway that rebuilds agents on every boot, reload and channel clone
+    would write to a fresh store each time. Derive the id from the configured
+    agent id instead; characters FileMemory rejects in a directory name are
+    replaced, plus a short hash of the original id when anything was replaced
+    so ids like ``support.bot`` and ``support_bot`` stay distinct.
+    """
+    raw = str(agent_id)
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", raw)
+    if safe != raw:
+        safe += "-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return "gateway-" + safe
+
+
+def _with_memory_user_id(memory: Any, user_id: str) -> Any:
+    """Add ``user_id`` to a YAML ``memory:`` value that does not set one.
+
+    ``True``, a preset name (``"sqlite"``, ``"history"``, ...) and a dict
+    without ``user_id`` become the equivalent dict carrying ``user_id``. An
+    explicit ``user_id``, a disabled memory and any other value (e.g. a URL)
+    are returned unchanged.
+    """
+    if not memory:
+        return memory
+    if memory is True:
+        return {"user_id": user_id}
+    if isinstance(memory, dict):
+        return memory if memory.get("user_id") else {**memory, "user_id": user_id}
+    if isinstance(memory, str):
+        from praisonaiagents.config.presets import MEMORY_PRESETS
+
+        preset = MEMORY_PRESETS.get(memory.strip().lower())
+        if preset is not None:
+            return {**preset, "user_id": user_id}
+    return memory
+
+
 def _apply_bot_loop_config(config_kwargs: Dict[str, Any], ch_cfg: Mapping[str, Any]) -> None:
     """Fold a channel's ``allow_bots`` / ``bot_loop_protection`` into BotConfig.
 
@@ -8582,9 +8622,12 @@ class WebSocketGateway:
                           session store is present — see
                           :meth:`_durable_runs_from_config`, Issue #4216),
                           construct each agent with ``ExecutionConfig(durable=True)`` so
-                          every gateway turn is journalled to the core ``RunJournal`` and
-                          can resume after a restart — no re-execution of side-effecting
-                          tools, no re-billing of LLM calls. When ``False`` (explicit
+                          every gateway turn is journalled to the core ``RunJournal``.
+                          The gateway does not auto-resume on boot: an interrupted turn
+                          can be resumed by run id via
+                          ``ExecutionConfig(durable=True, resume_run_id=...)`` (same
+                          ``journal_path``) with the same prompt,
+                          replaying recorded tool results. When ``False`` (explicit
                           ``durable_runs: false`` / ``reliability: "off"`` / no durable
                           store) the execution hot path is unchanged (zero-overhead).
                           Per-agent ``durable`` in YAML overrides this gateway-wide
@@ -8621,7 +8664,11 @@ class WebSocketGateway:
                     )
 
                     model = resolve_model_by_provider()
-            memory = agent_def.get("memory", False)
+            # Issue #6033: a stable memory id per configured agent, so memory
+            # survives restarts/reloads and is shared with channel clones. An
+            # explicit ``memory: {user_id: ...}`` still wins.
+            memory_user_id = _gateway_memory_user_id(agent_id)
+            memory = _with_memory_user_id(agent_def.get("memory", False), memory_user_id)
 
             # G2: Pass temperature through (optional, SDK uses its own default)
             temperature = agent_def.get("temperature", None)
@@ -8691,10 +8738,12 @@ class WebSocketGateway:
             # Durable runs (Issue #4028): when the operator opts in via
             # ``gateway.durable_runs`` (or per-agent ``durable: true``), build the
             # agent with ``ExecutionConfig(durable=True)`` so every turn is
-            # journalled to the core ``RunJournal``. This engages the already-shipped
-            # resume machinery — after a restart an interrupted run replays recorded
-            # tool results instead of re-executing side-effecting tools or re-billing
-            # LLM calls. Default-off/zero-overhead when neither flag is set; a lazy
+            # journalled to the core ``RunJournal``. A turn interrupted by a crash
+            # stays ``running`` in the journal; resuming it by run id
+            # (``ExecutionConfig(durable=True, resume_run_id=...)``, same journal)
+            # replays recorded tool results
+            # instead of re-executing them. Nothing here resumes runs on boot.
+            # Default-off/zero-overhead when neither flag is set; a lazy
             # import keeps the SDK cost off the hot path for non-durable gateways.
             agent_durable = self._config_bool(
                 agent_def.get("durable"), durable_runs
@@ -8727,6 +8776,12 @@ class WebSocketGateway:
                 guardrails=guardrail_prompt,
                 execution=execution_cfg,
             )
+
+            # No memory configured: bot defaults may inject memory keyed on
+            # agent.user_id, which otherwise falls back to the host-wide
+            # "praison" constant shared by every agent.
+            if not memory:
+                agent.user_id = memory_user_id
 
             # Store tool_choice for later use in chat()
             if tool_choice:
@@ -9698,6 +9753,9 @@ class WebSocketGateway:
             )
 
             clone = agent.clone_for_channel() if hasattr(agent, "clone_for_channel") else agent
+            # clone_for_channel() does not carry user_id (Issue #6033).
+            if getattr(agent, "user_id", None):
+                clone.user_id = agent.user_id
             clone = apply_bot_smart_defaults(clone, config)
             enabled = enable_shell_tools(
                 clone,
@@ -9778,7 +9836,12 @@ class WebSocketGateway:
         """Create a bot instance for the given channel type."""
         # Clone agent to prevent channel-specific settings from leaking between channels
         # Use clone_for_channel() instead of copy.deepcopy() to avoid RLock issues (fixes #1746)
+        source_user_id = getattr(agent, "user_id", None)
         agent = agent.clone_for_channel()
+        # clone_for_channel() does not carry user_id; bot-injected memory keys
+        # on it, so keep the registered agent's stable id (Issue #6033).
+        if source_user_id:
+            agent.user_id = source_user_id
         
         # Apply smart defaults to agent (same logic as Bot() wrapper)
         from praisonai_bot.bots._defaults import apply_bot_smart_defaults, enable_shell_tools

@@ -10,6 +10,7 @@ import threading
 from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable
 from collections import OrderedDict
 import inspect
+import uuid
 
 # Decomposed agent functionality - real implementations in mixin files
 from .chat_mixin import ChatMixin, _deadline_scope
@@ -134,7 +135,11 @@ from ..config.feature_configs import (
     PlanningConfig, ReflectionConfig, RulesConfig, GuardrailConfig, WebConfig,
     TemplateConfig, CachingConfig, HooksConfig, SkillsConfig,
     DEFAULT_TOOL_OUTPUT_LIMIT,
+    LearnConfig, LLMConfig, ToolConfig, resolve_tools,
 )
+# Already loaded by the imports above; hoisted so __init__ does not pay a
+# function-local relative import per construction (#5835).
+from ..config.parse_utils import canonical_preset_key, validate_preset_string
 
 # Default tool output limit (16000 chars ≈ 4000 tokens)
 # Single source of truth defined in config.feature_configs and imported here
@@ -188,8 +193,6 @@ def _validate_preset_params(params):
     Raises:
         ValueError: With a "Did you mean ...?" suggestion and the valid names.
     """
-    from ..config.parse_utils import validate_preset_string
-
     for name, value in params.items():
         if not isinstance(value, str):
             continue
@@ -1141,7 +1144,6 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         
         # Fast path: string preset lookup (most common case)
         if isinstance(output, str):
-            from ..config.parse_utils import canonical_preset_key
             output_lower = canonical_preset_key(output)
             preset_value = OUTPUT_PRESETS.get(output_lower)
             if preset_value is not None:
@@ -1267,7 +1269,6 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         elif isinstance(execution, ExecutionConfig):
             _exec_config = execution
         elif isinstance(execution, str):
-            from ..config.parse_utils import canonical_preset_key
             preset_value = EXECUTION_PRESETS.get(canonical_preset_key(execution))
             if preset_value is not None:
                 _exec_config = ExecutionConfig(**preset_value) if isinstance(preset_value, dict) else preset_value
@@ -1530,8 +1531,6 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # Resolve LEARN param - FAST PATH (top-level, peer to memory)
         # learn= is a first-class citizen, independent of memory=
         # ─────────────────────────────────────────────────────────────────────
-        from ..config.feature_configs import LearnConfig
-        
         _learn_config = None
         
         # Top-level learn= takes precedence over memory.learn
@@ -2094,8 +2093,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # skill grant leak onto every other unnamed agent in the same process
         # (a cross-tenant privilege escalation). This id can never collide
         # across unrelated instances.
-        import uuid as _uuid
-        self._approval_scope_id = f"{self.name}:{_uuid.uuid4().hex}"
+        self._approval_scope_id = f"{self.name}:{uuid.uuid4().hex}"
 
         # Resolve tool_config for tool execution settings
         _tool_config = Agent._resolve_tool_config(
@@ -2156,7 +2154,6 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         resolve_model_alias(llm, model, type(self).__name__)
 
         # Check if llm is an LLMConfig object
-        from ..config import LLMConfig
         if isinstance(llm, LLMConfig):
             # Extract values from LLMConfig
             llm_config_obj = llm
@@ -3271,9 +3268,6 @@ Your Goal: {self.goal}
     @staticmethod
     def _resolve_tool_config(tool_config):
         """Resolve tool_config parameter with backward compatibility."""
-        # Import here to avoid circular imports
-        from ..config.feature_configs import ToolConfig, resolve_tools
-        
         # Handle the new consolidated parameter
         if tool_config is not None:
             resolved_config = resolve_tools(tool_config)
@@ -4366,6 +4360,7 @@ Summary:"""
             "clear_context": config.clear_context,
             "track_changes": config.effective_track_changes,
             "snapshot_dir": config.snapshot_dir,
+            "snapshot": config.snapshot,
             "default_tools": config.default_tools,
             "max_budget_usd": config.max_budget_usd,
             "max_tokens": config.max_tokens,
@@ -4453,15 +4448,16 @@ Summary:"""
     def undo(self) -> bool:
         """Undo the last set of file changes.
         
-        Restores files to the state before the last autonomous iteration.
-        Requires ``autonomy=AutonomyConfig(track_changes=True)``.
+        Restores files to the state before the last autonomous run.
+        Requires ``autonomy=AutonomyConfig(track_changes=True, snapshot=True)``
+        so run_autonomous() records a pre-run snapshot.
         
         Returns:
             True if undo was successful, False if nothing to undo.
             
         Example::
         
-            agent = Agent(autonomy="full_auto")
+            agent = Agent(autonomy=AutonomyConfig(level="full_auto", snapshot=True))
             result = agent.start("Refactor utils.py")
             agent.undo()  # Restore original files
         """
@@ -4763,7 +4759,7 @@ Summary:"""
         # Take initial snapshot before autonomous execution starts
         # NOTE: Snapshot tracking is disabled by default for performance (G12 fix)
         # FileSnapshot.track() walks entire project and is too slow for large codebases
-        # Enable with autonomy={"snapshot": True} if needed
+        # Enable with AutonomyConfig(snapshot=True) / autonomy={"snapshot": True}
         if self._file_snapshot is not None and self.autonomy_config.get("snapshot", False):
             try:
                 snap_info = self._file_snapshot.track(message="pre-autonomous")
