@@ -1908,7 +1908,7 @@ Each key in `hooks={}` is a `PluginHook` enum value; the callable's return value
 | `PluginHook.BEFORE_TOOL` | `fn(tool_name: str, args: dict) -> dict` | Rewrites tool args |
 | `PluginHook.AFTER_TOOL` | `fn(tool_name: str, result: Any) -> Any \| PluginDecision \| None` | Rewrites/redacts tool result, or `deny` blocks it before it reaches the model |
 | `PluginHook.BEFORE_AGENT` | `fn(prompt: str, context: dict) -> str` | Rewrites prompt |
-| `PluginHook.AFTER_AGENT` | `fn(response: str, context: dict) -> str` | Rewrites response |
+| `PluginHook.AFTER_AGENT` | `fn(response: str, context: dict) -> str \| PluginDecision \| None` | Rewrites the final response, or `deny` withholds it — see [Output Guardrails](#output-guardrails) |
 | `PluginHook.MESSAGE_RECEIVED` | `fn(message: dict) -> dict \| PluginDecision \| None` | Rewrites `content`, or `deny` drops the inbound message |
 | `PluginHook.MESSAGE_SENDING` | `fn(message: dict) -> dict` | Rewrites outbound `content` |
 | `PluginHook.MESSAGE_SENT` | `fn(message: dict) -> None` | Observe-only |
@@ -2322,7 +2322,7 @@ Writing a `.toml` config requires `tomli_w`. Without it the CLI **fails fast** w
 `plugins.enable()` auto-calls `wire_into_hook_registry()` — no manual step. Only lifecycle methods a plugin actually overrides (or declares in `PluginInfo.hooks`) are bridged, so a plugin with one guardrail never fires on every event. Return a new value and the bridge writes it back onto the payload in place. Errors in a lifecycle method are non-fatal, and `plugins.disable([...])` calls `unwire_from_hook_registry(name)` so the plugin truly stops firing.
 
 <Note>
-The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `before_tool_definitions`, `before_message`) also accept a deny/block decision instead of a rewrite — see [Blocking Plugins](#blocking-plugins-guardrails--policies). `after_tool` additionally accepts a rewrite **or** block — see [Redact / Block Tool Output](/features/redact-tool-output).
+The five `before_*` methods (`before_agent`, `before_llm`, `before_tool`, `before_tool_definitions`, `before_message`) also accept a deny/block decision instead of a rewrite — see [Blocking Plugins](#blocking-plugins-guardrails--policies). `after_tool` additionally accepts a rewrite **or** block — see [Redact / Block Tool Output](/features/redact-tool-output). `after_agent` does the same for the final response — see [Output Guardrails](#output-guardrails).
 </Note>
 
 Every method in this table may be declared either `def` or `async def` — see [Sync or Async Hook Methods](#sync-or-async-hook-methods).
@@ -2330,7 +2330,7 @@ Every method in this table may be declared either `def` or `async def` — see [
 | Plugin method | Hook event | Requires grant? | In-place mutation |
 |---------------|-----------|:---------------:|-------------------|
 | `before_agent(prompt, ctx)` | `BEFORE_AGENT` | 🔐 | Return a `str` → rewrites `data.prompt` |
-| `after_agent(response, ctx)` | `AFTER_AGENT` | 🔐 | Return a `str` → rewrites `data.response` |
+| `after_agent(response, ctx)` | `AFTER_AGENT` | 🔐 | Return a `str` → rewrites the final response returned to the caller. Return `PluginDecision.deny(reason)` / `.block(reason)` / a denying `HookResult`, or raise `GuardrailBlocked(reason)` → caller gets `"[Response blocked by hook: <reason>]"`. `None` → no-op. Non-string (structured / Pydantic) outputs are left unchanged. See [Output Guardrails](#output-guardrails). |
 | `before_llm(messages, params)` | `BEFORE_LLM` | 🔐 | Return `(new_messages, ...)` → replaces `data.messages` |
 | `after_llm(response, usage)` | `AFTER_LLM` | 🔐 | Return a `str` → rewrites `data.response` |
 | `before_tool(name, args)` | `BEFORE_TOOL` | — | Return a `dict` → replaces `data.tool_input` |
@@ -2618,11 +2618,11 @@ class BlockDelete(Plugin):
 ```
 </CodeGroup>
 
-`PluginDecision.deny(reason)` and `PluginDecision.block(reason)` both stop the action (`is_denied()` is `True` for each); `allow(reason=None)` is an explicit no-op. `GuardrailBlocked(reason: str = "Blocked by guardrail plugin")` is caught by the bridge and converted to a block. It may be raised from any `before_*` method **and from `after_tool`** — the tool has already run there, but the output is suppressed before it reaches the model (see [Redact / Block Tool Output](/features/redact-tool-output)).
+`PluginDecision.deny(reason)` and `PluginDecision.block(reason)` both stop the action (`is_denied()` is `True` for each); `allow(reason=None)` is an explicit no-op. `GuardrailBlocked(reason: str = "Blocked by guardrail plugin")` is caught by the bridge and converted to a block. It may be raised from any `before_*` method, **from `after_tool`** — the tool has already run there, but the output is suppressed before it reaches the model (see [Redact / Block Tool Output](/features/redact-tool-output)) — **and from `after_agent`**, which withholds the final response (see [Output Guardrails](#output-guardrails)).
 
 ### Where Blocks Fire
 
-The five `before_*` methods and `after_tool` can block; the remaining `after_*` / observational methods cannot.
+The five `before_*` methods, `after_tool` and `after_agent` can block; the remaining `after_*` / observational methods cannot. `after_llm` stays non-blocking because it also fires on intermediate tool-calling turns — use `after_agent` to gate the **final** response.
 
 | Plugin method | Can rewrite? | Can block? | Runtime effect of block |
 |---------------|:------------:|:----------:|-------------------------|
@@ -2632,7 +2632,69 @@ The five `before_*` methods and `after_tool` can block; the remaining `after_*` 
 | `before_tool` | ✅ | ✅ | Tool call skipped; reason surfaced |
 | `before_message` | ✅ | ✅ | Inbound message dropped |
 | `after_tool` | ✅ | ✅ | Tool output rewritten/redacted, or suppressed — the model sees the block reason instead ([details](/features/redact-tool-output)) |
+| `after_agent` | ✅ | ✅ | Final response rewritten, or replaced with `"[Response blocked by hook: <reason>]"` ([details](#output-guardrails)) |
 | other `after_*` | ✅ | ❌ | *(observational — no block path)* |
+
+### Output Guardrails
+
+`after_agent` is the final-response gate — return a rewritten string to redact, or deny to withhold the response.
+
+```mermaid
+graph LR
+    R[🤖 Agent response] --> H{🪝 after_agent}
+    H -->|None| A[✅ Returned as-is]
+    H -->|str| W[✏️ Rewrite adopted]
+    H -->|deny / GuardrailBlocked| B[⛔ Response blocked by hook]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class R agent
+    class H,W process
+    class A ok
+    class B warn
+```
+
+```python
+from praisonaiagents import Agent, plugins
+from praisonaiagents.plugins import Plugin, PluginInfo, PluginHook, PluginDecision, GuardrailBlocked
+
+class SecretRedactor(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="secret_redactor", hooks=[PluginHook.AFTER_AGENT])
+
+    def after_agent(self, response, context):
+        return response.replace("sk-abc123xyz", "[REDACTED]")   # rewrite is adopted
+
+class PiiBlocker(Plugin):
+    @property
+    def info(self):
+        return PluginInfo(name="pii_blocker", hooks=[PluginHook.AFTER_AGENT])
+
+    def after_agent(self, response, context):
+        if "123-45-6789" in response:
+            raise GuardrailBlocked("PII in response")   # or: return PluginDecision.deny("PII in response")
+        return response
+
+manager = plugins.get_plugin_manager()
+manager.register(SecretRedactor())
+manager.register(PiiBlocker())
+plugins.enable()
+
+agent = Agent(name="Assistant", instructions="Help users.")
+print(agent.start("What is my SSN?"))   # [Response blocked by hook: PII in response]
+```
+
+- **Stacked plugins compose.** `AFTER_AGENT` plugins run sequentially in registration order (same as `MESSAGE_SENDING`), so each sees the previous rewrite; the first denial wins.
+- **Blocked text is not kept.** The matching in-memory assistant turn is replaced with the final value, so later turns, auto-memory and self-learning never see the withheld or unredacted text.
+- **Non-string outputs pass through.** Structured / Pydantic responses are left unchanged.
+
+<Warning>
+`after_agent` gates the **returned value** only. Interaction callbacks, verbose display, streamed output and session/DB persistence run before it and are not retroactively withheld.
+</Warning>
 
 ### How a Block Flows
 
