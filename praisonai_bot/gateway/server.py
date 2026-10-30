@@ -1240,6 +1240,9 @@ class WebSocketGateway:
         # serving loop only when a ``gateway.watchdog`` block (or the CLI
         # ``--watchdog`` flag) enables it; ``None`` means zero cost.
         self._watchdog = None
+        # Issue #6123: systemd READY=1/WATCHDOG=1 notifier; only started when
+        # running under a ``Type=notify`` unit (``$NOTIFY_SOCKET`` set).
+        self._sd_notify_task: Optional[asyncio.Task] = None
         # Issue #2798/#3911: application-level connection-liveness heartbeat +
         # half-open reaper. The background task emits ``PING`` at the configured
         # interval and closes any session whose ``last_activity`` exceeds the
@@ -2672,6 +2675,14 @@ class WebSocketGateway:
         if self._session_store:
             await self._start_session_cleanup()
 
+        # Issue #6123: tell systemd when we are actually serving and keep its
+        # watchdog fed from this loop (a wedged loop stops the pings). Started
+        # before the boot-time recovery below so a long resume stays covered.
+        if os.environ.get("NOTIFY_SOCKET") and self._sd_notify_task is None:
+            self._sd_notify_task = asyncio.create_task(
+                self._sd_notify_loop(), name="gateway-sd-notify"
+            )
+
         # Issue #4603: record this boot in the durable lifecycle ledger before
         # anything else. This reads the prior sentinel, classifies whether the
         # previous process exited cleanly (an unclean/OOM death runs no signal
@@ -2748,6 +2759,7 @@ class WebSocketGateway:
         finally:
             self._disarm_watchdog()
             await self._cancel_liveness_task()
+            await self._cancel_sd_notify_task()
             # Issue #4603: ``serve()`` returns through here on every graceful
             # termination — the SIGINT/SIGTERM handler only flips
             # ``should_exit`` and uvicorn unwinds, so ``stop()`` is not
@@ -2777,6 +2789,51 @@ class WebSocketGateway:
                 pass
             except Exception:
                 logger.debug("Liveness task exited with error on cancel")
+
+    async def _sd_notify_loop(self) -> None:
+        """Send systemd READY=1 once serving, then WATCHDOG=1 pings (#6123).
+
+        Until READY=1, also sends EXTEND_TIMEOUT_USEC so a long boot-time
+        recovery is not killed by ``TimeoutStartSec`` while the loop is alive.
+        """
+        from ..daemon.sd_notify import sd_notify, watchdog_interval
+
+        interval = watchdog_interval()
+        period = interval or 10.0
+        tick = min(period, 0.5)
+        ready = False
+        last_ping = 0.0
+        while True:
+            if not ready and self._server is not None and getattr(
+                self._server, "started", False
+            ):
+                sd_notify("READY=1")
+                ready = True
+                if interval is None:
+                    return
+            now = time.monotonic()
+            if now - last_ping >= period:
+                if interval:
+                    sd_notify("WATCHDOG=1")
+                if not ready:
+                    sd_notify(f"EXTEND_TIMEOUT_USEC={int(period * 3_000_000)}")
+                last_ping = now
+            await asyncio.sleep(tick)
+
+    async def _cancel_sd_notify_task(self) -> None:
+        """Stop the systemd notifier and report STOPPING=1 (idempotent)."""
+        task = self._sd_notify_task
+        self._sd_notify_task = None
+        if task is None:
+            return
+        from ..daemon.sd_notify import sd_notify
+
+        sd_notify("STOPPING=1")
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def _cancel_ledger_heartbeat(self) -> None:
         """Stop the lifecycle-ledger memory-sample heartbeat (idempotent)."""
@@ -3846,7 +3903,13 @@ class WebSocketGateway:
         # routing new traffic while in-flight sessions finish. Keep _is_running
         # True so liveness (/live) still reports the process as alive during drain.
         self._draining = True
-        
+        # Issue #6123: tell systemd this is a clean drain, not a hang/crash.
+        # The notifier keeps feeding WATCHDOG=1 until serve() unwinds.
+        if self._sd_notify_task is not None:
+            from ..daemon.sd_notify import sd_notify
+
+            sd_notify("STOPPING=1")
+
         # Gracefully drain active sessions before closing
         await self._drain_active_sessions(reason="shutdown", timeout=drain_timeout)
 
@@ -9748,6 +9811,7 @@ class WebSocketGateway:
         platform = str(ch_cfg.get("platform") or channel_name).lower()
         try:
             from praisonai_bot.bots._defaults import (
+                _sync_approval_registry,
                 apply_bot_smart_defaults,
                 enable_shell_tools,
             )
@@ -9764,6 +9828,32 @@ class WebSocketGateway:
                 channel_type=platform,
                 gateway_bind_host=self._resolve_gateway_bind_host(),
             )
+            # Reuse the durable approval backend the channel adapter already
+            # renders and resolves (#6032); a fresh per-clone one has no sender.
+            # Only when it gates the same chat with the same or a narrower
+            # approver set, so a routed shell agent is never gated more loosely.
+            from praisonai_bot.bots._presentation_approval_backend import (
+                PresentationApprovalBackend,
+            )
+
+            shared = getattr(
+                self._channel_bots.get(channel_name), "_approval_backend", None
+            )
+            own = getattr(enabled, "_approval_backend", None)
+            if (
+                isinstance(shared, PresentationApprovalBackend)
+                and isinstance(own, PresentationApprovalBackend)
+                and shared._target == own._target
+                and (
+                    own._allowed_actors is None
+                    or (
+                        shared._allowed_actors is not None
+                        and shared._allowed_actors <= own._allowed_actors
+                    )
+                )
+            ):
+                enabled._approval_backend = shared
+                _sync_approval_registry(enabled)
             self._shell_routed_agents[cache_key] = enabled
             return enabled
         except Exception as exc:  # pragma: no cover - defensive
@@ -10141,6 +10231,7 @@ class WebSocketGateway:
             from telegram import Update
             from telegram.ext import (
                 Application,
+                CallbackQueryHandler,
                 CommandHandler,
                 MessageHandler,
                 filters,
@@ -10169,8 +10260,17 @@ class WebSocketGateway:
         # Set up message handler with routing support
         channel_name = name
         gateway = self
+        # Turn handlers run with ``block=False`` so an approval tap can be
+        # dispatched while a turn waits on it (#6032). This lock keeps turns and
+        # /new strictly one at a time, as PTB's sequential dispatch did before,
+        # so staged profiles, debounce batches and resets never interleave.
+        turn_lock = asyncio.Lock()
 
         async def handle_message(update: Update, context: Any):
+            async with turn_lock:
+                await _handle_message(update, context)
+
+        async def _handle_message(update: Update, context: Any):
             # Import the shared security pipeline from telegram.py
             from praisonai_bot.bots.telegram import process_inbound_telegram_message
             
@@ -10267,6 +10367,14 @@ class WebSocketGateway:
                         pass
                 ack_ctx = await bot._ack.ack(react_fn=_tg_react)
 
+            # Same identifiers the standalone adapter passes, so ingress dedup
+            # and ``session_scope: per_chat`` work in gateway mode (#6032).
+            _session_ids = {
+                "chat_id": chat_id or "",
+                "message_id": str(update.message.message_id),
+                "account": getattr(bot.config, "account", "default"),
+            }
+
             try:
                 message_text = await bot._debouncer.debounce(user_id, message_text)
                 
@@ -10280,12 +10388,14 @@ class WebSocketGateway:
                     response = await with_typing_renewal(
                         typing_func=_typing_action,
                         operation_coro=bot._session.chat(
-                            agent, user_id, message_text, tool_policy=tool_policy
+                            agent, user_id, message_text, tool_policy=tool_policy,
+                            **_session_ids,
                         )
                     )
                 else:
                     response = await bot._session.chat(
-                        agent, user_id, message_text, tool_policy=tool_policy
+                        agent, user_id, message_text, tool_policy=tool_policy,
+                        **_session_ids,
                     )
                 if hasattr(bot, '_send_response_with_media'):
                     # Issue #3623: this handler serves VOICE|AUDIO as well as
@@ -10323,6 +10433,10 @@ class WebSocketGateway:
             await update.message.reply_text(bot._format_status())
 
         async def handle_new(update: Update, context: Any):
+            async with turn_lock:
+                await _handle_new(update, context)
+
+        async def _handle_new(update: Update, context: Any):
             if not update.message:
                 return
             from praisonai_bot.bots.telegram import process_inbound_telegram_message
@@ -10330,7 +10444,12 @@ class WebSocketGateway:
             if not message:
                 return
             user_id = message.sender.user_id if message.sender else "unknown"
-            bot._session.reset(user_id)
+            # Same route chat() receives, so ``per_chat`` group sessions reset.
+            bot._session.reset(
+                user_id,
+                account=getattr(bot.config, "account", "default"),
+                chat_id=str(update.message.chat_id) if update.message.chat_id else "",
+            )
             await update.message.reply_text("Session reset. Starting fresh conversation.")
 
         async def handle_help(update: Update, context: Any):
@@ -10343,10 +10462,17 @@ class WebSocketGateway:
 
         # Register handlers
         app.add_handler(CommandHandler("status", handle_status))
-        app.add_handler(CommandHandler("new", handle_new))
+        # Non-blocking so an agent turn awaiting tool approval does not stall
+        # PTB's sequential dispatch of the button tap that resolves it (#6032);
+        # ``turn_lock`` still runs turns and resets one at a time, in order.
+        app.add_handler(CommandHandler("new", handle_new, block=False))
         app.add_handler(CommandHandler("help", handle_help))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message, block=False))
+        app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice, block=False))
+        # Inline buttons (pairing Approve/Deny, tool approvals) use the adapter's
+        # own dispatcher, so no second getUpdates poller is needed (#6032).
+        app.add_handler(CallbackQueryHandler(bot._handle_callback_query))
+        bot._autowire_agent_approval_backend()
 
         # Initialize and start using low-level API
         await app.initialize()

@@ -18,6 +18,7 @@ import logging
 from praisonaiagents._logging import get_logger
 from ..errors import BudgetExceededError, ToolExecutionError
 from .tool_execution import _active_turn_cancel
+from .interrupt import protect_turn
 
 # Shared lazy display helpers (cached, thread-safe; avoid circular imports)
 from ._lazy_display import _get_console, _get_live, _get_display_functions
@@ -1724,8 +1725,9 @@ Your Goal: {self.goal}"""
 
         self._run_pre_compaction_memory_flush(messages, compactor)
         
-        # Perform compaction
-        compacted_msgs, result = compactor.compact(messages)
+        # Perform compaction (protected: interrupt busy-mode queues instead)
+        with protect_turn(getattr(self, 'interrupt_controller', None)):
+            compacted_msgs, result = compactor.compact(messages)
         
         logging.info(
             f"[proactive-compaction] {self.name}: {result.original_tokens}→{result.compacted_tokens} tokens "
@@ -1910,8 +1912,9 @@ Your Goal: {self.goal}"""
 
         await self._arun_pre_compaction_memory_flush(messages, compactor)
         
-        # Perform compaction
-        compacted_msgs, result = compactor.compact(messages)
+        # Perform compaction (protected: interrupt busy-mode queues instead)
+        with protect_turn(getattr(self, 'interrupt_controller', None)):
+            compacted_msgs, result = compactor.compact(messages)
         
         logging.info(
             f"[proactive-compaction-async] {self.name}: {result.original_tokens}→{result.compacted_tokens} tokens "
@@ -3693,7 +3696,8 @@ Your Goal: {self.goal}"""
             _in_ok, _in_prompt, _in_err = self._validate_input_with_guardrail(prompt)
             if not _in_ok:
                 logging.warning(f"Agent {self.name}: input blocked by guardrail: {_in_err}")
-                return None
+                self._last_guardrail_error = _in_err
+                return self._guardrail_blocked_message(_in_err)
             prompt = _in_prompt
 
         # Check if external managed backend is configured
@@ -4543,7 +4547,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 )
             if not _in_ok:
                 logging.warning(f"Agent {self.name}: input blocked by guardrail: {_in_err}")
-                return None
+                self._last_guardrail_error = _in_err
+                return self._guardrail_blocked_message(_in_err)
             prompt = _in_prompt
 
         # Check if external managed backend is configured (async parity with the
@@ -5663,7 +5668,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             _in_ok, _in_prompt, _in_err = self._validate_input_with_guardrail(prompt)
             if not _in_ok:
                 logging.warning(f"Agent {getattr(self, 'name', '')}: input blocked by guardrail: {_in_err}")
-                yield f"[Input blocked by guardrail: {_in_err}]"
+                self._last_guardrail_error = _in_err
+                yield self._guardrail_blocked_message(_in_err)
                 return "failed"
             prompt = _in_prompt
 
@@ -6629,23 +6635,24 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             self._run_pre_compaction_memory_flush(messages, _compactor)
             
             # Perform compaction
-            if _strategy == CompactionStrategy.LLM_SUMMARIZE and _llm_fn:
-                # Drive the async summariser through the shared bridge so it runs
-                # correctly whether or not a loop is already running (FastAPI /
-                # Jupyter / a bot handler). The previous code caught bare
-                # RuntimeError from ``asyncio.run`` ("event loop already
-                # running") and silently downgraded LLM summarisation to naive
-                # truncation whenever a loop was live; the bridge removes that
-                # spurious fallback so the real summariser always runs. Provider
-                # errors inside the summariser remain best-effort (see
-                # ``_llm_summarize_async``, which falls back to a naive summary on
-                # failure) — compaction never hard-fails the turn.
-                from ..utils.async_bridge import run_coroutine_from_any_context
-                compacted_msgs, _cr = run_coroutine_from_any_context(
-                    _compactor.compact_async(messages)
-                )
-            else:
-                compacted_msgs, _cr = _compactor.compact(messages)
+            with protect_turn(getattr(self, 'interrupt_controller', None)):
+                if _strategy == CompactionStrategy.LLM_SUMMARIZE and _llm_fn:
+                    # Drive the async summariser through the shared bridge so it runs
+                    # correctly whether or not a loop is already running (FastAPI /
+                    # Jupyter / a bot handler). The previous code caught bare
+                    # RuntimeError from ``asyncio.run`` ("event loop already
+                    # running") and silently downgraded LLM summarisation to naive
+                    # truncation whenever a loop was live; the bridge removes that
+                    # spurious fallback so the real summariser always runs. Provider
+                    # errors inside the summariser remain best-effort (see
+                    # ``_llm_summarize_async``, which falls back to a naive summary on
+                    # failure) — compaction never hard-fails the turn.
+                    from ..utils.async_bridge import run_coroutine_from_any_context
+                    compacted_msgs, _cr = run_coroutine_from_any_context(
+                        _compactor.compact_async(messages)
+                    )
+                else:
+                    compacted_msgs, _cr = _compactor.compact(messages)
             
             messages[:] = compacted_msgs  # in-place update so callers see the change
             logging.info(
@@ -6719,10 +6726,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             await self._arun_pre_compaction_memory_flush(messages, _compactor)
             
             # Perform compaction (use async version when available)
-            if _strategy == CompactionStrategy.LLM_SUMMARIZE and _llm_fn:
-                compacted_msgs, _cr = await _compactor.compact_async(messages)
-            else:
-                compacted_msgs, _cr = _compactor.compact(messages)
+            with protect_turn(getattr(self, 'interrupt_controller', None)):
+                if _strategy == CompactionStrategy.LLM_SUMMARIZE and _llm_fn:
+                    compacted_msgs, _cr = await _compactor.compact_async(messages)
+                else:
+                    compacted_msgs, _cr = _compactor.compact(messages)
             
             # If messages is the same object as chat_history, replace chat history
             # Otherwise, update the passed messages list in-place
