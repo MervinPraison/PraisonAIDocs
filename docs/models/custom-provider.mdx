@@ -164,7 +164,10 @@ graph TB
 
 ### Structured Outputs from the YAML Generator
 
-To be used by `AutoGenerator` for structured completion, a registered provider opts in by exposing an **async** `generate_structured(...)`:
+To be used by `AutoGenerator` for structured completion, a registered provider opts in by exposing a sync **or** async `generate_structured(...)`. Both shapes are accepted — a sync implementation is automatically offloaded to a worker thread so it never parks the caller's event loop or the shared `AsyncBridge` loop ([PR #6137](https://github.com/MervinPraison/PraisonAI/pull/6137)).
+
+<Tabs>
+<Tab title="Async">
 
 ```python
 from praisonai.llm import register_llm_provider
@@ -184,6 +187,30 @@ register_llm_provider("bedrock", BedrockProvider)
 # AutoGenerator now delegates structured completion for "bedrock/..." models
 # to your provider, before falling back to LiteLLM/OpenAI.
 ```
+
+</Tab>
+<Tab title="Sync">
+
+```python
+from praisonai.llm import register_llm_provider
+
+class BedrockProvider:
+    provider_id = "bedrock"
+
+    def __init__(self, model_id, config=None):
+        self.model_id = model_id
+        self.config = config or {}
+
+    def generate_structured(self, response_model, messages, **kwargs):
+        # Return an instance of `response_model` (a Pydantic model).
+        # PraisonAI runs this in a worker thread via asyncio.to_thread.
+        ...
+
+register_llm_provider("bedrock", BedrockProvider)
+```
+
+</Tab>
+</Tabs>
 
 Providers that don't define `generate_structured(...)` are skipped and the built-in ladder runs unchanged.
 
@@ -281,7 +308,7 @@ Two wrapper hot paths now consult the registry before falling back to the built-
 | Hot path | What it calls on your provider | Opt-in |
 |---|---|---|
 | **`PraisonAIModel.get_model()`** — every `Agent(llm="myprov/…")` call routed through a framework adapter (AutoGen, CrewAI, etc.) | `provider.get_client()` if defined, otherwise the provider instance itself is returned as the "client" | Passive — any registered provider works |
-| **`BaseAutoGenerator._completion_impl`** — YAML auto-generation and any generator inheriting from `BaseAutoGenerator` | `await provider.generate_structured(response_model, messages, **kwargs)` | Explicit — providers without `generate_structured` fall through to the built-in LiteLLM ladder |
+| **`BaseAutoGenerator._completion_impl`** — YAML auto-generation and any generator inheriting from `BaseAutoGenerator` | `await provider.generate_structured(response_model, messages, **kwargs)` if async; `await asyncio.to_thread(provider.generate_structured, response_model, messages, **kwargs)` if sync | Explicit — providers without `generate_structured` fall through to the built-in LiteLLM ladder |
 
 <Note>
 Registering a provider under a built-in prefix (`openai/`, `groq/`, `cohere/`, `ollama/`, `ollama_chat/`, `lm_studio/`, `vllm/`, `hosted_vllm/`, `anthropic/`, `google/`, `openrouter/`) does **not** hijack the built-in path. Both hot paths gate against a shared `_BUILTIN_MODEL_PREFIXES` set so the built-in ladder always wins for those prefixes. Use a unique namespace (e.g. `mycompany-openai/`) if you need custom routing under an OpenAI-like protocol.
@@ -337,6 +364,8 @@ agent = Agent(
 
 result = agent.start("Summarise the latest PR in one sentence.")
 ```
+
+- If `generate_structured(...)` is sync (e.g. you use the blocking `boto3` client directly), that works too — PraisonAI offloads it to a worker thread so the caller's loop stays responsive ([PR #6137](https://github.com/MervinPraison/PraisonAI/pull/6137)).
 
 <Tip>
 Skip `generate_structured` if you only need chat completion — `PraisonAIModel.get_client()` is enough for framework adapters. Add `generate_structured` when you also need YAML auto-generation (`praisonai --auto ...`) or another generator that produces pydantic models. The emitted YAML now matches your **configured** model — the job-workflow generator no longer hard-codes `gpt-4o-mini` (see [Auto Mode Providers → Job-workflow generation honours your configured model](/features/auto-generator-providers#job-workflow-generation-honours-your-configured-model)).
