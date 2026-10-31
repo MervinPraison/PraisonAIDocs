@@ -928,6 +928,10 @@ class GatewayServerSchema(BaseModel):
     # best-effort sends a short plain-text notice on the same channel.
     notify_on_undelivered: Optional[bool] = None
     undelivered_template: Optional[str] = None
+    # Notification policy (#6138): ``{defaults: {...}, recipients: {"<platform>:
+    # <channel_id>": {categories, quiet_hours, timezone, detail}}}`` gating
+    # categorised proactive sends (scheduled results = ``agent_finished``).
+    notifications: Optional[Dict[str, Any]] = None
     # Additive protocol surfaces (#2715), liveness (#2798), health monitor
     api: Optional[Dict[str, Any]] = None
     liveness: Optional[Dict[str, Any]] = None
@@ -942,6 +946,9 @@ class GatewayServerSchema(BaseModel):
     forensics: Optional[Dict[str, Any]] = None
     # Hooks may be nested under ``gateway:`` for grouping
     hooks: Optional[List["HookSchema"]] = None
+    # Outbound lifecycle sinks (#6140): shell commands run on core hook events
+    # (event JSON on stdin) — the config-only counterpart to inbound ``hooks``.
+    hooks_outbound: Optional[List["OutboundHookSchema"]] = None
 
     @field_validator("overflow_policy")
     @classmethod
@@ -950,6 +957,19 @@ class GatewayServerSchema(BaseModel):
             raise ValueError(
                 "overflow_policy must be one of 'reject', 'queue', 'shed_oldest'"
             )
+        return v
+
+    @field_validator("notifications")
+    @classmethod
+    def validate_notifications(
+        cls, v: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        # Fail at load on an unknown category/detail or malformed quiet_hours
+        # rather than silently at send time.
+        if v:
+            from ._notifications import NotificationGate
+
+            NotificationGate(v)
         return v
 
 
@@ -1026,8 +1046,28 @@ class HookSchema(BaseModel):
         return v
 
 
-# Resolve the forward reference to ``HookSchema`` in
-# ``GatewayServerSchema.hooks`` now that ``HookSchema`` is defined.
+class OutboundHookSchema(BaseModel):
+    """``gateway.hooks_outbound[]`` — a core ``CommandHook`` on lifecycle events (#6140)."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    command: str = Field(min_length=1)
+    events: List[str] = Field(min_length=1)
+    timeout: float = Field(default=30.0, gt=0)
+
+    @field_validator("events")
+    @classmethod
+    def validate_events(cls, v: List[str]) -> List[str]:
+        from praisonaiagents.hooks.types import HookEvent
+
+        allowed = {e.value for e in HookEvent}
+        bad = [e for e in v if e not in allowed]
+        if bad:
+            raise ValueError(f"Unknown hook event(s): {', '.join(bad)}")
+        return v
+
+
+# Resolve the forward references to ``HookSchema``/``OutboundHookSchema`` in
+# ``GatewayServerSchema`` now that both are defined.
 GatewayServerSchema.model_rebuild()
 
 
