@@ -144,6 +144,8 @@ from praisonai.jobs import SqliteJobStore, create_app
 app = create_app(store=SqliteJobStore(path="/var/lib/praisonai/jobs.db"))
 ```
 
+This app owns its store — a later `create_app()` call with a different store does not override it. See [Isolated Apps / Multi-Tenant](#isolated-apps--multi-tenant).
+
 `SqliteJobStore` and `create_app` are both exported from `praisonai.jobs`. `_build_default_store()` in `praisonai/jobs/server.py` selects the backend from the environment:
 
 | Env var | Default | Effect |
@@ -244,6 +246,59 @@ sequenceDiagram
 
 <Note>
 This is transparent to API callers: reconciled jobs still report `JobStatus.FAILED` through `/runs/<id>`. Existing databases gain the `owner` column automatically on the first `SqliteJobStore(...)` call.
+</Note>
+
+## Isolated Apps / Multi-Tenant
+
+Each `create_app()` call that gets its own `store=` or `executor=` keeps them on `app.state` — two apps built that way in the same process never share state. Apps built with no arguments share the process defaults.
+
+```mermaid
+graph LR
+    A[📦 create_app&#40;store=A&#41;] --> AppA[🛰️ App A]
+    B[📦 create_app&#40;store=B&#41;] --> AppB[🛰️ App B]
+    AppA --> StoreA[(🧪 Store A)]
+    AppB --> StoreB[(🧪 Store B)]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef app fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class A,B input
+    class AppA,AppB app
+    class StoreA,StoreB store
+```
+
+Run two Jobs APIs for two tenants in one process:
+
+```python
+from praisonai.jobs import SqliteJobStore, create_app
+
+tenant_a = create_app(store=SqliteJobStore(path="/var/lib/jobs/tenant-a.db"))
+tenant_b = create_app(store=SqliteJobStore(path="/var/lib/jobs/tenant-b.db"))
+
+assert tenant_a.state.job_store is not tenant_b.state.job_store
+assert tenant_a.state.job_executor is not tenant_b.state.job_executor
+```
+
+Reach the app's store from your own routes via `app.state`:
+
+```python
+from fastapi import Request
+
+@tenant_a.get("/stats/jobs")
+async def count(request: Request):
+    return {"jobs": await request.app.state.job_store.count()}
+```
+
+| You pass | What `create_app()` does |
+|---|---|
+| nothing | Uses the process defaults `get_store()` / `get_executor()` |
+| `store=` only | Builds a fresh `JobExecutor` for that store |
+| `executor=` only | Uses `executor.store` |
+| both | Uses both as-is |
+
+<Note>
+`get_store()` and `get_executor()` are **process defaults** — used when `create_app()` gets no injection, and by the kanban jobs bridge. Passing `store=` or `executor=` never touches them. The app's lifespan stops its executor in a `finally` block, so the worker loop shuts down even if the app errors. Added in PR [#5993](https://github.com/MervinPraison/PraisonAI/pull/5993).
 </Note>
 
 ## Backpressure & Admission Control
