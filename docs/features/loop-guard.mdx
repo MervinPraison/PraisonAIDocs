@@ -21,6 +21,8 @@ Loop Guard now resets its per-turn state at the start of every `chat()` / `achat
 
 <Note>
 **Overlapping turns on a shared Agent now each get their own per-turn `LoopGuard`** as of [PR #5861](https://github.com/MervinPraison/PraisonAI/pull/5861) (merged 2026-10-26, fixes [#5860](https://github.com/MervinPraison/PraisonAI/issues/5860)). Each turn's guard shares the agent-level `LoopGuardConfig` but has its own tool counts, no-progress streak, and turn clock, bound to the turn via a `ContextVar` that is copied into tool worker threads. Before this PR, a gateway or bot serving overlapping requests on one `Agent` could HALT a later request with `No progress detected` because the shared guard had already crossed the threshold on another caller's traffic. `chat()` / `achat()` / `start()` / `astart()` and streaming all get this behaviour. `agent.execute_tool(...)` called outside a chat turn still uses the agent-level guard. No config change is required to pick this up.
+
+**The per-turn wall-clock budget is now user-configurable** as of [PR #6057](https://github.com/MervinPraison/PraisonAI/pull/6057) (merged 2026-10-26, fixes [#6026](https://github.com/MervinPraison/PraisonAI/issues/6026)). `ExecutionConfig.max_execution_time` (Python, or `max_execution_time:` on a YAML agent) now sets `LoopGuardConfig.max_time_per_turn` for every per-turn guard the agent creates — `None` keeps the new 600 s default, a positive int sets the limit in seconds, and `0` disables the wall-clock HALT entirely. The built-in default also rose from **120 s → 600 s**, so a single slow tool call (a long test suite, a build, a slow MCP call) no longer HALTs the next tool call in a healthy turn. The count and no-progress thresholds still catch real loops. Both the sync (`agent.chat()` / `agent.start()`) and async (`agent.achat()` / `agent.astart()`) paths pick this up. No API surface was added.
 </Note>
 
 ```python
@@ -108,6 +110,8 @@ agent._loop_guard = LoopGuard(LoopGuardConfig(
 ```
 
 Per-turn guards reuse this guard's config (created lazily on the turn's first tool call), so one `agent._loop_guard = ...` reconfiguration applies to every subsequent turn, streaming or non-streaming, sync or async.
+
+For the per-turn time limit specifically, prefer `Agent(execution=ExecutionConfig(max_execution_time=...))` — it reaches the same place, and it also works from YAML (`max_execution_time:` on the agent). Set `LoopGuardConfig(max_time_per_turn=...)` directly only when you want to override the time budget alongside count thresholds in one block — a custom `_loop_guard` takes its own value and ignores `max_execution_time`.
 
 </Step>
 
@@ -240,7 +244,7 @@ If you can't move your tool into the explicit set, **name it well** — Loop Gua
 | `mutating_warn_threshold` | `int` | `3` | Warning threshold for mutating tools |
 | `mutating_block_threshold` | `int` | `5` | Block threshold for mutating tools |
 | `mutating_halt_threshold` | `int` | `7` | Halt threshold for mutating tools |
-| `max_time_per_turn` | `float` | `120.0` | Maximum seconds per turn before timeout |
+| `max_time_per_turn` | `float` | `600.0` | Maximum seconds per turn before timeout. For most users, don't set this directly — set `ExecutionConfig.max_execution_time` on the Agent instead, and the loop guard reads it (`0` disables the wall-clock halt). If you assign a custom `agent._loop_guard`, its `max_time_per_turn` is used as-is and `ExecutionConfig.max_execution_time` is ignored. |
 | `no_progress_warn` | `int` | `4` | Warn once the trailing run of *identical* tool-result fingerprints reaches this length. Changing results reset the streak. |
 | `no_progress_halt` | `int` | `8` | Halt once the trailing run of *identical* tool-result fingerprints reaches this length. Changing results reset the streak. |
 
@@ -478,6 +482,54 @@ for t in threads: t.join()
 
 Each `chat()` / `achat()` turn, and each streaming generator, binds its own `LoopGuard` on a `ContextVar` that is copied into tool worker threads — so twenty overlapping writes to twenty different paths neither warn nor HALT each other.
 
+### Set the per-turn time limit through ExecutionConfig
+
+```python
+from praisonaiagents import Agent, ExecutionConfig
+
+def run_tests(suite: str) -> str:
+    """Run a (slow) test suite."""
+    ...
+
+# One slow tool call used to HALT the next one at 120 s.
+# The new 600 s default handles this; raise it further for very long tool calls.
+agent = Agent(
+    name="coder",
+    instructions="Run the tests, then summarise.",
+    tools=[run_tests],
+    execution=ExecutionConfig(max_execution_time=1800),  # 30 min per turn
+)
+
+agent.start("Run unit and integration suites, then summarise")
+```
+
+`max_execution_time=0` disables the per-turn wall-clock halt entirely — count and no-progress thresholds still catch real loops. The same setting works from YAML:
+
+```yaml
+agents:
+  coder:
+    instructions: Run the tests, then summarise.
+    max_execution_time: 1800
+```
+
+```mermaid
+graph TB
+    Q{Need a longer<br/>per-turn budget?}
+    Q -->|No — turns are fast| Default[Default 600s<br/>no config needed]
+    Q -->|Yes — one slow tool| Set[ExecutionConfig<br/>max_execution_time=N]
+    Q -->|Never want a HALT| Zero[ExecutionConfig<br/>max_execution_time=0]
+    Set --> Note1[Count &amp; no-progress<br/>thresholds still active]
+    Zero --> Note1
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef pick fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef note fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class Default,Set,Zero pick
+    class Note1 note
+```
+
 ### Long-lived agents
 
 ```python
@@ -525,7 +577,7 @@ Loop Detection is **also always-on** as of PR #3005 — every `Agent` runs resul
 <AccordionGroup>
 
 <Accordion title="Long-lived agents are safe to reuse">
-Reuse one `Agent` across many turns of a bot, gateway, or chat UI. The per-turn tool counts and the 120 s `max_time_per_turn` budget reset at the start of every `chat()` / `achat()` call, so an idle session that wakes up 10 minutes later still gets a full fresh turn. Only the current turn's work counts.
+Reuse one `Agent` across many turns of a bot, gateway, or chat UI. The per-turn tool counts and the 600 s `max_time_per_turn` budget reset at the start of every `chat()` / `achat()` call, so an idle session that wakes up 10 minutes later still gets a full fresh turn. Only the current turn's work counts.
 </Accordion>
 
 <Accordion title="Trust the defaults">
