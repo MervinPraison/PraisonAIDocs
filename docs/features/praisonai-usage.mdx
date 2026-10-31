@@ -59,6 +59,16 @@ praisonai usage --json
 ```
 
 </Step>
+
+<Step title="See per-tool reliability">
+
+```bash
+praisonai usage --by tool
+```
+
+Reports calls, success rate, average latency, and the last error for each tool used.
+
+</Step>
 </Steps>
 
 ---
@@ -104,15 +114,16 @@ graph TB
     Q -->|How much this week?| Day[--by day]
     Q -->|Which model costs most?| Model[--by model]
     Q -->|Which workspace burns budget?| Project[--by project]
+    Q -->|Which tool is flaky or slow?| Tool[--by tool]
 
     classDef question fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef option fill:#189AB4,stroke:#7C90A0,color:#fff
 
     class Q question
-    class Day,Model,Project option
+    class Day,Model,Project,Tool option
 ```
 
-`day` sorts chronologically; `model` and `project` sort by highest token count first.
+`day` sorts chronologically; `model` and `project` sort by highest token count first. `tool` sorts by most-called first, so your busiest (or busiest-failing) tool rises to the top.
 
 ---
 
@@ -121,11 +132,74 @@ graph TB
 | Option | Short | Type | Default | Values | Description |
 |--------|-------|------|---------|--------|-------------|
 | `--days` | `-d` | `int` | `30` | any int; `0` = all | Only include sessions updated in the last N days. |
-| `--by` | `-b` | `str` | `day` | `day` \| `model` \| `project` | Group rows by dimension. Invalid values exit `1`. |
+| `--by` | `-b` | `str` | `day` | `day` \| `model` \| `project` \| `tool` | Group rows by dimension. Invalid values exit `1`. |
 | `--project` | `-p` | `str` | `None` | any project id | Restrict to a specific project's session store. |
 | `--json` | — | `bool` | `False` | flag | Emit machine-readable JSON instead of a table. |
 
-An invalid `--by` value prints `--by must be one of: day, model, project` and exits with code `1`.
+An invalid `--by` value prints `--by must be one of: day, model, project, tool` and exits with code `1`.
+
+---
+
+## Per-Tool Reliability
+
+`praisonai usage --by tool` reports per-tool call counts, success rate, average and last latency, and the last error — read from the local session store, same as every other grouping.
+
+```mermaid
+graph LR
+    subgraph "praisonai usage --by tool"
+        Hook[🪝 AFTER_TOOL hook] --> Tally[📊 Per-tool tally]
+        Tally --> Store[💾 Session metadata]
+        Store --> Report[✅ Tool report]
+    end
+
+    classDef hook fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Hook hook
+    class Tally,Store process
+    class Report result
+```
+
+```
+                                 Tool usage
+┏━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━┓
+┃ Tool       ┃ Calls ┃ Success ┃ Avg ms ┃ Last ms ┃ Last error ┃
+┡━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━┩
+│ search     │     3 │  66.7%  │   200  │   200   │ timeout    │
+│ write_file │     1 │ 100.0%  │     5  │     5   │ -          │
+└────────────┴───────┴─────────┴────────┴─────────┴────────────┘
+```
+
+| Column | Meaning |
+|---|---|
+| `Tool` | Tool name as the runtime saw it |
+| `Calls` | How many times the tool was invoked |
+| `Success` | Percentage of calls that returned without an error |
+| `Avg ms` | Average execution time across all calls |
+| `Last ms` | Latency of the most recent call |
+| `Last error` | Last error message (truncated to 60 chars in the table, 500 in JSON) |
+
+`Last ms` and `Last error` are picked by when the tool itself last ran, not by when the session was last updated. If no tool calls are recorded, the command prints `No tool usage recorded yet`.
+
+<Note>
+The tally counts tool outcomes that reach the `AFTER_TOOL` hook — which covers normalised tool failures (the common case). A raw exception that escapes the tool retry loop does not fire `AFTER_TOOL` and is not counted.
+</Note>
+
+### Python: read the same data with a hook
+
+Prefer Python? The same per-call data is available via the `AFTER_TOOL` hook — no new API is needed.
+
+```python
+from praisonaiagents.hooks import add_hook, HookEvent
+
+def on_tool(data):
+    print(data.tool_name, data.execution_time_ms, data.tool_error)
+
+add_hook(HookEvent.AFTER_TOOL, on_tool)
+```
+
+The CLI tally reads exactly these three fields.
 
 ---
 
@@ -161,6 +235,32 @@ Zero values render as `-`, and a final `Total` row sums the report.
 ```
 
 </Tab>
+<Tab title="JSON (--by tool)">
+
+```json
+{
+  "by": "tool",
+  "days": 30,
+  "project": null,
+  "rows": [
+    {
+      "tool": "search",
+      "calls": 3,
+      "successes": 2,
+      "errors": 1,
+      "success_rate": 0.6667,
+      "avg_ms": 200.0,
+      "last_ms": 200.0,
+      "last_error": "timeout"
+    }
+  ],
+  "errors": []
+}
+```
+
+Tool mode omits the top-level `total_tokens` / `cost` fields — it reports outcomes, not spend.
+
+</Tab>
 </Tabs>
 
 ---
@@ -185,6 +285,9 @@ Run `praisonai usage --by model` weekly to see which model your agents actually 
 </Accordion>
 <Accordion title="Compare workspaces">
 Use `praisonai usage --project <id>` inside a workspace and `praisonai usage --by project` in the default shell to compare workloads.
+</Accordion>
+<Accordion title="Spot flaky or slow tools before users notice">
+Run `praisonai usage --by tool --days 7` as part of your weekly review. Rows are sorted by call count first, so the busiest tool is on top — and the `Success` column immediately shows which ones are quietly failing. Pipe `--json` into `jq` in CI to fail a build when any tool drops below your target success rate.
 </Accordion>
 <Accordion title="Script with jq">
 `--json` is stable for scripting — pipe into `jq` or a small dashboard rather than parsing the table.
