@@ -17,6 +17,18 @@ agent = Agent(name="assistant", instructions="Be helpful.")
 # Per-client gateway rate limits protect this agent from traffic spikes
 agent.start("Quick question")
 ```
+
+```python
+from praisonai_bot.bots import BotOS
+from praisonaiagents import Agent
+
+agent = Agent(name="Support", instructions="Help users")
+bot = BotOS(agent=agent, platforms=["telegram"], per_user_per_minute=20)
+bot.run()
+```
+
+One line protects every connected channel — Telegram, Discord, Slack, HTTP, WebSocket.
+
 Gateway rate limiting completes the gateway's policy-protocol family: bound how often an identity can start turns in a given scope with the built-in sliding window, or inject your own limiter.
 
 The user hits the gateway repeatedly; per-client rate limits cap requests and return clear backoff signals.
@@ -45,6 +57,85 @@ graph LR
 ```
 
 ## Quick Start
+
+<Steps>
+
+<Step title="Simplest: one YAML key">
+Cap how many turns one user may start per minute — unlimited by default (`0`).
+
+```yaml
+# gateway.yaml  (or botos.yaml under the same gateway: block)
+gateway:
+  per_user_per_minute: 20
+```
+
+The equivalent Python one-liner:
+
+```python
+from praisonai_bot.bots import BotOS
+from praisonaiagents import Agent
+
+agent = Agent(name="Support", instructions="Help users")
+bot = BotOS(agent=agent, platforms=["telegram"], per_user_per_minute=20)
+bot.run()
+```
+
+Over the budget, the user sees: **"Rate limit reached — please try again in Ns."** The turn is refused before any agent work starts. A fresh conversation does not reset the budget — the gateway charges a [stable identity](#stable-identity) (session id on bot channels, authenticated token or peer IP on HTTP / WebSocket).
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Bot
+    participant Gate as AdmissionGate
+    participant Agent
+
+    User->>Bot: 21st message within 60s
+    Bot->>Gate: admit(session_id="alice", rate_key="alice")
+    Gate-->>Bot: AdmissionRejected(retry_after=37)
+    Bot-->>User: "Rate limit reached — please try again in 37s."
+    Note over User,Bot: 37 seconds later...
+    User->>Bot: Next message
+    Bot->>Gate: admit(...)
+    Gate-->>Bot: ADMIT
+    Bot->>Agent: Run turn
+    Agent-->>User: Reply
+```
+
+| Value | Behaviour |
+|---|---|
+| `0` (default) | Unlimited — no-op |
+| `20` | 20 turns per minute per identity |
+| `-1` | `ValueError` at startup |
+| `0.5` or `true` | `ValueError` at startup |
+
+<Note>
+`per_user_per_minute` is a 60-second sliding window with no lockout, and it composes with `max_concurrent_runs`, `max_concurrent_runs_per_scope` and `max_rss_mb` on the same [admission gate](/features/gateway-admission-control) — whichever triggers first refuses the turn. A gateway config reload re-validates the new value; a bad value rejects the reload and the previous budget stays in force.
+</Note>
+</Step>
+
+</Steps>
+
+### Choosing which path
+
+```mermaid
+graph TB
+    Q{"Need per-user budget?"}
+    Q -->|"Just a per-minute cap"| Simple["gateway.per_user_per_minute: N"]
+    Q -->|"Need a cooldown lockout"| Policy["SlidingWindowRateLimitPolicy(..., lockout_seconds=N)"]
+    Q -->|"Redis / per-tenant / cost-based"| Custom["Custom RateLimitPolicyProtocol"]
+
+    classDef decision fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef simple fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef policy fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef custom fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q decision
+    class Simple simple
+    class Policy policy
+    class Custom custom
+```
+
+For a cooldown penalty, Redis-backed state, or per-tenant limits, use the policy surface:
 
 <Steps>
 
@@ -98,7 +189,7 @@ bot.start()
 </Step>
 
 <Step title="YAML configuration">
-Configure via `gateway.yaml`:
+Configure via `gateway.yaml`. For a plain per-minute cap, `gateway.per_user_per_minute: N` is all you need; use the `rate_limit` block when you need a custom window or a lockout:
 
 ```yaml
 gateway:
@@ -235,6 +326,20 @@ graph TB
 
 ---
 
+## Stable identity
+
+`gateway.per_user_per_minute` charges each turn to a caller identity the client cannot reset.
+
+| Entry point | Rate key |
+|---|---|
+| Channel bots (Telegram, Discord, Slack, WhatsApp, …) and other admission callers | `session_id` (the per-user storage key) |
+| HTTP API | `token:<sha256-prefix>` only when the bearer equals the gateway's configured `auth_token` (constant-time compared); otherwise `ip:<peer-host>`; `ip:unknown` when the peer is absent |
+| WebSocket turns | `ip:<peer-host>` from the live connection; `ip:unknown` when absent |
+
+Rotating a bearer token, cycling `x-session-id`, or opening a new WebSocket conversation does not mint a fresh budget — the caller keeps hitting the same token- or IP-keyed budget.
+
+---
+
 ## Building a Custom Limiter
 
 Any object with a `check(*, identity, scope, now)` method satisfies `RateLimitPolicyProtocol`. The signature **must be keyword-only**.
@@ -279,6 +384,10 @@ Wrappers exposing it to an **unbounded or untrusted** identity space (e.g. raw p
 
 The gateway's built-in limiters (`gateway/rate_limiter.py`, `bots/_rate_limit.py`) already handle locking and reclamation — prefer those for untrusted identity spaces.
 </Warning>
+
+<Note>
+`gateway.per_user_per_minute` already handles reclamation — the admission gate prunes stale per-identity entries lazily once there are more than 4096 of them, so an open ingress cannot grow that state forever.
+</Note>
 
 ---
 
