@@ -415,6 +415,48 @@ is_safe_command("rm -rf /")        # False
 is_safe_command("sudo apt install") # False
 ```
 
+## Crash-Safe Writes
+
+`code_write_file`, `code_search_replace`, and `code_apply_diff` write files atomically. Each write goes to a temp file in the target's directory, is flushed and `fsync`'d, then swapped over the target with `os.replace`. If the agent is cancelled, times out, is `SIGTERM`'d, or the disk fills up mid-write, the original file is untouched.
+
+```mermaid
+graph LR
+    subgraph "Crash-safe write"
+        Call["📝 code_write_file /<br/>search_replace /<br/>apply_diff"] --> Tmp["📄 temp file<br/>.tmp_&lt;hex&gt;"]
+        Tmp --> Fsync["💾 fsync"]
+        Fsync --> Replace["♻️ os.replace<br/>(atomic)"]
+        Replace --> Done["✅ Target updated"]
+        Call -. interrupt .-> Keep["🛡️ Original intact"]
+        Tmp -. interrupt .-> Keep
+        Fsync -. interrupt .-> Keep
+    end
+
+    classDef call fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef io fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef keep fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Call call
+    class Tmp,Fsync io
+    class Replace,Done ok
+    class Keep keep
+```
+
+| Guarantee | What it prevents |
+|-----------|------------------|
+| Atomic replace | A cancellation / `SIGTERM` / disk-full mid-write leaving the file zero-byte or half-written |
+| `fsync` before rename | Power loss leaving an empty file after apparent success |
+| Permission bits preserved | A `0o755` script turning into `0o600`; a `0o600` `.env` becoming world-readable |
+| Owner preserved (POSIX, best-effort) | A group-/shared-owned file silently changing owner |
+| Symlinks written through, not replaced | A symlink being turned into a plain file |
+| Read-only targets refused (`PermissionError`) | An inode swap bypassing a target's read-only permissions |
+
+Nothing changes for the caller when a write succeeds — same return value, same file. On failure, the temp file (`.tmp_<hex>` next to the target) is removed before the error propagates.
+
+<Warning>
+**Upgrade note (PraisonAI [PR #6205](https://github.com/MervinPraison/PraisonAI/pull/6205))**: before this release, these three tools used `open(path, 'w')`, which truncates the target immediately. A cancelled or timed-out tool call could leave your file empty or half-written and lose the original content. Upgrade to get the crash-safe write guarantee.
+</Warning>
+
 ## Low-Level API
 
 For advanced use cases, you can use the low-level functions directly:
@@ -495,6 +537,10 @@ diff = create_multi_diff([
     Group related changes in a single diff, but keep unrelated changes separate for easier debugging.
   </Accordion>
 
+  <Accordion title="Trust the tools on cancellation">
+    `code_write_file`, `code_search_replace`, and `code_apply_diff` write atomically — if the agent is cancelled, times out, or is killed mid-write, the original file is untouched. You don't need a manual backup for crash safety (you may still want one for content-level rollback).
+  </Accordion>
+
   <Accordion title="Verify changes">
     After applying a diff, read the file again or run tests to verify:
     ```python
@@ -552,5 +598,8 @@ print(result)
   </Card>
   <Card title="Agents" icon="robot" href="/features/agent-profiles">
     Learn about PraisonAI agents
+  </Card>
+  <Card title="MultiEdit" icon="wand-magic-sparkles" href="/features/multiedit-tool">
+    Apply many edits to one file atomically and lock-safely — shares the same crash-safe write helper
   </Card>
 </CardGroup>
