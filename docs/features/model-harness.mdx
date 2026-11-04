@@ -31,17 +31,21 @@ graph LR
     subgraph "Model Harness"
         M[🏷️ model id] --> R[🔍 resolve_harness]
         R --> P[📘 HarnessProfile]
-        P --> B[📝 base_prompt<br/>prepended to system prompt]
+        P --> HasEdit{edit_file or<br/>apply_patch in tools?}
+        HasEdit -->|Yes| B[📝 base_prompt<br/>prepended to system prompt]
+        HasEdit -->|No| Skip[🚫 fragment skipped]
         P --> E[✏️ preferred_edit_format<br/>coding toolset advertises first]
     end
 
     classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef process fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef skip fill:#6366F1,stroke:#7C90A0,color:#fff
 
     class M input
-    class R,P process
+    class R,P,HasEdit process
     class B,E result
+    class Skip skip
 ```
 
 <Note>
@@ -77,6 +81,10 @@ agent.start("Rename `run_all` to `run_pipeline` in src/")
 ```
 
 On this agent, `apply_patch` is advertised before `edit_file`, and the system prompt gains: *"When editing files, prefer patch-style edits: use apply_patch to create or rewrite files and edit_file for targeted changes."*
+
+<Note>
+The fragment is file-editing guidance, so it is only added when the agent's tools include `edit_file` or `apply_patch`. `toolsets=["coding"]` brings both in.
+</Note>
 </Step>
 
 <Step title="Opt in — OpenAI family">
@@ -92,6 +100,18 @@ agent = Agent(
 ```
 
 Here `edit_file` is advertised first, with a matching prompt fragment.
+</Step>
+
+<Step title="No edit tools — no edit hint">
+```python
+from praisonaiagents import Agent
+
+# No edit tool → no family fragment on the system prompt.
+agent = Agent(name="Chatter", instructions="Answer briefly.", llm="claude-opus-4")
+agent.start("Hi!")
+```
+
+Small agents stay small: a tool-less `gpt-4o-mini` agent drops from 149 to 123 billed prompt tokens.
 </Step>
 
 <Step title="Inspect the resolved profile">
@@ -162,8 +182,8 @@ sequenceDiagram
 | Step | What happens |
 |------|--------------|
 | `Agent.__init__` | Reads `self.llm` (only when it's a `str`) and calls `resolve_toolsets_for_model(toolsets, model_id)` to reorder edit primitives. |
-| `_build_system_prompt` | Calls `_resolve_harness_base_prompt()`; if the profile has a `base_prompt`, it's prepended as `f"{harness_prompt}\n\n{system_prompt}"`. |
-| Override | An explicit `harness_base_prompt` attribute on the Agent wins over resolver output. Any error path collapses to no fragment (default profile). |
+| `_build_system_prompt` | Calls `_resolve_harness_base_prompt(tools)`. The family fragments are file-editing guidance, so they are prepended **only when the tools for the call include `edit_file` or `apply_patch`**. Tool names are matched across strings, OpenAI-style schema dicts, `@tool(name=…)` functions, `BaseTool` instances, plain functions and nested lists. `chat()`, `achat()` and streamed `start()` pass the per-call tools, so the hint follows the tools actually sent. |
+| Override | An explicit `harness_base_prompt` attribute on the Agent wins over resolver output and is always prepended, with no tool check. Any error path collapses to no fragment (default profile). |
 | Fallback | Falsy, unknown, or object-based model ids → default profile, no change |
 
 ---
@@ -176,6 +196,7 @@ graph TB
     Start --> Scope{Scope?}
     Scope -->|One agent only| Attr[Set agent.harness_base_prompt]
     Scope -->|All agents in this process| Reg[Call register_profile]
+    Scope -->|Keep fragment without edit tools| Keep[Set agent.harness_base_prompt explicitly]
     Reg --> Match{Match by?}
     Match -->|Model id substring| RegSub[register_profile with substrings]
     Match -->|Fully custom rule| Proto[Implement HarnessResolverProtocol]
@@ -183,7 +204,18 @@ graph TB
     classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef action fill:#189AB4,stroke:#7C90A0,color:#fff
     class Start,Scope,Match decision
-    class Attr,Reg,RegSub,Proto action
+    class Attr,Reg,RegSub,Proto,Keep action
+```
+
+### Keep the fragment on an agent without edit tools
+
+The family fragment is skipped when no edit tool is attached. To keep it anyway (e.g. as general style guidance), set the override — it bypasses the tool check:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Chatter", llm="claude-opus-4")
+agent.harness_base_prompt = "When editing files, prefer patch-style edits."
 ```
 
 ### Precedence
@@ -236,7 +268,7 @@ First match wins; matching is case-insensitive substring on the model id.
 
 | Function | Signature | Behaviour |
 |----------|-----------|-----------|
-| `resolve_harness` | `resolve_harness(model: Optional[str]) -> HarnessProfile` | Case-insensitive substring match, first match wins. Falsy or unknown model → `DEFAULT_PROFILE` |
+| `resolve_harness` | `resolve_harness(model: Optional[str]) -> HarnessProfile` | Case-insensitive substring match, first match wins. Falsy or unknown model → `DEFAULT_PROFILE`. Always returns the full profile (with `base_prompt`) regardless of tools — only the agent-level call site gates the fragment on edit-tool presence |
 | `register_profile` | `register_profile(matchers: List[str], profile: HarnessProfile) -> None` | Prepends a `(matchers, profile)` mapping so caller profiles take precedence. Process-global and thread-safe |
 
 Toolset helpers for advanced users composing custom coding toolsets:
@@ -396,6 +428,8 @@ Object-based LLMs resolve to the default profile by design, so custom LLM wrappe
 
 <Warning>
 **Backward compatibility:** Default behaviour is unchanged. Agents that don't set a supported `llm` string, don't set `toolsets`, or use a non-string LLM object continue producing byte-for-byte identical system prompts and tool orderings.
+
+Agents that set a supported `llm=` string but ship no edit tool now produce a shorter system prompt — the family fragment is skipped. A tool-less `gpt-4o-mini` agent drops from 149 to 123 billed prompt tokens. Set `agent.harness_base_prompt = "..."` to opt back in.
 </Warning>
 
 ---
@@ -417,5 +451,8 @@ Object-based LLMs resolve to the default profile by design, so custom LLM wrappe
 </Card>
 <Card title="Models" icon="robot" href="/models">
   The model id you pass is the trigger for profile resolution.
+</Card>
+<Card title="Agent Instructions" icon="file-lines" href="/course/agents/04-agent-instructions">
+  How `instructions=` builds a duplicate-free system prompt
 </Card>
 </CardGroup>
