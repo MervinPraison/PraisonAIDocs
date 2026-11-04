@@ -5,7 +5,7 @@ description: "Reconnect-safe interactive requests (approval / choice / input) fr
 icon: "right-left"
 ---
 
-A blocked HITL turn asks any connected gateway client for an approval, a choice, or free-text input — and the request survives every reconnect until the client answers or the turn times out.
+A blocked HITL turn asks any connected gateway client for an approval, a choice, free-text input, or a masked secret — and the request survives every reconnect until the client answers or the turn times out.
 
 ```mermaid
 graph LR
@@ -93,6 +93,36 @@ if reply is None:
 
 </Step>
 
+<Step title="Ask for a secret mid-turn">
+
+A tool asks the human for a credential with `kind="secret"`; the client masks the input. The one rule: **never return `reply.value` from the tool and never put it in a string the model sees.**
+
+```python
+import uuid
+from praisonaiagents import Agent
+from praisonaiagents.gateway import GatewayServerRequest
+from praisonaiagents.session.context import get_request_channel
+
+async def clear_apt_cache() -> str:
+    reply = await get_request_channel().request(
+        GatewayServerRequest(
+            request_id=str(uuid.uuid4()),
+            kind="secret",
+            prompt="sudo password?",
+            session_id=SESSION_ID,  # the gateway session this turn runs in
+        )
+    )
+    if reply is None:
+        return "No password provided."
+    ok = run_with_sudo("apt-get clean", password=reply.value)  # value stays here
+    return "Cache cleared." if ok else "sudo failed."  # opaque result only
+
+agent = Agent(name="ops", instructions="You can run shell commands.", tools=[clear_apt_cache])
+agent.start("Clear the apt cache.")
+```
+
+</Step>
+
 </Steps>
 
 ---
@@ -143,7 +173,7 @@ Copy these frames verbatim — integrators code straight against them.
  }}
 ```
 
-`kind` is one of `"approval"`, `"choice"`, `"input"`. `options` is present only when `kind == "choice"`.
+`kind` is one of `"approval"`, `"choice"`, `"input"`, `"secret"`. `options` is present only when `kind == "choice"`. A client receiving `kind == "secret"` MUST render a masked input (e.g. `<input type="password">` on the web, `getpass`-style on a TUI).
 
 **Client → server** — the correlated answer:
 
@@ -157,6 +187,8 @@ Copy these frames verbatim — integrators code straight against them.
 {"type": "server_reply_ack", "request_id": "req-1", "status": "resolved"}
 {"type": "server_reply_ack", "request_id": "req-1", "status": "unknown_request"}
 ```
+
+For a `secret` reply the ack is identical in shape. The `value` is **not** echoed back; it is handed only to the waiting caller's `Future` in-process.
 
 An `unknown_request` ack is a safe no-op: an unknown or already-answered id acks without leaking state.
 
@@ -172,19 +204,21 @@ An `unknown_request` ack is a safe no-op: an unknown or already-answered id acks
 
 ## Request Kinds and Value Contract
 
-Three request kinds map to three value contracts, validated at the handler.
+Four request kinds map to four value contracts, validated at the handler.
 
 | `kind` | Meaning |
 |---|---|
 | `approval` | Allow or deny a blocked action |
 | `choice` | Pick one of the offered `options` |
 | `input` | Provide free-text input |
+| `secret` | Provide a credential, rendered as masked input, isolated from model/logs/history |
 
 | `kind` | Accepted `value` |
 |---|---|
 | `approval` | exactly `"allow"` or `"deny"` |
 | `choice` | one of `options` (any string when `options` is absent) |
 | `input` | any string |
+| `secret` | any string (treated as a credential; see [Isolation Contract](#isolation-contract-secret-kind)) |
 
 An unrelated value is rejected with `{"code": "invalid_value"}` and the request stays open.
 
@@ -210,11 +244,52 @@ Only a client bound to the request's own `session_id` may answer it. A WRITE cli
 
 ### Scopes
 
-`server_reply` classifies as `write` in the central registry. The handler **escalates to `approvals` when the request's `kind == "approval"`** (parity with `approvals.resolve`). Choice and input still require `write`. A WRITE-only client can answer choice/input but gets `{"code": "insufficient_scope", "required_scope": "approvals"}` for an approval. See [Gateway Operator Scopes](/features/gateway-operator-scopes).
+`server_reply` classifies as `write` in the central registry. The handler **escalates to `approvals` when the request's `kind == "approval"`** (parity with `approvals.resolve`). Choice, input, and secret still require `write`. A WRITE-only client can answer choice/input/secret but gets `{"code": "insufficient_scope", "required_scope": "approvals"}` for an approval. See [Gateway Operator Scopes](/features/gateway-operator-scopes).
 
 ### Value contract
 
 The reply value is enforced per the table above; an invalid value is rejected with `{"code": "invalid_value"}` and the request stays open.
+
+### Isolation Contract (secret kind)
+
+A `secret` reply's `value` reaches only the specific caller that awaited `request(...)`; it never enters the transcript, the inbound journal, the model context, or any log.
+
+<Warning>
+A `secret` value:
+
+- MUST NOT be logged.
+- MUST NOT be journalled (no inbound dedup store entry).
+- MUST NOT be echoed over the wire (the `server_reply_ack` carries no value).
+- MUST NOT be returned to the model or appended to message history by the caller.
+</Warning>
+
+<Info>
+Two mechanisms enforce this. `GatewayServerReply.value` is declared `field(repr=False)`, so any `repr()` or logger that prints the reply shows `GatewayServerReply(request_id='…')` only. The `server_reply` path resolves a `Future` for the in-process caller directly — it does not go through ingress, the inbound journal, or event history — and the ack carries no value.
+</Info>
+
+The gateway cannot stop a tool from returning the secret to the model itself. The caller (tool or callback) uses `reply.value` only inside its own scope and returns a non-sensitive result to the agent.
+
+```mermaid
+graph LR
+    subgraph "Secret Isolation"
+        A[👤 Human] -->|masked input| B[🖥 Client]
+        B -->|server_reply| C[🛡 Gateway]
+        C -->|Future.set_result| D[🔧 Tool/Callback]
+        C -. never .-> E[🧠 LLM context]
+        C -. never .-> F[📝 Journal / logs]
+        C -. never .-> G[💬 Message history]
+    end
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gateway fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef blocked fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A,B input
+    class C gateway
+    class D ok
+    class E,F,G blocked
+```
 
 ---
 
@@ -234,12 +309,14 @@ Unbound (CLI / one-shot) behaviour is unchanged — `get_request_channel()` retu
 
 The minimum a client needs: receive a `server_request`, render the prompt, post back a `server_reply`, and clear on the ack — keyed idempotently on `request_id`.
 
+For `secret`, the masking is the client's job — the server has already marked the value as isolated, but only the client controls what the human's screen shows.
+
 <Tabs>
 
 <Tab title="Python">
 
 ```python
-import asyncio, json
+import asyncio, getpass, json
 import websockets
 
 async def client(url):
@@ -253,6 +330,8 @@ async def client(url):
                     value = "allow"            # or "deny"
                 elif req["kind"] == "choice":
                     value = req["options"][0]  # one of the offered options
+                elif req["kind"] == "secret":
+                    value = getpass.getpass(req["prompt"])  # never echoes to the terminal
                 else:
                     value = "some text"        # input
                 await ws.send(json.dumps({
@@ -274,7 +353,7 @@ asyncio.run(client("ws://localhost:8765/ws"))
 ```javascript
 const ws = new WebSocket("ws://localhost:8765/ws");
 
-ws.onmessage = (event) => {
+ws.onmessage = async (event) => {
   const msg = JSON.parse(event.data);
   if (msg.type === "server_request") {
     const req = msg.request;
@@ -282,6 +361,10 @@ ws.onmessage = (event) => {
     let value;
     if (req.kind === "approval") value = "allow";        // or "deny"
     else if (req.kind === "choice") value = req.options[0];
+    else if (req.kind === "secret") {
+      // render <input type="password"> for req.prompt
+      value = await promptMasked(req.prompt);
+    }
     else value = "some text";                            // input
     ws.send(JSON.stringify({
       type: "server_reply",
@@ -303,6 +386,14 @@ ws.onmessage = (event) => {
 ## Best Practices
 
 <AccordionGroup>
+
+<Accordion title="Never return a secret value to the model">
+A tool that wraps `request(..., kind="secret")` uses the credential inside its own scope and returns an opaque success/failure string to the agent — never the credential itself, and never a string that embeds it.
+</Accordion>
+
+<Accordion title="Prefer secret over input for any credential-shaped prompt">
+If the thing being asked for is a password, API key, OTP, token, or any other value you would not want in a log, use `kind="secret"`. An `input` reply is journalled, kept in history, and sent to the LLM; the isolation contract applies only to `secret`.
+</Accordion>
 
 <Accordion title="Set a sensible timeout_s">
 The default `120s` is safe for a human-in-the-loop web UI. Interactive shells that expect a fast answer may want a shorter timeout so a blocked turn does not sit idle.
@@ -354,6 +445,14 @@ The terminal-side sibling capability.
 
 <Card title="Gateway Scoped Approvals" icon="user-lock" href="/features/gateway-scoped-approvals">
 Durable allow-always grants that compose with an approval-kind reply.
+</Card>
+
+<Card title="Secret Egress Sentinels" icon="shield-halved" href="/features/secret-egress-sentinels">
+The complementary outbound check: if a secret ever does leak into a response, sentinels detect it.
+</Card>
+
+<Card title="Context Security Redaction" icon="eye-slash" href="/features/context-security-redaction">
+Context-level redaction for sensitive strings that are already in history.
 </Card>
 
 </CardGroup>
