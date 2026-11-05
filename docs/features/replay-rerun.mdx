@@ -1,0 +1,376 @@
+---
+title: "Replay Rerun"
+sidebarTitle: "Replay Rerun"
+description: "Re-run a recorded run from any step — earlier steps reuse their recorded output"
+icon: "rotate"
+---
+
+`praisonai replay rerun` re-runs a recorded run from the step you choose: steps before it reuse their recorded output, so you only pay for the part you changed.
+
+```python
+from praisonaiagents import Agent, AgentFlow
+from praisonai.replay import record
+from praisonai.replay.rerun import rerun
+
+research = Agent(name="research", instructions="List three facts about the topic")
+draft = Agent(name="draft", instructions="Write a short post from the facts")
+
+with record(full_content=True) as first:
+    AgentFlow(steps=[research, draft]).start("AI agents")
+
+rec, result = rerun(AgentFlow(steps=[research, draft]), first.run_id, "step:draft", input="AI agents")
+print(rec.run_id, result)
+```
+
+```mermaid
+graph LR
+    subgraph "Original run-aaa"
+        A1[research] --> A2[draft] --> A3[edit]
+    end
+    subgraph "Rerun run-bbb"
+        B1[research ♻️ reused] --> B2[draft 🔁 fresh] --> B3[edit 🔁 fresh]
+    end
+    A1 -. recorded output .-> B1
+    B2 -. forked_from .-> A2
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef cached fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef fresh fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A1,A2,A3 agent
+    class B1 cached
+    class B2,B3 fresh
+```
+
+## Quick Start
+
+<Steps>
+<Step title="Record a run">
+
+```bash
+praisonai agents.yaml --save
+```
+
+</Step>
+
+<Step title="Find the node to re-run from">
+
+```bash
+praisonai replay list
+praisonai replay flow run-1a2b3c4d5e6f --format mermaid
+```
+
+</Step>
+
+<Step title="Re-run from that node">
+
+```bash
+praisonai replay rerun run-1a2b3c4d5e6f --from step:draft
+```
+
+```
+Re-running run-1a2b3c4d5e6f from step:draft as run-9f8e7d6c5b4a (reusing: step:research)
+```
+
+</Step>
+</Steps>
+
+---
+
+## How It Works
+
+<Tabs title="Framework">
+<Tab title="AgentFlow">
+
+```mermaid
+sequenceDiagram
+    participant CLI as replay rerun
+    participant Flow as AgentFlow
+    participant Cache as TraceStepCache
+    participant LLM
+
+    CLI->>Cache: seed with recorded step outputs
+    Flow->>Cache: research?
+    Cache-->>Flow: cache hit (recorded output)
+    Flow->>Cache: draft?
+    Cache-->>Flow: miss
+    Flow->>LLM: run draft fresh
+```
+
+Earlier steps go through the flow's normal cache-hit path, so variables and `{{previous_output}}` behave exactly as on a real cache hit — the same path the [Step-Result Cache](/features/workflow-step-cache) uses.
+
+</Tab>
+<Tab title="AgentTeam">
+
+```mermaid
+sequenceDiagram
+    participant CLI as replay rerun
+    participant Team as AgentTeam
+    participant LLM
+
+    CLI->>Team: restore earlier tasks as completed
+    CLI->>Team: reset NODE and later tasks
+    Team->>Team: skip completed tasks
+    Team->>LLM: run NODE fresh
+```
+
+Earlier tasks come back `completed` with their recorded output; the task you chose and everything after it start again.
+
+</Tab>
+</Tabs>
+
+---
+
+## Node Ids
+
+| Node id | Means |
+|---|---|
+| `task:write` | The `write` task of an AgentTeam |
+| `step:draft` | The `draft` step of an AgentFlow |
+| `step:draft#2` | The second run of a repeated `draft` step |
+
+Only nodes that finished as `completed` or `cached` before your node started are reused.
+
+## Options
+
+| Option | Default | Description |
+|---|---|---|
+| `RUN` | — | Run id or path to the recorded trace |
+| `--from` | required | Node id to re-run from |
+| `--file` | the YAML recorded with the run | YAML definition to run instead |
+
+---
+
+## Fork Tracking
+
+The new run records where it came from on its first `workflow_start` event:
+
+```json
+{"forked_from": {"run_id": "run-1a2b3c4d5e6f", "node_id": "step:draft"}}
+```
+
+See it with `praisonai replay show <new-run> --type workflow_start` or in an [HTML export](/features/replay-export).
+
+---
+
+## When It Fails
+
+<Warning>
+Rerun refuses to guess rather than feed the next step the wrong input:
+
+- **No node ids** — traces recorded before schema 1.1 fail with *"This trace has no node ids (schema 1.0)… record it again."*
+- **Truncated output** — if only a 500-character preview was recorded, re-record with `record(full_content=True)` or re-run from an earlier node.
+- **Wrong YAML kind** — a `--file` that defines a team when the node is a flow step (or the reverse) exits with an error.
+- **No recorded definition** — runs recorded from Python have no YAML path; pass `--file agents.yaml`.
+</Warning>
+
+```mermaid
+graph TB
+    Start[🔁 replay rerun --from NODE] --> HasNodeIds{Schema 1.1?}
+    HasNodeIds -->|No| ErrSchema[❌ No node ids: re-record]
+    HasNodeIds -->|Yes| HasOutput{Earlier outputs full?}
+    HasOutput -->|Truncated| ErrPreview[❌ Use full_content=True]
+    HasOutput -->|Yes| HasRedacted{Recorded variable redacted?}
+    HasRedacted -->|Yes| ErrRedact[❌ Re-run from that node]
+    HasRedacted -->|No| OrderOK{Flow order matches recording?}
+    OrderOK -->|Step inserted| ErrOrder[❌ Did not run in recording]
+    OrderOK -->|Yes| Run[✅ Reuse earlier steps, run NODE onward]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef err fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start input
+    class HasNodeIds,HasOutput,HasRedacted,OrderOK check
+    class ErrSchema,ErrPreview,ErrRedact,ErrOrder err
+    class Run ok
+```
+
+### Variables are preserved
+
+Variables a step's handler sets with `StepResult(variables={...})` are recorded and restored, so a later step reads the recorded value — not a fresh one.
+
+```python
+from praisonaiagents import AgentFlow
+from praisonaiagents.workflows import StepResult
+from praisonai.replay import record
+from praisonai.replay.rerun import rerun
+
+def research(ctx):
+    return StepResult(output="notes", variables={"customer_id": 42})
+
+def draft(ctx):
+    return StepResult(output=f"draft for customer {ctx.variables.get('customer_id')}")
+
+with record(full_content=True) as rec:
+    AgentFlow(steps=[research, draft]).start("topic")
+
+# research is reused from the recording, and its customer_id=42 is restored
+rerun(AgentFlow(steps=[research, draft]), rec.path, "step:draft", input="topic")
+```
+
+```mermaid
+sequenceDiagram
+    participant Flow as AgentFlow
+    participant File as run-xxx.jsonl
+    participant Draft as draft
+
+    Note over Flow,File: Recording
+    Flow->>File: step_end research (variables: customer_id=42)
+    Note over Flow,Draft: Rerun from step:draft
+    File-->>Flow: research reused + customer_id=42
+    Flow->>Draft: ctx.variables["customer_id"] == 42
+```
+
+A step that was skipped in the recording is checked again against the restored variables, so the same condition skips it again.
+
+### Secrets block rerun
+
+If a step set a secret-looking variable (such as `api_key`, `token`, `password` or `secret`), the recording redacted it — so rerun refuses to restore it.
+
+<Warning>
+`step:auth set 'api_key', which the recording redacted, so it cannot be restored; re-run from that node or earlier.`
+</Warning>
+
+```python
+from praisonaiagents import AgentFlow
+from praisonaiagents.workflows import StepResult
+from praisonai.replay import record
+from praisonai.replay.rerun import RerunError, rerun
+
+def auth(ctx):
+    return StepResult(output="ok", variables={"api_key": "sk-abcdefghijklmnop"})
+
+def call(ctx):
+    return StepResult(output="done")
+
+with record(full_content=True) as rec:
+    AgentFlow(steps=[auth, call]).start("x")
+
+try:
+    rerun(AgentFlow(steps=[auth, call]), rec.path, "step:call", input="x")
+except RerunError as e:
+    print(e)
+
+# Re-run from the step that sets the secret, so it runs fresh
+rerun(AgentFlow(steps=[auth, call]), rec.path, "step:auth", input="x")
+```
+
+The full list of redacted key names is `REDACT_KEYS` in `praisonaiagents/trace/redact.py`.
+
+### Rerun validates the current flow
+
+A step added before your node that never ran in the recording would run fresh and change the input your node gets, so rerun stops instead.
+
+<AccordionGroup title="Rerun error cases">
+
+<Accordion title="Step inserted before the target">
+
+The recording ran `research → draft`; the current flow is `research → extra → draft`.
+
+```python
+from praisonaiagents import AgentFlow
+from praisonaiagents.workflows import StepResult
+from praisonai.replay import record
+from praisonai.replay.rerun import RerunError, rerun
+
+def research(ctx): return StepResult(output="r")
+def extra(ctx):    return StepResult(output="e")
+def draft(ctx):    return StepResult(output="d")
+
+with record(full_content=True) as rec:
+    AgentFlow(steps=[research, draft]).start("topic")
+
+try:
+    rerun(AgentFlow(steps=[research, extra, draft]), rec.path, "step:draft", input="topic")
+except RerunError as e:
+    print(e)
+```
+
+<Warning>
+`Step 'step:extra' comes before 'step:draft' in this flow but did not run in the recording; re-run against the flow that recorded it.`
+</Warning>
+
+</Accordion>
+
+<Accordion title="Unnamed patterns are caught too">
+
+Steps are matched by graph node id, so an inserted `If`, `When` or `Loop` with no name raises the same error.
+
+</Accordion>
+
+<Accordion title="Nested target">
+
+When your node lives inside a pattern (for example `research → If[draft] → polish`), the check runs up to that pattern — a step inserted before it is still rejected.
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Python
+
+```python
+from praisonaiagents import Agent, AgentFlow
+from praisonai.replay.rerun import rerun
+
+research = Agent(name="research", instructions="List three facts about the topic")
+draft = Agent(name="draft", instructions="Write a short post from the facts")
+flow = AgentFlow(steps=[research, draft])
+
+rec, result = rerun(flow, "run-1a2b3c4d5e6f", "step:draft", input="AI agents")
+print(rec.run_id, rec.path)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `target` | `AgentFlow` \| `AgentTeam` | — | What to run (must match the recorded kind) |
+| `source` | `str` \| `list` | — | Run id, trace path, or loaded events |
+| `node_id` | `str` | — | Node to re-run from |
+| `input` | `Any` | `None` | Passed to `target.start()` |
+| `run_id` | `str` | auto | Id for the new run |
+| `live` | `bool` | `False` | Flush every event as it happens |
+| `meta` | `dict` | `None` | Extra `session_start` data |
+
+Returns `(recording, result)`.
+
+---
+
+## Best Practices
+
+<AccordionGroup>
+
+<Accordion title="Record with full_content=True">
+
+Long step outputs are otherwise only kept as previews; `full_content=True` lets you re-run from any node.
+
+</Accordion>
+
+<Accordion title="Change one thing per rerun">
+
+Edit the step you're tuning, rerun from it, and compare the two runs side by side in `replay view`.
+
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Related
+
+<CardGroup cols={2}>
+<Card title="PraisonAI Replay" icon="rotate-left" href="/features/replay">
+  Record, view, export, and re-run runs
+</Card>
+<Card title="Step-Result Cache" icon="database" href="/features/workflow-step-cache">
+  The cache path rerun reuses for AgentFlow
+</Card>
+<Card title="Record API" icon="code" href="/features/replay-record-api">
+  `full_content` and other record options
+</Card>
+<Card title="Replay Export" icon="download" href="/features/replay-export">
+  See forked runs in an HTML export
+</Card>
+</CardGroup>
