@@ -104,7 +104,7 @@ print([s.value for s in OperatorScope.all()])
 </Steps>
 
 <Note>
-When **no** `auth_scopes` policy is configured, every successfully authenticated client is granted **all** scopes — identical to today's binary auth behaviour. Single-operator setups need no changes.
+When **no** `auth_scopes` policy is configured, every successfully authenticated client is granted **all** scopes on **every** agent — identical to today's binary auth behaviour. A token mapped to a plain scope list also reaches every agent; to limit it to specific agents, see [Confining operators to specific agents](#confining-operators-to-specific-agents-issue-6253). Single-operator setups need no changes.
 </Note>
 
 ---
@@ -276,6 +276,150 @@ config = GatewayConfig(
 
 print(config.has_scope_policy)  # True when auth_scopes is non-empty
 print(config.resolve_scopes("${VIEWER_TOKEN}"))  # ['read']
+```
+
+---
+
+## Confining operators to specific agents (Issue #6253)
+
+On a multi-agent gateway, an operator token can be confined to a subset of agents by giving it `{scopes, agents}` instead of a plain scope list.
+
+```mermaid
+graph LR
+    subgraph "Per-agent confinement"
+        S[🔑 tok_support<br/>agents: support] --> GW[🌐 Gateway]
+        L[🔑 tok_legacy<br/>no agents key] --> GW
+        GW -->|tok_support + tok_legacy| SA[🤖 support]
+        GW -->|tok_legacy only| FA[🤖 finance]
+    end
+
+    classDef token fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gateway fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class S,L token
+    class GW gateway
+    class SA,FA agent
+```
+
+### Quick Start
+
+<Steps>
+<Step title="Flat auth_scopes (recommended)">
+
+```yaml
+gateway:
+  host: 0.0.0.0
+  port: 8765
+  auth_scopes:
+    "${SUPPORT_TOKEN}":
+      scopes: [read, write]
+      agents: [support]
+    "${FINANCE_TOKEN}":
+      scopes: [read, write]
+      agents: [finance]
+    "${ADMIN_TOKEN}": [admin]        # unchanged — reaches every agent
+
+agents:
+  support:  { instructions: "..." }
+  finance:  { instructions: "..." }
+```
+
+</Step>
+<Step title="Structured auth.tokens[] (equivalent)">
+
+```yaml
+gateway:
+  auth:
+    tokens:
+      - token: "${SUPPORT_TOKEN}"
+        scopes: [read, write]
+        agents: [support]
+      - token: "${ADMIN_TOKEN}"
+        scopes: [admin]              # no `agents:` → unconfined
+```
+
+</Step>
+<Step title="Python">
+
+```python
+from praisonaiagents.gateway import GatewayConfig, OperatorScope
+
+cfg = GatewayConfig(
+    host="0.0.0.0",
+    port=8765,
+    auth_token="${ADMIN_TOKEN}",
+    auth_scopes={
+        "${SUPPORT_TOKEN}": {
+            "scopes": [OperatorScope.READ.value, OperatorScope.WRITE.value],
+            "agents": ["support"],
+        },
+        "${ADMIN_TOKEN}": [OperatorScope.ADMIN.value],  # unconfined
+    },
+)
+```
+
+</Step>
+</Steps>
+
+<Warning>
+Confinement covers WebSocket bind/resume, `attach()`, and event delivery only. The HTTP approval endpoints (`/api/approval/*`) are **not yet filtered per agent** (tracked in [PraisonAI #5151](https://github.com/MervinPraison/PraisonAI/issues/5151)). Do not grant `approvals` to a confined token that must not act on other agents' requests.
+</Warning>
+
+### How it works
+
+A confined operator is refused wherever a session would bind to, resume, join, or receive events from an agent outside its grant:
+
+- **`hello` / `join` bind** — an `agent_id` outside the grant is refused with `AGENT_NOT_FOUND`.
+- **`join` session resume** — a `session_id` owned by an out-of-grant agent is refused (`Session does not belong to the requested agent`) before the session is resumed; sessions rehydrated from the store are checked again after resume.
+- **`attach()`** (shared sessions) — raises `PermissionError` for a session whose agent is outside the grant.
+- **`broadcast()`** — events whose `source` is an out-of-grant agent are withheld. System (non-agent) events are unaffected.
+
+```mermaid
+sequenceDiagram
+    participant Op as Confined operator (tok_support)
+    participant GW as Gateway
+    participant Grant as resolve_agents
+
+    Op->>GW: hello {agent_id: "finance"}
+    GW->>Grant: resolve_agents(tok_support)
+    Grant-->>GW: ["support"]
+    GW-->>Op: error AGENT_NOT_FOUND
+    Note over Op,GW: Same reply as a missing agent — the agent's existence is not disclosed
+```
+
+<Note>
+**Backward compatible.** A plain scope list (no `agents:` key) still reaches every agent, and no `auth_scopes` policy at all behaves exactly as before.
+</Note>
+
+### Fail-closed guards
+
+| Situation | Behaviour |
+|---|---|
+| Unknown grant key (e.g. `agnts: [support]`) | Rejected at load — a typo cannot silently drop the confinement |
+| Scalar `agents: support` | `ValueError` at load — must be a list |
+| `${VAR}` token key resolves to empty | That entry is dropped; if every entry is empty the gateway refuses to start |
+| Installed `praisonaiagents` too old to parse grants | A declared policy refuses the start; with no policy declared, a warning is logged and behaviour is unchanged |
+
+### Python API
+
+`GatewayConfig.resolve_agents(token)` returns the agent ids a token is confined to, or `None` when the token is unconfined (or unknown).
+
+```python
+from praisonaiagents.gateway import GatewayConfig
+
+cfg = GatewayConfig(
+    auth_token="tmp",
+    auth_scopes={
+        "tok_support": {"scopes": ["read", "write"], "agents": ["support"]},
+        "tok_legacy":  ["read", "write"],
+    },
+)
+
+cfg.resolve_scopes("tok_support")   # ['read', 'write']
+cfg.resolve_agents("tok_support")   # ['support']  — confined
+cfg.resolve_agents("tok_legacy")    # None         — unconfined (every agent)
+cfg.resolve_agents("nope")          # None
 ```
 
 ---
