@@ -13,7 +13,9 @@ graph LR
         A[📝 Prompt] --> B[🤖 LLM]
         B --> C[📊 Usage input/output]
         C --> D[💲 Pricing Table]
-        D --> E[✅ Cost USD]
+        D --> F{⚖️ max}
+        R[🧾 Reported cost] --> F
+        F --> E[✅ Cost USD]
     end
 
     classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
@@ -24,7 +26,8 @@ graph LR
     class A input
     class B process
     class C process
-    class D pricing
+    class D,F pricing
+    class R process
     class E output
 ```
 
@@ -64,6 +67,38 @@ print(f"${cost}")  # $0.00045  →  (1000/1M × $0.15) + (500/1M × $0.60)
 ```
 </Step>
 
+<Step title="Price a call with prompt caching">
+Cached input tokens are priced at a fraction of the input rate. The SDK reads the cache counts from the response for you:
+
+```python
+from praisonaiagents.utils.cost_utils import calculate_llm_cost
+
+# Anthropic-style response from a cached run
+response = {
+    "usage": {
+        "prompt_tokens": 1_000_000,
+        "cache_read_input_tokens": 500_000,
+        "cache_creation_input_tokens": 100_000,
+    }
+}
+cost = calculate_llm_cost(1_000_000, 0, "claude-3-5-sonnet-20241022", response=response)
+print(f"${cost}")  # $1.725
+```
+
+An agent does this on every call, so `agent.total_cost` already reflects cache pricing:
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    instructions="You are a helpful assistant.",
+    llm="anthropic/claude-3-5-sonnet-20241022",
+)
+agent.start("Summarise this long document ...")
+print(agent.total_cost)  # cached tokens priced at the cache-read rate
+```
+</Step>
+
 <Step title="Read cost from an async agent">
 An async run reports the same telemetry as sync — every tool-loop iteration emits `llm_end` with tokens, cost, and latency.
 
@@ -86,6 +121,10 @@ print(summary["total_metrics"]["input_tokens"], summary["total_metrics"]["output
 </Step>
 </Steps>
 
+<Note>
+**Prompt-cache pricing** ([PR #5996](https://github.com/MervinPraison/PraisonAI/pull/5996)). Cached input is no longer billed at the full input rate, and a higher provider-reported cost wins over the local estimate. Nothing to opt in to. The response rebuilt from a stream also carries `prompt_tokens_details.cached_tokens` and `usage.cost`, so `calculate_llm_cost(..., response=...)` prices streamed calls the same way.
+</Note>
+
 <Warning>
 **Fixed in PraisonAI [PR #4887](https://github.com/MervinPraison/PraisonAI/pull/4887).** Prior to this release, async agent runs (`agent.achat()`, `agent.astart()`, any async tool-calling workflow) never emitted `llm_start` / `llm_end` callbacks, so cost dashboards and `--trace` / status output reported **zero LLM spans and zero cost for every async workload** — the identical run synchronously reported full per-call cost and latency. After this release, async cost tracking is at full parity with sync: per-iteration `llm_end` events fire with `tokens_in`, `tokens_out`, `cost`, and `latency_ms`. Latency is measured **per iteration** (each tool-loop step captures its own `iteration_start_time`), so every billed call reports its own latency rather than a cumulative total.
 </Warning>
@@ -98,7 +137,7 @@ print(summary["total_metrics"]["input_tokens"], summary["total_metrics"]["output
 
 ## How It Works
 
-Cost is `input_tokens × input_rate + output_tokens × output_rate`. The only question is which rate applies to a given model name.
+Cost is `input_tokens × input_rate + output_tokens × output_rate`, with cached input priced at a discount (see below). The main question is which rate applies to a given model name.
 
 ```mermaid
 graph TB
@@ -121,6 +160,63 @@ graph TB
     class F output
 ```
 
+### Prompt-cache aware pricing
+
+```mermaid
+graph LR
+    A[📊 prompt_tokens] --> B[🆕 Uncached × 1.0]
+    A --> C[♻️ Cached × cache_read]
+    A --> D[✍️ Cache write × cache_write]
+    B --> E[➕ Sum × input rate]
+    C --> E
+    D --> E
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A input
+    class B,C,D process
+    class E output
+```
+
+- Cached and cache-write tokens are **part of** `prompt_tokens` (the OpenAI/litellm convention).
+- Their sum is **capped** at `prompt_tokens`, so nothing is counted twice.
+- A model with no `cache_read` / `cache_write` multiplier uses `1.0` — the flat input rate.
+
+### Reported cost as a floor-raiser
+
+```mermaid
+graph LR
+    A[🧾 Reported cost] --> C{⚖️ max}
+    B[💲 Local estimate] --> C
+    C --> D[✅ Final cost]
+
+    classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A,B input
+    class C decision
+    class D output
+```
+
+- A reported cost **can raise** the figure above the estimate — for example when OpenRouter bills above list price.
+- It **cannot lower** it — a misreporting proxy or `base_url` can't trick the budget guard.
+- A reported `0.0` means "unknown" — the estimate is used.
+
+### Supported cache fields
+
+| Shape | Field read | Example provider |
+|---|---|---|
+| OpenAI-style | `usage.prompt_tokens_details.cached_tokens` | OpenAI, Azure OpenAI |
+| Anthropic-style | `usage.cache_read_input_tokens` | Anthropic |
+| Anthropic-style | `usage.cache_creation_input_tokens` | Anthropic (cache write) |
+| OpenRouter-style | `usage.cost` (reported, raises floor) | OpenRouter |
+| litellm-wrapped | `_hidden_params["response_cost"]` (raises floor) | litellm |
+
+Dict-shaped (`{"usage": {...}}`) and attribute-shaped responses both work.
+
 ---
 
 ## How Pricing Is Resolved
@@ -139,32 +235,32 @@ The fallback matcher resolves a model name to a rate in three steps:
 
 ## Fallback Pricing Table
 
-These are the built-in rates the SDK ships in `_FALLBACK_PRICING` (USD per 1M tokens). They apply when litellm is not installed.
+These are the built-in rates the SDK ships in `_FALLBACK_PRICING` (USD per 1M tokens). They apply when litellm is not installed. Cache multipliers scale the input rate; blank = flat input rate.
 
-| Model | Input ($/1M) | Output ($/1M) |
-|-------|-------------|---------------|
-| `gpt-4o` | 2.50 | 10.00 |
-| `gpt-4o-mini` | 0.15 | 0.60 |
-| `gpt-4-turbo` | 10.00 | 30.00 |
-| `gpt-4` | 30.00 | 60.00 |
-| `gpt-3.5-turbo` | 0.50 | 1.50 |
-| `o1` | 15.00 | 60.00 |
-| `o1-mini` | 1.10 | 4.40 |
-| `o1-preview` | 15.00 | 60.00 |
-| `o3-mini` | 1.10 | 4.40 |
-| `claude-3-5-sonnet` | 3.00 | 15.00 |
-| `claude-3-5-haiku` | 0.80 | 4.00 |
-| `claude-3-opus` | 15.00 | 75.00 |
-| `claude-3-sonnet` | 3.00 | 15.00 |
-| `claude-3-haiku` | 0.25 | 1.25 |
-| `gemini-1.5-pro` | 1.25 | 5.00 |
-| `gemini-1.5-flash` | 0.075 | 0.30 |
-| `gemini-2.0-flash` | 0.10 | 0.40 |
-| `gemini-2.0-flash-exp` | 0.10 | 0.40 |
-| `gemini-pro` | 0.50 | 1.50 |
-| `deepseek-chat` | 0.14 | 0.28 |
-| `deepseek-reasoner` | 0.55 | 2.19 |
-| `default` | 1.00 | 3.00 |
+| Model | Input ($/1M) | Output ($/1M) | Cache read × | Cache write × |
+|-------|-------------|---------------|--------------|---------------|
+| `gpt-4o` | 2.50 | 10.00 | 0.5 |  |
+| `gpt-4o-mini` | 0.15 | 0.60 | 0.5 |  |
+| `gpt-4-turbo` | 10.00 | 30.00 |  |  |
+| `gpt-4` | 30.00 | 60.00 |  |  |
+| `gpt-3.5-turbo` | 0.50 | 1.50 |  |  |
+| `o1` | 15.00 | 60.00 | 0.5 |  |
+| `o1-mini` | 1.10 | 4.40 | 0.5 |  |
+| `o1-preview` | 15.00 | 60.00 |  |  |
+| `o3-mini` | 1.10 | 4.40 | 0.5 |  |
+| `claude-3-5-sonnet` | 3.00 | 15.00 | 0.1 | 1.25 |
+| `claude-3-5-haiku` | 0.80 | 4.00 | 0.1 | 1.25 |
+| `claude-3-opus` | 15.00 | 75.00 | 0.1 | 1.25 |
+| `claude-3-sonnet` | 3.00 | 15.00 |  |  |
+| `claude-3-haiku` | 0.25 | 1.25 | 0.1 | 1.25 |
+| `gemini-1.5-pro` | 1.25 | 5.00 | 0.25 |  |
+| `gemini-1.5-flash` | 0.075 | 0.30 | 0.25 |  |
+| `gemini-2.0-flash` | 0.10 | 0.40 | 0.25 |  |
+| `gemini-2.0-flash-exp` | 0.10 | 0.40 |  |  |
+| `gemini-pro` | 0.50 | 1.50 |  |  |
+| `deepseek-chat` | 0.14 | 0.28 | 0.1 |  |
+| `deepseek-reasoner` | 0.55 | 2.19 | 0.25 |  |
+| `default` | 1.00 | 3.00 |  |  |
 
 <Note>
 Install litellm for accurate pricing across 1000+ models. Pass `use_litellm=True` to `calculate_llm_cost()` to prefer it; without it, the fallback table above is used for speed.
@@ -201,6 +297,37 @@ agent.start("Summarise the theory of relativity in one paragraph")
 
 print(agent.total_cost)                 # non-zero
 print(agent.cost_summary["llm_calls"])  # >= 1
+```
+</Accordion>
+
+<Accordion title="Pass cache counts explicitly">
+No response object? Pass the counts directly:
+
+```python
+from praisonaiagents.utils.cost_utils import calculate_llm_cost
+
+cost = calculate_llm_cost(
+    prompt_tokens=1_000_000,
+    completion_tokens=200_000,
+    model="claude-3-5-sonnet",
+    cached_tokens=800_000,
+    cache_write_tokens=0,
+)
+print(f"${cost}")  # $3.84
+```
+</Accordion>
+
+<Accordion title="OpenRouter / litellm proxy">
+A positive `usage.cost` or `_hidden_params["response_cost"]` is picked up automatically and wins when higher than the estimate:
+
+```python
+from praisonaiagents.utils.cost_utils import calculate_llm_cost
+
+response = {"usage": {"cost": 0.01}}
+print(calculate_llm_cost(1000, 500, "gpt-4o-mini", response=response))  # 0.01 — reported wins
+
+response = {"usage": {"cost": 0.0001}}
+print(calculate_llm_cost(1000, 500, "gpt-4o-mini", response=response))  # 0.00045 — estimate wins
 ```
 </Accordion>
 
