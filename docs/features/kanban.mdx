@@ -94,7 +94,7 @@ Task coordination happens through a SQLite-backed persistent store that all agen
 | **Kanban Store** | SQLite database storing tasks, comments, links |
 | **Agent Tools** | 8 functions for task CRUD operations |
 | **CLI Commands** | Human interface for task management |
-| **Background Dispatcher** | Auto-claims ready tasks for processing |
+| **Background Dispatcher** | Auto-claims ready tasks, keeps running workers' claims alive, and reclaims abandoned runs so stuck tasks get another attempt |
 
 ---
 
@@ -215,6 +215,10 @@ Kanban tools are available through the SDK protocols. The wrapper implementation
 | `kanban_link` | Create dependency | `kanban_link("design_task", "implement_task")` |
 | `kanban_heartbeat` | Signal liveness | `kanban_heartbeat("task_abc123", "testing")` |
 
+<Note>
+You do **not** need to call `kanban_heartbeat` to keep a claim alive — the dispatcher already heartbeats its own workers on every poll tick. Call it when you want a progress update visible on the task.
+</Note>
+
 ---
 
 ## Boards & Storage
@@ -292,6 +296,10 @@ sequenceDiagram
     end
 ```
 
+<Note>
+If an operator releases, moves, or reassigns a card while its worker is running, the dispatcher stops the worker and closes the run as `failed` — not `crashed`. The task stays wherever the operator put it; the dispatcher does not move it on this path.
+</Note>
+
 <Steps>
 <Step title="Idempotent create with retry limit">
 
@@ -351,6 +359,28 @@ When a worker claims a task, the dispatcher **opens a run** with the claim — a
 
 **Non-blocking git.** With per-task worktree isolation (`workspace_kind="worktree"` or `repo_path`), every git command the dispatcher runs — fork, merge, cleanup — happens off the gateway event loop, so chat and WebSocket traffic stay responsive during a slow merge. Integrations into the shared repo are serialised, so two tasks never run `git merge` at the same time. If the dispatcher stops mid-dispatch, a half-prepared worktree and its branch are removed so a retry can recreate them.
 
+On every poll tick the dispatcher runs the same four steps, in order:
+
+```mermaid
+graph TB
+    Tick[⏱️ Poll tick] --> Cleanup[🧹 Close finished workers]
+    Cleanup --> Beat[💓 Heartbeat live workers]
+    Beat --> Reclaim[♻️ Reclaim stale claims]
+    Reclaim --> Dispatch[🚀 Dispatch ready tasks]
+
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef intermediate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Tick,Cleanup process
+    class Beat,Reclaim intermediate
+    class Dispatch success
+```
+
+- **Healthy long-running tasks are never reclaimed.** The dispatcher heartbeats every live worker it owns *before* the stale-claim sweep, so a task can run as long as it needs. Workers launched with `praisonai-code run` need no extra setup.
+- **A lost claim stops the worker.** If an operator releases, moves, or reassigns the card mid-run, the dispatcher terminates the worker on the next tick and closes its run as `failed`. A per-task worktree goes through the usual [lossless teardown](#lossless-only-worktree-teardown).
+- **Abandoned runs are closed atomically.** When a worker genuinely dies or stops heartbeating, the store closes its open run as `crashed` in the same step that puts the task back on `ready`, and the attempt counts towards `max_retries`.
+
 ### New params on `kanban_create`
 
 | Option | Type | Default | Description |
@@ -389,6 +419,14 @@ Each row matches the `KanbanRunProtocol` shape:
 | `error` | `str` | Error text for failed/crashed attempts |
 | `started_at` | `str \| None` | ISO-8601 timestamp |
 | `ended_at` | `str \| None` | ISO-8601 timestamp; `None` while the run is open |
+
+Runs closed by the dispatcher itself carry one of these exact `error` strings:
+
+| `outcome` | `error` | Meaning |
+|---|---|---|
+| `failed` | `Claim lost while worker was running; worker terminated` | An operator released, moved, or reassigned the card mid-run; the worker was stopped. |
+| `crashed` | `Worker dead; claim reclaimed` | The worker's process died; the task went back to `ready`. |
+| `crashed` | `Worker stale_heartbeat; claim reclaimed` | The worker stopped heartbeating; the task went back to `ready`. |
 
 ### New `Task` fields
 
@@ -837,6 +875,8 @@ sequenceDiagram
         Note over Dispatcher: worktree left on disk; tracking entry kept
     end
 ```
+
+The same guard runs when an operator releases or reassigns a card while its worker is running — the dispatcher stops the worker, then preserves any unmerged work with the same reasons below.
 
 Every preserved worktree records its reason as a task comment, readable via `kanban_show(task_id)`:
 
