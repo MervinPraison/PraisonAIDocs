@@ -9,10 +9,13 @@ from praisonaiagents._logging import get_logger
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Union
 
 # Import HookEvent at module level for alias (DRY)
 from ..hooks.types import HookEvent
+
+if TYPE_CHECKING:
+    from ..hooks.types import HookResult
 
 logger = get_logger(__name__)
 
@@ -26,7 +29,8 @@ class GuardrailBlocked(Exception):
     A ``POLICY``/``GUARDRAIL`` plugin can raise this from any ``before_*``
     method (``before_tool``, ``before_llm``, ``before_agent``,
     ``before_message``) to stop the tool call / LLM request / agent run /
-    inbound message. It may also be raised from ``after_tool`` to block
+    inbound message. Raising it from ``after_message`` cancels final channel
+    delivery. It may also be raised from ``after_tool`` to block
     *propagation* of a tool result (e.g. secret/PII detected) — the tool has
     already run, but the output is suppressed before it reaches the model.
     The plugin bridge converts it into a denying ``HookResult`` so the
@@ -45,7 +49,8 @@ class PluginDecision:
     This is an alternative to returning a full ``HookResult`` (which requires
     importing from ``hooks.types``) or raising :class:`GuardrailBlocked`. Return
     ``PluginDecision.deny(reason)`` or ``PluginDecision.block(reason)`` from a
-    ``before_*`` method to stop the action; the bridge forwards it to the
+    ``before_*`` method to stop the action, or from ``after_message`` to cancel
+    final channel delivery; the bridge forwards it to the
     runtime's block enforcement. Returning ``allow()`` (or the usual
     ``dict``/``str``/``tuple``/``None``) keeps today's rewrite/no-op semantics.
     """
@@ -106,14 +111,75 @@ class PluginInfo:
             "plugin_type": self.plugin_type.value,
         }
 
+
+def core_incompatibility(dependencies: List[str]) -> Optional[str]:
+    """Check a plugin's ``dependencies`` against the running core.
+
+    Only a ``praisonaiagents`` entry (e.g. ``"praisonaiagents>=0.9,<2"``) is
+    checked; other entries are ignored. Returns an actionable reason when the
+    installed core does not satisfy it, else ``None`` (permissive: no entry,
+    an unparseable entry, or ``packaging`` unavailable all mean compatible).
+    """
+    if not dependencies:
+        return None
+    try:
+        from packaging.requirements import InvalidRequirement, Requirement
+        from packaging.utils import canonicalize_name
+        from packaging.version import InvalidVersion, Version
+        from .._version import __version__ as core_version
+    except ImportError:
+        return None
+    if core_version == "unknown":
+        # Wheel installs ship no pyproject.toml; read the installed metadata.
+        try:
+            from importlib.metadata import version
+            core_version = version("praisonaiagents")
+        except Exception:
+            return None
+
+    # Comma-separated manifest headers split "pkg>=1,<2" into ["pkg>=1", "<2"];
+    # rejoin bare specifier fragments onto the preceding requirement.
+    merged: List[str] = []
+    for dep in dependencies:
+        dep = str(dep).strip()
+        if merged and dep[:1] in "<>=!~":
+            merged[-1] = f"{merged[-1]},{dep}"
+        elif dep:
+            merged.append(dep)
+
+    for dep in merged:
+        try:
+            req = Requirement(dep)
+        except InvalidRequirement:
+            continue
+        if canonicalize_name(req.name) != "praisonaiagents" or not req.specifier:
+            continue
+        try:
+            if req.marker and not req.marker.evaluate({"extra": ""}):
+                continue  # e.g. "; sys_platform == 'win32'" on another OS
+        except Exception:
+            continue
+        try:
+            ok = req.specifier.contains(Version(core_version), prereleases=True)
+        except InvalidVersion:
+            return None
+        if not ok:
+            return (
+                f"requires praisonaiagents{req.specifier}, installed {core_version}. "
+                "Update the plugin or praisonaiagents."
+            )
+    return None
+
+
 class Plugin(ABC):
     """
     Base class for PraisonAI plugins.
     
     Plugins can extend agent functionality by implementing
     hook methods that are called at various points in the
-    agent lifecycle.
-    
+    agent lifecycle. Hook methods may be ``def`` or ``async def``;
+    coroutines returned by async hooks are awaited by the dispatcher.
+
     Example:
         class MyPlugin(Plugin):
             @property
@@ -157,7 +223,7 @@ class Plugin(ABC):
 
     def before_agent(
         self, prompt: str, context: Dict[str, Any]
-    ) -> Union[str, "PluginDecision", None]:
+    ) -> Union[str, "PluginDecision", "HookResult", None]:
         """Called before agent execution.
 
         Return a modified ``prompt`` (rewrite), or a deny/block decision
@@ -166,13 +232,23 @@ class Plugin(ABC):
         """
         return prompt
     
-    def after_agent(self, response: str, context: Dict[str, Any]) -> str:
-        """Called after agent execution. Can modify response."""
+    def after_agent(
+        self, response: str, context: Dict[str, Any]
+    ) -> Union[str, "PluginDecision", "HookResult", None]:
+        """Called after agent execution.
+
+        Return a modified ``response`` (rewrite), or a deny/block decision
+        (``PluginDecision.deny(reason)`` / a ``HookResult`` / raise
+        :class:`GuardrailBlocked`) to replace the value returned to the caller
+        (and the in-memory assistant turn) with a refusal marker, or ``None``
+        for no-op. Interaction callbacks, verbose display, streamed output and
+        session/DB persistence happen before this hook and are not gated by it.
+        """
         return response
     
     def before_tool(
         self, tool_name: str, args: Dict[str, Any]
-    ) -> Union[Dict[str, Any], "PluginDecision", None]:
+    ) -> Union[Dict[str, Any], "PluginDecision", "HookResult", None]:
         """Called before tool execution.
 
         Return modified ``args`` (rewrite), or a deny/block decision
@@ -200,7 +276,7 @@ class Plugin(ABC):
     
     def before_message(
         self, message: Dict[str, Any]
-    ) -> Union[Dict[str, Any], "PluginDecision", None]:
+    ) -> Union[Dict[str, Any], "PluginDecision", "HookResult", None]:
         """Called before message is processed.
 
         Return a modified ``message`` (rewrite), or a deny/block decision
@@ -209,8 +285,16 @@ class Plugin(ABC):
         """
         return message
     
-    def after_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        """Called after message is processed. Can modify message."""
+    def after_message(
+        self, message: Dict[str, Any]
+    ) -> Union[Dict[str, Any], "PluginDecision", "HookResult", None]:
+        """Called before final channel delivery (MESSAGE_SENDING).
+
+        Return a message dict with modified ``content`` to rewrite the reply,
+        a ``PluginDecision.deny/block`` or ``HookResult`` to cancel delivery,
+        or ``None`` for no-op. Raising :class:`GuardrailBlocked` also cancels.
+        This hook does not cover progressive drafts or direct transport sends.
+        """
         return message
 
     def message_sent(self, message: Dict[str, Any]) -> None:
@@ -232,7 +316,7 @@ class Plugin(ABC):
     
     def before_llm(
         self, messages: List[Dict], params: Dict[str, Any]
-    ) -> Union[tuple, "PluginDecision", None]:
+    ) -> Union[tuple, "PluginDecision", "HookResult", None]:
         """Called before LLM call.
 
         Return a ``(messages, params)`` tuple (rewrite), or a deny/block
@@ -398,12 +482,14 @@ class FunctionPlugin(Plugin):
 
     def before_message(
         self, message: Dict[str, Any]
-    ) -> Union[Dict[str, Any], "PluginDecision", None]:
+    ) -> Union[Dict[str, Any], "PluginDecision", "HookResult", None]:
         if PluginHook.MESSAGE_RECEIVED in self._hooks:
             return self._hooks[PluginHook.MESSAGE_RECEIVED](message)
         return message
 
-    def after_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    def after_message(
+        self, message: Dict[str, Any]
+    ) -> Union[Dict[str, Any], "PluginDecision", "HookResult", None]:
         if PluginHook.MESSAGE_SENDING in self._hooks:
             return self._hooks[PluginHook.MESSAGE_SENDING](message)
         return message

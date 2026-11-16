@@ -167,6 +167,13 @@ sequenceDiagram
 | Path-like arg outside workspace | `cat /etc/passwd` | `[cat] + external_dir:/etc/*` |
 | Redirect target outside workspace | `echo x > ~/.bashrc` | `[echo] + external_dir:<home>/*` |
 | Executable referenced by path outside workspace | `/tmp/tool.sh` | `[/tmp/tool.sh] + external_dir:/tmp/*` |
+| POSIX wrapper prefix (`sudo`, `env`, `command`, `nohup`, `nice`, `ionice`, `stdbuf`, `setsid`, `time`, `timeout`, `exec`, `busybox`, `xargs`, `doas`) | `sudo rm -rf x` | `[rm]` |
+| Wrapper with value flag (`sudo -u`, `doas -u`, `nice -n`, `ionice -c/-n/-p`, `env -u/-C/-S`) | `sudo -u root rm -rf x` | `[rm]` (value token for `-u` is skipped) |
+| Wrapper with leading operand (`timeout 5`, `nice -n 5`, `ionice -c 2`) | `timeout 5s rm -rf x` | `[rm]` (duration operand with optional `s`/`m`/`h`/`d` for `timeout`) |
+| Standard-bindir path prefix (`/bin/`, `/sbin/`, `/usr/bin/`, `/usr/sbin/`, `/usr/local/bin/`, `/usr/local/sbin/`, `/opt/homebrew/bin/`) | `/bin/rm -rf x` | `[rm]` |
+| POSIX `sh -c` / `bash -c` / `zsh -c` / `dash -c` / `ksh -c` / `ash -c` | `bash -c 'rm -rf x'` | recurse into the quoted script, carrying its own inner redirects |
+| External wrapper path (`/tmp/sudo cmd`, `/tmp/bash -c '…'`) | `/tmp/sudo rm -rf x` | `[/tmp/sudo] + [rm]` — the external path stays as its own op so the workspace-boundary gate still prompts for running `/tmp/sudo` |
+| Executable at a non-standard path (`/tmp/tool`, `../tool`, `/bin/../x`) | `/tmp/tool` | **kept intact** — not reduced to a basename, so the workspace-boundary gate still fires |
 
 <Note>
 The `external_dir:` rows above only apply when `PermissionManager` is created with `workspace_root=...`. See [Workspace Boundary](/features/workspace-boundary).
@@ -324,6 +331,70 @@ graph TB
 
 ---
 
+## POSIX wrappers and absolute paths
+
+POSIX wrappers are unwrapped so a deny on the inner command still fires.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.approval.protocols import ApprovalConfig
+
+agent = Agent(
+    name="Safe Worker",
+    instructions="Run shell commands safely",
+    approval=ApprovalConfig(permissions={
+        "bash:rm *": "deny",
+        "bash:*": "allow",
+    }),
+)
+
+# The single bash:rm * deny now catches every wrapper-prefixed form:
+#   sudo rm -rf x
+#   sudo -u root rm -rf x
+#   env FOO=1 rm -rf x
+#   /bin/rm -rf x
+#   nice -n 5 rm -rf x
+#   timeout 5s rm -rf x
+#   xargs rm x
+#   bash -c 'rm -rf x'
+agent.start("Clean up temp files")
+```
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Tool
+    participant PermissionManager
+    participant Normalize as _normalize_posix_argv
+
+    Agent->>Tool: bash:sudo rm -rf x
+    Tool->>PermissionManager: check("bash:sudo rm -rf x")
+    PermissionManager->>Normalize: strip wrapper prefix
+    Normalize-->>PermissionManager: [ShellOp(rm)]
+    PermissionManager->>PermissionManager: check inner rm op
+    PermissionManager-->>Tool: deny (rm matched bash:rm *)
+    Tool-->>Agent: blocked
+```
+
+### What POSIX wrappers understand
+
+| Wrapper / construct | Example | Result |
+|---|---|---|
+| Prefix wrapper | `sudo rm -rf x` | `[rm]` |
+| Wrapper with value flag | `sudo -u root rm -rf x` | `[rm]` (`root` skipped as `-u`'s value) |
+| `env` with assignments | `env FOO=1 rm -rf x` | `[rm]` (leading `VAR=val` skipped) |
+| Duration/priority operand | `timeout 5s rm -rf x`, `nice -n 5 rm -rf x` | `[rm]` (numeric operand skipped) |
+| `--` ends option parsing | `sudo -u root -- rm -rf x` | `[rm]` |
+| Standard-bindir path | `/usr/bin/rm -rf x` | `[rm]` |
+| POSIX `sh`/`bash`/`zsh`/`dash`/`ksh`/`ash` `-c` | `bash -c 'rm -rf x'` | recurse into the quoted script |
+| Nested wrappers | `sudo env nice rm -rf x` | `[rm]` (unwrapped left-to-right) |
+
+<Note>
+**External paths escape the reduction.** A wrapper invoked by an out-of-bindir path (`/tmp/sudo cmd`, `/tmp/bash -c '…'`) keeps `/tmp/sudo` as its own op so the workspace-boundary gate still prompts for running it. See [Workspace Boundary](/features/workspace-boundary).
+</Note>
+
+---
+
 ## Shell expansion escalates to ASK
 
 Shell commands containing an expansion that cannot be statically resolved are escalated to `ASK` instead of being silently allowed by a broad rule.
@@ -380,6 +451,49 @@ graph LR
     class Normal,Ask ok
 ```
 
+### Unparseable commands escalate to ASK
+
+A command whose quoting cannot be tokenized (`shlex.split` raises) is escalated to `ASK` so a mis-tokenized string can never slip past a specific deny.
+
+An unterminated quote like `echo 'x; rm -rf x` makes `shlex.split` raise, after which the fallback splitter mis-tokenizes the command and a specific deny can no longer be verified. An explicit `DENY` from the flat matcher still wins; otherwise the request is escalated to `ASK` with the reason *"Command could not be parsed (unbalanced quotes?); requires approval"*.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.approval.protocols import ApprovalConfig
+
+agent = Agent(
+    name="Safe Worker",
+    instructions="Run shell commands safely",
+    approval=ApprovalConfig(permissions={
+        "bash:rm *": "deny",
+        "bash:*": "allow",
+    }),
+)
+
+# Unbalanced quote → ASK (explicit deny still wins if one matches):
+#   echo 'x; rm -rf x      → ASK
+agent.start("Print a status line")
+```
+
+```mermaid
+graph LR
+    Cmd[📥 Shell command] --> HasErr{shlex.split<br/>raises?}
+    HasErr -->|No| Normal[🔧 Tokenize & decompose]
+    HasErr -->|Yes| FlatCheck{Explicit deny<br/>matches?}
+    FlatCheck -->|Yes| Deny[🚫 DENY]
+    FlatCheck -->|No| Ask[❓ ASK user]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef deny fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Cmd input
+    class HasErr,FlatCheck check
+    class Deny deny
+    class Normal,Ask ok
+```
+
 ---
 
 ## Evasions Now Blocked
@@ -395,6 +509,27 @@ A `deny: bash:rm *` rule now blocks **all** of these:
 | `bash:echo $(rm -rf x)` | **ALLOWED** | denied |
 | `bash:echo \`rm -rf x\`` | **ALLOWED** | denied |
 | `bash:(cd /tmp && rm -rf x)` | **ALLOWED** | denied |
+| `bash:/bin/rm -rf x` | **ALLOWED** | denied |
+| `bash:sudo rm -rf x` | **ALLOWED** | denied |
+| `bash:sudo -u root rm -rf x` | **ALLOWED** | denied |
+| `bash:env rm -rf x` | **ALLOWED** | denied |
+| `bash:env FOO=1 rm -rf x` | **ALLOWED** | denied |
+| `bash:command rm -rf x` | **ALLOWED** | denied |
+| `bash:nohup rm -rf x` | **ALLOWED** | denied |
+| `bash:nice rm -rf x` / `bash:nice -n 5 rm -rf x` | **ALLOWED** | denied |
+| `bash:ionice -c 2 rm -rf x` | **ALLOWED** | denied |
+| `bash:stdbuf rm -rf x` | **ALLOWED** | denied |
+| `bash:setsid rm -rf x` | **ALLOWED** | denied |
+| `bash:time rm -rf x` | **ALLOWED** | denied |
+| `bash:timeout 5 rm -rf x` / `bash:timeout 5s rm -rf x` | **ALLOWED** | denied |
+| `bash:exec rm -rf x` | **ALLOWED** | denied |
+| `bash:busybox rm -rf x` | **ALLOWED** | denied |
+| `bash:xargs rm x` | **ALLOWED** | denied |
+| `bash:doas rm -rf x` | **ALLOWED** | denied |
+| `bash:bash -c 'rm -rf x'` | **ALLOWED** | denied |
+| `bash:sh -c 'rm -rf x'` | **ALLOWED** | denied |
+| `bash:zsh -c 'cat foo > /etc/hosts'` (with `write:/etc/*` deny) | **ALLOWED** | denied (inner redirect preserved) |
+| `bash:echo 'x; rm -rf x` (unbalanced quote) | **ALLOWED** | **ASK** (new: parse error escalates; an explicit deny still wins) |
 | `execute_command({"command=": "rm -rf /tmp/x"})` (argument-key mangling) | **ALLOWED** | denied |
 | `bash:echo '$(rm -rf x)'` (single-quoted) | denied | **allowed** (correctly — literal) |
 
@@ -555,8 +690,12 @@ praisonai run "Deploy check" \
 ## Best Practices
 
 <AccordionGroup>
-<Accordion title="Patterns match the executable name, not the full path">
-`bash:rm *` catches `rm -rf /tmp` but **not** `bash:/usr/bin/rm -rf /tmp`. Use a regex rule with `is_regex: true` for absolute-path coverage.
+<Accordion title="Standard bindir paths are reduced to the basename">
+`bash:rm *` now catches `/bin/rm`, `/usr/bin/rm`, `/usr/sbin/rm`, `/usr/local/bin/rm`, `/opt/homebrew/bin/rm`. Executables at a non-standard path (`/tmp/tool`, `../tool`) keep their path so the workspace-boundary gate still gates them — use a regex rule with `is_regex: true` only if you need to match those arbitrary paths too.
+</Accordion>
+
+<Accordion title="Wrappers no longer defeat a bash:rm * deny">
+`sudo rm`, `env rm`, `/bin/rm`, `nice rm`, `timeout 5 rm`, `xargs rm`, `bash -c 'rm'`, and the other POSIX wrappers all resolve to the inner command, so one `bash:rm *` deny covers them. Externally-pathed wrappers (`/tmp/sudo cmd`) still keep their path so the workspace-boundary gate prompts.
 </Accordion>
 
 <Accordion title="Single-quoted substitutions are literals">

@@ -254,6 +254,46 @@ Since [PR #4878](https://github.com/MervinPraison/PraisonAI/pull/4878), the `PRA
 | `GatewayApprovalBackend` | `from praisonai_bot.gateway.gateway_approval import GatewayApprovalBackend` | Queue approvals into the gateway control plane |
 | `CallbackBackend` | `from praisonaiagents.approval import CallbackBackend` | Wraps a legacy callback function |
 
+### TypeScript imports
+
+The four core backends have TypeScript parity in `praisonai-ts` — import them flat from `praisonai`. See [Approval Backends (TypeScript)](/js/approval#approval-backends-python-parity).
+
+| Backend | Python import | TypeScript import |
+|---------|---------------|-------------------|
+| `AutoApproveBackend` | `from praisonaiagents.approval.backends import AutoApproveBackend` | `import { AutoApproveBackend } from 'praisonai'` |
+| `ConsoleBackend` | `from praisonaiagents.approval import ConsoleBackend` | `import { ConsoleBackend } from 'praisonai'` |
+| `AgentApproval` | `from praisonaiagents.approval import AgentApproval` | `import { AgentApproval } from 'praisonai'` |
+| `CallbackBackend` | `from praisonaiagents.approval import CallbackBackend` | `import { CallbackBackend } from 'praisonai'` |
+
+Install a TypeScript backend with `setApprovalBackend(backend, manager?)`; the chat/channel backends (`SlackApproval`, `TelegramApproval`, …) are Python/CLI-only.
+
+### GatewayApprovalBackend webhook payload
+
+`GatewayApprovalBackend(notify_url="https://your-consumer/hook")` POSTs a JSON payload to the URL:
+
+```json
+{
+  "request_id": "f3a2…",
+  "status": "pending",
+  "tool_name": "execute_command",
+  "arguments": {"command": "rm -rf /tmp/cache"},
+  "agent_name": "ops",
+  "risk_level": "high"
+}
+```
+
+The `status` field (added in [PR #5916](https://github.com/MervinPraison/PraisonAI/pull/5916)) says which lifecycle event fired:
+
+| `status` | When it fires | What the consumer should do |
+|---|---|---|
+| `"pending"` | Once, when the request is created | Show a live Allow/Deny card |
+| `"timed_out"` | At most once, when nobody resolved the request within `timeout` | Mark the card as not run and disable its buttons |
+
+- The `"timed_out"` POST is sent only **after** the `"pending"` POST has completed, so it never arrives before the card it settles.
+- No `notify_url` ⇒ no webhook is sent, on creation or on timeout.
+- A human Approve/Deny does **not** fire a webhook — only `"pending"` and `"timed_out"` are emitted.
+- The agent still receives a fail-closed DENY on timeout (`approver="gateway:timeout"`).
+
 ---
 
 ## Gateway-wired approvals
@@ -272,10 +312,12 @@ approval_mode == "webhook" OR
                                              ↳ webhook mode with NO url:
                                                warn + fall through to gateway
 channel_type == "slack"    + resolved id  → SlackApproval(...)
-channel_type == "telegram" + resolved id  → TelegramApproval(...)
+channel_type == "telegram" + resolved id  → PresentationApprovalBackend(target=chat_id)
 channel_type == "discord"  + resolved id  → DiscordApproval(...)
 otherwise                                 → GatewayApprovalBackend()  (fallback)
 ```
+
+On gateway Telegram channels, the gateway installs `PresentationApprovalBackend` and renders / resolves taps through the channel adapter — not `TelegramApproval`, whose own `getUpdates` loop would conflict with the running bot. See [Telegram Durable Approval → Gateway mode](/features/telegram-durable-approval#gateway-mode).
 
 <Card title="Bot Shell Execution" icon="terminal" href="/features/bot-shell-execution">
   Full field reference, per-platform ID resolution, env vars, and recipes.
@@ -876,6 +918,74 @@ sequenceDiagram
 ```
 
 The predicate the SDK supplies follows the effective per-turn cancel token — the same authority an explicit `cancel_token=` argument or a `/stop` targets — and falls back to the agent's interrupt controller when no per-turn token is registered. When neither is attached the request stays always-live, preserving today's behaviour.
+
+---
+
+## Context Isolation
+
+Approvals are scoped to the Python [context](https://docs.python.org/3/library/contextvars.html) they are granted in. An approval granted inside an `asyncio` task, a `copy_context().run(...)` worker, or a thread spawned with `asyncio.to_thread(...)` stays in that worker — it does not appear in the parent task, and it does not appear in sibling workers copied from the same parent.
+
+```python
+import asyncio
+from praisonaiagents import Agent
+
+agent = Agent(name="ops", instructions="Run shell commands", tools=["execute_command"])
+
+async def main():
+    # Worker A approves `execute_command` for its own context only.
+    # Worker B still gets its own approval prompt — the approval does not leak.
+    await asyncio.gather(
+        asyncio.to_thread(agent.start, "list /tmp"),
+        asyncio.to_thread(agent.start, "list /var/log"),
+    )
+
+asyncio.run(main())
+```
+
+This is the behaviour you want for anything that fans out: a single human approval must not silently unlock every parallel branch.
+
+```mermaid
+sequenceDiagram
+    participant Parent as Parent context
+    participant Worker_A as Worker A (copy_context)
+    participant Worker_B as Worker B (copy_context)
+    participant Registry
+
+    Parent->>Worker_A: run(agent.start, …)
+    Parent->>Worker_B: run(agent.start, …)
+    Worker_A->>Registry: mark_approved(execute_command, {"cmd": "ls /tmp"})
+    Note over Registry: Copy-on-write — new set stored in Worker A's context only
+    Worker_B->>Registry: is_already_approved(execute_command, {"cmd": "ls /var/log"})
+    Registry-->>Worker_B: False — Worker A's grant stays in Worker A
+```
+
+Fixed in PraisonAI [PR #5757](https://github.com/MervinPraison/PraisonAI/pull/5757). Before #5757, `mark_approved` mutated the set stored in the per-context approval cache in place; because `contextvars.copy_context()` copies the mapping and not the set, an approval granted in a child context appeared in the parent and in every sibling copied from it. Multi-threaded and `asyncio.to_thread` users of `approval=` therefore saw a sibling worker's approval silently unlock their own tool call. The registry now stores a **new** set each time, so approvals stay in the context that granted them.
+
+### Garbage-collected agents are safe
+
+Letting an `Agent` be collected without calling `.close()` is safe on any thread. `Agent.__del__` releases the agent's process-global registry grants (`auto_approve_tool` entries, session-scoped targets) but **never writes the per-context approval cache** — a finalizer can run on any thread, in any context, so touching a ContextVar from there would clobber an unrelated worker's approvals.
+
+- `Agent.close()` / `Agent.aclose()` — called by your code on the context that owned the agent — still evict that context's approval cache for the agent's scope. Interactive behaviour is unchanged.
+- `Agent.__del__` — called by the garbage collector on an unspecified thread — leaves every context's cache alone, and reclaims only the process-global grants.
+
+```python
+from praisonaiagents import Agent
+
+# OK on any thread, in any context — finalizer only reclaims
+# process-global grants, never writes a ContextVar.
+agent = Agent(name="worker", instructions="…", tools=["execute_command"])
+agent.start("…")
+del agent
+
+# Explicit close() still clears this context's approval cache for the agent's scope.
+agent2 = Agent(name="worker", instructions="…", tools=["execute_command"])
+try:
+    agent2.start("…")
+finally:
+    agent2.close()
+```
+
+Fixed in PraisonAI [PR #5757](https://github.com/MervinPraison/PraisonAI/pull/5757). The pre-fix finalizer rewrote the per-context approval cache from inside the garbage collector, which could wipe an unrelated context's approval cache.
 
 ---
 

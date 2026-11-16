@@ -198,6 +198,9 @@ sequenceDiagram
 | `max_budget_usd` | `Optional[float]` | `None` | Cumulative USD spend cap for the run. `None` = unlimited. |
 | `max_tokens` | `Optional[int]` | `None` | Cumulative token cap (input + output). `None` = unlimited. |
 | `budget_action` | `str` | `"pause"` | `"pause"` (recoverable) or `"stop"` (terminal) when a cap is hit. |
+| `snapshot` | `bool` | `False` | Take a pre-run workspace snapshot in `run_autonomous()` so `agent.undo()` can restore it. Requires `track_changes`. Off by default because snapshotting walks the whole project. |
+
+`agent.undo()` only works with `AutonomyConfig(track_changes=True, snapshot=True)` — see [File Snapshot](/features/file-snapshot).
 
 <Tip>
 See [Autonomy Budget](/features/autonomy-budget) for the full spend/token kill-switch guide, including pause-and-resume.
@@ -249,6 +252,14 @@ agent = Agent(
 
 ## CLI Usage
 
+<Note>
+`praisonai loop` always runs in `mode="iterative"`, so `--max-iterations`, `--completion-promise`, and `--clear-context` work without `--level full_auto`. In Python, `autonomy=True` still defaults to caller mode.
+</Note>
+
+<Note>
+`praisonai loop` exposes `--max-budget` and `--on-budget-exceeded`. The other run controls — `durable`, `journal_path`, and `resume_run_id` — are set from YAML (see [`execution:` block](/features/yaml-configuration-reference#execution-block)) or Python, not from `loop` flags. See [Agent Max Budget](/features/agent-max-budget).
+</Note>
+
 <Tabs>
   <Tab title="Basic">
     ```bash
@@ -270,6 +281,16 @@ agent = Agent(
     praisonai loop "Debug the issue" -t 300 -v
     ```
   </Tab>
+  <Tab title="With Budget Cap">
+    ```bash
+    praisonai loop "Research AI trends" --max-budget 0.50 -v
+    ```
+  </Tab>
+  <Tab title="Budget — warn only">
+    ```bash
+    praisonai loop "Keep refining" --max-budget 2.0 --on-budget-exceeded warn
+    ```
+  </Tab>
 </Tabs>
 
 ### CLI Options
@@ -279,7 +300,9 @@ agent = Agent(
 | `-n, --max-iterations` | Maximum iterations (default: 10) |
 | `-p, --completion-promise` | Promise text to signal completion |
 | `-c, --clear-context` | Clear chat history between iterations |
-| `-t, --timeout` | Timeout in seconds |
+| `-t, --timeout` | Timeout in seconds. On expiry the run returns `success=False`, `completion_reason="timeout"`. Only forwarded when set |
+| `--max-budget` | Hard USD spend cap for the **whole** loop (cumulative across iterations, not reset per iteration). Must be a positive, finite number — `0`, negatives, `nan`, and `inf` are rejected with exit code `2`. Omit for no cap |
+| `--on-budget-exceeded` | What happens when the cap is hit: `stop` (default — raises `BudgetExceededError`, CLI exits `1`) or `warn` (logs and continues). Any other value exits `2`. Only meaningful with `--max-budget` |
 | `-m, --model` | LLM model to use |
 | `-v, --verbose` | Show verbose output |
 
@@ -312,6 +335,42 @@ result.metadata = {
 }
 ```
 
+## Timeout
+
+Pass `timeout=` (seconds) to `agent.start()` or `agent.astart()` to cap a run in both caller and iterative modes.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="worker",
+    instructions="Answer the question.",
+    autonomy={"level": "suggest"},  # caller mode
+)
+
+result = agent.start("Research topic X", timeout=30)
+if result.completion_reason == "timeout":
+    print("Budget exceeded:", result.output)  # "Task timed out"
+```
+
+```python
+import asyncio
+from praisonaiagents import Agent
+
+async def main():
+    agent = Agent(name="worker", instructions="Answer the question.", autonomy=True)
+    result = await agent.astart("Research topic X", timeout=30)
+    print(result.success, result.completion_reason)
+
+asyncio.run(main())
+```
+
+On expiry the result has `success=False`, `output="Task timed out"`, and `completion_reason="timeout"`.
+
+<Note>
+In caller mode, sync `start()` stops the run cooperatively through an internal `cancel_token`. If you pass your own `cancel_token=`, it wins and `timeout=` is ignored. Async `astart()` cancels the inner `achat()` task and waits for its cleanup before returning.
+</Note>
+
 ## How Completion Detection Works
 
 ```mermaid
@@ -342,7 +401,7 @@ graph TB
     The model used tools to complete the task and then produced a summary response without requesting more tools. This is the **most reliable** completion signal — it's the same mechanism used by ChatGPT and all major LLM APIs.
   </Accordion>
   <Accordion title="caller_mode">
-    Agent was in caller mode (`autonomy=True` default). Single `chat()` call wrapped in AutonomyResult.
+    Agent was in caller mode (`autonomy=True` default, or `level="suggest"` / `"auto_edit"`). A single `chat()` / `achat()` call wrapped in AutonomyResult. If `timeout=` elapses first, the reason is `timeout` instead.
   </Accordion>
   <Accordion title="promise">
     Agent output contained a promise tag with TEXT matching the configured promise.
@@ -363,7 +422,7 @@ graph TB
     `max_budget_usd` or `max_tokens` was reached. `result.metadata` carries `spend_usd`, `tokens`, `max_budget_usd`, `max_tokens`, and `status` (`"paused"` or `"stopped"`). With `budget_action="pause"` the run is resumable — raise the cap and re-invoke `run_autonomous`. See [Autonomy Budget](/features/autonomy-budget).
   </Accordion>
   <Accordion title="timeout">
-    Execution exceeded the configured timeout.
+    Execution exceeded the configured timeout. Applies to both caller and iterative modes — see [Timeout](#timeout).
   </Accordion>
   <Accordion title="needs_help">
     Doom loop recovery exhausted — task needs human guidance.

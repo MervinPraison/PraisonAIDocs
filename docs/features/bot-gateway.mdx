@@ -142,7 +142,7 @@ Each channel bot gets an isolated agent via `Agent.clone_for_channel()` — fres
 
 <CardGroup cols={2}>
   <Card title="Telegram" icon="paper-plane">
-    Full support for DMs, groups, commands, voice, and media.
+    Full support for DMs, groups, commands, voice, and media. Inline buttons (pairing Approve/Deny, tool approvals, interactive callbacks) resolve in gateway mode via the channel's own callback handler.
   </Card>
   <Card title="Discord" icon="discord">
     Guild channels, DMs, slash commands, and embeds.
@@ -193,7 +193,7 @@ agents:
 |-------|------|---------|-------------|
 | **instructions** | string | `""` | System prompt for the agent |
 | **model** | string | `None` | LLM model (e.g., `gpt-4o-mini`, `gpt-4o`) |
-| **memory** | boolean | `false` | Enable conversation memory |
+| **memory** | `bool \| str \| dict` | `false` | Enable conversation memory. See [Gateway memory identity](#gateway-memory-identity) for the stable `gateway-<agent_id>` default and how to override it with an explicit `user_id`. |
 | **tools** | list | `[]` | Tool names resolved via ToolResolver |
 | **reflection** | boolean | `true` | Enable self-reflection / interactive mode |
 | **role** | string | `None` | Agent role (CrewAI-style) |
@@ -201,6 +201,95 @@ agents:
 | **backstory** | string | `None` | Agent backstory (CrewAI-style) |
 | **tool_choice** | string | `None` | `auto`, `required`, or `none` |
 | **allow_delegation** | boolean | `false` | Allow task delegation to other agents |
+
+### Gateway memory identity
+
+Every gateway agent gets a stable memory identity derived from its configured agent id, so facts learned through one chat survive restarts, hot-reloads, and channel clones.
+
+```mermaid
+graph LR
+    subgraph "Gateway Memory Identity"
+        A[📝 gateway.yaml<br/>agents.support-bot] --> B[🧮 Derive id]
+        B --> C[🆔 gateway-support-bot]
+        C --> D[💾 Memory store<br/>.praisonai/memory/gateway-support-bot/]
+    end
+
+    classDef cfg fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef derive fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef id fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef store fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A cfg
+    class B derive
+    class C id
+    class D store
+```
+
+| YAML `memory:` shape | Example | Resolved `user_id` |
+|---|---|---|
+| **Omitted** (no `memory:` key) or `memory: false` | — | Agent `user_id` is set to `gateway-<agent_id>`, so bot-injected memory keys off a stable id instead of the shared `"praison"` constant |
+| **`true`** | `memory: true` | `gateway-<agent_id>` |
+| **Preset string** | `memory: sqlite` or `memory: history` | Preset config + `user_id: gateway-<agent_id>` |
+| **Dict without `user_id`** | `memory: { history: true }` | Dict merged with `user_id: gateway-<agent_id>` |
+| **Dict with explicit `user_id`** | `memory: { user_id: billing-team }` | `billing-team` — **explicit always wins** |
+| **URL / connection string** | `memory: "sqlite:///m.db"` | Passed through unchanged |
+
+The same id is carried onto every per-channel clone, so Telegram, Slack, and other channels served by one agent share its memory.
+
+#### What `gateway-<agent_id>` looks like
+
+Memory directories only allow `A-Z`, `a-z`, `0-9`, `_` and `-`, so the gateway replaces any other character with `_`. When a replacement happens, an 8-character hash of the original id is appended so ids stay distinct: `support_bot` → `gateway-support_bot`, but `support.bot` → `gateway-support_bot-<hash>` — they live in **different** memory directories.
+
+```python
+from praisonaiagents import Agent
+
+# Plain Agent (outside the gateway) — still gets a random id, by design.
+agent = Agent(name="assistant", instructions="Help the user.", memory=True)
+# → memory user_id = agent-<random hex>
+```
+
+```yaml
+# gateway.yaml — gateway agents get a stable id for free.
+agents:
+  support-bot:
+    instructions: "Help the customer."
+    model: gpt-4o-mini
+    memory: true
+    # memory user_id = gateway-support-bot (stable across restarts)
+
+  billing-bot:
+    instructions: "Handle invoices."
+    model: gpt-4o-mini
+    memory:
+      user_id: billing-team        # explicit override wins
+```
+
+```mermaid
+sequenceDiagram
+    participant User as 👤 User
+    participant TG as 📱 Telegram
+    participant GW as 🛰️ Gateway (boot 1)
+    participant Mem as 💾 Memory (gateway-support-bot)
+    participant GW2 as 🛰️ Gateway (boot 2)
+
+    User->>TG: "Remember I prefer teal UIs."
+    TG->>GW: Inbound message
+    GW->>Mem: Store "prefers teal UIs"
+    GW-->>User: "Noted."
+
+    Note over GW,GW2: Gateway restarts / hot-reload / redeploy
+
+    User->>TG: "What UI style do I like?"
+    TG->>GW2: Inbound message
+    GW2->>Mem: Search "UI style"
+    Mem-->>GW2: "prefers teal UIs"
+    Note over GW2,Mem: Same user_id → recall works
+    GW2-->>User: "You prefer teal UIs."
+```
+
+<Warning>
+**Two gateways using the same agent id share memory.** The id derives from the configured agent id only. If you run two gateway processes with the same `gateway.yaml` from the same working directory, both read from and write to `.praisonai/memory/gateway-<agent_id>/`. To isolate them, set an explicit `memory.user_id` per environment (e.g. `gateway-support-bot-prod` and `gateway-support-bot-staging`).
+</Warning>
 
 ### Channels Section
 
@@ -222,9 +311,33 @@ channels:
 Use `${ENV_VAR_NAME}` syntax in token fields. The gateway automatically reads from your environment variables.
 </Tip>
 
+### Multi-Agent Rooms
+
+Declare a roster of agents under a top-level `rooms:` block and bind it to a channel with a `room:<name>` route target. The roster takes bounded, `@`-addressed turns on each new human message, and the transcript is persisted via the configured session store.
+
+```yaml
+rooms:
+  standup:
+    agents: [researcher, critic, writer]
+    max_rounds: 3
+    max_messages: 20
+
+channels:
+  telegram:
+    token: ${TELEGRAM_BOT_TOKEN}
+    routes:
+      group: room:standup
+```
+
+<Card title="Gateway Rooms" icon="users" href="/features/gateway-rooms">
+  Durable transcript, member isolation, and tool-policy details.
+</Card>
+
 ### Channel Security
 
 Each channel enforces the same access-control pipeline as standalone bots. Every key below is read per-channel from `gateway.yaml` — including `unknown_user_policy` and `owner_user_id`, which the gateway now wires through at start and on hot-reload ([PR #2856](https://github.com/MervinPraison/PraisonAI/pull/2856)).
+
+**Reusable sender sets.** If several channels share the same user list, define it once under top-level `access_groups:` and reference it as `group:<name>` from `allowed_users`, `allowlist` or `blocklist`. See [Access Groups](/features/gateway-access-groups).
 
 <Note>
 `unknown_user_policy` and `owner_user_id` are honoured **identically** by the single-bot CLI (`praisonai bot start`) since [PR #5111](https://github.com/MervinPraison/PraisonAI/pull/5111) — same semantics, same validation, same resolved-policy startup log. See [Standalone Bot YAML → Admission policy](/features/standalone-bot-yaml#admission-policy-unknown-user-policy-owner-user-id).
@@ -261,8 +374,8 @@ The same configuration comes straight from `gateway.yaml`:
 | `allowed_channels` | `list[str]` \| `str` | `[]` | Channel/group-ID allowlist. Same string handling. |
 | `unknown_user_policy` | `"deny" \| "pair" \| "allow"` | `"deny"` | What to do with users not in `allowed_users`. `deny` silently drops. `pair` runs the owner-approval flow (`owner_user_id` required). `allow` lets everyone through (trusted networks only). |
 | `owner_user_id` | `str` | `null` | Platform user ID of the channel owner. Required when `unknown_user_policy: "pair"` — the owner receives approval prompts for new users. |
-| `group_policy` | `str` | `"mention_only"` | One of `"mention_only"`, `"command_only"`, `"respond_all"`, `"observe"`. Sets `mention_required` automatically. `observe` records unmentioned group messages as passive context instead of dropping them (Telegram only). |
-| `implicit_mentions` | `list[str]` | `["reply"]` | Non-`@mention` signals that admit a message under `mention_only` / `observe`. Values: `"reply"`, `"quote"`, `"thread"`. Empty list = strict `@`-only. Telegram reports `reply` today. |
+| `group_policy` | `str` | `"mention_only"` | One of `"mention_only"`, `"command_only"`, `"respond_all"`, `"observe"`. Sets `mention_required` automatically. `observe` records unmentioned group messages as passive context instead of dropping them (Telegram, Discord and Slack). An unknown value is treated as `"mention_only"`. |
+| `implicit_mentions` | `list[str]` | `["reply"]` | Non-`@mention` signals that admit a message under `mention_only` / `observe`. Values: `"reply"`, `"quote"`, `"thread"`. Empty list = strict `@`-only. Telegram, Discord and Slack report `reply` today. |
 | `auto_approve_tools` | `bool` \| `str` | `True` | Auto-approve safe tools. Strings `"1"/"true"/"yes"/"on"` are truthy. |
 | `default_tools` | `list[str]` | (BotConfig default) | Per-channel override for default safe tools. |
 | `allow_bots` | `bool` (accepts `true`/`false`, `yes`/`no`, `on`/`off`, `1`/`0`) | `false` | Opt-in for bot-authored inbound messages on this channel. Default-off drops every bot-authored inbound turn — byte-for-byte compatible with pre-#5242. Honoured on both channel start and hot-reload. See [Bot Loop Protection](/features/bot-loop-protection). |
@@ -324,7 +437,7 @@ channels:
 ```
 
 <Note>
-`observe` is Telegram-only today. Other adapters ignore it and fall back to their default group handling.
+`observe` works on Telegram, Discord and Slack. On Discord, a Reply to the bot's own message admits as an implicit mention; on Slack, a reply in a thread whose parent was posted by the bot admits the same way. WhatsApp does not support `observe` yet.
 </Note>
 
 **When to use it:** a busy group where users want to `@bot` and have it see prior discussion; the bot stays quiet until addressed.
@@ -361,6 +474,14 @@ channels:
     # auto_approve_shell: false
     # approval_channel: "123456789"
 ```
+
+<Note>
+On Telegram, gateway and standalone use the same durable `PresentationApprovalBackend` for shell approval — buttons render and resolve through the channel's own bot.
+</Note>
+
+<Note>
+**Routed shell agents.** When a channel has routing rules and `allow_shell: true`, the routed clone reuses the channel's wired approval backend only if the target chat matches and the approver set is the same or narrower. Otherwise the clone keeps its own backend.
+</Note>
 
 <Note>
 See [Bot Shell Execution](/features/bot-shell-execution) for the full routing ladder, per-platform ID resolution, env-var reference, and copy-paste recipes.
@@ -587,6 +708,77 @@ gateway.get_agent("personal")    # Returns Agent instance
 </Tab>
 </Tabs>
 
+### Custom agent entry-point contract
+
+When a custom agent is registered with the gateway, its `arun` / `achat` / `chat` method receives a per-turn interrupt in one of two ways depending on its signature.
+
+```mermaid
+graph TB
+    Q{What does your agent's<br/>chat / achat signature look like?} --> A["def chat(self, content, cancel_token=None)"]
+    Q --> B["def chat(self, content, **kwargs)"]
+    Q --> C["def chat(self, content)  (legacy)"]
+
+    A --> R1["cancel_token passed as a kwarg<br/>Per-turn isolation ✅"]
+    B --> R2["cancel_token passed via **kwargs<br/>Per-turn isolation ✅"]
+    C --> R3["agent.interrupt_controller is set<br/>Shared attribute — best-effort, not isolated"]
+
+    classDef question fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef sig fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef shared fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Q question
+    class A,B,C sig
+    class R1,R2 ok
+    class R3 shared
+```
+
+The gateway prefers an async `arun` / `achat` and falls back to a sync `chat`.
+
+<Tabs>
+<Tab title="cancel_token (recommended)">
+```python
+class MyAgent:
+    def chat(self, content, cancel_token=None):
+        # cancel_token is this turn's interrupt controller
+        return f"echo: {content}"
+
+gateway.register_agent(MyAgent(), agent_id="mine")
+```
+</Tab>
+
+<Tab title="**kwargs">
+```python
+class MyAgent:
+    async def achat(self, content, **kwargs):
+        cancel_token = kwargs.get("cancel_token")  # this turn's interrupt controller
+        return f"echo: {content}"
+
+gateway.register_agent(MyAgent(), agent_id="mine")
+```
+</Tab>
+
+<Tab title="Legacy">
+```python
+class MyAgent:
+    interrupt_controller = None  # must exist — the gateway only writes the turn's controller to an existing attribute
+
+    def chat(self, content):
+        return f"echo: {content}"
+
+gateway.register_agent(MyAgent(), agent_id="mine")
+```
+</Tab>
+</Tabs>
+
+<Warning>
+The legacy path writes to a shared `agent.interrupt_controller` attribute, so it is **not isolated across concurrent turns on the same agent instance**. Add a `cancel_token` parameter to get per-turn isolation — see [Cooperative Tool Cancellation → Concurrent turns on one Agent](/features/cooperative-tool-cancellation#concurrent-turns-on-one-agent).
+</Warning>
+
+<Note>
+Since [PR #5885](https://github.com/MervinPraison/PraisonAI/pull/5885) (fixes [#5884](https://github.com/MervinPraison/PraisonAI/issues/5884)), the gateway picks the calling convention from the signature before the call, so the entry point runs exactly once and any `TypeError` it raises is the turn's error. Before #5885, an application `TypeError` raised inside the entry point caused a silent second invocation.
+</Note>
+
 <Accordion title="Advanced: Health Endpoint">
   The gateway exposes a health endpoint at `http://host:port/health`:
   
@@ -751,6 +943,9 @@ if detect_code_skew(fingerprint):
   </Accordion>
   <Accordion title="Monitor via /health and /metrics">
     Poll the health endpoint during deploys and wire [Gateway Metrics](/features/gateway-metrics) into Prometheus for message-flow visibility.
+  </Accordion>
+  <Accordion title="Set an explicit user_id when you need isolation">
+    The default `gateway-<agent_id>` is right for most single-tenant bots. If you need to isolate memory per environment (prod vs staging), per tenant, or per channel, set `memory.user_id` explicitly in the agent block. An explicit `user_id` always wins over the default.
   </Accordion>
 </AccordionGroup>
 

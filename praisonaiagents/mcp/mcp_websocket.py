@@ -20,14 +20,14 @@ import asyncio
 import json
 from praisonaiagents._logging import get_logger
 import threading
-import inspect
 import re
 from typing import Any, Dict, Optional, List
 
 logger = get_logger("mcp-websocket")
 
 # Import shared utilities for thread-safe event loop and schema fixing
-from .mcp_schema_utils import ThreadLocalEventLoop, build_openai_tool_dict
+from ..trace.redact import redact_string
+from .mcp_schema_utils import ThreadLocalEventLoop, build_openai_tool_dict, build_tool_signature, get_running_loop_or_none, remote_tool_error
 
 def is_websocket_url(url: str) -> bool:
     """
@@ -169,7 +169,7 @@ class WebSocketTransport:
                     ),
                     timeout=self.timeout
                 )
-                logger.debug(f"WebSocket connected to {self.url}")
+                logger.debug(f"WebSocket connected to {redact_string(self.url)}")
                 
                 # Start background receive task
                 self._receive_task = asyncio.create_task(self._receive_loop())
@@ -277,45 +277,9 @@ class WebSocketMCPTool:
         self.timeout = timeout
         
         # Build function signature from input schema
-        self.__signature__ = self._build_signature()
-    
-    def _build_signature(self) -> inspect.Signature:
-        """Build function signature from input schema."""
-        params = []
-        
-        if self.input_schema and 'properties' in self.input_schema:
-            required = self.input_schema.get('required', [])
-            
-            for param_name, prop_schema in self.input_schema['properties'].items():
-                # Determine type annotation
-                prop_type = prop_schema.get('type', 'string') if isinstance(prop_schema, dict) else 'string'
-                annotation = self._json_type_to_python(prop_type)
-                
-                # Determine default value
-                default = inspect.Parameter.empty if param_name in required else None
-                
-                params.append(
-                    inspect.Parameter(
-                        name=param_name,
-                        kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                        default=default,
-                        annotation=annotation
-                    )
-                )
-        
-        return inspect.Signature(params)
-    
-    def _json_type_to_python(self, json_type: str) -> type:
-        """Convert JSON Schema type to Python type."""
-        type_map = {
-            'string': str,
-            'integer': int,
-            'number': float,
-            'boolean': bool,
-            'array': list,
-            'object': dict
-        }
-        return type_map.get(json_type, Any)
+        self.__signature__ = build_tool_signature(self.input_schema)
+        # The client creates this wrapper on the loop that owns ``session``
+        self._loop = get_running_loop_or_none()
     
     def __call__(self, **kwargs):
         """
@@ -325,14 +289,16 @@ class WebSocketMCPTool:
         """
         logger.debug(f"Tool {self.name} called with args: {kwargs}")
         
-        loop = get_event_loop()
+        # Run on the session's loop; the caller's thread-local loop is not running
+        loop = self._loop or get_event_loop()
         future = asyncio.run_coroutine_threadsafe(self._async_call(**kwargs), loop)
         
         try:
             return future.result(timeout=self.timeout)
         except Exception as e:
-            logger.error(f"Error calling tool {self.name}: {e}")
-            return f"Error: {str(e)}"
+            future.cancel()
+            logger.error(f"Error calling tool {self.name}: {e!r}")
+            return remote_tool_error(self.name, e, self.timeout)
     
     async def _async_call(self, **kwargs):
         """Call the tool asynchronously."""
@@ -403,6 +369,11 @@ class WebSocketMCPClient:
         self.transport = None
         self.tools: List[WebSocketMCPTool] = []
         self._closed = False
+        # The loop that owns ``self.session``. ``get_event_loop()`` is
+        # thread-local, so close() must not look it up again: a finalizer or a
+        # caller on another thread would get a different, idle loop and the
+        # scheduled cleanup would never run.
+        self._loop = None
         
         # Configure logging
         if debug:
@@ -416,6 +387,7 @@ class WebSocketMCPClient:
     def _initialize(self):
         """Initialize the connection and discover tools."""
         loop = get_event_loop()
+        self._loop = loop
         
         # Start event loop in background thread if not running
         def run_event_loop():
@@ -431,7 +403,7 @@ class WebSocketMCPClient:
     
     async def _async_initialize(self):
         """Asynchronously initialize connection and discover tools."""
-        logger.debug(f"Connecting to MCP server at {self.server_url}")
+        logger.debug(f"Connecting to MCP server at {redact_string(self.server_url)}")
         
         # Lazy import mcp package
         try:
@@ -529,16 +501,20 @@ class WebSocketMCPClient:
         except Exception:
             pass
     
-    def close(self):
-        """Synchronous cleanup."""
+    def close(self, wait: bool = True):
+        """Synchronous cleanup. ``wait=False`` only schedules it (finalizers)."""
         if self._closed:
             return
         
         try:
-            loop = get_event_loop()
-            if not loop.is_closed():
+            loop = getattr(self, "_loop", None)
+            if loop is not None and not loop.is_closed():
                 future = asyncio.run_coroutine_threadsafe(self.aclose(), loop)
-                future.result(timeout=5)
+                if wait:
+                    future.result(timeout=5)
+            else:
+                # Never connected (or its loop is gone): nothing to close.
+                self._closed = True
         except Exception:
             self._closed = True
     
@@ -546,6 +522,6 @@ class WebSocketMCPClient:
         """Cleanup on garbage collection."""
         try:
             if not self._closed:
-                self.close()
+                self.close(wait=False)
         except Exception:
             pass

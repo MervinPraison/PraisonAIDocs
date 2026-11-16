@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import (
     BaseModel,
@@ -873,6 +873,15 @@ class HealthMonitorSchema(BaseModel):
     breaker_cooldown_s: float = Field(120.0, ge=0)
 
 
+class OperatorGrantSchema(BaseModel):
+    """Per-token operator grant (Issue #6253). Unknown keys are rejected so a
+    typo (``agnts``) cannot silently drop an agent confinement."""
+    model_config = ConfigDict(extra="forbid")
+
+    scopes: List[str] = Field(default_factory=list)
+    agents: Optional[List[str]] = None
+
+
 class GatewayServerSchema(BaseModel):
     """Typed schema for the ``gateway:`` server block (issue #3050).
 
@@ -896,7 +905,8 @@ class GatewayServerSchema(BaseModel):
     allowed_origins: Optional[List[str]] = None
     auth_token: Optional[str] = None
     auth: Optional[Dict[str, Any]] = None
-    auth_scopes: Optional[Dict[str, List[str]]] = None
+    # Issue #6253: token -> [scopes] or {scopes: [...], agents: [...]}.
+    auth_scopes: Optional[Dict[str, Union[List[str], OperatorGrantSchema]]] = None
     max_connections: Optional[int] = Field(None, ge=0)
     max_sessions_per_agent: Optional[int] = Field(None, ge=0)
     session_config: Optional[Dict[str, Any]] = None
@@ -912,6 +922,8 @@ class GatewayServerSchema(BaseModel):
     max_concurrent_runs: Optional[int] = Field(None, ge=0)
     queue_depth: Optional[int] = Field(None, ge=0)
     overflow_policy: Optional[str] = None
+    # Per-user inbound request budget (#6215). 0 = unlimited (default).
+    per_user_per_minute: Optional[int] = Field(None, ge=0)
     preauth_max_connections_per_ip: Optional[int] = Field(None, ge=0)
     max_unauthorized_frames: Optional[int] = Field(None, ge=0)
     # Graceful-drain windows (#2375 / #2533)
@@ -928,6 +940,10 @@ class GatewayServerSchema(BaseModel):
     # best-effort sends a short plain-text notice on the same channel.
     notify_on_undelivered: Optional[bool] = None
     undelivered_template: Optional[str] = None
+    # Notification policy (#6138): ``{defaults: {...}, recipients: {"<platform>:
+    # <channel_id>": {categories, quiet_hours, timezone, detail}}}`` gating
+    # categorised proactive sends (scheduled results = ``agent_finished``).
+    notifications: Optional[Dict[str, Any]] = None
     # Additive protocol surfaces (#2715), liveness (#2798), health monitor
     api: Optional[Dict[str, Any]] = None
     liveness: Optional[Dict[str, Any]] = None
@@ -942,6 +958,9 @@ class GatewayServerSchema(BaseModel):
     forensics: Optional[Dict[str, Any]] = None
     # Hooks may be nested under ``gateway:`` for grouping
     hooks: Optional[List["HookSchema"]] = None
+    # Outbound lifecycle sinks (#6140): shell commands run on core hook events
+    # (event JSON on stdin) — the config-only counterpart to inbound ``hooks``.
+    hooks_outbound: Optional[List["OutboundHookSchema"]] = None
 
     @field_validator("overflow_policy")
     @classmethod
@@ -951,6 +970,36 @@ class GatewayServerSchema(BaseModel):
                 "overflow_policy must be one of 'reject', 'queue', 'shed_oldest'"
             )
         return v
+
+    @field_validator("notifications")
+    @classmethod
+    def validate_notifications(
+        cls, v: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        # Fail at load on an unknown category/detail or malformed quiet_hours
+        # rather than silently at send time.
+        if v:
+            from ._notifications import NotificationGate
+
+            NotificationGate(v)
+        return v
+
+
+class HookCoalesceSchema(BaseModel):
+    """``hooks[].coalesce`` — mirrors core ``CoalesceConfig`` (#5867)."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    group_key: str = Field(min_length=1)
+    window_seconds: float = Field(default=30.0, gt=0)
+    max_wait_seconds: float = Field(default=300.0, gt=0)
+
+    @model_validator(mode="after")
+    def validate_max_wait(self) -> "HookCoalesceSchema":
+        if not self.group_key.strip():
+            raise ValueError("coalesce.group_key must be a non-empty template")
+        if self.max_wait_seconds < self.window_seconds:
+            raise ValueError("coalesce.max_wait_seconds must be >= window_seconds")
+        return self
 
 
 class HookSchema(BaseModel):
@@ -977,11 +1026,19 @@ class HookSchema(BaseModel):
     signature_header: Optional[str] = None
     signature_algo: str = "sha256"
     signature_prefix: Optional[str] = None
+    # Signature scheme + replay window (#5866)
+    signature_scheme: Literal[
+        "hmac_hex", "hmac_base64", "hmac_timestamped", "structured"
+    ] = "hmac_hex"
+    timestamp_header: Optional[str] = None
+    signature_tolerance_seconds: int = Field(default=300, ge=0)
     # Event-type filtering (#3165)
     events: Optional[List[str]] = None
     event_header: Optional[str] = None
     # No-LLM pass-through delivery (#3165)
     deliver_only: bool = False
+    # Burst coalescing (#5867): {group_key, window_seconds, max_wait_seconds}
+    coalesce: Optional[HookCoalesceSchema] = None
 
     @field_validator("path")
     @classmethod
@@ -1001,8 +1058,28 @@ class HookSchema(BaseModel):
         return v
 
 
-# Resolve the forward reference to ``HookSchema`` in
-# ``GatewayServerSchema.hooks`` now that ``HookSchema`` is defined.
+class OutboundHookSchema(BaseModel):
+    """``gateway.hooks_outbound[]`` — a core ``CommandHook`` on lifecycle events (#6140)."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    command: str = Field(min_length=1)
+    events: List[str] = Field(min_length=1)
+    timeout: float = Field(default=30.0, gt=0)
+
+    @field_validator("events")
+    @classmethod
+    def validate_events(cls, v: List[str]) -> List[str]:
+        from praisonaiagents.hooks.types import HookEvent
+
+        allowed = {e.value for e in HookEvent}
+        bad = [e for e in v if e not in allowed]
+        if bad:
+            raise ValueError(f"Unknown hook event(s): {', '.join(bad)}")
+        return v
+
+
+# Resolve the forward references to ``HookSchema``/``OutboundHookSchema`` in
+# ``GatewayServerSchema`` now that both are defined.
 GatewayServerSchema.model_rebuild()
 
 
@@ -1043,6 +1120,10 @@ class GatewayConfigSchema(BaseModel):
     # Channel configuration
     channels: Dict[str, ChannelConfigSchema] = Field(default_factory=dict)
 
+    # Named sender sets referenced from channel allow/block lists as
+    # ``group:<name>`` (Issue #5775); expanded by the gateway loader.
+    access_groups: Optional[Dict[str, Union[List[str], str]]] = None
+
     # Credential-presence auto-enablement (Issue #4779). When true (default),
     # the gateway auto-registers a channel for any known platform whose
     # credential env var(s) are present and that the user has neither declared
@@ -1072,6 +1153,16 @@ class GatewayConfigSchema(BaseModel):
     # surfaces a warning per invalid entry so the operator sees it.
     schedules: Optional[Dict[str, Dict[str, Any]]] = None
 
+    # Multi-agent conversation rooms (Issue #5768). Each ``rooms.<name>`` entry
+    # (``agents:``/``roster:``, ``max_rounds``, ``max_messages``) is parsed by
+    # core ``RoomConfig.from_dict`` and bound like an agent via ``room:<name>``.
+    rooms: Optional[Dict[str, Dict[str, Any]]] = None
+
+    # Downstream MCP tool servers (Issue #6004). Each ``mcp_servers.<name>``
+    # (``command``/``args``/``env`` or ``url``/``headers``) is opened once as a
+    # shared ``MCP`` client and handed to agents that list ``<name>`` in tools.
+    mcp_servers: Optional[Dict[str, Union[Dict[str, Any], str]]] = None
+
     # Gateway server settings (host/port, drain_timeout, admission control,
     # etc.) and inbound trigger hooks. Kept as dicts/lists on this model so
     # downstream consumers (``gateway/server.py`` reads them via ``.get(...)``)
@@ -1081,6 +1172,22 @@ class GatewayConfigSchema(BaseModel):
     # friendly, field-named error instead of being silently dropped (#3050).
     gateway: Optional[Dict[str, Any]] = None
     hooks: Optional[List[Dict[str, Any]]] = None
+
+    @field_validator("rooms")
+    @classmethod
+    def validate_rooms(
+        cls, v: Optional[Dict[str, Dict[str, Any]]]
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Reject an unbuildable room at load time, naming it (Issue #5768)."""
+        if v:
+            from praisonaiagents.rooms import RoomConfig
+
+            for name, data in v.items():
+                try:
+                    RoomConfig.from_dict(str(name), data or {})
+                except (TypeError, ValueError) as e:
+                    raise ValueError(f"rooms.{name}: {e}") from e
+        return v
 
     @field_validator("unknown_user_policy")
     @classmethod
@@ -1526,6 +1633,8 @@ class GatewayConfigSchema(BaseModel):
         agent_ids = set(self.agents or {})
         if not agent_ids:
             return
+        # Declared rooms are routable as ``room:<name>`` (Issue #5768).
+        agent_ids |= {f"room:{name}" for name in (self.rooms or {})}
 
         import difflib
 

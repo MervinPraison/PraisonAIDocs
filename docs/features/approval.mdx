@@ -29,7 +29,7 @@ agent.start("Remove unused imports in utils.py")
 </Note>
 
 <Warning>
-**Behaviour change (PR #2369):** Dangerous built-in tools (`execute_command`, `kill_process`, `execute_code`, `delete_file`, `move_file`, `copy_file`, and others) are now **gated by default**. Interactive sessions (TTY) ask before running; non-interactive sessions (CI/pipes) deny. Read-only tools are unaffected. See [What counts as dangerous](#what-counts-as-dangerous) below.
+**Behaviour change (PR #2369):** Dangerous built-in tools (`execute_command`, `kill_process`, `execute_code`, `delete_file`, `move_file`, `copy_file`, `github_create_branch`, `github_commit_and_push`, `github_create_pull_request`, and others) are now **gated by default**. Interactive sessions (TTY) ask before running; non-interactive sessions (CI/pipes) deny. Read-only tools are unaffected. See [What counts as dangerous](#what-counts-as-dangerous) below.
 </Warning>
 
 <Note>
@@ -233,11 +233,18 @@ The `DEFAULT_DANGEROUS_TOOLS` set (from `praisonaiagents/approval/registry.py`) 
 | `acp_edit_file` | high | ACP file edits |
 | `acp_delete_file` | high | ACP file deletion |
 | `execute_query` | high | Executes a database query |
+| `github_create_branch` | high | Creates/checks out a local git branch |
+| `github_commit_and_push` | high | Commits tracked changes and pushes to `origin` |
+| `github_create_pull_request` | high | Opens a pull request via `gh pr create` |
 | `evaluate` | medium | Evaluates code expressions |
 | `crawl` | medium | Crawls web URLs |
 | `scrape_page` | medium | Scrapes a web page |
 
 Read-only tools (search, read_file, etc.) are **not** in this set and run without gating.
+
+<Note>
+**Why are the GitHub write tools `high` and not `critical`?** YAML/declarative approve lists are ignored for `critical` tools but honoured at `high`. Keeping the GitHub tools at `high` means a YAML workflow that lists them as approved can still push without a prompt — the same unattended path `praisonai github triage` relies on with `PRAISONAI_AUTO_APPROVE=true`.
+</Note>
 
 ### Doom-loop safety gate
 
@@ -307,7 +314,7 @@ graph TB
     class Block,Preset bad
 ```
 
-The `default` preset specifically blocks: `execute_command`, `kill_process`, `execute_code`, `acp_execute_command`, `delete_file`, `move_file`, `copy_file`, `acp_delete_file`. Write and create operations (`write_file`, `acp_create_file`, `acp_edit_file`) still run — they are blocked only under the `safe` or `read_only` presets.
+The `default` preset specifically blocks: `execute_command`, `kill_process`, `execute_code`, `acp_execute_command`, `delete_file`, `move_file`, `copy_file`, `acp_delete_file`, `github_create_branch`, `github_commit_and_push`, `github_create_pull_request`. Write and create operations (`write_file`, `acp_create_file`, `acp_edit_file`) still run — they are blocked only under the `safe` or `read_only` presets.
 
 ---
 
@@ -341,6 +348,10 @@ graph LR
 |-------|----------------|---------------|
 | Function schema sent to LLM | All tools advertised; denial only at execution | Denied tools removed from the schema |
 | `"You have access to the following tools: …"` in system prompt | All tool names listed | Only allowed tool names listed |
+| [Model-family edit hint](/features/model-harness#what-counts-as-an-edit-tool) | Added even when `edit_file` / `apply_patch` was denied | Omitted when the edit tool is denied |
+| Bridge `tool_search` / `tool_describe` results | Denied tools could be returned | Filtered against the same deny set |
+
+Pruning is re-applied on every call, so changing permissions on a live agent takes effect on the next turn — see [Permissions › Runtime permission updates](/features/permissions#runtime-permission-updates).
 
 ```python
 from praisonaiagents import Agent
@@ -449,7 +460,7 @@ Precedence, from weakest input to strongest:
 | 5 | `approval=ApprovalConfig(permissions={})` | Empty — explicit opt-out is intentional |
 | 6 | `PRAISONAI_TOOL_SAFETY=off` | Empty — full bypass, regardless of config |
 
-The default deny set contains eight tools: `execute_command`, `kill_process`, `execute_code`, `acp_execute_command`, `delete_file`, `move_file`, `copy_file`, `acp_delete_file`.
+The default deny set contains eleven tools: `execute_command`, `kill_process`, `execute_code`, `acp_execute_command`, `delete_file`, `move_file`, `copy_file`, `acp_delete_file`, `github_create_branch`, `github_commit_and_push`, `github_create_pull_request`.
 
 ```python
 from praisonaiagents import Agent
@@ -520,6 +531,15 @@ praisonai code --dangerously-skip-approval
 - **Set env vars** — `PRAISON_APPROVAL_MODE=auto`, `PRAISONAI_TOOL_SAFETY=off` — read by the CLI's own tool wiring.
 - **Register `AutoApproveBackend`** on the approval registry — read by the core `@require_approval` decorator that gates critical tools like `acp_execute_command`. Without this the flag was a no-op for any registry-decorated tool.
 
+Known `PRAISON_APPROVAL_MODE` values for the CLI tool wiring:
+
+- `prompt` — safe default written by `praisonai code --safe`; every HIGH-risk call goes through `@require_approval` (ask on TTY, deny off-TTY).
+- `auto` — full privileges; opt-in via `--no-safe` / `--dangerously-skip-approval`.
+- `manual` — all write operations require approval.
+- `scoped` — safe operations auto-approved; dangerous ones require approval.
+
+Any other non-empty value is logged as a warning and treated as `prompt` (fail-closed). Even in `auto`, `edit_file` / `apply_patch` only get a standing approval when the `edit` group is in the requested tool list — `enable_edit=True` alone is not enough.
+
 Cleanup contract:
 
 - A safe-mode run *removes* the `AutoApproveBackend` a prior `--no-safe` installed in the same process (REPL/worker/test).
@@ -577,6 +597,10 @@ sequenceDiagram
 
 <Note>
 On the console backend, the prompt now offers **five** choices: `[o] once`, `[s] this session`, `[a] always`, `[n] no`, `[d] deny & redirect`. See [Interactive Tool Approval](/docs/features/interactive-approval#scope-choice) for the full scope semantics.
+</Note>
+
+<Note>
+**Per-context approval cache (PR [#5757](https://github.com/MervinPraison/PraisonAI/pull/5757)).** The "already approved in this session" cache is scoped to the [Python context](https://docs.python.org/3/library/contextvars.html) that granted the approval. A grant made inside an `asyncio` task, `asyncio.to_thread(...)` worker, or `copy_context().run(...)` block does not leak into the parent or into sibling workers — each parallel branch asks for its own approval. See [Approval Protocol → Context Isolation](/features/approval-protocol#context-isolation).
 </Note>
 
 ## Standing grants and attached backends
@@ -852,6 +876,10 @@ agents:
         read_file: low
 ```
 
+<Note>
+YAML `approval:` is only honoured on `framework: praisonai`. On `crewai` or `autogen`, an active approval config raises `ValueError` at startup instead of being silently dropped — see [Framework Safety Enforcement](/features/framework-safety-enforcement).
+</Note>
+
 ### Hook installation
 
 Register a `before_tool` hook that enforces the policy:
@@ -1115,6 +1143,38 @@ Prompt once per unique high-risk argument (for example, one prompt per file path
 </Accordion>
 </AccordionGroup>
 
+### Approval cache bounds and cleanup
+
+The cache that remembers granted approvals stays small in long-running processes.
+
+```mermaid
+graph LR
+    W[✍️ Approval write] --> P[🧹 Prune dead agents' keys]
+    P --> C{📏 Over 1,024?}
+    C -->|Yes| D[✂️ Drop oldest]
+    C -->|No| S[✅ Store]
+    D --> S
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class W input
+    class P,D step
+    class C warn
+    class S ok
+```
+
+- **Bounded.** Each context remembers at most **1,024** granted `(scope, tool, args)` approvals. Past that, the oldest exact-args "once" approvals drop out, so a person may be asked again for the same call. No safety rule changes.
+- **Dead agents are pruned.** When an agent is closed or garbage-collected, its keys are removed on the next approval write in that context.
+
+<Note>
+The limit is `ApprovalRegistry._MAX_CONTEXT_APPROVALS` (1024). It is a private known limit, not a tuning parameter.
+</Note>
+
+See [Agent Lifecycle Cleanup](/features/agent-lifecycle-cleanup#garbage-collection-safety) and [MCP Lifecycle](/features/mcp-lifecycle#garbage-collection-safety).
+
 ### Per-agent approval scoping
 
 Approvals granted inside a multi-agent run are scoped to the agent that received them. If a permissive agent and a stricter agent share the same run and both call the same tool with the same arguments, the stricter agent still re-prompts — the permissive agent's approval does not carry over. Calls made outside any agent (e.g. bare `@require_approval` module functions in tests) use a `*` sentinel and never satisfy an agent-scoped lookup.
@@ -1140,7 +1200,7 @@ When `workspace_root` is set, a command touching any path outside it emits a dis
 
 ### Durable, Per-Agent Scoping
 
-On the gateway, "allow always" grants persist across restart and default to being scoped to the approving agent — one agent's approval no longer authorises every other agent. Grants live in a SQLite store at `~/.praisonai/state/gateway/approvals.sqlite` and expire after 90 days by default.
+On the gateway, "allow always" grants persist across restart and default to being scoped to the approving agent — one agent's approval no longer authorises every other agent. Grants live in a SQLite store at `~/.praisonai/state/gateway/approvals.sqlite` and expire after 90 days by default — checked on every request, so a long-running gateway honours the cap without a restart.
 
 The in-process approval registry is now agent-scoped too: an in-context approval for one agent never pre-authorises an identical call from another agent in the same run. See [Per-agent approval scoping](#per-agent-approval-scoping).
 
@@ -1155,6 +1215,8 @@ The in-process approval registry is now agent-scoped too: an in-context approval
 | `PermissionError: Approval request failed for <tool>` | Async agent with console backend, or the backend raised (fail-closed) | Configure a non-console backend — see [Denial guarantees](#denial-guarantees) |
 | `RuntimeError: Tool '<tool>' requires approval but cannot use console I/O from async context.` | Same root cause, surfaced earlier | Same fix |
 | Tool I expected to be called was never tried by the model | Tool name is in the active deny set / preset and is pruned from the LLM's view | Either widen permissions (e.g. `approval="full"`) or change your `permissions` rules; check the agent's `_perm_deny` at runtime |
+| Toggled a deny rule mid-session but the model still saw the tool | Older release cached the already-pruned tool list | Upgrade `praisonai-agents` — pruning now re-runs on every call |
+| Passed `tools=[["edit_file"]]` and the model never called `edit_file` | A nested bare string is dropped by the tool formatter, so the model never receives it (and gets no edit hint) | Flatten to `tools=["edit_file"]`, or pass a full function-schema dict |
 
 ## Best Practices
 
@@ -1201,8 +1263,20 @@ Interactive terminal approval experience
 <Card icon="database" href="/features/durable-approvals">
 Restart-safe pending approvals for bots
 </Card>
+<Card icon="lock" href="/features/permissions">
+Pattern-based permission rules and runtime permission updates
+</Card>
+<Card icon="wand-magic-sparkles" href="/features/model-harness">
+When the model-family edit hint is added — and what hides it
+</Card>
 <Card icon="shield" href="/features/permission-modes">
 Permission modes (plan, accept-edits, bypass)
+</Card>
+<Card icon="broom" href="/features/agent-lifecycle-cleanup">
+Agent cleanup and GC-safe finalizers
+</Card>
+<Card icon="arrows-rotate" href="/features/mcp-lifecycle">
+MCP shutdown and GC-safe finalizers
 </Card>
 <Card icon="computer-mouse" href="/features/computer-use-tools">
 Screen/mouse/keyboard control — canonical per-action approval-callback example

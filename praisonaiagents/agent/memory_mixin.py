@@ -11,7 +11,7 @@ import inspect
 import logging
 import threading
 import contextvars
-from typing import Optional, Dict
+from typing import Any, Awaitable, Callable, Optional, Dict
 
 # Per-turn ownership of appended chat-history messages. Each chat()/achat() turn
 # runs in its own thread (sync) or task (async); both get an isolated copy of
@@ -31,6 +31,7 @@ _active_turn_owned: "contextvars.ContextVar[Optional[list]]" = contextvars.Conte
 # _live_turns_lock because turns on different threads mutate it concurrently.
 _live_turn_owners: "Dict[int, list]" = {}
 _live_turns_lock = threading.Lock()
+_auto_memory_init_lock = threading.Lock()
 
 
 def _register_live_turn(owned: list) -> None:
@@ -54,6 +55,27 @@ def _live_turn_message_ids() -> set:
         ids.update(id(m) for m in owned)
     return ids
 
+
+def _exchange_spans(history: list) -> list:
+    """Split history into ``(start, end)`` units that must stay together.
+
+    An assistant turn carrying ``tool_calls`` and the ``role="tool"`` results
+    that follow it form one unit; every other message is its own unit. History
+    mutators cut/delete on unit boundaries so they never leave an orphaned tool
+    result or a dangling ``tool_calls`` turn, which providers reject (#6217).
+    """
+    spans = []
+    i, n = 0, len(history)
+    while i < n:
+        j = i + 1
+        msg = history[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            while j < n and history[j].get("role") == "tool":
+                j += 1
+        spans.append((i, j))
+        i = j
+    return spans
+
 # Shared lazy display helpers (cached, thread-safe; avoid circular imports)
 from ._lazy_display import _get_console, _get_live, _get_display_functions
 
@@ -71,6 +93,38 @@ if TYPE_CHECKING:
 
 class MemoryMixin:
     """Mixin providing memory methods for the Agent class."""
+
+    @property
+    def _current_run_id(self) -> Optional[str]:
+        state = self._get_db_run_state()
+        return state["run_id"] if state is not None else None
+
+    def _get_db_run_state(self) -> Optional[dict]:
+        run_context = getattr(self, "_db_run_context", None)
+        return run_context.get() if run_context is not None else None
+
+    def _restore_db_run_state(self, state: Optional[dict]) -> None:
+        run_context = getattr(self, "_db_run_context", None)
+        if run_context is not None:
+            run_context.set(state)
+
+    def _mark_db_run_error(self) -> None:
+        state = self._get_db_run_state()
+        if state is not None:
+            state["status"] = "error"
+
+    @_current_run_id.setter
+    def _current_run_id(self, value: Optional[str]) -> None:
+        run_context = getattr(self, "_db_run_context", None)
+        if run_context is None:
+            if value is None:
+                return
+            # Each agent has its own context; concurrent tasks and threads must
+            # not finalize one another's runs. Allocate only for configured DBs.
+            run_context = self.__dict__.setdefault(
+                "_db_run_context", contextvars.ContextVar("praisonai_db_run", default=None)
+            )
+        run_context.set({"run_id": value, "status": None} if value is not None else None)
 
     def _cache_put(self, cache_dict, key, value):
         """Thread-safe LRU cache put operation.
@@ -145,6 +199,11 @@ class MemoryMixin:
             length: Target length for chat history
         """
         with self._history_lock:
+            # Never cut inside a tool exchange: back off to its start (#6217).
+            for start, end in _exchange_spans(self.chat_history):
+                if start < length < end:
+                    length = start
+                    break
             self.chat_history = self.chat_history[:length]
 
     def _begin_turn_tracking(self):
@@ -266,8 +325,14 @@ class MemoryMixin:
             if len(self.chat_history) <= keep_last:
                 return 0
             
-            deleted_count = len(self.chat_history) - keep_last
-            self.chat_history = self.chat_history[-keep_last:]
+            cut = len(self.chat_history) - keep_last
+            # Never start the kept tail inside a tool exchange (#6217).
+            for start, end in _exchange_spans(self.chat_history):
+                if start < cut < end:
+                    cut = end
+                    break
+            deleted_count = cut
+            self.chat_history = self.chat_history[cut:]
             # Reset auto-save index to match new history length
             self._auto_save_last_index = len(self.chat_history)
             return deleted_count
@@ -285,8 +350,17 @@ class MemoryMixin:
             True if deleted, False if index out of range
         """
         with self._history_lock:
+            n = len(self.chat_history)
+            if not -n <= index < n:
+                return False
+            index %= n
+            # Deleting part of a tool exchange removes the whole exchange so no
+            # orphaned tool result / dangling tool_calls is left (#6217).
+            for start, end in _exchange_spans(self.chat_history):
+                if start <= index < end:
+                    break
             try:
-                del self.chat_history[index]
+                del self.chat_history[start:end]
                 # Adjust auto-save index if deletion affects saved range
                 if hasattr(self, '_auto_save_last_index'):
                     self._auto_save_last_index = min(
@@ -311,10 +385,18 @@ class MemoryMixin:
         """
         with self._history_lock:
             original_len = len(self.chat_history)
-            self.chat_history = [
-                msg for msg in self.chat_history
-                if pattern.lower() not in msg.get("content", "").lower()
-            ]
+            needle = pattern.lower()
+            history = self.chat_history
+            kept = []
+            # Match per exchange so a hit inside a tool exchange drops the whole
+            # exchange; content may be None on tool-calling turns (#6217).
+            for start, end in _exchange_spans(history):
+                unit = history[start:end]
+                if not any(
+                    needle in str(m.get("content") or "").lower() for m in unit
+                ):
+                    kept.extend(unit)
+            self.chat_history = kept
             deleted_count = original_len - len(self.chat_history)
             # Adjust auto-save index if deletion affects saved range
             if deleted_count > 0 and hasattr(self, '_auto_save_last_index'):
@@ -372,7 +454,31 @@ class MemoryMixin:
         """Initialize DB session if db adapter is provided (lazy, first chat only)."""
         if self._db is None or self._db_initialized:
             return
-        
+
+        with self._get_db_session_init_lock().sync():
+            if self._db_initialized:
+                return
+            self._ensure_db_session_id()
+            try:
+                history = self._db.on_agent_start(
+                    agent_name=self.name,
+                    session_id=self._session_id,
+                    user_id=self.user_id,
+                    metadata={"role": self.role, "goal": self.goal}
+                )
+                self._restore_db_history(history)
+            except Exception as e:
+                logging.warning(f"Failed to initialize DB session: {e}")
+            self._db_initialized = True
+            self._current_run_id = None
+
+    def _get_db_session_init_lock(self):
+        from .async_safety import DualLock
+
+        return self.__dict__.setdefault("_db_session_init_lock", DualLock())
+
+    def _ensure_db_session_id(self) -> None:
+        """Share session allocation between sync and async adapter callbacks."""
         # Generate session_id if not provided: default to per-hour ID (YYYYMMDDHH-agentname)
         # Protected by history lock to prevent race condition between concurrent chat() calls
         if self._session_id is None:
@@ -398,42 +504,57 @@ class MemoryMixin:
                         agent_hash = hashlib.sha256((self.name or "agent").encode()).hexdigest()[:6]
                         # per-instance suffix so same-named agents can never collide
                         self._session_id = f"{hour_str}-{agent_hash}-{uuid.uuid4().hex[:8]}"
-        
-        # Call db adapter's on_agent_start to get previous messages
-        try:
-            history = self._db.on_agent_start(
-                agent_name=self.name,
-                session_id=self._session_id,
-                user_id=self.user_id,
-                metadata={"role": self.role, "goal": self.goal}
-            )
-            
-            # Restore chat history from previous session. Rebuild the full LLM
-            # message shape so a resumed tool-using session hands the model the
-            # same transcript it saw before — assistant turns keep their
-            # ``tool_calls`` and tool-result turns keep their ``tool_call_id``
-            # (Issue #3089 parity for the DB path). Plain turns stay minimal.
-            if history:
-                for msg in history:
-                    entry = {"role": msg.role, "content": msg.content}
-                    tool_calls = getattr(msg, "tool_calls", None)
-                    if tool_calls:
-                        # ``DbMessage.tool_calls`` may arrive as provider-shaped
-                        # dicts (OpenAI format, the way _persist_message stores
-                        # them) or as ``DbToolCall`` dataclasses from an adapter
-                        # that follows the declared field type. Normalise to the
-                        # provider shape so the next model request always gets a
-                        # valid, serialisable tool-call list (Issue #5075).
-                        entry["tool_calls"] = self._normalize_restored_tool_calls(tool_calls)
-                    if getattr(msg, "tool_call_id", None):
-                        entry["tool_call_id"] = msg.tool_call_id
-                    self.chat_history.append(entry)
-                logging.info(f"Resumed session {self._session_id} with {len(history)} messages")
-        except Exception as e:
-            logging.warning(f"Failed to initialize DB session: {e}")
-        
-        self._db_initialized = True
-        self._current_run_id = None  # Track current run
+
+    def _restore_db_history(self, history) -> None:
+        # Restore chat history from previous session. Rebuild the full LLM
+        # message shape so a resumed tool-using session hands the model the
+        # same transcript it saw before — assistant turns keep their
+        # ``tool_calls`` and tool-result turns keep their ``tool_call_id``
+        # (Issue #3089 parity for the DB path). Plain turns stay minimal.
+        if history:
+            for msg in history:
+                entry = {"role": msg.role, "content": msg.content}
+                tool_calls = getattr(msg, "tool_calls", None)
+                if tool_calls:
+                    # ``DbMessage.tool_calls`` may arrive as provider-shaped
+                    # dicts (OpenAI format, the way _persist_message stores
+                    # them) or as ``DbToolCall`` dataclasses from an adapter
+                    # that follows the declared field type. Normalise to the
+                    # provider shape so the next model request always gets a
+                    # valid, serialisable tool-call list (Issue #5075).
+                    entry["tool_calls"] = self._normalize_restored_tool_calls(tool_calls)
+                if getattr(msg, "tool_call_id", None):
+                    entry["tool_call_id"] = msg.tool_call_id
+                self.chat_history.append(entry)
+            logging.info(f"Resumed session {self._session_id} with {len(history)} messages")
+
+    def _async_db_hook(self, name: str) -> Optional[Callable[..., Awaitable[Any]]]:
+        """Use adapter-provided async hooks without changing sync-only adapters."""
+        callback = getattr(self._db, f"a{name}", None)
+        return callback if inspect.iscoroutinefunction(callback) else None
+
+    async def _ainit_db_session(self) -> None:
+        """Await session reads when the adapter supplies an async callback."""
+        if self._db is None or self._db_initialized:
+            return
+        callback = self._async_db_hook("on_agent_start")
+        if callback is None:
+            self._init_db_session()
+            return
+        async with self._get_db_session_init_lock().async_lock():
+            if self._db_initialized:
+                return
+            self._ensure_db_session_id()
+            try:
+                history = await callback(
+                    agent_name=self.name, session_id=self._session_id,
+                    user_id=self.user_id, metadata={"role": self.role, "goal": self.goal},
+                )
+                self._restore_db_history(history)
+            except Exception as exc:
+                logging.warning(f"Failed to initialize DB session: {exc}")
+                return
+            self._db_initialized = True
 
     @staticmethod
     def _normalize_restored_tool_calls(tool_calls):
@@ -497,11 +618,10 @@ class MemoryMixin:
             if history:
                 # Only restore if chat_history is empty (avoid duplicates)
                 if not self.chat_history:
+                    # The store returns LLM-shaped dicts (to_llm_message), so
+                    # keep tool_calls / tool_call_id intact (#6217).
                     for msg in history:
-                        self.chat_history.append({
-                            "role": msg["role"],
-                            "content": msg["content"]
-                        })
+                        self.chat_history.append(dict(msg))
                     logging.info(f"Restored session {self._session_id} with {len(history)} messages from JSON store")
             
             # Set agent info
@@ -516,44 +636,97 @@ class MemoryMixin:
         
         self._session_store_initialized = True
 
+    def _prepare_db_run(self, input_content: str) -> dict:
+        import uuid
+
+        self._current_run_id = f"run-{uuid.uuid4().hex[:12]}"
+        return {
+            "session_id": self._session_id,
+            "run_id": self._current_run_id,
+            "input_content": input_content,
+            "metadata": {"agent_name": self.name},
+        }
+
     def _start_run(self, input_content: str):
         """Start a new run (turn) for persistence tracking."""
         if self._db is None:
             return
-        
-        import uuid
-        self._current_run_id = f"run-{uuid.uuid4().hex[:12]}"
-        
+        kwargs = self._prepare_db_run(input_content)
         try:
-            if hasattr(self._db, 'on_run_start'):
-                self._db.on_run_start(
-                    session_id=self._session_id,
-                    run_id=self._current_run_id,
-                    input_content=input_content,
-                    metadata={"agent_name": self.name}
-                )
-        except Exception as e:
-            logging.warning(f"Failed to start run: {e}")
+            if hasattr(self._db, "on_run_start"):
+                self._db.on_run_start(**kwargs)
+        except Exception as exc:
+            logging.warning(f"Failed to start run: {exc}")
+
+    async def _astart_run(self, input_content: str) -> None:
+        callback = self._async_db_hook("on_run_start")
+        if callback is None:
+            self._start_run(input_content)
+            return
+        kwargs = self._prepare_db_run(input_content)
+        try:
+            await callback(**kwargs)
+        except Exception as exc:
+            logging.warning(f"Failed to start run: {exc}")
+
+    def _db_run_end_kwargs(self, output_content, status, metrics) -> Optional[dict]:
+        if self._db is None or self._current_run_id is None:
+            return None
+        state = self._get_db_run_state()
+        if status == "completed" and state is not None and state.get("status") == "error":
+            status = "error"
+        return {
+            "session_id": self._session_id,
+            "run_id": self._current_run_id,
+            "output_content": output_content,
+            "status": status,
+            "metrics": metrics or {},
+            "metadata": {"agent_name": self.name},
+        }
 
     def _end_run(self, output_content: str, status: str = "completed", metrics: dict = None):
         """End the current run (turn)."""
-        if self._db is None or self._current_run_id is None:
+        kwargs = self._db_run_end_kwargs(output_content, status, metrics)
+        if kwargs is None:
             return
-        
         try:
-            if hasattr(self._db, 'on_run_end'):
-                self._db.on_run_end(
-                    session_id=self._session_id,
-                    run_id=self._current_run_id,
-                    output_content=output_content,
-                    status=status,
-                    metrics=metrics or {},
-                    metadata={"agent_name": self.name}
-                )
-        except Exception as e:
-            logging.warning(f"Failed to end run: {e}")
-        
-        self._current_run_id = None
+            if hasattr(self._db, "on_run_end"):
+                self._db.on_run_end(**kwargs)
+        except Exception as exc:
+            logging.warning(f"Failed to end run: {exc}")
+        finally:
+            self._current_run_id = None
+
+    async def _aend_run(self, output_content: Optional[str], status: str = "completed", metrics: Optional[dict] = None) -> None:
+        callback = self._async_db_hook("on_run_end")
+        if callback is None:
+            self._end_run(output_content, status, metrics)
+            return
+        kwargs = self._db_run_end_kwargs(output_content, status, metrics)
+        if kwargs is None:
+            return
+        import asyncio
+
+        async def save():
+            try:
+                await callback(**kwargs)
+            except Exception as exc:
+                logging.warning(f"Failed to end run: {exc}")
+
+        pending = asyncio.create_task(save())
+        try:
+            await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # Finish the terminal write before propagating caller cancellation.
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    continue
+            pending.result()
+            raise
+        finally:
+            self._current_run_id = None
 
     def _persist_message(
         self,
@@ -659,7 +832,85 @@ class MemoryMixin:
             self._persist_message, role, content, tool_calls, tool_call_id
         )
 
-    def _add_message_with_tool_fields(self, role, content, **tool_fields):
+    def _persist_assistant_delta(self, content: str, *, force: bool = False) -> None:
+        """Persist the in-progress streamed assistant turn (Issue #5407).
+
+        Streamed output is only persisted after a turn completes, so an
+        interrupt mid-generation loses the whole partial turn. This flushes the
+        latest partial text to the session store via
+        ``upsert_partial_assistant_message`` so the store always reflects the
+        current turn. Writes are debounced (time-based) so per-token streaming
+        does not hammer the disk; ``force=True`` bypasses the debounce.
+
+        Degrades to a no-op when the store does not support partial upserts
+        (the terminal :meth:`_persist_message` write then preserves existing
+        per-turn behaviour).
+        """
+        store = getattr(self, "_session_store", None)
+        session_id = getattr(self, "_session_id", None)
+        if store is None or session_id is None:
+            return
+        upsert = getattr(store, "upsert_partial_assistant_message", None)
+        if upsert is None:
+            return
+        if not force:
+            import time as _time
+            now = _time.monotonic()
+            last = getattr(self, "_partial_persist_last", 0.0)
+            # ~5 writes/sec ceiling keeps disk I/O bounded for long turns.
+            if now - last < 0.2:
+                return
+            self._partial_persist_last = now
+        try:
+            upsert(session_id, content)
+        except Exception as e:
+            logging.debug(f"Partial assistant persist skipped: {e}")
+
+    def _finalize_assistant_turn(self, content: str) -> None:
+        """Finalize the streamed assistant turn, promoting the partial record.
+
+        Clears the partial flag on the trailing assistant message so resume
+        sees a normal completed turn. When the store has no partial-upsert
+        support this falls back to :meth:`_persist_message` so the assistant
+        turn is still persisted once at the end (backward compatible).
+        """
+        store = getattr(self, "_session_store", None)
+        session_id = getattr(self, "_session_id", None)
+        self._partial_persist_last = 0.0
+        if store is not None and session_id is not None:
+            upsert = getattr(store, "upsert_partial_assistant_message", None)
+            if upsert is not None:
+                try:
+                    upsert(session_id, content, finalize=True)
+                    self._persist_session_stats()
+                    return
+                except Exception as e:
+                    logging.debug(f"Finalize assistant turn skipped: {e}")
+        # Fallback: no partial support — persist once terminally.
+        if content:
+            self._persist_message("assistant", content)
+
+    def _discard_partial_assistant_turn(self) -> None:
+        """Drop any in-progress partial assistant record for this session.
+
+        Used when the authoritative assistant turn is persisted through another
+        path (e.g. a streamed tool-call turn) so a stale partial does not linger
+        in the store (Issue #5407). No-op for stores without partial support.
+        """
+        store = getattr(self, "_session_store", None)
+        session_id = getattr(self, "_session_id", None)
+        self._partial_persist_last = 0.0
+        if store is None or session_id is None:
+            return
+        discard = getattr(store, "discard_partial_assistant_message", None)
+        if discard is None:
+            return
+        try:
+            discard(session_id)
+        except Exception as e:
+            logging.debug(f"Discard partial assistant turn skipped: {e}")
+
+    def _add_message_with_tool_fields(self, role, content, session_id=None, **tool_fields):
         """Add a message carrying tool fields, tolerating stores without them.
 
         The default JSON store and the SQLite store accept ``tool_calls`` /
@@ -671,11 +922,13 @@ class MemoryMixin:
         back to a plain-text turn so no exchange is silently lost.
         """
         add_message = self._session_store.add_message
-        if self._store_supports_tool_fields(add_message):
-            add_message(self._session_id, role, content, **tool_fields)
+        if session_id is None:
+            session_id = self._session_id
+        if tool_fields and self._store_supports_tool_fields(add_message):
+            add_message(session_id, role, content, **tool_fields)
             return
         # Legacy store: preserve the turn as plain text so resume still sees it.
-        add_message(self._session_id, role, content)
+        add_message(session_id, role, content)
 
     def _store_supports_tool_fields(self, add_message) -> bool:
         """Return True if ``add_message`` accepts the tool keyword fields."""
@@ -751,12 +1004,13 @@ class MemoryMixin:
         try:
             from ..memory.auto_memory import AutoMemory
             # Lazy-create AutoMemory wrapper on first use
-            if not hasattr(self, '_auto_memory_instance') or self._auto_memory_instance is None:
-                self._auto_memory_instance = AutoMemory(
-                    self._memory_instance,
-                    enabled=True,
-                    verbose=1 if getattr(self, 'verbose', False) else 0
-                )
+            with _auto_memory_init_lock:
+                if not hasattr(self, '_auto_memory_instance') or self._auto_memory_instance is None:
+                    self._auto_memory_instance = AutoMemory(
+                        self._memory_instance,
+                        enabled=True,
+                        verbose=1 if getattr(self, 'verbose', False) else 0
+                    )
             self._auto_memory_instance.process_interaction(
                 user_message=str(user_message),
                 assistant_response=str(assistant_response),
@@ -767,10 +1021,18 @@ class MemoryMixin:
     def _persist_memory_turn(self, user_message: str, assistant_response: str):
         """Persist a raw conversation turn to the memory store.
 
-        Called after each response when ``_memory_instance`` is set but
-        ``auto_memory`` extraction is off. Stores the turn to short-term memory
-        so a later Agent sharing the same store (e.g. ``memory={"user_id": uid}``)
-        recalls it via ``get_memory_context()``. Best-effort: never raises.
+        Called after each response when ``_memory_instance`` is set. Stores the
+        turn so a later Agent sharing the same store (e.g. a second ``Agent``
+        with the same ``user_id``) recalls it. Best-effort: never raises.
+
+        The turn is written to **long-term** memory because turn-start prefetch
+        (``_prefetch_memory``) queries ``search_long_term``; a short-term-only
+        write was invisible to prefetch, so cross-instance recall returned empty
+        (issue #5667). ``user_id`` is stamped into the record metadata so the
+        prefetch scope filter — which post-filters on ``metadata.user_id`` —
+        matches records written here (they otherwise carry no ``user_id`` and
+        were silently dropped). A short-term copy is kept so the inline
+        ``get_memory_context()`` path still sees the turn.
 
         Async-safe: a memory store write is blocking file/DB I/O. When this runs
         inside a live event loop (the async ``achat``/``astart`` after-agent path),
@@ -780,17 +1042,41 @@ class MemoryMixin:
         memory = getattr(self, "_memory_instance", None)
         if memory is None or not assistant_response:
             return
-        store = getattr(memory, "store_short_term", None) or getattr(memory, "add_short_term", None)
-        if store is None:
+        long_store = getattr(memory, "store_long_term", None) or getattr(memory, "add_long_term", None)
+        short_store = getattr(memory, "store_short_term", None) or getattr(memory, "add_short_term", None)
+        if long_store is None and short_store is None:
             return
         text = f"User: {user_message}\nAssistant: {assistant_response}"
         metadata = {"agent_id": getattr(self, "agent_id", getattr(self, "name", None))}
+        # Stamp the scoping identity so turn-start prefetch can find this record
+        # on a different Agent instance. Prefetch (_memory_prefetch_scope) sends
+        # user_id AND, when configured, a session_id metadata_filter; both are
+        # post-filtered against record metadata by Memory.search_long_term, so a
+        # turn missing either key is silently dropped on recall.
+        config = getattr(self, "_memory_config", None)
+        user_id = getattr(config, "user_id", None)
+        if user_id:
+            metadata["user_id"] = user_id
+        session_id = getattr(config, "session_id", None)
+        if session_id:
+            metadata["session_id"] = session_id
 
         def _do_store():
-            try:
-                store(text, metadata=metadata)
-            except Exception as e:
-                logging.debug(f"Memory turn persistence failed: {e}")
+            # Write each tier under its own guard. The two tiers are independent
+            # stores; a long-term failure (e.g. a locked DB) must not skip the
+            # short-term copy that powers the inline get_memory_context() path,
+            # and vice versa. Sharing one try would have removed the existing
+            # short-term fallback the moment durable recall was added.
+            if long_store is not None:
+                try:
+                    long_store(text, metadata=metadata)
+                except Exception as e:
+                    logging.debug(f"Long-term memory turn persistence failed: {e}")
+            if short_store is not None:
+                try:
+                    short_store(text, metadata=metadata)
+                except Exception as e:
+                    logging.debug(f"Short-term memory turn persistence failed: {e}")
 
         try:
             import asyncio
@@ -959,10 +1245,17 @@ class MemoryMixin:
                 if self._session_store is not None:
                     # Persist only NEW messages to SessionStore
                     for msg in new_messages:
-                        self._session_store.add_message(
-                            self.auto_save,  # Use auto_save name as session_id
-                            role=msg.get("role", "user"),
-                            content=msg.get("content", ""),
+                        tool_fields = {
+                            k: msg[k]
+                            for k in ("tool_calls", "tool_call_id")
+                            if msg.get(k) is not None
+                        }
+                        # Persist tool fields so resumed tool turns stay valid (#6217)
+                        self._add_message_with_tool_fields(
+                            msg.get("role", "user"),
+                            msg.get("content") or "",
+                            session_id=self.auto_save,
+                            **tool_fields,
                         )
                     # Update last saved index
                     self._auto_save_last_index = len(clean_history)
@@ -992,36 +1285,19 @@ class MemoryMixin:
             return False
         
         try:
-            import os
-            from praisonaiagents.tools.path_safety import resolve_within_root
+            from ..utils.output_file import write_output_file
 
-            project_root = os.environ.get("PRAISONAI_PROJECT_ROOT") or os.getcwd()
-            file_path = resolve_within_root(self._output_file, project_root)
+            # Shared hardened writer (root containment, O_NOFOLLOW, hardlink-safe).
+            file_path = write_output_file(self._output_file, str(content))
             if file_path is None:
-                logging.warning(
-                    "Output file %r is outside project root %r; skipping save",
-                    self._output_file,
-                    project_root,
-                )
                 print(f"⚠️ Output path outside project root: {self._output_file}")
                 return False
-            
-            # Create parent directories if they don't exist
-            parent_dir = os.path.dirname(file_path)
-            if parent_dir and not os.path.exists(parent_dir):
-                os.makedirs(parent_dir, exist_ok=True)
-            
-            # Write content to file
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(str(content))
-            
-            # Print success message to terminal
+
             print(f"✅ Output saved to {file_path}")
             logging.debug(f"Output saved to file: {file_path}")
             return True
-            
+
         except Exception as e:
             logging.warning(f"Failed to save output to file '{self._output_file}': {e}")
             print(f"⚠️ Failed to save output to {self._output_file}: {e}")
             return False
-

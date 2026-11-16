@@ -14,7 +14,8 @@ from typing import Optional
 
 @click.command("app")
 @click.option("--port", "-p", type=int, default=8000, help="Port to listen on")
-@click.option("--host", "-h", type=str, default="0.0.0.0", help="Host to bind to")
+@click.option("--host", "-h", type=str, default="127.0.0.1",
+              help="Host to bind to (pass 0.0.0.0 to expose; requires an API key)")
 @click.option("--config", "-c", type=click.Path(exists=True), help="Path to config file (YAML)")
 @click.option("--reload", "-r", is_flag=True, help="Enable auto-reload for development")
 @click.option("--debug", "-d", is_flag=True, help="Enable debug mode")
@@ -78,7 +79,11 @@ def app_command(
     if agents:
         console.print(f"[dim]Agents: {len(agents)}[/dim]")
     if reload:
-        console.print("[yellow]Auto-reload enabled (development mode)[/yellow]")
+        console.print(
+            "[yellow]--reload requested; note auto-reload is not supported for a "
+            "programmatically-built AgentOS (the reload worker runs in a separate "
+            "process). Serving without reload.[/yellow]"
+        )
     console.print()
     
     try:

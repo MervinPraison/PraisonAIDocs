@@ -44,6 +44,7 @@ import logging
 from praisonaiagents._logging import get_logger
 import subprocess
 from pathlib import Path
+from ..utils.safe_path import safe_child
 from typing import Any, Dict, List, Optional, Literal, Callable
 from dataclasses import dataclass, field
 
@@ -156,7 +157,7 @@ class RulesManager:
     MAX_RULE_CHARS = 12000
     
     # Import pattern for @path/to/file syntax
-    IMPORT_PATTERN = re.compile(r'(?<!`)@([\w./-]+)(?!`)')
+    IMPORT_PATTERN = re.compile(r'(?<!`)@((?:~/)?[\w./-]+)(?!`)')
     
     def __init__(
         self,
@@ -181,6 +182,7 @@ class RulesManager:
         self.verbose = verbose
         
         self._rules: Dict[str, Rule] = {}
+        self._extra_rule_files: List[str] = []
         self._load_all_rules()
     
     def _log(self, msg: str, level: int = logging.INFO):
@@ -193,7 +195,8 @@ class RulesManager:
         Find the git repository root from a starting path.
         
         Uses pure Python (no gitpython dependency) for performance.
-        Falls back to subprocess if needed.
+        Worktrees and submodules are covered by the walk-up (their ``.git``
+        is a file). ``git`` is only invoked when GIT_DIR/GIT_WORK_TREE is set.
         
         Args:
             start_path: Starting path (defaults to workspace_path)
@@ -211,7 +214,10 @@ class RulesManager:
                 return current
             current = current.parent
         
-        # Method 2: Fallback to git command (handles edge cases like worktrees)
+        # Method 2: Only GIT_DIR/GIT_WORK_TREE can locate a repo without a
+        # .git on disk; otherwise rev-parse would fail too (~9 ms per agent).
+        if not (os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE")):
+            return None
         try:
             result = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"],
@@ -299,38 +305,54 @@ class RulesManager:
         frontmatter = {}
         body = content
         
-        # Check for YAML frontmatter (--- ... ---)
-        if content.startswith("---"):
-            parts = content.split("---", 2)
-            if len(parts) >= 3:
-                yaml_content = parts[1].strip()
-                body = parts[2].strip()
-                
-                # Simple YAML parsing (avoid dependency)
-                for line in yaml_content.split("\n"):
-                    line = line.strip()
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        key = key.strip()
-                        value = value.strip()
-                        
-                        # Handle lists
-                        if value.startswith("[") and value.endswith("]"):
-                            # Parse simple list: ["*.py", "*.pyx"]
-                            value = [v.strip().strip('"\'') for v in value[1:-1].split(",") if v.strip()]
-                        # Handle booleans
-                        elif value.lower() in ("true", "false"):
-                            value = value.lower() == "true"
-                        # Handle numbers
-                        elif value.isdigit():
-                            value = int(value)
-                        # Handle quoted strings
-                        elif value.startswith('"') and value.endswith('"'):
-                            value = value[1:-1]
-                        elif value.startswith("'") and value.endswith("'"):
-                            value = value[1:-1]
-                        
-                        frontmatter[key] = value
+        # Delimiters are complete lines, not substrings in metadata values.
+        lines = content.splitlines(keepends=True)
+        if lines and lines[0].rstrip("\r\n \t") == "---":
+            import yaml
+
+            for end in range(1, len(lines)):
+                if lines[end].rstrip("\r\n \t") != "---":
+                    continue
+                # Invalid metadata retains text for explicit use, not automatic selection.
+                frontmatter = {"activation": "manual"}
+                try:
+                    yaml_content = "".join(lines[1:end])
+                    loader = yaml.SafeLoader(yaml_content)
+                    try:
+                        node = loader.get_single_node()
+                        if isinstance(node, yaml.MappingNode):
+                            loader.flatten_mapping(node)
+                            for key, value in node.value:
+                                # These schema fields preserve scalar spellings,
+                                # including leading zeroes and numeric filenames.
+                                if (key.value == "priority" and isinstance(value, yaml.ScalarNode)
+                                        and re.fullmatch(r"[+-]?[0-9]+", value.value)):
+                                    value.tag = "tag:yaml.org,2002:str"
+                                elif key.value == "globs" and isinstance(value, yaml.SequenceNode):
+                                    for item in value.value:
+                                        if isinstance(item, yaml.ScalarNode):
+                                            item.tag = "tag:yaml.org,2002:str"
+                        parsed = loader.construct_document(node) if node is not None else {}
+                    finally:
+                        loader.dispose()
+                    if isinstance(parsed, dict):
+                        if "priority" in parsed:
+                            priority = parsed["priority"]
+                            if isinstance(priority, str) and re.fullmatch(r"[+-]?[0-9]+", priority):
+                                parsed["priority"] = int(priority, 10)
+                            elif type(priority) is not int:
+                                raise ValueError("Rule priority must be an integer")
+                        if "globs" in parsed:
+                            globs = parsed["globs"]
+                            if not isinstance(globs, list) or not all(isinstance(item, str) for item in globs):
+                                raise ValueError("Rule globs must be a list of scalar patterns")
+                            parsed["globs"] = globs
+                        frontmatter = parsed
+                        body = "".join(lines[end + 1:]).strip()
+                except (yaml.YAMLError, ValueError):
+                    # Preserve the original instruction text when metadata is invalid.
+                    pass
+                break
         
         return frontmatter, body
     
@@ -443,6 +465,7 @@ class RulesManager:
     def _load_all_rules(self):
         """Load rules from all sources including git root and additional directories."""
         self._rules = {}
+        self._explicit_rule_keys = set()
         
         # Find git root for monorepo support
         git_root = self._find_git_root()
@@ -493,9 +516,13 @@ class RulesManager:
                     dir_prefix = rules_dir_name.split("/")[0].strip(".")
                     self._rules[f"gitroot_{dir_prefix}:{rule.name}"] = rule
         
-        # 6. Load subdirectory rules (walk up from cwd to workspace/git root)
-        stop_at = git_root if git_root else self.workspace_path
-        current = Path.cwd()
+        # 6. Load subdirectory rules (walk up from cwd to workspace/git root).
+        # Skipped when cwd is outside that tree, so ancestors such as the
+        # user's home directory are never scanned.
+        stop_at = (git_root if git_root else self.workspace_path).resolve()
+        current = Path.cwd().resolve()
+        if not current.is_relative_to(stop_at):
+            current = stop_at
         while current != stop_at and current != current.parent:
             # Check .praisonai/rules/
             subdir_rules_dir = current / self.RULES_DIR_NAME.replace("/", os.sep)
@@ -515,6 +542,9 @@ class RulesManager:
             
             current = current.parent
         
+        for path in self._extra_rule_files:
+            self._load_extra_rule_file(path)
+
         self._log(f"Loaded {len(self._rules)} rules total")
     
     def add_rule_file(self, path: str) -> int:
@@ -532,6 +562,14 @@ class RulesManager:
         Returns:
             Number of rule files successfully added.
         """
+        path = str(path)
+        if path in self._extra_rule_files:
+            self._extra_rule_files.remove(path)
+        self._extra_rule_files.append(path)
+        return self._load_extra_rule_file(path)
+
+    def _load_extra_rule_file(self, path: str) -> int:
+        """Load the current matches for a registered instruction file or glob."""
         candidate = Path(path)
         if candidate.is_absolute():
             matches = [candidate] if candidate.exists() else list(
@@ -543,13 +581,31 @@ class RulesManager:
                 matches = list(self.workspace_path.glob(path))
 
         added = 0
-        for file_path in matches:
+        for file_path in sorted(matches, key=str):
             if not file_path.is_file():
                 continue
             rule = self._load_root_instruction_file(file_path)
             if rule:
                 rule.priority = rule.priority + 200  # Explicit files win
-                self._rules[f"extra:{rule.name}"] = rule
+                source = os.path.normcase(str(file_path.resolve()))
+                # Explicit registration replaces any auto-discovered or previous
+                # copy of this file, but keeps distinct files with the same name.
+                duplicates = [
+                    key for key, existing in self._rules.items()
+                    if existing.file_path
+                    and os.path.normcase(str(Path(existing.file_path).resolve())) == source
+                ]
+                # Keep a discovered scope key so public name lookup/deletion
+                # still addresses this file, without retaining a second copy.
+                storage_key = next(
+                    (key for key in duplicates if not key.startswith("extra:")),
+                    f"extra:{source}",
+                )
+                for key in duplicates:
+                    del self._rules[key]
+                    self._explicit_rule_keys.discard(key)
+                self._rules[storage_key] = rule
+                self._explicit_rule_keys.add(storage_key)
                 added += 1
         self._log(f"Added {added} extra rule file(s) from '{path}'")
         return added
@@ -596,8 +652,13 @@ class RulesManager:
     
     def get_rule_by_name(self, name: str) -> Optional[Rule]:
         """Get a rule by name (for manual @mention invocation)."""
+        # Registration precedence is independent of the retained deletion scope.
+        for key, rule in reversed(list(self._rules.items())):
+            if key in self._explicit_rule_keys and rule.name == name:
+                return rule
+
         # Check all scopes
-        for scope in ["subdir", "workspace", "global"]:
+        for scope in ["subdir", "workspace", "global", "root"]:
             key = f"{scope}:{name}"
             if key in self._rules:
                 return self._rules[key]
@@ -662,14 +723,18 @@ class RulesManager:
             
             section = f"{header}\n{rule_text}\n"
             
-            if total_chars + len(section) <= max_chars:
+            separator_chars = 1 if parts else 0
+            remaining = max_chars - total_chars - separator_chars
+            if len(section) <= remaining:
                 parts.append(section)
-                total_chars += len(section)
+                total_chars += separator_chars + len(section)
             else:
-                # Truncate last rule
-                remaining = max_chars - total_chars
-                if remaining > 100:
-                    parts.append(section[:remaining] + "\n... (truncated)")
+                # Preserve the complete header and truncation notice.
+                marker = "\n... (truncated)"
+                prefix = f"{header}\n"
+                body_budget = remaining - len(prefix) - len(marker)
+                if body_budget > 0:
+                    parts.append(prefix + rule_text[:body_budget] + marker)
                 break
         
         return "\n".join(parts)
@@ -684,7 +749,7 @@ class RulesManager:
 
         Only rules with ``activation == "glob"`` are considered; ``always``
         rules are handled up front by the system-prompt builder. Results are
-        deduplicated by rule name and any name in ``exclude_names`` is skipped
+        deduplicated by file identity and any name in ``exclude_names`` is skipped
         so already-injected rules are not emitted twice.
 
         Args:
@@ -700,11 +765,15 @@ class RulesManager:
         for rule in self._rules.values():
             if rule.activation != "glob":
                 continue
-            if rule.name in exclude or rule.name in seen:
+            identity = (
+                os.path.normcase(str(Path(rule.file_path).resolve()))
+                if rule.file_path else rule.name
+            )
+            if rule.name in exclude or identity in seen:
                 continue
             if any(rule.matches_file(fp) for fp in file_paths):
                 matched.append(rule)
-                seen.add(rule.name)
+                seen.add(identity)
         matched.sort(key=lambda r: r.priority, reverse=True)
         return matched
 
@@ -744,23 +813,23 @@ class RulesManager:
             rules_dir = self.workspace_path / self.RULES_DIR_NAME.replace("/", os.sep)
         
         rules_dir.mkdir(parents=True, exist_ok=True)
-        file_path = rules_dir / f"{name}.md"
+        file_path = safe_child(rules_dir, name, ".md")
         
         # Build frontmatter
-        frontmatter_lines = ["---"]
+        import yaml
+
+        metadata = {"activation": activation}
         if description:
-            frontmatter_lines.append(f'description: "{description}"')
+            metadata["description"] = description
         if globs:
-            globs_str = ", ".join(f'"{g}"' for g in globs)
-            frontmatter_lines.append(f"globs: [{globs_str}]")
-        frontmatter_lines.append(f"activation: {activation}")
+            metadata["globs"] = globs
         if priority != 0:
-            frontmatter_lines.append(f"priority: {priority}")
-        frontmatter_lines.append("---")
-        frontmatter_lines.append("")
+            metadata["priority"] = priority
         
         # Write file
-        full_content = "\n".join(frontmatter_lines) + content
+        full_content = "---\n" + yaml.safe_dump(
+            metadata, sort_keys=False, allow_unicode=False
+        ) + "---\n" + content
         file_path.write_text(full_content, encoding="utf-8")
         
         # Create and register rule
@@ -811,6 +880,7 @@ class RulesManager:
         try:
             Path(rule.file_path).unlink()
             del self._rules[key]
+            self._explicit_rule_keys.discard(key)
             self._log(f"Deleted rule '{name}'")
             return True
         except Exception as e:

@@ -34,6 +34,18 @@ _debug_initialized = False
 # Sentinel marking a failed registry build so it is not retried every command.
 _REGISTRY_FAILED = object()
 
+
+def _definitions_fingerprint(workspace=None):
+    """Fingerprint of rules/definition files, or ``None`` when unavailable."""
+    try:
+        from praisonai_code.cli.features.custom_definitions import (
+            definitions_fingerprint,
+        )
+
+        return definitions_fingerprint(workspace)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
 def _init_debug_logging():
     """Initialize debug logging to file. Only called when debug mode is enabled."""
     global _debug_initialized
@@ -367,6 +379,7 @@ class AsyncTUI:
         self._running = False
         self._agent = None
         self._review_agent = None  # Cached read-only agent for review commands
+        self._definitions_fingerprint = _definitions_fingerprint(self.config.workspace)
         self._interrupt_controller = None  # Cooperative cancellation for in-flight turns
         self._interrupt_worker = None  # Tracks an in-flight/abandoned turn worker
         self._processing = False
@@ -387,8 +400,6 @@ class AsyncTUI:
         # wired to that session's store + prior turns for real conversational
         # continuity — not just display-only scrollback (Issue #4910).
         self._resume_session_id: Optional[str] = None
-        self._total_tokens = 0
-        self._total_cost = 0.0
         self._workspace_files: List[str] = []  # Files in workspace for @ completion
         self._runtime = None  # InteractiveRuntime for ACP/LSP
         self._runtime_started = False
@@ -545,33 +556,31 @@ class AsyncTUI:
             self.messages.append(ChatMessage(role="system", content="Failed to revert."))
 
     def _process_file_mentions(self, prompt: str) -> str:
-        """Process @file mentions and include file contents."""
+        """Process @file mentions and include file contents.
+
+        Delegates to the shared core ``MentionsParser`` so this interactive
+        surface, ``praisonai run``, YAML and Python all expand ``@file``
+        references identically (and share the same workspace-containment and
+        path-traversal gates). The private regex this used to carry drifted
+        from the non-interactive path — the parser is the single source now.
+        """
         import os
-        import re
-        
+
         workspace = self.config.workspace or os.getcwd()
-        
-        # Find all @file mentions
-        pattern = r'@([^\s]+)'
-        matches = re.findall(pattern, prompt)
-        
-        if not matches:
+
+        try:
+            from praisonaiagents.tools.mentions import MentionsParser
+        except ImportError:
             return prompt
-        
-        file_contents = []
-        for match in matches:
-            file_path = os.path.join(workspace, match)
-            if os.path.isfile(file_path):
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    file_contents.append(f"\n--- Content of {match} ---\n{content}\n--- End of {match} ---\n")
-                except Exception as e:
-                    file_contents.append(f"\n[Error reading {match}: {e}]\n")
-        
-        if file_contents:
-            return prompt + "\n" + "\n".join(file_contents)
-        return prompt
+
+        parser = MentionsParser(workspace_path=workspace)
+        if not parser.has_mentions(prompt):
+            return prompt
+
+        context, cleaned = parser.process(prompt)
+        if not context:
+            return prompt
+        return f"{cleaned}\n\n{context}".rstrip()
     
     # Tool names that can mutate the workspace or run commands. Review turns
     # run with these filtered OUT so a purported read-only review cannot write
@@ -693,6 +702,15 @@ class AsyncTUI:
         enforcing review commands at the capability level rather than by prompt
         instruction alone.
         """
+        # Rebuild when rules/instruction/definition files changed since the
+        # agent was built, so edits apply on the next prompt without a restart.
+        # Conversation continuity is preserved via the session store (as for
+        # ``/model``).
+        fingerprint = _definitions_fingerprint(self.config.workspace)
+        if fingerprint != self._definitions_fingerprint:
+            self._definitions_fingerprint = fingerprint
+            self._agent = None
+            self._review_agent = None
         if read_only:
             if self._review_agent is None:
                 self._review_agent = self._build_agent(read_only=True)
@@ -833,12 +851,14 @@ class AsyncTUI:
         logger.debug("Starting runtime...")
         try:
             from praisonai_code.cli.features.interactive_runtime import create_runtime
+            from praisonai_code.cli.features.interactive_tools import ToolConfig
             
             self._runtime = create_runtime(
                 workspace=self.config.workspace or ".",
                 lsp=self.config.enable_lsp,
                 acp=self.config.enable_acp,
-                approval="auto",  # Auto-approve for interactive mode
+                # Report the mode the tools actually run under (--safe => prompt)
+                approval=ToolConfig.from_env().approval_mode,
             )
             logger.debug("Runtime created")
             
@@ -1339,6 +1359,9 @@ Tips:
             self.messages.clear()
             self._conversation_history.clear()
             self._reset_agent_context()
+            from praisonai_code.cli.features.cost_tracker import reset_collected_usage
+
+            reset_collected_usage()
             self.messages.append(ChatMessage(role="system", content="Conversation cleared."))
             return True
         
@@ -1346,6 +1369,9 @@ Tips:
             self.messages.clear()
             self._conversation_history.clear()
             self._reset_agent_context()
+            from praisonai_code.cli.features.cost_tracker import reset_collected_usage
+
+            reset_collected_usage()
             self.messages.append(ChatMessage(role="system", content=f"New session: {self.session_id}"))
             return True
         
@@ -1392,10 +1418,13 @@ Tips:
             return True
         
         elif cmd in ("cost", "stats"):
+            from praisonai_code.cli.features.cost_tracker import collected_usage_line
+
+            tokens, cost_text = collected_usage_line(self.config.model)
             stats_info = (
                 f"Model:          {self.config.model}\n"
-                f"Total tokens:   {self._total_tokens}\n"
-                f"Estimated cost: ${self._total_cost:.4f}"
+                f"Total tokens:   {tokens}\n"
+                f"Estimated cost: {cost_text}"
             )
             self.messages.append(ChatMessage(role="system", content=stats_info))
             return True

@@ -4,6 +4,7 @@ Hook Registry for PraisonAI Agents.
 Manages registration and lookup of hooks for different events.
 """
 
+import inspect
 import threading
 from praisonaiagents._logging import get_logger
 from typing import Dict, List, Optional, Callable, Union
@@ -118,6 +119,8 @@ class HookRegistry:
         Returns:
             The hook ID
         """
+        if not is_async and inspect.iscoroutinefunction(func):
+            is_async = True
         hook = FunctionHook(
             event=event,
             func=func,
@@ -278,7 +281,12 @@ class HookRegistry:
     
     def has_hooks(self, event: HookEvent) -> bool:
         """Check if there are any hooks registered for an event."""
-        return bool(self.get_hooks(event))
+        # Hot-path existence check: same result as bool(get_hooks(event))
+        # without the snapshot copy, priority sort, or filtered list.
+        if not self._enabled:
+            return False
+        with self._lock:
+            return any(h.enabled for h in self._hooks.get(event, ()))
     
     def clear(self, event: Optional[HookEvent] = None):
         """

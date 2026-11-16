@@ -238,6 +238,14 @@ Since PraisonAI [#4423](https://github.com/MervinPraison/PraisonAI/pull/4423), `
 
 MCP stdio tool calls are safe to run in parallel — each call gets its own response channel, so results never cross.
 
+Concurrent calls to one stdio server also **run concurrently** on it: each request is dispatched as its own task on the MCP session, so a slow call never holds up the others and `timeout=` is charged from when a call starts, not from when it was queued. When the runner shuts down, in-flight calls are cancelled and return `MCP <kind> call cancelled: runner shut down` instead of blocking ([PR #5796](https://github.com/MervinPraison/PraisonAI/pull/5796), fixes [#5795](https://github.com/MervinPraison/PraisonAI/issues/5795)).
+
+| Scenario | Before | After |
+|---|---|---|
+| 50 sequential fast calls | 0.68 s | 0.13 s |
+| 4 concurrent 1.5 s calls, `timeout=3` | 3 of 4 time out | all succeed, 1.51 s wall |
+| Fast call queued behind a 2 s call | waits for the slow call | returns immediately |
+
 ```python
 from praisonaiagents import Agent, ExecutionConfig, MCP
 
@@ -263,6 +271,8 @@ The `timeout` parameter on `MCP()` bounds every call issued via the MCP session 
 - **180s** for cold-start package launchers (`npx`, `uvx`, `bunx`, `pnpm`, `yarn`, including the Windows `.cmd`/`.exe` shims and full paths ending in one) — their first run downloads the server package before the MCP handshake can begin (PraisonAI [#5110](https://github.com/MervinPraison/PraisonAI/pull/5110)).
 
 An explicit `MCP(..., timeout=N)` overrides both defaults.
+
+**Timed-out calls never run later.** A timed-out call is also abandoned: the caller marks the queued request cancelled and the runner skips it, so the tool will not execute after you received the timeout error (PraisonAI [#5772](https://github.com/MervinPraison/PraisonAI/pull/5772)). Side effects like sending an email or calling an API will not fire after the timeout.
 
 ```mermaid
 graph TB
@@ -379,24 +389,51 @@ sequenceDiagram
 
 The Streamable HTTP transport uses HTTP POST for sending messages and supports SSE streaming for responses.
 
+<Note>
+**mcp package compatibility.** This transport uses the official `mcp` SDK's `streamablehttp_client`, which was **removed in `mcp` 2.0.0**. The `praisonaiagents[mcp]` extra pins `mcp>=1.20.0,<2` for you — a fresh install is correct out of the box. If you've already upgraded to `mcp` 2.x, run `pip install "mcp<2"` to roll back. See PraisonAI [#5706](https://github.com/MervinPraison/PraisonAI/pull/5706).
+</Note>
+
 ### Requirements
 
-The Streamable HTTP transport is powered by the official MCP SDK's `streamablehttp_client` (httpx-based). It requires an up-to-date `mcp` package.
+The Streamable HTTP transport is powered by the official MCP SDK's `streamablehttp_client` (httpx-based). It requires `mcp >= 1.20.0, < 2`. `mcp` 2.0.0 removed `streamablehttp_client` entirely, so **do not** upgrade to `mcp` 2.x — see PraisonAI [#5706](https://github.com/MervinPraison/PraisonAI/pull/5706).
 
 ```bash
-pip install -U 'mcp'
+# Fresh install — the praisonaiagents[mcp] extra already pins mcp<2.
+pip install "praisonaiagents[mcp]"
+
+# Already on mcp 2.x? Downgrade:
+pip install "mcp<2"
+```
+
+```mermaid
+graph TB
+    Q{Which mcp package<br/>version do I have?}
+    Q -->|"mcp >= 1.20.0, < 2"| Good[✅ Streamable HTTP works]
+    Q -->|"mcp < 1.20.0"| Old[⚠️ No streamablehttp_client<br/>→ pip install &quot;mcp&lt;2&quot;]
+    Q -->|"mcp >= 2.0.0"| New[❌ streamablehttp_client removed<br/>→ pip install &quot;mcp&lt;2&quot;]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef old fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Q question
+    class Good good
+    class Old old
+    class New bad
 ```
 
 <Warning>
-If the installed `mcp` package is too old, `HTTPStreamMCPClient` raises at construction time:
+If the installed `mcp` package does not provide the Streamable HTTP client, `HTTPStreamMCPClient` raises at construction time:
 
 ```
-The installed 'mcp' package does not provide the Streamable HTTP client
-(mcp.client.streamable_http.streamablehttp_client).
-Upgrade it with: pip install -U 'mcp'
+The installed 'mcp' package does not provide the Streamable HTTP
+client (mcp.client.streamable_http.streamablehttp_client).
+This transport was removed in mcp 2.x; install a compatible
+version with: pip install "mcp<2"
 ```
 
-Fix it by upgrading: `pip install -U 'mcp'`.
+Fix it by installing a compatible version: `pip install "mcp<2"`. Do **not** `pip install -U 'mcp'` — upgrading to mcp 2.x is what caused the error.
 </Warning>
 
 ### Features
@@ -404,6 +441,7 @@ Fix it by upgrading: `pip install -U 'mcp'`.
 - ✅ Powered by the official `mcp.client.streamable_http.streamablehttp_client` (httpx, not aiohttp)
 - ✅ Session lifecycle managed by the official SDK client
 - ✅ Custom headers for authentication
+- ✅ Structured error dicts on timeout or transport failure (see Error handling below)
 - ✅ Clean context unwinding — a failed `initialize()` handshake unwinds already-entered contexts, so no httpx/anyio connection or half-open remote session is leaked
 
 ### Usage
@@ -442,15 +480,31 @@ The HTTP-Stream transport reads only these two options:
 `session`, `resumability`, `cors`, and `responseMode` are still accepted as keyword arguments but are **no-ops** on this transport — session and resumability are fully managed by the official SDK client. Use `headers` and `timeout` only.
 </Note>
 
+### Error handling
+
+Failures return structured dicts, so retry, circuit breaker, and `ON_RETRY` engage with no config.
+
+```python
+# Timeout
+{"error": "MCP tool call timed out after <timeout> seconds", "timeout": True, "mcp_error": True}
+
+# Other failure (message falls back to just <ExcType> if empty)
+{"error": "MCP tool '<name>' failed: <ExcType>: <msg>", "mcp_error": True}
+```
+
+See [MCP → remote tool failures](/features/mcp#transport-level-failures-on-remote-mcp-tools).
+
 ### Troubleshooting
 
 <AccordionGroup>
 <Accordion title="ImportError: streamablehttp_client not found">
-Your `mcp` package predates the Streamable HTTP client. Upgrade it:
+Either your `mcp` package predates the Streamable HTTP client, or you are on `mcp` 2.x where it was removed. Install a version in the supported range:
 
 ```bash
-pip install -U 'mcp'
+pip install "mcp<2"
 ```
+
+The `praisonaiagents[mcp]` extra now pins `mcp<2` automatically (PraisonAI [#5706](https://github.com/MervinPraison/PraisonAI/pull/5706)).
 </Accordion>
 
 <Accordion title="session=True / resumability=True have no effect">
@@ -489,6 +543,20 @@ WebSocket transport provides bidirectional, long-lived connections ideal for clo
 - ✅ Reconnection with exponential backoff
 - ✅ Authentication token support
 - ✅ Ping/pong keepalive
+
+### Error handling
+
+Failures return structured dicts, so retry, circuit breaker, and `ON_RETRY` engage with no config.
+
+```python
+# Timeout
+{"error": "MCP tool call timed out after <timeout> seconds", "timeout": True, "mcp_error": True}
+
+# Other failure (message falls back to just <ExcType> if empty)
+{"error": "MCP tool '<name>' failed: <ExcType>: <msg>", "mcp_error": True}
+```
+
+See [MCP → remote tool failures](/features/mcp#transport-level-failures-on-remote-mcp-tools).
 
 ### Usage
 
@@ -549,6 +617,20 @@ from praisonaiagents.mcp.mcp_websocket import calculate_backoff
 <Warning>This transport is deprecated. Use Streamable HTTP for new implementations.</Warning>
 
 The SSE transport is maintained for backward compatibility with servers using protocol version 2024-11-05.
+
+### Error handling
+
+Failures return structured dicts, so retry, circuit breaker, and `ON_RETRY` engage with no config.
+
+```python
+# Timeout
+{"error": "MCP tool call timed out after <timeout> seconds", "timeout": True, "mcp_error": True}
+
+# Other failure (message falls back to just <ExcType> if empty)
+{"error": "MCP tool '<name>' failed: <ExcType>: <msg>", "mcp_error": True}
+```
+
+See [MCP → remote tool failures](/features/mcp#transport-level-failures-on-remote-mcp-tools).
 
 ### Usage
 
@@ -687,7 +769,7 @@ registry.register("my_transport", MyCustomTransport)
     - **SSE**: Legacy server compatibility
   </Card>
   <Card title="Streamable HTTP" icon="key">
-    - Upgrade with `pip install -U 'mcp'`
+    - Install with `pip install "praisonaiagents[mcp]"` (pins `mcp<2`); don't `pip install -U 'mcp'`
     - Pass `headers` for authentication
     - Session lifecycle is handled by the SDK client
   </Card>

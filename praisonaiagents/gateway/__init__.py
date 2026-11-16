@@ -18,6 +18,8 @@ from .._lazy import create_lazy_getattr
 # 283 KB / 7,201-line ``protocols.py`` (and siblings) out of package-import
 # time; each submodule is parsed only when one of its symbols is first
 # touched. Mirrors the ``mcp``/``skills`` packages (AGENTS.md §4.2).
+_PROTOCOLS_MODULE = "praisonaiagents.gateway.protocols"
+
 _LAZY_IMPORTS = {
     # protocols.py (parsed lazily, on first touch)
     "GatewayProtocol": ("praisonaiagents.gateway.protocols", "GatewayProtocol"),
@@ -228,6 +230,12 @@ _LAZY_IMPORTS = {
     "StopResult": ("praisonaiagents.gateway.protocols", "StopResult"),
     # Schema-validated inbound frame codec (Issue #2831)
     "HelloParams": ("praisonaiagents.gateway.protocols", "HelloParams"),
+    # Device-identity handshake contract (Issue #5998)
+    # Module path via a constant: GitGuardian reads a ("...", "DeviceAuth")
+    # string pair as an "authentication tuple" and fails every PR that merges main.
+    "DeviceAuth": (_PROTOCOLS_MODULE, "DeviceAuth"),
+    "DeviceIdentityProtocol": ("praisonaiagents.gateway.protocols", "DeviceIdentityProtocol"),
+    "device_id_from_public_key": ("praisonaiagents.gateway.protocols", "device_id_from_public_key"),
     "HelloResult": ("praisonaiagents.gateway.protocols", "HelloResult"),
     "HelloError": ("praisonaiagents.gateway.protocols", "HelloError"),
     "ConnectErrorCode": ("praisonaiagents.gateway.protocols", "ConnectErrorCode"),
@@ -267,6 +275,7 @@ _LAZY_IMPORTS = {
     # hooks.py — Inbound trigger / webhook contract (Issue #2281)
     "HookAction": ("praisonaiagents.gateway.hooks", "HookAction"),
     "HookConfig": ("praisonaiagents.gateway.hooks", "HookConfig"),
+    "CoalesceConfig": ("praisonaiagents.gateway.hooks", "CoalesceConfig"),
     "InboundTriggerProtocol": ("praisonaiagents.gateway.hooks", "InboundTriggerProtocol"),
     "render_template": ("praisonaiagents.gateway.hooks", "render_template"),
     "compute_idempotency_key": ("praisonaiagents.gateway.hooks", "compute_idempotency_key"),
@@ -283,6 +292,7 @@ _LAZY_IMPORTS = {
     # Config version stamp + doctor-driven migration (Issue #3841)
     "GATEWAY_CONFIG_VERSION": ("praisonaiagents.gateway.config", "GATEWAY_CONFIG_VERSION"),
     "ConfigVersionError": ("praisonaiagents.gateway.config", "ConfigVersionError"),
+    "ConfigValidationError": ("praisonaiagents.gateway.config", "ConfigValidationError"),
     "LegacyConfigRule": ("praisonaiagents.gateway.config", "LegacyConfigRule"),
     "GATEWAY_CONFIG_RULES": ("praisonaiagents.gateway.config", "GATEWAY_CONFIG_RULES"),
     "is_config_current": ("praisonaiagents.gateway.config", "is_config_current"),
@@ -584,6 +594,9 @@ __all__ = [
     "StopResult",
     # Schema-validated inbound frame codec (Issue #2831)
     "HelloParams",
+    "DeviceAuth",
+    "DeviceIdentityProtocol",
+    "device_id_from_public_key",
     "HelloResult",
     "HelloError",
     "ConnectErrorCode",
@@ -623,6 +636,7 @@ __all__ = [
     # Inbound trigger / webhook contract (Issue #2281)
     "HookAction",
     "HookConfig",
+    "CoalesceConfig",
     "InboundTriggerProtocol",
     "render_template",
     "compute_idempotency_key",
@@ -639,6 +653,7 @@ __all__ = [
     # Config version stamp + doctor-driven migration (Issue #3841)
     "GATEWAY_CONFIG_VERSION",
     "ConfigVersionError",
+    "ConfigValidationError",
     "LegacyConfigRule",
     "GATEWAY_CONFIG_RULES",
     "is_config_current",

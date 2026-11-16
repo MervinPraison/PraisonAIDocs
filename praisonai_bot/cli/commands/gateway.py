@@ -228,6 +228,12 @@ def gateway_start(
         "reverse proxy this keeps per-IP rate-limits and the operator id keyed "
         "on the real client; unattributable proxies fail closed (#5312)",
     ),
+    pure: bool = typer.Option(
+        False, "--pure", "--no-plugins", "--safe-mode",
+        help="Safe mode for incident triage: skip external plugins and inbound "
+        "YAML hooks so only the core agent + channels serve (equivalent to "
+        "PRAISONAI_NO_PLUGINS=1); config is not modified (#5747)",
+    ),
 ):
     """Start the gateway server.
 
@@ -246,6 +252,7 @@ def gateway_start(
         praisonai gateway start --config gateway.yaml --openai-api --mcp
         praisonai gateway start --config gateway.yaml --reliability production
         praisonai gateway start --config gateway.yaml --max-concurrent-runs 8 --queue-depth 32
+        praisonai gateway start --config gateway.yaml --safe-mode
         GATEWAY_PORT=9000 praisonai gateway start
     """
     import os
@@ -257,6 +264,11 @@ def gateway_start(
             port = int(os.environ.get("GATEWAY_PORT", "8765"))
         except ValueError:
             port = 8765
+
+    # Set before the --verify-turn pre-flight below so its agent turn also
+    # skips plugins; handler.start persists it for ``restart`` (#5747).
+    if pure:
+        os.environ["PRAISONAI_NO_PLUGINS"] = "1"
 
     # Resolve one canonical gateway config shared with onboard/doctor (#3880).
     # Without this, no --config silently started WebSocket-only with NO channels
@@ -421,6 +433,7 @@ def gateway_start(
             if isinstance(trusted_proxy, (list, tuple))
             else None
         ),
+        safe_mode=True if pure else None,
     )
     raise typer.Exit(code if isinstance(code, int) else 0)
 
@@ -640,6 +653,19 @@ def gateway_status(
         try:
             handler = GatewayHandler()
             handler.status(host=host, port=port, deep=deep)
+            info_status, info = _fetch_gateway(host, port, "/info")
+            if info_status is not None:
+                access = _summarise_access(host, info_status, info)
+                if access["authorized"]:
+                    scopes = access.get("scopes")
+                    scope_s = ", ".join(scopes) if scopes is not None else "unknown"
+                    print(f"  Access: authorized (scopes: {scope_s})")
+                elif access["authorized"] is False:
+                    print(f"  Access: credential refused (HTTP {info_status})")
+                else:
+                    print(f"  Access: unknown (/info returned HTTP {info_status})")
+                if access.get("next_step"):
+                    print(f"  Next step: {access['next_step']}")
             if deep and config and os.path.exists(config):
                 from praisonai_bot.daemon.launchd import get_logs
 
@@ -919,26 +945,77 @@ def _resolve_gateway_auth_token() -> str:
     return ""
 
 
-def _fetch_gateway_json(host: str, port: int, path: str, timeout: float = 5.0):
-    """GET a JSON gateway endpoint over loopback, returning None on failure.
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 
+
+def _fetch_gateway(host: str, port: int, path: str, timeout: float = 5.0):
+    """GET a JSON gateway endpoint, returning ``(http_status, body)``.
+
+    ``http_status`` is ``None`` when nothing answered, so callers can tell an
+    unreachable gateway apart from one that refused the credential (#5776).
     Attaches the loopback-only bearer token (resolved from the environment or
     the persisted ``~/.praisonai/.env``) so authenticated gateways still
     answer, without leaking the credential onto a remote plaintext hop.
     """
     import json
+    import urllib.error
     import urllib.request
 
     url = f"http://{host}:{port}{path}"
     try:
         req = urllib.request.Request(url)
         token = _resolve_gateway_auth_token()
-        if token and host in ("127.0.0.1", "localhost", "::1"):
+        if token and host in _LOOPBACK_HOSTS:
             req.add_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(req, timeout=timeout) as response:
-            return json.loads(response.read().decode())
+            return response.status, json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
     except Exception:
-        return None
+        return None, None
+
+
+def _fetch_gateway_json(host: str, port: int, path: str, timeout: float = 5.0):
+    """GET a JSON gateway endpoint over loopback, returning None on failure."""
+    status, body = _fetch_gateway(host, port, path, timeout)
+    return body if status == 200 else None
+
+
+def _summarise_access(host: str, info_status, info) -> dict:
+    """Classify what this CLI's credential may do on a reachable gateway (#5776).
+
+    Distinguishes "reachable but the credential was refused" and "reachable
+    with limited operator scopes" from a dead socket, with a named next step.
+    """
+    if info_status == 200 and isinstance(info, dict):
+        scopes = info.get("scopes")
+        access = {"authorized": True, "scopes": scopes}
+        if scopes is not None and not ({"admin", "write"} & set(scopes)):
+            access["next_step"] = (
+                "credential lacks operator write/admin scope; grant it via "
+                "gateway.auth_scopes in the gateway config"
+            )
+        return access
+    if info_status not in (401, 403):
+        # No auth decision was made (timeout, 404, 5xx): don't blame the token.
+        return {"authorized": None, "http_status": info_status}
+    access = {"authorized": False, "http_status": info_status}
+    if host not in _LOOPBACK_HOSTS:
+        access["next_step"] = (
+            "the CLI only sends GATEWAY_AUTH_TOKEN to loopback; run "
+            "`praisonai gateway status` on the gateway host"
+        )
+    elif not _resolve_gateway_auth_token():
+        access["next_step"] = (
+            "no GATEWAY_AUTH_TOKEN found; export it or run "
+            "`praisonai gateway doctor --fix`"
+        )
+    else:
+        access["next_step"] = (
+            "GATEWAY_AUTH_TOKEN was rejected; it does not match the "
+            "running gateway's auth token"
+        )
+    return access
 
 
 def _build_status_snapshot(host: str, port: int) -> dict:
@@ -966,8 +1043,12 @@ def _build_status_snapshot(host: str, port: int) -> dict:
     except Exception as exc:  # noqa: BLE001
         snapshot["daemon"] = {"error": str(exc)}
 
-    health = _fetch_gateway_json(host, port, "/health")
-    info = _fetch_gateway_json(host, port, "/info")
+    health_status, health = _fetch_gateway(host, port, "/health")
+    if health_status != 200:
+        health = None
+    info_status, info = _fetch_gateway(host, port, "/info")
+    if info_status != 200:
+        info = None
 
     if info:
         snapshot["version"] = info.get("version")
@@ -998,6 +1079,7 @@ def _build_status_snapshot(host: str, port: int) -> dict:
         # (#5363, greptile P1).
         if info is None and snapshot.get("version") is None:
             snapshot["version_unavailable"] = "info_unreachable"
+        snapshot["access"] = _summarise_access(host, info_status, info)
 
     return snapshot
 
@@ -1471,8 +1553,16 @@ def gateway_test(
         raise typer.Exit(1)
 
 
-@app.command("channels")
+channels_app = typer.Typer(
+    help="List, probe and edit channels in gateway.yaml",
+    invoke_without_command=True,
+)
+app.add_typer(channels_app, name="channels")
+
+
+@channels_app.callback()
 def gateway_channels(
+    ctx: typer.Context,
     config: str = typer.Option("gateway.yaml", "--config", "-c", help="Path to gateway.yaml"),
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
     probe: bool = typer.Option(False, "--probe", help="Probe each channel's credentials"),
@@ -1491,6 +1581,9 @@ def gateway_channels(
     """
     import os
     import yaml
+
+    if ctx.invoked_subcommand is not None:
+        return
 
     if available:
         try:
@@ -1578,6 +1671,125 @@ def gateway_channels(
             platform = ch_cfg.get("platform", "unknown")
             has_token = "set" if ch_cfg.get("token") else "missing"
             print(f"{name:<20} {platform:<12} {has_token:<12}")
+
+
+def _parse_channel_settings(pairs: Optional[List[str]]) -> dict:
+    """Parse repeated ``--set key=value`` flags; values are YAML-typed."""
+    import yaml
+
+    settings = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key.strip():
+            print(f"Error: --set expects key=value, got {pair!r}")
+            raise typer.Exit(1)
+        settings[key.strip()] = yaml.safe_load(value) if value else ""
+    return settings
+
+
+def _edit_channel(
+    ctx: typer.Context, config: Optional[str], name: str, settings=None, *, remove=False, must_exist=True
+) -> None:
+    """Run one validated channel edit, mapping failures to CLI exits (#6079)."""
+    import os
+    import yaml
+
+    from praisonai_bot.gateway.admin import _editable_channels, edit_gateway_channel
+
+    # ``gateway channels --config X <cmd>`` applies to the subcommand too.
+    config = _resolve_doctor_config(config or ctx.parent.params.get("config") or "gateway.yaml")
+    if not os.path.exists(config):
+        print(f"Error: Config file not found: {config}")
+        raise typer.Exit(1)
+    with open(config) as fh:
+        exists = name in _editable_channels(yaml.safe_load(fh) or {})
+    if must_exist and not exists:
+        print(f"Error: channel {name!r} is not configured in {config}")
+        raise typer.Exit(1)
+    if not must_exist and exists:
+        print(f"Error: channel {name!r} already exists in {config}; use 'update'")
+        raise typer.Exit(1)
+    try:
+        edit_gateway_channel(config, name, settings, remove=remove)
+    except ValueError as exc:
+        print(f"Error: {exc}\nNo changes written to {config}.")
+        raise typer.Exit(1) from exc
+
+
+@channels_app.command("add")
+def gateway_channels_add(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Channel name, e.g. 'telegram'"),
+    platform: Optional[str] = typer.Option(None, "--platform", help="Platform (default: the channel name)"),
+    token: Optional[str] = typer.Option(
+        None, "--token",
+        help="Channel token (default: ${VAR} reference to the platform's credential env var)",
+    ),
+    set_: Optional[List[str]] = typer.Option(None, "--set", help="Extra setting key=value (repeatable)"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="Path to gateway.yaml"),
+):
+    """Add one channel to gateway.yaml without touching the others.
+
+    Examples:
+        praisonai gateway channels add telegram
+        praisonai gateway channels add support --platform discord --set group_policy=mention_only
+    """
+    from praisonai_bot.bots._config_schema import GatewayConfigSchema
+
+    platform = platform or name
+    settings = {"platform": platform}
+    settings["token"] = token if token is not None else GatewayConfigSchema._credential_env_ref(platform)
+    settings.update(_parse_channel_settings(set_))
+    _edit_channel(ctx, config, name, settings, must_exist=False)
+    print(f"Added channel {name!r}.")
+
+
+@channels_app.command("update")
+def gateway_channels_update(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Channel name to update"),
+    token: Optional[str] = typer.Option(None, "--token", help="New channel token"),
+    set_: Optional[List[str]] = typer.Option(None, "--set", help="Setting key=value (repeatable)"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="Path to gateway.yaml"),
+):
+    """Update settings of one configured channel.
+
+    Examples:
+        praisonai gateway channels update telegram --set group_policy=mention_only
+    """
+    settings = _parse_channel_settings(set_)
+    if token is not None:
+        settings["token"] = token
+    if not settings:
+        print("Error: nothing to update; pass --set key=value, --token, or both")
+        raise typer.Exit(1)
+    _edit_channel(ctx, config, name, settings)
+    print(f"Updated channel {name!r}.")
+
+
+@channels_app.command("disable")
+def gateway_channels_disable(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Channel name to disable"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="Path to gateway.yaml"),
+):
+    """Stop serving a channel but keep its config (sets ``enabled: false``).
+
+    Re-enable with ``praisonai gateway channels update <name> --set enabled=true``.
+    """
+    _edit_channel(ctx, config, name, {"enabled": False})
+    print(f"Disabled channel {name!r}.")
+
+
+@channels_app.command("remove")
+def gateway_channels_remove(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Channel name to remove"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="Path to gateway.yaml"),
+):
+    """Delete a channel block from gateway.yaml."""
+    _edit_channel(ctx, config, name, remove=True)
+    print(f"Removed channel {name!r}.")
 
 
 def _resolve_gateway_rest_url(
@@ -2225,7 +2437,9 @@ def outbox_retry(
 
     from praisonai_bot.bots import OutboundQueue
 
-    outbox = OutboundQueue(path=_resolve_outbox_path(path))
+    # read_only: the gateway may be live — never flip its in-flight 'sending'
+    # rows to 'recovered' (duplicate delivery). Targeted ops still work.
+    outbox = OutboundQueue(path=_resolve_outbox_path(path), read_only=True)
     ok = asyncio.run(outbox.retry(key))
     if ok:
         typer.echo("requeued 1 entry")
@@ -2248,7 +2462,9 @@ def outbox_purge(
     """Delete a single outbound entry by key, or all entries with --all."""
     from praisonai_bot.bots import OutboundQueue
 
-    outbox = OutboundQueue(path=_resolve_outbox_path(path))
+    # read_only: the gateway may be live — never flip its in-flight 'sending'
+    # rows to 'recovered' (duplicate delivery). Targeted ops still work.
+    outbox = OutboundQueue(path=_resolve_outbox_path(path), read_only=True)
 
     if all_entries:
         n = outbox.size()

@@ -141,6 +141,74 @@ graph TB
 | File added after the checkpoint | Removed by restore (no leak) |
 | Ignored file (`.env`, `venv`, secrets) | Preserved — never snapshotted, never pruned |
 | Selective restore (`files=[...]` / partial) | Only listed files touched; no project prune |
+| Uncommitted work when `restore()` is called | Auto-saved as a `[pre-restore] auto-save` checkpoint; recoverable via `restore(<pre_id>)` |
+| Uncommitted file above `max_file_size` | Preserved on disk; not deleted by restore |
+
+### Recoverable restore
+
+`restore()` and `rewind()` auto-save uncommitted work before touching the workspace. Restore to the wrong checkpoint? Restore the auto-save and your changes come back.
+
+```python
+from praisonaiagents.checkpoints import CheckpointService, CheckpointEvent
+
+service = CheckpointService(workspace_dir="./my_project")
+await service.initialize()
+
+# Remember the latest auto-save
+pre_restore = []
+service.on(
+    CheckpointEvent.CHECKPOINT_CREATED,
+    lambda cp: cp.message == "[pre-restore] auto-save" and pre_restore.append(cp.id),
+)
+
+with open("./my_project/a.txt", "w") as f:
+    f.write("a")
+baseline = await service.save("base")
+
+# New work, not checkpointed
+with open("./my_project/unsaved.txt", "w") as f:
+    f.write("precious")
+
+await service.restore(baseline.checkpoint.id)  # unsaved.txt is gone from disk
+await service.restore(pre_restore[-1])         # unsaved.txt is back
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant S as CheckpointService
+    participant G as Shadow git
+
+    User->>S: restore(baseline_id)
+    S->>G: save "[pre-restore] auto-save"
+    G-->>S: pre_id
+    S->>G: update-ref refs/pre-restore/pre_id
+    S->>G: reset --hard baseline_id
+    G-->>User: workspace at baseline
+
+    User->>S: restore(pre_id)
+    S->>G: reset --hard pre_id
+    G-->>User: unsaved work recovered
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef svc fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef git fill:#6366F1,stroke:#7C90A0,color:#fff
+    class User user
+    class S svc
+    class G git
+```
+
+<Note>
+If the pre-restore snapshot fails for any reason **other than** "No changes to checkpoint", `restore()` aborts — the service never destroys work it could not snapshot first.
+</Note>
+
+<Note>
+The auto-save is pinned under `refs/pre-restore/<id>`, so `git gc` never prunes it even though the reset moves HEAD off it. Because it sits off the HEAD timeline, `list_checkpoints()` does not show it — capture its id from the `CHECKPOINT_CREATED` event (or `get_checkpoint(<id>)` while it is in the in-memory view).
+</Note>
+
+<Note>
+Files above `max_file_size` cannot be snapshotted, so `restore()` **leaves them on disk** instead of deleting them.
+</Note>
 
 ## How It Works
 
@@ -157,7 +225,8 @@ sequenceDiagram
     Agent->>Agent: edit files
     User->>Agent: "This broke tests"
     User->>Checkpoints: rewind()
-    Checkpoints-->>User: workspace restored to pre-turn-1 state
+    Checkpoints->>Checkpoints: save("[pre-restore] auto-save")
+    Checkpoints-->>User: workspace restored to pre-turn-1 state (unsaved work recoverable)
 
     classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef agent fill:#189AB4,stroke:#7C90A0,color:#fff
@@ -478,10 +547,63 @@ service = CheckpointService(
 | `storage_dir` | `str` | `~/.praisonai/checkpoints` | Where the shadow-git store lives. |
 | `enabled` | `bool` | `True` | Enable / disable checkpoints. |
 | `auto_checkpoint` | `bool` | `True` | Auto-checkpoint before file modifications. |
-| `max_checkpoints` | `int` | `100` | Maximum logical checkpoints to keep in the in-memory listing. |
+| `max_checkpoints` | `int` | `100` | In-memory view limit for `get_checkpoint()` and the search depth of `restore(step=N)`. Shadow git keeps every commit; `delete_all()` reclaims storage by wiping all checkpoints. |
 | `user_name` | `str` | `"PraisonAI Checkpoints"` | Git `user.name` for shadow commits (env: `PRAISONAI_GIT_USER_NAME`). |
 | `user_email` | `str` | `"checkpoints@praison.ai"` | Git `user.email` for shadow commits (env: `PRAISONAI_GIT_USER_EMAIL`). |
 | `max_file_size` | `int` | `2 * 1024 * 1024` (2 MB) | Skip files larger than this from the shadow commit (they stay on disk). `0` disables the cap. |
+
+## Concurrency safety
+
+Call `save()`, `restore()`, `rewind()`, and `diff()` from parallel coroutines on one `CheckpointService` — no locking needed. The service serialises every git operation that touches `HEAD`, the index, or the worktree.
+
+```python
+import asyncio
+from praisonaiagents.checkpoints import CheckpointService
+
+service = CheckpointService(workspace_dir="./my_project")
+await service.initialize()
+
+async def one(i):
+    with open(f"./my_project/f{i}.txt", "w") as f:
+        f.write(str(i))
+    return await service.save(f"cp{i}")
+
+# Six parallel saves — none fail on git lock contention
+results = await asyncio.gather(*[one(i) for i in range(6)])
+assert all(r.success or "No changes" in r.error for r in results)
+```
+
+- A per-event-loop `asyncio.Lock` is created lazily and rebound if the running loop changes.
+- `save()`, `restore()`, `rewind()`, and working-directory `diff()` (no `to_id`) take the lock.
+- Checkpoint-to-checkpoint `diff(from_id, to_id)` stays lock-free — it does not mutate state.
+
+```mermaid
+sequenceDiagram
+    participant A as Agent 1
+    participant B as Agent 2
+    participant L as Op Lock
+    participant S as Shadow git
+
+    A->>L: save()
+    L-->>A: acquired
+    B->>L: save()
+    Note right of B: waits
+    A->>S: add -A → commit
+    A-->>L: release
+    L-->>B: acquired
+    B->>S: add -A → commit
+
+    classDef user fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef lock fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef shadow fill:#6366F1,stroke:#7C90A0,color:#fff
+    class A,B user
+    class L lock
+    class S shadow
+```
+
+<Note>
+The lock belongs to a **single `CheckpointService` instance**. Two instances pointing at the same workspace are still unsafe — share one instance across your agents.
+</Note>
 
 ## Large-repo performance
 
@@ -617,8 +739,14 @@ class CheckpointDiff:
   <Accordion title="Diff before restore">
     Run `praisonai checkpoint diff last` to confirm you are rewinding to the right snapshot.
   </Accordion>
-  <Accordion title="Cap stored checkpoints">
-    Set `max_checkpoints` on `CheckpointService` to avoid unbounded shadow-git growth.
+  <Accordion title="max_checkpoints only trims the in-memory view">
+    `max_checkpoints` caps the in-memory view (`get_checkpoint()`) and how far `restore(step=N)` searches — the shadow git repo retains every commit. To reclaim disk, call `service.delete_all()` — this wipes **every** checkpoint for the workspace, so call `initialize()` again before saving.
+  </Accordion>
+  <Accordion title="A wrong restore() is itself undoable">
+    Every `restore()` and `rewind()` auto-saves current work as `[pre-restore] auto-save` and pins it under `refs/pre-restore/<id>`. Jumped to the wrong checkpoint? `restore()` the auto-save id and your edits come back.
+  </Accordion>
+  <Accordion title="Share one CheckpointService across concurrent agents">
+    The op lock lives on the service instance. Parallel `save()` / `restore()` / `diff()` on one instance are safe; two instances on the same workspace are not — pass the same `CheckpointService` to every agent that touches the workspace.
   </Accordion>
   <Accordion title="Use --no-checkpoint for throwaway runs">
     Skip auto-checkpoints on YAML runs when you know the workspace is disposable.
@@ -633,7 +761,7 @@ class CheckpointDiff:
     Checkpoint restore mirrors `.gitignore` + built-in ignore rules (`.git`, `__pycache__`, `node_modules`, `venv`, `.venv`, `.pytest_cache`, `.mypy_cache`). Ignored files are never snapshotted and never pruned by restore/rewind — a `.env` sitting outside version control survives every `praisonai checkpoint rewind` / `restore`.
   </Accordion>
   <Accordion title="Snapshot large fixtures with max_file_size">
-    By default, files above **2 MB** are skipped from checkpoints (they stay on disk). If your project deliberately versions large fixtures inside the workspace and you want them snapshotted, pass `max_file_size=0` (disabled) or a larger byte cap to `CheckpointService`. On projects with model weights or build outputs, the default keeps the shadow store small.
+    By default, files above **2 MB** are skipped from checkpoints (they stay on disk). If your project deliberately versions large fixtures inside the workspace and you want them snapshotted, pass `max_file_size=0` (disabled) or a larger byte cap to `CheckpointService`. On projects with model weights or build outputs, the default keeps the shadow store small. Skipped files are also never deleted by `restore()` — an uncommitted large fixture survives a rewind.
   </Accordion>
   <Accordion title="Long-running sessions don't leak disk">
     Every 20 saves, the shadow store runs `git repack -a -d` (which pulls borrowed objects into a local pack) followed by `git gc --auto`. That means the shadow repo becomes fully self-contained shortly after seeding — even if the project repo is later pruned or repacked, `/undo` and `/revert` history stays readable.

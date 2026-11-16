@@ -397,6 +397,94 @@ memory_config = {
 }
 ```
 
+### Share one SQLite file across agents (`db_path`)
+
+Set `db_path` to point two or more agents at a single SQLite file so they share long-term and short-term memory.
+
+```mermaid
+graph LR
+    subgraph "Shared db_path"
+        W[🤖 Writer Agent] -->|store| F[(🗄️ one .db file)]
+        F -->|recall| R[🤖 Reader Agent]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class W,R agent
+    class F store
+```
+
+A support team runs two assistants in the same process. Agent A captures what the user said; Agent B answers a follow-up five minutes later. Point both at the same `db_path` and Agent B recalls the fact Agent A stored — without extra wiring, `user_id` juggling, or a shared vector store.
+
+```python
+# Shared memory across Agent instances using db_path
+from praisonaiagents import Agent
+from praisonaiagents.config.feature_configs import MemoryConfig
+
+shared = "/tmp/team-memory.db"
+
+writer = Agent(
+    name="Writer",
+    instructions="Remember what the user tells you.",
+    memory=MemoryConfig(backend="sqlite", config={"db_path": shared}),
+)
+writer.start("Remember codename ORANGE-PANDA for the Q4 launch.")
+
+reader = Agent(
+    name="Reader",
+    instructions="Answer questions using memory.",
+    memory=MemoryConfig(backend="sqlite", config={"db_path": shared}),
+)
+reader.start("What is the codename for the Q4 launch?")
+```
+
+**Precedence** — explicit `short_db` / `long_db` win over `db_path`, which wins over the per-user default paths. This is per-tier: set `short_db` explicitly and let `long_db` fall back to `db_path`.
+
+```
+Explicit short_db / long_db  >  db_path  >  Per-user default paths
+```
+
+```mermaid
+graph TD
+    Q["Which SQLite file(s) will the store write?"]
+    Q -->|"short_db or long_db set"| EX["Explicit path wins per-tier"]
+    Q -->|"only db_path set"| ALIAS["db_path used for BOTH tiers"]
+    Q -->|"nothing set"| DEF["Per-user default paths<br/>(short_term&lt;suffix&gt;.db / long_term&lt;suffix&gt;.db)"]
+
+    classDef q fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef a fill:#10B981,stroke:#7C90A0,color:#fff
+    class Q q
+    class EX,ALIAS,DEF a
+```
+
+```python
+# Explicit short_db / long_db still win over db_path
+from praisonaiagents import Agent
+from praisonaiagents.config.feature_configs import MemoryConfig
+
+agent = Agent(
+    name="Writer",
+    instructions="Keep short- and long-term memory in separate files.",
+    memory=MemoryConfig(
+        backend="sqlite",
+        config={
+            "db_path":  "/tmp/ignored.db",   # ignored because the explicit paths win
+            "short_db": "/tmp/short.db",
+            "long_db":  "/tmp/long.db",
+        },
+    ),
+)
+```
+
+<Note>
+The sqlite memory adapter stores short-term and long-term tiers in separate tables (`short_term_memory` / `long_term_memory`) inside a single file, so pointing both at one `db_path` is safe — nothing is overwritten.
+</Note>
+
+<Note>
+Before PraisonAI PR [#5711](https://github.com/MervinPraison/PraisonAI/pull/5711) (fixes [#5710](https://github.com/MervinPraison/PraisonAI/issues/5710)), `MemoryConfig(backend="sqlite", config={"db_path": ...})` silently dropped `db_path` and both tiers fell back to per-user default files. If two agents on the same `db_path` could not recall each other's writes on an older release, upgrade PraisonAI to pick up the fix.
+</Note>
+
 ### Mem0 Configuration
 
 > Requires the optional memory extras:
@@ -622,14 +710,14 @@ results = memory.search_long_term(
 )
 ```
 
-`user_id` is now enforced twice on every search — once at the `Memory` layer (existing) and again inside `SearchMixin.search_short_term` / `SearchMixin.search_long_term` as of [PraisonAI PR #4819](https://github.com/MervinPraison/PraisonAI/pull/4819). The lower layer auto-derives the same `user_id` metadata filter, so adapters that accept `user_id` but ignore it in their own query (Chroma/RAG, SQLite, in-memory) still isolate per-tenant results. If a caller passes both an explicit `user_id` and a conflicting `metadata_filter["user_id"]`, the explicit `user_id` always wins — a caller cannot widen scope to another tenant's data.
+`user_id` is enforced inside `Memory.search_short_term` / `Memory.search_long_term` as of [PraisonAI PR #4819](https://github.com/MervinPraison/PraisonAI/pull/4819). The method auto-derives a `user_id` metadata filter, so adapters that accept `user_id` but ignore it in their own query (Chroma/RAG, SQLite, in-memory) still isolate per-tenant results. If a caller passes both an explicit `user_id` and a conflicting `metadata_filter["user_id"]`, the explicit `user_id` always wins — a caller cannot widen scope to another tenant's data.
 
 <Note>
 `user_id` takes precedence over any `metadata_filter["user_id"]`, so a route can never widen scope to another tenant. Applied across every backend — Mem0, MongoDB (with and without vector search), ChromaDB, memory-adapter, and the SQLite fallback. When a `metadata_filter` is present, each backend over-fetches by 10× so results ranked beyond `limit` still survive the post-filter, then truncates back to `limit`.
 </Note>
 
 <Note>
-Direct `SearchMixin` use (subclassing or embedding in a custom store) previously depended on the adapter to filter by `user_id`. If you have such code, no change is required — the filter is applied automatically now — but you may safely remove any duplicate post-filtering you added as a workaround.
+To extend memory search with a custom backend, register an adapter via `add_memory_adapter` / `AsyncMemoryProtocol` — see [Custom Memory Adapters](/features/custom-memory-adapters). The `user_id` filter is applied automatically at the `Memory` layer, so a custom adapter cannot leak cross-tenant rows even if its own query ignores `user_id`.
 </Note>
 
 <Warning>
@@ -1025,6 +1113,78 @@ agent = Agent(
 | `auto_memory` | `bool` | `False` | Enable automatic memory extraction |
 | `backend` | `str` | `"file"` | Storage backend (`file`, `sqlite`, `chroma`, `mongodb`, `mem0`, `dakera`, `in_memory`) |
 | `user_id` | `str` | `None` | User ID for scoping memories |
+
+### Previews and retry semantics
+
+A preview call extracts memories without consuming the dedup hash, so a later real store for the same text still writes, and a failed store also leaves dedup un-consumed so a retry after the backend recovers stores the extracted memories.
+
+```python
+from praisonaiagents.memory import FileMemory, AutoMemory
+
+base = FileMemory(user_id="user123")
+auto = AutoMemory(base, enabled=True)
+
+# Preview — extraction only, no state change
+auto.process_interaction("I prefer dark mode.", store=False)
+
+# Real store — writes because the preview did not consume dedup
+auto.process_interaction("I prefer dark mode.", store=True)
+
+# Repeated real store — deduplicated (returns [])
+auto.process_interaction("I prefer dark mode.", store=True)
+```
+
+```mermaid
+sequenceDiagram
+    participant U as 👤 Caller
+    participant A as 🔍 AutoMemory
+    participant M as 💾 Base memory
+
+    U->>A: process_interaction(text, store=False)
+    A->>A: extract (hash NOT recorded)
+    A-->>U: memories (deepcopy)
+
+    U->>A: process_interaction(text, store=True)
+    A->>A: hash check → miss
+    A->>M: store memories
+    M-->>A: ok
+    A->>A: hash recorded
+    A-->>U: memories
+
+    U->>A: process_interaction(text, store=True)
+    A->>A: hash check → hit
+    A-->>U: [] (deduped)
+```
+
+Retry resumes after a transient backend outage because dedup is recorded only after a successful write.
+
+```python
+# A failed store leaves dedup un-consumed — retry after recovery stores
+original_add_long_term = base.add_long_term
+base.add_long_term = lambda *a, **kw: (_ for _ in ()).throw(OSError("disk full"))
+
+try:
+    auto.process_interaction("I like concise answers.", store=True)
+except OSError:
+    pass
+
+base.add_long_term = original_add_long_term  # backend recovers
+
+retried = auto.process_interaction("I like concise answers.", store=True)
+assert retried != []   # stores on retry
+```
+
+<Note>
+Fixed in [PraisonAI PR #5689](https://github.com/MervinPraison/PraisonAI/pull/5689) (fixes [#5500](https://github.com/MervinPraison/PraisonAI/issues/5500)). On earlier releases, `process_interaction(..., store=False)` consumed the dedup hash and silently blocked a subsequent real store for the same text; a failed store left the hash consumed and blocked retry.
+</Note>
+
+<Note>
+Overlapping callers sharing one `AutoMemory` instance (such as a shared agent across worker threads) are serialised by an internal `RLock` — the dedup check and the store are atomic, so the same interaction stores exactly once.
+</Note>
+
+<Warning>
+`AutoMemory` tracks at most 1000 in-flight interactions (`_MAX_PENDING_INTERACTIONS = 1000`). On overflow, the oldest pending write is retried before a new interaction is admitted — nothing is evicted silently. If that retry fails, `process_interaction` raises `RuntimeError("AutoMemory pending interaction limit reached; pending retry failed")`.
+</Warning>
 
 ---
 

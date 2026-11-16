@@ -50,6 +50,172 @@ class ConfigVersionError(ValueError):
     """
 
 
+class ConfigValidationError(ValueError):
+    """Raised when gateway config contains an unknown/misspelled key.
+
+    Carries the dotted ``path`` to the offending section plus the offending
+    ``keys`` and (when a near match exists) a ``suggestion`` so the error is
+    actionable — e.g. ``channels.telegram.tokenn: unknown key (did you mean
+    'token'?)`` — rather than the silent no-op a typo produces today (#5723).
+    """
+
+    def __init__(
+        self,
+        path: str,
+        keys: List[str],
+        suggestion: Optional[str] = None,
+    ) -> None:
+        self.path = path
+        self.keys = list(keys)
+        self.suggestion = suggestion
+        # Keys may be non-string YAML scalars; render by string form so the
+        # error message never raises while formatting itself.
+        shown = ", ".join(sorted(str(k) for k in self.keys))
+        msg = f"{path}: unknown key(s): {shown}"
+        if suggestion:
+            msg += f" (did you mean '{suggestion}'?)"
+        super().__init__(msg)
+
+
+def _closest_known_key(unknown: str, known: Set[str]) -> Optional[str]:
+    """Return the closest known key to ``unknown`` for a "did you mean" hint.
+
+    ``unknown`` may be any YAML scalar (e.g. a numeric/boolean mapping key), so
+    only string keys are matched — difflib expects strings and a non-string key
+    cannot be a typo of a reserved string key.
+    """
+    if not isinstance(unknown, str):
+        return None
+    import difflib
+
+    matches = difflib.get_close_matches(unknown, sorted(known), n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+def _check_unknown_keys(
+    data: Mapping[str, Any],
+    known: Set[str],
+    path: str,
+    strict: bool,
+) -> None:
+    """Reject (strict) or warn about keys in ``data`` not present in ``known``.
+
+    When ``strict`` is False (the default, preserving today's fail-open
+    behaviour) a prominent warning is logged for each unknown key so the
+    misconfiguration surfaces before a future release makes it a hard failure.
+    """
+    # Keys may be any YAML scalar (numeric/boolean mapping keys), so compare as
+    # strings and sort by string form to avoid a TypeError on mixed types —
+    # preserving today's tolerance (those extras were silently dropped) rather
+    # than crashing config loading.
+    unknown = sorted(
+        (k for k in data if k not in known), key=lambda k: str(k)
+    )
+    if not unknown:
+        return
+    suggestion = _closest_known_key(unknown[0], known)
+    if strict:
+        raise ConfigValidationError(path, unknown, suggestion)
+    import logging
+
+    hint = f" (did you mean '{suggestion}'?)" if suggestion else ""
+    logging.getLogger(__name__).warning(
+        "Ignoring unknown %s key(s) %s%s; valid keys are %s",
+        path,
+        unknown,
+        hint,
+        sorted(known),
+    )
+
+
+_GRANT_KEYS = {"scopes", "agents"}
+
+
+def _parse_grant(scopes: Any, agents: Any, path: str) -> Any:
+    """Normalise one operator grant to a scope list or ``{scopes, agents}``.
+
+    Issue #6253: unknown grant keys always fail closed — a typo such as
+    ``agnts`` would otherwise silently drop the agent confinement and leave
+    the token able to reach every agent.
+    """
+    if isinstance(scopes, Mapping):
+        _check_unknown_keys(scopes, _GRANT_KEYS, path, strict=True)
+        scopes, agents = scopes.get("scopes", []), scopes.get("agents")
+    scopes = list(scopes or [])
+    if agents is None:
+        return scopes
+    if not isinstance(agents, (list, tuple)):
+        # ``agents: support`` would otherwise iterate into ['s', 'u', ...].
+        raise ValueError(f"{path}: 'agents' must be a list of agent ids")
+    return {"scopes": scopes, "agents": [str(a) for a in agents]}
+
+
+def _parse_auth_scopes(gw_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Parse the YAML ``gateway.auth.tokens`` / ``gateway.auth_scopes`` policy.
+
+    Returns ``None`` when neither form is present so callers can leave an
+    existing policy untouched.
+    """
+    auth_section = gw_data.get("auth")
+    if isinstance(auth_section, Mapping) and isinstance(auth_section.get("tokens"), list):
+        policy: Dict[str, Any] = {}
+        for entry in auth_section["tokens"]:
+            if isinstance(entry, Mapping) and entry.get("token"):
+                # A typo such as ``agnts`` must fail closed here too.
+                _check_unknown_keys(
+                    entry, _GRANT_KEYS | {"token"}, "gateway.auth.tokens", strict=True
+                )
+                policy[str(entry["token"])] = _parse_grant(
+                    entry.get("scopes", []), entry.get("agents"),
+                    "gateway.auth.tokens",
+                )
+        return policy
+    if isinstance(gw_data.get("auth_scopes"), Mapping):
+        return {
+            str(tok): _parse_grant(grant, None, "gateway.auth_scopes")
+            for tok, grant in gw_data["auth_scopes"].items()
+        }
+    return None
+
+
+def _check_typo_keys(
+    data: Mapping[str, Any],
+    reserved: Set[str],
+    path: str,
+    strict: bool,
+) -> None:
+    """Flag keys that look like typos of ``reserved`` keys.
+
+    Unlike :func:`_check_unknown_keys` this does *not* reject every extra key —
+    it only fires on a close misspelling of a reserved key (e.g. ``tokenn`` for
+    ``token``), so sections that legitimately accept pass-through keys (channel
+    metadata) keep working while the #5723 footgun still surfaces.
+    """
+    import difflib
+
+    for key in data:
+        if key in reserved:
+            continue
+        # Only a string key can be a typo of a reserved string key; a
+        # non-string key (numeric/boolean YAML scalar) passes through to
+        # metadata untouched, as before.
+        if not isinstance(key, str):
+            continue
+        match = difflib.get_close_matches(key, sorted(reserved), n=1, cutoff=0.8)
+        if match:
+            if strict:
+                raise ConfigValidationError(path, [key], match[0])
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Ignoring %s key %r which looks like a typo of %r; "
+                "if intentional this is passed through as metadata",
+                path,
+                key,
+                match[0],
+            )
+
+
 @dataclass
 class LegacyConfigRule:
     """A single declarative config-migration rule.
@@ -1034,7 +1200,13 @@ class GatewayConfig:
             scope names (see OperatorScope). When None/empty (default), any
             successfully authenticated client is granted all scopes — identical
             to the previous binary behaviour. Single-operator setups are
-            unaffected.
+            unaffected. A token's value may instead be a mapping
+            ``{"scopes": [...], "agents": [...]}`` to also confine the operator
+            to the listed agent ids (omitted ``agents`` = all agents).
+            Confinement covers WebSocket bind/resume and event delivery only;
+            the HTTP approval endpoints are not yet filtered per agent
+            (tracked in #5151), so do not grant ``approvals`` to a token that
+            must not act on other agents' requests.
     """
     
     host: str = "127.0.0.1"
@@ -1092,7 +1264,9 @@ class GatewayConfig:
     # (0 = disabled).
     max_unauthorized_frames: int = 10
     push: PushConfig = field(default_factory=PushConfig)
-    auth_scopes: Optional[Dict[str, List[str]]] = None
+    # Issue #6253: a value is either a scope list or
+    # ``{"scopes": [...], "agents": [...]}`` (agent confinement).
+    auth_scopes: Optional[Dict[str, Any]] = None
     # Additive protocol surfaces (OpenAI-compatible / MCP) served on the same
     # app and auth. Opt-in; disabled by default so the gateway is unchanged.
     api: ApiConfig = field(default_factory=ApiConfig)
@@ -1213,6 +1387,8 @@ class GatewayConfig:
         if token is None:
             return []
         granted = self.auth_scopes.get(token)
+        if isinstance(granted, dict):
+            granted = granted.get("scopes") or []
         if granted is None:
             return []
         resolved: List[str] = []
@@ -1231,6 +1407,22 @@ class GatewayConfig:
                 sorted(valid_scopes),
             )
         return resolved
+
+    def resolve_agents(self, token: Optional[str]) -> Optional[List[str]]:
+        """Resolve the agent ids ``token`` is confined to (Issue #6253).
+
+        ``None`` means unconfined (every agent) — the result whenever no
+        policy is set or the token's entry carries no ``agents`` list, so
+        existing ``token -> [scopes]`` policies are unchanged. A token absent
+        from a configured policy holds no scopes, so it never reaches an
+        agent regardless of this value.
+        """
+        if not self.auth_scopes or token is None:
+            return None
+        entry = self.auth_scopes.get(token)
+        if not isinstance(entry, dict) or entry.get("agents") is None:
+            return None
+        return [str(a) for a in entry["agents"]]
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary (hides sensitive data)."""
@@ -1367,8 +1559,33 @@ class MultiChannelGatewayConfig:
     channels: Dict[str, ChannelRouteConfig] = field(default_factory=dict)
     hooks: List[Any] = field(default_factory=list)
     
+    # Known top-level and nested keys for strict unknown-key validation
+    # (#5723). Kept here as the single source of truth consumed by all three
+    # surfaces (YAML, CLI, Python) — ``gateway doctor`` reuses the same sets.
+    _KNOWN_TOP_KEYS = frozenset({"gateway", "agents", "channels", "hooks", "config_version"})
+    _KNOWN_GATEWAY_KEYS = frozenset({
+        "host", "port", "trusted_proxies", "cors_origins", "allowed_origins",
+        "auth_token", "auth", "auth_scopes", "max_connections",
+        "max_sessions_per_agent", "session_config", "heartbeat_interval",
+        "reconnect_timeout", "per_turn_timeout", "ssl_cert", "ssl_key",
+        "max_buffered_bytes", "max_queued_frames", "max_concurrent_runs",
+        "queue_depth", "overflow_policy", "drain_timeout", "watchdog",
+        "watchdog_timeout", "max_concurrent_runs_per_scope",
+        "preauth_max_connections_per_ip", "max_unauthorized_frames",
+        "api", "liveness", "turn_lock", "control", "attachments",
+        "push", "preflight", "strict_tools", "hooks",
+        # Derived/read-only keys emitted by ``GatewayConfig.to_dict`` so a
+        # round-tripped config stays strict-clean.
+        "ssl_enabled", "scope_policy_enabled", "executor",
+    })
+    _KNOWN_CHANNEL_KEYS = frozenset({
+        "token", "app_token", "routes", "enabled",
+    })
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "MultiChannelGatewayConfig":
+    def from_dict(
+        cls, data: Dict[str, Any], *, strict: bool = False
+    ) -> "MultiChannelGatewayConfig":
         """Create from parsed YAML dictionary.
         
         Expected format::
@@ -1389,12 +1606,27 @@ class MultiChannelGatewayConfig:
         
         Args:
             data: Parsed YAML dictionary
+            strict: When True, unknown/misspelled keys raise
+                :class:`ConfigValidationError` with a path-scoped, actionable
+                message. When False (default, backward-compatible) unknown keys
+                are tolerated but logged as a prominent warning so a typo such
+                as ``channels.telegram.tokenn`` surfaces instead of silently
+                no-op'ing (#5723).
             
         Returns:
             Configured MultiChannelGatewayConfig instance
         """
+        # Validate top-level keys first so a misplaced section is caught early.
+        # Use a distinct "<root>" path so a top-level typo (e.g. ``channelz``)
+        # is not misreported under the ``gateway`` section it does not live in.
+        _check_unknown_keys(data, set(cls._KNOWN_TOP_KEYS), "<root>", strict)
+
         # Parse gateway section
         gw_data = data.get("gateway", {})
+        if isinstance(gw_data, dict):
+            _check_unknown_keys(
+                gw_data, set(cls._KNOWN_GATEWAY_KEYS), "gateway", strict
+            )
         
         # Parse session config if provided
         session_config = SessionConfig()
@@ -1422,18 +1654,10 @@ class MultiChannelGatewayConfig:
         #   gateway:
         #     auth_scopes:
         #       "${VIEWER_TOKEN}": [read]
-        auth_scopes: Optional[Dict[str, List[str]]] = None
-        auth_section = gw_data.get("auth")
-        if isinstance(auth_section, dict) and isinstance(auth_section.get("tokens"), list):
-            auth_scopes = {}
-            for entry in auth_section["tokens"]:
-                if isinstance(entry, dict) and entry.get("token"):
-                    auth_scopes[str(entry["token"])] = list(entry.get("scopes", []))
-        elif isinstance(gw_data.get("auth_scopes"), dict):
-            auth_scopes = {
-                str(tok): list(scopes)
-                for tok, scopes in gw_data["auth_scopes"].items()
-            }
+        # Either shape may add ``agents: [...]`` per token (Issue #6253):
+        #     auth_scopes:
+        #       "${SUPPORT_TOKEN}": {scopes: [read, write], agents: [support]}
+        auth_scopes = _parse_auth_scopes(gw_data)
 
         raw_trusted = gw_data.get("trusted_proxies", [])
         trusted_proxies = (
@@ -1497,6 +1721,17 @@ class MultiChannelGatewayConfig:
         channels: Dict[str, ChannelRouteConfig] = {}
         for name, ch_data in data.get("channels", {}).items():
             if isinstance(ch_data, dict):
+                # Channels deliberately pass unrecognised keys through to
+                # ``metadata`` for channel-specific config, so we can't reject
+                # *every* extra key. Instead flag only near-miss typos of the
+                # reserved keys (e.g. ``tokenn`` → ``token``) — the motivating
+                # footgun in #5723 — leaving genuine metadata untouched.
+                _check_typo_keys(
+                    ch_data,
+                    set(cls._KNOWN_CHANNEL_KEYS),
+                    f"channels.{name}",
+                    strict,
+                )
                 channels[name] = ChannelRouteConfig(
                     channel_type=name,
                     token_env=ch_data.get("token", ""),

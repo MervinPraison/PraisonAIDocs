@@ -140,6 +140,10 @@ Invoke a specific PraisonAI agent with input data.
 | `agent_config` | `object` | Optional per-request overrides applied to the isolated agent clone. Keys are validated against a whitelist; an unknown or unsettable key returns **HTTP 400**. See _Supported `agent_config` keys_ below. |
 | `context` | `object` | Additional context data |
 
+<Note>
+`Idempotency-Key` is a request **header** (not a body field). See [Safe Retries](#safe-retries-idempotency-key) below.
+</Note>
+
 ### Supported `agent_config` keys
 
 `agent_config` overrides only the whitelisted attributes below on the request's isolated clone. Any other key returns a `400`.
@@ -287,6 +291,170 @@ sequenceDiagram
 <Note>
 Every deployment that serves `praisonai serve agents.yaml` (or embeds `router` from `praisonai.api.agent_invoke`) gets this cleanup automatically — including every n8n workflow that hits the endpoint. See [Agent Lifecycle Cleanup](/features/agent-lifecycle-cleanup) and [Agent Invoke Registry](/features/agent-invoke-registry).
 </Note>
+
+### Safe Retries (`Idempotency-Key`)
+
+Send the same `Idempotency-Key` header on a retry and the invoke endpoint returns `409` instead of starting a second agent run — no duplicate tool actions, no doubled LLM spend.
+
+```mermaid
+graph LR
+    Req[📨 POST /invoke<br/>Idempotency-Key: abc] --> Check{🔍 Key seen<br/>for this agent?}
+    Check -->|No| Run[🤖 Run agent]
+    Run --> Ok[✅ 200 — key recorded]
+    Run --> Fail[⚠️ 500 — key freed]
+    Check -->|Yes| Dup[🚫 409 — no second run]
+
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Req request
+    class Check,Fail check
+    class Run agent
+    class Ok result
+    class Dup error
+```
+
+Opt-in, backward-compatible: **no header → unchanged behaviour** (every POST runs the agent). The request body is unchanged.
+
+```python
+import os
+import uvicorn
+from fastapi import FastAPI
+from praisonaiagents import Agent
+from praisonai.api.agent_invoke import register_agent, router
+
+os.environ.setdefault("CALL_SERVER_TOKEN", "my-secret-token")
+
+agent = Agent(name="support", instructions="Handle refund requests.")
+register_agent("support", agent)
+
+app = FastAPI()
+app.include_router(router)
+uvicorn.run(app, host="127.0.0.1", port=8005)
+```
+
+```bash
+curl -X POST http://127.0.0.1:8005/api/v1/agents/support/invoke \
+  -H "Authorization: Bearer my-secret-token" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: order-123" \
+  -d '{"message": "refund order 123"}'
+```
+
+<Steps>
+<Step title="Retry with the same key">
+Your client times out after the agent already fired the refund. Retry with the **same** key — the retry gets `409`, so the refund is not issued twice.
+
+```python
+import requests
+
+url = "http://127.0.0.1:8005/api/v1/agents/support/invoke"
+headers = {"Authorization": "Bearer my-secret-token", "Idempotency-Key": "order-123"}
+body = {"message": "refund order 123"}
+
+first = requests.post(url, json=body, headers=headers)   # 200 — agent runs
+retry = requests.post(url, json=body, headers=headers)   # 409 — no second run
+print(first.status_code, retry.status_code)
+```
+</Step>
+
+<Step title="Set the header in n8n">
+Add the header to the HTTP Request node. Use a value that stays the same across n8n's retries of one item but differs between items.
+
+```json
+{
+  "method": "POST",
+  "url": "http://localhost:8005/api/v1/agents/support/invoke",
+  "sendBody": true,
+  "specifyBody": "json",
+  "jsonBody": "{\"message\": \"{{ $json.query }}\"}",
+  "options": {
+    "headers": {
+      "Authorization": "Bearer {{ $node.parameter.auth_token }}",
+      "Idempotency-Key": "{{ $execution.id }}-{{ $itemIndex }}"
+    }
+  }
+}
+```
+
+With **Retry On Fail** enabled, a timed-out attempt that already reached the agent now returns `409` on the retry instead of running the agent again.
+</Step>
+
+<Step title="Retry after a failure">
+If the first run fails (tool error, LLM timeout → `500`), just retry with the same key. A failed run frees its key, so the retry runs the agent normally.
+</Step>
+</Steps>
+
+**What happens in each case:**
+
+| Case | HTTP status | Agent run? |
+|------|-------------|------------|
+| No `Idempotency-Key` header | unchanged behaviour (200 on success) | Yes — every call runs |
+| First use of a key, run succeeds | `200` | Yes — key is recorded |
+| Retry with the same key while first run is still in flight | `409` with `detail: "A run with this Idempotency-Key was already submitted"` | No — key is reserved |
+| Retry with the same key after a successful run (within TTL) | `409` same body | No — key is committed |
+| Retry with the same key after the first request failed (`400` bad `agent_config`, or `500`) | normal behaviour (200/400/500) | Yes — a failed request frees its key, so retries are allowed |
+| Request is cancelled (connection drop, `asyncio.CancelledError`) | — | Reservation is kept (sync `start` keeps running in its worker thread). A retry sees `409`. |
+| Idempotency store cannot be opened (filesystem error) | `503` with `detail: "Idempotency store unavailable; retry later"` | No — the request is rejected rather than running without dedup protection |
+
+```mermaid
+sequenceDiagram
+    participant Client as 💻 Client
+    participant LB as 🔀 n8n / Load balancer
+    participant Route as 🌐 /invoke route
+    participant Store as 💾 Idempotency store
+    participant Agent as 🤖 Agent
+
+    Client->>LB: POST /invoke<br/>Idempotency-Key: abc
+    LB->>Route: Forward (attempt 1)
+    Route->>Store: reserve(agent_id, abc)
+    Store-->>Route: admitted
+    Route->>Agent: start()
+    Note over LB,Route: Connection drops before response
+    LB->>Route: Forward (attempt 2, same key)
+    Route->>Store: reserve(agent_id, abc)
+    Store-->>Route: already reserved
+    Route-->>LB: 409 — no second run
+    Agent-->>Route: (first run finishes)
+    Route->>Store: record(agent_id, abc)
+```
+
+**Scoping and limits:**
+
+| Rule | Why |
+|------|-----|
+| **Per agent** | Keys are scoped by `agent_id`, so `support` and `billing` with the same key run independently. |
+| **No response replay** | The store tracks keys only. A retry sees `409`, not the first run's result. For a replayable result, use the async Jobs API (`POST /api/v1/runs`). |
+| **Failed runs free their key** | A `400` or `500` from the first request releases the reservation so the client can retry safely. |
+| **Cancelled requests keep the reservation** | A dropped connection does not free the key (the sync `start` keeps running in its worker thread). |
+| **Store unavailable → 503** | If the SQLite database can't be opened, the request is rejected rather than running without dedup protection. |
+| **Durable, 24h TTL** | SQLite at `$PRAISONAI_HOME/state/invoke_idempotency.db` (default `~/.praisonai/state/`); survives restart. |
+
+<Note>
+Unlike the gateway's [OpenAI-compatible endpoints](/features/gateway-api-endpoints), which replay the first run's result, `/invoke` answers a duplicate with `409`. There is no config knob, CLI flag, or new dependency — the header is the whole feature.
+</Note>
+
+**Which endpoint for safe retries?**
+
+```mermaid
+graph TB
+    Q1{Need the result<br/>back on retry?}
+    Q1 -->|No, just dedupe| Invoke[POST /api/v1/agents/.../invoke<br/>Idempotency-Key → 409 on duplicate]
+    Q1 -->|Yes, replay the result| Q2{Using the<br/>gateway?}
+    Q2 -->|Yes| Gateway[Gateway /v1/responses<br/>replays first result]
+    Q2 -->|No, standalone| Jobs[POST /api/v1/runs<br/>Idempotency-Key → returns the same job]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef choice fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q1,Q2 question
+    class Invoke,Gateway,Jobs choice
+```
+
+See [Gateway API → Safe Retries](/features/gateway-api-endpoints) and [Async Jobs → Submit Run](/deploy/api/async-jobs/submit-run).
 
 **Response:**
 
@@ -853,6 +1021,30 @@ Secure your API integration:
 **Cause:** Fixed in PR #5083. Before that release, the invoke handler discarded the per-request agent clone without calling `close()` / `aclose()`, so lazily-created MCP subprocesses, LLM HTTP pools, and tool-executor threads leaked.
 
 **Fix:** Upgrade to the release containing PR #5083. Verify with `pytest src/praisonai/tests/test_n8n_agent_invoke.py::TestAgentInvokeCleanup -v`.
+</Tab>
+
+<Tab title="409 Conflict on retry">
+**Symptom:** a retry returns `409` with `detail: "A run with this Idempotency-Key was already submitted"`.
+
+**Cause:** working as intended — the first request with that key already ran (or is still running), so the retry is not run again.
+
+**Fix:** nothing to fix. If you need the first run's result back on retry, use the async Jobs API (`POST /api/v1/runs`) instead — see _Safe Retries_ above.
+</Tab>
+
+<Tab title="503 Idempotency store unavailable">
+**Symptom:** a request with an `Idempotency-Key` header returns `503` with `detail: "Idempotency store unavailable; retry later"`.
+
+**Cause:** the server could not open `$PRAISONAI_HOME/state/invoke_idempotency.db` (default `~/.praisonai/state/`).
+
+**Fix:** make sure `$PRAISONAI_HOME` (or `~/.praisonai`) exists and is writable by the server process.
+</Tab>
+
+<Tab title="n8n keeps re-running my agent">
+**Symptom:** an n8n retry (timeout, "Retry On Fail") runs the agent twice — duplicate tool actions, doubled LLM spend.
+
+**Cause:** the HTTP Request node is not sending an `Idempotency-Key` header.
+
+**Fix:** add an `Idempotency-Key` header with a value that stays the same across retries (for example `{{ $execution.id }}-{{ $itemIndex }}`). See _Safe Retries_ above.
 </Tab>
 </Tabs>
 

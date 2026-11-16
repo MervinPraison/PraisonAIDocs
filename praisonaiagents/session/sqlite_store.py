@@ -35,7 +35,13 @@ from typing import Any, Dict, List, Optional
 
 from praisonaiagents._logging import get_logger
 
-from .store import DefaultSessionStore, FileLock, SessionData
+from .store import (
+    DefaultSessionStore,
+    FileLock,
+    SessionData,
+    _legacy_session_filename,
+    _safe_session_filename,
+)
 
 logger = get_logger(__name__)
 
@@ -51,7 +57,8 @@ class SqliteSessionStore(DefaultSessionStore):
     # Bumped whenever ``_flatten`` changes what content lands in the index, so
     # a store built by an older release rebuilds its FTS rows once on upgrade.
     # v2: archived_messages included (Issue #5031).
-    INDEX_CONTENT_VERSION = 2
+    # v3: compaction summaries excluded (Issue #5051).
+    INDEX_CONTENT_VERSION = 3
 
     def __init__(
         self,
@@ -175,6 +182,10 @@ class SqliteSessionStore(DefaultSessionStore):
             "CREATE INDEX IF NOT EXISTS idx_route_agent "
             "ON session_route(agent_id)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_route_agent_session "
+            "ON session_route(agent_id, session_id)"
+        )
 
     @staticmethod
     def _init_index_meta_schema(conn) -> None:
@@ -225,11 +236,16 @@ class SqliteSessionStore(DefaultSessionStore):
         Includes ``archived_messages`` (turns rolled out of the active window
         by ``retention="compact"``) ahead of the active ``messages`` so a
         compaction re-index preserves — rather than deletes — the raw turns,
-        keeping the whole conversation searchable (Issue #5031).
+        keeping the whole conversation searchable (Issue #5031). Compaction
+        summaries are skipped: search never scores them, so indexing them
+        would only spend the candidate allowance on misses (Issue #5051).
         """
         parts = []
         for msg in (*session.archived_messages, *session.messages):
             content = getattr(msg, "content", "")
+            metadata = getattr(msg, "metadata", None)
+            if isinstance(metadata, dict) and metadata.get("compaction"):
+                continue
             if content:
                 parts.append(str(content))
         return "\n".join(parts)
@@ -386,6 +402,22 @@ class SqliteSessionStore(DefaultSessionStore):
         except Exception:
             return set()
 
+    def _stored_session_id(self, filename: str) -> Optional[str]:
+        """Return the id stored in ``filename`` if it maps back to that file."""
+        import json
+
+        try:
+            with open(os.path.join(self.session_dir, filename), "r", encoding="utf-8") as f:
+                sid = json.load(f).get("session_id")
+        except (OSError, ValueError, AttributeError):
+            return None
+        if isinstance(sid, str) and filename in (
+            f"{_safe_session_filename(sid)}.json",
+            f"{_legacy_session_filename(sid)}.json",
+        ):
+            return sid
+        return None
+
     def _reindex_all(self) -> bool:
         """Backfill the index from existing JSON transcripts.
 
@@ -429,6 +461,10 @@ class SqliteSessionStore(DefaultSessionStore):
             if not filename.endswith(".json"):
                 continue
             sid = filename[:-5]
+            if "~" in sid or sid not in already:
+                # Hashed or pre-#6024 legacy name (Issue #6024): the real id
+                # lives in the file; loading it migrates a legacy file.
+                sid = self._stored_session_id(filename) or sid
             if sid in pending:
                 # Failed restore retries must not be bypassed by a synthetic
                 # empty transcript from the initial/upgrade backfill path.
@@ -823,14 +859,18 @@ class SqliteSessionStore(DefaultSessionStore):
         if limit == 0:
             return []
         verified = []
-        offset = 0
+        after = None
         try:
             while True:
                 with self._db_lock:
+                    # A peer can remove or reassign earlier rows during file
+                    # verification. Resume by identity, not a shifting offset.
+                    condition = "" if after is None else "AND session_id > ? "
+                    params = (agent_id, limit) if after is None else (agent_id, after, limit)
                     rows = conn.execute(
                         "SELECT session_id FROM session_route WHERE agent_id = ? "
-                        "LIMIT ? OFFSET ?",
-                        (agent_id, limit, offset),
+                        + condition + "ORDER BY session_id LIMIT ?",
+                        params,
                     ).fetchall()
                 if not rows:
                     break
@@ -844,7 +884,7 @@ class SqliteSessionStore(DefaultSessionStore):
                             return verified
                 if limit < 0:
                     break
-                offset += len(rows)
+                after = rows[-1][0]
         except Exception as exc:
             logger.debug("Route lookup failed (%s); falling back to scan.", exc)
             return super().list_sessions_by_gateway_agent(agent_id, limit)
@@ -892,7 +932,7 @@ class SqliteSessionStore(DefaultSessionStore):
                 if not isinstance(msg, dict):
                     continue
                 content = str(msg.get("content", ""))
-                if not content:
+                if not content or self._is_compaction_summary(msg):
                     continue
                 lowered = content.lower()
                 score = 0.0

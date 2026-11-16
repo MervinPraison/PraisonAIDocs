@@ -17,6 +17,7 @@ Usage (no Agent param needed)::
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextvars
 import threading
 from praisonaiagents._logging import get_logger
@@ -43,6 +44,9 @@ DEFAULT_DANGEROUS_TOOLS: Dict[str, str] = {
     "acp_edit_file": "high",
     "acp_delete_file": "high",
     "execute_query": "high",
+    "github_create_branch": "high",
+    "github_commit_and_push": "high",
+    "github_create_pull_request": "high",
     "evaluate": "medium",
     "crawl": "medium",
     "scrape_page": "medium",
@@ -75,10 +79,11 @@ DOOM_LOOP_TARGET = "__doom_loop__"
 # or set ``PRAISONAI_TOOL_SAFETY=off``; users who want stricter
 # controls can opt into ``approval="safe"`` or ``"read_only"``.
 PERMISSION_PRESETS = {
-    # "default" — blocks delete + shell/code exec. Allows read/create/edit.
+    # "default" — blocks delete + shell/code exec + git push/PR. Allows read/create/edit.
     "default": frozenset({
         "execute_command", "kill_process", "execute_code", "acp_execute_command",
         "delete_file", "move_file", "copy_file", "acp_delete_file",
+        "github_create_branch", "github_commit_and_push", "github_create_pull_request",
     }),
     # "safe" — blocks all dangerous tools (file writes, shell exec, etc.)
     "safe": frozenset(DEFAULT_DANGEROUS_TOOLS.keys()),
@@ -90,6 +95,24 @@ PERMISSION_PRESETS = {
     "off": frozenset(),
 }
 
+# Optional host hook (Issue #5912): a runner that bounds concurrent work (e.g.
+# the gateway's admission gate) binds a zero-arg factory here for the duration
+# of an admitted turn. The registry enters ``factory()`` — a sync *and* async
+# context manager — around the backend's human wait so a turn parked on a
+# person does not occupy a run slot. Unbound (the default) is a no-op.
+HUMAN_WAIT_SCOPE: contextvars.ContextVar[Optional[Callable[[], object]]] = contextvars.ContextVar(
+    "praisonai_approval_human_wait_scope", default=None
+)
+
+
+def _human_wait_scope() -> object:
+    factory = HUMAN_WAIT_SCOPE.get()
+    if factory is None:
+        import contextlib
+        return contextlib.nullcontext()
+    return factory()
+
+
 class ApprovalRegistry:
     """Per-agent approval configuration.
 
@@ -97,6 +120,9 @@ class ApprovalRegistry:
     semantics.  The singleton instance is obtained via
     :func:`get_approval_registry`.
     """
+
+    # Upper bound on per-context approval-cache entries (see ``mark_approved``).
+    _MAX_CONTEXT_APPROVALS = 1024
 
     def __init__(self) -> None:
         # Backends
@@ -122,6 +148,17 @@ class ApprovalRegistry:
         # agent's grant that is being written at the same time. Only wraps these
         # small in-memory mutations, so it adds no hot-path cost.
         self._scope_lock = threading.Lock()
+        # Scope ids whose release a GC finalizer could not apply because
+        # ``_scope_lock`` was held (possibly by the very frame the collector
+        # interrupted). Drained by the next ``release_scope``.
+        self._pending_scope_releases: List[str] = []
+        # Scope ids of agents that have been closed or collected. A finalizer
+        # appends here (deque.append is atomic, so no lock); the next ordinary
+        # ``mark_approved`` drains it and prunes those agents' keys from the
+        # per-context cache it is already copying. Bounded: if a dead scope
+        # falls off the end its keys are still bounded by the cache cap below.
+        self._dead_scope_ids: collections.deque = collections.deque(maxlen=4096)
+        self._dead_scopes: Dict[str, None] = {}
 
         # Per-agent, per-tool auto-approval (G-A fix)
         self._agent_tool_auto_approve: Dict[tuple[str, str], bool] = {}
@@ -133,8 +170,10 @@ class ApprovalRegistry:
         self._session_scoped_targets: Set[tuple[Optional[str], str]] = set()
 
         # Context variables (per-coroutine / per-thread)
-        self._approved_context: contextvars.ContextVar[Set[str]] = contextvars.ContextVar(
-            "approved_context", default=set()
+        # Per-context approval cache: an insertion-ordered ``{cache_key: scope}``
+        # mapping, replaced (never mutated) on every write. ``None`` = empty.
+        self._approved_context: contextvars.ContextVar[Optional[Dict[str, str]]] = contextvars.ContextVar(
+            "approved_context", default=None
         )
         self._yaml_approved_tools: contextvars.ContextVar[Set[str]] = contextvars.ContextVar(
             "yaml_approved_tools", default=set()
@@ -235,6 +274,30 @@ class ApprovalRegistry:
                 return level
         return self._risk_levels.get(tool_name)
 
+    def list_requirements(self) -> List[Dict[str, Optional[str]]]:
+        """Public, stable view of every approval requirement.
+
+        Returns one entry per (tool, agent) pair -- ``agent`` is ``None`` for a
+        global requirement -- so callers (e.g. an HTTP ``/approvals`` surface)
+        can enumerate requirements without reaching into private fields. Keeps
+        the internal storage shape free to change without breaking consumers.
+        """
+        requirements: List[Dict[str, Optional[str]]] = []
+        for tool_name in sorted(self._required_tools):
+            requirements.append({
+                "tool": tool_name,
+                "agent": None,
+                "risk_level": self.get_risk_level(tool_name),
+            })
+        for agent_name, tools in self._agent_required_tools.items():
+            for tool_name in sorted(tools):
+                requirements.append({
+                    "tool": tool_name,
+                    "agent": agent_name,
+                    "risk_level": self.get_risk_level(tool_name, agent_name),
+                })
+        return requirements
+
     # ── Per-tool auto-approval (G-A fix) ─────────────────────────────────
 
     def auto_approve_tool(self, tool_name: str, agent_name: str) -> None:
@@ -280,9 +343,47 @@ class ApprovalRegistry:
         agent_name: Optional[str] = None,
         scope_id: Optional[str] = None,
     ) -> None:
-        approved = self._approved_context.get(set())
-        approved.add(self._approval_cache_key(tool_name, arguments or {}, agent_name, scope_id))
-        self._approved_context.set(approved)
+        # Copy-on-write: ``contextvars.copy_context()`` copies the mapping, not
+        # the cache object, so mutating it in place would leak an approval
+        # granted in a child context (worker thread, task) into its parent and
+        # siblings. The copy also prunes keys of agents that have since died
+        # and keeps at most ``_MAX_CONTEXT_APPROVALS`` (oldest dropped first;
+        # a dropped entry only means a human may be asked again).
+        key = self._approval_cache_key(tool_name, arguments or {}, agent_name, scope_id)
+        scope = scope_id or agent_name or '*'
+        dead = self._drain_dead_scopes()
+        current = self._approved_context.get(None) or {}
+        if key in current and not dead:
+            return
+        if isinstance(current, dict):
+            fresh = {k: s for k, s in current.items() if s not in dead} if dead else dict(current)
+        else:  # tolerate a plain set written by older code or tests
+            # Keys are "{scope}:{tool}:{hash}" and scope ids themselves contain
+            # a colon ("{name}:{uuid}"), so strip the last two fields.
+            fresh = {k: k.rsplit(":", 2)[0] for k in current}
+        fresh.pop(key, None)
+        fresh[key] = scope
+        overflow = len(fresh) - self._MAX_CONTEXT_APPROVALS
+        if overflow > 0:
+            for old in list(fresh)[:overflow]:
+                del fresh[old]
+        self._approved_context.set(fresh)
+
+    def _drain_dead_scopes(self) -> Dict[str, None]:
+        """Move finalizer-reported dead scopes into the bounded lookup map.
+
+        Called only from ordinary (non-finalizer) code. Returns the map so the
+        caller can prune with an O(1) membership test per cached key.
+        """
+        if self._dead_scope_ids:
+            with self._scope_lock:
+                while self._dead_scope_ids:
+                    self._dead_scopes[self._dead_scope_ids.popleft()] = None
+                overflow = len(self._dead_scopes) - self._dead_scope_ids.maxlen
+                if overflow > 0:
+                    for old in list(self._dead_scopes)[:overflow]:
+                        del self._dead_scopes[old]
+        return self._dead_scopes
 
     def is_already_approved(
         self,
@@ -293,7 +394,7 @@ class ApprovalRegistry:
     ) -> bool:
         # Honour an explicit mark_approved() from the agent approval path even
         # for critical tools (e.g. execute_command after AutoApproveBackend).
-        if self._approval_cache_key(tool_name, arguments or {}, agent_name, scope_id) in self._approved_context.get(set()):
+        if self._approval_cache_key(tool_name, arguments or {}, agent_name, scope_id) in (self._approved_context.get(None) or ()):
             return True
         return False
 
@@ -415,11 +516,11 @@ class ApprovalRegistry:
             )
 
     def clear_approved(self) -> None:
-        self._approved_context.set(set())
+        self._approved_context.set(None)
         with self._scope_lock:
             self._session_scoped_targets.clear()
 
-    def release_scope(self, scope_id: str) -> None:
+    def release_scope(self, scope_id: str, *, from_finalizer: bool = False) -> None:
         """Drop all grants recorded under a per-instance approval scope id.
 
         ``auto_approve_tool`` (skill ``allowed-tools`` pre-approval),
@@ -431,6 +532,14 @@ class ApprovalRegistry:
         ``Agent.close()``/``aclose()``/``__del__`` to reclaim a dead agent's
         entries without touching any other agent's grants.
 
+        ``from_finalizer=True`` must be used from a garbage-collection
+        finalizer, which runs in whichever thread and context the collector
+        fires in, possibly in the middle of a ContextVar update or while this
+        thread already holds ``_scope_lock``. It therefore never writes the
+        ContextVar (the "current" context there is not the agent's anyway) and
+        never blocks on the lock: if the lock is busy the release is queued and
+        applied by the next ``release_scope`` call.
+
         Mutates the shared collections **in place under ``_scope_lock``** (rather
         than rebuilding-and-replacing) so a concurrent writer's grant for a
         *different* scope can never be lost to a read-modify-write race, and
@@ -438,11 +547,24 @@ class ApprovalRegistry:
         """
         if not scope_id:
             return
-        with self._scope_lock:
-            for key in [k for k in self._agent_tool_auto_approve if k[0] == scope_id]:
+        # Lets every context prune this agent's cache keys on its next write.
+        self._dead_scope_ids.append(scope_id)
+        if from_finalizer:
+            if not self._scope_lock.acquire(blocking=False):
+                self._pending_scope_releases.append(scope_id)
+                return
+        else:
+            self._scope_lock.acquire()
+        try:
+            scopes = {scope_id}
+            while self._pending_scope_releases:
+                scopes.add(self._pending_scope_releases.pop())
+            for key in [k for k in self._agent_tool_auto_approve if k[0] in scopes]:
                 self._agent_tool_auto_approve.pop(key, None)
-            for entry in [t for t in self._session_scoped_targets if t[0] == scope_id]:
+            for entry in [t for t in self._session_scoped_targets if t[0] in scopes]:
                 self._session_scoped_targets.discard(entry)
+        finally:
+            self._scope_lock.release()
 
         # Evict this scope's per-context approval-cache keys. ``mark_approved``
         # stores ``"{scope_id}:{tool}:{hash}"`` entries in the ``_approved_context``
@@ -450,10 +572,16 @@ class ApprovalRegistry:
         # agents would otherwise retain one key per approved call forever. This
         # only touches the *current* context's set (ContextVars are per
         # coroutine/thread), which is the context the closing agent ran in.
-        prefix = f"{scope_id}:"
+        if from_finalizer:
+            return
         try:
-            approved = self._approved_context.get(set())
-            if approved:
+            approved = self._approved_context.get(None)
+            if isinstance(approved, dict) and approved:
+                remaining = {k: s for k, s in approved.items() if s != scope_id}
+                if len(remaining) != len(approved):
+                    self._approved_context.set(remaining)
+            elif approved:  # a plain set written by older code or tests
+                prefix = f"{scope_id}:"
                 remaining = {k for k in approved if not k.startswith(prefix)}
                 if len(remaining) != len(approved):
                     self._approved_context.set(remaining)
@@ -565,28 +693,41 @@ class ApprovalRegistry:
             liveness=liveness,
         )
 
-        # Prefer sync method if available
-        if hasattr(backend, "request_approval_sync"):
-            decision = backend.request_approval_sync(request)
-        else:
-            # Use shared utility for consistent async-to-sync bridging
-            from .utils import run_coroutine_safely
-            decision = run_coroutine_safely(
-                backend.request_approval(request),
-                timeout=self.timeout
-            )
+        # Replay: a person is actually being asked (the fast paths above are not).
+        from ..trace.context_events import _approval_begin, _approval_end
+        _trace = _approval_begin(request)
+        try:
+            with _human_wait_scope():
+                # Prefer sync method if available
+                if hasattr(backend, "request_approval_sync"):
+                    decision = backend.request_approval_sync(request)
+                else:
+                    # Use shared utility for consistent async-to-sync bridging
+                    from .utils import run_coroutine_safely
+                    decision = run_coroutine_safely(
+                        backend.request_approval(request),
+                        timeout=self.timeout
+                    )
 
-        # Live-authority gate: a resolution that lands after the originating
-        # turn was stopped/superseded is dropped fail-closed — the tool does not
-        # run and no durable session/always grant is persisted.
-        stale = self._reject_if_stale(request)
-        if stale is not None:
-            return stale
+            # Live-authority gate: a resolution that lands after the originating
+            # turn was stopped/superseded is dropped fail-closed — the tool does not
+            # run and no durable session/always grant is persisted.
+            stale = self._reject_if_stale(request)
+            if stale is not None:
+                decision = stale
+                return stale
 
-        if decision.approved:
-            self.mark_approved(tool_name, arguments, agent_name, scope_id)
-        self._persist_scoped_decision(agent_name, tool_name, arguments, decision, scope_id)
-        return decision
+            if decision.approved:
+                self.mark_approved(tool_name, arguments, agent_name, scope_id)
+            self._persist_scoped_decision(agent_name, tool_name, arguments, decision, scope_id)
+            return decision
+        except BaseException as exc:
+            _approval_end(_trace, error=exc)
+            _trace = None
+            raise
+        finally:
+            if _trace is not None:
+                _approval_end(_trace, decision)
 
     async def approve_async(
         self,
@@ -639,25 +780,38 @@ class ApprovalRegistry:
             liveness=liveness,
         )
 
+        # Replay: a person is actually being asked (the fast paths above are not).
+        from ..trace.context_events import _approval_begin, _approval_end
+        _trace = _approval_begin(request)
         try:
-            decision = await asyncio.wait_for(
-                backend.request_approval(request),
-                timeout=self.timeout,
-            )
-        except asyncio.TimeoutError:
-            decision = ApprovalDecision(approved=False, reason="Approval timed out")
+            try:
+                async with _human_wait_scope():
+                    decision = await asyncio.wait_for(
+                        backend.request_approval(request),
+                        timeout=self.timeout,
+                    )
+            except asyncio.TimeoutError:
+                decision = ApprovalDecision(approved=False, reason="Approval timed out")
 
-        # Live-authority gate: a resolution that lands after the originating
-        # turn was stopped/superseded is dropped fail-closed — the tool does not
-        # run and no durable session/always grant is persisted.
-        stale = self._reject_if_stale(request)
-        if stale is not None:
-            return stale
+            # Live-authority gate: a resolution that lands after the originating
+            # turn was stopped/superseded is dropped fail-closed — the tool does not
+            # run and no durable session/always grant is persisted.
+            stale = self._reject_if_stale(request)
+            if stale is not None:
+                decision = stale
+                return stale
 
-        if decision.approved:
-            self.mark_approved(tool_name, arguments, agent_name, scope_id)
-        self._persist_scoped_decision(agent_name, tool_name, arguments, decision, scope_id)
-        return decision
+            if decision.approved:
+                self.mark_approved(tool_name, arguments, agent_name, scope_id)
+            self._persist_scoped_decision(agent_name, tool_name, arguments, decision, scope_id)
+            return decision
+        except BaseException as exc:
+            _approval_end(_trace, error=exc)
+            _trace = None
+            raise
+        finally:
+            if _trace is not None:
+                _approval_end(_trace, decision)
 
     @staticmethod
     def _reject_if_stale(request: ApprovalRequest) -> Optional[ApprovalDecision]:

@@ -82,6 +82,18 @@ store.revert_to_snapshot(session_id, snapshot_id)
 ```
 
 </Step>
+
+<Step title="Inspect the whole hierarchy">
+
+```python
+# After forking a few times, inspect the whole hierarchy as a nested dict
+tree = store.get_session_tree(session_id)
+print(tree["title"], "has", len(tree["children"]), "forks")
+for child in tree["children"]:
+    print(" ├─", child["title"], f"({child['message_count']} messages)")
+```
+
+</Step>
 </Steps>
 
 ---
@@ -121,6 +133,101 @@ from praisonaiagents.session import get_hierarchical_session_store
 
 store = get_hierarchical_session_store()
 session = store.get_extended_session(session_id, force_reload=True)  # bypass cache
+```
+
+---
+
+## Inspecting the Session Tree
+
+`get_session_tree(session_id)` returns the full parent-child subtree as a nested dictionary, safe for arbitrarily deep hierarchies.
+
+```python
+tree = store.get_session_tree(root_session_id)
+# {
+#   "session_id": "root-123",
+#   "title": "Planning chat",
+#   "message_count": 8,
+#   "children": [
+#     {"session_id": "fork-a", "title": "Alternative plan",
+#      "message_count": 3, "children": [...]},
+#     ...
+#   ],
+# }
+```
+
+```mermaid
+graph TB
+    subgraph "get_session_tree(root)"
+        R[📝 root] --> A[🌿 child-a]
+        R --> B[🌿 child-b]
+        A --> S[📄 shared-descendant]
+        B --> S
+        A --> C[❌ cycle: points at root]
+    end
+
+    classDef session fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef shared fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef bad fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class R,A,B session
+    class S shared
+    class C bad
+```
+
+*Shared descendants are preserved (traversed on both branches). A child that repeats an ancestor on the current path raises `ValueError`.*
+
+| Property | Behaviour |
+|---|---|
+| Traversal | Iterative with an explicit stack — no `RecursionError` on deep chains, whatever `sys.getrecursionlimit()` is set to |
+| Cycle detection | Raises `ValueError("Cycle detected in session tree at '<id>'")` when a persisted `children_ids` list points at an ancestor on the current path |
+| Shared descendant | A session referenced from two sibling branches is preserved on both — only a repeat on the active ancestor path is treated as a cycle |
+| Missing child | Silently skipped (unchanged from earlier releases) |
+| Return shape | Nested `dict` with `session_id`, `title`, `message_count`, `children` on every node — unchanged from earlier releases |
+
+<Note>
+Earlier releases raised `RecursionError` on deep chains built via `create_session(parent_id=...)` and on persisted child-reference cycles. Fixed in [PR #5680](https://github.com/MervinPraison/PraisonAI/pull/5680) — iterative traversal + per-path cycle detection.
+</Note>
+
+### Which read API to use
+
+Pick the read method by what you need back — one session's messages, its parent, or the whole subtree.
+
+```mermaid
+graph LR
+    Q{What do you need?} --> M[Messages for one session]
+    Q --> P[Parent of one session]
+    Q --> T[Whole subtree]
+
+    M --> GH["get_chat_history(session_id)"]
+    P --> GP["get_parent(session_id)"]
+    T --> GT["get_session_tree(session_id)"]
+
+    classDef q fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef out fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Q q
+    class M,P,T,GH,GP,GT out
+```
+
+### Migration from `RecursionError`
+
+Callers that special-cased `RecursionError` should catch `ValueError` instead — deep chains no longer need any guard.
+
+```python
+# Before PR #5680
+try:
+    tree = store.get_session_tree(root_id)
+except RecursionError:
+    # had to flatten manually or raise recursion limit
+    ...
+
+# After PR #5680
+try:
+    tree = store.get_session_tree(root_id)
+except ValueError as e:
+    # Only raised for persisted child-reference cycles.
+    # Deep chains no longer need special-casing.
+    print(e)  # "Cycle detected in session tree at 'node-42'"
 ```
 
 ---
@@ -173,9 +280,53 @@ except OSError as e:
 | `fork_session()` | `ValueError` | `from_message_index` out of range |
 | `create_snapshot()` | `OSError` | Snapshot persistence failed |
 | `import_session()` | `OSError` | Imported session persistence failed |
+| `get_session_tree()` | `ValueError` | A persisted `children_ids` entry points at an ancestor on the current traversal path (cycle). The message carries the offending id: `"Cycle detected in session tree at '<id>'"`. |
+
+<Warning>
+`get_session_tree()` previously raised `RecursionError` for both deep chains and
+cyclic child references. After [PR #5680](https://github.com/MervinPraison/PraisonAI/pull/5680),
+deep chains return normally and cycles raise `ValueError("Cycle detected ...")`.
+Replace any existing `except RecursionError` around this call with `except ValueError`.
+</Warning>
 
 <Note>
 If a child/fork is persisted but parent registration fails, the saved child ID is surfaced in the `OSError` message. Retry with that same `session_id` to recover the existing child rather than creating a duplicate.
+</Note>
+
+A persisted two-node cycle raises `ValueError` the moment a child repeats an ancestor on the current path.
+
+```python
+from praisonaiagents.session import HierarchicalSessionStore, ExtendedSessionData
+
+store = HierarchicalSessionStore(session_dir="/tmp/example")
+store._save_extended_session(ExtendedSessionData(session_id="a", children_ids=["b"]))
+store._save_extended_session(ExtendedSessionData(session_id="b", children_ids=["a"]))
+
+try:
+    store.get_session_tree("a")
+except ValueError as e:
+    print(e)  # Cycle detected in session tree at 'a'
+```
+
+A session shared across two sibling branches is not a cycle — it appears under both.
+
+```python
+from praisonaiagents.session import HierarchicalSessionStore, ExtendedSessionData
+
+store = HierarchicalSessionStore(session_dir="/tmp/example")
+store._save_extended_session(ExtendedSessionData(session_id="root", children_ids=["b1", "b2"]))
+store._save_extended_session(ExtendedSessionData(session_id="b1", children_ids=["shared"]))
+store._save_extended_session(ExtendedSessionData(session_id="b2", children_ids=["shared"]))
+store._save_extended_session(ExtendedSessionData(session_id="shared"))
+
+tree = store.get_session_tree("root")
+assert [c["session_id"] for c in tree["children"]] == ["b1", "b2"]
+for branch in tree["children"]:
+    assert branch["children"][0]["session_id"] == "shared"
+```
+
+<Note>
+These two snippets use `_save_extended_session` to build fixtures that `create_session` would reject — use it only for reproducing cycle and shared-descendant shapes, never in normal code.
 </Note>
 
 ### Save order guarantees

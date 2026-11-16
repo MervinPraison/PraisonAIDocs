@@ -37,6 +37,7 @@ from typing import AsyncIterator, Callable, Dict, Any, Optional, List, Union
 from enum import Enum
 
 from ._managed_base import ManagedBackendBase
+from praisonai._errors import _WrapperError
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 # Shared exceptions
 # ---------------------------------------------------------------------------
 
-class ManagedSandboxRequired(RuntimeError):
+class ManagedSandboxRequired(_WrapperError, RuntimeError):
     """Raised when package installation is attempted without proper sandboxing.
     
     This exception is raised when `LocalManagedAgent` is configured with packages
@@ -749,8 +750,7 @@ class AnthropicManagedAgent(ManagedBackendBase):
 
         Runs the synchronous Anthropic SDK in a thread executor to stay async-safe.
         """
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._execute_sync, prompt)
+        return await self._execute_in_executor(self._execute_sync, prompt, **kwargs)
 
     def _execute_sync(self, prompt: str, stream_live: bool = False) -> str:
         """Synchronous execution using the SDK's native streaming.

@@ -38,6 +38,8 @@ def _generate_unit(config_path: str) -> str:
     python = shutil.which("python3") or shutil.which("python") or sys.executable
     abs_config = os.path.abspath(config_path)
     working_dir = os.path.dirname(abs_config) or os.getcwd()
+    from . import stop_timeout_seconds
+    stop_timeout = stop_timeout_seconds(abs_config)
 
     return f"""[Unit]
 Description=PraisonAI Bot Service
@@ -46,13 +48,21 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-Type=simple
+# The gateway sends READY=1 once serving and WATCHDOG=1 from its event loop,
+# so systemd gates start on real readiness and restarts a wedged loop (#6123).
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
 WorkingDirectory={working_dir}
 ExecStart={python} -m praisonai_bot gateway start --config {abs_config}
 Restart=on-failure
 RestartSec=5
 SuccessExitStatus=0
 RestartPreventExitStatus={GATEWAY_FATAL_CONFIG_EXIT_CODE}
+# Allow the configured graceful drain to finish before SIGKILL, and signal only
+# the gateway first so it can drain its own children in order (#5815).
+TimeoutStopSec={stop_timeout}
+KillMode=mixed
 Environment=PATH={os.environ.get('PATH', '/usr/bin')}
 
 [Install]

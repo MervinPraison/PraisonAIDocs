@@ -6,6 +6,7 @@ Zero dependencies beyond stdlib.
 """
 
 import copy
+import hashlib
 import json
 from praisonaiagents._logging import get_logger
 import os
@@ -29,6 +30,27 @@ from typing import Any, Callable, Dict, List, Optional
 from ..paths import get_sessions_dir
 
 logger = get_logger(__name__)
+
+
+
+def _legacy_session_filename(session_id: str) -> str:
+    """Pre-#6024 lossy filename (many ids -> one name); kept only for migration."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id)
+
+
+def _safe_session_filename(session_id: str) -> str:
+    """Injective, filesystem-safe filename stem for a session id (Issue #6024).
+
+    Ids already made of ``[A-Za-z0-9_-]`` keep their exact legacy name; any
+    other id gets a readable prefix plus a digest of the full id, so ids that
+    differ only in ``.``/``@``/``:``/… never share a file.
+    """
+    readable = _legacy_session_filename(session_id)
+    if readable == session_id:
+        return readable
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    return f"{readable[:64]}~{digest}"
+
 
 # Module-level sentinel to track if we've warned about degraded locking
 _WARNED_NO_FCNTL = False
@@ -293,14 +315,31 @@ class SessionData:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionData":
-        """Create from dictionary."""
+        """Create from dictionary.
+
+        Transcript entries that are not JSON objects (``null``, a string, a
+        number, …) cannot become a ``SessionMessage`` and would otherwise raise
+        ``AttributeError`` from ``SessionMessage.from_dict``'s ``.get`` calls,
+        crashing gateway routing on a single malformed turn. Such entries are
+        skipped so a healthy session stays loadable; the original on-disk
+        transcript and its index record are left untouched (Issue #5672).
+
+        When a dropped active turn precedes the compaction anchor, the saved
+        ``last_compaction.message_index`` is shifted down by the number of
+        entries removed before it. Without this, ``get_working_history`` would
+        slice the retained tail from the wrong offset and silently drop a
+        healthy post-compaction turn (Issue #2741 interaction).
+        """
+        raw_messages = data.get("messages", [])
         messages = [
-            SessionMessage.from_dict(m) 
-            for m in data.get("messages", [])
+            SessionMessage.from_dict(m)
+            for m in raw_messages
+            if isinstance(m, dict)
         ]
         archived = [
             SessionMessage.from_dict(m)
             for m in (data.get("archived_messages") or [])
+            if isinstance(m, dict)
         ]
         last_compaction_data = data.get("last_compaction")
         last_compaction = (
@@ -308,6 +347,17 @@ class SessionData:
             if last_compaction_data
             else None
         )
+        if last_compaction is not None:
+            anchor = last_compaction.message_index
+            dropped_before_anchor = sum(
+                1
+                for m in raw_messages[:anchor]
+                if not isinstance(m, dict)
+            )
+            if dropped_before_anchor:
+                last_compaction.message_index = max(
+                    0, anchor - dropped_before_anchor
+                )
         # Backward compatibility: `to_dict` mirrors select metadata keys to the
         # top level, and older/externally-written session files may carry
         # `model`/`llm` (etc.) only there. Fold those back into `metadata` so
@@ -568,7 +618,9 @@ class _SessionMirrorWriter:
         delay = 0.05
         for attempt in range(1, self._max_retries + 1):
             try:
-                self._mirror.append(session_id, records)
+                # A sink may mutate its input before failing. Keep the queued
+                # snapshot unchanged so each retry receives the same record.
+                self._mirror.append(session_id, copy.deepcopy(records))
                 return
             except Exception as e:  # pragma: no cover - defensive; mirror is external
                 if attempt >= self._max_retries:
@@ -854,10 +906,56 @@ class DefaultSessionStore:
         )
 
     def _get_session_path(self, session_id: str) -> str:
-        """Get the file path for a session."""
-        # Sanitize session_id for filesystem
-        safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id)
-        return os.path.join(self.session_dir, f"{safe_id}.json")
+        """Get the file path for a session (injective mapping, Issue #6024)."""
+        path = self._session_file_path(session_id)
+        legacy = os.path.join(self.session_dir, f"{_legacy_session_filename(session_id)}.json")
+        # Migrate a pre-#6024 file only when it is provably this id's own.
+        # Recheck under the destination lock so a racing worker that already
+        # migrated and wrote here is never clobbered by a stale move.
+        if legacy != path and not os.path.exists(path) and os.path.exists(legacy):
+            try:
+                with FileLock(path, self.lock_timeout):
+                    if not os.path.exists(path):
+                        with open(legacy, "r", encoding="utf-8") as f:
+                            owner = json.load(f).get("session_id")
+                        if owner == session_id:
+                            os.replace(legacy, path)
+            except (OSError, ValueError, AttributeError):
+                pass
+        return path
+
+    def _session_file_path(self, session_id: str) -> str:
+        """Session file path without legacy migration (takes no lock)."""
+        return os.path.join(self.session_dir, f"{_safe_session_filename(session_id)}.json")
+
+    def _owns_file(self, session_id: str, filepath: str, session: SessionData) -> bool:
+        """Return False if the loaded file belongs to another session id.
+
+        A foreign file (e.g. a pre-#6024 legacy collision) is never served to
+        the caller; it is moved to its owner's own path (or set aside when that
+        is taken) so a later write here cannot destroy the owner's history.
+        Caller must hold the ``filepath`` lock. Raises ``OSError`` if the file
+        cannot be moved, so writers abort instead of overwriting it.
+        """
+        if not session.session_id:
+            session.session_id = session_id
+            return True
+        if session.session_id == session_id:
+            return True
+        logger.warning(
+            "Session file %s belongs to session %r, not %r; starting fresh",
+            filepath, session.session_id, session_id,
+        )
+        owner_path = self._session_file_path(session.session_id)
+        moved = False
+        if owner_path != filepath:
+            with FileLock(owner_path, self.lock_timeout):
+                if not os.path.exists(owner_path):
+                    os.replace(filepath, owner_path)
+                    moved = True
+        if not moved and self._quarantine_corrupt(filepath) is None:
+            raise OSError(f"cannot move foreign session file {filepath}")
+        return False
     
     def _load_session(self, session_id: str) -> SessionData:
         """Load session from disk with file locking."""
@@ -922,7 +1020,10 @@ class DefaultSessionStore:
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return SessionData.from_dict(data)
+            session = SessionData.from_dict(data)
+            if not self._owns_file(session_id, filepath, session):
+                return SessionData(session_id=session_id)
+            return session
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             # Malformed content — the parsed data is unusable, but the raw file
             # may still hold recoverable bytes. Quarantine it aside so the next
@@ -1092,9 +1193,7 @@ class DefaultSessionStore:
         try:
             spill_dir = self._spill_dir()
             os.makedirs(spill_dir, exist_ok=True)
-            safe_id = "".join(
-                c if c.isalnum() or c in "-_" else "_" for c in session_id
-            )
+            safe_id = _safe_session_filename(session_id)
             # A monotonic ms timestamp keeps files sortable/attributable, but a
             # short random token guarantees uniqueness so consecutive failures
             # within the same PID+millisecond never overwrite an earlier spill
@@ -1205,13 +1304,15 @@ class DefaultSessionStore:
             spill_dir = self._spill_dir()
             if not os.path.isdir(spill_dir):
                 return
-            safe_id = "".join(
-                c if c.isalnum() or c in "-_" else "_" for c in session_id
+            # Also match pre-#6024 spill names; the session_id check below
+            # rejects any spill that belongs to a colliding id.
+            prefixes = (
+                f"{_safe_session_filename(session_id)}.",
+                f"{_legacy_session_filename(session_id)}.",
             )
-            prefix = f"{safe_id}."
             candidates = sorted(
                 f for f in os.listdir(spill_dir)
-                if f.startswith(prefix) and f.endswith(".json")
+                if f.startswith(prefixes) and f.endswith(".json")
             )
         except (IOError, OSError):
             return
@@ -1301,7 +1402,9 @@ class DefaultSessionStore:
         new_messages = [m for _, msgs in recovered for m in msgs]
         if new_messages:
             session.messages.extend(new_messages)
-            filepath = self._get_session_path(session_id)
+            # Callers already hold this path's lock; the migrating lookup
+            # would take it again and stall for ``lock_timeout``.
+            filepath = self._session_file_path(session_id)
             session.updated_at = datetime.now(timezone.utc).isoformat()
             # Recovered turns extend the active window like any other append, so
             # they must go through the same retention policy (compact/truncate)
@@ -1468,7 +1571,17 @@ class DefaultSessionStore:
             return
         records = []
         for m in messages:
-            record = m.to_dict()
+            # Normalize to the JSON shape that was persisted. Container
+            # subclasses may be JSON-serializable but carry uncopyable attrs.
+            try:
+                record = json.loads(json.dumps(m.to_dict(), ensure_ascii=False))
+            except Exception as exc:
+                logger.warning(
+                    "session mirror record preparation failed for %s; "
+                    "dropping record (local write unaffected): %s",
+                    session_id, exc,
+                )
+                continue
             record.setdefault(
                 "id", f"{session_id}:{record.get('timestamp', time.time())}"
             )
@@ -1511,7 +1624,143 @@ class DefaultSessionStore:
     ) -> bool:
         """Add an assistant message to a session."""
         return self.add_message(session_id, "assistant", content, metadata)
-    
+
+    def upsert_partial_assistant_message(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> bool:
+        """Create or update the single in-progress assistant turn (Issue #5407).
+
+        Streamed output is only persisted today after a turn completes, so an
+        interrupt mid-generation (Ctrl-C / crash) loses the whole partial turn.
+        This writes the latest known partial text to a single trailing
+        assistant message tagged ``metadata={"partial": True}`` and overwrites
+        it on each flush instead of appending a new message per token, keeping
+        the write cheap.
+
+        When ``finalize`` is True the partial flag is dropped, promoting the
+        trailing message to a normal assistant turn. If there is no partial
+        message to finalize and ``content`` is non-empty, a normal assistant
+        message is appended (the fallback path when no partial was ever
+        flushed).
+
+        Args:
+            session_id: The session ID.
+            content: The full assistant text known so far.
+            finalize: When True, mark the turn complete (clear the partial flag).
+
+        Returns:
+            True if the store was updated successfully.
+        """
+        # Short-circuit: finalizing with no text and a *confirmed* absent
+        # partial is a no-op, so avoid a needless read-modify-write. An
+        # ambiguous read failure (None) falls through to the locked RMW, which
+        # re-reads under the lock rather than guessing (Issue #5407).
+        if finalize and not content and self._has_trailing_partial(session_id) is False:
+            return True
+
+        # Capture the finalized message so it can be mirrored after the write
+        # succeeds, without re-reading the session.
+        finalized_holder: Dict[str, Any] = {}
+
+        def _apply(session: SessionData) -> None:
+            trailing = session.messages[-1] if session.messages else None
+            is_partial = (
+                trailing is not None
+                and trailing.role == "assistant"
+                and bool((trailing.metadata or {}).get("partial"))
+            )
+            if is_partial:
+                if finalize and not content:
+                    # Interrupted with no text ever produced: drop the empty
+                    # placeholder rather than leaving a blank partial turn.
+                    session.messages.pop()
+                else:
+                    trailing.content = content
+                    trailing.timestamp = time.time()
+                    if finalize:
+                        trailing.metadata.pop("partial", None)
+                        if trailing.metadata is None:
+                            trailing.metadata = {}
+                        finalized_holder["message"] = trailing
+            else:
+                if finalize and not content:
+                    return
+                message = SessionMessage(
+                    role="assistant",
+                    content=content,
+                    timestamp=time.time(),
+                    metadata={} if finalize else {"partial": True},
+                )
+                session.messages.append(message)
+                if finalize:
+                    finalized_holder["message"] = message
+
+        # Route through the transactional read-modify-write seam so SQLite-
+        # backed stores write their authoritative row (not a stray JSON file),
+        # concurrent turns stay serialized, failed writes propagate (and spill
+        # for recovery), and search indexes refresh on finalize — rather than
+        # re-implementing a FileLock+JSON write that only the default store
+        # honours (Issue #5407).
+        if not self._modify_session_locked(
+            session_id, _apply, error_label="upsert partial assistant message"
+        ):
+            return False
+
+        # Only a finalized turn is a completed record the mirror should carry;
+        # per-token partials are intentionally local until finalize.
+        if finalize and finalized_holder.get("message") is not None:
+            self._mirror_append(session_id, [finalized_holder["message"]])
+        return True
+
+    def _has_trailing_partial(self, session_id: str) -> Optional[bool]:
+        """Return the trailing-partial state, or ``None`` if it can't be read.
+
+        ``True``/``False`` report a successful check; ``None`` signals the read
+        itself failed, so callers must not treat an ambiguous failure as a
+        confirmed absence (which would silently skip a needed discard).
+        """
+        try:
+            session = self._read_session_fresh(session_id)
+        except Exception:
+            return None
+        trailing = session.messages[-1] if session.messages else None
+        return (
+            trailing is not None
+            and trailing.role == "assistant"
+            and bool((trailing.metadata or {}).get("partial"))
+        )
+
+    def discard_partial_assistant_message(self, session_id: str) -> bool:
+        """Drop a trailing in-progress assistant turn, if any (Issue #5407).
+
+        Used when the authoritative assistant turn is written through another
+        path (e.g. a tool-call turn) so a stale partial record does not linger.
+        No-op when the trailing message is not a partial.
+        """
+        # Only skip the read-modify-write when we can *confirm* there is no
+        # trailing partial. An ambiguous read failure (None) must fall through
+        # to the locked RMW — which re-reads under the lock — so a stale partial
+        # is never left behind on a transient read error (Issue #5407).
+        if self._has_trailing_partial(session_id) is False:
+            return True
+
+        def _apply(session: SessionData) -> None:
+            trailing = session.messages[-1] if session.messages else None
+            if (
+                trailing is not None
+                and trailing.role == "assistant"
+                and bool((trailing.metadata or {}).get("partial"))
+            ):
+                session.messages.pop()
+
+        return self._modify_session_locked(
+            session_id, _apply, error_label="discard partial assistant message"
+        )
+
     def get_chat_history(
         self,
         session_id: str,
@@ -1827,6 +2076,8 @@ class DefaultSessionStore:
                             "model": data.get("model") or data.get("llm") or (data.get("metadata") or {}).get("model"),
                             "total_tokens": data.get("total_tokens") or data.get("token_count") or (data.get("metadata") or {}).get("total_tokens"),
                             "cost": data.get("cost") or (data.get("metadata") or {}).get("cost"),
+                            # Per-tool outcome tally for `usage --by tool` (Issue #6158).
+                            "tool_stats": (data.get("metadata") or {}).get("tool_stats"),
                         })
                     except (UnicodeDecodeError, json.JSONDecodeError, IOError) as exc:
                         self._report_unreadable_session(filename[:-5], filepath, exc)
@@ -2153,6 +2404,17 @@ class DefaultSessionStore:
         return snippet
 
     @staticmethod
+    def _is_compaction_summary(msg: Dict[str, Any]) -> bool:
+        """True for the synthetic ``retention="compact"`` rollup message.
+
+        The summary paraphrases archived turns that are scanned verbatim, so
+        it is kept for context/replay but excluded from scoring — otherwise a
+        session's rank would depend on how often it was compacted (Issue #5051).
+        """
+        metadata = msg.get("metadata")
+        return isinstance(metadata, dict) and bool(metadata.get("compaction"))
+
+    @staticmethod
     def _searchable_messages(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Project a persisted session into the list of messages to scan.
 
@@ -2228,7 +2490,7 @@ class DefaultSessionStore:
                 if not isinstance(msg, dict):
                     continue
                 content = str(msg.get("content", ""))
-                if not content:
+                if not content or self._is_compaction_summary(msg):
                     continue
                 lowered = content.lower()
                 score = 0.0

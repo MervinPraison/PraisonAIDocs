@@ -64,6 +64,60 @@ curl http://localhost:8000/status
 {"status": "available"}
 ```
 
+## Verify Routes
+
+After `include_router`, `app.routes` won't list `/agui` and `/status` as flat paths — Starlette nests them under an internal `_IncludedRouter`. The endpoints work at runtime; verify them with `TestClient`.
+
+```mermaid
+graph LR
+    subgraph "Mount & Verify"
+        A[FastAPI app] -->|include_router| B[_IncludedRouter wrapper]
+        B --> C[AGUI router: /agui, /status]
+        D[TestClient] -->|GET /status| C
+        D -->|POST /agui| C
+    end
+
+    classDef app fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef wrap fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef route fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef client fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A app
+    class B wrap
+    class C route
+    class D client
+```
+
+```python
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from praisonaiagents import Agent, AGUI
+
+agent = Agent(instructions="You are a helpful assistant")
+agui = AGUI(agent=agent)
+
+app = FastAPI()
+app.include_router(agui.get_router())
+
+client = TestClient(app)
+
+# Health check
+assert client.get("/status").status_code == 200
+
+# AG-UI endpoint reachable (will stream SSE on real input)
+assert client.post("/agui", json={"message": "hi"}).status_code != 404
+```
+
+<Note>
+If you need to inspect route paths programmatically, read them off the router instead of the app:
+
+```python
+paths = [getattr(r, "path", "") for r in agui.get_router().routes]
+assert "/agui" in paths
+assert "/status" in paths
+```
+</Note>
+
 ## agents.yaml
 
 AGUI server is Python-only. No agents.yaml support.
@@ -75,6 +129,10 @@ AGUI server is Python-only. No agents.yaml support.
 | `/agui` | POST | Run agent with SSE streaming |
 | `/status` | GET | Check agent availability |
 
+<Note>
+Nested-router paths may not flatten into the top-level OpenAPI schema at `/openapi.json`. The endpoints are fully reachable; this only affects introspection and auto-generated docs tooling that reads `app.routes`. See [Verify Routes](#verify-routes).
+</Note>
+
 ## AGUI Parameters
 
 | Parameter | Type | Default | Description |
@@ -84,6 +142,65 @@ AGUI server is Python-only. No agents.yaml support.
 | `name` | str | agent.name | AGUI endpoint name |
 | `description` | str | agent.role | Agent description |
 | `prefix` | str | `""` | URL prefix |
+
+## Concurrency & Thread Isolation
+
+One `AGUI(agent=agent)` instance safely serves many concurrent clients — each run's streamed tokens stay in its own SSE stream.
+
+A shared `Agent` still means a **shared `chat_history`**. The request's `threadId` does **not** create a separate conversation history. For per-thread memory, give each thread its own Agent.
+
+```mermaid
+graph TB
+    subgraph "Shared Agent (default)"
+        A1[Client A<br/>thread-A] -->|POST /agui| S1["AGUI(agent)"]
+        B1[Client B<br/>thread-B] -->|POST /agui| S1
+        S1 --> Agent1[One Agent<br/>one chat_history]
+    end
+    subgraph "Agent per thread"
+        A2[Client A] -->|POST /alice/agui| S2["AGUI(agent_alice)"]
+        B2[Client B] -->|POST /bob/agui| S2b["AGUI(agent_bob)"]
+        S2 --> AgentA[Agent A<br/>own history]
+        S2b --> AgentB[Agent B<br/>own history]
+    end
+
+    classDef client fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef server fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class A1,B1,A2,B2 client
+    class S1,S2,S2b server
+    class Agent1,AgentA,AgentB agent
+```
+
+| Behaviour | Shared Agent | Agent per thread |
+|-----------|--------------|------------------|
+| Streamed tokens isolated per run | Yes | Yes |
+| `tool_call_*` events isolated per run | Yes | Yes |
+| Custom `praisonai.*` events isolated per run | Yes | Yes |
+| **Conversation history isolated per `threadId`** | **No** | Yes |
+
+<Warning>
+Per-run isolation landed in [PraisonAI#6153](https://github.com/MervinPraison/PraisonAI/pull/6153) and ships in releases **after v4.7.22**. On v4.7.22 and earlier, concurrent runs on one shared Agent can receive each other's streamed tokens — upgrade, or use the Agent-per-thread pattern below.
+</Warning>
+
+**Agent per thread** — mount one `AGUI` router per thread (or tenant) with `prefix`:
+
+```python
+from praisonaiagents import Agent, AGUI
+from fastapi import FastAPI
+
+app = FastAPI()
+
+for thread in ["alice", "bob"]:
+    agent = Agent(instructions="You are a helpful assistant")
+    app.include_router(AGUI(agent=agent, prefix=f"/{thread}").get_router())
+
+# Client A → POST /alice/agui, Client B → POST /bob/agui
+```
+
+<Note>
+The server receives the request's `threadId` and `messages`, but does **not** replay them into the Agent's history. Separate history needs the Agent-per-thread pattern above.
+</Note>
 
 ## CopilotKit Integration
 
@@ -206,6 +323,7 @@ while (true) {
 | Missing deps | `pip install "praisonaiagents[os]"` |
 | No API key | `export OPENAI_API_KEY="your-key"` |
 | CORS errors | Add CORS middleware to FastAPI app |
+| `/agui` and `/status` missing from `app.routes` | Expected — Starlette nests included routers under `_IncludedRouter`. Verify with `TestClient` (see [Verify Routes](#verify-routes)) or inspect `agui.get_router().routes` directly. Endpoints work at runtime. |
 
 ## Related
 

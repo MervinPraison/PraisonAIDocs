@@ -61,10 +61,20 @@ _REDACT_PATTERN = re.compile(
 )
 
 # Compiled regex for key=value pattern matching in strings (case-insensitive for raw text)
+# An auth scheme (``Authorization: Bearer <tok>``) is consumed with the value so
+# the secret after it is redacted, not the scheme word.
 _REDACT_KV_PATTERN = re.compile(
-    r'(["\']?)(' + '|'.join(re.escape(k) for k in REDACT_KEYS) + r')(["\']?\s*[:=]\s*["\']?)([^"\'\s,}\]]+)',
+    r'(["\']?)(' + '|'.join(re.escape(k) for k in sorted(REDACT_KEYS, key=len, reverse=True)) + r')'
+    r'(["\']?\s*[:=]\s*["\']?)'
+    r'(?:(?:Bearer|Basic|Token|Digest)\s+)?'
+    r'([^"\'\s,}\]]+)',
     re.IGNORECASE
 )
+
+# URL-borne secrets: userinfo (``scheme://user:pass@host``) and bot-token
+# path segments (``/bot<id>:<token>/``) carry credentials with no key name.
+_URL_USERINFO_PATTERN = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/?#\s]+@")
+_URL_BOT_TOKEN_PATTERN = re.compile(r"/bot\d+:[A-Za-z0-9_\-]+")
 
 REDACTED_VALUE = "[REDACTED]"
 
@@ -108,6 +118,10 @@ def _redact_value(value: Any) -> Any:
         return {k: _redact_key_value(k, v) for k, v in value.items()}
     elif isinstance(value, list):
         return [_redact_value(item) for item in value]
+    elif isinstance(value, tuple):
+        return tuple(_redact_value(item) for item in value)
+    elif isinstance(value, str):
+        return redact_string(value)
     else:
         return value
 
@@ -230,7 +244,9 @@ def redact_string(text: str, enabled: bool = True) -> str:
     Redact potential secrets from a string.
     
     This is a best-effort function that looks for common patterns
-    like "api_key=xxx" or "password: xxx" in strings.
+    like "api_key=xxx" or "password: xxx" in strings, plus secrets carried
+    in URLs (``scheme://user:pass@host`` userinfo, ``?token=xxx`` query
+    params and ``/bot<id>:<token>/`` path segments).
     
     Args:
         text: String to redact
@@ -242,5 +258,7 @@ def redact_string(text: str, enabled: bool = True) -> str:
     if not enabled or not text:
         return text
     
-    # Use pre-compiled pattern for better performance
+    # Use pre-compiled patterns for better performance
+    text = _URL_USERINFO_PATTERN.sub(r'\1[REDACTED]@', text)
+    text = _URL_BOT_TOKEN_PATTERN.sub('/bot[REDACTED]', text)
     return _REDACT_KV_PATTERN.sub(r'\1\2\3[REDACTED]', text)

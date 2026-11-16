@@ -1,11 +1,11 @@
 ---
 title: "Server: Unified"
 sidebarTitle: "Unified"
-description: "Deploy a unified server with all PraisonAI providers"
+description: "Deploy a unified server that combines the agents API, A2A and A2U providers"
 icon: "layer-group"
 ---
 
-Deploy a unified server that combines all PraisonAI provider types in a single endpoint.
+Deploy a unified server that combines the agents API, A2A and A2U providers in a single endpoint.
 
 ## CLI
 
@@ -13,81 +13,77 @@ Deploy a unified server that combines all PraisonAI provider types in a single e
 pip install "praisonai[serve]"
 export OPENAI_API_KEY="your-key"
 
-# Start unified server
-praisonai serve unified --port 8765
+# Start unified server — mounts agents-api + a2a from agents.yaml, plus a2u
+praisonai serve unified --file agents.yaml --port 8765
 ```
 
 **Expected Output:**
 ```
-🚀 Starting Unified PraisonAI Server...
-   Host: 127.0.0.1
-   Port: 8765
-   Providers: agents-api, recipe, mcp, a2a, a2u
-📡 Discovery: http://127.0.0.1:8765/__praisonai__/discovery
-✅ Server started at http://127.0.0.1:8765
+✓ Starting unified server on 127.0.0.1:8765
+  Providers: agents-api, a2a, a2u
+  Discovery: /__praisonai__/discovery
 ```
 
-## Python
+The server only advertises providers it actually mounts. `agents-api` and `a2a` run the workflow in `--file`, so they are mounted only when that file exists:
 
-```python
-from fastapi import FastAPI
-import uvicorn
-from praisonaiagents import Agent
+| `--file` | Providers |
+|----------|-----------|
+| Exists | `agents-api`, `a2a`, `a2u` |
+| Missing | `a2u` |
 
-app = FastAPI(title="PraisonAI Unified Server")
+```mermaid
+graph TB
+    Start[praisonai serve unified] --> File{--file exists?}
+    File -->|Yes| Full[agents-api + a2a + a2u]
+    File -->|No| A2U[a2u only]
 
-# Create agents
-assistant = Agent(
-    name="Assistant",
-    role="Helpful AI Assistant",
-    goal="Help users with their questions",
-    llm="gpt-4o-mini"
-)
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef info fill:#189AB4,stroke:#7C90A0,color:#fff
 
-# Discovery endpoint
-@app.get("/__praisonai__/discovery")
-async def discovery():
-    return {
-        "schema_version": "1.0.0",
-        "server_name": "praisonai-unified",
-        "providers": [
-            {"type": "agents-api", "name": "Agents API"},
-            {"type": "recipe", "name": "Recipe Runner"},
-            {"type": "mcp", "name": "MCP Server"},
-            {"type": "a2a", "name": "A2A Protocol"},
-            {"type": "a2u", "name": "A2U Event Stream"},
-        ],
-        "endpoints": [
-            {"name": "agents", "provider_type": "agents-api"},
-            {"name": "agent", "provider_type": "agents-api"},
-            {"name": "mcp/tools", "provider_type": "mcp"},
-            {"name": "a2a", "provider_type": "a2a"},
-            {"name": "a2u/events", "provider_type": "a2u"},
-        ]
-    }
-
-# Health endpoint
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "providers": 5}
-
-# Agent endpoint
-@app.post("/agent")
-async def query_agent(request: dict):
-    query = request.get("query", "")
-    response = assistant.chat(query)
-    return {"response": response}
-
-uvicorn.run(app, host="0.0.0.0", port=8765)
+    class File decision
+    class Full ok
+    class A2U info
 ```
 
 <Note>
-`create_unified_app(..., api_key=...)` now installs the `_api_auth` middleware on every mounted route except `/health`. Existing callers that were passing `api_key=` but not sending `Authorization: Bearer` / `X-API-Key` from clients will start getting `401` — this closes a silent auth-bypass on the tool-driving routes.
+`recipe` and `mcp` are not part of the unified server. Run them with their own commands: [`praisonai serve recipe`](/cli/serve) and [`praisonai mcp serve`](./tools-mcp).
 </Note>
+
+## Agent
+
+Define the agents the unified server runs in `agents.yaml`:
+
+```yaml
+framework: praisonai
+topic: "Answer user questions"
+roles:
+  assistant:
+    role: Helpful AI Assistant
+    goal: Help users with their questions
+    backstory: You are a friendly assistant.
+    tasks:
+      answer:
+        description: "Answer: {topic}"
+        expected_output: A clear answer
+```
+
+```bash
+curl -X POST http://localhost:8765/agents \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What is PraisonAI?"}'
+```
+
+**Response:**
+```json
+{"response": "PraisonAI is ..."}
+```
+
+`POST /agents` accepts `query` (or `message`). A body that is not a JSON object returns `400`; an agent failure returns `500`.
 
 ## Security
 
-`praisonai serve unified` mounts tool-driving routes (notably `POST /v1/tools/invoke` via `mount_provider_routes`), so binding it to a non-localhost interface without authentication is refused.
+`praisonai serve unified` mounts agent-driving routes (`POST /agents`, `POST /a2a`), so binding it to a non-localhost interface without authentication is refused.
 
 <Warning>
 Binding to any host other than `127.0.0.1` / `localhost` / `::1` **requires** an API key. The server exits immediately (`SystemExit`) if neither `--api-key` nor `PRAISONAI_SERVE_API_KEY` is set.
@@ -105,7 +101,7 @@ praisonai serve unified --port 8765 --host 0.0.0.0
 praisonai serve unified --port 8765 --host 0.0.0.0 --api-key "your-secret"
 ```
 
-Clients send the key in `Authorization: Bearer …` or `X-API-Key: …`. The `/health` route is public.
+Clients send the key in `Authorization: Bearer …` or `X-API-Key: …`. Only `/health`, `/` and `/.well-known/agent.json` are public.
 
 ```mermaid
 graph TB
@@ -126,18 +122,34 @@ graph TB
 
 ## Unified Endpoints
 
-| Endpoint | Method | Provider | Description |
-|----------|--------|----------|-------------|
-| `/__praisonai__/discovery` | GET | - | Discovery document |
-| `/health` | GET | - | Health check |
-| `/agents` | POST | agents-api | Multi-agent router |
-| `/agent` | POST | agents-api | Single agent |
-| `/mcp/tools` | GET | mcp | List MCP tools |
-| `/mcp/tools/call` | POST | mcp | Call MCP tool |
-| `/.well-known/agent.json` | GET | a2a | A2A agent card |
-| `/a2a` | POST | a2a | A2A messages |
-| `/a2u/info` | GET | a2u | A2U info |
-| `/a2u/events/<stream>` | GET | a2u | A2U event stream |
+| Endpoint | Method | Provider | Needs `--file`? | Description |
+|----------|--------|----------|-----------------|-------------|
+| `/agents` | POST | agents-api | Yes | Run the agents YAML workflow |
+| `/a2a` | POST | a2a | Yes | A2A JSON-RPC `message/send` ([error codes](./a2a#json-rpc-errors)) |
+| `/.well-known/agent.json` | GET | - | No | Agent card; includes `url` only when `a2a` is mounted |
+| `/a2u/info` | GET | a2u | No | A2U info |
+| `/a2u/events/<stream>` | GET | a2u | No | A2U event stream |
+| `/__praisonai__/discovery` | GET | - | No | Discovery document |
+| `/health` | GET | - | No | Health check |
+| `/` | GET | - | No | Landing JSON with the mounted `providers` list |
+
+## Agent Card
+
+```bash
+curl http://localhost:8765/.well-known/agent.json
+```
+
+**Response (with `--file`):**
+```json
+{
+  "name": "PraisonAI Unified",
+  "description": "PraisonAI Unified Server",
+  "version": "1.0.0",
+  "url": "http://127.0.0.1:8765/a2a"
+}
+```
+
+Without `--file`, the `url` key is omitted because `/a2a` is not mounted.
 
 ## Discovery Document
 
@@ -145,21 +157,21 @@ graph TB
 curl http://localhost:8765/__praisonai__/discovery
 ```
 
-**Response:**
+**Response (with `--file`):**
 ```json
 {
   "schema_version": "1.0.0",
   "server_name": "praisonai-unified",
   "providers": [
-    {"type": "agents-api", "name": "Agents API", "capabilities": ["invoke", "health"]},
-    {"type": "recipe", "name": "Recipe Runner", "capabilities": ["list", "describe", "invoke"]},
-    {"type": "mcp", "name": "MCP Server", "capabilities": ["list-tools", "call-tool"]},
+    {"type": "agents-api", "name": "Agents API", "capabilities": ["invoke"]},
     {"type": "a2a", "name": "A2A Protocol", "capabilities": ["agent-card", "message-send"]},
     {"type": "a2u", "name": "A2U Event Stream", "capabilities": ["subscribe", "stream"]}
   ],
   "endpoints": [...]
 }
 ```
+
+Without `--file`, `providers` contains only `a2u`.
 
 ## Client Usage
 
@@ -185,8 +197,8 @@ praisonai endpoints health --url http://localhost:8765
 |--------|---------|-------------|
 | `--port` | 8765 | Server port |
 | `--host` | 127.0.0.1 | Server host |
-| `--api-key` | - | API key. **Required when `--host` is not `127.0.0.1` / `localhost` / `::1`.** Can also be set via `PRAISONAI_SERVE_API_KEY`. Enforces `Authorization: Bearer` / `X-API-Key` on every route except `/health`. |
-| `--file` | agents.yaml | Agents configuration file |
+| `--api-key` | - | API key. **Required when `--host` is not `127.0.0.1` / `localhost` / `::1`.** Can also be set via `PRAISONAI_SERVE_API_KEY`. Enforces `Authorization: Bearer` / `X-API-Key` on every route except `/health`, `/`, `/.well-known/agent.json`. |
+| `--file` | agents.yaml | Agents YAML file. `agents-api` and `a2a` are mounted only when it exists |
 
 ## Environment Variables
 
@@ -198,12 +210,9 @@ praisonai endpoints health --url http://localhost:8765
 
 | Type | Description |
 |------|-------------|
-| `recipe` | Recipe runner endpoints |
-| `agents-api` | Single/multi-agent HTTP API |
-| `mcp` | MCP server (stdio, http, sse) |
-| `tools-mcp` | Tools exposed as MCP server |
-| `a2a` | Agent-to-agent protocol |
-| `a2u` | Agent-to-user event stream |
+| `agents-api` | Runs the agents YAML workflow (`POST /agents`) |
+| `a2a` | Agent-to-agent protocol (`POST /a2a`) |
+| `a2u` | Agent-to-user event stream (always mounted) |
 
 ## Troubleshooting
 
@@ -212,7 +221,8 @@ praisonai endpoints health --url http://localhost:8765
 | Port in use | `lsof -i :8765` |
 | Missing deps | `pip install "praisonai[serve]"` |
 | No API key | `export OPENAI_API_KEY="your-key"` |
-| Provider not found | Check discovery document |
+| Provider not found | Check discovery document. `agents-api` / `a2a` need an existing `--file` |
+| `POST /agents` returns `404` / `405` | `--file` is missing, so only `a2u` is mounted |
 | `--api-key ... is required when binding to a non-localhost host` at startup | Set `PRAISONAI_SERVE_API_KEY=...` (or `--api-key ...`), or bind to `127.0.0.1` / `localhost` for a private-only server. |
 
 ## Related
@@ -222,3 +232,5 @@ praisonai endpoints health --url http://localhost:8765
 - [A2A Server](./a2a) - Agent-to-agent protocol
 - [A2U Server](./a2u) - Agent-to-user events
 - [Agents Server](./agents) - HTTP API server
+- [Tools MCP Server](./tools-mcp) - MCP is served by its own command, not `serve unified`
+- [Serve CLI: recipe](/cli/serve) - Recipes are served by `praisonai serve recipe`, not `serve unified`

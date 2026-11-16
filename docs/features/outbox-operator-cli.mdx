@@ -78,6 +78,7 @@ sequenceDiagram
     CLI-->>Operator: key=slack:C0abc:msg-d4e5:18 (429 rate limited)
     Note over Operator: channel recovers
     Operator->>CLI: outbox retry slack:C0abc:msg-d4e5:18
+    Note over Outbox: open as read_only=True — no crash recovery runs
     CLI->>Outbox: status → pending, attempts → 0
     Drain->>Outbox: next drain claims entry
     Drain->>User: delivers reply
@@ -161,12 +162,16 @@ Keys are always printed **un-truncated** so operators can copy them directly. Th
 
 ---
 
-## Read-only inspection (safe on a live gateway)
+## Safe to run alongside a live gateway
 
-`outbox list` and `outbox stats` open the store with `read_only=True`.
+All four subcommands — `outbox list`, `outbox stats`, `outbox retry`, `outbox purge` — open the SQLite store with `read_only=True`.
+
+`read_only=True` only skips the `sending → recovered` crash-recovery migration. Targeted ops still work: `retry` only touches `failed`/`permanent_failure` rows, and `purge <key>` refuses `sending` rows. `purge --all` is an explicit, confirmed operator action and still deletes every row, including `sending` ones.
+
+Fixed in [PraisonAI PR #5954](https://github.com/MervinPraison/PraisonAI/pull/5954) (issue [#5953](https://github.com/MervinPraison/PraisonAI/issues/5953)) — before the fix, `retry` and `purge` opened the store read-write and could duplicate a live gateway's in-flight sends.
 
 <Warning>
-Operator inspection must never run crash recovery on a live database. Flipping in-flight `sending` rows to `recovered` while the owning gateway is mid-send would let a later drain re-claim and duplicate a message. `read_only=True` opens the store for reads without the `sending → recovered` migration; targeted ops (`retry`/`purge_entry`) still work but leave in-flight rows untouched.
+Operator CLI opens must never run crash recovery on a live database. Flipping in-flight `sending` rows to `recovered` while the owning gateway is mid-send lets a later drain re-claim and duplicate a message. All four operator subcommands (`list`, `stats`, `retry`, `purge`) open the store with `read_only=True`, which skips the `sending → recovered` migration while leaving targeted ops working.
 </Warning>
 
 ---
@@ -178,20 +183,23 @@ The CLI mirrors four `OutboundQueue` methods. Wire them from Python directly.
 ```python
 from praisonai_bot.bots import OutboundQueue
 
-# Safe inspection alongside a live gateway — no crash recovery runs
+# Safe to run alongside a live gateway — no crash recovery runs
 outbox = OutboundQueue(
     path="~/.praisonai/state/gateway_outbox.sqlite",
     read_only=True,
 )
 
+# Inspection
 entries = outbox.list(status="failed", target="slack:C0abc", limit=50)
 counts = outbox.stats()  # e.g. {"pending": 3, "permanent_failure": 2}
 
-# Targeted ops require a writable open (drop read_only)
-writable = OutboundQueue(path="~/.praisonai/state/gateway_outbox.sqlite")
-await writable.retry("slack:C0abc:msg-d4e5:18")
-writable.purge_entry("slack:C0abc:msg-d4e5:18")
+# Targeted ops still work under read_only=True. retry only touches
+# failed/permanent_failure rows; purge_entry refuses to delete a 'sending' row.
+await outbox.retry("slack:C0abc:msg-d4e5:18")
+outbox.purge_entry("slack:C0abc:msg-d4e5:18")
 ```
+
+`read_only=True` only skips the `sending → recovered` migration — targeted writes still succeed. Runtime drainers (the gateway itself, `DurableAdapterMixin` adapters) still open the store read-write and run crash recovery on open; this guidance is for operator code running alongside a live gateway.
 
 ### `list(*, status=None, target=None, limit=100)`
 
@@ -232,6 +240,10 @@ A crash-`recovered` entry was in-flight when the process last crashed, so its de
 
 <Accordion title="Never purge a sending entry">
 `purge_entry` refuses an in-flight `sending` row. The gateway may have already handed the payload to the channel API and be awaiting `mark_sent`/`mark_failed`. Deleting the row makes `mark_sent` a no-op and the caller report a spurious failure despite delivery. Wait until it transitions.
+</Accordion>
+
+<Accordion title="Don't construct a writable OutboundQueue next to a live gateway">
+Opening `OutboundQueue(path=...)` without `read_only=True` while the gateway is running flips every in-flight `sending` row to `recovered` — the gateway's next drain then re-dispatches those rows, producing duplicate replies. Use `read_only=True` for any operator-side script that touches a live outbox; `retry` and `purge_entry` still succeed under it.
 </Accordion>
 
 <Accordion title="Start from gateway status --deep">

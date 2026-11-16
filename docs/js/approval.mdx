@@ -242,8 +242,355 @@ const needsApproval = createDangerousPatternChecker([/\bwipe\b/i]);
 | `ToolApprovalTimeoutError` | An approval request exceeds its timeout. |
 
 <Note>
-**Python parity:** the Python `approval` API exposes `ApprovalDecision.scope` (`"once" | "session" | "always"`) and `ApprovalDecision.feedback`. The TypeScript gate re-prompts every call and returns a fixed refusal string — there is no scope or per-decision feedback channel yet.
+**Two approval layers.** The `ApprovalManager → ApprovalHandler` layer is boolean-only (a handler returns `true`/`false`). A **backend** installed via `setApprovalBackend` (see below) produces a full `ApprovalBackendDecision` carrying `scope` (`'once' | 'session' | 'always'`), `scopePattern`, and `feedback` — Python parity with `praisonaiagents.approval`. The handler projects that decision down to a boolean for the manager.
 </Note>
+
+---
+
+## Approval Backends (Python parity)
+
+Swap the default `y`/`n` prompt for a richer backend that matches `praisonaiagents.approval` — auto-approve, a diff-aware console, an LLM reviewer, or a legacy callback.
+
+```mermaid
+graph LR
+    subgraph "Backend Flow"
+        A[🤖 Agent] --> B[📋 Request]
+        B --> C[⚙️ Backend]
+        C --> D[✅ Decision]
+        D --> A
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef request fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef backend fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef decision fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A agent
+    class B request
+    class C backend
+    class D decision
+```
+
+An `Agent` with `approval: true` builds an `ApprovalManager`; `setApprovalBackend` answers its requests.
+
+```typescript
+import { Agent, setApprovalBackend, AutoApproveBackend } from 'praisonai';
+
+// Trusted CI: approve every tool call automatically.
+setApprovalBackend(new AutoApproveBackend());
+
+const agent = new Agent({
+  instructions: 'You can execute commands',
+  approval: true  // creates the ApprovalManager; the backend above answers it
+});
+
+await agent.chat('Clean up the temp directory');
+```
+
+Pass a specific `ApprovalManager` to install the backend on it instead of the process-global one.
+
+```typescript
+import { Agent, ApprovalManager, setApprovalBackend, ConsoleBackend } from 'praisonai';
+
+const manager = new ApprovalManager();
+setApprovalBackend(new ConsoleBackend(), manager);  // diffs + once/session/always
+
+const agent = new Agent({
+  instructions: 'Refactor files carefully',
+  approval: manager
+});
+
+await agent.chat('Rename all .js files to .ts');
+```
+
+### Which backend?
+
+```mermaid
+graph TB
+    Start{Pick a backend}
+    Start -->|Trusted CI / bot| Auto[🟢 AutoApproveBackend<br/>approve everything]
+    Start -->|Human at a terminal| Console[🔵 ConsoleBackend<br/>diffs + scopes]
+    Start -->|Let an LLM decide| AgentB[🟠 AgentApproval<br/>reviewer agent]
+    Start -->|Have an old callback| Callback[🟣 CallbackBackend<br/>wrap a function]
+
+    classDef pick fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef auto fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef console fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef agent fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef cb fill:#6366F1,stroke:#7C90A0,color:#fff
+
+    class Start pick
+    class Auto auto
+    class Console console
+    class AgentB agent
+    class Callback cb
+```
+
+### AutoApproveBackend
+
+Approves every call — use in bots, CI, or trusted unattended runs.
+
+```typescript
+import { setApprovalBackend, AutoApproveBackend } from 'praisonai';
+
+setApprovalBackend(new AutoApproveBackend());
+```
+
+<Note>
+**Python parity:** `praisonaiagents.approval.AutoApproveBackend` — same always-approve behaviour.
+</Note>
+
+### ConsoleBackend
+
+Prompts on the terminal with a coloured unified diff and once/session/always scopes.
+
+```typescript
+import { setApprovalBackend, ConsoleBackend } from 'praisonai';
+
+setApprovalBackend(new ConsoleBackend());
+// turn colours off for logs / non-TTY:
+setApprovalBackend(new ConsoleBackend({ colors: false }));
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant ApprovalManager
+    participant Backend as ConsoleBackend
+
+    User->>Agent: "Rename all .js files"
+    Agent->>ApprovalManager: requestApproval(edit_file)
+    ApprovalManager->>Backend: requestApproval(request + diff)
+    Backend->>User: Show diff + [o/s/a/n/d]
+    alt once
+        User-->>Backend: o
+        Backend-->>ApprovalManager: approved (scope=once)
+    else this session
+        User-->>Backend: s
+        Backend-->>ApprovalManager: approved (scope=session)
+    else always
+        User-->>Backend: a
+        Backend-->>ApprovalManager: approved (scope=always, scopePattern)
+    else deny & redirect
+        User-->>Backend: d → "edit only .ts files"
+        Backend-->>ApprovalManager: denied (feedback)
+    end
+    ApprovalManager-->>Agent: boolean
+```
+
+**What the user sees:**
+
+```
+────────────────────────────────────────────────────────────
+🔒 Tool Approval Required
+────────────────────────────────────────────────────────────
+Function: edit_file
+Risk Level: HIGH
+Agent: refactor-bot
+Diff:
+--- old
++++ new
+@@ ...
+
+────────────────────────────────────────────────────────────
+Allow edit_file?  [o] once   [s] this session   [a] always (edit:/path/to/file)   [n] no   [d] deny & redirect
+Choice [o/s/a/n/d] (n):
+```
+
+- `y`/`yes` is accepted as `once`.
+- Empty input defaults to `n` (deny).
+- `d` prompts for free-text guidance returned on `decision.feedback`.
+- Diffs render in ANSI unless `NO_COLOR` is set or output is not a TTY — override with `new ConsoleBackend({ colors: false })`.
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `input` | `NodeJS.ReadableStream` | `process.stdin` | Input stream for the default async reader. |
+| `output` | `NodeJS.WritableStream` | `process.stdout` | Output stream for prompts. |
+| `reader` | `(q: string) => Promise<string>` | built-in `readline` | Injected async reader (useful in tests). |
+| `syncReader` | `(q: string) => string` | blocking `fs.readSync` on stdin | Injected sync reader; required by `requestApprovalSync` when `input` is not `process.stdin`. |
+| `colors` | `boolean` | `isTTY && !NO_COLOR` | Force ANSI colours on/off. |
+
+<Note>
+**Python parity:** `praisonaiagents.approval.ConsoleBackend` — same prompt, Rich markup instead of ANSI.
+</Note>
+
+### AgentApproval
+
+Delegates the decision to another AI agent that replies `APPROVE` or `DENY`.
+
+```typescript
+import { Agent, setApprovalBackend, AgentApproval } from 'praisonai';
+
+const reviewer = new Agent({
+  name: 'strict-reviewer',
+  instructions: 'Only approve file reads. Deny everything else. Reply APPROVE or DENY.'
+});
+
+setApprovalBackend(new AgentApproval(reviewer));          // custom reviewer
+// or let it create a default reviewer agent lazily:
+setApprovalBackend(new AgentApproval(null, 'gpt-4o-mini'));
+```
+
+<Warning>
+`requestApprovalSync` returns a **denial** in TypeScript — an LLM call cannot block the event loop. Use the async path (`requestApproval`, which `setApprovalBackend` uses). Python's `request_approval_sync` does prompt synchronously; this is a real divergence.
+</Warning>
+
+<Note>
+**Python parity:** `praisonaiagents.approval.AgentApproval(approver_agent=..., llm="gpt-4o-mini")`.
+</Note>
+
+### CallbackBackend
+
+Wraps a legacy `(toolName, arguments, riskLevel) => decision | boolean` callback.
+
+```typescript
+import { setApprovalBackend, CallbackBackend } from 'praisonai';
+
+setApprovalBackend(new CallbackBackend((toolName, args, riskLevel) => {
+  return toolName.startsWith('read_');  // boolean, decision object, or Promise
+}));
+```
+
+<Note>
+**Python parity:** `praisonaiagents.approval.CallbackBackend(callback)`.
+</Note>
+
+### Build your own backend
+
+Implement `ApprovalBackend` — `requestApproval` (async) and `requestApprovalSync`. Use the `approvalRequest` / `approvalDecision` builders for Python-shaped defaults and `suggestScopePattern` for a reusable "always" pattern.
+
+```typescript
+import { setApprovalBackend, approvalDecision, suggestScopePattern } from 'praisonai';
+import type { ApprovalBackend, ApprovalBackendRequest } from 'praisonai';
+
+const myBackend: ApprovalBackend = {
+  async requestApproval(request: ApprovalBackendRequest) {
+    const ok = request.riskLevel !== 'critical';
+    return approvalDecision({
+      approved: ok,
+      approver: 'policy',
+      scope: ok ? 'always' : 'once',
+      scopePattern: ok ? suggestScopePattern(request) : null
+    });
+  },
+  requestApprovalSync(request: ApprovalBackendRequest) {
+    return approvalDecision({ approved: request.riskLevel !== 'critical', approver: 'policy' });
+  }
+};
+
+setApprovalBackend(myBackend);
+```
+
+### Wiring functions
+
+`setApprovalBackend` installs a backend; `getApprovalBackend` reads it back.
+
+```typescript
+import { setApprovalBackend, getApprovalBackend, AutoApproveBackend, ApprovalManager } from 'praisonai';
+
+const manager = new ApprovalManager();
+setApprovalBackend(new AutoApproveBackend(), manager, { riskLevel: 'high', agentName: 'ci-bot' });
+
+getApprovalBackend(manager);  // → the AutoApproveBackend instance
+```
+
+Adapt a backend into a plain `ApprovalHandler`, or convert a manager request into the Python shape, directly.
+
+```typescript
+import { approvalHandlerFromBackend, toApprovalBackendRequest, ConsoleBackend, ApprovalManager } from 'praisonai';
+
+const manager = new ApprovalManager();
+manager.onApprovalRequest(approvalHandlerFromBackend(new ConsoleBackend()));
+
+// inside a handler, reshape a manager request:
+manager.onApprovalRequest(async (req) => {
+  const backendRequest = toApprovalBackendRequest(req, { riskLevel: 'high' });
+  return backendRequest.riskLevel !== 'critical';
+});
+```
+
+`approvalRequest` and `approvalDecision` build the Python-shaped objects with dataclass defaults (`approvalId` auto-fills like `uuid4().hex`).
+
+```typescript
+import { approvalRequest, approvalDecision } from 'praisonai';
+
+const request = approvalRequest({ toolName: 'edit_file', arguments: { path: 'a.ts' }, riskLevel: 'high' });
+const decision = approvalDecision({ approved: true, scope: 'session' });
+```
+
+<Warning>
+`setApprovalBackend(null)` clears the backend slot — it does **not** detach the registered handler. The handler then declines (returns `false`), letting other handlers or the manager's event flow decide.
+</Warning>
+
+### Permission-target helpers
+
+Turn a tool call into a reusable permission target or glob for `session`/`always` scopes.
+
+| Helper | Input | Output |
+|--------|-------|--------|
+| `buildPermissionTarget('execute_command', { command: 'ls -la' })` | shell tool | `bash:ls -la` |
+| `buildPermissionTarget('edit_file', { path: '/x.ts' })` | file tool | `edit:/x.ts` |
+| `derivePattern('bash:git status -s')` | shell target | `bash:git status *` |
+| `commandPrefix(['git', 'status', '-s'])` | tokens | `git status` |
+| `suggestScopePattern(request)` | a request | best-effort `always` pattern |
+
+`ARITY` maps commands (`git`, `npm`, `docker`, …) to the number of leading tokens `commandPrefix` keeps.
+
+```typescript
+import { buildPermissionTarget, derivePattern, commandPrefix, suggestScopePattern, ARITY, approvalRequest } from 'praisonai';
+
+buildPermissionTarget('execute_command', { command: 'ls -la' });  // 'bash:ls -la'
+derivePattern('bash:git status -s');                              // 'bash:git status *'
+commandPrefix(['npm', 'run', 'build']);                           // 'npm run'
+suggestScopePattern(approvalRequest({ toolName: 'execute_command', arguments: { command: 'git push' }, riskLevel: 'high' }));
+ARITY.git;  // 2
+```
+
+### API surface
+
+Everything exported from the `approval` module — all import flat from `praisonai`.
+
+| Kind | Exports |
+|------|---------|
+| Classes | `AutoApproveBackend`, `ConsoleBackend`, `AgentApproval`, `CallbackBackend` |
+| Functions | `setApprovalBackend`, `getApprovalBackend`, `approvalHandlerFromBackend`, `toApprovalBackendRequest`, `approvalRequest`, `approvalDecision`, `buildPermissionTarget`, `derivePattern`, `commandPrefix`, `suggestScopePattern` |
+| Constants | `ARITY` |
+| Types | `ApprovalBackend`, `ApprovalBackendRequest`, `ApprovalBackendDecision`, `ApprovalRequestInit`, `ApprovalDecisionInit`, `ApprovalScope`, `ConsoleBackendOptions`, `ConsolePromptResult`, `BackendHandlerOptions`, `ApproverAgentLike`, `LegacyApprovalCallback` |
+
+**`ApprovalBackendRequest`** — what a custom backend receives:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `toolName` | `string` | Tool requesting approval. |
+| `arguments` | `Record<string, unknown>` | Arguments the tool will be called with. |
+| `riskLevel` | `string` | `critical` / `high` / `medium` / `low`. |
+| `agentName` | `string \| null` | Triggering agent. |
+| `sessionId` | `string \| null` | Session tracker. |
+| `context` | `Record<string, unknown>` | Arbitrary context — e.g. a rendered `diff`. |
+| `approvalId` | `string` | Stable correlation id (auto `uuid4().hex` via `approvalRequest`). |
+| `authorizedReviewers` | `string[] \| null` | Reviewer identities allowed to resolve. |
+| `liveness` | `(() => boolean) \| null` | Predicate that returns `true` while the originating turn is live. |
+
+**`ApprovalBackendDecision`** — what a backend returns:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `approved` | `boolean` | — | Final verdict. |
+| `reason` | `string` | `""` | Human-readable justification. |
+| `modifiedArgs` | `Record<string, unknown>` | `{}` | Optional replacement arguments. |
+| `approver` | `string \| null` | `null` | Who/what approved (user, system, console, agent, …). |
+| `metadata` | `Record<string, unknown>` | `{}` | Backend-specific metadata. |
+| `scope` | `'once' \| 'session' \| 'always'` | `'once'` | How long to remember the decision. |
+| `scopePattern` | `string \| null` | `null` | Reusable target/pattern for session/always scopes. |
+| `feedback` | `string \| null` | `null` | Free-text guidance when denying with redirect. |
+
+**`BackendHandlerOptions`** — passed to `setApprovalBackend` / `approvalHandlerFromBackend`:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `riskLevel` | `string` | `"medium"` | Risk stamped on requests from the manager (which carries none). |
+| `agentName` | `string \| null` | `null` | Agent name stamped on requests. |
 
 ---
 
@@ -278,13 +625,16 @@ const needsApproval = createDangerousPatternChecker([/\bwipe\b/i]);
 ## Related
 
 <CardGroup cols={2}>
+  <Card title="Python Approval Backends" icon="python" href="/features/approval-backends">
+    The matching Python/CLI backends
+  </Card>
+  <Card title="Approval Protocol" icon="shield-check" href="/features/approval-protocol">
+    Cross-SDK backend matrix and request/decision shapes
+  </Card>
   <Card title="Human Review" icon="user-check" href="/js/human-in-the-loop-review">
     Approve a task's output before the next task
   </Card>
   <Card title="Guardrails" icon="shield" href="/js/guardrails">
     Input/output validation
-  </Card>
-  <Card title="Security" icon="lock" href="/js/security">
-    Security features
   </Card>
 </CardGroup>

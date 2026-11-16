@@ -124,7 +124,7 @@ The same durable store now also backs the **inbound operator-request path** (the
 ### Voice notes
 
 Voice messages sent to your gateway bot are transcribed automatically on
-Telegram, Slack, and WhatsApp — no code changes required. Configure the
+Telegram, Slack, WhatsApp, Discord, and Signal — no code changes required. Configure the
 `stt:` block under each channel to force a language or opt out. See
 [Voice Notes (Speech-to-Text)](/features/gateway-stt).
 
@@ -250,7 +250,7 @@ await client.connect()
 | `preauth_max_connections_per_ip` | `int` | `32` | Max concurrent unauthenticated WS connections per source IP. `0` disables. Loopback exempt. |
 | `max_unauthorized_frames` | `int` | `10` | Close the connection after N unauthorized frames. `0` disables. |
 | `revoke_on_secret_rotation` | `bool` | `true` | Force-close live sessions when `auth_token` is rotated via config reload. `false` adopts the new secret for new connections only. See [Gateway Credential Rotation](/features/gateway-credential-rotation). |
-| `api.openai` | `bool` | `false` | When on, mounts `/v1/chat/completions`, `/v1/responses` (with **background/async runs**, `GET /v1/responses/{id}`, and `POST /v1/responses/{id}/cancel`), and `/v1/models` on the same port and auth. See [Gateway API Endpoints](/features/gateway-api-endpoints). |
+| `api.openai` | `bool` | `false` | When on, mounts `/v1/chat/completions`, `/v1/responses` (with **background/async runs**, `GET /v1/responses/{id}`, `POST /v1/responses/{id}/cancel`, and **client `Idempotency-Key` support for safe retries**), and `/v1/models` on the same port and auth. See [Gateway API Endpoints](/features/gateway-api-endpoints). |
 | `api.mcp` | `bool` | `false` | When on, mounts an MCP JSON-RPC endpoint at `/mcp` on the same port and auth. See [Gateway API Endpoints](/features/gateway-api-endpoints). |
 
 ### Python-first surface (parity with CLI/YAML)
@@ -281,6 +281,10 @@ Precedence is unchanged: **CLI flag > explicit YAML (block *or* scalar, incl. `w
 
 The `gateway.yaml` schema accepts three optional top-level blocks alongside `channels` and `agents`. All three are optional and ignored when not present.
 
+<Tip>
+Run a `gateway.yaml` from Python with `asyncio.run(WebSocketGateway().start_with_config("gateway.yaml"))` (`from praisonai_bot import WebSocketGateway`). Do not pass it to `BotOS.from_config()` — that raises `ValueError` (see [BotOS YAML vs Gateway YAML](/features/botos#botos-yaml-vs-gateway-yaml)).
+</Tip>
+
 <Note>
 Since PraisonAI [PR #3079](https://github.com/MervinPraison/PraisonAI/pull/3079), the `gateway:` and `hooks:` blocks are validated field-by-field at load time. Unknown keys (`drain_timout`), wrong types (`reload_drain_timeout: "quick"`), out-of-range values (`port: 99999`), and invalid `overflow_policy` values are rejected with a friendly, field-named error instead of running silently with the default.
 </Note>
@@ -305,9 +309,10 @@ channels:
   discord:
     platform: discord
     token: ${DISCORD_BOT_TOKEN}
+    stt: true                # Discord voice notes are transcribed too (default on)
 ```
 
-Inbound voice notes on Telegram, Slack, and WhatsApp are transcribed automatically — see [Voice Notes](/features/gateway-voice-notes).
+Inbound voice notes on Telegram, Slack, WhatsApp, Discord, and Signal are transcribed automatically — see [Voice Notes](/features/gateway-voice-notes).
 
 ### Local terminal channel
 
@@ -332,7 +337,7 @@ The `gateway:` block validates every knob below. Extra keys are rejected (`extra
 | `allowed_origins` | `list[str]` | `None` | |
 | `auth_token` | `str` | `None` | See [Rotating the shared secret](#rotating-the-shared-secret) and [Weak Secret Guard](/docs/features/gateway-bind-aware-auth#weak-placeholder-secret-guard). Well-known placeholder values refuse the start on an external bind. |
 | `auth` | `dict` | `None` | |
-| `auth_scopes` | `dict[str, list[str]]` | `None` | |
+| `auth_scopes` | `dict[str, list[str] \| {scopes, agents}]` | `None` | Each entry is a plain scope list or `{scopes, agents}` to confine the token to specific agents. See [Confining operators to specific agents](/features/gateway-operator-scopes#confining-operators-to-specific-agents-issue-6253). |
 | `max_connections` | `int` | `None` | ≥ 0 |
 | `max_sessions_per_agent` | `int` | `None` | ≥ 0 |
 | `session_config` | `dict` | `None` | |
@@ -432,6 +437,9 @@ hooks:
 | `signature_header` | `str` | `None` | no | Header carrying the signature. Auto-defaults to `X-Hub-Signature-256` when `secret` is set. |
 | `signature_algo` | `str` | `"sha256"` | no | HMAC digest name. |
 | `signature_prefix` | `str` | `None` | no | Optional signature prefix, e.g. `sha256=`. |
+| `signature_scheme` | `str` | `"hmac_hex"` | no | How the provider signs — `"hmac_hex"` (default, hex HMAC of the body), `"hmac_base64"` (base64 HMAC of the body), `"hmac_timestamped"` (hex HMAC of `"{timestamp}.{body}"`), or `"structured"` (Stripe-style `t=…,v1=…` composite header; any `v1` may match). Invalid values raise `ValueError`. |
+| `timestamp_header` | `str` | `None` | no | Header carrying the provider timestamp (unix seconds). Only valid with `hmac_timestamped` or `structured`; required for `hmac_timestamped`. For `structured`, the `t=` component is read from the signature header when omitted. |
+| `signature_tolerance_seconds` | `int` | `300` | no | Replay window for timestamped and structured schemes — a request outside `±` this many seconds is rejected before any agent runs. `0` disables the freshness check (not recommended). Negative values raise `ValueError`. |
 | `events` | `list[str]` | `None` | no | Allow-list of event types. Unmatched deliveries are ack'd (200) with no LLM turn. A string is coerced to a list. |
 | `event_header` | `str` | `None` | no | Header carrying the event type (e.g. `X-GitHub-Event`); when omitted the event is read from the payload as a dotted path (default `"event"`). |
 | `deliver_only` | `bool` | `false` | no | Deliver the rendered `message` straight through `deliver_to` with no LLM turn. Requires `deliver_to`. |
@@ -460,6 +468,28 @@ scheduler:
 | `audit_dir` | `str` | `null` | Directory for the durable full-output audit trail. |
 
 Overrides apply on the next tick without a process restart. See [Scheduled Run Policy](/features/scheduled-run-policy) for the full policy semantics.
+
+### `mcp_servers:` block
+
+Declare downstream MCP servers once; every agent that lists the server name in `tools:` gets the same pooled client.
+
+```yaml
+mcp_servers:
+  github:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+  search:
+    url: https://mcp.example.com/sse
+    headers:
+      Authorization: Bearer ${SEARCH_MCP_TOKEN}
+
+agents:
+  support:
+    instructions: "Answer questions using GitHub and web search."
+    tools: [github, search]
+```
+
+See [Gateway MCP Servers](/features/gateway-mcp-servers) for hot-reload, pool shutdown, failure modes, and tool-name namespacing.
 
 ### `BotOS.from_config` and tool names
 
@@ -526,6 +556,8 @@ Changed in PraisonAI v4.6.26: gateway agents now default to `reflection: false`.
 <Card title="Gateway Scoped Approvals" icon="user-lock" href="/features/gateway-scoped-approvals">
   Durable, agent-scoped allow-always grants, resolver scoping options, and the `/api/approval/allow-list` endpoint
 </Card>
+
+Unanswered approvals fail closed and say so: the Slack / Telegram / Discord card edits to **"⌛ Timed out — not run"**, and a `GatewayApprovalBackend` you build yourself with `notify_url` sends a follow-up `"timed_out"` POST (the auto-wired default has no `notify_url`, so it sends none). See [Timeout feedback on the card](/features/durable-approvals#timeout-feedback-on-the-card) and [GatewayApprovalBackend webhook payload](/features/approval-protocol#gatewayapprovalbackend-webhook-payload).
 
 Gateway also supports isolated exec approval managers for multi-tenant environments where agents must not share approval state.
 
@@ -729,6 +761,11 @@ print(path)   # ~/.praisonai/bot.yaml
 
 **Kanban dispatcher (v4.6.x):** Worker file descriptors are now released as soon as the subprocess starts (fixes a slow leak under sustained dispatch). `release_claim` failures are logged with full stack traces instead of being silently swallowed — orphaned `claimed` tasks now leave a clear log trail for triage. `KeyboardInterrupt` / `SystemExit` / asyncio cancellation propagate cleanly through dispatcher shutdown.
 
+**Kanban dispatcher (off-loop git):** Every git command the dispatcher runs — `worktree add`, `merge --no-ff`, `commit`, `status`, `worktree remove` — now runs in a worker thread, off the gateway event loop. A slow git step no longer freezes chats, WebSocket pings or health probes.
+
+- **Serialised per gateway process.** A single in-process lock, shared by every dispatcher, lets only one blocking git section run at a time, so two dispatchers in the same process never run `git merge` concurrently. Running dispatchers in separate processes against one repo? Serialise at the repo level yourself (file lock, dedicated worker host).
+- **Shutdown stops the whole worker group.** On POSIX, workers start in their own session. Shutdown sends `SIGTERM` to each worker's process group, waits up to 5 s for all of them together, then `SIGKILL`s the group — so shells, dev servers and test runners a worker spawned don't outlive the gateway. Windows is unchanged.
+- **Cancel during worktree prep is clean.** If the dispatcher stops while `git worktree add` is running, it waits for git to finish, removes the unused worktree and `kanban/<task_id>` branch, closes the run as `failed` and releases the claim so a retry starts fresh.
 - Every git command the dispatcher runs is now bounded by `PRAISONAI_KANBAN_GIT_TIMEOUT` (default 300 s). A hung git operation returns `returncode=124` with a diagnosis in stderr instead of stalling the event loop. See [Gateway Subprocess Guard](/features/gateway-subprocess-guard).
 
 ---
@@ -748,6 +785,10 @@ agent = Agent(
 # CLI deployment
 # praisonai serve unified --port 8765
 ```
+
+<Tip>
+You can run several gateways on one host only if each has its own `HOME` (its own `~/.praisonai` state) and its own bot tokens — a different port alone is refused. See [Run a second, isolated gateway](/features/gateway-cli#run-a-second-isolated-gateway).
+</Tip>
 
 ### Multi-Agent Gateway
 ```python
@@ -1046,8 +1087,14 @@ Native thread implementations for Telegram / Discord / Slack live in the `praiso
 <Card title="Trusted Proxies" icon="shield-halved" href="/features/gateway-trusted-proxies">
   Resolve the real client IP behind a reverse proxy or tunnel
 </Card>
+<Card title="Turn Error Codes" icon="triangle-exclamation" href="/features/gateway-turn-error-codes">
+  Typed `outcome.error` on failed turns — code, retryable, retry_after_seconds, message
+</Card>
 <Card title="Gateway API Endpoints" icon="plug" href="/features/gateway-api-endpoints">
   OpenAI-compat and MCP HTTP endpoints on the live gateway
+</Card>
+<Card title="Gateway MCP Servers" icon="plug" href="/features/gateway-mcp-servers">
+  Share one pooled MCP client across every gateway agent
 </Card>
 <Card title="Relay Transport" icon="arrow-left-right" href="/features/relay-transport">
   Out-of-process platform connector relay

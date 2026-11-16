@@ -170,6 +170,10 @@ Keep `max_tokens` small for interactive UIs to bound latency and cost.
 
 Streaming can fail mid-flight — a context-length overflow, a provider hiccup, a sync adapter that refuses to stream — and when it does, `start(stream=True)` and `iter_stream()` fall back to a single non-streaming `chat()` call so your caller still gets an answer.
 
+<Note>
+**Tool turns + streaming failure = surfaced, not silently retried.** If a stream drops mid-response on a turn that exposes `tools`, PraisonAI no longer falls back to `stream=False` — a tool may already have run server-side. The original error surfaces so you decide. Tool-less streaming turns and pre-dispatch (connect/DNS/TLS) failures still fall back exactly as before. See [Replay-Safe Retries → Streaming → Non-Streaming Fallback is Gated Too](/features/replay-safe-retries#streaming--non-streaming-fallback-is-gated-too).
+</Note>
+
 ```mermaid
 sequenceDiagram
     participant U as Your code
@@ -278,6 +282,8 @@ graph TB
 | `run()` | ❌ No | ❌ No | Production, batch processing |
 | `chat(stream=True)` | Configurable | Configurable | Low-level control |
 
+Since [PR #5739](https://github.com/MervinPraison/PraisonAI/pull/5739), `chat(stream=True)` mirrors `start(stream=True)`'s sync-adapter behaviour: on adapters that cannot stream, it falls back to a non-streaming call and returns the completed text — it no longer returns `None`.
+
 ---
 
 ## Common Patterns
@@ -292,6 +298,19 @@ agent = Agent(instructions="You are a helpful assistant")
 # Tokens appear as they arrive
 for chunk in agent.start("Explain quantum computing", stream=True):
     print(chunk, end="", flush=True)
+```
+
+### `chat(stream=True)` Sync-Adapter Fallback
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(instructions="You are a helpful assistant")
+
+# chat(stream=True) on the default sync OpenAI adapter used to return None.
+# Since PR #5739 it transparently falls back to non-streaming — you get text.
+reply = agent.chat("Summarise streaming in one sentence.", stream=True)
+print(reply)   # -> a complete answer, never None
 ```
 
 ### App Integration with `iter_stream()`
@@ -377,6 +396,65 @@ asyncio.run(main())
 
 ---
 
+## Resuming after an interrupt
+
+An interrupted streamed run keeps its partial answer in the session store, so `praisonai run --continue` / `--session <id>` picks up whatever was produced before the interrupt.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    instructions="You are a helpful assistant",
+    memory={"session_id": "write-doc"},
+)
+
+# Stream and interrupt (Ctrl-C)
+for chunk in agent.start("Write a long doc on streaming", stream=True):
+    print(chunk, end="", flush=True)
+```
+
+```bash
+# Later — pick up right where it stopped
+praisonai run --continue
+# or
+praisonai run --session write-doc
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Store as Session Store
+
+    User->>Agent: start(prompt, stream=True)
+    Agent->>Store: persist user turn
+    loop tokens
+        Agent-->>User: chunk
+        Agent->>Store: upsert_partial_assistant_message (debounced)
+    end
+    Note over User,Agent: Ctrl-C mid-stream
+    Agent->>Store: force-flush partial (GeneratorExit)
+    User->>Agent: praisonai run --continue
+    Store-->>Agent: history incl. partial turn
+    Agent-->>User: resume with partial answer visible
+
+    classDef user fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef store fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class User user
+    class Agent agent
+    class Store store
+```
+
+The streaming path persists the user turn as soon as the stream starts, then flushes the growing partial assistant turn as tokens arrive. Partial writes are debounced (~5 writes/sec) and the retention/compaction window is enforced only on finalize, so streaming does not thrash the disk. Three internal helpers drive this — `_persist_assistant_delta`, `_finalize_assistant_turn`, and `_discard_partial_assistant_turn` — you'll see their names in debug logs but never call them directly.
+
+<Note>
+Stores without the new protocol fall back to the previous single-terminal write and behave as before — the agent feature-detects `upsert_partial_assistant_message` and uses a legacy per-turn `add_assistant_message` when it is absent. See [Incremental Session Store Protocol](/features/session-protocol#incremental-session-store-protocol).
+</Note>
+
+---
+
 ## Streaming with Knowledge
 
 Streaming responses retrieve and inject knowledge context using the same normalization as the non-streaming sync path.
@@ -413,7 +491,7 @@ LM Studio, vLLM, and llama.cpp stream tool calls correctly — the `LocalOpenAIA
 </Note>
 
 <Note>
-**Where the two-phase flow lives.** The follow-up completion after tools is issued by the custom-LLM streaming path (`praisonaiagents/llm/llm.py::get_response_stream`), which most providers route through. The follow-up **keeps** `tools` available and is fetched non-streamed, then yielded as a single block — so the model can call another tool if it needs to. This is not bounded to a single round.
+**Follow-up loops through chained tool calls.** The follow-up completion after tools is issued by the custom-LLM streaming path (`praisonaiagents/llm/llm.py::get_response_stream`). It is non-streamed, keeps `tools` available, and now **loops** — if the model responds with another `tool_calls`, those tools are executed with the same executor path as the first turn and the follow-up repeats until the model returns plain content. Loop bound: `kwargs["max_iterations"]` (fallback `self.max_iter`, default 20). Fixed in PraisonAI [PR #5400](https://github.com/MervinPraison/PraisonAI/pull/5400) (closes [#5399](https://github.com/MervinPraison/PraisonAI/issues/5399)).
 </Note>
 
 <Note>
@@ -423,6 +501,67 @@ LM Studio, vLLM, and llama.cpp stream tool calls correctly — the `LocalOpenAIA
 <Warning>
 This fix is scoped to the custom-LLM path (`llm.py::get_response_stream`). The native sync-OpenAI streaming path (`agent/chat_mixin.py::_start_stream_impl`) is a **separate** path that PR #4757 does not touch: it does **not** yet issue a follow-up completion after a tool runs — the streamed generator ends once tool results are appended to chat history. If you rely on `start(stream=True)` with tools on the sync OpenAI adapter and see no synthesized answer, use the non-streaming path (`chat()` / `start()` without `stream=True`) for that turn.
 </Warning>
+
+### Chained follow-up tool calls
+
+Streaming agents can now chain tool calls through the follow-up turn — a second tool call returned by the follow-up is executed, its result is fed back to the model, and the loop continues until the model answers with plain content.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Researcher",
+    instructions="Call step1 first, then step2 with step1's result.",
+    tools=[step1, step2],
+)
+
+for chunk in agent.start("Run the pipeline", stream=True):
+    print(chunk, end="", flush=True)
+```
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent
+    participant Model
+    participant Tools
+
+    User->>Agent: start(stream=True)
+    Agent->>Model: stream turn
+    Model-->>Agent: tool_calls
+    Agent->>Tools: execute batch
+    Tools-->>Agent: results → messages
+    loop until plain content
+        Agent->>Model: follow-up turn (tools kept)
+        Model-->>Agent: tool_calls?
+        Agent->>Tools: execute batch
+        Tools-->>Agent: results → messages
+    end
+    Model-->>Agent: final content
+    Agent-->>User: yield answer
+```
+
+- **Bounds.** The total tools-executed count is capped by `max_tool_calls_per_turn` (seeded with the first streamed batch, so the cap spans every follow-up batch); the follow-up iteration count is capped by `max_iterations` (fallback `self.max_iter`, default 20).
+- **Ollama.** In the single-shot (non-parallel) mode, follow-up batches resolve chained-arg placeholders and run one call at a time, mirroring the first streamed batch so an argument that references an earlier call's result in the same batch is resolved before dispatch.
+- **Cancellation.** A Stop between follow-up iterations short-circuits with the existing stream-cancel sentinel.
+
+<Warning>
+This loop lives on the custom-LLM path (`llm.py::get_response_stream`). The native sync-OpenAI streaming path (`agent/chat_mixin.py::_start_stream_impl`) is a **separate** path this fix does not touch.
+</Warning>
+
+### Parallel tool calls under streaming
+
+The streaming accumulator now handles the three cases providers hit in practice — a tool-call `index` greater than the current list, parallel calls that reuse `index=0` with different `id`s, and `id`/`name` fields that arrive in a later chunk.
+
+| Streaming chunk shape | Previous | Now |
+|---|---|---|
+| First-seen `index` past the end of the list | `IndexError` | List is padded with placeholder slots up to `index` |
+| Two different non-empty `id`s at the same `index` (parallel calls reusing `index=0`) | Argument strings concatenated into one invalid-JSON blob | A new slot is appended; subsequent id-less argument chunks for that index are routed to the new slot |
+| `id` / `name` arrives in a later chunk than the first delta for that index | Ignored (the `id` was never updated) | Filled in on the appropriate slot |
+
+<Note>
+The per-accumulation routing map (`_stream_index_route`) is scoped to the `tool_calls` list identity and is reset whenever a fresh empty list begins a new stream — no cross-turn leakage.
+</Note>
 
 ### Stopping a streamed tool batch
 
@@ -781,7 +920,7 @@ sequenceDiagram
 
 `TODO_UPDATED` fires on every `todo_add` / `todo_update` — subscribe to render a live checklist. See [Live Todo Streaming](/features/todo-live-streaming).
 
-`MODEL_FALLBACK` fires the moment the runtime swaps models. Subscribe to render a "switched to backup" notice, or pair it with the [`HookEvent.MODEL_FALLBACK` hook](/features/hook-events#model_fallback) for programmatic reactions. See [Model Fallback → Observing the Switch](/features/model-fallback#observing-the-switch).
+`MODEL_FALLBACK` fires the moment the runtime swaps models. Subscribe to render a "switched to backup" notice, or pair it with the [`HookEvent.MODEL_FALLBACK` hook](/features/hook-events#model_fallback) for programmatic reactions. See [Model Fallback → Observing the Switch](/features/model-fallback#observing-the-switch). The custom-LLM path (`provider/model` strings, model objects, `base_url`) emits it too, so one subscription covers every agent shape.
 
 ---
 
@@ -980,7 +1119,7 @@ TTFT is the time before the first token arrives. This is provider latency — th
 | Mode | Behavior | Use Case |
 |------|----------|-----------|
 | `stream=None` (default) | Try streaming, fall back to non-streaming if unsupported | **Recommended** — works across all providers |
-| `stream=True` | Force streaming (errors on sync adapters that don't support it) | When you definitely want tokens |
+| `stream=True` | Try streaming; on sync adapters that don't support it, fall back transparently to non-streaming (never returns `None`). Both `start(stream=True)` and `chat(stream=True)` share this fallback. | When you prefer tokens but still want text on sync-only providers |
 | `stream=False` | Force non-streaming | Batch jobs, structured output, sync providers |
 | **Multi-agent** `output=None` (default) | `stream=True` — auto streaming | Default streaming behavior |
 | **Multi-agent** `output="verbose"` / `"minimal"` | `stream=True` by default | Display with streaming |
@@ -991,6 +1130,54 @@ TTFT is the time before the first token arrives. This is provider latency — th
 
 Multi-agent teams (`AgentTeam`, `PraisonAIAgents`) default to `stream=True` for `"verbose"` and `"minimal"` presets. Use `output=MultiAgentOutputConfig(stream=False)` or `output=["verbose", {"stream": False}]` to opt out for sync-only providers.
 </Note>
+
+---
+
+## Streaming runs the same pre-turn checks
+
+Streamed turns pass the same pre-turn gate as `chat()` / `achat()` before the first chunk is yielded ([PR #5863](https://github.com/MervinPraison/PraisonAI/pull/5863)).
+
+- **Rate limiter:** `iter_stream()` / `start(stream=True)` acquires the agent's configured `rate_limiter`, so a streamed turn cannot bypass the request budget.
+- **`BEFORE_AGENT` hooks:** a blocking result ends the generator immediately — no model call, no chunks. A hook returning `modified_input["prompt"]` rewrites the prompt the model sees, exactly like on `chat()`.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Writer", instructions="Write product copy")
+
+for chunk in agent.iter_stream("Announce our new espresso machine"):
+    print(chunk, end="", flush=True)
+```
+
+---
+
+## Trace coverage for streamed turns
+
+`agent.start(prompt, stream=True)` records the same `agent_start` / `agent_end` trace events as `chat()` ([PR #6087](https://github.com/MervinPraison/PraisonAI/pull/6087)), so a replay, Langfuse, or custom sink shows the agent running while tokens stream.
+
+```python
+from praisonaiagents import Agent, ContextTraceEmitter, ContextListSink, trace_context
+
+sink = ContextListSink()
+emitter = ContextTraceEmitter(sink=sink, session_id="demo", enabled=True)
+agent = Agent(instructions="Answer briefly.")
+
+with trace_context(emitter):
+    for chunk in agent.start("Why do solar sails work?", stream=True):
+        print(chunk, end="", flush=True)
+
+# sink now holds agent_start ... agent_end(status="completed")
+```
+
+`agent_end.data["status"]` tells you how the streamed turn ended:
+
+| `status` | When it fires |
+|---|---|
+| `completed` | The stream ran to its end. |
+| `cancelled` | The caller closed the generator early (stopped reading, `gen.close()`, `InterruptedError`). |
+| `failed` | An exception escaped the stream, or an input guardrail / blocking `BEFORE_AGENT` hook stopped the turn. |
+
+Nothing is emitted when tracing is off. If a streaming error falls back to `chat()`, the turn is still recorded once. Model calls inside the stream are still reported as `request_start` / `stream_end` by the stream emitter.
 
 ---
 
@@ -1082,8 +1269,76 @@ graph TB
 ```
 
 <Note>
-Closing the generator early signals the producer to stop. The internal queue is bounded (`maxsize=64`), so an abandoned consumer applies back-pressure instead of leaking memory, and the producer thread is a daemon — a stalled backend cannot block interpreter shutdown.
+Closing the generator (`await gen.aclose()` or `contextlib.aclosing(...)`) sets a stop event that the producer thread checks between chunks and calls the backend's `interrupt()` on a daemon thread, so the upstream run is torn down — on Anthropic that sends `user.interrupt` to the active session, stopping token billing. A bare `break` on a retained generator reference only triggers the same teardown once the generator is garbage-collected; prefer `contextlib.aclosing(...)` to make the teardown deterministic. The internal queue is unbounded, so the producer never deadlocks on `queue.put` after the consumer stops reading.
 </Note>
+
+### Stopping a managed stream early
+
+Explicitly closing the stream tears down the upstream run — on Anthropic that stops the server-side session and stops token billing.
+
+```python
+import asyncio
+import contextlib
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", backend=my_managed_backend)
+
+async def main():
+    async with contextlib.aclosing(agent.astart("Write a long report.", stream=True)) as stream:
+        async for chunk in stream:
+            print(chunk, end="", flush=True)
+            if user_disconnected():
+                break
+    # Leaving the `async with` closes the generator deterministically, which
+    # sets the stop event and calls backend.interrupt() on a daemon thread.
+
+asyncio.run(main())
+```
+
+| Close method | Producer stops promptly? | Billing stops promptly? |
+|---|---|---|
+| `async with contextlib.aclosing(gen)` / explicit `await gen.aclose()` | ✅ | ✅ (interrupt fires in the `finally`) |
+| Bare `break` on a retained reference | Only on GC of the generator | Only on GC of the generator |
+| Task cancellation (`task.cancel()`) | ✅ (`CancelledError` propagates through `finally`) | ✅ |
+
+<Note>
+**Fixed in PraisonAI [PR #5774](https://github.com/MervinPraison/PraisonAI/pull/5774) ([issue #5773](https://github.com/MervinPraison/PraisonAI/issues/5773)).** Before #5774, the producer thread in `ManagedBackendBase.stream()` had no signalling path from the async consumer — a `break` / `aclose()` / `CancelledError` on the caller side only exited the async generator; the producer kept iterating SSE events and, on Anthropic, kept the server-side session running until `session.status_idle`, with every token billable. #5774 adds a `threading.Event` the consumer sets in its `finally` block, checks it at two points inside the producer (after `_ensure_session()` and at the top of every `_iter_events` chunk), and interrupts the backend from a daemon thread so the upstream run is torn down even when the producer is blocked waiting on a tool call.
+</Note>
+
+### Closing a sync managed stream early
+
+Since [PR #6073](https://github.com/MervinPraison/PraisonAI/pull/6073) (merged 2026-10-27), the sync generator from `agent.start(prompt, stream=True)` uses one hardened bridge whether or not your code already has a running event loop. Closing it early stops the backend cleanly.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="assistant", backend=my_managed_backend)
+
+stream = agent.start("Write a long report.", stream=True)
+print(next(stream))   # read one chunk
+stream.close()        # producer stops; the backend's own cleanup runs
+```
+
+- **Bounded buffer** — at most 64 chunks are buffered; a slow consumer pauses the producer instead of growing memory.
+- **Early close stops the producer** — `close()` (or garbage collection) signals the producer thread, which stops within ~100 ms.
+- **Backend cleanup runs** — the bridge calls `aclose()` on the backend's async generator, so its `finally` blocks execute.
+- **No shutdown hangs** — the producer runs on a daemon thread.
+- **Errors surface once** — a `RuntimeError` from the backend is raised to you exactly once; `backend.stream()` is never re-run.
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant Bridge as Sync bridge
+    participant Backend as backend.stream()
+
+    You->>Bridge: next(stream)
+    Bridge->>Backend: async for chunk
+    Backend-->>Bridge: chunk
+    Bridge-->>You: chunk
+    You->>Bridge: stream.close()
+    Bridge->>Backend: aclose()
+    Backend-->>Bridge: cleanup done
+```
 
 This path streams like any other `start(stream=True)` call — see [Choosing the Right Method](#choosing-the-right-method) and [Managed Runtime Protocol](/features/managed-runtime-protocol) for the backend contract.
 
@@ -1161,7 +1416,19 @@ Fixed in PraisonAI PR [#4757](https://github.com/MervinPraison/PraisonAI/pull/47
 
 ### "Streaming is not supported in sync OpenAIAdapter" / Deepseek multi-agent crash
 
-Fixed with single-agent smart-fallback in PR #1734. Since [PR #4731](https://github.com/MervinPraison/PraisonAI/pull/4731) the fallback filters kwargs (`max_tokens`, `top_p`, and anything else `chat()` doesn't declare) and chains the original streaming exception via `raise ... from streaming_error`; [PR #4734](https://github.com/MervinPraison/PraisonAI/pull/4734) factored the whole fallback into `ChatMixin._stream_fallback_chat` (signature-driven, so it is robust to future `chat()` changes) and added the `_praisonai_stream_fallback_exhausted` sentinel so the outer handler does not run the fallback twice. If you were previously catching `TypeError: chat() got an unexpected keyword argument 'max_tokens'` as a proxy for "streaming failed", switch to inspecting `exc.__cause__` instead — the real cause is now preserved. For multi-agent teams that use sync-only providers, explicitly disable streaming with `output=["verbose", {"stream": False}]` or similar. See [Multi-Agent Output](/features/multi-agent-output) for configuration options.
+Fixed on `start(stream=True)` with single-agent smart-fallback in PR #1734. Since [PR #4731](https://github.com/MervinPraison/PraisonAI/pull/4731) the fallback filters kwargs (`max_tokens`, `top_p`, and anything else `chat()` doesn't declare) and chains the original streaming exception via `raise ... from streaming_error`; [PR #4734](https://github.com/MervinPraison/PraisonAI/pull/4734) factored the whole fallback into `ChatMixin._stream_fallback_chat` (signature-driven, so it is robust to future `chat()` changes) and added the `_praisonai_stream_fallback_exhausted` sentinel so the outer handler does not run the fallback twice. If you were previously catching `TypeError: chat() got an unexpected keyword argument 'max_tokens'` as a proxy for "streaming failed", switch to inspecting `exc.__cause__` instead — the real cause is now preserved. For multi-agent teams that use sync-only providers, explicitly disable streaming with `output=["verbose", {"stream": False}]` or similar. See [Multi-Agent Output](/features/multi-agent-output) for configuration options.
+
+**`chat(stream=True)` was not covered by that fallback until [PR #5739](https://github.com/MervinPraison/PraisonAI/pull/5739) (fixes [#5737](https://github.com/MervinPraison/PraisonAI/issues/5737)).** Before #5739, an explicit `chat(prompt, stream=True)` against the sync OpenAI adapter raised `ValueError("Streaming is not supported in sync OpenAIAdapter…")` inside `_chat_completion`, which the outer `except` handler swallowed — so the call returned `None`. Since #5739, `_chat_completion` catches that specific `ValueError` and retries once with `stream=False`, so the caller receives the completed text. Any other `ValueError` (and any unrelated error) is still re-raised and surfaces as the normal typed `LLMError` — the fix is scoped to the "Streaming is not supported" message, so error signals are never swallowed into `None`.
+
+If you were previously branching on `result is None` from `chat(stream=True)` as a proxy for "the sync adapter can't stream", switch to one of:
+
+- rely on the new fallback — the returned string is the real response;
+- call `achat()` for native async streaming when you need streaming semantics;
+- call `chat(stream=False)` explicitly if you want to skip the streaming attempt entirely.
+
+### Streamed turns missing from traces
+
+Before [PR #6087](https://github.com/MervinPraison/PraisonAI/pull/6087), `start(stream=True)` emitted only `session_start` / `session_end` — no `agent_start` / `agent_end`. Upgrade `praisonaiagents`; your sink is not broken. See [Trace coverage for streamed turns](#trace-coverage-for-streamed-turns).
 
 ### Routed Claude / Gemini crash on the async path
 

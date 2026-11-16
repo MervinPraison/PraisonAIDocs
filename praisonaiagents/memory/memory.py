@@ -11,7 +11,6 @@ from praisonaiagents._logging import get_logger
 from datetime import datetime, timezone
 
 # Decomposed memory functionality - imported as mixins for backward compatibility
-from .search import SearchMixin
 from .core import MemoryCoreMixin
 
 # Protocol-driven imports (AGENTS.md compliant)
@@ -39,7 +38,7 @@ CACHE_BOUNDARY = "--- CACHE_BOUNDARY ---"
 
 
 
-class Memory(SearchMixin, MemoryCoreMixin):
+class Memory(MemoryCoreMixin):
     """
     A single-file memory manager covering:
     - Short-term memory (STM) for ephemeral context
@@ -328,8 +327,17 @@ class Memory(SearchMixin, MemoryCoreMixin):
         # compatible).
         suffix = self._path_safe_suffix(self.cfg.get("user_id"))
 
-        config["short_db"] = self.cfg.get("short_db", os.path.join(project_data, f"short_term{suffix}.db"))
-        config["long_db"] = self.cfg.get("long_db", os.path.join(project_data, f"long_term{suffix}.db"))
+        # ``db_path`` is a documented single-file alias for the sqlite backend
+        # (MemoryConfig(backend="sqlite", config={"db_path": ...})). Without this
+        # it was silently dropped and both agents fell back to the per-user
+        # default paths, so a caller-supplied shared file never took effect and
+        # cross-instance recall failed. An explicit short_db/long_db still wins.
+        db_path = self.cfg.get("db_path")
+        default_short = db_path or os.path.join(project_data, f"short_term{suffix}.db")
+        default_long = db_path or os.path.join(project_data, f"long_term{suffix}.db")
+
+        config["short_db"] = self.cfg.get("short_db", default_short)
+        config["long_db"] = self.cfg.get("long_db", default_long)
         config["rag_db_path"] = self.cfg.get("rag_db_path", os.path.join(project_data, f"chroma_db{suffix}"))
         config["collection_name"] = self.cfg.get("collection_name", f"memory_store{suffix}")
         config["verbose"] = self.verbose
@@ -373,8 +381,15 @@ class Memory(SearchMixin, MemoryCoreMixin):
         # per-user store paths derived in _get_adapter_config (explicit paths win).
         suffix = self._path_safe_suffix(self.cfg.get("user_id"))
 
-        self.short_db = self.cfg.get("short_db", os.path.join(project_data, f"short_term{suffix}.db"))
-        self.long_db = self.cfg.get("long_db", os.path.join(project_data, f"long_term{suffix}.db"))
+        # Honor the ``db_path`` single-file alias here too so the legacy direct
+        # connections (_get_stm_conn/_get_ltm_conn) point at the caller-supplied
+        # file, matching _get_adapter_config. Explicit short_db/long_db still win.
+        db_path = self.cfg.get("db_path")
+        default_short = db_path or os.path.join(project_data, f"short_term{suffix}.db")
+        default_long = db_path or os.path.join(project_data, f"long_term{suffix}.db")
+
+        self.short_db = self.cfg.get("short_db", default_short)
+        self.long_db = self.cfg.get("long_db", default_long)
         
         # Only create separate SQLite adapter if primary adapter is not SQLite
         if self.provider != "sqlite":
@@ -512,9 +527,8 @@ class Memory(SearchMixin, MemoryCoreMixin):
             )
             self._local.stm_conn.commit()
             
-            # Register connection for cleanup
-            with self._connection_lock:
-                self._all_connections.add(self._local.stm_conn)
+            # Register connection for cleanup (also reclaims dead threads' connections)
+            self._sqlite_adapter._register_connection(self._local.stm_conn)
         return self._local.stm_conn
 
     def _get_ltm_conn(self):
@@ -532,9 +546,8 @@ class Memory(SearchMixin, MemoryCoreMixin):
             )
             self._local.ltm_conn.commit()
             
-            # Register connection for cleanup
-            with self._connection_lock:
-                self._all_connections.add(self._local.ltm_conn)
+            # Register connection for cleanup (also reclaims dead threads' connections)
+            self._sqlite_adapter._register_connection(self._local.ltm_conn)
         return self._local.ltm_conn
 
     def _log_verbose(self, msg: str, level: int = logging.INFO):
@@ -683,6 +696,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
             accuracy, weights, evaluator_quality
         )
         metadata = self._stamp_provenance(metadata, trust, origin)
+        metadata = self._stamp_user_id(metadata)
         logger.info(f"Processed metadata: {metadata}")
         
         # Generate unique ID and timestamp once
@@ -789,6 +803,18 @@ class Memory(SearchMixin, MemoryCoreMixin):
         if origin is not None:
             metadata["origin"] = origin
         return metadata
+
+    def _stamp_user_id(self, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Default ``metadata["user_id"]`` to this store's configured user_id.
+
+        User-scoped search post-filters on ``metadata.user_id``; without the
+        stamp, facts saved via ``agent.store_memory()`` were invisible to the
+        same user's recall (#6040). An explicit metadata user_id still wins.
+        """
+        user_id = self.cfg.get("user_id")
+        if not user_id:
+            return metadata or {}
+        return {"user_id": user_id, **(metadata or {})}
 
     @staticmethod
     def _filter_by_trust(
@@ -1061,6 +1087,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
             accuracy, weights, evaluator_quality
         )
         metadata = self._stamp_provenance(metadata, trust, origin)
+        metadata = self._stamp_user_id(metadata)
         logger.info(f"Processed metadata: {metadata}")
         
         # Generate unique ID
@@ -2513,6 +2540,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                 # Remove from registry before closing
                 with self._connection_lock:
                     self._all_connections.discard(self._local.stm_conn)
+                    self._sqlite_adapter._connection_owners.pop(self._local.stm_conn, None)
                 self._local.stm_conn.close()
                 self._local.stm_conn = None
             except Exception as e:
@@ -2523,6 +2551,7 @@ class Memory(SearchMixin, MemoryCoreMixin):
                 # Remove from registry before closing
                 with self._connection_lock:
                     self._all_connections.discard(self._local.ltm_conn)
+                    self._sqlite_adapter._connection_owners.pop(self._local.ltm_conn, None)
                 self._local.ltm_conn.close()
                 self._local.ltm_conn = None
             except Exception as e:

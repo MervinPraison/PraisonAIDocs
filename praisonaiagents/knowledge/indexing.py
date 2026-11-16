@@ -13,12 +13,14 @@ No heavy imports - only stdlib.
 import fnmatch
 import hashlib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+logger = logging.getLogger(__name__)
 
 # Strategy thresholds based on corpus size
 STRATEGY_THRESHOLDS = {
@@ -29,13 +31,6 @@ STRATEGY_THRESHOLDS = {
     100000: "compressed", # < 100000 files: reranked + compression
 }
 DEFAULT_STRATEGY = "hierarchical"  # > 100000 files
-
-
-def estimate_tokens_simple(text: str) -> int:
-    """Simple token estimation (~4 chars per token)."""
-    if not text:
-        return 0
-    return len(text) // 4 + 1
 
 
 @dataclass
@@ -424,11 +419,11 @@ class FileTracker:
             return
         
         try:
-            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
-            with open(self._state_file, "w", encoding="utf-8") as f:
-                json.dump(self._tracked, f, indent=2)
-        except (OSError, IOError):
-            pass
+            os.makedirs(os.path.dirname(self._state_file) or ".", exist_ok=True)
+            from ..utils.atomic_io import atomic_write_json
+            atomic_write_json(self._state_file, self._tracked, indent=2)
+        except (OSError, IOError) as e:
+            logger.warning("Failed to save index state %s: %s", self._state_file, e)
     
     def load(self) -> None:
         """Load state from file."""
@@ -438,7 +433,9 @@ class FileTracker:
         try:
             with open(self._state_file, "r", encoding="utf-8") as f:
                 self._tracked = json.load(f)
-        except (OSError, IOError, json.JSONDecodeError):
+        except (OSError, IOError, json.JSONDecodeError) as e:
+            # Surface this: an empty state forces a full (costly) re-index.
+            logger.warning("Index state %s unreadable (%s); re-indexing", self._state_file, e)
             self._tracked = {}
     
     def clear(self) -> None:

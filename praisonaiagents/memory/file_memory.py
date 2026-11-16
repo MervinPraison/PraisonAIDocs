@@ -23,7 +23,10 @@ import sys
 import hashlib
 import logging
 from praisonaiagents._logging import get_logger
+from praisonaiagents.utils.safe_path import safe_child
 import threading
+import weakref
+from collections import Counter
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -37,6 +40,20 @@ else:
     _HAS_FCNTL = False
 
 logger = get_logger(__name__)
+
+_store_locks = weakref.WeakValueDictionary()
+_store_locks_guard = threading.Lock()
+
+
+def _shared_store_lock(path):
+    """Share in-process transactions for instances targeting the same store."""
+    key = os.path.normcase(str(path.resolve()))
+    with _store_locks_guard:
+        lock = _store_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _store_locks[key] = lock
+        return lock
 
 
 @dataclass
@@ -126,6 +143,15 @@ class FileMemory:
             raise ValueError("user_id must not contain path separators or parent references")
         safe = user_id.strip()
         return safe or "default"
+
+    def _episodic_file(self, date: str) -> Path:
+        """Map a YYYY-MM-DD date to its episodic file, rejecting anything else."""
+        try:
+            # Normalise so "2026-3-5" lands in the same file recent reads look for
+            date = datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            raise ValueError(f"date must be YYYY-MM-DD, got {date!r}") from None
+        return safe_child(self.episodic_path, date, ".json")
     
     def __init__(
         self,
@@ -171,7 +197,7 @@ class FileMemory:
         self.config = self._load_config(config)
         
         # Initialize thread-safe memory stores with lock for in-memory data protection
-        self._lock = threading.RLock()  # Reentrant lock for nested operations
+        self._lock = _shared_store_lock(self.user_path)
         self._short_term: List[MemoryItem] = []
         self._long_term: List[MemoryItem] = []
         self._entities: Dict[str, EntityItem] = {}
@@ -450,12 +476,12 @@ class FileMemory:
     def _save_long_term(self):
         """Save long-term memory to file."""
         data = [item.to_dict() for item in self._long_term]
-        self._write_json(self.long_term_file, data)
+        return self._write_json(self.long_term_file, data)
     
     def _save_entities(self):
         """Save entities to file."""
         data = {k: v.to_dict() for k, v in self._entities.items()}
-        self._write_json(self.entities_file, data)
+        return self._write_json(self.entities_file, data)
     
     def _save_summaries(self):
         """Save summaries to file."""
@@ -546,6 +572,14 @@ class FileMemory:
                     promoted.append(item.id)
         
         if promoted:
+            # Promotion writes the same store as add_long_term, so retain the
+            # same highest-importance, newest-first items within its capacity.
+            limit = self.config["long_term_limit"]
+            if len(self._long_term) > limit:
+                self._long_term.sort(
+                    key=lambda item: (item.importance, item.created_at), reverse=True
+                )
+                self._long_term = self._long_term[:limit]
             self._save_long_term()
             self._log(f"Auto-promoted {len(promoted)} items to long-term memory")
     
@@ -585,16 +619,30 @@ class FileMemory:
                 importance=importance
             )
             
+            previous_items = self._long_term[:]
             self._long_term.append(item)
             
             # Enforce limit
             limit = self.config["long_term_limit"]
             if len(self._long_term) > limit:
-                # Remove lowest importance items
-                self._long_term.sort(key=lambda x: x.importance, reverse=True)
+                # Remove lowest importance items. Break equal-importance ties by
+                # recency (newer first) so a freshly appended turn is not
+                # discarded in favour of an older equally-weighted one — raw
+                # conversation turns all share the default importance, and a
+                # later agent must still be able to prefetch the newest facts.
+                self._long_term.sort(
+                    key=lambda x: (x.importance, x.created_at), reverse=True
+                )
                 self._long_term = self._long_term[:limit]
             
-            self._save_long_term()
+            try:
+                saved = self._save_long_term()
+            except Exception:
+                self._long_term = previous_items
+                raise
+            if saved is False:
+                self._long_term = previous_items
+                raise OSError("Failed to persist long-term memory")
             self._log(f"Added long-term memory: {content[:50]}...")
             
             # Emit trace event
@@ -641,6 +689,8 @@ class FileMemory:
                 k: EntityItem.from_dict(v)
                 for k, v in self._read_json(self.entities_file, {}).items()
             }
+            from copy import deepcopy
+            previous_entities = deepcopy(self._entities)
             entity_id = self._generate_id(f"{name}:{entity_type}")
             
             # Check if entity exists
@@ -663,7 +713,14 @@ class FileMemory:
                 )
                 self._entities[entity_id] = entity
             
-            self._save_entities()
+            try:
+                saved = self._save_entities()
+            except Exception:
+                self._entities = previous_entities
+                raise
+            if saved is False:
+                self._entities = previous_entities
+                raise OSError("Failed to persist entity memory")
             self._log(f"Added/updated entity: {name} ({entity_type})")
             
             return entity_id
@@ -714,10 +771,7 @@ class FileMemory:
         if date is None:
             date = datetime.now().strftime("%Y-%m-%d")
         
-        episodic_file = self.episodic_path / f"{date}.json"
-        
-        # Load existing episodic memories for this date
-        episodes = self._read_json(episodic_file, [])
+        episodic_file = self._episodic_file(date)
         
         # Create new item
         item = MemoryItem(
@@ -726,8 +780,11 @@ class FileMemory:
             metadata=metadata or {}
         )
         
-        episodes.append(item.to_dict())
-        self._write_json(episodic_file, episodes)
+        # Read-modify-write under the store lock so concurrent adds are not lost
+        with self._lock:
+            episodes = self._read_json(episodic_file, [])
+            episodes.append(item.to_dict())
+            self._write_json(episodic_file, episodes)
         
         self._log(f"Added episodic memory for {date}: {content[:50]}...")
         
@@ -749,7 +806,7 @@ class FileMemory:
             List of episodic memories
         """
         if date:
-            episodic_file = self.episodic_path / f"{date}.json"
+            episodic_file = self._episodic_file(date)
             data = self._read_json(episodic_file, [])
             return [MemoryItem.from_dict(item) for item in data]
         
@@ -774,7 +831,8 @@ class FileMemory:
             try:
                 file_date = datetime.strptime(episodic_file.stem, "%Y-%m-%d")
                 if file_date < cutoff_date:
-                    episodic_file.unlink()
+                    with self._lock:
+                        episodic_file.unlink(missing_ok=True)
                     removed += 1
             except ValueError:
                 continue
@@ -1062,6 +1120,10 @@ class FileMemory:
             True if memory was found and deleted, False otherwise
         """
         with self._lock:
+            self._short_term = [
+                MemoryItem.from_dict(item)
+                for item in self._read_json(self.short_term_file, [])
+            ]
             for i, item in enumerate(self._short_term):
                 if item.id == memory_id:
                     del self._short_term[i]
@@ -1081,6 +1143,10 @@ class FileMemory:
             True if memory was found and deleted, False otherwise
         """
         with self._lock:
+            self._long_term = [
+                MemoryItem.from_dict(item)
+                for item in self._read_json(self.long_term_file, [])
+            ]
             for i, item in enumerate(self._long_term):
                 if item.id == memory_id:
                     del self._long_term[i]
@@ -1100,6 +1166,10 @@ class FileMemory:
             True if entity was found and deleted, False otherwise
         """
         with self._lock:
+            self._entities = {
+                key: EntityItem.from_dict(value)
+                for key, value in self._read_json(self.entities_file, {}).items()
+            }
             # Find entity by name using existing helper
             entity = self._find_entity_by_name(name)
             if entity:
@@ -1142,16 +1212,17 @@ class FileMemory:
                 for i in range(30)
             ]
         
-        for check_date in dates_to_check:
-            episodic_file = self.episodic_path / f"{check_date}.json"
-            if episodic_file.exists():
-                data = self._read_json(episodic_file, [])
-                for i, item in enumerate(data):
-                    if item.get("id") == memory_id:
-                        del data[i]
-                        self._write_json(episodic_file, data)
-                        self._log(f"Deleted episodic memory: {memory_id}")
-                        return True
+        with self._lock:
+            for check_date in dates_to_check:
+                episodic_file = self._episodic_file(check_date)
+                if episodic_file.exists():
+                    data = self._read_json(episodic_file, [])
+                    for i, item in enumerate(data):
+                        if item.get("id") == memory_id:
+                            del data[i]
+                            self._write_json(episodic_file, data)
+                            self._log(f"Deleted episodic memory: {memory_id}")
+                            return True
         
         return False
     
@@ -1389,7 +1460,7 @@ class FileMemory:
         sessions_path = self.user_path / "sessions"
         sessions_path.mkdir(parents=True, exist_ok=True)
         
-        session_file = sessions_path / f"{name}.json"
+        session_file = safe_child(sessions_path, name, ".json")
         
         # Take snapshots under lock for consistent session data
         with self._lock:
@@ -1428,7 +1499,7 @@ class FileMemory:
             Session data including conversation history
         """
         sessions_path = self.user_path / "sessions"
-        session_file = sessions_path / f"{name}.json"
+        session_file = safe_child(sessions_path, name, ".json")
         
         if not session_file.exists():
             raise FileNotFoundError(f"Session '{name}' not found")
@@ -1480,7 +1551,7 @@ class FileMemory:
     def delete_session(self, name: str) -> bool:
         """Delete a saved session."""
         sessions_path = self.user_path / "sessions"
-        session_file = sessions_path / f"{name}.json"
+        session_file = safe_child(sessions_path, name, ".json")
         
         if session_file.exists():
             session_file.unlink()
@@ -1504,24 +1575,31 @@ class FileMemory:
         
         Args:
             llm_func: Optional LLM function for summarization.
-                      Should accept (prompt: str) -> str
-            max_items: Max items to keep after compression
+                      Should accept (prompt: str) -> str. May be called again
+                      if concurrent turnover removes selected records.
+            max_items: Max snapshot items to keep after compression. Records
+                       added while summarizing are also retained.
             
         Returns:
-            The generated summary
+            The persisted summary, or an empty string if no compression commits.
         """
         # Check length and gather content under lock
         with self._lock:
+            self._short_term = [
+                MemoryItem.from_dict(item)
+                for item in self._read_json(self.short_term_file, [])
+            ]
             if len(self._short_term) <= max_items:
                 return ""  # No compression needed
             
             # Gather content to compress while holding lock
-            items_to_compress = self._short_term[:-max_items]
-            content_list = [item.content for item in items_to_compress]
+            items_to_compress = self._short_term[:-max_items] if max_items else self._short_term[:]
         
         # Generate summary OUTSIDE lock (LLM call may be slow)
-        if llm_func:
-            prompt = f"""Summarize the following conversation context into key points.
+        while items_to_compress:
+            content_list = [item.content for item in items_to_compress]
+            if llm_func:
+                prompt = f"""Summarize the following conversation context into key points.
 Preserve important facts, decisions, and context.
 Be concise but comprehensive.
 
@@ -1529,26 +1607,56 @@ Context to summarize:
 {chr(10).join(f'- {c}' for c in content_list)}
 
 Summary:"""
-            summary = llm_func(prompt)
-        else:
-            # Simple concatenation if no LLM
-            summary = "Compressed context: " + " | ".join(content_list[:5]) + "..."
+                summary = llm_func(prompt)
+            else:
+                # Simple concatenation if no LLM
+                summary = "Compressed context: " + " | ".join(content_list) + "..."
         
-        # Add summary as a high-importance long-term memory (add_long_term has its own lock)
-        self.add_long_term(
-            content=f"[Session Summary] {summary}",
-            metadata={"type": "compression_summary", "items_compressed": len(items_to_compress)},
-            importance=0.9
-        )
+            # Commit a still-current snapshot under the shared store lock. The LLM
+            # stays outside it; overlapping calls must not commit duplicate summaries.
+            with self._lock:
+                current = self._read_json(self.short_term_file, [])
+                # A survivor is a selected record still present with unchanged
+                # content. Evicted records (turnover) and same-id replacements
+                # (import_data) are both excluded so we never summarize stale
+                # content and then delete the record that replaced it.
+                available = Counter((item["id"], item["content"]) for item in current)
+                survivors = []
+                for item in items_to_compress:
+                    key = (item.id, item.content)
+                    if available[key]:
+                        survivors.append(item)
+                        available[key] -= 1
+                if len(survivors) != len(items_to_compress):
+                    # Summarize the survivors afresh, never records added during
+                    # this call. Every retry drops at least one record, so retries
+                    # are finite; a peer that consumed the whole snapshot
+                    # produces no duplicate.
+                    items_to_compress = survivors
+                    continue
+                summary_id = self.add_long_term(
+                    content=f"[Session Summary] {summary}",
+                    metadata={"type": "compression_summary", "items_compressed": len(items_to_compress)},
+                    importance=0.9,
+                )
+                retained = self._read_json(self.long_term_file, [])
+                if not any(item["id"] == summary_id for item in retained):
+                    return ""
+                # Remove sources only after verifying their summary survived retention.
+                remaining = Counter((item.id, item.content) for item in items_to_compress)
+                self._short_term = []
+                for item in self._read_json(self.short_term_file, []):
+                    key = (item["id"], item["content"])
+                    if remaining[key]:
+                        remaining[key] -= 1
+                    else:
+                        self._short_term.append(MemoryItem.from_dict(item))
+                self._save_short_term()
         
-        # Keep only recent items under lock
-        with self._lock:
-            self._short_term = self._short_term[-max_items:]
-            self._save_short_term()
+            self._log(f"Compressed {len(items_to_compress)} items into summary")
         
-        self._log(f"Compressed {len(items_to_compress)} items into summary")
-        
-        return summary
+            return summary
+        return ""
     
     def auto_compress_if_needed(
         self,
@@ -1597,8 +1705,9 @@ Summary:"""
         checkpoints_path = self.user_path / "checkpoints"
         checkpoints_path.mkdir(parents=True, exist_ok=True)
         
-        checkpoint_id = name or f"checkpoint_{int(time.time())}"
-        checkpoint_file = checkpoints_path / f"{checkpoint_id}.json"
+        from uuid import uuid4
+        checkpoint_id = name or f"checkpoint_{int(time.time())}_{uuid4().hex}"
+        checkpoint_file = safe_child(checkpoints_path, checkpoint_id, ".json")
         
         checkpoint_data = {
             "id": checkpoint_id,
@@ -1635,7 +1744,7 @@ Summary:"""
             True if restored successfully
         """
         checkpoints_path = self.user_path / "checkpoints"
-        checkpoint_file = checkpoints_path / f"{checkpoint_id}.json"
+        checkpoint_file = safe_child(checkpoints_path, checkpoint_id, ".json")
         
         if not checkpoint_file.exists():
             self._log(f"Checkpoint '{checkpoint_id}' not found", logging.ERROR)
@@ -1686,7 +1795,7 @@ Summary:"""
     def delete_checkpoint(self, checkpoint_id: str) -> bool:
         """Delete a checkpoint."""
         checkpoints_path = self.user_path / "checkpoints"
-        checkpoint_file = checkpoints_path / f"{checkpoint_id}.json"
+        checkpoint_file = safe_child(checkpoints_path, checkpoint_id, ".json")
         
         if checkpoint_file.exists():
             checkpoint_file.unlink()

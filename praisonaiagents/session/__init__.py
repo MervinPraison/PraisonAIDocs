@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from .sqlite_transcript_store import SqliteTranscriptStore
     from .protocols import SessionStoreProtocol, SessionMirrorProtocol
     from .hierarchy import HierarchicalSessionStore, SessionSnapshot, ExtendedSessionData
+    from .encrypted_store import EncryptedSessionStore, SessionEncryptionError, generate_session_key
 
 # Lazy loading for zero import overhead
 _module_cache = {}
@@ -108,6 +109,11 @@ def __getattr__(name: str):
         from .protocols import PortableSessionStoreProtocol
         _module_cache[name] = PortableSessionStoreProtocol
         return PortableSessionStoreProtocol
+
+    if name == "IncrementalSessionStoreProtocol":
+        from .protocols import IncrementalSessionStoreProtocol
+        _module_cache[name] = IncrementalSessionStoreProtocol
+        return IncrementalSessionStoreProtocol
 
     if name == "ImportReport":
         from .protocols import ImportReport
@@ -186,6 +192,12 @@ def __getattr__(name: str):
         _module_cache[name] = workspace_id
         return workspace_id
 
+    # Session manifest: plane refs + run-in-flight marker (Issue #6248)
+    if name in ("FileSessionManifest", "ManifestEntry", "SessionManifestProtocol"):
+        from . import manifest as _manifest
+        _module_cache[name] = getattr(_manifest, name)
+        return _module_cache[name]
+
     # Cross-context continuation prompt assembler (session handoff)
     if name == "build_handoff_prompt":
         from .handoff import build_handoff_prompt
@@ -201,6 +213,12 @@ def __getattr__(name: str):
         from .provenance import wrap_inter_agent
         _module_cache[name] = wrap_inter_agent
         return wrap_inter_agent
+
+    if name in ("EncryptedSessionStore", "SessionEncryptionError", "generate_session_key"):
+        from . import encrypted_store
+        value = getattr(encrypted_store, name)
+        _module_cache[name] = value
+        return value
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -218,6 +236,7 @@ __all__ = [
     "SearchableSessionStoreProtocol",
     "SessionMirrorProtocol",
     "PortableSessionStoreProtocol",
+    "IncrementalSessionStoreProtocol",
     "ImportReport",
     "SessionHit",
     "SessionSummary",
@@ -236,6 +255,9 @@ __all__ = [
     "clear_session_context",
     "workspace_id",
     "build_handoff_prompt",
+    "FileSessionManifest",
+    "ManifestEntry",
+    "SessionManifestProtocol",
     "MessageOrigin",
     "wrap_inter_agent",
     # Encryption at rest
@@ -243,9 +265,3 @@ __all__ = [
     "SessionEncryptionError",
     "generate_session_key",
 ]
-
-from .encrypted_store import (  # noqa: E402
-    EncryptedSessionStore,
-    SessionEncryptionError,
-    generate_session_key,
-)

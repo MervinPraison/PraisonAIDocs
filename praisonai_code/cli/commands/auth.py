@@ -37,13 +37,22 @@ app = typer.Typer(help="Manage API credentials")
 # exactly as credentials.py does.
 def _build_provider_env_keys() -> dict:
     try:
-        from praisonai_code.llm.catalogue import PROVIDER_ENV_CATALOGUE
+        from praisonai_code.llm.catalogue import (
+            PROVIDER_ENV_CATALOGUE,
+            discovered_providers,
+        )
 
-        return {
+        keys = {
             provider: tuple(env_vars)
             for provider, (env_vars, _model, _prefix) in PROVIDER_ENV_CATALOGUE.items()
             if env_vars
         }
+        # Discovered (Python-registered / entry-point) providers get the
+        # conventional ``<PROVIDER>_API_KEY`` so `auth login/list/status`
+        # recognise their credentials exactly like a built-in provider.
+        for pid in discovered_providers():
+            keys.setdefault(pid, (f"{pid.upper()}_API_KEY",))
+        return keys
     except Exception:
         return {
             "openai": ("OPENAI_API_KEY",),
@@ -397,6 +406,23 @@ def auth_login(
         else:
             output.print_success(f"API key validated: {live_msg}")
     
+    # The store holds one credential per provider, so never replace an
+    # existing, different key silently: confirm when the key was typed at the
+    # prompt, and always report what was replaced.
+    try:
+        previous = CredentialStore().get_credential(provider)
+    except Exception:
+        previous = None
+    replaced = None
+    if previous and previous.api_key != api_key:
+        if not key and not key_stdin and not typer.confirm(
+            f"Replace existing {provider} key {redact_key(previous.api_key)}?",
+            default=True,
+        ):
+            raise typer.Exit(1)
+        replaced = redact_key(previous.api_key)
+        output.print_info(f"Replacing existing {provider} key {replaced}")
+
     # Store credential
     try:
         store = CredentialStore()
@@ -410,11 +436,14 @@ def auth_login(
         output.print_success(f"Stored credentials for {provider}")
         
         if output.is_json_mode:
-            output.print_json({
+            result = {
                 "provider": provider,
                 "status": "stored",
                 "key_redacted": redact_key(api_key)
-            })
+            }
+            if replaced:
+                result["replaced_key_redacted"] = replaced
+            output.print_json(result)
         else:
             output.print_info(f"Key stored: {redact_key(api_key)}")
             

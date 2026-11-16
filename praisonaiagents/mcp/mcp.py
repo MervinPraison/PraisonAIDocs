@@ -22,6 +22,26 @@ except ImportError:
     StdioServerParameters = None
     stdio_client = None
 
+def _is_transport_closed(exc):
+    """True when ``exc`` means the stdio session is gone for good."""
+    try:
+        import anyio
+        if isinstance(exc, (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream)):
+            return True
+    except ImportError:
+        pass
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, EOFError)):
+        return True
+    try:
+        from mcp.shared.exceptions import McpError
+        from mcp.types import CONNECTION_CLOSED
+        if isinstance(exc, McpError) and getattr(getattr(exc, "error", None), "code", None) == CONNECTION_CLOSED:
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 class MCPToolRunner(threading.Thread):
     """A dedicated thread for running MCP operations."""
     
@@ -31,6 +51,13 @@ class MCPToolRunner(threading.Thread):
         self.queue = queue.Queue()
         self.initialized = threading.Event()
         self._init_error = None
+        # Set once the server's transport closes; the runner stops serving and
+        # callers get this message instead of queueing onto a dead session.
+        self._dead = None
+        # Startup task handle so stop() can cancel a hung initialize().
+        self._loop = None
+        self._main_task = None
+        self._stop_requested = False
         self.tools = []
         self.resources = []
         self.resource_templates = []
@@ -41,12 +68,46 @@ class MCPToolRunner(threading.Thread):
         self.start()
         
     def run(self):
-        """Main thread function that processes MCP requests."""
-        asyncio.run(self._run_async())
+        """Main thread function that processes MCP requests.
+
+        On Windows the stdio transport must spawn a child process (e.g. ``npx``)
+        and talk to it over pipes. A non-main thread gets a ``SelectorEventLoop``
+        by default there, which does not support subprocesses and fails with an
+        opaque ``fileno`` error during init (issue #5598). Use a dedicated
+        ``ProactorEventLoop`` on Windows so subprocess stdio works; other
+        platforms keep the standard ``asyncio.run`` behaviour.
+        """
+        if platform.system() == 'Windows':
+            loop = asyncio.ProactorEventLoop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._run_async())
+            finally:
+                # Mirror asyncio.run()'s graceful teardown so outstanding async
+                # generators and the default executor are finalized before the
+                # loop is closed (the subprocess transport relies on this).
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                try:
+                    loop.run_until_complete(loop.shutdown_default_executor())
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                finally:
+                    asyncio.set_event_loop(None)
+        else:
+            asyncio.run(self._run_async())
         
     async def _run_async(self):
         """Async entry point for MCP operations."""
+        self._loop = asyncio.get_running_loop()
+        self._main_task = asyncio.current_task()
         try:
+            if self._stop_requested:
+                raise asyncio.CancelledError()
             # Set up MCP session
             async with stdio_client(self.server_params) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -66,38 +127,103 @@ class MCPToolRunner(threading.Thread):
                     # Signal that initialization is complete
                     self.initialized.set()
                     
-                    # Process requests
-                    while True:
+                    # Process requests. Each request runs as its own task so
+                    # one slow call never serializes the others behind it (the
+                    # session multiplexes requests by id), and the queue is read
+                    # with a short blocking get instead of a busy 10ms poll. The
+                    # bounded get keeps the reader thread from outliving the loop.
+                    loop = asyncio.get_running_loop()
+                    tasks = set()
+
+                    def _next_item():
                         try:
-                            # Check for new requests
-                            try:
-                                item = self.queue.get(block=False)
-                                if item is None:  # Shutdown signal
-                                    break
-                                
-                                response_queue, kind, name, arguments = item
-                                try:
-                                    if kind == "resource":
-                                        result = await asyncio.wait_for(session.read_resource(name), timeout=self.timeout)
-                                    elif kind == "prompt":
-                                        result = await asyncio.wait_for(session.get_prompt(name, arguments or None), timeout=self.timeout)
-                                    else:
-                                        result = await asyncio.wait_for(session.call_tool(name, arguments), timeout=self.timeout)
-                                    response_queue.put((True, result))
-                                except asyncio.TimeoutError:
-                                    response_queue.put((False, f"MCP {kind} call timed out after {self.timeout} seconds (server side)"))
-                                except Exception as e:
-                                    response_queue.put((False, str(e)))
-                            except queue.Empty:
-                                pass
-                            
-                            # Give other tasks a chance to run
-                            await asyncio.sleep(0.01)
-                        except asyncio.CancelledError:
-                            break
+                            return self.queue.get(timeout=0.25)
+                        except queue.Empty:
+                            return queue.Empty
+
+                    try:
+                        while True:
+                            item = await loop.run_in_executor(None, _next_item)
+                            if item is queue.Empty:
+                                if self._dead:
+                                    break  # leave stdio_client() so the child is reaped
+                                continue
+                            if item is None:  # Shutdown signal
+                                break
+                            if self._dead:
+                                self.queue.put(item)  # answered by _fail_pending()
+                                break
+                            task = asyncio.create_task(self._handle_request(session, item))
+                            tasks.add(task)
+                            task.add_done_callback(tasks.discard)
+                    except asyncio.CancelledError:
+                        pass
+                    finally:
+                        for task in tasks:
+                            task.cancel()
+                        if tasks:
+                            await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            # stop() cancelled a startup that never completed; leaving the
+            # contexts above has already terminated the stdio child.
+            if not self.initialized.is_set():
+                self._init_error = "MCP initialization cancelled"
+            self.initialized.set()
         except Exception as e:
-            self._init_error = f"MCP initialization error: {str(e)}"
+            if self.initialized.is_set():
+                # Session ended after a successful init (e.g. teardown of a
+                # crashed server); report it as a lost connection, not init.
+                self._dead = self._dead or f"MCP server connection lost: {str(e) or type(e).__name__}"
+            else:
+                self._init_error = f"MCP initialization error: {str(e)}"
             self.initialized.set()  # Ensure we don't hang
+        finally:
+            if self.initialized.is_set() and not self._init_error and not self._dead:
+                self._dead = "MCP server session ended"
+            self._fail_pending()
+
+    def _fail_pending(self):
+        """Answer requests still queued after the loop exits so callers don't wait out the timeout."""
+        message = self._dead or self._init_error or "MCP server session ended"
+        while True:
+            try:
+                item = self.queue.get(block=False)
+            except queue.Empty:
+                return
+            if item is not None:
+                try:
+                    item[0].put((False, message), block=False)
+                except Exception:
+                    pass
+
+    async def _handle_request(self, session, item):
+        """Run one queued request on the session and post its result."""
+        response_queue, kind, name, arguments, cancelled = item
+        if cancelled.is_set():
+            # Caller already gave up (timed out); never execute a call it was
+            # told did not happen.
+            return
+        try:
+            if kind == "resource":
+                coro = session.read_resource(name)
+            elif kind == "prompt":
+                coro = session.get_prompt(name, arguments or None)
+            else:
+                coro = session.call_tool(name, arguments)
+            result = await asyncio.wait_for(coro, timeout=self.timeout)
+            response_queue.put((True, result))
+        except asyncio.TimeoutError:
+            response_queue.put((False, f"MCP {kind} call timed out after {self.timeout} seconds (server side)"))
+        except asyncio.CancelledError:
+            # Report the real cause when a sibling call saw the transport die.
+            response_queue.put((False, self._dead or f"MCP {kind} call cancelled: runner shut down"))
+            raise
+        except Exception as e:
+            if _is_transport_closed(e):
+                self._dead = f"MCP server connection lost: {str(e) or type(e).__name__}"
+                response_queue.put((False, self._dead))
+                return
+            response_queue.put((False, str(e) or type(e).__name__))
 
     async def _discover_resources_and_prompts(self, session):
         """Enumerate server resources, resource templates and prompts.
@@ -145,12 +271,18 @@ class MCPToolRunner(threading.Thread):
 
         if self._init_error:
             return (False, self._init_error)
+        if self._dead:
+            return (False, self._dead)
 
         response_queue = queue.Queue(maxsize=1)
-        self.queue.put((response_queue, kind, name, arguments))
+        cancelled = threading.Event()
+        self.queue.put((response_queue, kind, name, arguments, cancelled))
+        if self._dead:
+            self._fail_pending()  # the runner may have drained the queue before our put
         try:
             success, result = response_queue.get(timeout=self.timeout)
         except queue.Empty:
+            cancelled.set()
             return (False, f"MCP {kind} call timed out after {self.timeout} seconds")
         if not success:
             return (False, result)
@@ -194,6 +326,10 @@ class MCPToolRunner(threading.Thread):
             if telemetry:
                 telemetry.track_tool_usage(tool_name, success=False, execution_time=0)
             return f"Error: {self._init_error}"
+        if self._dead:
+            if telemetry:
+                telemetry.track_tool_usage(tool_name, success=False, execution_time=0)
+            return f"Error: {self._dead}"
         
         # Start timing after initialization check
         start_time = time.time()
@@ -201,12 +337,17 @@ class MCPToolRunner(threading.Thread):
         response_queue = queue.Queue(maxsize=1)
         try:
             # Put request in queue with caller-specific response channel
-            self.queue.put((response_queue, "tool", tool_name, arguments))
+            cancelled = threading.Event()
+            self.queue.put((response_queue, "tool", tool_name, arguments, cancelled))
+            if self._dead:
+                self._fail_pending()  # the runner may have drained the queue before our put
             
             # Wait for result with timeout
             try:
                 success, result = response_queue.get(timeout=self.timeout)
             except queue.Empty:
+                # Mark abandoned so the runner skips it if not yet started
+                cancelled.set()
                 return f"Error: MCP tool call timed out after {self.timeout} seconds"
             if not success:
                 return f"Error: {result}"
@@ -278,8 +419,8 @@ class MCPToolRunner(threading.Thread):
         Queues the shutdown sentinel and joins the thread so the request loop
         exits and its stdio subprocess is terminated instead of leaking a
         background thread (and its child) across the process lifetime. The
-        request loop polls the queue between async operations, so once any
-        in-flight call unwinds the sentinel is consumed promptly.
+        request loop reads the sentinel promptly and cancels any in-flight
+        calls, which are answered with an error instead of left waiting.
 
         Args:
             timeout: Seconds to wait for the thread to exit. Defaults to the
@@ -291,6 +432,14 @@ class MCPToolRunner(threading.Thread):
             self.queue.put(None)
         except Exception:
             pass
+        # The sentinel is only read once init finishes, so cancel a startup
+        # that is still in progress (e.g. hung in session.initialize()).
+        self._stop_requested = True
+        if not self.initialized.is_set() and self._main_task is not None:
+            try:
+                self._loop.call_soon_threadsafe(self._main_task.cancel)
+            except RuntimeError:
+                pass  # loop already closed
         if timeout is None:
             timeout = getattr(self, "timeout", 60)
         if self.is_alive():
@@ -343,6 +492,10 @@ class MCP:
     # skill requirement, once the last client holding it lets go (issue #5135).
     _active_server_names: dict = {}
     _active_server_names_lock = threading.Lock()
+    # Registrations a GC finalizer could not release because the lock was busy
+    # (possibly held by the frame the collector interrupted). ``list.append``
+    # is atomic; the next holder of the lock applies them.
+    _pending_name_releases: list = []
 
     # Default init/tool-call timeout (seconds). Used when the caller does not
     # pass an explicit ``timeout``.
@@ -361,7 +514,14 @@ class MCP:
     def list_active_server_names(cls) -> set:
         """Return the set of MCP server names currently registered this run."""
         with cls._active_server_names_lock:
+            cls._drain_pending_name_releases()
             return {name for name, count in cls._active_server_names.items() if count > 0}
+
+    @classmethod
+    def _drain_pending_name_releases(cls) -> None:
+        """Apply releases deferred by finalizers. Caller holds the lock."""
+        while cls._pending_name_releases:
+            cls._adjust_server_name_counts(cls._pending_name_releases.pop(), -1)
 
     @classmethod
     def _adjust_server_name_counts(cls, names: tuple, delta: int) -> None:
@@ -384,6 +544,7 @@ class MCP:
         previous names after they have been handed over and release them twice.
         """
         with type(self)._active_server_names_lock:
+            type(self)._drain_pending_name_releases()
             previous = getattr(self, "_registered_server_names", None)
             if previous == names:
                 return
@@ -393,20 +554,36 @@ class MCP:
                 type(self)._adjust_server_name_counts(names, 1)
             self._registered_server_names = names or None
 
-    def _release_registered_names(self) -> None:
+    def _release_registered_names(self, *, blocking: bool = True) -> None:
         """Release this instance's registration, decrementing it exactly once.
 
         Claiming the names and decrementing them share one critical section, so
         concurrent lifecycle calls on the same instance (explicit
         ``shutdown()``, context-manager exit, agent cleanup, ``__del__``) cannot
         each consume a shared client's count.
+
+        ``blocking=False`` is for ``__del__``: the lock is non-reentrant and the
+        collector may have interrupted a frame on this thread that holds it.
+        If it is busy the claimed names are queued for the next lock holder.
+        Claiming without the lock is safe there because nothing else can still
+        reach an object that is being finalized.
         """
-        with type(self)._active_server_names_lock:
+        lock = type(self)._active_server_names_lock
+        if not lock.acquire(blocking=blocking):
+            names = getattr(self, "_registered_server_names", None)
+            if names:
+                self._registered_server_names = None
+                type(self)._pending_name_releases.append(names)
+            return
+        try:
+            type(self)._drain_pending_name_releases()
             names = getattr(self, "_registered_server_names", None)
             if not names:
                 return
             self._registered_server_names = None
             type(self)._adjust_server_name_counts(names, -1)
+        finally:
+            lock.release()
 
     @classmethod
     def _is_cold_start_launcher(cls, cmd) -> bool:
@@ -764,17 +941,17 @@ class MCP:
         if has_resources:
             def list_mcp_resources() -> str:
                 """List the resources available from the connected MCP server."""
-                return _res.to_json(_res.resources_to_dicts(runner.resources))
+                return _res.to_json(_res.resources_to_dicts(self._live_stdio_runner(runner).resources))
 
             def list_mcp_resource_templates() -> str:
                 """List the resource templates available from the MCP server."""
                 return _res.to_json(
-                    _res.resource_templates_to_dicts(runner.resource_templates)
+                    _res.resource_templates_to_dicts(self._live_stdio_runner(runner).resource_templates)
                 )
 
             def read_mcp_resource(uri: str) -> str:
                 """Read a resource from the MCP server by its URI."""
-                return runner.read_resource(uri)
+                return self._live_stdio_runner(runner).read_resource(uri)
 
             candidates.extend(
                 [list_mcp_resources, list_mcp_resource_templates, read_mcp_resource]
@@ -783,11 +960,11 @@ class MCP:
         if has_prompts:
             def list_mcp_prompts() -> str:
                 """List the prompt templates available from the MCP server."""
-                return _res.to_json(_res.prompts_to_dicts(runner.prompts))
+                return _res.to_json(_res.prompts_to_dicts(self._live_stdio_runner(runner).prompts))
 
             def get_mcp_prompt(name: str, arguments: dict = None) -> str:
                 """Fetch an MCP prompt template rendered with the given arguments."""
-                return runner.get_prompt(name, arguments or {})
+                return self._live_stdio_runner(runner).get_prompt(name, arguments or {})
 
             candidates.extend([list_mcp_prompts, get_mcp_prompt])
 
@@ -796,69 +973,80 @@ class MCP:
         ]
         return synthetic
 
+    # Respawns allowed after a stdio server dies mid-session.
+    _MAX_STDIO_RESTARTS = 3
+
+    def _live_stdio_runner(self, fallback=None):
+        """Return the current stdio runner, respawning it if its server died.
+
+        At most ``_MAX_STDIO_RESTARTS`` respawns; a replacement that fails to
+        start is marked dead so a later call may retry within that budget. No
+        replacement is kept once :meth:`shutdown` has begun.
+        """
+        runner = getattr(self, "runner", None) or fallback
+        if runner is None or not isinstance(getattr(runner, "_dead", None), str):
+            return runner
+        lock = self.__dict__.setdefault("_restart_lock", threading.Lock())
+        with lock:
+            restarts = getattr(self, "_stdio_restarts", 0)
+            if (self.runner is runner and not getattr(self, "_closing", False)
+                    and restarts < self._MAX_STDIO_RESTARTS):
+                self._stdio_restarts = restarts + 1
+                logging.warning(
+                    "MCP stdio server lost (%s); restarting (%d/%d)",
+                    runner._dead, self._stdio_restarts, self._MAX_STDIO_RESTARTS,
+                )
+                runner.stop(timeout=1)
+                new_runner = MCPToolRunner(runner.server_params, runner.timeout)
+                if not new_runner.initialized.wait(timeout=runner.timeout) or new_runner._init_error:
+                    new_runner._dead = new_runner._init_error or "MCP server restart timed out"
+                    new_runner.stop(timeout=1)
+                self.runner = new_runner
+                # shutdown() sets _closing before reading self.runner, so either
+                # it sees new_runner or we see _closing here.
+                if getattr(self, "_closing", False):
+                    new_runner.stop(timeout=1)
+            return self.runner or runner
+
+    def _call_stdio_tool(self, tool_name, arguments):
+        """Call a stdio tool, lazily respawning the runner if its server died.
+
+        The call that observed the crash is never replayed (it may already have
+        reached the server); the next call gets a fresh runner instead.
+        """
+        runner = self._live_stdio_runner()
+        dead = getattr(runner, "_dead", None)
+        if isinstance(dead, str):
+            return f"Error: {dead}"
+        return runner.call_tool(tool_name, arguments)
+
     def _create_tool_wrapper(self, tool):
         """Create a wrapper function for an MCP tool."""
-        # Determine parameter names from the schema
-        param_names = []
-        param_annotations = {}
-        required_params = []
-        
-        if hasattr(tool, 'inputSchema') and tool.inputSchema:
-            properties = tool.inputSchema.get("properties", {})
-            required = tool.inputSchema.get("required", [])
-            
-            for name, prop in properties.items():
-                param_names.append(name)
-                
-                # Set annotation based on property type
-                prop_type = prop.get("type", "string")
-                if prop_type == "string":
-                    param_annotations[name] = str
-                elif prop_type == "integer":
-                    param_annotations[name] = int
-                elif prop_type == "number":
-                    param_annotations[name] = float
-                elif prop_type == "boolean":
-                    param_annotations[name] = bool
-                elif prop_type == "array":
-                    param_annotations[name] = list
-                elif prop_type == "object":
-                    param_annotations[name] = dict
-                else:
-                    param_annotations[name] = Any
-                
-                if name in required:
-                    required_params.append(name)
-        
-        # Create the function signature
-        # Separate required and optional parameters to ensure proper ordering
-        # (required parameters must come before optional parameters)
-        required_param_objects = []
-        optional_param_objects = []
-        
-        for name in param_names:
-            is_required = name in required_params
-            param = inspect.Parameter(
-                name=name,
-                kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                default=inspect.Parameter.empty if is_required else None,
-                annotation=param_annotations.get(name, Any)
-            )
-            
-            if is_required:
-                required_param_objects.append(param)
-            else:
-                optional_param_objects.append(param)
-        
-        # Combine parameters with required first, then optional
-        params = required_param_objects + optional_param_objects
-        
+        from .mcp_schema_utils import build_tool_signature, build_openai_tool_dict
+
+        input_schema = getattr(tool, 'inputSchema', None) or {}
+        signature = build_tool_signature(input_schema)
+        # Positional arguments map onto the named parameters of the signature,
+        # in declaration order. Non-identifier/keyword property names (``from``,
+        # ``max-results``) are handled through ``**kwargs``, so they are excluded
+        # here to keep positional mapping aligned with the visible parameters.
+        param_names = [
+            name
+            for name, param in signature.parameters.items()
+            if param.kind is not inspect.Parameter.VAR_KEYWORD
+        ]
+        param_annotations = {
+            name: param.annotation
+            for name, param in signature.parameters.items()
+            if param.kind is not inspect.Parameter.VAR_KEYWORD
+        }
+
         # Create function template to be properly decorated
         def template_function(*args, **kwargs):
             return None
         
         # Create a proper function with the correct signature
-        template_function.__signature__ = inspect.Signature(params)
+        template_function.__signature__ = signature
         template_function.__annotations__ = param_annotations
         template_function.__name__ = tool.name
         template_function.__qualname__ = tool.name
@@ -877,11 +1065,24 @@ class MCP:
             all_args.update(kwargs)
             
             # Call the tool
-            return self.runner.call_tool(tool.name, all_args)
+            return self._call_stdio_tool(tool.name, all_args)
         
         # Make sure the wrapper has the correct signature for inspection
-        wrapper.__signature__ = inspect.Signature(params)
-        
+        wrapper.__signature__ = signature
+        # Expose the server's original schema so schema builders (e.g.
+        # LLM._generate_tool_definition) surface every property instead of
+        # re-deriving from the signature, which omits ``**kwargs`` names
+        # (JSON Schema allows ``from``/``max-results`` that are not valid Python
+        # parameter names). The schema name tracks the wrapper's current
+        # ``__name__`` so it stays in sync after ``with_tool_prefix``.
+        def get_schema():
+            """Return the OpenAI tool schema built from the server's original inputSchema."""
+            return build_openai_tool_dict(
+                wrapper.__name__, tool.description, input_schema
+            )
+
+        wrapper.get_schema = get_schema
+
         return wrapper
     
     def _initialize_npx_mcp_tools(self, cmd, arguments):
@@ -1336,6 +1537,14 @@ class MCP:
         Call this method when done using the MCP instance to ensure
         all background threads and connections are properly cleaned up.
         """
+        self._shutdown(from_finalizer=False)
+
+    def _shutdown(self, *, from_finalizer: bool) -> None:
+        """Shared teardown. ``from_finalizer`` never blocks: it signals the
+        stdio runner instead of joining it (a join can wait up to the operation
+        timeout inside the garbage collector) and releases the server-name
+        registration without waiting on its lock."""
+        self._closing = True  # stop _live_stdio_runner from installing a replacement
         # Shutdown stdio runner if present
         if hasattr(self, 'runner') and self.runner is not None:
             try:
@@ -1345,18 +1554,33 @@ class MCP:
             # Join the daemon thread (and terminate its stdio subprocess) so
             # long-lived processes don't leak one child per MCP server. Plain
             # shutdown() only enqueues a sentinel; stop() also joins the thread.
-            try:
-                if hasattr(self.runner, "stop"):
-                    self.runner.stop()
-            except Exception:
-                pass  # Best effort cleanup
-            # Only drop the reference once the thread has actually exited so a
-            # later shutdown() can retry the join if an in-flight call kept the
-            # runner alive past the join timeout. The thread is a daemon, so a
-            # surviving runner never blocks interpreter exit.
-            if not getattr(self.runner, "is_alive", lambda: False)():
-                self.runner = None
+            # Not from a finalizer: the sentinel above lets the daemon exit.
+            if not from_finalizer:
+                try:
+                    if hasattr(self.runner, "stop"):
+                        self.runner.stop()
+                except Exception:
+                    pass  # Best effort cleanup
+                # Only drop the reference once the thread has actually exited so a
+                # later shutdown() can retry the join if an in-flight call kept the
+                # runner alive past the join timeout. The thread is a daemon, so a
+                # surviving runner never blocks interpreter exit.
+                if not getattr(self.runner, "is_alive", lambda: False)():
+                    self.runner = None
         
+        self._close_transport_clients(wait=not from_finalizer)
+
+        # Drop this server from the process-level registry now that its
+        # connections are gone, so skills' CapabilityValidator stops reporting
+        # it as available (issue #5135). Runs last so the registry only shrinks
+        # once the transports above have actually been torn down.
+        self._release_registered_names(blocking=not from_finalizer)
+
+    def _close_transport_clients(self, wait: bool = True) -> None:
+        """Close SSE / HTTP-stream / WebSocket clients (best effort).
+
+        ``wait=False`` (finalizer path) schedules the WebSocket close instead of
+        waiting up to 5 s for it on the transport's event loop."""
         # Shutdown SSE client if present
         if hasattr(self, 'sse_client') and self.sse_client is not None:
             try:
@@ -1383,15 +1607,12 @@ class MCP:
                 if hasattr(self.websocket_client, 'shutdown'):
                     self.websocket_client.shutdown()
                 elif hasattr(self.websocket_client, 'close'):
-                    self.websocket_client.close()
+                    if wait:
+                        self.websocket_client.close()
+                    else:
+                        self.websocket_client.close(wait=False)
             except Exception:
                 pass
-
-        # Drop this server from the process-level registry now that its
-        # connections are gone, so skills' CapabilityValidator stops reporting
-        # it as available (issue #5135). Runs last so the registry only shrinks
-        # once the transports above have actually been torn down.
-        self._release_registered_names()
     
     def __del__(self):
         """Clean up resources when the object is garbage collected.
@@ -1401,6 +1622,6 @@ class MCP:
         pattern or call shutdown() explicitly.
         """
         try:
-            self.shutdown()
+            self._shutdown(from_finalizer=True)
         except Exception:
             pass  # Best effort cleanup in __del__

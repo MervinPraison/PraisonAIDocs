@@ -117,6 +117,55 @@ This is a fix relative to older releases. Before PraisonAI PR #4125, `PRAISONAI_
 `DEFAULT_SESSION_DIR` remains a readable, assignable module attribute — but is now resolved at access time. Reading it returns the live directory; assigning it (`store_module.DEFAULT_SESSION_DIR = "/some/path"`) pins the root process-wide.
 </Note>
 
+### On-disk filenames (collision-safe)
+
+Two different session ids never share a file. Each user keeps their own history, even when ids differ only in `.`, `@`, `:`, `/`, `+`, or spaces.
+
+```python
+from praisonaiagents import Agent
+
+alice = Agent(name="Assistant", memory={"session_id": "alice.smith@example.com"})
+other = Agent(name="Assistant", memory={"session_id": "alice_smith_example_com"})
+# Separate files — neither agent sees the other's history.
+```
+
+```mermaid
+graph LR
+    Id[session_id] --> Q{Only letters, digits, _ or - ?}
+    Q -->|Yes| Safe[Same filename as before]
+    Q -->|No| Hashed[readable prefix + ~ + digest]
+    Hashed --> L{Legacy file present?}
+    L -->|Stored id matches| Move[Migrated to new path]
+    L -->|Stored id differs| Keep[Left alone, never served]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Id input
+    class Q,L,Hashed process
+    class Safe,Move output
+    class Keep warn
+```
+
+| Session id | File |
+|------------|------|
+| `user-42-chat` (only letters, digits, `_`, `-`) | `user-42-chat.json` — unchanged, no migration |
+| `alice.smith@example.com` (any other character) | `alice_smith_example_com~7dcd3a39ad3a8d21.json` |
+
+Letters and digits include Unicode (`café` keeps `café.json`). Other ids use `<readable[:64]>~<sha256(id)[:16]>.json`: the readable prefix replaces unsafe characters with `_` and is capped at 64 characters; the 16 hex digest of the full id keeps the mapping injective.
+
+- **Legacy migration** — a file written by an older release under the old lossy name is moved to the new path on first read, **only when its stored `session_id` equals the requested id**. A legacy file owned by a different id is never adopted.
+- **Ownership check on read** — if a loaded file's stored `session_id` differs from the requested id, it is never returned. The store logs a warning, starts a fresh session, and moves the foreign file to its owner's path (or sets it aside as `<name>.json.corrupt-<ts>` when that path is taken).
+- **Spill files** from [write-failure salvage](/features/session-persistence#write-failure-salvage) use the same filename stem.
+
+<Tip>
+`PlanStorage` and `ContextAgent` give the same guarantee for plan, todo, and PRP names — confined, injective, and digest-tagged when long — using percent-encoding via `safe_join`. See [Safe Storage Names](/features/safe-storage-names).
+</Tip>
+
+No code change is needed — existing sessions with safe ids keep their files. See PraisonAI issue [#6024](https://github.com/MervinPraison/PraisonAI/issues/6024) and PR [#6061](https://github.com/MervinPraison/PraisonAI/pull/6061).
+
 ## Portable export/import
 
 `DefaultSessionStore`, `SqliteSessionStore`, and `SqliteTranscriptStore` all implement `PortableSessionStoreProtocol`, so you can back up, migrate, or restore live conversation state as a versioned JSON payload.
@@ -134,6 +183,10 @@ report  = store.import_sessions(payload)   # ImportReport (imported / skipped)
 
 See [Gateway Session Portability](/features/gateway-session-portability) for the operator-facing backup / migrate / restore story.
 
+<Note>
+**`DefaultSessionStore`, `SqliteSessionStore`, and `EncryptedSessionStore` support incremental streamed-turn persistence** (PraisonAI PR [#5413](https://github.com/MervinPraison/PraisonAI/pull/5413) / issue [#5407](https://github.com/MervinPraison/PraisonAI/issues/5407)). Interrupted streamed runs resume with their partial assistant turn via `praisonai run --continue` / `--session <id>`. See [Incremental Session Store Protocol](/features/session-protocol#incremental-session-store-protocol).
+</Note>
+
 ## Quick Start
 
 <Steps>
@@ -150,7 +203,7 @@ agent.start("Remember I like tea.")
 agent.start("What do I like?")
 ```
 
-Default files live at `~/.praisonai/sessions/{session_id}.json`.
+Default files live at `~/.praisonai/sessions/{session_id}.json` for ids made of letters, digits, `_` and `-` — see [On-disk filenames](#on-disk-filenames-collision-safe) for other ids.
 
 </Step>
 
@@ -314,12 +367,59 @@ graph LR
 | Agent lookup | `SELECT session_id FROM session_route WHERE agent_id = ? LIMIT ?` (overrides parent's O(N) directory scan) |
 | Fallback | If FTS5 is unavailable → plain `LIKE` table. If the routing query fails or `sqlite3` is unavailable → transparent fallback to `DefaultSessionStore.get_by_gateway_session` / `list_sessions_by_gateway_agent` scan. |
 | Backfill | Legacy JSON transcripts are indexed once, on first `search()` **or** first routing lookup. A session is treated as indexed only if it appears in **both** `session_meta` **and** `session_route`, so stores upgraded from a prior release re-populate route rows on first read. |
-| Indexed content | `_flatten` concatenates `archived_messages` (compacted turns) ahead of the active `messages`, so compacted history stays searchable (Issue #5031). |
-| Content version | `INDEX_CONTENT_VERSION = 2`. Persisted in the `session_index_meta` table (`content_version` key). A stale version forces a one-time FTS rebuild on startup. |
-| Write sync | `_save_session`, `add_message`, `_modify_session_locked` (covers `set_chat_history`, `set_gateway_info`, `append_compaction_checkpoint`), `clear_session`, and `delete_session` all keep both indexes in sync. Route rows are `INSERT OR REPLACE`d when either `gateway_session_id` or `agent_id` is set, and `DELETE`d when both are cleared. |
+| Indexed content | `_flatten` concatenates `archived_messages` (compacted turns) ahead of the active `messages`, so compacted history stays searchable (Issue #5031). The synthetic `[Session Summary]` message built by `retention="compact"` (`metadata["compaction"]=True`) is skipped — the raw archived turns it paraphrases are already indexed, so indexing the summary too would double-count and spend the bounded candidate allowance on misses (Issue #5051). |
+| Content version | `INDEX_CONTENT_VERSION = 3` (v2 = archived turns indexed, Issue #5031; v3 = compaction summaries excluded, Issue #5051). Persisted in the `session_index_meta` table (`content_version` key). A stale version forces a one-time FTS rebuild on startup. |
+| Write sync | `_save_session`, `add_message`, and `_modify_session_locked` (covers `set_chat_history`, `set_gateway_info`, `append_compaction_checkpoint`, and `clear_session`) all re-index the retained content and routes. `delete_session` is the only operation that deindexes a session (removes rows from `session_meta`, `session_fts`, and `session_route`). Route rows are `INSERT OR REPLACE`d when either `gateway_session_id` or `agent_id` is set, and `DELETE`d (via `delete_session`) when the session is removed. |
 | Query rewrite | Free text is tokenised on alphanumerics into an `OR` of quoted terms for a safe FTS5 `MATCH` expression. |
 | Candidate fan-out | Over-fetches `max(limit * 5, limit)` candidates so lineage dedup / automated demotion can still promote the right sessions into the final `limit`. |
 | Corrupt-transcript tolerance | `search()` skips unreadable candidates — `OSError`, `JSONDecodeError`, and `UnicodeDecodeError` — on both the FTS5 and `LIKE` candidate paths, so one bad transcript on disk cannot abort recall across the remaining valid sessions. See [Cross-Session Recall → Resilience to Corrupt Transcripts](/features/cross-session-recall#resilience-to-corrupt-transcripts). |
+| Malformed-turn tolerance | `SessionData.from_dict` skips any entry in `messages` or `archived_messages` that is not a JSON object (`null`, a string, a number). This covers the SQLite indexed route, the `SqliteTranscriptStore` indexed route, and the default-store scan fallback — a single malformed turn on disk no longer crashes `get_by_gateway_session` or `list_sessions_by_gateway_agent`. The on-disk transcript and its route index record are left untouched. When one or more dropped active turns precede the compaction anchor, `last_compaction.message_index` is shifted down by the number of entries dropped before it so `get_working_history()` still slices the retained tail correctly. See PraisonAI PR [#5676](https://github.com/MervinPraison/PraisonAI/pull/5676) / issue [#5672](https://github.com/MervinPraison/PraisonAI/issues/5672). |
+
+<Note>
+**`clear_session` preserves routing and archive on `SqliteSessionStore`** (parity with `DefaultSessionStore`, PraisonAI PR [#5681](https://github.com/MervinPraison/PraisonAI/pull/5681) / issue [#5521](https://github.com/MervinPraison/PraisonAI/issues/5521)). Clearing a session empties only the active turns — the JSON transcript, `archived_messages`, and gateway/agent bindings all remain on disk, and the matching rows in `session_meta`, `session_fts`, and `session_route` are retained. `get_by_gateway_session`, `list_sessions_by_gateway_agent`, and archived-only `search` continue to return the session as an indexed lookup. Only `delete_session` deindexes a session.
+</Note>
+
+A long-lived gateway bot can reset the active window without losing its route:
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.session import SqliteSessionStore
+
+store = SqliteSessionStore(db_path="~/.praisonai/sessions.db")
+agent = Agent(name="Gateway", session_store=store)
+
+# Session is bound to a gateway event and handles a conversation
+agent.start("Hello", session_id="chat-42")
+store.set_gateway_info("chat-42", gateway_session_id="gw-abc", agent_id="support")
+
+# Operator clears the active window to start a fresh chat for the same user
+store.clear_session("chat-42")
+
+# The next inbound gateway event still routes to the same local session —
+# the route index survives clear_session (PR #5681).
+same = store.get_by_gateway_session("gw-abc")   # SessionData for "chat-42"
+assert same.session_id == "chat-42"
+```
+
+```mermaid
+graph LR
+    subgraph "clear_session on SqliteSessionStore"
+        C[🧹 clear_session] --> A[Active turns emptied]
+        C --> K1[📦 archived_messages retained]
+        C --> K2[🌐 gateway_session_id retained]
+        C --> K3[🤖 agent_id retained]
+        C --> K4[🔎 FTS + route indexes retained]
+    end
+    D[🗑️ delete_session] --> R[All of the above removed]
+
+    classDef op fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef kept fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef gone fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class C,D op
+    class A,K1,K2,K3,K4 kept
+    class R gone
+```
 
 ### Fallback matrix
 
@@ -340,6 +440,8 @@ Bookends, automated demotion, and lineage dedup apply to results from both store
 
 <Note>
 As of Issue #5031, `SqliteSessionStore` also indexes `archived_messages` (turns compacted out of the active window), bumping `INDEX_CONTENT_VERSION` to `2`. On the **first startup after upgrade**, the store detects the stale version and rebuilds every session's FTS row once so archived-only queries work immediately — rather than only after each session's next write. No user action is required: startup runs a bounded backfill, then persists the new version so later startups fall back to the cheap skip-already-indexed path. A new internal `session_index_meta` key/value table (`content_version` key) tracks the version, so operators upgrading an existing store should expect that table to appear in the index file.
+
+As of Issue #5051 (PR [#6112](https://github.com/MervinPraison/PraisonAI/pull/6112)), `INDEX_CONTENT_VERSION` is bumped again to `3` so compaction summaries drop out of the FTS index — the same one-time rebuild path runs on first startup after upgrade. No user action required.
 </Note>
 
 See [Cross-Session Recall → Recall Across Compacted History](/features/cross-session-recall#recall-across-compacted-history) for the caller-facing behaviour.
@@ -375,7 +477,7 @@ history = store.get_working_history("chat-42")   # summary + tail
 | `get_working_history(max_messages=None)` | Reconstruct `[summary_message, *tail]`; falls back to `get_chat_history` with no checkpoint |
 
 <Note>
-`set_chat_history()` and `clear_session()` both clear `last_compaction` — replacing or clearing the transcript invalidates the anchor.
+`set_chat_history()` and `clear_session()` both clear `last_compaction` — replacing or clearing the active transcript invalidates the anchor. Raw turns already moved into `archived_messages` by prior compactions are **not** removed, and stay searchable through `search()` and `session_search` (PraisonAI PR [#5681](https://github.com/MervinPraison/PraisonAI/pull/5681)).
 </Note>
 
 ## Task-Local Context

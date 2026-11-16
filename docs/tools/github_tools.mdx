@@ -53,6 +53,10 @@ graph LR
 **Prerequisites:** **git** installed with the working directory inside a repository (`github_create_branch`, `github_commit_and_push`); **`origin` remote** configured for push; **`gh` CLI** installed and authenticated via `gh auth login` (`github_create_pull_request`). `user.email` should match the identity you expect to author commits — the foreign-author guard reads `git config user.email`.
 </Note>
 
+<Warning>
+**Approval required (SDK PR #6063):** `github_create_branch`, `github_commit_and_push`, and `github_create_pull_request` are `high`-risk tools. Interactive agents (TTY) are prompted before each call; non-interactive agents (gateway hooks, CI, schedulers) are denied unless you set `PRAISONAI_TOOL_SAFETY=off`, `PRAISONAI_AUTO_APPROVE=true`, or pass an explicit `approval=` policy. See [Approval](/features/approval).
+</Warning>
+
 ## Quick Start
 
 <Steps>
@@ -95,38 +99,41 @@ sequenceDiagram
     Agent-->>User: Result
 ```
 
-You don't have to think about branch safety — the tool quietly does the right thing.
+You don't have to think about branch safety — the tool quietly does the right thing, and only your tracked edits (plus any files you list in `paths`) are committed — untracked files like a new `.env` or build output are never swept in.
 
 > **User:** "Commit and push what I have."
 > **Agent:** *(tool auto-creates `praisonai/fix-login-a1b2c3`, pushes there, and reports the branch name back)*
 
 ## Tools
 
-### `github_create_branch(branch_name: str) -> str`
+### `github_create_branch(branch_name, repo_path=None) -> str`
 
 Creates and checks out a new branch (`git checkout -B`).
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `branch_name` | `str` | Branch to create and check out |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `branch_name` | `str` | — | Branch to create and check out |
+| `repo_path` | `Optional[str]` | `None` | Repository directory to run git in. Defaults to the current working directory. |
 
 Returns a success message or an error string.
 
-### `github_commit_and_push(commit_message, branch=None, allow_unsafe_branch=False) -> str`
+### `github_commit_and_push(commit_message, branch=None, allow_unsafe_branch=False, repo_path=None, paths=None) -> str`
 
-Stages all changes, commits, and pushes to `origin` — with branch-safety guardrails that refuse unsafe pushes and never force-push.
+Stages tracked changes (plus any `paths` you list), commits, and pushes to `origin` — with branch-safety guardrails that refuse unsafe pushes and never force-push.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `commit_message` | `str` | — | Commit message |
 | `branch` | `Optional[str]` | `None` | Target branch. Defaults to the current branch. |
 | `allow_unsafe_branch` | `bool` | `False` | Opt-in override for default-branch and foreign-author refusals. Divergence is never overridable. |
+| `repo_path` | `Optional[str]` | `None` | Repository directory to run git in. Defaults to the current working directory. |
+| `paths` | `Optional[List[str]]` | `None` | Extra (e.g. untracked) files to stage alongside tracked changes. |
 
-Returns a success message, `"No changes to commit."`, or an error string.
+Returns a success message, `"No changes to commit."`, or an error string. Untracked files alone don't count as changes — list them in `paths` to commit them.
 
 #### Branch-safety rules
 
-The tool checks these rules before committing, so a refusal leaves your changes intact.
+The tool checks these rules before staging anything, so a refusal leaves your index and working tree untouched.
 
 1. **Agent branches are always allowed.** Any branch whose name starts with `praisonai/` skips the default and foreign-author checks.
 2. **The default branch is never pushed directly.** On `main` (or when `branch="main"`), the tool creates a fresh `praisonai/{slug}-{6hex}` branch from HEAD and pushes there instead.
@@ -157,7 +164,8 @@ graph TB
     ForeignCheck -->|Yes| Refuse1[Refuse - unless allow_unsafe_branch=True]
     ForeignCheck -->|No| DivCheck
     DivCheck -->|Yes| Refuse2[Refuse - never overridable]
-    DivCheck -->|No| Push[Commit and push]
+    DivCheck -->|No| Stage[Stage tracked changes + paths]
+    Stage --> Push[Commit and push]
 
     classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
@@ -167,12 +175,12 @@ graph TB
 
     class Start start
     class HasChanges,IsDefault,IsAgent,ForeignCheck,DivCheck check
-    class AutoBranch action
+    class AutoBranch,Stage action
     class Refuse1,Refuse2,Noop refuse
     class Push ok
 ```
 
-### `github_create_pull_request(title, body, head_branch, base_branch="main") -> str`
+### `github_create_pull_request(title, body, head_branch, base_branch="main", repo_path=None) -> str`
 
 Creates a pull request via `gh pr create`.
 
@@ -182,6 +190,7 @@ Creates a pull request via `gh pr create`.
 | `body` | `str` | — | PR description (markdown, issue refs such as `#123`) |
 | `head_branch` | `str` | — | Source branch with your changes |
 | `base_branch` | `str` | `"main"` | Target branch (`main`, `master`, `develop`, …) |
+| `repo_path` | `Optional[str]` | `None` | Repository directory to run gh in. Defaults to the current working directory. |
 
 ```python
 github_create_pull_request(
@@ -245,6 +254,33 @@ github_create_pull_request(
 ```
 </Tab>
 
+<Tab title="Specific repository">
+```python
+from praisonaiagents.tools import github_commit_and_push
+
+github_commit_and_push(
+    "docs: fix typo",
+    repo_path="/workspace/my-repo",
+)
+```
+
+Use `repo_path` when the agent's working directory isn't the repo it should push to — common for gateway, hook, and scheduler agents.
+</Tab>
+
+<Tab title="Committing new files">
+```python
+from praisonaiagents.tools import github_commit_and_push
+
+# Tracked edits plus brand-new files
+github_commit_and_push(
+    "feat: add Dockerfile",
+    paths=["Dockerfile", "docker/entrypoint.sh"],
+)
+```
+
+New files that aren't listed in `paths` (and aren't already tracked) are **not** committed.
+</Tab>
+
 <Tab title="PR only">
 ```python
 # After you have already pushed head_branch
@@ -265,7 +301,7 @@ Run `gh auth login` before agents call `github_create_pull_request`. The tool ch
 </Accordion>
 
 <Accordion title="Keep commits scoped">
-`github_commit_and_push` stages **all** changes (`git add .`), so review the working tree for a tidy commit. An over-broad `git add .` no longer risks an over-broad push to `main` — the tool refuses unsafe pushes before committing.
+`github_commit_and_push` stages only **tracked** changes (`git add -u -- .`). New (untracked) files are committed only when you list them in the `paths` argument — an untracked `.env` or build output is never swept in. Staging also runs **after** the branch-safety checks, so a refused push leaves the index untouched.
 </Accordion>
 
 <Accordion title="Prefer the auto-branch flow">

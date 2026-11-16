@@ -156,6 +156,7 @@ def _get_default_adapter_registry():
 
 # Framework availability detection (lazy via __getattr__)
 from ._framework_availability import is_available
+from praisonai._errors import _WrapperError
 
 # Lazy constants mapping for backward compatibility
 _AVAIL = {
@@ -192,7 +193,7 @@ def __dir__():
 _DEFAULT_TOOL_TIMEOUT_WORKERS = 32
 
 
-class ToolTimeoutError(TimeoutError):
+class ToolTimeoutError(_WrapperError, TimeoutError):
     """Raised when a wrapped tool exceeds its per-call timeout.
 
     Preserves the tool's declared return-type contract: instead of silently
@@ -418,6 +419,7 @@ def _wrap_with_timeout(tool, timeout_seconds: float, executor_factory, on_leaked
     import concurrent.futures
     import functools
     import inspect
+    import time
 
     # Identity of the wrapper's owner so a shared framework-tool object wrapped
     # by one generator is transparently re-wrapped (not skipped) when a
@@ -457,7 +459,16 @@ def _wrap_with_timeout(tool, timeout_seconds: float, executor_factory, on_leaked
             # pool; a second failure is genuinely fatal. Surfacing the failure
             # as ToolTimeoutError keeps the module contract (see the docstring
             # above) intact instead of leaking RuntimeError/CancelledError.
+            # A single monotonic deadline spans both attempts so a retry never
+            # extends the user-declared wall-clock budget.
+            deadline = time.monotonic() + timeout_seconds
             for attempt in (0, 1):
+                if deadline - time.monotonic() <= 0:
+                    raise ToolTimeoutError(
+                        tool_name=tool_name,
+                        timeout_seconds=timeout_seconds,
+                        background_work_may_continue=False,
+                    )
                 try:
                     executor = executor_factory()
                     future = executor.submit(fn, *args, **kwargs)
@@ -477,8 +488,11 @@ def _wrap_with_timeout(tool, timeout_seconds: float, executor_factory, on_leaked
                         timeout_seconds=timeout_seconds,
                         background_work_may_continue=False,
                     )
+                # Recompute right before waiting so time spent obtaining or
+                # recycling the pool is charged to the budget; an expired budget
+                # (timeout=0) takes the normal cancel/report path below.
                 try:
-                    return future.result(timeout=timeout_seconds)
+                    return future.result(timeout=max(0.0, deadline - time.monotonic()))
                 except concurrent.futures.TimeoutError:
                     # Best-effort cancel; only effective if the future has not started.
                     # A started sync call cannot be interrupted, so warn operators that
@@ -638,7 +652,7 @@ class AgentsGenerator:
         self.agent_callback = agent_callback
         self.task_callback = task_callback
         self.agent_yaml = agent_yaml
-        self.tools = tools or []  # Store tool class names as a list
+        self.tools = tools or []  # Tool classes, callables or framework tool objects
         self.cli_config = cli_config or {}  # Store CLI configuration overrides
 
         # Per-run behaviour toggles. Precedence: explicit arg > cli_config > env
@@ -815,7 +829,9 @@ class AgentsGenerator:
         adapter name by the time an adapter invokes a wrap closure at run time).
         """
         if native_delegates_to_core is None:
-            native_delegates_to_core = (getattr(self, "framework", None) or "") == "praisonai"
+            native_delegates_to_core = self._delegates_tool_timeout_to_core(
+                getattr(self, "framework", None)
+            )
         return _wrap_with_timeout(
             tool,
             timeout_seconds,
@@ -824,6 +840,18 @@ class AgentsGenerator:
             owner_key=self._timeout_owner_key,
             native_delegates_to_core=native_delegates_to_core,
         )
+
+    def _delegates_tool_timeout_to_core(self, framework) -> bool:
+        """Whether ``framework``'s adapter declares ``SUPPORTS_CORE_TOOL_TIMEOUT``."""
+        if not framework:
+            return False
+        from .framework_adapters.registry import adapter_capability
+
+        return adapter_capability(
+            str(framework),
+            "SUPPORTS_CORE_TOOL_TIMEOUT",
+            registry=getattr(self, "_adapter_registry", None),
+        ) is True
 
     def close(self):
         """Release the owned tool-timeout executor; safe to call repeatedly."""
@@ -982,6 +1010,8 @@ class AgentsGenerator:
             spec = ApprovalSpec.from_cli(MockArgs(cli_config))
             if spec.enabled:
                 agent_overrides['approval'] = spec.to_dict()
+                if cli_config.get('permissions_config'):
+                    agent_overrides['approval']['permissions'] = dict(cli_config['permissions_config'])
             
         # Handle guardrail separately
         if 'guardrail' in cli_config:
@@ -1052,7 +1082,7 @@ class AgentsGenerator:
         self._validate_agents_config(config)
         
         # Build tools dictionary using shared logic
-        tools_dict = self._build_tools_dict(config)
+        tools_dict, run_ctx = self._build_tools_and_run_ctx(config)
         
         # Select framework and resolve adapter variant. Registry is the single
         # source of truth for the default, so no literal framework name here.
@@ -1085,7 +1115,31 @@ class AgentsGenerator:
             'config': config,
             'topic': topic,
             'tools_dict': tools_dict,
+            # Per-run closures travel with this call's prep (not via ``self``) so
+            # concurrent runs on one generator never pick up each other's
+            # tool-timeout wrap/resolvers.
+            'run_ctx': run_ctx,
         }
+
+    def _run_config_list(self, config):
+        """Return the ``config_list`` for this run with YAML top-level ``llm`` applied.
+
+        Precedence for agents without their own ``llm``/``model``: explicit CLI
+        ``--model`` (``cli_config['model']``) > top-level YAML ``llm`` >
+        credential/catalogue-resolved ``config_list``. Returns a copy so the
+        caller-owned ``self.config_list`` is never mutated.
+        """
+        config_list = self.config_list
+        if (self.cli_config or {}).get('model'):
+            return config_list
+        yaml_llm = config.get('llm')
+        if isinstance(yaml_llm, dict):
+            yaml_llm = yaml_llm.get('model')
+        if not isinstance(yaml_llm, str) or not yaml_llm.strip():
+            return config_list
+        if config_list:
+            return [{**config_list[0], 'model': yaml_llm.strip()}, *config_list[1:]]
+        return [{'model': yaml_llm.strip()}]
 
     def _run_adapter_setup(self, adapter):
         """Run an adapter's setup hooks.
@@ -1098,13 +1152,27 @@ class AgentsGenerator:
     
     def _build_tools_dict(self, config):
         """Shared tool resolution logic for sync and async paths."""
+        tools_dict, self._run_ctx = self._build_tools_and_run_ctx(config)
+        return tools_dict
+
+    def _build_tools_and_run_ctx(self, config):
+        """Resolve tools and return ``(tools_dict, run_ctx)`` for one run."""
         tools_dict = self.tool_resolver.resolve_all_from_yaml(config)
-        for tool_class in self.tools:
-            if isinstance(tool_class, type):
+        for tool in self.tools:
+            if isinstance(tool, type):
                 try:
-                    tools_dict[tool_class.__name__] = tool_class()
+                    tools_dict[tool.__name__] = tool()
                 except (TypeError, ValueError, RuntimeError) as e:
-                    self.logger.warning(f"Failed to instantiate tool class {tool_class.__name__}: {e}")
+                    self.logger.warning(f"Failed to instantiate tool class {tool.__name__}: {e}")
+            elif callable(tool) or _looks_like_framework_tool(tool):
+                # Plain callables / @tool functions and framework tool instances
+                # (CrewAI/LangChain BaseTool) are registered as-is by name.
+                name = getattr(tool, "name", None) or getattr(tool, "__name__", None)
+                if not isinstance(name, str) or not name:
+                    name = type(tool).__name__
+                tools_dict[name] = tool
+            else:
+                self.logger.warning(f"Ignoring non-tool entry in tools: {tool!r}")
 
         # Enforce tool_timeout from CLI/YAML at the wrapper layer so the field is
         # not silently dropped. The timeout stack (_wrap_tool_with_timeout) is
@@ -1133,7 +1201,7 @@ class AgentsGenerator:
             )
         except Exception:
             resolved_framework = _requested_framework
-        native = resolved_framework == "praisonai"
+        native = self._delegates_tool_timeout_to_core(resolved_framework)
 
         uniform = self._resolve_uniform_tool_timeout(config)
         wrap = None
@@ -1180,14 +1248,14 @@ class AgentsGenerator:
                 lambda agent_key, _cfg=config: self.resolve_agent_tool_timeout(agent_key, _cfg)
             )
 
-        self._run_ctx = {
+        run_ctx = {
             "_tool_timeout_wrap": wrap,
             "_agent_tool_wrap_resolver": resolver,
             "_native_tool_timeout_resolver": native_tool_timeout_resolver,
         }
-        return tools_dict
+        return tools_dict, run_ctx
 
-    def _dispatch_cli_config(self):
+    def _dispatch_cli_config(self, run_ctx=None):
         """Merge the private per-run context onto the user cli_config for adapters.
 
         Adapters read ``_tool_timeout_wrap`` / ``_agent_tool_wrap_resolver`` off
@@ -1196,7 +1264,8 @@ class AgentsGenerator:
         ``self.cli_config`` (which stays "user overrides only").
         """
         base = self.cli_config or {}
-        run_ctx = getattr(self, "_run_ctx", None)
+        if run_ctx is None:
+            run_ctx = getattr(self, "_run_ctx", None)
         if not run_ctx:
             return base
         return {**base, **run_ctx}
@@ -1626,6 +1695,50 @@ class AgentsGenerator:
                 "stream-json bridge."
             )
 
+    def build_agents(self):
+        """Build the agent objects from the YAML spec *without running them*.
+
+        This is the "build only" counterpart to
+        :meth:`generate_crew_and_kickoff` and exists for callers that need the
+        constructed :class:`~praisonaiagents.Agent` instances rather than a run
+        result -- e.g. the ``praisonai eval`` evaluators, which drive an agent
+        themselves. It reuses the same :meth:`_prepare_for_run` normalisation so
+        the agents are identical to what a real run would build.
+
+        Returns:
+            list: The constructed agent instances (empty list if none defined).
+        """
+        config = self._load_config()
+        prep = self._prepare_for_run(config)
+        adapter = prep['adapter']
+        builder = getattr(adapter, "_build_agents_and_tasks", None)
+        if not callable(builder):
+            raise NotImplementedError(
+                f"Framework {adapter.name!r} does not support building agents "
+                "without running them; use generate_crew_and_kickoff()."
+            )
+        model_name = adapter._pick_model(self._run_config_list(prep['config']))
+        # Thread the per-agent tool_timeout wrap resolver (carried in prep by
+        # _prepare_for_run) exactly as the real run paths do, so agents built for
+        # evaluation carry the same heterogeneous per-agent timeout guards a
+        # normal run would apply — not a different (unguarded) tool policy.
+        run_ctx = prep.get('run_ctx') or {}
+        agents, _tasks = builder(
+            prep['config'],
+            prep['topic'],
+            prep['tools_dict'],
+            getattr(self, 'agent_callback', None),
+            getattr(self, 'task_callback', None),
+            model_name,
+            agent_tool_wrap_resolver=run_ctx.get("_agent_tool_wrap_resolver"),
+            cli_config=self._dispatch_cli_config(run_ctx),
+        )
+        # _build_agents_and_tasks returns a name->agent mapping; callers expect
+        # a flat list in definition order.
+        if isinstance(agents, dict):
+            return list(agents.values())
+        return list(agents) if agents else []
+
     def generate_crew_and_kickoff(self):
         """
         Generates a crew of agents and initiates tasks based on the provided configuration.
@@ -1683,12 +1796,12 @@ class AgentsGenerator:
             with scoped_bridge():
                 return prep['adapter'].run(
                     prep['config'],
-                    self.config_list,
+                    self._run_config_list(prep['config']),
                     prep['topic'],
                     tools_dict=prep['tools_dict'],
                     agent_callback=getattr(self, 'agent_callback', None),
                     task_callback=getattr(self, 'task_callback', None),
-                    cli_config=self._dispatch_cli_config(),
+                    cli_config=self._dispatch_cli_config(prep.get('run_ctx')),
                 )
 
     async def _aload_config(self):
@@ -1752,12 +1865,12 @@ class AgentsGenerator:
                 await asyncio.to_thread(self._run_adapter_setup, prep['adapter'])
                 return await prep['adapter'].arun(
                     prep['config'],
-                    self.config_list,
+                    self._run_config_list(prep['config']),
                     prep['topic'],
                     tools_dict=prep['tools_dict'],
                     agent_callback=getattr(self, 'agent_callback', None),
                     task_callback=getattr(self, 'task_callback', None),
-                    cli_config=self._dispatch_cli_config(),
+                    cli_config=self._dispatch_cli_config(prep.get('run_ctx')),
                 )
 
 
@@ -1887,6 +2000,10 @@ class AgentsGenerator:
 
         parser = YAMLWorkflowParser()
         workflow = parser.parse_string(yaml_content)
+
+        # ``praisonai replay rerun``: reuse recorded step outputs (no-op otherwise).
+        from .replay._hook import apply_rerun_seed
+        apply_rerun_seed(workflow)
 
         # Get input: 'input' is canonical, 'topic' is alias for backward compatibility
         input_data = config.get('input', config.get('topic', ''))

@@ -473,7 +473,10 @@ class YAMLWorkflowParser:
             
             if 'reasoning' in role_config:
                 agent['reasoning'] = role_config['reasoning']
-            
+
+            if isinstance(role_config.get('execution'), dict):
+                agent['execution'] = role_config['execution']
+
             agents[role_id] = agent
         
         return agents
@@ -591,7 +594,11 @@ class YAMLWorkflowParser:
             # so we don't override the Agent's own caching default.
             if cache is False:
                 agent_kwargs['caching'] = False
-            _execution: Dict[str, Any] = {}
+            # An agent-level `execution:` mapping passes straight through to
+            # ExecutionConfig (e.g. max_budget, on_budget_exceeded, durable,
+            # journal_path, resume_run_id); flat max_iter/max_execution_time win.
+            _yaml_execution = config.get('execution')
+            _execution: Dict[str, Any] = dict(_yaml_execution) if isinstance(_yaml_execution, dict) else {}
             if max_iter is not None:
                 _execution['max_iter'] = max_iter
             if max_execution_time is not None:
@@ -707,7 +714,7 @@ class YAMLWorkflowParser:
         from ..agent import ImageAgent
         
         # ImageAgent accepts: llm, style, and other image config
-        style = config.get('style', 'natural')
+        style = config.get('style')
         
         agent = ImageAgent(
             llm=llm,
@@ -1077,11 +1084,15 @@ class YAMLWorkflowParser:
         # Build routes dictionary with resolved agents
         routes = {}
         for route_key, agent_ids in route_config.items():
-            if isinstance(agent_ids, list):
-                routes[route_key] = [self._agents[aid] for aid in agent_ids if aid in self._agents]
-            else:
-                if agent_ids in self._agents:
-                    routes[route_key] = [self._agents[agent_ids]]
+            if not isinstance(agent_ids, list):
+                agent_ids = [agent_ids]
+            try:
+                routes[route_key] = [self._agents[aid] for aid in agent_ids]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Agent '{exc.args[0]}' in route '{route_key}' "
+                    "not defined in agents section"
+                ) from exc
         
         return route(routes)
     
@@ -1109,7 +1120,12 @@ class YAMLWorkflowParser:
                         agent._yaml_action = item['action']
                     parallel_steps.append(agent)
         
-        return parallel(parallel_steps)
+        # Forward optional fan-out controls so YAML has parity with the Python
+        # API. context defaults to "full" (exact pass-through, no data loss);
+        # opt into token savings with context: truncate|summarize.
+        context_mode = step_data.get('context', 'full')
+        on_failure = step_data.get('on_failure', 'partial_ok')
+        return parallel(parallel_steps, on_failure=on_failure, context=context_mode)
     
     def _parse_loop_step(self, step_data: Dict):
         """
@@ -1165,6 +1181,9 @@ class YAMLWorkflowParser:
         from_file = loop_config.get('from_file')
         var_name = loop_config.get('var_name', 'item')
         parallel_flag = loop_config.get('parallel', False)
+        # context defaults to "full" (exact pass-through); opt into lossy token
+        # savings for parallel iterations with context: truncate.
+        context_mode = loop_config.get('context', 'full')
         max_workers_raw = loop_config.get('max_workers')
         # Ensure max_workers is int (YAML may parse as string or contain template)
         max_workers = None
@@ -1197,7 +1216,8 @@ class YAMLWorkflowParser:
                     var_name=var_name,
                     parallel=parallel_flag, 
                     max_workers=max_workers,
-                    output_variable=output_variable
+                    output_variable=output_variable,
+                    context=context_mode
                 )
         
         # Resolve the step/agent to execute (single step - backward compat)
@@ -1256,7 +1276,8 @@ class YAMLWorkflowParser:
             var_name=var_name,
             parallel=parallel_flag, 
             max_workers=max_workers,
-            output_variable=output_variable
+            output_variable=output_variable,
+            context=context_mode
         )
     
     def _parse_repeat_step(self, step_data: Dict) -> Dict:

@@ -237,6 +237,10 @@ all                               # fan out to every bot (gateway only)
 `origin` now works on the lightweight scheduler path when the job has a persisted origin (`ScheduleJob.origin` — set automatically when a job is created from a bot/webhook request). It resolves to the same channel/thread the request came in on, no gateway required. If the job has **no** persisted origin, the lightweight path logs a warning and skips delivery. Only `all` still needs the full gateway — it enumerates every registered bot.
 </Note>
 
+<Note>
+On the gateway, scheduled results are tagged `agent_finished` and gated by [Notification Policy](/features/gateway-notification-policy) when `gateway.notifications` is configured — the recipient key is the resolved `platform:channel_id`.
+</Note>
+
 ### Thread semantics per platform
 
 The third `:thread_id` segment threads the outbound message. `DeliveryRouter.resolve()` returns `(platform, channel_id, thread_id)` and `deliver()` passes `thread_id` into `bot.send_message(...)`. Adapters without a `thread_id` kwarg are unaffected — a guard introspects the adapter first.
@@ -352,8 +356,11 @@ graph LR
         Tick --> Exec[ScheduledAgentExecutor]
         Exec --> Live{live delivery_handler?}
         Live -- yes --> LiveOK[gateway send_message]
-        Live -- no --> Standalone[🌐 standalone sender<br/>Telegram · Slack · Discord · WhatsApp · Signal]
+        Live -- no --> Bundled{Bundled platform?}
+        Bundled -- yes --> Standalone[🌐 standalone sender<br/>Telegram · Slack · Discord · WhatsApp · Signal]
+        Bundled -- no --> Plugin[📇 descriptor.standalone_sender]
         Standalone -- retry ×4 on transient --> Chat[✅ chat]
+        Plugin --> Chat
     end
 
     classDef trigger fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -362,10 +369,14 @@ graph LR
     classDef out     fill:#10B981,stroke:#7C90A0,color:#fff
 
     class Cron,Tick trigger
-    class Exec,Standalone process
-    class Live branch
+    class Exec,Standalone,Plugin process
+    class Live,Bundled branch
     class LiveOK,Chat out
 ```
+
+<Note>
+**Plugin channels on the standalone path.** A channel registered through `praisonai.channels` also works on the standalone path, as long as its `ChannelDescriptor` declares an optional `standalone_sender`. See [Standalone Sender for Custom Channels](/features/plugin-standalone-sender). The resolver tries the bundled senders first, so bundled names always win. If the descriptor lookup fails, the run records `delivery_error` and the tick doesn't crash.
+</Note>
 
 <Steps>
 <Step title="Set the platform token">
@@ -443,7 +454,8 @@ Nothing is hidden — a target that cannot be delivered is recorded as `delivery
 | **Unroutable token at schedule creation** (missing/malformed `channel_id`, unknown platform, empty target) | `SchedulerDelivery` logs an actionable warning with `reason` + `hint`; construction still returns so callers that only want a preview aren't blocked. A caller that wants hard-fail behaviour can raise `ScheduleTargetError` explicitly. See [Creation-time validation and preview](#creation-time-validation-and-preview). |
 | Token env unset | Run succeeds; `delivery_error` recorded (`"{TOKEN} not set for standalone delivery"`). |
 | Bare-platform target and no `{PLATFORM}_HOME_CHANNEL` + no registry entry | Run succeeds; `delivery_error` recorded. |
-| Unsupported platform (custom / entry-point / etc.) | Run succeeds; `delivery_error` recorded. |
+| Unsupported platform **with no `standalone_sender`** on its descriptor | Run succeeds; `delivery_error` recorded. |
+| Custom / entry-point platform whose descriptor **does** declare `standalone_sender` | Delivered via the plugin's sender, with the same semantics as the bundled senders: raise → `delivery_error`, `return False` → `delivery_error`, otherwise `delivered=True`. |
 | Slack `{"ok": false}` body | Run succeeds; `delivery_error` records the Slack error name |
 | Payload > platform limit | Auto-chunked into multiple messages (see per-platform table below) |
 | Live `delivery_handler` present | Live path wins; standalone sender is never invoked |
@@ -470,7 +482,7 @@ Nothing is hidden — a target that cannot be delivered is recorded as `delivery
 | Discord | `DISCORD_BOT_TOKEN` | `DISCORD_HOME_CHANNEL` | 2000 chars | `thread_id` → `message_reference` reply |
 | WhatsApp | `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID` | `WHATSAPP_HOME_CHANNEL` | 4096 chars | **Ignored** — WhatsApp has no thread concept; a scheduler `thread_id` is **not** a WhatsApp `context.message_id` and is deliberately dropped (see the WhatsApp note below) |
 | Signal | `SIGNAL_ACCOUNT` (sender number) | `SIGNAL_HOME_CHANNEL` (recipient) | 2000 chars | Not applicable (Signal has no threads) |
-| Custom / entry-point platforms | — | — | — | **Not supported** — no standalone sender, delivery raises → `delivery_error` |
+| Custom / entry-point platforms (`praisonai.channels`) | Set by the plugin | Set by the plugin | Set by the plugin | **Supported** when the plugin's `ChannelDescriptor` declares `standalone_sender`. See [Standalone Sender for Custom Channels](/features/plugin-standalone-sender). Without one, delivery raises → `delivery_error` |
 
 Signal also reads `SIGNAL_BRIDGE_URL` (defaults to `http://localhost:8080`, matching the live [Signal Bot](/features/signal-bot) adapter) for the `signal-cli-rest-api` bridge endpoint.
 
@@ -719,11 +731,25 @@ Given a successful delivery of `text` to `channel:channel_id`, the gateway seeds
 
 | Precondition | What the gateway does |
 |---|---|
-| `continuable is True` (default) | Mirrors `text` into the destination bot's session under the delivery chat id. The user's next message in this chat resumes the conversation. |
+| `continuable is True` (default), agent-run result | Mirrors `text` into the destination bot's session under the delivery chat id **as an `assistant` turn** (`authored_by="agent"`). The user's next message in this chat resumes the conversation. |
+| `continuable is True` (default), `command` / backend output or a failure / hold / recovery notice | Mirrors `text` as a **`user` turn prefixed `[cron]`** (`authored_by="external"`). The agent never thinks it wrote command output or a system notice. |
 | `continuable is False` | Skips seeding entirely. Reply lands as a brand-new, contextless turn. |
 | Delivery **failed** (any path) | Does **not** seed. Nothing was delivered, so nothing is claimed to have been. |
 | Seeding raises (session missing, adapter oddity) | Logs a single `debug` line and returns. The delivery has already succeeded and remains committed — a seeding failure never breaks it. |
 | Intentional-silence run (`NO_REPLY` / `[SILENT]` / `SILENT`) | Delivery is skipped — no delivery, no seed. See [Intentional Silence](#intentional-silence). |
+
+```python
+# command job stdout, mirrored into the session
+history = [
+    {"role": "user",      "content": "..."},
+    {"role": "assistant", "content": "...previous agent reply..."},
+    {"role": "user",      "content": "[cron] Backup finished: 3 files", "mirror": True},
+]
+```
+
+<Note>
+A custom `delivery_handler` only receives `authored_by` if its signature accepts it — existing `(delivery, text)` handlers keep working unchanged.
+</Note>
 
 <Note>
 The `continuable` field is a **declarable contract**. Core (`praisonaiagents/scheduler/models.py`) owns the field and its round-trip; the actual seeding runs in the `praisonai-bot` gateway. Deployments running the scheduler without the bot wrapper (direct scheduler → agent, no gateway) still round-trip the field and honour the opt-out, but there is no session to seed.

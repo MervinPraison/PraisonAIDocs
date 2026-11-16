@@ -135,6 +135,31 @@ def _get_display_tool_call():
         _display_tool_call = display_tool_call
     return _display_tool_call
 
+# Sampling params reasoning models reject (same set as ``llm.py``).
+_REASONING_UNSUPPORTED_PARAMS = (
+    "temperature", "top_p", "presence_penalty", "frequency_penalty", "logit_bias",
+)
+
+def _normalize_chat_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Make Chat Completions params acceptable to reasoning models (#5909).
+
+    An unset ``temperature``/``max_tokens`` is omitted rather than sent as
+    JSON ``null``, which reasoning models reject; an explicit ``max_tokens``
+    becomes ``max_completion_tokens`` for them and unsupported sampling
+    params are dropped (mirrors ``llm.py``, #6128).
+    """
+    for key in ("temperature", "max_tokens"):
+        if key in params and params[key] is None:
+            del params[key]
+    if any(key in params for key in ("max_tokens",) + _REASONING_UNSUPPORTED_PARAMS):
+        from .model_capabilities import is_reasoning_model
+        if is_reasoning_model(params.get("model") or ""):
+            if "max_tokens" in params:
+                params.setdefault("max_completion_tokens", params.pop("max_tokens"))
+            for key in _REASONING_UNSUPPORTED_PARAMS:
+                params.pop(key, None)
+    return params
+
 # Constants
 LOCAL_SERVER_API_KEY_PLACEHOLDER = "not-needed"
 
@@ -177,6 +202,7 @@ class CompletionUsage:
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     prompt_cache_hit_tokens: int = 0
     prompt_cache_miss_tokens: int = 0
+    cost: Optional[float] = None
 
 @dataclass
 class ChatCompletion:
@@ -216,6 +242,41 @@ def _extract_tool_call_name_and_args(tool_call):
     except (json.JSONDecodeError, KeyError, AttributeError, TypeError) as e:
         return function_name, None, tool_call_id, e
 
+def _delta_reasoning(chunk):
+    """The reasoning text (``reasoning_content``) of a stream chunk, or None.
+
+    Usage-only chunks have no choices, so this never indexes an empty list.
+    """
+    choices = getattr(chunk, "choices", None)
+    if not choices:
+        return None
+    delta = getattr(choices[0], "delta", None)
+    return getattr(delta, "reasoning_content", None) or None
+
+
+# Same bound as ParallelToolCallExecutor's default worker count.
+_NATIVE_PARALLEL_TOOL_WORKERS = 5
+
+
+def _native_batch_parallel_ok(parallel: bool, specs) -> bool:
+    """Whether a batch of parsed ``(name, args, tool_call_id)`` may run concurrently.
+
+    Opt-in via ``ExecutionConfig.parallel_tool_calls``; a single call, or any
+    pair touching overlapping write paths, stays sequential (same guard as
+    ``ParallelToolCallExecutor``).
+    """
+    if not parallel or len(specs) < 2:
+        return False
+    if any(not isinstance(args, dict) for _, args, _ in specs):
+        return False
+    from ..tools.call_executor import ToolCall as _BatchCall
+    from ..tools.path_overlap import has_write_conflicts
+    return not has_write_conflicts([
+        _BatchCall(function_name=name, arguments=args, tool_call_id=tcid)
+        for name, args, tcid in specs
+    ])
+
+
 def process_stream_chunks(chunks):
     """Process streaming chunks into combined response"""
     if not chunks:
@@ -234,6 +295,8 @@ def process_stream_chunks(chunks):
         # Track usage
         completion_tokens = 0
         prompt_tokens = 0
+        cached_tokens = 0
+        reported_cost = None
         
         content_list = []
         reasoning_list = []
@@ -250,6 +313,11 @@ def process_stream_chunks(chunks):
             if chunk_usage:
                 completion_tokens = getattr(chunk_usage, "completion_tokens", 0) or completion_tokens
                 prompt_tokens = getattr(chunk_usage, "prompt_tokens", 0) or prompt_tokens
+                details = getattr(chunk_usage, "prompt_tokens_details", None)
+                cached_tokens = getattr(details, "cached_tokens", 0) or cached_tokens
+                chunk_cost = getattr(chunk_usage, "cost", None)
+                if isinstance(chunk_cost, (int, float)):
+                    reported_cost = chunk_cost
 
             if not hasattr(chunk, "choices") or not chunk.choices:
                 continue
@@ -267,23 +335,35 @@ def process_stream_chunks(chunks):
             # Handle tool calls
             if hasattr(delta, "tool_calls") and delta.tool_calls:
                 for tool_call_delta in delta.tool_calls:
+                    fn = getattr(tool_call_delta, "function", None)
+                    args_part = getattr(fn, "arguments", None) or ""
                     if tool_call_delta.index is not None and tool_call_delta.id:
-                        # Found the initial tool call
+                        # Found the initial tool call. Many OpenAI-compatible
+                        # servers (vLLM, Ollama, Gemini, proxies) send the
+                        # whole arguments string in this same delta, so keep
+                        # it instead of starting from "".
                         current_tool_call = {
                             "id": tool_call_delta.id,
                             "type": "function",
                             "function": {
-                                "name": tool_call_delta.function.name,
-                                "arguments": ""
+                                "name": getattr(fn, "name", None),
+                                "arguments": args_part
                             }
                         }
                         while len(tool_calls) <= tool_call_delta.index:
                             tool_calls.append(None)
                         tool_calls[tool_call_delta.index] = current_tool_call
-                        current_tool_call = tool_calls[tool_call_delta.index]
-                    elif current_tool_call is not None and hasattr(tool_call_delta.function, "arguments"):
-                        if tool_call_delta.function.arguments:
-                            current_tool_call["function"]["arguments"] += tool_call_delta.function.arguments
+                    elif args_part:
+                        # Continuation delta: append to the call at its index
+                        # (parallel calls interleave), else to the last one.
+                        idx = tool_call_delta.index
+                        target = (
+                            tool_calls[idx]
+                            if idx is not None and 0 <= idx < len(tool_calls) and tool_calls[idx]
+                            else current_tool_call
+                        )
+                        if target is not None:
+                            target["function"]["arguments"] += args_part
 
         # Remove any None values and empty tool calls
         tool_calls = [tc for tc in tool_calls if tc and tc["id"] and tc["function"]["name"]]
@@ -327,7 +407,8 @@ def process_stream_chunks(chunks):
             prompt_tokens=prompt_tokens,
             total_tokens=completion_tokens + prompt_tokens,
             completion_tokens_details=CompletionTokensDetails(),
-            prompt_tokens_details=PromptTokensDetails()
+            prompt_tokens_details=PromptTokensDetails(cached_tokens=cached_tokens),
+            cost=reported_cost,
         )
         
         return ChatCompletion(
@@ -342,6 +423,15 @@ def process_stream_chunks(chunks):
     except Exception as e:
         print(f"Error processing chunks: {e}")
         return None
+
+def _env_timeout() -> Optional[float]:
+    """Return the OPENAI_TIMEOUT env var as seconds, or None when unset/invalid."""
+    value = os.environ.get("OPENAI_TIMEOUT")
+    try:
+        return float(value) if value else None
+    except ValueError:
+        return None
+
 
 class OpenAIClient:
     """
@@ -377,6 +467,8 @@ class OpenAIClient:
                 except (TypeError, ValueError):
                     max_retries = None
         self.max_retries = max_retries
+        # Per-request timeout (seconds) from OPENAI_TIMEOUT; unset keeps the SDK default (600s).
+        self.timeout = _env_timeout()
         
         # For local servers like LM Studio, allow minimal API key
         if self.base_url and not self.api_key:
@@ -391,6 +483,19 @@ class OpenAIClient:
         # Initialize clients lazily
         self._sync_client = None
         self._async_client = None
+        # Event loop the cached async client is bound to. A cached AsyncOpenAI
+        # keeps an httpx transport tied to the loop that first used it; reusing
+        # it from a different/closed loop raises "Event loop is closed", so we
+        # recreate the client when the running loop changes.
+        self._async_client_loop = None
+        # Whether the cached async client was created by ``async_client`` itself.
+        # Externally injected clients (e.g. a stubbed transport in tests) are
+        # never dropped on a loop change, since we did not bind them to a loop.
+        self._async_client_owned = False
+        # Guards the loop-change drop/rebuild of the async client so concurrent
+        # sync callers (each on its own ``asyncio.run`` loop) cannot observe a
+        # half-swapped client or a transient ``None``.
+        self._async_client_lock = threading.Lock()
         
         # Set up logging
         self.logger = get_logger(__name__)
@@ -432,6 +537,8 @@ class OpenAIClient:
             client_kwargs = {"api_key": self.api_key, "base_url": self.base_url}
             if self.max_retries is not None:
                 client_kwargs["max_retries"] = self.max_retries
+            if getattr(self, "timeout", None) is not None:
+                client_kwargs["timeout"] = self.timeout
             self._sync_client = OpenAI(**client_kwargs)
         return self._sync_client
     
@@ -444,13 +551,64 @@ class OpenAIClient:
                 via ``praisonaiagents.model_harness.allow_model_requests(False)``.
         """
         check_model_request(getattr(self, "model", None), "openai.chat.completions")
-        if self._async_client is None:
-            _, AsyncOpenAI = _get_openai_classes()
-            client_kwargs = {"api_key": self.api_key, "base_url": self.base_url}
-            if self.max_retries is not None:
-                client_kwargs["max_retries"] = self.max_retries
-            self._async_client = AsyncOpenAI(**client_kwargs)
-        return self._async_client
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        # Serialise the drop/rebuild so concurrent sync callers (each on their
+        # own ``asyncio.run`` loop) cannot observe a transient ``None`` or a
+        # half-swapped client. Clients built via ``__new__`` in tests may lack
+        # the lock, so fall back to a throwaway lock.
+        lock = getattr(self, "_async_client_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._async_client_lock = lock
+        with lock:
+            # Drop a client bound to a different (often already closed) loop so
+            # we never call into a transport whose loop is gone. Only clients we
+            # built here are loop-bound; an externally injected client (e.g. a
+            # stubbed transport in tests) is left untouched.
+            if (
+                self._async_client is not None
+                and self._async_client_owned
+                and running_loop is not None
+                and self._async_client_loop is not None
+                and self._async_client_loop is not running_loop
+            ):
+                self._async_client = None
+            if self._async_client is None:
+                _, AsyncOpenAI = _get_openai_classes()
+                client_kwargs = {"api_key": self.api_key, "base_url": self.base_url}
+                if self.max_retries is not None:
+                    client_kwargs["max_retries"] = self.max_retries
+                if getattr(self, "timeout", None) is not None:
+                    client_kwargs["timeout"] = self.timeout
+                # Use the plain default httpx client rather than openai's
+                # internal wrapper: the wrapper's ``__del__`` schedules
+                # ``aclose()`` on whichever loop is running at GC time. When a
+                # stale client (bound to a closed ``asyncio.run`` loop) is
+                # dropped above, that is the *new* loop, so the orphan task
+                # fails with "Event loop is closed" and is logged as
+                # "Task exception was never retrieved".
+                from openai import DefaultAsyncHttpxClient
+                client_kwargs["http_client"] = DefaultAsyncHttpxClient()
+                self._async_client = AsyncOpenAI(**client_kwargs)
+                self._async_client_loop = running_loop
+                self._async_client_owned = True
+            elif (
+                self._async_client_owned
+                and running_loop is not None
+                and self._async_client_loop is None
+            ):
+                # The client was first built with no running loop (e.g.
+                # sync-path construction). Bind it to the first loop that
+                # actually uses it so a later loop change is detected and the
+                # stale client is dropped.
+                self._async_client_loop = running_loop
+            # Return a local reference taken under the lock so a concurrent
+            # drop on another thread cannot turn the caller's result into None.
+            client = self._async_client
+        return client
     
     def build_messages(
         self, 
@@ -720,7 +878,10 @@ class OpenAIClient:
         if not self._supports_responses_api(model):
             return False
         try:
-            return hasattr(self.sync_client, 'responses')
+            responses = getattr(self.sync_client, "responses", None)
+            return responses is not None and callable(
+                getattr(responses, "create", None)
+            )
         except Exception:
             return False
 
@@ -746,28 +907,39 @@ class OpenAIClient:
         # ── Extract system instructions ──────────────────────────────────
         instructions = None
         input_items: List[Dict[str, Any]] = []
+        # Track call_ids emitted as function_call items so function_call_output
+        # items without a matching call stay out of the payload — orphaned
+        # outputs make the Responses API reject the request with a 400
+        # "No tool call found for function call output with call_id ...".
+        emitted_call_ids: set = set()
         for msg in messages:
             role = msg.get("role", "")
             if role in ("system", "developer"):
-                content = msg.get("content", "")
+                content = self._normalise_instruction_content(msg.get("content", ""))
                 if instructions is None:
                     instructions = content
                 else:
-                    instructions += "\n" + content
+                    instructions = instructions + "\n" + content
             else:
                 # Handle Chat Completions → Responses API format transforms
                 if role == "assistant" and msg.get("tool_calls"):
                     content = msg.get("content")
-                    if content and content.strip():
+                    if isinstance(content, list):
+                        converted = self._build_responses_content(content)
+                        if converted:
+                            input_items.append({"role": "assistant", "content": converted})
+                    elif content and content.strip():
                         input_items.append({"role": "assistant", "content": content})
                     for tc in msg["tool_calls"]:
-                        fn = tc.get("function", tc) if isinstance(tc, dict) else tc
+                        fn = tc.get("function", tc) if isinstance(tc, dict) else getattr(tc, "function", tc)
                         fn_name = fn.get("name", "") if isinstance(fn, dict) else getattr(fn, "name", "")
                         fn_args = fn.get("arguments", "{}") if isinstance(fn, dict) else getattr(fn, "arguments", "{}")
                         tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
                         # Skip items with empty name — API rejects them
                         if not fn_name:
                             continue
+                        if tc_id:
+                            emitted_call_ids.add(tc_id)
                         input_items.append({
                             "type": "function_call",
                             "call_id": tc_id,
@@ -775,9 +947,15 @@ class OpenAIClient:
                             "arguments": fn_args if isinstance(fn_args, str) else json.dumps(fn_args),
                         })
                 elif role == "tool":
+                    call_id = msg.get("tool_call_id", "")
+                    # Drop orphan outputs whose call_id has no matching
+                    # function_call in this payload; the Responses API 400s on
+                    # them and forces an unnecessary Chat Completions fallback.
+                    if not call_id or call_id not in emitted_call_ids:
+                        continue
                     input_items.append({
                         "type": "function_call_output",
-                        "call_id": msg.get("tool_call_id", ""),
+                        "call_id": call_id,
                         "output": msg.get("content", ""),
                     })
                 else:
@@ -817,7 +995,16 @@ class OpenAIClient:
 
         # ── Scalar params ────────────────────────────────────────────────
         if temperature is not None:
-            params["temperature"] = temperature
+            from .model_capabilities import is_reasoning_model
+            # Reasoning models reject sampling params (#6128).
+            if not is_reasoning_model(model):
+                params["temperature"] = temperature
+
+        # Chat Completions takes ``reasoning_effort``; the Responses API takes
+        # the same level as ``reasoning: {"effort": ...}``.
+        reasoning_effort = kwargs.get("reasoning_effort")
+        if reasoning_effort:
+            params["reasoning"] = {"effort": reasoning_effort}
 
         return params
 
@@ -841,6 +1028,42 @@ class OpenAIClient:
             raise ValueError(f"Unsupported local image type: {image_path}")
         encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
+
+    @staticmethod
+    def _normalise_instruction_content(content: Any) -> str:
+        """Normalise system/developer content into a plain instruction string.
+
+        Accepts a plain string or a Chat Completions-style list of text parts
+        (``[{"type": "text", "text": "..."}]`` or ``input_text``) and returns
+        the concatenated text. Non-text parts are rejected explicitly rather
+        than silently discarded. The caller-owned content is never mutated.
+        """
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts: List[str] = []
+            for part in content:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") in ("text", "input_text")
+                    and isinstance(part.get("text"), str)
+                ):
+                    texts.append(part["text"])
+                else:
+                    raise ValueError(
+                        "Unsupported system/developer instruction: "
+                        "System/developer instructions must contain text parts; "
+                        f"unsupported content part: {part!r}. Only plain strings "
+                        "or text parts ({'type': 'text', 'text': ...}) are supported."
+                    )
+            return "\n".join(texts)
+        raise ValueError(
+            "Unsupported system/developer instruction: "
+            "System/developer instructions must be text or a list of text parts; "
+            f"unsupported content: {content!r}"
+        )
 
     @classmethod
     def _build_responses_content(cls, content: Any) -> Any:
@@ -1140,7 +1363,7 @@ class OpenAIClient:
                         if response_text:
                             stream_callback(StreamEvent(
                                 type=StreamEventType.FIRST_TOKEN,
-                                timestamp=now, content=response_text[:50]
+                                timestamp=now, content=response_text
                             ))
                             stream_callback(StreamEvent(
                                 type=StreamEventType.LAST_TOKEN,
@@ -1168,7 +1391,7 @@ class OpenAIClient:
             # stream_options so we never clobber an explicit choice.
             stream_options = kwargs.pop("stream_options", {"include_usage": True})
             # Create the response stream
-            response_stream = self.sync_client.chat.completions.create(
+            response_stream = self.sync_client.chat.completions.create(**_normalize_chat_params(dict(
                 model=model,
                 messages=messages,
                 temperature=temperature,
@@ -1176,7 +1399,7 @@ class OpenAIClient:
                 stream=True,
                 stream_options=stream_options,
                 **kwargs
-            )
+            )))
             
             # Emit HEADERS_RECEIVED event (stream object created means headers received)
             if _emit:
@@ -1250,20 +1473,21 @@ class OpenAIClient:
                                     }
                                 ))
                         
-                        # Update live display with reasoning content if enabled
-                        if reasoning_steps and hasattr(chunk.choices[0].delta, "reasoning_content"):
-                            rc = chunk.choices[0].delta.reasoning_content
-                            if rc:
+                        # Reasoning deltas are always emitted as StreamEvents
+                        # (is_reasoning=True, as on the LiteLLM path); the live
+                        # display shows them only with reasoning_steps.
+                        rc = _delta_reasoning(chunk)
+                        if rc:
+                            if _emit:
+                                stream_callback(StreamEvent(
+                                    type=StreamEventType.DELTA_TEXT,
+                                    timestamp=time.perf_counter(),
+                                    content=rc,
+                                    is_reasoning=True
+                                ))
+                            if reasoning_steps:
                                 reasoning_content += rc
                                 live.update(display_fn(f"{full_response_text}\n[Reasoning: {reasoning_content}]", start_time))
-                                # Emit reasoning content as StreamEvent with is_reasoning=True
-                                if _emit:
-                                    stream_callback(StreamEvent(
-                                        type=StreamEventType.DELTA_TEXT,
-                                        timestamp=time.perf_counter(),
-                                        content=rc,
-                                        is_reasoning=True
-                                    ))
                 
                 # Clear the last generating display with a blank line
                 console.print()
@@ -1271,6 +1495,15 @@ class OpenAIClient:
                 # Just collect chunks without display, but still emit events
                 for chunk in response_stream:
                     chunks.append(chunk)
+
+                    rc = _delta_reasoning(chunk) if _emit else None
+                    if rc:
+                        stream_callback(StreamEvent(
+                            type=StreamEventType.DELTA_TEXT,
+                            timestamp=time.perf_counter(),
+                            content=rc,
+                            is_reasoning=True
+                        ))
                     
                     if chunk.choices and chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
@@ -1421,7 +1654,7 @@ class OpenAIClient:
                         if response_text:
                             await _emit_event(StreamEvent(
                                 type=StreamEventType.FIRST_TOKEN,
-                                timestamp=now, content=response_text[:50]
+                                timestamp=now, content=response_text
                             ))
                             await _emit_event(StreamEvent(
                                 type=StreamEventType.LAST_TOKEN,
@@ -1449,7 +1682,7 @@ class OpenAIClient:
             # stream_options so we never clobber an explicit choice.
             stream_options = kwargs.pop("stream_options", {"include_usage": True})
             # Create the response stream
-            response_stream = await self.async_client.chat.completions.create(
+            response_stream = await self.async_client.chat.completions.create(**_normalize_chat_params(dict(
                 model=model,
                 messages=messages,
                 temperature=temperature,
@@ -1457,7 +1690,7 @@ class OpenAIClient:
                 stream=True,
                 stream_options=stream_options,
                 **kwargs
-            )
+            )))
             
             # Emit HEADERS_RECEIVED event
             if _emit:
@@ -1531,20 +1764,21 @@ class OpenAIClient:
                                     }
                                 ))
                         
-                        # Update live display with reasoning content if enabled
-                        if reasoning_steps and hasattr(chunk.choices[0].delta, "reasoning_content"):
-                            rc = chunk.choices[0].delta.reasoning_content
-                            if rc:
+                        # Reasoning deltas are always emitted as StreamEvents
+                        # (is_reasoning=True, as on the LiteLLM path); the live
+                        # display shows them only with reasoning_steps.
+                        rc = _delta_reasoning(chunk)
+                        if rc:
+                            if _emit:
+                                await emit_event(StreamEvent(
+                                    type=StreamEventType.DELTA_TEXT,
+                                    timestamp=time.perf_counter(),
+                                    content=rc,
+                                    is_reasoning=True
+                                ))
+                            if reasoning_steps:
                                 reasoning_content += rc
                                 live.update(display_fn(f"{full_response_text}\n[Reasoning: {reasoning_content}]", start_time))
-                                # Emit reasoning content as StreamEvent with is_reasoning=True
-                                if _emit:
-                                    stream_callback(StreamEvent(
-                                        type=StreamEventType.DELTA_TEXT,
-                                        timestamp=time.perf_counter(),
-                                        content=rc,
-                                        is_reasoning=True
-                                    ))
                 
                 # Clear the last generating display with a blank line
                 console.print()
@@ -1552,6 +1786,15 @@ class OpenAIClient:
                 # Just collect chunks without display
                 async for chunk in response_stream:
                     chunks.append(chunk)
+
+                    rc = _delta_reasoning(chunk) if _emit else None
+                    if rc:
+                        await emit_event(StreamEvent(
+                            type=StreamEventType.DELTA_TEXT,
+                            timestamp=time.perf_counter(),
+                            content=rc,
+                            is_reasoning=True
+                        ))
                     
                     if _emit and chunk.choices and chunk.choices[0].delta.content:
                         content = chunk.choices[0].delta.content
@@ -1744,7 +1987,7 @@ class OpenAIClient:
                 params["tool_choice"] = tool_choice
         
         try:
-            return self.sync_client.chat.completions.create(**params)
+            return self.sync_client.chat.completions.create(**_normalize_chat_params(params))
         except Exception as e:
             self.logger.error(f"Error creating completion: {e}")
             raise
@@ -1812,7 +2055,7 @@ class OpenAIClient:
                 params["tool_choice"] = tool_choice
         
         try:
-            return await self.async_client.chat.completions.create(**params)
+            return await self.async_client.chat.completions.create(**_normalize_chat_params(params))
         except Exception as e:
             self.logger.error(f"Error creating async completion: {e}")
             raise
@@ -1869,6 +2112,8 @@ class OpenAIClient:
         # path so /stop and live steering work on the OpenAI-native loop too.
         cancel_token = kwargs.pop("cancel_token", None)
         steering_drain = kwargs.pop("steering_drain", None)
+        # Bounded auto-continuation on output-token truncation (True/False/int cap).
+        output_continuation = kwargs.pop("output_continuation", True)
         # Durable sink for deferred tool re-injection: the caller's persistent
         # conversation history (e.g. the agent's ``chat_history``). Background
         # jobs usually complete after this loop returns, so late results must
@@ -1902,6 +2147,9 @@ class OpenAIClient:
         # truncation (unified with the LiteLLM path). "completed" by default.
         self._last_stop_reason = "completed"
         _wrapup_injected = False
+        from ._continuation import OutputContinuation, is_structured
+        # Schema-enforced output cannot be continued as a text suffix.
+        _continuation = OutputContinuation(False if is_structured(kwargs.get("response_format")) else output_continuation)
         # Ensure a defined return value even if cancellation breaks the loop
         # before any model call is made.
         final_response = None
@@ -1910,6 +2158,9 @@ class OpenAIClient:
             # G2: Check for cancellation at the top of each tool iteration.
             if _is_cancelled():
                 self._last_stop_reason = "cancelled"
+                if _continuation.text and final_response is not None:
+                    # Return every truncated piece gathered so far, not just the last.
+                    final_response.choices[0].message.content = _continuation.text
                 break
             # G2: Mid-run steering - inject pending steering notes before next call.
             _inject_steering(messages)
@@ -2128,7 +2379,7 @@ class OpenAIClient:
                         history_sink=deferred_history_sink,
                     )
                     try:
-                        results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
+                        results_str = json.dumps(tool_result) if tool_result is not None else "Function returned an empty output"
                     except (TypeError, ValueError):
                         tool_result = {"result": str(tool_result)}
                         results_str = json.dumps(tool_result)
@@ -2166,7 +2417,17 @@ class OpenAIClient:
                 if iteration_count >= max_iterations:
                     self._last_stop_reason = "max_steps"
             else:
-                # No tool calls, we're done
+                # No tool calls, we're done -- unless the output-token limit cut
+                # the answer off, in which case ask the model to continue (bounded).
+                from ..agent.run_outcome import classify_finish_reason
+                _choice = final_response.choices[0]
+                _truncated = classify_finish_reason(getattr(_choice, "finish_reason", None)) == "length_truncated"
+                if _continuation.take(messages, _choice.message.content, _truncated):
+                    continue
+                if _continuation.text:
+                    _choice.message.content = _continuation.stitch(_choice.message.content)
+                if _truncated and _choice.message.content and self._last_stop_reason == "completed":
+                    self._last_stop_reason = "length_truncated"
                 break
 
         # Usage is recorded per iteration inside the loop above so every billed
@@ -2219,8 +2480,13 @@ class OpenAIClient:
         # path so /stop and live steering work on the OpenAI-native loop too.
         cancel_token = kwargs.pop("cancel_token", None)
         steering_drain = kwargs.pop("steering_drain", None)
+        # Bounded auto-continuation on output-token truncation (True/False/int cap).
+        output_continuation = kwargs.pop("output_continuation", True)
         # Durable sink for deferred tool re-injection (see sync counterpart).
         deferred_history_sink = kwargs.pop("deferred_history_sink", None)
+        # Opt-in concurrent execution of a batch of tool calls
+        # (ExecutionConfig.parallel_tool_calls); a loop setting, not an API param.
+        parallel_tool_calls = bool(kwargs.pop("parallel_tool_calls", False))
 
         def _is_cancelled() -> bool:
             return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
@@ -2248,6 +2514,9 @@ class OpenAIClient:
         # Structured stop reason (unified with the sync/LiteLLM paths).
         self._last_stop_reason = "completed"
         _wrapup_injected = False
+        from ._continuation import OutputContinuation, is_structured
+        # Schema-enforced output cannot be continued as a text suffix.
+        _continuation = OutputContinuation(False if is_structured(kwargs.get("response_format")) else output_continuation)
         # Ensure a defined return value even if cancellation breaks the loop
         # before any model call is made.
         final_response = None
@@ -2256,6 +2525,9 @@ class OpenAIClient:
             # G2: Check for cancellation at the top of each tool iteration.
             if _is_cancelled():
                 self._last_stop_reason = "cancelled"
+                if _continuation.text and final_response is not None:
+                    # Return every truncated piece gathered so far, not just the last.
+                    final_response.choices[0].message.content = _continuation.text
                 break
             # G2: Mid-run steering - inject pending steering notes before next call.
             _inject_steering(messages)
@@ -2436,12 +2708,60 @@ class OpenAIClient:
                 # Collect media-bearing follow-ups to flush after all tool
                 # replies for this turn (keeps tool replies consecutive).
                 _deferred_media_followups = []
-                for tool_call in tool_calls:
-                    # Handle both ToolCall dataclass and OpenAI object.
-                    # Guard the parse itself so malformed/truncated argument
-                    # JSON is reported back to the model instead of aborting
-                    # the whole run (matches chat_completion_with_tools_stream).
-                    function_name, arguments, _tool_call_id, err = _extract_tool_call_name_and_args(tool_call)
+                # Handle both ToolCall dataclass and OpenAI object.
+                # Guard the parse itself so malformed/truncated argument
+                # JSON is reported back to the model instead of aborting
+                # the whole run (matches chat_completion_with_tools_stream).
+                _parsed = [(tc, *_extract_tool_call_name_and_args(tc)) for tc in tool_calls]
+                _specs = [(n, a, t) for _, n, a, t, e in _parsed if e is None]
+
+                async def _arun_tool(name, args, tcid, _iteration=iteration_count):
+                    # Always trigger callback for tool call tracking (even when verbose=False)
+                    _get_display_tool_call()(f"Calling function: {name}", console=console if verbose else None)
+                    if verbose and console:
+                        console.print(f"[dim]Arguments:[/dim] {args}")
+                    # Execute the tool (async) - pass tool_call_id for event correlation.
+                    # Capture failures and report them back to the model instead of
+                    # aborting the whole run (safe-by-default, matching the streaming
+                    # path chat_completion_with_tools_stream).
+                    _kw = _durable_iteration_kwargs(execute_tool_fn, _iteration)
+                    try:
+                        if asyncio.iscoroutinefunction(execute_tool_fn):
+                            return await execute_tool_fn(name, args, tool_call_id=tcid, **_kw)
+                        # Run sync function in executor (preserve ContextVars e.g. SessionContext)
+                        from ..trace.context_events import copy_context_to_callable
+                        return await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            copy_context_to_callable(
+                                lambda: execute_tool_fn(name, args, tool_call_id=tcid, **_kw)
+                            ),
+                        )
+                    except ToolExecutionError:
+                        raise
+                    except Exception as tool_error:
+                        logging.warning(f"Tool '{name}' failed: {tool_error}")
+                        return {"error": str(tool_error)}
+
+                if _native_batch_parallel_ok(parallel_tool_calls, _specs):
+                    _sem = asyncio.Semaphore(_NATIVE_PARALLEL_TOOL_WORKERS)
+
+                    async def _bounded(spec):
+                        # Hold ToolExecutionError so every sibling finishes and
+                        # its (deferred) result is registered before re-raising.
+                        async with _sem:
+                            try:
+                                return await _arun_tool(*spec)
+                            except ToolExecutionError as exc:
+                                return exc
+
+                    _results = iter(await asyncio.gather(*(_bounded(s) for s in _specs)))
+                else:
+                    # Sequential: run each call in the loop below so it registers
+                    # any deferred result before the next one starts.
+                    _results = None
+                _batch_error = None
+
+                for tool_call, function_name, arguments, _tool_call_id, err in _parsed:
                     if err is not None:
                         logging.warning(f"Failed to parse tool call arguments: {err}")
                         messages.append({
@@ -2453,47 +2773,13 @@ class OpenAIClient:
                     
                     # Always trigger callback for tool call tracking (even when verbose=False)
                     display_tool_call_fn = _get_display_tool_call()
-                    display_tool_call_fn(f"Calling function: {function_name}", console=console if verbose else None)
-                    
-                    if verbose and console:
-                        console.print(f"[dim]Arguments:[/dim] {arguments}")
-                    
-                    # Execute the tool (async) - pass tool_call_id for event correlation.
-                    # Capture failures and report them back to the model instead of
-                    # aborting the whole run (safe-by-default, matching the streaming
-                    # path chat_completion_with_tools_stream).
-                    try:
-                        if asyncio.iscoroutinefunction(execute_tool_fn):
-                            tool_result = await execute_tool_fn(
-                                function_name,
-                                arguments,
-                                tool_call_id=_tool_call_id,
-                                **_durable_iteration_kwargs(
-                                    execute_tool_fn, iteration_count
-                                ),
-                            )
-                        else:
-                            # Run sync function in executor (preserve ContextVars e.g. SessionContext)
-                            loop = asyncio.get_running_loop()
-                            from ..trace.context_events import copy_context_to_callable
-                            tool_result = await loop.run_in_executor(
-                                None,
-                                copy_context_to_callable(
-                                    lambda fn=function_name, args=arguments, tcid=_tool_call_id: execute_tool_fn(
-                                        fn,
-                                        args,
-                                        tool_call_id=tcid,
-                                        **_durable_iteration_kwargs(
-                                            execute_tool_fn, iteration_count
-                                        ),
-                                    )
-                                ),
-                            )
-                    except ToolExecutionError:
-                        raise
-                    except Exception as tool_error:
-                        logging.warning(f"Tool '{function_name}' failed: {tool_error}")
-                        tool_result = {"error": str(tool_error)}
+                    tool_result = (
+                        next(_results) if _results is not None
+                        else await _arun_tool(function_name, arguments, _tool_call_id)
+                    )
+                    if isinstance(tool_result, ToolExecutionError):
+                        _batch_error = _batch_error or tool_result
+                        continue
 
                     # Parity with the LiteLLM loop: register a deferred handle so
                     # its eventual background value is re-injected, not lost.
@@ -2502,7 +2788,7 @@ class OpenAIClient:
                         history_sink=deferred_history_sink,
                     )
                     try:
-                        results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
+                        results_str = json.dumps(tool_result) if tool_result is not None else "Function returned an empty output"
                     except (TypeError, ValueError):
                         tool_result = {"result": str(tool_result)}
                         results_str = json.dumps(tool_result)
@@ -2522,6 +2808,8 @@ class OpenAIClient:
                             "content": results_str
                         })
 
+                if _batch_error is not None:
+                    raise _batch_error
                 if _deferred_media_followups:
                     messages.extend(_deferred_media_followups)
                 
@@ -2532,7 +2820,17 @@ class OpenAIClient:
                 if iteration_count >= max_iterations:
                     self._last_stop_reason = "max_steps"
             else:
-                # No tool calls, we're done
+                # No tool calls, we're done -- unless the output-token limit cut
+                # the answer off, in which case ask the model to continue (bounded).
+                from ..agent.run_outcome import classify_finish_reason
+                _choice = final_response.choices[0]
+                _truncated = classify_finish_reason(getattr(_choice, "finish_reason", None)) == "length_truncated"
+                if _continuation.take(messages, _choice.message.content, _truncated):
+                    continue
+                if _continuation.text:
+                    _choice.message.content = _continuation.stitch(_choice.message.content)
+                if _truncated and _choice.message.content and self._last_stop_reason == "completed":
+                    self._last_stop_reason = "length_truncated"
                 break
 
         # Usage is recorded per iteration inside the loop above so every billed
@@ -2597,14 +2895,14 @@ class OpenAIClient:
         while iteration_count < max_iterations:
             try:
                 # Create streaming response
-                response_stream = self.sync_client.chat.completions.create(
+                response_stream = self.sync_client.chat.completions.create(**_normalize_chat_params(dict(
                     model=model,
                     messages=messages,
                     temperature=temperature,
                     tools=formatted_tools if formatted_tools else None,
                     stream=True,
                     **kwargs
-                )
+                )))
                 
                 full_response_text = ""
                 reasoning_content = ""
@@ -2731,7 +3029,7 @@ class OpenAIClient:
                         # sync/async non-streaming loops' (TypeError, ValueError)
                         # fallback.
                         try:
-                            results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
+                            results_str = json.dumps(tool_result) if tool_result is not None else "Function returned an empty output"
                         except (TypeError, ValueError):
                             tool_result = {"result": str(tool_result)}
                             results_str = json.dumps(tool_result)
@@ -2842,9 +3140,11 @@ class OpenAIClient:
         """Close the OpenAI clients."""
         if self._sync_client and hasattr(self._sync_client, 'close'):
             self._sync_client.close()
-        if self._async_client and hasattr(self._async_client, 'close'):
-            self._async_client.close()
-    
+        # AsyncOpenAI.close() is a coroutine and cannot be awaited here; calling
+        # it only produced a never-awaited coroutine. Drop the reference so the
+        # client is not reused after close (use ``aclose()`` for async teardown).
+        self._async_client = None
+
     async def aclose(self):
         """Asynchronously close the OpenAI clients."""
         if self._sync_client and hasattr(self._sync_client, 'close'):
@@ -2887,7 +3187,7 @@ def get_openai_client(api_key: Optional[str] = None, base_url: Optional[str] = N
                 normalized_max_retries = int(_env_retries)
             except (TypeError, ValueError):
                 normalized_max_retries = None
-    current_params = (normalized_api_key, normalized_base_url, normalized_max_retries)
+    current_params = (normalized_api_key, normalized_base_url, normalized_max_retries, _env_timeout())
     
     # Thread-safe client creation
     with _global_client_lock:

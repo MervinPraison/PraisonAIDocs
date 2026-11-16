@@ -10,6 +10,7 @@ and direct integration with PraisonAI's features.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from .base import BaseFrameworkAdapter
@@ -159,6 +160,7 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
     SUPPORTS_RUNTIME_FEATURES = True
     SUPPORTS_SESSION_CONTINUITY = True
     SUPPORTS_STREAM_BRIDGE = True
+    SUPPORTS_CORE_TOOL_TIMEOUT = True
 
     @property
     def name(self) -> str:
@@ -297,15 +299,18 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 # Check if permissions are specified inline
                 permissions = approval_config.get('permissions')
                 if permissions:
-                    # Create backend with permissions
-                    backend = InteractiveCLIApprovalBackend(
-                        permissions_config=permissions
-                    )
-                    return ApprovalConfig(
-                        backend=backend,
-                        all_tools=approval_config.get('all_tools', False),
-                        timeout=approval_config.get('timeout', 0),
-                        permissions=permissions,
+                    from praisonai_code.cli.features._approval_bridge import resolve_approval_config
+
+                    # Use the same backend/mode precedence as direct CLI runs.
+                    return resolve_approval_config(
+                        approval_config.get('backend') or 'console',
+                        all_tools=approval_config.get('all_tools', approval_config.get('approve_all_tools', False)),
+                        timeout=(
+                            'none'
+                            if 'timeout' in approval_config and approval_config['timeout'] is None
+                            else approval_config.get('timeout')
+                        ),
+                        permissions_config=permissions,
                     )
                 # Otherwise map the wrapper approval dict onto the core
                 # ApprovalConfig fields. The wrapper spec carries extra keys
@@ -657,6 +662,10 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                     # consistently with the CrewAI adapter.
                     if task_spec.tools:
                         task_kwargs['tools'] = task_spec.tools
+                    output_file = task_spec.extras.get('output_file')
+                    if output_file:
+                        task_kwargs['output_file'] = output_file
+                        task_kwargs['create_directory'] = bool(os.path.dirname(output_file))
                     task = PraisonTask(**task_kwargs)
                     
                     if task_callback:
@@ -983,12 +992,25 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 else:
                     logger.info(f"No prior state for session: {resume_session}")
 
+            # ``praisonai replay rerun``: restore recorded tasks before NODE and
+            # reset the rest (no-op unless a re-run is in progress).
+            from praisonai.replay._hook import apply_rerun_seed
+            apply_rerun_seed(team)
+
             # Bridge the team's aggregate per-step events onto the CLI
             # structured output stream so `--output stream-json` on a YAML/team
             # run emits the same per-agent NDJSON events as a single-agent run.
             # Best-effort and a no-op outside stream-json (the bridge guards on
             # its own `active`), so serve/jobs and non-CLI callers are unaffected.
             bridge, _ = self._attach_stream_bridge(team)
+            cli = cli_config or {}
+            want_metrics = cli.get('metrics') or cli.get('metrics_json')
+            metrics = None
+            if want_metrics:
+                from . import _run_metrics
+                metrics = _run_metrics.RunMetrics(team)
+            # Only --trust runs check output_file writes; skip the read-back otherwise.
+            written = self._track_output_files(team) if cli.get('trust') else set()
             try:
                 # Use native async path
                 response = await team.astart()
@@ -1005,9 +1027,15 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 raise
             finally:
                 self._detach_stream_bridge(team, bridge)
+                if metrics is not None:
+                    metrics.close()
             result = f"### PraisonAI Output ###\n{response}" if response else "### PraisonAI Output ###\nTask completed."
+            failure = self._run_failure(response, tasks, written, check_files=cli.get('trust'))
             if bridge is not None:
-                bridge.emit_run_result(response, ok=True)
+                if failure:
+                    bridge.emit_run_error(failure)
+                else:
+                    bridge.emit_run_result(response, ok=True)
 
             # Persist team state after kickoff so the run can be resumed later
             # (respects --no-save, which leaves auto_save unset).
@@ -1022,6 +1050,18 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 except Exception as e:  # never fail a completed run on save
                     logger.warning(f"Failed to save session state '{auto_save}': {e}")
 
+            if metrics is not None:
+                report = metrics.report(model_name)
+                if cli.get('metrics'):
+                    _run_metrics.print_table(report)
+                if cli.get('metrics_json'):
+                    _run_metrics.print_json(report)
+
+            if failure:
+                # Surface failed runs as errors so the CLI exits non-zero
+                # instead of printing the status dict and exiting 0.
+                raise RuntimeError(failure)
+
             logger.info("PraisonAI async execution completed")
             return result
         finally:
@@ -1033,6 +1073,61 @@ class PraisonAIAdapter(BaseFrameworkAdapter):
                 except Exception as e:
                     logger.error(f"Error stopping InteractiveRuntime: {e}")
     
+    @staticmethod
+    def _track_output_files(team) -> set:
+        """Record the ``output_file`` paths core actually wrote during this run.
+
+        Core's ``save_output_to_file`` only logs write errors, so wrap it on the
+        instance and verify the file now holds this run's output. A stale file
+        from an earlier run therefore never passes as written.
+        """
+        written: set = set()
+        original = team.save_output_to_file
+
+        def save_output_to_file(task, task_output):
+            original(task, task_output)
+            path = getattr(task, 'output_file', None)
+            if not path:
+                return
+            # Read without newline translation: core writes in text mode, so
+            # only os.linesep translation may differ from str(task_output).
+            expected = str(task_output)
+            try:
+                with open(path, newline='') as f:
+                    if f.read() in (expected, expected.replace('\n', os.linesep)):
+                        written.add(path)
+            except OSError:
+                pass
+
+        team.save_output_to_file = save_output_to_file
+        return written
+
+    @staticmethod
+    def _run_failure(response, tasks, written, *, check_files=False) -> Optional[str]:
+        """Return an error message when the team run failed, else ``None``.
+
+        A task counts as failed when its final status is ``failed`` — this
+        holds even when ``AgentTeam.astart`` returns a later task's text rather
+        than its status dict. With ``check_files`` (headless ``--trust`` runs)
+        a declared ``output_file`` not written this run also counts, since core
+        only logs that write error.
+        """
+        statuses = [getattr(t, 'status', None) for t in tasks]
+        if isinstance(response, dict):
+            statuses = list((response.get('task_status') or {}).values()) or statuses
+        failed = statuses.count('failed')
+        if failed:
+            return f"{failed} of {len(statuses)} task(s) failed"
+        if check_files:
+            # Only completed tasks: skipped workflow branches never write.
+            missing = [
+                t.output_file for t in tasks
+                if t.output_file and t.status == 'completed' and t.output_file not in written
+            ]
+            if missing:
+                return f"output_file not written: {', '.join(missing)}"
+        return None
+
     @staticmethod
     def _attach_stream_bridge(team):
         """Attach the CLI stream-json bridge to a team's aggregate emitter.

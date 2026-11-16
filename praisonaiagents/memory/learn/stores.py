@@ -13,7 +13,8 @@ Each store handles a specific type of learning data:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -30,8 +31,8 @@ class LearnEntry:
     id: str
     content: str
     metadata: Dict[str, Any] = field(default_factory=dict)
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     use_count: int = 0
     last_used: Optional[str] = None
     
@@ -52,8 +53,8 @@ class LearnEntry:
             id=data["id"],
             content=data["content"],
             metadata=data.get("metadata", {}),
-            created_at=data.get("created_at", datetime.utcnow().isoformat()),
-            updated_at=data.get("updated_at", datetime.utcnow().isoformat()),
+            created_at=data.get("created_at", datetime.now(timezone.utc).isoformat()),
+            updated_at=data.get("updated_at", datetime.now(timezone.utc).isoformat()),
             use_count=data.get("use_count", 0),
             last_used=data.get("last_used"),
         )
@@ -125,9 +126,9 @@ class BaseStore(ABC):
         ensure_dir(base)
         return str(base / f"{self.store_name}.json")
     
-    def _load(self) -> None:
+    def _load(self, *, strict: bool = False) -> None:
         """Load entries from storage using BaseJSONStore."""
-        data = self._store.load()
+        data = self._store._load_strict() if strict else self._store.load()
         self._entries = {
             k: LearnEntry.from_dict(v) for k, v in data.items()
         }
@@ -145,7 +146,7 @@ class BaseStore(ABC):
         # Re-read the current on-disk state before mutating so a concurrent
         # writer sharing the same store (e.g. another agent with the same
         # user_id) isn't silently overwritten by this save.
-        self._load()
+        self._load(strict=True)
         # Deduplication: Check for exact content match
         content_normalized = content.strip().lower()
         for existing_entry in self._entries.values():
@@ -153,13 +154,13 @@ class BaseStore(ABC):
                 # Update metadata if provided, but don't create duplicate
                 if metadata:
                     existing_entry.metadata.update(metadata)
-                    existing_entry.updated_at = datetime.utcnow().isoformat()
+                    existing_entry.updated_at = datetime.now(timezone.utc).isoformat()
                     self._save()
                     self._was_updated = True
                 return existing_entry
         
         # No duplicate found, create new entry
-        entry_id = f"{self.store_name}_{len(self._entries)}_{datetime.utcnow().timestamp()}"
+        entry_id = f"{self.store_name}_{len(self._entries)}_{datetime.now(timezone.utc).timestamp()}"
         entry = LearnEntry(
             id=entry_id,
             content=content,
@@ -182,7 +183,7 @@ class BaseStore(ABC):
         """
         if not entries:
             return
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         for entry in entries:
             entry.use_count += 1
             entry.last_used = now
@@ -192,41 +193,65 @@ class BaseStore(ABC):
     def get(self, entry_id: str) -> Optional[LearnEntry]:
         """Get entry by ID."""
         return self._entries.get(entry_id)
+
+    def _refresh_for_retrieval(self) -> bool:
+        """Refresh before telemetry writes; use cached entries on backend outage."""
+        try:
+            self._load(strict=True)
+            return True
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            # Unreadable source: retain the cache without persisting telemetry.
+            refresh_error = exc
+        except (KeyError, TypeError, ValueError, AttributeError):
+            # Invalid records are data errors, not temporary backend outages.
+            raise
+        except Exception as exc:
+            refresh_error = exc
+        import logging
+        logging.warning("Failed to refresh learning store; using read-only cached entries: %s", refresh_error)
+        return False
     
     def search(self, query: str, limit: int = 10) -> List[LearnEntry]:
         """Simple text search (can be overridden for semantic search)."""
+        # Retrieval persists usage telemetry, so refresh before selecting entries.
+        refreshed = self._refresh_for_retrieval()
         query_lower = query.lower()
         results = [
             entry for entry in self._entries.values()
             if query_lower in entry.content.lower()
         ]
         results = results[:limit]
-        self._touch(results)
+        if refreshed:
+            self._touch(results)
         return results
     
     def list_all(self, limit: int = 100) -> List[LearnEntry]:
         """List all entries."""
+        refreshed = self._refresh_for_retrieval()
         entries = list(self._entries.values())
-        entries.sort(key=lambda x: x.updated_at, reverse=True)
+        entries.sort(key=lambda x: self._timestamp_sort_key(x.updated_at), reverse=True)
         entries = entries[:limit]
-        self._touch(entries)
+        if refreshed:
+            self._touch(entries)
         return entries
     
     def update(self, entry_id: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[LearnEntry]:
         """Update an existing entry."""
+        self._load(strict=True)
         if entry_id not in self._entries:
             return None
         entry = self._entries[entry_id]
         entry.content = content
         if metadata:
             entry.metadata.update(metadata)
-        entry.updated_at = datetime.utcnow().isoformat()
+        entry.updated_at = datetime.now(timezone.utc).isoformat()
         self._save()
         self._was_updated = True
         return entry
     
     def delete(self, entry_id: str) -> bool:
         """Delete an entry."""
+        self._load(strict=True)
         if entry_id in self._entries:
             del self._entries[entry_id]
             self._save()
@@ -256,18 +281,25 @@ class BaseStore(ABC):
         if not entries:
             return True
         try:
-            import json
+            from ...storage.base import FileLock
+            from ...utils.atomic_io import atomic_write_json, quarantine_corrupt_file
+
             archive_path = self._archive_path()
-            existing: List[Dict[str, Any]] = []
-            if archive_path.exists():
-                with open(archive_path, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-                if not isinstance(existing, list):
-                    existing = []
-            existing.extend(e.to_dict() for e in entries)
             archive_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(archive_path, "w", encoding="utf-8") as f:
-                json.dump(existing, f, ensure_ascii=False, indent=2)
+            with FileLock(archive_path, timeout=10):
+                existing: Any = []
+                if archive_path.exists():
+                    try:
+                        with open(archive_path, "r", encoding="utf-8") as f:
+                            existing = json.load(f)
+                    except (json.JSONDecodeError, ValueError):
+                        existing = None
+                    if not isinstance(existing, list):
+                        # Keep the bad bytes as a sidecar and keep evicting.
+                        quarantine_corrupt_file(str(archive_path))
+                        existing = []
+                existing.extend(e.to_dict() for e in entries)
+                atomic_write_json(str(archive_path), existing, ensure_ascii=False, indent=2)
             return True
         except Exception as e:
             import logging
@@ -283,9 +315,29 @@ class BaseStore(ABC):
             ref_dt = datetime.fromisoformat(reference)
         except (ValueError, TypeError):
             return False
+        if ref_dt.tzinfo is None:
+            ref_dt = ref_dt.replace(tzinfo=timezone.utc)
         age_days = (now - ref_dt).total_seconds() / 86400.0
         return age_days > self.retention_days
-    
+
+    @staticmethod
+    def _timestamp_sort_key(value: str) -> tuple:
+        """Comparable key that orders ISO timestamps chronologically in UTC.
+
+        Naive values are treated as UTC (matching how older stores were written).
+        Missing or unparseable values sort as the oldest instant, so prune()
+        evicts them first (an entry never used sorts before used ones, as it did
+        under the previous raw-string sort) and list_all() lists them last. A
+        datetime is never compared against a string, so mixed data never raises.
+        """
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (ValueError, TypeError):
+            return (-1, value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (0, parsed.astimezone(timezone.utc))
+
     def prune(self, save: bool = True, protect_id: Optional[str] = None) -> int:
         """Archive stale and least-used/oldest excess entries.
         
@@ -306,7 +358,7 @@ class BaseStore(ABC):
         if self.max_entries <= 0 and self.retention_days <= 0:
             return 0
         
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         evicted: List[LearnEntry] = []
         
         # 1. Staleness: archive entries beyond the retention window
@@ -324,7 +376,11 @@ class BaseStore(ABC):
             ]
             remaining = sorted(
                 candidates,
-                key=lambda e: (e.use_count, e.last_used or "", e.created_at),
+                key=lambda e: (
+                    e.use_count,
+                    self._timestamp_sort_key(e.last_used or ""),
+                    self._timestamp_sort_key(e.created_at),
+                ),
             )
             overflow = len(self._entries) - self.max_entries
             for entry in remaining[:overflow]:

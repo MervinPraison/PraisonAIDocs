@@ -282,9 +282,11 @@ class MemoryConfig:
     history: bool = False
     history_limit: int = 10
 
-    # Turn-start long-term memory retrieval. Disabled by default so existing
-    # agents incur no backend query or prompt changes.
-    prefetch: bool = False
+    # Turn-start long-term memory retrieval. None = auto: on for query-based
+    # backends (sqlite/chroma/mem0), whose system-prompt context is empty
+    # without a query; off for FileMemory, which injects recent items itself.
+    # True/False force it on/off.
+    prefetch: Optional[bool] = None
     prefetch_limit: int = 5
     prefetch_token_budget: int = 512
     
@@ -295,6 +297,29 @@ class MemoryConfig:
     def __post_init__(self):
         # Reject a backend we cannot provide instead of substituting another.
         self.backend = validate_memory_backend(self.backend)
+        # Fail fast on a non-adapter ``db``. The memory bridge drives this object
+        # through the ``DbAdapter`` lifecycle hooks
+        # (``on_agent_start``/``on_user_message``/``on_agent_message``). A bare
+        # path string or other non-adapter used to flow through, where each hook
+        # raised ``'str' object has no attribute 'on_agent_start'`` and was
+        # swallowed as a warning -- memory looked enabled while every message was
+        # silently dropped (Issue #5668). A valid ``db`` is a DbAdapter or a
+        # ``db(...)`` backend instance; both implement these hooks. Require the
+        # hooks themselves (callable), not a weaker signal like ``database_url``
+        # that a half-built object could expose while still dropping messages.
+        if self.db is not None and not all(
+            callable(getattr(self.db, hook, None))
+            for hook in ("on_agent_start", "on_user_message", "on_agent_message")
+        ):
+            raise TypeError(
+                "MemoryConfig.db must be a DbAdapter instance (e.g. db(...) / "
+                "db.SQLiteDB(path=...)) implementing the on_agent_start/"
+                "on_user_message/on_agent_message hooks, not "
+                f"{type(self.db).__name__}. For a SQLite file use "
+                'db(database_url="sqlite:///path/to.db") or '
+                'MemoryConfig(backend="sqlite", config={"short_db": "short.db", '
+                '"long_db": "long.db"}).'
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -567,8 +592,11 @@ class GuardrailConfig:
         # With validator function
         Agent(guardrails=my_validator_fn)
         
-        # With string preset
-        Agent(guardrails="strict")  # Uses strict preset
+        # With a string: an LLM-validation prompt (not a preset name)
+        Agent(guardrails="Ensure the response is polite")
+
+        # With a preset (sets max_retries only) plus a validator
+        Agent(guardrails=["strict", {"validator": my_validator_fn}])
 
         # For tool policy enforcement, use the dedicated `policy` param instead:
         Agent(policy=PolicyEngine(...))  # policy strings on guardrails are NOT enforced
@@ -577,7 +605,7 @@ class GuardrailConfig:
         Agent(guardrails=GuardrailConfig(
             validator=my_validator_fn,
             max_retries=3,
-            on_fail="retry",
+            on_fail="retry",  # only "retry" is implemented
         ))
         
         # With LLM-based validation
@@ -886,7 +914,8 @@ class ExecutionConfig:
     # ``rate_limiter`` explicitly for burst/TPM control (it takes precedence).
     max_rpm: Optional[int] = None
     
-    # Time limits
+    # Time limits: per-turn wall-clock seconds for the loop guard.
+    # None = loop-guard default (600s); 0 = no time limit.
     max_execution_time: Optional[int] = None
     
     # Retry settings
@@ -948,6 +977,11 @@ class ExecutionConfig:
     # in __post_init__) so the Agent can tell an explicit False from an omitted one
     # and reject a conflicting ToolConfig(parallel=True) instead of silently winning.
     parallel_tool_calls: Optional[bool] = None
+
+    # Auto-continue a final answer cut off by the output-token limit
+    # (finish_reason="length"): True = up to 3 continuations (default),
+    # False/0 = disabled (surface ``length_truncated`` immediately), int = cap.
+    output_continuation: Union[bool, int] = True
 
     # Durable tool-loop replay. Default-off keeps the execution hot path free
     # of journal construction and SQLite writes.
@@ -1078,6 +1112,7 @@ class ExecutionConfig:
             "compaction_strategy": self.compaction_strategy.value if self.compaction_strategy and hasattr(self.compaction_strategy, 'value') else (str(self.compaction_strategy) if self.compaction_strategy else None),
             "max_budget": self.max_budget,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "output_continuation": self.output_continuation,
             "durable": self.durable,
             "journal_path": self.journal_path,
             "resume_run_id": self.resume_run_id,
@@ -1123,6 +1158,7 @@ class ExecutionConfig:
             compaction_strategy=compaction_strategy,
             max_budget=data.get("max_budget", None),
             parallel_tool_calls=data.get("parallel_tool_calls", None),
+            output_continuation=data.get("output_continuation", True),
             durable=data.get("durable", False),
             journal_path=data.get("journal_path", None),
             resume_run_id=data.get("resume_run_id", None),
@@ -1818,30 +1854,6 @@ def resolve_autonomy(value: AutonomyParam) -> Optional["AutonomyConfig"]:
     return _resolve(value, AutonomyConfig)
 
 
-def resolve_tool_search(value: ToolSearchParam) -> Optional["ToolSearchConfig"]:
-    """
-    Resolve tool_search= parameter following precedence ladder.
-    
-    NOTE: This resolver has zero references in the codebase but is kept
-    for backward compatibility. Consider removing in a future version.
-    """
-    # Simple implementation since it's unused
-    if value is None or value is False:
-        return None
-    # Lazy-load ToolSearchConfig only when tool search is actually configured,
-    # so the tools subsystem is not imported on the `import Agent` path.
-    ToolSearchConfig = _resolve_tool_search_config()
-    if value is True:
-        return ToolSearchConfig()
-    if isinstance(value, str):
-        return ToolSearchConfig(enabled=value)
-    if isinstance(value, dict):
-        return ToolSearchConfig(**value)
-    if isinstance(value, ToolSearchConfig):
-        return value
-    return value
-
-
 def resolve_tools(value: ToolParam) -> Optional[ToolConfig]:
     """Resolve tools= parameter following precedence ladder."""
     if value is None or value is False:
@@ -2062,7 +2074,6 @@ __all__ = [
     "resolve_web",
     "resolve_caching",
     "resolve_autonomy",
-    "resolve_tool_search",
     "resolve_tools",
     "resolve_runtime",
     "canonical_runtime_name",

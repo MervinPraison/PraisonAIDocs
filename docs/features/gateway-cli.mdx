@@ -42,6 +42,10 @@ praisonai gateway start --config gateway.yaml
 ```
 
 <Tip>
+New to the gateway? Follow the [Golden Path](/features/golden-path) runbook — install to a live channel reply and a sandboxed command in under 30 minutes.
+</Tip>
+
+<Tip>
 **Even simpler:** if you have a platform token in the environment, you can skip the `channels:` block entirely. `export TELEGRAM_BOT_TOKEN=... && praisonai gateway` brings up a working bot with no config. See [Zero-Config Gateway](/features/gateway-auto-enable-from-env).
 </Tip>
 
@@ -169,6 +173,11 @@ graph TB
 | `praisonai gateway doctor` | Validate channel credentials **and route/binding targets** before start, run [plugin health checks](/features/gateway-doctor-plugins), and optionally auto-repair weak auth tokens (`--fix`) | `praisonai gateway doctor --config gateway.yaml --fix` |
 | `praisonai gateway test` | One-shot readiness (probes + shell wiring + optional turn) | `praisonai gateway test --config gateway.yaml` |
 | `praisonai gateway channels` | List configured channels (add `--probe` to check creds) | `praisonai gateway channels --probe` |
+| `praisonai gateway channels {add,update,disable,remove}` | Edit one channel in place (validated before writing) | `praisonai gateway channels add discord --set group_policy=mention_only` |
+
+<Tip>
+For the full per-channel lifecycle (Python helper, validation rules, legacy-config migration), see [Gateway Channel Lifecycle](/features/gateway-channels-lifecycle).
+</Tip>
 
 <Tip>
 `praisonai-bot gateway status` is safe to run on any platform. On Windows, if PID-lock inspection can't complete, the `/health` probe still runs and shows the authoritative gateway status. On POSIX, a foreign-uid gateway is now correctly reported as running (rather than being treated as dead) — see [PraisonAI #4197](https://github.com/MervinPraison/PraisonAI/pull/4197).
@@ -398,6 +407,91 @@ Examples:
   praisonai gateway status --port 9000
   praisonai gateway status --daemon-only
 ```
+
+#### What it reports
+
+`status` probes `/health` and `/info`, then reports reachability and whether your credential is accepted.
+
+| Line | Meaning |
+|------|---------|
+| `Access: authorized (scopes: read, write)` | `/info` returned 200; your token's operator scopes are listed |
+| `Access: credential refused (HTTP 403)` | The gateway answered 401/403 |
+| `Access: unknown (/info returned HTTP 500)` | No auth decision was made (timeout, 404, 5xx) |
+| `Next step: ...` | A follow-up action, when one applies |
+
+```text
+$ praisonai gateway status
+Gateway: reachable at http://127.0.0.1:8765
+  Access: authorized (scopes: read)
+  Next step: credential lacks operator write/admin scope; grant it via
+             gateway.auth_scopes in the gateway config
+```
+
+```text
+$ praisonai gateway status
+Gateway: reachable at http://127.0.0.1:8765
+  Access: credential refused (HTTP 403)
+  Next step: GATEWAY_AUTH_TOKEN was rejected; it does not match the
+             running gateway's auth token
+```
+
+```mermaid
+graph TB
+    Status[praisonai gateway status] --> Reach{/info reachable?}
+    Reach -->|No answer| Dead[Access omitted — reachable: false]
+    Reach -->|200 + scopes| Auth[Access: authorized]
+    Reach -->|401 / 403| Refused[Access: credential refused]
+    Reach -->|other 4xx/5xx| Unknown[Access: unknown]
+    Refused --> Host{Host loopback?}
+    Host -->|No| Remote[Next step: run on the gateway host]
+    Host -->|Yes + no token| NoTok[Next step: doctor --fix]
+    Host -->|Yes + wrong token| Reject[Next step: token rejected]
+
+    classDef cmd fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef gate fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef bad fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Status cmd
+    class Reach,Host gate
+    class Auth ok
+    class Dead,Unknown gate
+    class Refused,Remote,NoTok,Reject bad
+```
+
+#### JSON output
+
+`--json` adds an `access` block next to `reachable`.
+
+```json
+{
+  "reachable": true,
+  "access": {
+    "authorized": true,
+    "scopes": ["read", "write"]
+  }
+}
+```
+
+| Field | Type | When present | Meaning |
+|-------|------|--------------|---------|
+| `authorized` | `true` / `false` / `null` | Always, inside `access` | `true` → `/info` returned 200; `false` → 401/403; `null` → no auth decision (timeout, 404, 5xx) |
+| `scopes` | `list[str]` | `authorized` is `true` | Your token's effective operator scopes |
+| `http_status` | `int` / `null` | `authorized` is `false` or `null` | HTTP status `/info` returned, or `null` if nothing answered |
+| `next_step` | `str` | When a follow-up applies | Named action from the table below |
+
+`access` is omitted when `reachable` is `false`.
+
+| Situation | `next_step` |
+|-----------|-------------|
+| Authorized, but no `write` or `admin` scope | `credential lacks operator write/admin scope; grant it via gateway.auth_scopes in the gateway config` |
+| 401/403 on a non-loopback host | ``the CLI only sends GATEWAY_AUTH_TOKEN to loopback; run `praisonai gateway status` on the gateway host`` |
+| 401/403 on loopback, no token found | ``no GATEWAY_AUTH_TOKEN found; export it or run `praisonai gateway doctor --fix` `` |
+| 401/403 on loopback, token present | `GATEWAY_AUTH_TOKEN was rejected; it does not match the running gateway's auth token` |
+
+<Note>
+The CLI sends `GATEWAY_AUTH_TOKEN` only to `127.0.0.1`, `localhost`, or `::1`, so a 401 against a remote host is not a bad token. See [Operator Scopes](/features/gateway-operator-scopes#introspecting-your-own-scopes) and [`GET /info`](/features/gateway-api-endpoints#how-auth-works).
+</Note>
 </Tab>
 
 <Tab title="doctor">
@@ -548,19 +642,32 @@ Examples:
 
 <Tab title="channels">
 ```bash
-praisonai gateway channels [OPTIONS]
+praisonai gateway channels [OPTIONS] [SUBCOMMAND]
 
-Options:
+Options (list / probe when no subcommand is given):
   -c, --config TEXT   Path to gateway.yaml [default: gateway.yaml — resolves to
                       the onboarded ~/.praisonai/bot.yaml when present]
   --json              Output JSON format
   --probe             Probe each channel's credentials
+  --available         List all registered platforms
+
+Subcommands (edit one channel in place):
+  add <name>      [--platform P] [--token T] [--set k=v]...
+  update <name>   [--token T] [--set k=v]...
+  disable <name>
+  remove <name>
 
 Examples:
-  praisonai gateway channels
-  praisonai gateway channels --config my-gateway.yaml --json
-  praisonai gateway channels --probe
+  praisonai gateway channels                         # list
+  praisonai gateway channels --probe                 # list + credential probe
+  praisonai gateway channels add telegram            # token defaults to ${TELEGRAM_BOT_TOKEN}
+  praisonai gateway channels add discord --set group_policy=mention_only
+  praisonai gateway channels update telegram --token '${NEW_TOKEN}'
+  praisonai gateway channels disable slack           # keep config, stop serving
+  praisonai gateway channels remove slack            # delete the block
 ```
+
+See [Gateway Channel Lifecycle](/features/gateway-channels-lifecycle) for every option and validation rule.
 </Tab>
 
 <Tab title="pause">
@@ -1156,6 +1263,10 @@ graph LR
     class Fail bad
 ```
 
+<Note>
+Since [PR #5754](https://github.com/MervinPraison/PraisonAI/pull/5754), the pre-flight also catches typos in `tasks[*].tools` (earlier releases skipped task-level entries), and tools that live only in `tools.py`, `tools/`, or `.praisonai/tools/` no longer block start-up.
+</Note>
+
 ### Strict mode (default) — fail fast
 
 ```bash
@@ -1272,38 +1383,86 @@ The `doctor` verb uses a simpler `0` / `1` scheme (pass / fix-me) documented und
 
 ## Single-Instance Enforcement
 
-PraisonAI enforces a single gateway instance per host:port combination using PID locks.
+PraisonAI enforces two locks at gateway start: a **port lock** (one gateway per host:port) and a **state lock** (one gateway per shared state root, `~/.praisonai`). At most one gateway may own `~/.praisonai` at a time, whatever port it uses.
 
 ```mermaid
 graph TB
     Start[🚀 Gateway Start] --> PortCheck{🔍 Port Available?}
-    PortCheck -->|Yes| PIDLock{🔒 PID Lock?}
+    PortCheck -->|Yes| PIDLock{🔒 Port Lock?}
     PortCheck -->|No| Error1[❌ Port Error]
-    PIDLock -->|Acquired| Success[✅ Start Gateway]
+    PIDLock -->|Acquired| StateLock{🔒 State Lock?}
     PIDLock -->|Conflict| Error2[❌ Instance Error]
-    Error1 --> Stop1[💡 Use Different Port]
+    StateLock -->|Acquired| Success[✅ Start Gateway]
+    StateLock -->|Conflict| Error3[❌ State Owned]
+    Error1 --> Stop1[💡 Free the Port or Pick Another]
     Error2 --> Stop2[💡 Stop Existing Gateway]
-    
+    Error3 --> Stop3[💡 Isolated HOME + Port]
+
     classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
     classDef error fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef solution fill:#189AB4,stroke:#7C90A0,color:#fff
-    
+
     class Start start
-    class PortCheck,PIDLock check
+    class PortCheck,PIDLock,StateLock check
     class Success success
-    class Error1,Error2 error
-    class Stop1,Stop2 solution
+    class Error1,Error2,Error3 error
+    class Stop1,Stop2,Stop3 solution
 ```
 
-**Lock File Location:** `~/.praisonai/gateway-<safe_host>-<port>.pid`
+| Lock | File | Keyed on |
+|---|---|---|
+| Port lock | `~/.praisonai/gateway-<safe_host>-<port>.pid` | host + port |
+| State lock | `~/.praisonai/gateway.state.pid` | home root (`~/.praisonai`) |
 
-The `safe_host` replaces `:` and `.` with `_` (so `127.0.0.1` becomes `127_0_0_1`). Each host:port combination gets its own lock file, allowing multiple gateways on different ports.
+The `safe_host` replaces `:` and `.` with `_` (so `127.0.0.1` becomes `127_0_0_1`).
+
+### State lock file
+
+Two gateways on different ports that share `~/.praisonai` would poll the same bot tokens and write the same outbox, DLQ, pairing and hook stores. That causes Telegram 409 errors and duplicate delivery, so the second gateway is refused:
+
+```
+Error: another gateway already owns the state at /home/user/.praisonai (PID 12345 on 127.0.0.1:8765).
+
+  Two gateways sharing state poll the same bot tokens and write the same
+  queues, causing 409 Conflict errors and duplicate delivery.
+  Stop it:  praisonai gateway stop
+  Or run an isolated gateway with its own state and bot tokens:
+    HOME=/srv/gateway-b praisonai gateway start
+```
+
+- **Path:** `~/.praisonai/gateway.state.pid`, with a sidecar `gateway.state.pid.guard`.
+- **Keyed on the home root.** The state always lives at `~/.praisonai`. Changing `PRAISONAI_HOME` or the port does not move it, so a second gateway with only a different `PRAISONAI_HOME` or port is still refused.
+- **Held for the whole run.** Claimed right after the port lock — or, when starting from `gateway.yaml`, before channels start (before the inbound journal is replayed). Released only after channels stop; a failed start releases it so restarts are not blocked.
+- **Exclusive claim.** A POSIX `flock` on the `.guard` file serialises the check, and the lock is created with `os.link` (falling back to `O_EXCL`), so two simultaneous starts can never both win. The port lock uses the same claim.
+- **Stale reclaim.** Uses the same PID + start-time check as the port lock, so a lock left by a crashed gateway is reclaimed on the next start.
+- **Same-process safe.** Re-claiming from the same PID succeeds, so in-process restarts are not blocked.
+
+### Run a second, isolated gateway
+
+To run two gateways on one host, give the second one its own `HOME` (so its own `~/.praisonai` state), its own bot tokens and its own port:
+
+```bash
+# Shell 1 — default gateway
+praisonai gateway start
+
+# Shell 2 — isolated gateway with its own state and bot tokens
+HOME=/srv/gateway-b GATEWAY_PORT=8766 praisonai gateway start
+```
+
+<AccordionGroup>
+<Accordion title="I changed PRAISONAI_HOME but still get the state collision">
+`PRAISONAI_HOME` does not move the gateway state — the lock is keyed on `~/.praisonai`. Set `HOME=` instead.
+</Accordion>
+<Accordion title="Both isolated gateways still see 409 from Telegram">
+The state is isolated but both gateways use the same bot token. Each gateway needs its own bot and token.
+</Accordion>
+</AccordionGroup>
 
 ### PID-Lock Status Reference
 
-`praisonai gateway status` prints one PID-lock line before the `/health` probe. Look up any line you see:
+`praisonai gateway status` prints one PID-lock line for the **port lock** before the `/health` probe (the state lock is not shown). Look up any line you see:
 
 | Line printed | When |
 |---|---|

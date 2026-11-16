@@ -33,6 +33,8 @@ from praisonaiagents.bots import (
 
 from .media import split_media_from_output, is_audio_file
 from ._failure import failure_reply_text
+from ._group_policy import decide_group_admission, record_passive_group_message
+from praisonaiagents.bots.admission import MentionFacts
 from ._commands import (
     format_status, 
     format_help, 
@@ -498,6 +500,54 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
             logger.debug("Failed to update approval message: %s", e)
 
         return f"Approval {approval_id} {'resolved' if handled else 'unresolved'}"
+
+    async def _handle_callback_query(self, update: Any, context: Any) -> None:
+        """Dispatch an inline-button tap (interactive registry, then ``pair:``).
+
+        Shared by standalone :meth:`start` and the gateway's polling path so
+        both modes resolve pairing and tool-approval taps (Issue #6032).
+        """
+        query = update.callback_query
+        if not query or not query.data:
+            return
+
+        # Answer the callback query to stop loading spinner
+        await query.answer()
+
+        # Create interactive context
+        from praisonaiagents.bots import InteractiveContext
+        ctx = InteractiveContext(
+            callback_data=query.data,
+            user_id=str(query.from_user.id),
+            message_id=str(query.message.message_id) if query.message else None,
+            chat_id=str(query.message.chat_id) if query.message else None,
+            bot_adapter=self,
+            platform_data={
+                "update": update,
+                "context": context,
+                "query": query
+            }
+        )
+
+        # Try to dispatch through the interactive registry
+        handled = await self._interactive_registry.dispatch(ctx)
+
+        if not handled:
+            # Fallback: handle legacy pairing callbacks
+            if query.data.startswith("pair:"):
+                result = await self._pairing_callback_handler.handle_approval_callback(
+                    callback_data=query.data,
+                    owner_user_id=str(query.from_user.id),
+                    bot_adapter=self
+                )
+
+                # Update the message with result
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n{result.message}",
+                    parse_mode="Markdown"
+                )
+            else:
+                logger.debug(f"Unhandled callback: {query.data}")
 
     def register_approval_backend(self, backend, target: Optional[str] = None) -> None:
         """Wire a durable :class:`PresentationApprovalBackend` to this channel.
@@ -1409,50 +1459,7 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
         )
         
         # Add callback query handler for all interactive buttons
-        async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            query = update.callback_query
-            if not query or not query.data:
-                return
-            
-            # Answer the callback query to stop loading spinner
-            await query.answer()
-            
-            # Create interactive context
-            from praisonaiagents.bots import InteractiveContext
-            ctx = InteractiveContext(
-                callback_data=query.data,
-                user_id=str(query.from_user.id),
-                message_id=str(query.message.message_id) if query.message else None,
-                chat_id=str(query.message.chat_id) if query.message else None,
-                bot_adapter=self,
-                platform_data={
-                    "update": update,
-                    "context": context,
-                    "query": query
-                }
-            )
-            
-            # Try to dispatch through the interactive registry
-            handled = await self._interactive_registry.dispatch(ctx)
-            
-            if not handled:
-                # Fallback: handle legacy pairing callbacks
-                if query.data.startswith("pair:"):
-                    result = await self._pairing_callback_handler.handle_approval_callback(
-                        callback_data=query.data,
-                        owner_user_id=str(query.from_user.id),
-                        bot_adapter=self
-                    )
-                    
-                    # Update the message with result
-                    await query.edit_message_text(
-                        text=f"{query.message.text}\n\n{result.message}",
-                        parse_mode="Markdown"
-                    )
-                else:
-                    logger.debug(f"Unhandled callback: {query.data}")
-        
-        self._application.add_handler(CallbackQueryHandler(handle_callback_query))
+        self._application.add_handler(CallbackQueryHandler(self._handle_callback_query))
         
         # Add voice/audio handlers
         self._application.add_handler(
@@ -1524,6 +1531,7 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                         poll_interval=self.config.polling_interval,
                     )
                     self._monitor.record_success()
+                    self._is_running = True
                     
                     # Block until stop() is called
                     await self._stop_event.wait()
@@ -1545,27 +1553,21 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                         completed = await sleep_with_abort(delay, self._stop_event)
                         if not completed:
                             break  # Abort signaled during sleep
-                        # Attempt reconnect
-                        try:
-                            await self._application.updater.stop()
-                            await self._application.stop()
-                            await self._application.shutdown()
-                        except Exception:
-                            pass
-                        # Rebuild application for clean reconnect
-                        from telegram.ext import Application
-                        self._application = Application.builder().token(self._token).build()
+                        # Reinitialize the same application after finally cleans it
+                        # up, retaining every registered command/message handler.
                         continue
                     else:
                         logger.error(f"[telegram] Unrecoverable error: {e}")
-                        break
+                        raise
                 finally:
-                    try:
-                        await self._application.updater.stop()
-                        await self._application.stop()
-                        await self._application.shutdown()
-                    except Exception:
-                        pass
+                    # A partial startup may leave the updater stopped while the
+                    # application is running. Always attempt each cleanup step.
+                    for cleanup in (self._application.updater.stop,
+                                    self._application.stop, self._application.shutdown):
+                        try:
+                            await cleanup()
+                        except Exception as cleanup_error:
+                            logger.debug("Telegram cleanup: %s", cleanup_error)
                     self._is_running = False
 
             # Fail fast on a confirmed single-instance conflict so supervisors
@@ -1580,7 +1582,9 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
                 )
     
     async def stop(self) -> None:
-        """Stop the Telegram bot."""
+        """Stop the Telegram bot, including a reconnect still in progress."""
+        if self._stop_event is not None:
+            self._stop_event.set()
         if not self._is_running:
             return
         
@@ -2495,36 +2499,8 @@ class TelegramBot(ChatCommandMixin, MessageHookMixin):
             return None
 
 
-def _record_passive_group_message(bot: "TelegramBot", message) -> None:
-    """Record an unmentioned group message as passive session context.
-
-    Issue #3380: used by the ``observe`` group policy so that unmentioned
-    messages are retained in the transcript (without triggering an agent run)
-    and are visible to the agent when it is next addressed. Best-effort — a
-    missing session manager or any failure is swallowed so inbound handling is
-    never broken by observation.
-    """
-    session_mgr = getattr(bot, "_session", None)
-    if session_mgr is None or not hasattr(session_mgr, "record_passive"):
-        return
-    try:
-        content = message.get_text() if hasattr(message, "get_text") else str(message.content)
-        user_id = message.sender.user_id if message.sender else ""
-        sender = (message.sender.display_name or user_id) if message.sender else user_id
-        # Thread the same routing fields an addressed turn uses so that with
-        # session_scope="per_chat" the passive entry lands on the shared group
-        # key the next mentioned run reads from (Issue #3380 / #2376). With the
-        # default per_user scope these are simply ignored.
-        session_mgr.record_passive(
-            user_id,
-            content,
-            sender=sender,
-            chat_id=str(message.channel.channel_id) if message.channel and message.channel.channel_id else "",
-            thread_id=str(message.thread_id) if getattr(message, "thread_id", None) else "",
-            account=getattr(bot.config, "account", "default"),
-        )
-    except Exception as e:  # pragma: no cover — defensive
-        logger.debug(f"Failed to record passive group message: {e}")
+# Re-exported for back-compat; shared with Discord/Slack (Issue #5962).
+_record_passive_group_message = record_passive_group_message
 
 
 def _resolve_quoted_ref(update, bot: "TelegramBot") -> Optional["QuotedRef"]:
@@ -2677,57 +2653,26 @@ async def process_inbound_telegram_message(
     # 3. Group policy enforcement
     if message.channel and message.channel.channel_type not in ("dm", "private"):
         # This is a group/channel message, check group policies
-        group_policy = getattr(bot.config, 'group_policy', 'mention_only')
-        mention_required = getattr(bot.config, 'mention_required', True)
-        
-        if group_policy == "command_only":
-            if message.message_type != MessageType.COMMAND:
-                logger.debug(f"Message dropped: non-command in command_only group {channel_id}")
-                return None
-        elif group_policy in ("mention_only", "observe"):
-            # Check if bot was mentioned in the message
-            bot_username = bot._bot_user.username.lower() if bot._bot_user and bot._bot_user.username else ""
-            mention_handle = f"@{bot_username}" if bot_username else ""
-            explicit_mention = bool(
-                mention_handle and mention_handle in message.content.lower()
-            )
-            # Issue #5029: a reply to the bot's own message counts as an
-            # implicit mention, so continuing a conversation by tapping "Reply"
-            # is answered without re-typing @bot.
-            reply_to_bot = _is_reply_to_bot(update, bot)
-            bot_mentioned = (
-                explicit_mention
-                or reply_to_bot
-                or message.message_type == MessageType.COMMAND  # Commands are always allowed
-            )
-
-            if not bot_mentioned:
-                # Issue #3380: under ``observe`` an unmentioned group message is
-                # recorded into the session transcript as passive context (no
-                # agent run) so the bot has memory of the conversation when it is
-                # next addressed. ``mention_only`` still drops it outright.
-                if group_policy == "observe":
-                    _record_passive_group_message(bot, message)
-                    logger.debug(f"Message observed (no run) in group {channel_id}")
-                else:
-                    logger.debug(f"Message dropped: bot not mentioned in group {channel_id}")
-                return None
-        elif group_policy == "respond_all":
-            # Allow all group messages
-            pass
-        elif mention_required:
-            # Fallback for backward compatibility when group_policy is not set
-            bot_username = bot._bot_user.username.lower() if bot._bot_user and bot._bot_user.username else ""
-            mention_handle = f"@{bot_username}" if bot_username else ""
-            bot_mentioned = (
-                bool(mention_handle and mention_handle in message.content.lower())
-                or _is_reply_to_bot(update, bot)  # Issue #5029: reply-to-bot is implicit
-                or message.message_type == MessageType.COMMAND  # Commands are always allowed
-            )
-
-            if not bot_mentioned:
-                logger.debug(f"Message dropped: bot not mentioned in group {channel_id}")
-                return None
+        # Issue #5962: shared decision so group_policy behaves the same on
+        # every channel. A reply to the bot is an implicit mention (#5029).
+        bot_username = bot._bot_user.username.lower() if bot._bot_user and bot._bot_user.username else ""
+        mention_handle = f"@{bot_username}" if bot_username else ""
+        admission = decide_group_admission(
+            bot.config,
+            chat_type=message.channel.channel_type,
+            mention=MentionFacts(
+                explicit=bool(mention_handle and mention_handle in message.content.lower()),
+                reply_to_bot=_is_reply_to_bot(update, bot),
+            ),
+            is_command=message.message_type == MessageType.COMMAND,
+        )
+        if not admission.admit:
+            # Issue #3380: under ``observe`` an unmentioned group message is
+            # recorded as passive context (no agent run).
+            if admission.observe:
+                _record_passive_group_message(bot, message)
+            logger.debug(f"Message not run in group {channel_id}: {admission.reason_code}")
+            return None
     
     # Bot-to-bot loop guard (#5062). A bot-authored message is dropped unless
     # the channel opted into ``allow_bots``; once opted in, the BotLoopGuard
