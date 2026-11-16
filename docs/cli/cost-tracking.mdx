@@ -56,9 +56,41 @@ print(f"Total cost: ${tracker.get_cost():.4f}")
 
 ![Cost Tracking Monitors API Expenses](./cost-tracking-cost-tracking-monitors-api-exp.gif)
 
+## How a model name is matched
+
+PraisonAI picks a price in this order: an exact match in the small built-in table below (a leading `provider/` is ignored, so `openai/gpt-4o-mini` matches `gpt-4o-mini`), then litellm's bundled catalogue (1000+ models — no setup needed), then the longest matching family prefix (so `gpt-4o-mini-2024-07-18` prices as `gpt-4o-mini`, but `gpt-4.1-mini` never prices as `gpt-4`). If none match, the cost is reported as **unknown** rather than guessed.
+
+```mermaid
+graph TB
+    Name[📥 Model name<br/>e.g. openai/gpt-4o-mini] --> Exact{Exact match<br/>in static table?}
+    Exact -->|Yes| Static[💲 Static price]
+    Exact -->|No| Litellm{In litellm<br/>price map?}
+    Litellm -->|Yes| LitePrice[💲 litellm price]
+    Litellm -->|No| Prefix{Longest prefix<br/>in static table?}
+    Prefix -->|Yes, e.g. gpt-4o-mini| Static
+    Prefix -->|No| Default[⚠️ default entry<br/>priced=False]
+
+    classDef input fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef check fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef priced fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef unknown fill:#8B0000,stroke:#7C90A0,color:#fff
+
+    class Name input
+    class Exact,Litellm,Prefix check
+    class Static,LitePrice priced
+    class Default unknown
+```
+
+```python
+from praisonai_code.cli.features.cost_tracker import get_pricing
+
+print(get_pricing("openai/gpt-4o-mini").model_name)      # gpt-4o-mini
+print(get_pricing("my-local-model").priced)              # False
+```
+
 ## Supported Models
 
-Cost tracking supports 18+ models with accurate pricing:
+This is the built-in static table — the fast shortcut for common models. Anything not listed here is looked up in litellm's bundled price map next (see [How a model name is matched](#how-a-model-name-is-matched)).
 
 ### OpenAI Models
 
@@ -177,6 +209,30 @@ with open("session_costs.json", "w") as f:
     f.write(json_str)
 ```
 
+### Collected Usage Helpers
+
+The interactive `/cost` command and the headless `code -p --output json` envelope both read the global token collector through these helpers, so the two always agree. Use them to build your own surface:
+
+```python
+from praisonai_code.cli.features.cost_tracker import (
+    price_collected_usage,
+    reset_collected_usage,
+    collected_usage_line,
+)
+
+usage = price_collected_usage("gpt-4o-mini")
+# {"in": 1000, "out": 100, "cost": 0.00021}  — cost is None for unknown models
+
+reset_collected_usage()   # start the next conversation at 0
+
+tokens, cost_text = collected_usage_line("my-local-model")
+# tokens=15, cost_text="unknown (no price for this model)"
+```
+
+<Note>
+Each model in the collector is priced separately. If **any** of them has no known price, `cost` is `None` instead of a partial or made-up figure.
+</Note>
+
 ## CLI Integration
 
 ### Interactive Mode
@@ -188,27 +244,20 @@ praisonai chat
 [AI responds...]
 
 >>> /cost
-╭─────────────────────────────────────╮
-│           Session Stats             │
-├─────────────────────────────────────┤
-│ Session: abc12345                   │
-│ Duration: 125.3s                    │
-│ Requests: 3                         │
-│                                     │
-│ Tokens:                             │
-│   Input:  2,500                     │
-│   Output: 800                       │
-│   Total:  3,300                     │
-│   Cached: 500                       │
-│                                     │
-│ Cost: $0.0125                       │
-│ Avg per request: $0.0042            │
-│                                     │
-│ Models used:                        │
-│   gpt-4o: 2 requests                │
-│   gpt-4o-mini: 1 request            │
-╰─────────────────────────────────────╯
+Model:          gpt-4o-mini
+Total tokens:   1100
+Estimated cost: $0.0002
 ```
+
+When the model has no known price:
+
+```text
+Model:          my-local-model
+Total tokens:   15
+Estimated cost: unknown (no price for this model)
+```
+
+`/cost` (and its alias `/stats` in the async TUI) reads real totals from the global token collector via `price_collected_usage()` on every surface — the async TUI, the legacy REPL, and `tui_app`. The layout differs slightly per surface (the legacy REPL omits the `Model:` line; `tui_app` prints `Tokens: 1100 | Cost: $0.0002`), but the numbers are the same. `/new` and `/clear` in the async TUI, and `/clear` in the legacy REPL, reset the totals to zero (`tui_app`'s `/clear` only clears the screen).
 
 ### Token Breakdown
 
@@ -255,19 +304,23 @@ cost = pricing.calculate_cost(input_tokens, output_tokens)
 Add pricing for custom or new models:
 
 ```python
-from praisonai.cli.features.cost_tracker import ModelPricing, DEFAULT_PRICING
+from praisonai_code.cli.features.cost_tracker import ModelPricing, DEFAULT_PRICING, CostTracker
 
 # Add custom model pricing
 DEFAULT_PRICING["my-custom-model"] = ModelPricing(
     model_name="my-custom-model",
     input_price_per_1m=1.00,
     output_price_per_1m=2.00,
-    context_window=32000
+    context_window=32000,
+    # priced=True by default — set False only for placeholder entries
 )
 
 # Now tracking will use this pricing
+tracker = CostTracker()
 tracker.track_request("my-custom-model", 1000, 500)
 ```
+
+`priced=False` means `/cost` and the headless envelope report `unknown` / `null` for this model instead of multiplying by the placeholder rate.
 
 ## Per-session persistence
 
@@ -346,7 +399,7 @@ DEFAULT_PRICING["my-org/custom-llm"] = ModelPricing(
 scheduler = AsyncAgentScheduler(agent, task="Hourly digest", max_cost=5.00)
 ```
 
-Models that are **not** in `DEFAULT_PRICING` are priced at $0 — they still run, but `total_cost_usd` will under-report and the `max_cost` brake won't trip. See [Async Agent Scheduler](/features/async-agent-scheduler) for the full budget pattern.
+Unknown models fall back to the `default` entry (currently $1 input / $3 output per 1M tokens) with its `priced` flag set to `False`. The scheduler's `max_cost` brake still uses this conservative figure, so budgets stay enforced — but surfaces like `/cost` and the headless `code -p --output json` envelope report **unknown** / `null` for the cost instead of a made-up number. See [Async Agent Scheduler](/features/async-agent-scheduler) for the full budget pattern.
 
 ## Real-Time Monitoring
 

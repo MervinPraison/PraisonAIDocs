@@ -98,6 +98,8 @@ sequenceDiagram
 
 ### Lifecycle Events
 
+Any `HookEvent` can be forwarded to a shell command via [Gateway Outbound Hooks](/features/gateway-outbound-hooks).
+
 ```mermaid
 graph TB
     subgraph "Agent Lifecycle Events"
@@ -302,7 +304,7 @@ def small_model_subset(event_data):
 | Event | Trigger | Input Type | Use Case |
 |-------|---------|------------|----------|
 | `BEFORE_AGENT` | Before agent runs | `BeforeAgentInput` | Setup, initialization |
-| `AFTER_AGENT` | After agent completes | `AfterAgentInput` | Cleanup, reporting |
+| `AFTER_AGENT` | After agent completes | `AfterAgentInput` | Cleanup, reporting, output guardrails |
 
 ```python
 @registry.on(HookEvent.BEFORE_AGENT)
@@ -312,16 +314,18 @@ def before_agent(event_data):
 
 @registry.on(HookEvent.AFTER_AGENT)
 def after_agent(event_data):
-    print(f"Agent completed: {event_data.result}")
+    print(f"Agent completed: {event_data.response}")
     return HookResult.allow()
 ```
+
+**`AFTER_AGENT` can rewrite or block the final response.** Changing `event_data.response` (a string) rewrites what the caller receives; returning `HookResult.deny(reason)` replaces it with `"[Response blocked by hook: <reason>]"`. Streamed output, callbacks and session persistence run earlier and are not gated. See [Output Guardrails](/features/plugins#output-guardrails).
 
 ### LLM Events
 
 | Event | Trigger | Input Type | Use Case |
 |-------|---------|------------|----------|
 | `BEFORE_LLM` | Before LLM API call — register with `sequential=True` when the hook needs to rewrite `messages` via `modified_input` | `BeforeLLMInput` | Request modification |
-| `AFTER_LLM` | After LLM response | `AfterLLMInput` | Response validation |
+| `AFTER_LLM` | After LLM response | `AfterLLMInput` | Response validation, usage tracking |
 | `MODEL_FALLBACK` | Primary model unavailable mid-turn — runtime switched to the next `fallback_models` entry | `ModelFallbackInput` | Alerts, metrics, per-user notice on silent quality/cost degradation |
 
 ```python
@@ -334,7 +338,7 @@ def before_llm(event_data):
 @registry.on(HookEvent.AFTER_LLM)
 def after_llm(event_data):
     print(f"Response length: {len(event_data.response)}")
-    print(f"Tokens: {event_data.usage}")
+    print(f"Tokens: {event_data.tokens_used}")
     return HookResult.allow()
 ```
 
@@ -344,9 +348,17 @@ def after_llm(event_data):
 Hooks on this event run in `priority` order — see [Ordering hooks](/features/hooks#ordering-hooks-with-priority).
 </Note>
 
+<Note>
+**Custom-LLM path parity — since PraisonAI PR [#6103](https://github.com/MervinPraison/PraisonAI/pull/6103).** `BEFORE_LLM` / `AFTER_LLM` now also fire when the agent uses the `provider/model` (LiteLLM) path — e.g. `llm="anthropic/claude-3-5-sonnet-20240620"`, any `base_url`, or `llm={...}` dicts. Earlier releases skipped both hooks on that path, so `BEFORE_LLM` hooks such as `enable_pii_redaction()` had no effect for non-OpenAI-client models. Hooks fire **once per turn** on both paths (tool round trips included).
+
+- **`tokens_used`** — the sum of provider usage (prompt + completion) across every call in the turn, tool round trips included. Streaming without `stream_options.include_usage` still reports `0`.
+- **Blocking** — a deny returns the same `"[LLM request blocked by hook: <reason>]"` string and the provider is never contacted.
+- **Rewrites** — register the hook with `sequential=True` (parallel hooks' `modified_input` is discarded); `modified_input={"messages": [...]}` is then mapped back to the system prompt, chat history, and prompt. The rewritten list must end with a `user` message, otherwise the request fails closed with `"[LLM request blocked by hook: rewritten messages must end with a user message]"`.
+</Note>
+
 #### MODEL_FALLBACK — silent model switch became observable
 
-Fires the moment the runtime swaps the primary model for the next entry in `fallback_models` after a retryable failure, so an otherwise silent quality/cost degradation becomes an observable state transition.
+Fires the moment the runtime swaps the primary model for the next entry in `fallback_models` after a retryable failure, so an otherwise silent quality/cost degradation becomes an observable state transition. Since [PR #6053](https://github.com/MervinPraison/PraisonAI/pull/6053) it also fires on the custom-LLM path — `provider/model` strings, `llm={...}` dicts, `base_url`, and model objects — on both sync and async turns.
 
 <Note>
 **Observe-only.** Notification only — the turn already continued on `to_model`. Return `HookResult.allow()`; do not attempt to redirect the recovery here. Provider internals are redacted; only the failure class (`reason_category`) reaches your hook. Zero overhead when unsubscribed, and errors inside the hook never break the fallback path.
@@ -550,6 +562,8 @@ def on_retry(event_data):
 `ON_RETRY` fires on **both** sync and async retry paths. If you register the handler as a regular `def`, it is dispatched in a thread executor on the async path; if you register an `async def`, it is awaited directly. Either form is safe on both paths.
 
 <Note>
+`ON_RETRY` also fires for transient failures of remote MCP tools (HTTP-Stream, SSE, WebSocket), with `error_type="connection_error"` or `"timeout"`. See [MCP](/features/mcp#transport-level-failures-on-remote-mcp-tools).
+
 Retry is on by default, so `ON_RETRY` fires with **no config needed** on both the native OpenAI-client path and the LiteLLM path (default `max_retries=3`). It only stops firing if you disable retry with `retry=False`. See [Agent Retry](/features/agent-retry).
 </Note>
 
@@ -714,7 +728,7 @@ def on_plugin_removed(event_data: PluginLifecycleInput):
     return HookResult.allow()
 ```
 
-**Observe-only.** Fully guarded — a failing hook never breaks plugin loading. Zero cost when nothing is listening (early-out on `registry.has_hooks(...)`).
+**Observe-only.** Fully guarded — a failing hook never breaks plugin loading. Zero cost when nothing is listening (early-out on `registry.has_hooks(...)`). The early-out is a lock-guarded `any()` with no snapshot copy or priority sort (PR #5853).
 
 #### `PluginLifecycleInput` Fields
 
@@ -778,7 +792,7 @@ def on_plugin_removed(event_data: PluginLifecycleInput):
     return HookResult.allow()
 ```
 
-**Observe-only.** Fully guarded — a failing hook never breaks plugin loading. Zero cost when nothing is listening (early-out on `registry.has_hooks(...)`).
+**Observe-only.** Fully guarded — a failing hook never breaks plugin loading. Zero cost when nothing is listening (early-out on `registry.has_hooks(...)`). The early-out is a lock-guarded `any()` with no snapshot copy or priority sort (PR #5853).
 
 #### `PluginLifecycleInput` Fields
 
@@ -1036,7 +1050,7 @@ def on_schedule_remove(event_data):
     return HookResult.allow()
 ```
 
-**Where SCHEDULE events fire:** `SCHEDULE_ADD` and `SCHEDULE_REMOVE` are emitted by the schedule **store** — the one chokepoint every add/remove path funnels through — from `add()`, `remove()`, `remove_by_name()`, and the one-shot `delete_after_run` auto-delete inside `claim_due()`. The same hook fires whether the mutation came from the `schedule_add`/`schedule_remove` tools, the `praisonai schedule` CLI, or the gateway `config.yaml` reconciler.
+**Where SCHEDULE events fire:** `SCHEDULE_ADD` and `SCHEDULE_REMOVE` are emitted by the schedule **store** — the one chokepoint every add/remove path funnels through — from `add()`, `remove()`, `remove_by_name()`, the spent-job retire inside `ScheduleRunner.mark_run()` (one-shot `delete_after_run` or `max_runs` budget met, on run completion), and from `claim_due()` only when a spent job's crash retry was abandoned too or its `until` deadline has elapsed. The same hook fires whether the mutation came from the `schedule_add`/`schedule_remove` tools, the `praisonai schedule` CLI, or the gateway `config.yaml` reconciler.
 
 Events fire **only on a real change** and never in these four cases:
 - **Duplicate add** — an `add()` that raises `ValueError` on a duplicate name/id fires nothing.
@@ -1044,7 +1058,7 @@ Events fire **only on a real change** and never in these four cases:
 - **Principal-scoped skip** — a `remove_by_name()` that matches nothing under the caller's tenant `principal` fires nothing.
 - **Rolled-back persist** — if `_save()` fails and the deletion is rolled back, nothing is emitted.
 
-A spent `delete_after_run` one-shot fires `SCHEDULE_REMOVE` **exactly once**: the auto-delete inside `claim_due()` emits, and the runner's later `remove(job.id)` finds nothing and stays silent.
+A spent `delete_after_run` one-shot fires `SCHEDULE_REMOVE` **exactly once**, after its run completes — a crash mid-run no longer loses the job. A failed one-shot is kept (disabled) and emits nothing.
 
 ### Background Job Events
 

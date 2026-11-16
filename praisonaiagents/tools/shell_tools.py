@@ -7,12 +7,14 @@ This module provides a safe interface for executing shell commands with:
 - Resource limits
 """
 
+import re
 import subprocess
 import shlex
 import logging
 import os
 import time
 import platform
+import threading
 # psutil is imported lazily inside methods that need it
 # to avoid hard failure when the package is not installed
 from typing import Dict, List, Optional, Union
@@ -88,12 +90,57 @@ def _find_shell_syntax(command: str):
     return None
 
 
+# Credential-looking variable names are withheld from model-driven commands:
+# a gateway serving untrusted chat would otherwise hand `env` / `echo $X` every
+# LLM key, channel token and its own GATEWAY_AUTH_TOKEN. Operators who need one
+# inside a command name it in PRAISONAI_SHELL_ENV_ALLOWLIST (comma-separated).
+_SECRET_NAME_PARTS = frozenset({"TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CREDENTIALS", "APIKEY"})
+_ENV_REF = re.compile(r"\$(\w+|\{[^}]*\})")
+_ENV_REF_NT = re.compile(r"\$(\w+|\{[^}]*\})|%(\w+)%")
+
+
+def _is_secret_name(name: str) -> bool:
+    upper = name.upper()
+    return upper.endswith("_KEY") or any(part in _SECRET_NAME_PARTS for part in upper.split("_"))
+
+
+def _build_subprocess_env(extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Parent environment minus secret-looking names, plus explicit *extra_env*."""
+    allow = {n.strip() for n in os.environ.get("PRAISONAI_SHELL_ENV_ALLOWLIST", "").split(",") if n.strip()}
+    process_env = {k: v for k, v in os.environ.items() if k in allow or not _is_secret_name(k)}
+    if extra_env:
+        process_env.update(extra_env)
+    return process_env
+
+
+def _expandvars(value: str, env: Dict[str, str]) -> str:
+    """``os.path.expandvars`` against *env* rather than ``os.environ``.
+
+    On Windows ``%VAR%`` is expanded too and names are case-insensitive,
+    matching ``ntpath.expandvars``.
+    """
+    windows = platform.system() == 'Windows'
+    if windows:
+        env = {k.upper(): v for k, v in env.items()}
+
+    def _sub(match):
+        name = (match.group(1) or match.group(2)).strip("{}")
+        return env.get(name.upper() if windows else name, match.group(0))
+
+    if windows:
+        return _ENV_REF_NT.sub(_sub, value) if ("$" in value or "%" in value) else value
+    return _ENV_REF.sub(_sub, value) if "$" in value else value
+
+
 class ShellTools:
     """Tools for executing shell commands safely."""
     
     def __init__(self):
         """Initialize ShellTools."""
         self._check_dependencies()
+        # Commands started with run_in_background=True, keyed by process_id
+        self._background: Dict[str, Dict] = {}
+        self._background_lock = threading.Lock()
     
     def _check_dependencies(self):
         """Check if required packages are installed (lazy — no hard failure)."""
@@ -108,7 +155,8 @@ class ShellTools:
         env: Optional[Dict[str, str]] = None,
         max_output_size: int = 10000,
         spill: bool = True,
-        spill_dir: Optional[str] = None
+        spill_dir: Optional[str] = None,
+        run_in_background: bool = False
     ) -> Dict[str, Union[str, int, bool]]:
         """Execute a shell command safely.
         
@@ -127,7 +175,12 @@ class ShellTools:
             spill_dir: Optional directory for overflow artifacts (defaults to a
                 session/workspace dir via ``PRAISONAI_TOOL_OUTPUT_DIR`` or the
                 system temp dir).
-            
+            run_in_background: When True, start the command and return
+                immediately with a ``process_id`` instead of waiting (use for
+                dev servers, watchers, long builds/test suites). ``timeout`` is
+                ignored. Inspect it with ``get_command_output`` and end it with
+                ``stop_command``.
+
         Returns:
             Dictionary with execution results
         """
@@ -177,25 +230,27 @@ class ShellTools:
             if not command:
                 return {"error": "Empty command", "stdout": "", "stderr": "", "exit_code": 1}
             
+            # Set up process environment (secrets stripped, explicit env kept)
+            process_env = _build_subprocess_env(env)
+
             # Expand tilde and environment variables in command arguments
-            # (shell=False means the shell won't do this for us)
-            command = [os.path.expanduser(os.path.expandvars(arg)) for arg in command]
-            
+            # (shell=False means the shell won't do this for us). Expansion
+            # uses the scrubbed env so `echo $OPENAI_API_KEY` cannot leak it.
+            command = [os.path.expanduser(_expandvars(arg, process_env)) for arg in command]
+
             # Expand tilde in cwd (subprocess doesn't do this)
             if cwd:
                 cwd = os.path.expanduser(cwd)
-                cwd = os.path.expandvars(cwd)  # Also expand $HOME, $USER, etc.
+                cwd = _expandvars(cwd, process_env)  # Also expand $HOME, $USER, etc.
                 if not os.path.isdir(cwd):
                     # Fallback: try home directory, then current working directory
                     fallback = os.path.expanduser("~") if os.path.isdir(os.path.expanduser("~")) else os.getcwd()
                     logging.warning(f"Working directory '{cwd}' does not exist, using '{fallback}'")
                     cwd = fallback
-            
-            # Set up process environment
-            process_env = os.environ.copy()
-            if env:
-                process_env.update(env)
-            
+
+            if run_in_background:
+                return self._start_background(command, cwd, process_env)
+
             # Start process
             start_time = time.time()
             process = subprocess.Popen(
@@ -243,43 +298,38 @@ class ShellTools:
                     result['stderr_artifact'] = stderr_path
                 return result
             
-            except _CommandCancelled:
+            except _CommandCancelled as e:
                 # A cooperative interrupt (/stop, Ctrl-C) fired while the child
                 # was still running. Kill the whole process group so descendants
                 # do not keep mutating state, then report an interrupted outcome.
                 self._kill_process_tree(process)
-                return {
-                    'stdout': '',
-                    'stderr': 'Command interrupted by user',
-                    'exit_code': -1,
-                    'success': False,
-                    'interrupted': True,
-                    'execution_time': time.time() - start_time
-                }
+                result = self._partial_result(
+                    e, 'Command interrupted by user', max_output_size, spill, spill_dir
+                )
+                result.update(interrupted=True, execution_time=time.time() - start_time)
+                return result
 
-            except _StreamDrainTimeout:
+            except _StreamDrainTimeout as e:
                 # The direct child already exited; only an inherited pipe kept a
                 # reader blocked. Report a timeout but do NOT kill — the direct
                 # child's PID is gone (and may have been recycled), so killing it
                 # would be unsafe and misleading.
-                return {
-                    'stdout': '',
-                    'stderr': f'Command output streaming timed out after {timeout} seconds',
-                    'exit_code': -1,
-                    'success': False,
-                    'execution_time': timeout
-                }
+                result = self._partial_result(
+                    e, f'Command output streaming timed out after {timeout} seconds',
+                    max_output_size, spill, spill_dir,
+                )
+                result.update(timed_out=True, execution_time=timeout)
+                return result
 
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as e:
                 # Kill process on timeout
                 self._kill_process_tree(process)
-                return {
-                    'stdout': '',
-                    'stderr': f'Command timed out after {timeout} seconds',
-                    'exit_code': -1,
-                    'success': False,
-                    'execution_time': timeout
-                }
+                result = self._partial_result(
+                    e, f'Command timed out after {timeout} seconds',
+                    max_output_size, spill, spill_dir,
+                )
+                result.update(timed_out=True, execution_time=timeout)
+                return result
                 
         except Exception as e:
             # Name the exception type and log the traceback. Some exceptions
@@ -301,6 +351,152 @@ class ShellTools:
                 'execution_time': 0
             }
     
+    def _partial_result(self, exc, reason, max_output_size, spill, spill_dir):
+        """Build a failed result that keeps output captured before ``exc``."""
+        collect = getattr(exc, 'collect_output', None)
+        stdout, stderr = collect() if collect else ('', '')
+        stdout, stdout_path = self._handle_overflow(
+            stdout, "stdout", max_output_size, spill, spill_dir
+        )
+        stderr, stderr_path = self._handle_overflow(
+            stderr, "stderr", max_output_size, spill, spill_dir
+        )
+        result: Dict[str, Union[str, int, bool]] = {
+            'stdout': stdout,
+            'stderr': f"{stderr.rstrip()}\n{reason}" if stderr.strip() else reason,
+            'exit_code': -1,
+            'success': False,
+        }
+        if stdout_path:
+            result['stdout_artifact'] = stdout_path
+        if stderr_path:
+            result['stderr_artifact'] = stderr_path
+        return result
+
+    def _start_background(self, command, cwd, process_env):
+        """Start *command* detached, writing stdout+stderr to a log file."""
+        import tempfile
+        import uuid
+
+        fd, log_path = tempfile.mkstemp(prefix="praisonai-bg-", suffix=".log")
+        with os.fdopen(fd, "wb") as log_file:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd=cwd,
+                shell=False,  # Always use shell=False for security
+                env=process_env,
+                # Own process group so stop_command can reach the whole tree
+                start_new_session=platform.system() != 'Windows',
+            )
+        process_id = uuid.uuid4().hex[:8]
+        with self._background_lock:
+            if not self._background:
+                import atexit
+                atexit.register(self._stop_all_background)
+            self._background[process_id] = {"process": process, "log_path": log_path}
+        return {
+            'success': True,
+            'process_id': process_id,
+            'pid': process.pid,
+            'status': 'running',
+            'log_file': log_path,
+        }
+
+    def get_command_output(self, process_id: str, tail: int = 200) -> Dict[str, Union[str, int, bool, None]]:
+        """Get status and latest output of a command started with run_in_background=True.
+
+        Args:
+            process_id: The process_id returned by execute_command
+            tail: Number of most recent output lines to return
+
+        Returns:
+            Dictionary with status ("running" or "exited"), exit_code and output
+        """
+        entry = self._background.get(process_id)
+        if entry is None:
+            return {'success': False, 'error': f'No background command with process_id {process_id!r}'}
+        process = entry["process"]
+        exit_code = process.poll()
+        # Read only the end of the log so a chatty process stays bounded.
+        max_bytes = 64 * 1024
+        try:
+            with open(entry["log_path"], "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - max_bytes))
+                data = f.read(max_bytes).decode("utf-8", errors="replace")
+        except OSError as e:
+            data = f"<unable to read output: {e}>"
+        lines = data.splitlines()[-tail:] if tail > 0 else []
+        return {
+            'success': exit_code in (None, 0),
+            'process_id': process_id,
+            'pid': process.pid,
+            'status': 'running' if exit_code is None else 'exited',
+            'exit_code': exit_code,
+            'output': "\n".join(lines),
+            'log_file': entry["log_path"],
+        }
+
+    def stop_command(self, process_id: str) -> Dict[str, Union[str, int, bool, None]]:
+        """Stop a command started with run_in_background=True (and its children).
+
+        Args:
+            process_id: The process_id returned by execute_command
+
+        Returns:
+            Dictionary with the final status and exit_code
+        """
+        entry = self._background.get(process_id)
+        if entry is None:
+            return {'success': False, 'error': f'No background command with process_id {process_id!r}'}
+        process = entry["process"]
+        if process.poll() is None:
+            self._terminate_background(process)
+        return {
+            'success': True,
+            'process_id': process_id,
+            'status': 'exited',
+            'exit_code': process.returncode,
+        }
+
+    def _terminate_background(self, process):
+        """Terminate a background process group, escalating to kill."""
+        if platform.system() != 'Windows':
+            import signal
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            # The parent exiting does not mean its children did: SIGKILL
+            # whatever is left in the group so nothing outlives stop_command.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        else:
+            self._kill_process_tree(process)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    def _stop_all_background(self):
+        """Do not leave dev servers/watchers orphaned when the interpreter exits."""
+        for entry in list(self._background.values()):
+            try:
+                if entry["process"].poll() is None:
+                    self._terminate_background(entry["process"])
+            except Exception as exc:
+                logging.debug("Failed to stop background command: %s", exc, exc_info=True)
+
     def _current_cancel_event(self):
         """Return the agent's cooperative cancellation Event, if any.
 
@@ -321,7 +517,8 @@ class ShellTools:
         """Kill a child process and its descendants (best-effort).
 
         Uses psutil to reach the whole tree when available, falling back to
-        ``process.kill()`` otherwise. Safe to call if the process already exited.
+        ``taskkill /T`` on Windows or ``process.kill()`` otherwise. Safe to
+        call if the process already exited.
         """
         try:
             import psutil
@@ -334,6 +531,16 @@ class ShellTools:
                     pass
             parent.kill()
         except ImportError:
+            if platform.system() == 'Windows':
+                # Own try: a missing/hung taskkill must not skip process.kill().
+                try:
+                    subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
             try:
                 process.kill()
             except Exception:
@@ -412,18 +619,31 @@ class ShellTools:
         t_out.start()
         t_err.start()
 
+        def _with_partial(exc, drain=True):
+            # Keep whatever the command already printed: on a timeout/interrupt
+            # the real error usually lives in the output produced so far. The
+            # caller collects only AFTER killing the child, so the pipes close
+            # and readline() returns trailing text written without a newline.
+            def _collect():
+                if drain:
+                    for reader in (t_out, t_err):
+                        reader.join(timeout=_DRAIN_GRACE_SECONDS)
+                return "".join(stdout_chunks), "".join(stderr_chunks)
+            exc.collect_output = _collect
+            return exc
+
         deadline = None if timeout is None else time.monotonic() + timeout
         if cancel_event is None:
             try:
                 process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 # The direct child is still running. Disable any further emission
                 # and re-raise TimeoutExpired so the caller's timeout path KILLS
                 # the process before returning — a recorded read error must not
                 # short-circuit that cleanup (otherwise the still-running child
                 # leaks with its pipes open).
                 stop_emitting.set()
-                raise
+                raise _with_partial(exc)
         else:
             # Poll in short slices so a cooperative interrupt aborts the child
             # promptly (within the poll interval) rather than only on timeout.
@@ -431,12 +651,12 @@ class ShellTools:
             while True:
                 if cancel_event.is_set():
                     stop_emitting.set()
-                    raise _CommandCancelled()
+                    raise _with_partial(_CommandCancelled())
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         stop_emitting.set()
-                        raise subprocess.TimeoutExpired(process.args, timeout)
+                        raise _with_partial(subprocess.TimeoutExpired(process.args, timeout))
                     wait_slice = min(_POLL, remaining)
                 else:
                     wait_slice = _POLL
@@ -468,7 +688,7 @@ class ShellTools:
             # Stop emitting and signal a drain-timeout so the caller reports a
             # timeout WITHOUT trying to kill an already-exited process.
             stop_emitting.set()
-            raise _StreamDrainTimeout()
+            raise _with_partial(_StreamDrainTimeout(), drain=False)
 
         if read_errors:
             raise read_errors[0]
@@ -626,6 +846,8 @@ _shell_tools = ShellTools()
 execute_command = _shell_tools.execute_command
 list_processes = _shell_tools.list_processes
 kill_process = _shell_tools.kill_process
+get_command_output = _shell_tools.get_command_output
+stop_command = _shell_tools.stop_command
 get_system_info = _shell_tools.get_system_info
 
 if __name__ == "__main__":

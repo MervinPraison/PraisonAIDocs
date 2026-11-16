@@ -59,14 +59,17 @@ sequenceDiagram
     participant RM as 📚 RulesManager
     participant FS as 📂 Project Folder
     participant LLM as 🧠 LLM
+    participant Log as 📢 Logger
 
     Dev->>FS: Create AGENTS.md<br/>"Use type hints"
     Dev->>Agent: Agent(instructions="...", rules=True)
     Dev->>Agent: agent.start("sort a list")
     Agent->>RM: First run → lazy _init_rules_manager
     RM->>FS: Discovery gate → scan workspace
+    Note over RM,FS: Subfolder rules between cwd and workspace<br/>load only when cwd is inside the workspace
     FS-->>RM: AGENTS.md, CLAUDE.md, ...
     RM-->>Agent: rules context (build_system_prompt)
+    Agent-->>Log: WARNING "Applied rules: … (pass rules=False to turn off)"
     Agent->>LLM: system prompt + rules + task
     LLM-->>Dev: def sort_list(items: list[int]) -> list[int]: ...
 ```
@@ -131,6 +134,23 @@ graph TB
     class DISCOVER,PARSE,FILTER manager
     class INJECT,LLM agent
 ```
+
+## What you'll see when rules are applied
+
+When one or more rules are auto-discovered, a single `WARNING`-level log message prints the first time the agent loads its rules (exact prefix depends on your logging setup):
+
+```
+Applied rules: AGENTS.md, CLAUDE.md (pass rules=False to turn off)
+```
+
+- Lists only rules **actually injected** (names sorted, comma-separated) — `activation: manual` rules aren't listed.
+- Logged once per distinct rule-name set per process — repeated `Agent(...)` with the same active set stay quiet.
+- Silent when no rule files are discovered.
+- Pass `rules=False` to suppress discovery (and the line) for a sandboxed run.
+
+<Note>
+Since PraisonAI PR [#6258](https://github.com/MervinPraison/PraisonAI/pull/6258) (fixes [#6257](https://github.com/MervinPraison/PraisonAI/issues/6257)), auto-applied rules are announced at `WARNING` level. Before #6258, the same line was `DEBUG` and invisible under default logging.
+</Note>
 
 ## Supported Instruction Files
 
@@ -203,7 +223,7 @@ agent.start("Refactor this module in line with our conventions.")
 </Steps>
 
 <Note>
-**Opt out:** pass `rules=False` for sandboxed / reproducible runs where project files must not leak into the prompt.
+**Opt out:** pass `rules=False` for sandboxed / reproducible runs where project files must not leak into the prompt. This also silences the `Applied rules: …` warning line you'll see in the terminal when rules are discovered.
 
 ```python
 from praisonaiagents import Agent
@@ -219,7 +239,7 @@ agent.start("Explain closures.")
 
 | You pass | What happens |
 |----------|--------------|
-| Nothing (omit `rules=`) | Auto-discover and apply if files exist |
+| Nothing (omit `rules=`) | Auto-discover and apply if files exist (prints one `Applied rules: …` warning) |
 | `rules=None` | Same as omitting — auto-discover and apply |
 | `rules=True` | Same as above — auto-discover and apply |
 | `rules=RulesConfig(...)` | Full control (custom budget / files / workspace) |
@@ -577,6 +597,62 @@ graph TB
 The wrapper-layer `load_context_files()` (used by `configure_host` / `context_paths`) uses the same git-root walk-up and adds layered merge semantics — collecting `AGENTS.md`, `CLAUDE.md`, `agents.md`, and `.agents/AGENTS.md` at every directory level from `~/.praisonai/AGENTS.md` (lowest) up through the git root to `cwd` (highest). See [Context Files → CLI auto-loading](/docs/features/context-files#cli-auto-loading) for how `chat`, `run`, `code`, and `tui` automatically inject this context into the agent system prompt.
 
 Monorepos with per-subtree instruction files: see [On-demand Subtree Attachment](/docs/features/context-files#on-demand-subtree-attachment) for how a sibling package's `AGENTS.md` attaches the moment the agent opens a file inside it.
+
+### How subdirectory rules are discovered
+
+PraisonAI loads the instruction files at your workspace (or git) root, then walks **up from your current directory** toward that root, picking up `.praisonai/rules/`, `.claude/rules/`, `.cursor/rules/`, and `.windsurf/rules/` in each folder along the way.
+
+That walk stays **inside the workspace**. If your current directory is outside it, the walk is skipped — rule folders in `~/.claude/rules`, `~/.cursor/rules`, or other unrelated parent folders are never loaded just because of where your shell happens to be.
+
+```mermaid
+graph TB
+    A[📂 Current directory] --> B{🔍 Inside workspace<br/>or git root?}
+    B -->|Yes| C[⬆️ Walk up to the workspace root<br/>Load rule folders at each level]
+    B -->|No| D[💤 Skip the walk<br/>Root instruction files still load]
+    C --> E[✅ Rules merged into context]
+    D --> E
+
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef decide fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef walk fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef skip fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef result fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class A start
+    class B decide
+    class C walk
+    class D skip
+    class E result
+```
+
+| Where is your shell? | Where is `workspace_path`? | Subfolder walk runs? | How to load parent-folder rules |
+|---|---|---|---|
+| Inside the workspace (e.g. `project/src`) | `project/` | ✅ Yes | Already loaded |
+| At the workspace root | `project/` | — Nothing to walk | Not needed |
+| Monorepo root | A subpackage (`repo/packages/api`) | ❌ No | Point `workspace_path` at the repo root |
+| Repo root, running `pytest` | A temp folder (`tmp_path`) | ❌ No | `RulesConfig(files=[...])` |
+
+```python
+from praisonaiagents import Agent, RulesConfig
+
+# Shell outside the workspace? Register the rules you still want explicitly.
+agent = Agent(
+    name="Dev",
+    instructions="Help with code.",
+    rules=RulesConfig(files=["docs/CONVENTIONS.md"]),
+)
+agent.start("Summarise the project conventions.")
+```
+
+<Note>
+**Why it changed.** Running `pytest` with a temporary `workspace_path`, or launching an agent from a monorepo root while targeting a subpackage, used to pull in rules from unrelated parent folders — including your home directory. Since [PR #5939](https://github.com/MervinPraison/PraisonAI/pull/5939) ([issue #5937](https://github.com/MervinPraison/PraisonAI/issues/5937)) the walk only runs when your current directory is inside the workspace.
+</Note>
+
+<Note>
+**Want parent-folder rules anyway?** `cd` into the workspace, set `workspace_path` to the common parent, or register files with `RulesConfig(files=[...])` / `RulesManager.add_rule_file(...)`. Explicit files are not affected by where your shell is.
+</Note>
+
+See also: [How git-root detection works](#how-git-root-detection-works) and [On-demand Subtree Attachment](/docs/features/context-files#on-demand-subtree-attachment), which attaches subtree instructions regardless of your current directory.
 
 ## Storage Structure
 

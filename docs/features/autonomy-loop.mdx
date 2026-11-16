@@ -45,7 +45,9 @@ The user assigns a multi-step task; the agent loops until tool completion, a pro
 graph LR
     A[Start Loop] --> B[Execute Task]
     B --> S[Auto-Save Session]
-    S --> TC{Tools used\nthis turn?}
+    S --> P{Promise\nconfigured?}
+    P -->|No| TC{Tools used\nthis turn?}
+    P -->|Yes| C
     TC -->|Yes + response| D1["✅ Tool Completion"]
     TC -->|No| C{Check Other Signals}
     C -->|Promise Found| D[✅ Promise Match]
@@ -57,11 +59,15 @@ graph LR
     classDef tool fill:#189AB4,color:#fff
     
     class A agent
-    class B,S,TC,C,D1,D,E,F tool
+    class B,S,P,TC,C,D1,D,E,F tool
 ```
 
 <Info>
 The most common completion path is **tool completion** — the model calls tools to do the work, then produces a summary without requesting more tools. This is the same mechanism ChatGPT and Claude use.
+</Info>
+
+<Info>
+**Promise mode.** When `completion_promise` is set, it is the **only** success signal. Heuristic exits (`tool_completion`, `goal`, `direct`, `no_tool_calls`) are skipped and the run ends only on the promise match, the goal judge (`goal_met`), or a safety limit (`max_iterations`, `timeout`, budget, doom loop). Verification hooks, if configured, must pass before the promise counts.
 </Info>
 
 ## Quick Start
@@ -69,6 +75,25 @@ The most common completion path is **tool completion** — the model calls tools
 <Steps>
 <Step title="Simple Usage">
 <CodeGroup>
+```python Promise Mode
+from praisonaiagents import Agent
+
+# The agent iterates until it emits <promise>DONE</promise>.
+# Heuristic exits are off — only the promise ends a successful run.
+agent = Agent(
+    name="builder",
+    instructions="Build the requested feature.",
+    autonomy={"mode": "iterative", "completion_promise": "DONE"},
+)
+
+result = agent.start("Create a REST API with user authentication")
+print(result.success, result.completion_reason, result.iterations)
+```
+
+```bash CLI
+praisonai loop "Refactor the auth module" -p DONE -n 10 -v
+```
+
 ```python Full Auto (iterative by default)
 from praisonaiagents import Agent
 
@@ -131,6 +156,8 @@ Use an explicit autonomy dict for iterative mode, completion_promise, and option
 
 ## How It Works
 
+<Tabs>
+<Tab title="Tool completion">
 ```mermaid
 sequenceDiagram
     participant User
@@ -160,6 +187,33 @@ sequenceDiagram
     Note over Auto: Tools were used + response > 100 chars
     Auto-->>User: ✅ AutonomyResult(reason="tool_completion")
 ```
+</Tab>
+<Tab title="Promise mode">
+```mermaid
+sequenceDiagram
+    participant User
+    participant Agent as agent.start()
+    participant Loop as run_autonomous()
+    participant LLM
+
+    User->>Agent: start("Refactor auth module")
+    Note over Agent: completion_promise="DONE"
+    Agent->>Loop: Route to iterative loop
+    Note over Loop: Auto-append "include<br/>#lt;promise#gt;DONE#lt;/promise#gt;"
+
+    loop Each iteration
+        Loop->>LLM: prompt (with promise instruction)
+        LLM-->>Loop: response + tool calls
+        Note over Loop: Tool completion / keywords skipped<br/>Only the promise tag counts
+        alt Promise tag in response
+            Loop-->>User: ✅ success=True, reason="promise"
+        else max_iterations reached
+            Loop-->>User: ❌ success=False, reason="max_iterations"
+        end
+    end
+```
+</Tab>
+</Tabs>
 
 <Tip>
 **Behind the scenes**: The inner tool loop handles ALL tool calls in a single turn. The model keeps calling tools until it's satisfied, then stops. The outer loop detects this and returns immediately — no unnecessary extra iterations.
@@ -198,6 +252,9 @@ sequenceDiagram
 | `max_budget_usd` | `Optional[float]` | `None` | Cumulative USD spend cap for the run. `None` = unlimited. |
 | `max_tokens` | `Optional[int]` | `None` | Cumulative token cap (input + output). `None` = unlimited. |
 | `budget_action` | `str` | `"pause"` | `"pause"` (recoverable) or `"stop"` (terminal) when a cap is hit. |
+| `snapshot` | `bool` | `False` | Take a pre-run workspace snapshot in `run_autonomous()` so `agent.undo()` can restore it. Requires `track_changes`. Off by default because snapshotting walks the whole project. |
+
+`agent.undo()` only works with `AutonomyConfig(track_changes=True, snapshot=True)` — see [File Snapshot](/features/file-snapshot).
 
 <Tip>
 See [Autonomy Budget](/features/autonomy-budget) for the full spend/token kill-switch guide, including pause-and-resume.
@@ -247,7 +304,29 @@ agent = Agent(
 )
 ```
 
+### Promise injection into the prompt
+
+When `completion_promise` is set, the loop automatically appends a one-line instruction to the prompt — **unless** the prompt or `instructions` already contain the exact `<promise>TEXT</promise>` tag.
+
+Given `agent.run_autonomous("Refactor auth module", completion_promise="DONE")`, the model actually sees:
+
+```text
+Refactor auth module
+
+When the task is fully complete, include <promise>DONE</promise> in your response.
+```
+
+To control the wording yourself, put the tag directly in `instructions` or the prompt — the loop detects it and skips the auto-append.
+
 ## CLI Usage
+
+<Note>
+`praisonai loop` always runs in `mode="iterative"`, so `--max-iterations`, `--completion-promise`, and `--clear-context` work without `--level full_auto`. In Python, `autonomy=True` still defaults to caller mode.
+</Note>
+
+<Note>
+`praisonai loop` exposes `--max-budget` and `--on-budget-exceeded`. The other run controls — `durable`, `journal_path`, and `resume_run_id` — are set from YAML (see [`execution:` block](/features/yaml-configuration-reference#execution-block)) or Python, not from `loop` flags. See [Agent Max Budget](/features/agent-max-budget).
+</Note>
 
 <Tabs>
   <Tab title="Basic">
@@ -270,6 +349,16 @@ agent = Agent(
     praisonai loop "Debug the issue" -t 300 -v
     ```
   </Tab>
+  <Tab title="With Budget Cap">
+    ```bash
+    praisonai loop "Research AI trends" --max-budget 0.50 -v
+    ```
+  </Tab>
+  <Tab title="Budget — warn only">
+    ```bash
+    praisonai loop "Keep refining" --max-budget 2.0 --on-budget-exceeded warn
+    ```
+  </Tab>
 </Tabs>
 
 ### CLI Options
@@ -279,7 +368,9 @@ agent = Agent(
 | `-n, --max-iterations` | Maximum iterations (default: 10) |
 | `-p, --completion-promise` | Promise text to signal completion |
 | `-c, --clear-context` | Clear chat history between iterations |
-| `-t, --timeout` | Timeout in seconds |
+| `-t, --timeout` | Timeout in seconds. On expiry the run returns `success=False`, `completion_reason="timeout"`. Only forwarded when set |
+| `--max-budget` | Hard USD spend cap for the **whole** loop (cumulative across iterations, not reset per iteration). Must be a positive, finite number — `0`, negatives, `nan`, and `inf` are rejected with exit code `2`. Omit for no cap |
+| `--on-budget-exceeded` | What happens when the cap is hit: `stop` (default — raises `BudgetExceededError`, CLI exits `1`) or `warn` (logs and continues). Any other value exits `2`. Only meaningful with `--max-budget` |
 | `-m, --model` | LLM model to use |
 | `-v, --verbose` | Show verbose output |
 
@@ -312,49 +403,115 @@ result.metadata = {
 }
 ```
 
+## Timeout
+
+Pass `timeout=` (seconds) to `agent.start()` or `agent.astart()` to cap a run in both caller and iterative modes.
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="worker",
+    instructions="Answer the question.",
+    autonomy={"level": "suggest"},  # caller mode
+)
+
+result = agent.start("Research topic X", timeout=30)
+if result.completion_reason == "timeout":
+    print("Budget exceeded:", result.output)  # "Task timed out"
+```
+
+```python
+import asyncio
+from praisonaiagents import Agent
+
+async def main():
+    agent = Agent(name="worker", instructions="Answer the question.", autonomy=True)
+    result = await agent.astart("Research topic X", timeout=30)
+    print(result.success, result.completion_reason)
+
+asyncio.run(main())
+```
+
+On expiry the result has `success=False`, `output="Task timed out"`, and `completion_reason="timeout"`.
+
+<Note>
+In caller mode, sync `start()` stops the run cooperatively through an internal `cancel_token`. If you pass your own `cancel_token=`, it wins and `timeout=` is ignored. Async `astart()` cancels the inner `achat()` task and waits for its cleanup before returning.
+</Note>
+
 ## How Completion Detection Works
 
+How the loop decides it's done depends on whether `completion_promise` is set.
+
+<Tabs>
+<Tab title="No promise set">
 ```mermaid
 graph TB
     Response["📝 Agent produces response"] --> ToolCheck{Used tools\nthis turn?}
-    ToolCheck -->|"Yes + response > 100 chars"| TC["✅ tool_completion\n(most common)"] 
-    ToolCheck -->|No| Promise{Promise tag\nin response?}
-    Promise -->|Yes| PM["✅ promise"]
-    Promise -->|No| Keyword{Completion\nkeywords?}
+    ToolCheck -->|"Yes + response > 100 chars"| TC["✅ tool_completion\n(most common)"]
+    ToolCheck -->|No| Keyword{Completion\nkeywords?}
     Keyword -->|Yes| KW["✅ goal"]
     Keyword -->|No| NoTool{2+ turns with\nno tool calls?}
     NoTool -->|Yes| NT["✅ no_tool_calls"]
     NoTool -->|No| Continue["🔄 Next iteration"]
-    
+
     classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
     classDef success fill:#10B981,stroke:#7C90A0,color:#fff
     classDef continue fill:#F59E0B,stroke:#7C90A0,color:#fff
-    
-    class Response,ToolCheck,Promise,Keyword,NoTool check
-    class TC,PM,KW,NT success
+
+    class Response,ToolCheck,Keyword,NoTool check
+    class TC,KW,NT success
     class Continue continue
 ```
+</Tab>
+<Tab title="Promise set">
+```mermaid
+graph TB
+    Response["📝 Agent produces response"] --> Judge{Goal judge\nsays done?}
+    Judge -->|Yes| GM["✅ goal_met"]
+    Judge -->|No| Hook{Verification hooks\npass?}
+    Hook -->|No| Limits{Hit a limit?}
+    Hook -->|Yes| Promise{Promise tag\nin response?}
+    Promise -->|Yes| PM["✅ promise"]
+    Promise -->|No| Limits
+    Limits -->|max_iterations| MI["❌ max_iterations"]
+    Limits -->|timeout| TO["❌ timeout"]
+    Limits -->|budget| BE["⚠️ budget_exhausted"]
+    Limits -->|No| Continue["🔄 Next iteration"]
+
+    classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef fail fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef continue fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class Response,Judge,Hook,Promise,Limits check
+    class GM,PM success
+    class MI,TO,BE fail
+    class Continue continue
+```
+</Tab>
+</Tabs>
 
 ## Completion Reasons
 
 <AccordionGroup>
   <Accordion title="tool_completion (most common)">
-    The model used tools to complete the task and then produced a summary response without requesting more tools. This is the **most reliable** completion signal — it's the same mechanism used by ChatGPT and all major LLM APIs.
+    The model used tools to complete the task and then produced a summary response without requesting more tools. This is the **most reliable** completion signal — it's the same mechanism used by ChatGPT and all major LLM APIs. **Not emitted when `completion_promise` is set.**
   </Accordion>
   <Accordion title="caller_mode">
-    Agent was in caller mode (`autonomy=True` default). Single `chat()` call wrapped in AutonomyResult.
+    Agent was in caller mode (`autonomy=True` default, or `level="suggest"` / `"auto_edit"`). A single `chat()` / `achat()` call wrapped in AutonomyResult. If `timeout=` elapses first, the reason is `timeout` instead. A `completion_promise` has no effect here — `caller` mode makes exactly one call.
   </Accordion>
   <Accordion title="promise">
-    Agent output contained a promise tag with TEXT matching the configured promise.
+    Agent output contained the configured promise tag (`<promise>TEXT</promise>`). When `completion_promise` is set, this is the **only** way the run returns `success=True` (apart from the goal judge's `goal_met`). Configured verification hooks must pass first.
   </Accordion>
   <Accordion title="goal">
-    Agent output contained completion keywords like "task completed" or "done".
+    Agent output contained completion keywords like "task completed" or "done". **Not emitted when `completion_promise` is set.**
   </Accordion>
   <Accordion title="no_tool_calls">
-    The model produced text without calling any tools for 2+ consecutive turns — indicates it has nothing left to do.
+    The model produced text without calling any tools for 2+ consecutive turns — indicates it has nothing left to do. **Not emitted when `completion_promise` is set.**
   </Accordion>
   <Accordion title="max_iterations">
-    Reached the maximum iteration limit without completion signal.
+    Reached the maximum iteration limit without completion signal. When `completion_promise` is set and the model never emits the tag, this is the expected failure mode — `result.success == False`.
   </Accordion>
   <Accordion title="doom_loop">
     Detected repeated identical actions (agent stuck in a loop). The session-level [Escalation Doom-Loop Detection](/features/escalation-doom-loop) subsystem also catches `NO_PROGRESS` stalls — now using a recency window so an early success no longer suppresses it.
@@ -363,7 +520,7 @@ graph TB
     `max_budget_usd` or `max_tokens` was reached. `result.metadata` carries `spend_usd`, `tokens`, `max_budget_usd`, `max_tokens`, and `status` (`"paused"` or `"stopped"`). With `budget_action="pause"` the run is resumable — raise the cap and re-invoke `run_autonomous`. See [Autonomy Budget](/features/autonomy-budget).
   </Accordion>
   <Accordion title="timeout">
-    Execution exceeded the configured timeout.
+    Execution exceeded the configured timeout. Applies to both caller and iterative modes — see [Timeout](#timeout).
   </Accordion>
   <Accordion title="needs_help">
     Doom loop recovery exhausted — task needs human guidance.
@@ -385,10 +542,10 @@ graph TB
   <Step title="Set Reasonable Limits">
     Configure `max_iterations` based on task complexity. Start low and increase if needed.
   </Step>
-  <Step title="Include Promise in Instructions">
-    Tell the agent to output the promise tag when done:
+  <Step title="Optionally Word the Promise Yourself">
+    The loop auto-appends the promise instruction to the prompt. To use your own wording, include the exact tag in `instructions`:
     ```python
-    instructions="When finished, output DONE in a promise tag"
+    instructions="When finished, output <promise>DONE</promise>"
     ```
   </Step>
 </Steps>

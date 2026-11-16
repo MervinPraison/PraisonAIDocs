@@ -487,9 +487,9 @@ sequenceDiagram
 
     Agent->>Runner: call_tool("get_file", {...})
     Runner->>Server: session.call_tool(...)
-    alt Transport failure
+    alt Transport failure (stdio)
         Server-->>Runner: (queue timeout / exception)
-        Runner-->>Agent: "Error: MCP tool call timed out ..."
+        Runner-->>Agent: {"error": "MCP tool call timed out after N seconds", "timeout": True, "mcp_error": True}
     else Application failure (isError=True)
         Server-->>Runner: CallToolResult(isError=True, content=[...])
         Runner-->>Agent: {"error": "...", "mcp_error": True}
@@ -502,6 +502,78 @@ sequenceDiagram
 <Note>
 The **server-side** `isError` behaviour of the PraisonAI MCP server is documented separately in [PraisonAI MCP Server → Error semantics](/mcp/praisonai-mcp-server#error-semantics). PR #5320 changes the *client* side — how `praisonaiagents.mcp.MCP` **reads** `isError` from any MCP server it connects to.
 </Note>
+
+### Transport-level failures on remote MCP tools
+
+Since PraisonAI PR [#5849](https://github.com/MervinPraison/PraisonAI/pull/5849) (fixes [#5848](https://github.com/MervinPraison/PraisonAI/issues/5848)), remote MCP tools return the same structured errors as stdio, so retry, circuit breaker, and `ON_RETRY` engage automatically.
+
+```python
+from praisonaiagents import Agent, MCP
+
+agent = Agent(
+    name="RemoteToolAgent",
+    instructions="Use the remote MCP tools to answer the user.",
+    tools=MCP("https://api.example.com/mcp"),
+)
+
+# A transient ConnectError or timeout is retried automatically
+agent.start("What's the latest reading?")
+```
+
+Affected classes (see the SDK reference):
+
+| Transport | Class | File |
+|-----------|-------|------|
+| Streamable HTTP | `HTTPStreamMCPTool` | `praisonaiagents/mcp/mcp_http_stream.py` |
+| SSE | `SSEMCPTool` | `praisonaiagents/mcp/mcp_sse.py` |
+| WebSocket | `WebSocketMCPTool` | `praisonaiagents/mcp/mcp_websocket.py` |
+
+**Timeout** (empty-message `TimeoutError`):
+
+```python
+{"error": "MCP tool call timed out after <timeout> seconds", "timeout": True, "mcp_error": True}
+```
+
+**Any other transport failure** (falls back to just the exception type when the message is empty):
+
+```python
+{"error": "MCP tool '<name>' failed: <ExcType>: <msg>", "mcp_error": True}
+```
+
+| Failure | Before | Now |
+|---------|--------|-----|
+| Timeout | `"Error: "` string, treated as success | Timeout dict, retried as `timeout` |
+| `httpx.ConnectError` | `"Error: "` string, treated as success | Error dict, retried as `connection_error` |
+| `httpx.ReadTimeout()` | `"Error: "` string, treated as success | `"MCP tool 'lookup' failed: ReadTimeout"` |
+
+Timed-out calls also cancel the pending future, so the abandoned request stops running.
+
+```mermaid
+graph TB
+    Call[🤖 Agent calls MCP tool] --> Q{Which transport?}
+    Q -->|stdio| S[Runner: timeout dict, isError dict]
+    Q -->|HTTP / SSE / WebSocket| R[Wrapper: structured error dict]
+    S --> Crash[Crash or dead runner: not retried]
+    S --> Loop
+    R --> Loop[🔁 Retry policy + circuit breaker + ON_RETRY]
+    Loop --> Done[✅ Recovered or reported]
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Call agent
+    class Q decision
+    class S,R,Crash,Loop process
+    class Done ok
+```
+
+<Note>
+stdio crashes and dead-runner errors are intentionally **not** retryable, since a replay could re-drive a call that already reached the server.
+</Note>
+
+See [Tool Retry Policy](/features/tool-retry-policy), [Tool Circuit Breaker](/features/tool-circuit-breaker), [Hook Events](/features/hook-events), and [MCP Transports](/mcp/transports).
 
 ---
 
@@ -638,6 +710,9 @@ Agents can use tools from multiple MCP servers simultaneously. Unpack each serve
 <CardGroup cols={2}>
 <Card icon="wrench" href="/features/tools">
   Tools — built-in tools and custom tool functions
+</Card>
+<Card icon="rotate" href="/features/tool-retry-policy">
+  Tool Retry Policy — how failed MCP calls are retried
 </Card>
 <Card icon="plug" href="/features/mcp-tool-filtering">
   MCP Tool Filtering — filter which tools to expose per agent

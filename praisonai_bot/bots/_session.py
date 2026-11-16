@@ -156,6 +156,32 @@ async def _null_async_context():
     yield
 
 
+def _bind_turn_clarify(asked: List[Any]):
+    """Bind the built-in ``clarify`` tool to this bot turn (Issue #5850).
+
+    A blocking "send and await reply" would deadlock on the per-user turn lock,
+    so the question is delivered with this turn's reply instead: choices become
+    ``MessagePresentation.question()`` reply buttons whose tap feeds the next
+    turn, and the agent is told to stop rather than guess. Returns a reset
+    token, or ``None`` when the core SDK lacks the binding.
+    """
+    try:
+        from praisonaiagents.tools.clarify import ClarifyHandler, set_clarify_handler
+    except ImportError:
+        return None
+
+    def _ask(question: str, choices: Optional[List[str]] = None) -> str:
+        asked.append((question, list(choices or [])))
+        return (
+            "Your question has been delivered to the user. Do not guess an answer: "
+            "end your turn now by restating the question"
+            + (" and its choices" if choices else "")
+            + ". Their answer will arrive as their next message."
+        )
+
+    return set_clarify_handler(ClarifyHandler(ask_callback=_ask))
+
+
 class BotSessionManager:
     """Lightweight per-user session store for bot agents.
 
@@ -1299,7 +1325,13 @@ class BotSessionManager:
                 from praisonaiagents.session.context import (
                     register_outbound_messenger as _register_messenger,
                     clear_outbound_messenger as _clear_messenger,
+                    register_gateway_loop,
                 )
+
+                # Background workers (e.g. a ``deliver``-backed subagent)
+                # send after the turn ends; record the loop the router's
+                # adapters live on so they schedule onto it.
+                register_gateway_loop(asyncio.get_running_loop())
 
                 origin_source = None
                 if self._platform and chat_id:
@@ -1310,8 +1342,24 @@ class BotSessionManager:
                         thread_id=thread_id,
                         message_id=message_id or None,
                     )
+                # Issue #6160: bind outbound effects to this turn's liveness.
+                # The run-control InterruptController is created fresh per run
+                # and set on /stop or supersede, so a stopped/superseded turn
+                # (or a retained handle to this messenger) is dropped
+                # fail-closed. A normally completed turn never sets it, so
+                # post-turn background deliveries keep working. No controller
+                # (run control off) -> unbound, today's behaviour.
+                from praisonaiagents.agent.interrupt import InterruptController
+
+                _ic = getattr(agent, "interrupt_controller", None)
                 messenger = BotOutboundMessenger(
-                    self._delivery_router, origin=origin_source
+                    self._delivery_router,
+                    origin=origin_source,
+                    liveness=(
+                        (lambda: not _ic.is_set())
+                        if isinstance(_ic, InterruptController)
+                        else None
+                    ),
                 )
                 messenger_token = _register_messenger(messenger)
             except Exception as e:  # pragma: no cover — defensive
@@ -1393,7 +1441,13 @@ class BotSessionManager:
                     # Agent instance never observe each other's chat_history.
                     async with agent_lock:
                         saved_history = agent.chat_history
-                        agent.chat_history = user_history
+                        # #5928: merge mirror-induced same-role runs so
+                        # strict-alternation providers never see them, and fold
+                        # a trailing user mirror into this turn's prompt.
+                        from ._mirror import coalesce_mirror_turns, fold_trailing_user_mirror
+                        agent.chat_history, turn_prompt = fold_trailing_user_mirror(
+                            coalesce_mirror_turns(user_history), prompt
+                        )
 
                         # Per-route toolset scope (Issue #2298): swap the
                         # agent's tools to the policy-allowed subset for this
@@ -1439,6 +1493,11 @@ class BotSessionManager:
                         # below while the turn executes.
                         self.note_run_progress()
 
+                        # Route the built-in ``clarify`` tool to the user for
+                        # this turn instead of its best-guess fallback.
+                        _clarify_asked: List[Any] = []
+                        _clarify_token = _bind_turn_clarify(_clarify_asked)
+
                         bridged_stream_callback = None
                         try:
                             # Choose streaming vs non-streaming path based on callback
@@ -1482,7 +1541,7 @@ class BotSessionManager:
 
                                 try:
                                     response = await asyncio.wait_for(
-                                        agent.astart(prompt, **astart_kwargs),
+                                        agent.astart(turn_prompt, **astart_kwargs),
                                         timeout=self._run_timeout if self._run_timeout > 0 else None,
                                     )
                                     if hasattr(response, "output"):
@@ -1536,7 +1595,7 @@ class BotSessionManager:
                                     )
                                 ):
                                     _chat_kwargs['attachments'] = attachments
-                                chat_call = partial(agent.chat, prompt, **_chat_kwargs)
+                                chat_call = partial(agent.chat, turn_prompt, **_chat_kwargs)
                                 
                                 # Run with timeout and interruption support
                                 try:
@@ -1581,6 +1640,9 @@ class BotSessionManager:
                             raise
                         finally:
                             agent.chat_history = saved_history
+                            if _clarify_token is not None:
+                                from praisonaiagents.tools.clarify import reset_clarify_handler
+                                reset_clarify_handler(_clarify_token)
                             # Restore the agent's original toolset if a
                             # per-route policy scoped it for this turn.
                             if _restore_tools is not None:
@@ -1622,6 +1684,9 @@ class BotSessionManager:
                         )
                         storage_key = self._storage_key(user_id)
                         text, presentation = extract_presentation(response)
+                        if presentation is None and _clarify_asked and _clarify_asked[-1][1]:
+                            from praisonaiagents.bots.presentation import MessagePresentation
+                            presentation = MessagePresentation.question(*_clarify_asked[-1])
                         # Issue #3296: optionally surface *why* the turn ended.
                         # The completion is read from the agent-emitted result
                         # first (AgentReply/dict), falling back to the agent's

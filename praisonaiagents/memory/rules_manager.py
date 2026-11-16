@@ -44,6 +44,7 @@ import logging
 from praisonaiagents._logging import get_logger
 import subprocess
 from pathlib import Path
+from ..utils.safe_path import safe_child
 from typing import Any, Dict, List, Optional, Literal, Callable
 from dataclasses import dataclass, field
 
@@ -194,7 +195,8 @@ class RulesManager:
         Find the git repository root from a starting path.
         
         Uses pure Python (no gitpython dependency) for performance.
-        Falls back to subprocess if needed.
+        Worktrees and submodules are covered by the walk-up (their ``.git``
+        is a file). ``git`` is only invoked when GIT_DIR/GIT_WORK_TREE is set.
         
         Args:
             start_path: Starting path (defaults to workspace_path)
@@ -212,7 +214,10 @@ class RulesManager:
                 return current
             current = current.parent
         
-        # Method 2: Fallback to git command (handles edge cases like worktrees)
+        # Method 2: Only GIT_DIR/GIT_WORK_TREE can locate a repo without a
+        # .git on disk; otherwise rev-parse would fail too (~9 ms per agent).
+        if not (os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE")):
+            return None
         try:
             result = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"],
@@ -511,9 +516,13 @@ class RulesManager:
                     dir_prefix = rules_dir_name.split("/")[0].strip(".")
                     self._rules[f"gitroot_{dir_prefix}:{rule.name}"] = rule
         
-        # 6. Load subdirectory rules (walk up from cwd to workspace/git root)
-        stop_at = git_root if git_root else self.workspace_path
-        current = Path.cwd()
+        # 6. Load subdirectory rules (walk up from cwd to workspace/git root).
+        # Skipped when cwd is outside that tree, so ancestors such as the
+        # user's home directory are never scanned.
+        stop_at = (git_root if git_root else self.workspace_path).resolve()
+        current = Path.cwd().resolve()
+        if not current.is_relative_to(stop_at):
+            current = stop_at
         while current != stop_at and current != current.parent:
             # Check .praisonai/rules/
             subdir_rules_dir = current / self.RULES_DIR_NAME.replace("/", os.sep)
@@ -804,7 +813,7 @@ class RulesManager:
             rules_dir = self.workspace_path / self.RULES_DIR_NAME.replace("/", os.sep)
         
         rules_dir.mkdir(parents=True, exist_ok=True)
-        file_path = rules_dir / f"{name}.md"
+        file_path = safe_child(rules_dir, name, ".md")
         
         # Build frontmatter
         import yaml

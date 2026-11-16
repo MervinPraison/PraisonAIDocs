@@ -1,26 +1,35 @@
 ---
 title: "Attach"
 sidebarTitle: "Attach"
-description: "Stream live events from a session running on the warm runtime"
+description: "Watch, steer, or interrupt a live session running on the warm runtime"
 icon: "play"
 ---
 
-`praisonai attach` subscribes to a live agent session on the warm runtime and streams its events in real time from a second terminal — read-only, with multiple observers supported.
+`praisonai attach` connects a second terminal to a live agent session on the warm runtime. By default it streams events read-only; with `--message` it steers the live turn, and with `--interrupt` it cancels it — both as one-shot sends that exit without streaming.
 
 ```mermaid
 graph LR
     A[Terminal A<br/>run --attach id] --> R[Warm Runtime]
     R -->|SSE events| B[Terminal B<br/>attach id]
     R -->|SSE events| C[Terminal C<br/>attach id --json]
+    D[Terminal D<br/>attach -m / --interrupt id] -->|POST steer/interrupt| R
+    R -.->|run.steer / run.interrupt| B
+    R -.->|run.steer / run.interrupt| C
 
     classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
     classDef output fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef control fill:#F59E0B,stroke:#7C90A0,color:#fff
 
     class A input
     class R process
     class B,C output
+    class D control
 ```
+
+<Note>
+Live-turn **steering** (`-m / --message`) and **interrupt** (`--interrupt`) landed in [PR #5847](https://github.com/MervinPraison/PraisonAI/pull/5847) (release after 2026-10-15). Earlier releases supported read-only observation only. If `attach -m` or `attach --interrupt` prints `runtime does not support …`, the warm daemon is older than your CLI — restart it with `praisonai daemon stop && praisonai daemon start`.
+</Note>
 
 ## Quick Start
 
@@ -42,6 +51,20 @@ praisonai run "Research topic X" --attach my-session
 praisonai attach my-session
 ```
 </Step>
+
+<Step title="Steer the live turn from another terminal">
+```bash
+praisonai attach -m "also update the tests" my-session
+```
+Sends the steering message and exits. The running agent picks it up on its next tool-loop iteration.
+</Step>
+
+<Step title="Interrupt the live turn from another terminal">
+```bash
+praisonai attach --interrupt my-session
+```
+Requests a cooperative cancel and exits. The run stops at the next safe boundary.
+</Step>
 </Steps>
 
 <Note>
@@ -58,13 +81,86 @@ So `praisonai run "..." --no-save --attach obs-1` streams events to observers un
 ## Usage
 
 ```bash
-praisonai attach <session-id> [--json]
+praisonai attach [--json] [--message TEXT] [--interrupt] <session-id>
 ```
+
+<Warning>
+Options must come **before** the session id. `praisonai attach <id> --json` and `praisonai attach <id> -m "..."` do **not** parse due to a Typer group-callback limitation. Always write `praisonai attach -m "..." <id>`.
+</Warning>
 
 | Argument / Option | Type | Default | Description |
 |---|---|---|---|
 | `session_id` | positional | required | Session id to attach to |
 | `--json` | flag | `false` | Emit raw NDJSON events instead of human-readable output |
+| `--message`, `-m` | string | `None` | Steer the live turn with this message, then exit (no streaming) |
+| `--interrupt` | flag | `false` | Request a cooperative cancel of the live turn, then exit (no streaming) |
+
+---
+
+## Steering a live turn
+
+Send mid-run guidance to a session that is already executing on the warm runtime; it lands on the agent's next tool-loop iteration without restarting the run.
+
+```bash
+# Terminal A — start a long-running agent on the warm runtime
+praisonai run "Research solar market trends and write a 500-word summary" --attach my-session
+
+# Terminal B — steer it mid-run
+praisonai attach -m "Focus on the EU market only" my-session
+
+# Terminal B (optional) — stop it early
+praisonai attach --interrupt my-session
+```
+
+```
+User (Term A):  praisonai run "research solar market trends..." --attach my-session
+Agent:          (searching → reading → summarising …)
+User (Term B):  praisonai attach -m "focus on the EU market only" my-session
+Agent:          (next iteration picks up guidance, re-scopes the next search)
+User (Term B):  praisonai attach --interrupt my-session
+Agent:          ■ run.interrupt requested — stops at next safe boundary
+```
+
+<Tip>
+The CLI always sends priority `5` (NORMAL). For `URGENT` (20) or `INTERRUPT` (30) priorities, call `agent.steer(message, priority=…)` from Python. See [Message Steering](/features/message-steering).
+</Tip>
+
+---
+
+## Interrupting a live turn
+
+`--interrupt` requests a cooperative cancel; the agent stops at the next safe boundary, so partial progress and conversation history stay intact.
+
+```bash
+praisonai attach --interrupt my-session
+```
+
+<Note>
+`--interrupt` only cancels the **currently running turn**. The session stays warm — the next `praisonai run --session my-session "..."` continues from where the interrupted turn left off.
+</Note>
+
+---
+
+## Which flag do I want?
+
+```mermaid
+graph TB
+    Q[Attached to a running session] --> W{What do I want?}
+    W -->|Just watch events| S[praisonai attach id]
+    W -->|Send new guidance mid-run| M[praisonai attach -m text id]
+    W -->|Stop the current turn| I[praisonai attach --interrupt id]
+    W -->|Pipe JSON to a tool| J[praisonai attach --json id]
+
+    classDef question fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef start fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef action fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Q start
+    class W question
+    class S,M,I,J action
+```
+
+Both flags can be combined (`-m "focus" --interrupt <id>`): the message is sent first, then the interrupt.
 
 ---
 
@@ -72,21 +168,27 @@ praisonai attach <session-id> [--json]
 
 ```mermaid
 sequenceDiagram
-    participant A as Terminal A
+    participant A as Terminal A (run --attach)
     participant R as Warm Runtime
-    participant H as Event Hub
-    participant B as Terminal B
-    participant C as Terminal C
+    participant G as Live Agent
+    participant B as Terminal B (attach)
+    participant C as Terminal C (attach -m / --interrupt)
 
-    A->>R: run --attach my-session
-    B->>R: attach my-session
-    C->>R: attach my-session --json
-    R->>H: fan-out session events
-    H-->>B: run.start / run.result / run.error
-    H-->>C: NDJSON lines
+    A->>R: /run (session=my-session)
+    R->>G: agent.start(prompt)
+    B->>R: GET /sessions/my-session/events (SSE)
+    R-->>B: run.start
+    C->>R: POST /sessions/my-session/steer {message}
+    R->>G: agent.steer(message, priority=5)
+    R-->>B: run.steer {message}
+    C->>R: POST /sessions/my-session/interrupt
+    R->>G: interrupt request ("attach")
+    R-->>B: run.interrupt {reason: "attach"}
+    G-->>R: result (or clean stop)
+    R-->>B: run.result
 ```
 
-Attaching never starts execution — it only observes. Detaching (Ctrl-C) does not stop the run on terminal A.
+Attaching never starts execution; plain `attach` only observes, while `-m` and `--interrupt` act on a turn already in flight (not gated by the run lock). Detaching (Ctrl-C) does not stop the run on terminal A.
 
 <Tip>
 Events arrive over Server-Sent Events at `GET /sessions/{session_id}/events` with Bearer auth from the runtime lockfile. Session ids are percent-encoded on the wire. A `: keep-alive` comment is sent every ~15s and ignored.
@@ -101,6 +203,8 @@ Events arrive over Server-Sent Events at `GET /sessions/{session_id}/events` wit
 | `run.start` | `session_id`, `prompt` | `▶ run.start: <prompt>` |
 | `run.result` | `session_id`, `ok`, `result` | `✓ run.result` then result text |
 | `run.error` | `session_id`, `error` | `✗ run.error: <error>` |
+| `run.steer` | `session_id`, `message` | `↪ run.steer: <message>` |
+| `run.interrupt` | `session_id`, `reason` | `■ run.interrupt requested` |
 
 <Tabs>
 <Tab title="Human output">
@@ -117,6 +221,8 @@ praisonai attach my-session --json | jq 'select(.type=="run.result")'
 ```
 ```json
 {"type": "run.start", "session_id": "my-session", "prompt": "Research topic X"}
+{"type": "run.steer", "session_id": "my-session", "message": "Focus on the EU market only"}
+{"type": "run.interrupt", "session_id": "my-session", "reason": "attach"}
 {"type": "run.result", "session_id": "my-session", "ok": true, "result": "..."}
 ```
 </Tab>
@@ -128,8 +234,8 @@ praisonai attach my-session --json | jq 'select(.type=="run.result")'
 
 | Code | Meaning |
 |---|---|
-| `0` | Clean detach (Ctrl-C) |
-| `1` | No compatible warm runtime, or stream lost mid-attach |
+| `0` | Clean detach (Ctrl-C), or steer/interrupt sent |
+| `1` | No compatible warm runtime, runtime lacks steer/interrupt support, or stream lost mid-attach |
 | `4` | Runtime module not importable |
 
 ---
@@ -143,6 +249,10 @@ praisonai attach my-session --json | jq 'select(.type=="run.result")'
 **Multiple observers** — several terminals can attach to the same session concurrently; all receive the same events.
 
 **Observe without persisting** — `praisonai run "..." --no-save --attach obs-1` streams events under `obs-1` for observers while keeping the run on the anonymous, non-persisted path.
+
+**Steer a long multi-tool run from a second terminal** — `praisonai attach -m "focus on the EU market only" my-session` lands on the next tool-loop iteration without restarting the run.
+
+**Stop a stuck turn without losing the session** — `praisonai attach --interrupt my-session` cancels the current turn only; the next `run --session my-session` continues from where it left off.
 
 ---
 
@@ -161,6 +271,14 @@ Run `praisonai daemon start` before `run --attach`. Without a warm runtime, atta
 Ctrl-C in an attach terminal never cancels the underlying agent run.
 </Accordion>
 
+<Accordion title="One-shot steer and interrupt, not an interactive loop">
+`-m` and `--interrupt` send one request and exit. Run them again from a second terminal as needed; there is no persistent input loop inside `attach`.
+</Accordion>
+
+<Accordion title="Older daemon? Restart it after upgrading">
+If `attach -m` or `attach --interrupt` prints `runtime does not support …`, the warm daemon pre-dates PR #5847. Run `praisonai daemon stop && praisonai daemon start` to pick up the new routes.
+</Accordion>
+
 <Accordion title="Version mismatch after upgrade">
 If CLI and daemon major versions differ, attach refuses to connect. Run `praisonai daemon stop && praisonai daemon start` after upgrading.
 </Accordion>
@@ -176,5 +294,8 @@ If CLI and daemon major versions differ, attach refuses to connect. Run `praison
 </Card>
 <Card title="Daemon" icon="bolt" href="/cli/daemon">
   Warm runtime lifecycle and version handshake
+</Card>
+<Card title="Message Steering" icon="compass" href="/features/message-steering">
+  Send guidance from Python with priority levels (URGENT / INTERRUPT)
 </Card>
 </CardGroup>

@@ -282,9 +282,11 @@ class MemoryConfig:
     history: bool = False
     history_limit: int = 10
 
-    # Turn-start long-term memory retrieval. Disabled by default so existing
-    # agents incur no backend query or prompt changes.
-    prefetch: bool = False
+    # Turn-start long-term memory retrieval. None = auto: on for query-based
+    # backends (sqlite/chroma/mem0), whose system-prompt context is empty
+    # without a query; off for FileMemory, which injects recent items itself.
+    # True/False force it on/off.
+    prefetch: Optional[bool] = None
     prefetch_limit: int = 5
     prefetch_token_budget: int = 512
     
@@ -590,8 +592,11 @@ class GuardrailConfig:
         # With validator function
         Agent(guardrails=my_validator_fn)
         
-        # With string preset
-        Agent(guardrails="strict")  # Uses strict preset
+        # With a string: an LLM-validation prompt (not a preset name)
+        Agent(guardrails="Ensure the response is polite")
+
+        # With a preset (sets max_retries only) plus a validator
+        Agent(guardrails=["strict", {"validator": my_validator_fn}])
 
         # For tool policy enforcement, use the dedicated `policy` param instead:
         Agent(policy=PolicyEngine(...))  # policy strings on guardrails are NOT enforced
@@ -600,7 +605,7 @@ class GuardrailConfig:
         Agent(guardrails=GuardrailConfig(
             validator=my_validator_fn,
             max_retries=3,
-            on_fail="retry",
+            on_fail="retry",  # only "retry" is implemented
         ))
         
         # With LLM-based validation
@@ -909,7 +914,8 @@ class ExecutionConfig:
     # ``rate_limiter`` explicitly for burst/TPM control (it takes precedence).
     max_rpm: Optional[int] = None
     
-    # Time limits
+    # Time limits: per-turn wall-clock seconds for the loop guard.
+    # None = loop-guard default (600s); 0 = no time limit.
     max_execution_time: Optional[int] = None
     
     # Retry settings
@@ -971,6 +977,11 @@ class ExecutionConfig:
     # in __post_init__) so the Agent can tell an explicit False from an omitted one
     # and reject a conflicting ToolConfig(parallel=True) instead of silently winning.
     parallel_tool_calls: Optional[bool] = None
+
+    # Auto-continue a final answer cut off by the output-token limit
+    # (finish_reason="length"): True = up to 3 continuations (default),
+    # False/0 = disabled (surface ``length_truncated`` immediately), int = cap.
+    output_continuation: Union[bool, int] = True
 
     # Durable tool-loop replay. Default-off keeps the execution hot path free
     # of journal construction and SQLite writes.
@@ -1101,6 +1112,7 @@ class ExecutionConfig:
             "compaction_strategy": self.compaction_strategy.value if self.compaction_strategy and hasattr(self.compaction_strategy, 'value') else (str(self.compaction_strategy) if self.compaction_strategy else None),
             "max_budget": self.max_budget,
             "parallel_tool_calls": self.parallel_tool_calls,
+            "output_continuation": self.output_continuation,
             "durable": self.durable,
             "journal_path": self.journal_path,
             "resume_run_id": self.resume_run_id,
@@ -1146,6 +1158,7 @@ class ExecutionConfig:
             compaction_strategy=compaction_strategy,
             max_budget=data.get("max_budget", None),
             parallel_tool_calls=data.get("parallel_tool_calls", None),
+            output_continuation=data.get("output_continuation", True),
             durable=data.get("durable", False),
             journal_path=data.get("journal_path", None),
             resume_run_id=data.get("resume_run_id", None),

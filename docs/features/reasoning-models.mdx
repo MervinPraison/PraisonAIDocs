@@ -62,6 +62,20 @@ agent.start("Explain the CAP theorem with an example.")
 
 You can keep writing `max_tokens=...` — on reasoning models it is rewritten to `max_completion_tokens` before the request.
 </Step>
+
+<Step title="Per-call sampling kwargs are safe to pass">
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(name="Reasoner", instructions="Think it through.", llm="o4-mini")
+
+# temperature is dropped automatically on reasoning models — no error.
+agent.chat("Explain the CAP theorem.", temperature=0.2)
+```
+
+PraisonAI quietly strips `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, and `logit_bias` on reasoning models, whichever path the request takes.
+</Step>
 </Steps>
 
 ---
@@ -74,21 +88,23 @@ PraisonAI checks the model before every call and rewrites parameters only when t
 sequenceDiagram
     participant User
     participant Agent
-    participant Params as _build_completion_params
-    participant Detect as is_reasoning_model
-    participant LLM as LiteLLM / OpenAI
+    participant Native as openai_client<br/>(_normalize_chat_params<br/>+ _build_responses_input)
+    participant LiteLLMPath as llm.py<br/>_build_completion_params
+    participant LLM as OpenAI / LiteLLM
 
     User->>Agent: agent.start("...")
-    Agent->>Params: build request params
-    Params->>Detect: is_reasoning_model(model)?
-    Detect-->>Params: True / False
-    alt Reasoning model
-        Params->>Params: max_tokens → max_completion_tokens
-        Params->>Params: drop temperature, top_p, penalties, logit_bias
-    else Chat model
-        Params->>Params: send max_tokens + sampling params as-is
+    alt Native OpenAI client path
+        Agent->>Native: build request params
+        Native->>Native: omit temperature=None, max_tokens=None
+        Native->>Native: reasoning? max_tokens → max_completion_tokens
+        Native->>Native: reasoning? drop temperature, top_p, penalties, logit_bias
+        Native->>LLM: chat.completions.create(...) or responses.create(...)
+    else LiteLLM path
+        Agent->>LiteLLMPath: build request params
+        LiteLLMPath->>LiteLLMPath: reasoning? max_tokens → max_completion_tokens
+        LiteLLMPath->>LiteLLMPath: drop temperature, top_p, penalties, logit_bias
+        LiteLLMPath->>LLM: completion(...)
     end
-    Params->>LLM: normalised request
     LLM-->>Agent: response
     Agent-->>User: answer
 ```
@@ -96,9 +112,9 @@ sequenceDiagram
 | Step | Behaviour |
 |------|-----------|
 | Detection | `is_reasoning_model(model)` decides the path |
-| Reasoning model | `max_tokens` renamed, sampling params dropped |
+| Reasoning model | `max_tokens` renamed and sampling params dropped on both paths |
 | Chat model | Parameters sent unchanged |
-| Responses API path | Already uses `max_output_tokens` — unchanged |
+| Responses API path | Already uses `max_output_tokens`; `temperature` omitted on reasoning models |
 
 ---
 
@@ -119,29 +135,34 @@ Results are cached with `functools.lru_cache(maxsize=256)`.
 | OpenAI gpt-5.x | `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5.6-luna`, … | prefix + litellm |
 
 <Note>
-Provider prefixes are stripped before matching: `openai/o3-mini` → `o3-mini`.
+Provider prefixes are stripped before matching: `openai/o3-mini` → `o3-mini`. Both the native OpenAI client path and the LiteLLM path use the same `is_reasoning_model()` check, so any model LiteLLM's `supports_reasoning()` recognises is normalised on either path, not only the prefix-matched families.
 </Note>
 
 ---
 
 ## Parameter Behaviour
 
-On a reasoning model, PraisonAI rewrites and drops parameters as follows.
+<Note>
+Before PraisonAI [#6131](https://github.com/MervinPraison/PraisonAI/pull/6131) (merged 2026-10-30, closes [#6128](https://github.com/MervinPraison/PraisonAI/issues/6128)), `Agent(llm="o4-mini")` with a per-call `temperature` (e.g. `agent.chat("...", temperature=0.2)`) was rejected by OpenAI with `HTTP 400 Unsupported value: 'temperature' …` and `chat()` returned `None`. The native OpenAI client path now drops unsupported sampling params on both the Responses API and the Chat Completions fallback, so `Agent(llm="o4-mini")` and `Agent(llm="openai/o4-mini")` behave the same.
+</Note>
 
-| Rule | Effect |
-|------|--------|
-| `max_tokens` → `max_completion_tokens` | Silently renamed. |
-| `max_completion_tokens` (explicit) | Wins over `max_tokens`; `max_tokens` is still dropped. |
-| `temperature` | Silently dropped on reasoning models. |
-| `top_p` | Silently dropped. |
-| `presence_penalty` | Silently dropped. |
-| `frequency_penalty` | Silently dropped. |
-| `logit_bias` | Silently dropped. |
-| Chat models (non-reasoning) | Unchanged — still send `max_tokens` and all sampling params. |
-| Responses API path | Already used `max_output_tokens` correctly — unchanged. |
+<Note>
+Before PraisonAI [#5910](https://github.com/MervinPraison/PraisonAI/pull/5910) (merged 2026-10-19), `Agent(llm="o3-mini" | "gpt-5" | …)` could send a request body containing `"max_tokens": null`, which reasoning models rejected with `400 invalid_type` (`Invalid type for 'max_tokens': expected an unsupported value, but got null instead.`) and the agent returned an empty answer. The native OpenAI client path now omits unset `temperature`/`max_tokens` and maps an explicit `max_tokens` to `max_completion_tokens` for reasoning models — your `Agent(...)` code just works.
+</Note>
+
+On a reasoning model, PraisonAI rewrites and drops parameters as follows. Both paths apply the same rules.
+
+| Rule | Native OpenAI client path | LiteLLM path |
+|------|---------------------------|--------------|
+| `max_tokens` → `max_completion_tokens` | Renamed | Renamed |
+| `max_completion_tokens` (explicit) | Wins over `max_tokens` | Wins over `max_tokens` |
+| `temperature` / `max_tokens` left unset | Omitted from the request | Omitted from the request |
+| `temperature` set explicitly | Dropped (Responses API and Chat Completions) | Dropped |
+| `top_p`, `presence_penalty`, `frequency_penalty`, `logit_bias` | Dropped (Chat Completions) | Dropped |
+| Chat models (non-reasoning) | Unchanged | Unchanged |
 
 <Warning>
-Reasoning models reject `temperature`, `top_p`, and penalty params. PraisonAI drops them silently so your code keeps working — but the values have no effect. If you rely on deterministic sampling, use a chat model instead.
+Reasoning models reject `temperature`, `top_p`, and penalty params. PraisonAI drops them silently on both paths so your code keeps working — but the values have no effect. If you rely on deterministic sampling, use a chat model such as `gpt-4o` instead.
 </Warning>
 
 ---
@@ -223,7 +244,7 @@ agent.start("Compare quicksort and mergesort.")
 
 <AccordionGroup>
 <Accordion title="Don't set temperature or top_p on reasoning models">
-They are silently dropped. If you rely on determinism or creative sampling, prefer a chat model such as `gpt-4o`.
+They have no useful effect — PraisonAI drops them on both the LiteLLM path and the native OpenAI client path. Your code keeps working, but the values are ignored. If you rely on determinism or creative sampling, prefer a chat model such as `gpt-4o`.
 </Accordion>
 
 <Accordion title="Prefer max_completion_tokens when you want to be explicit">

@@ -395,14 +395,17 @@ class YAMLConfig(BaseModel):
     config: Optional[GlobalConfig] = Field(default=None, description="Global configuration")
     
     # LLM config
-    llm: Optional[str] = Field(default=None, description="Default LLM")
+    llm: Optional[Union[str, Dict[str, Any]]] = Field(default=None, description="Default LLM (string or dict with 'model' key)")
     models: Optional[Dict[str, Any]] = Field(default=None, description="Model configurations")
     providers: Optional[Dict[str, Any]] = Field(default=None, description="Provider configurations")
 
     # Deployment / dependency declarations
     deploy: Optional[Dict[str, Any]] = Field(default=None, description="Deployment configuration")
     dependencies: Optional[Any] = Field(default=None, description="Task dependency declarations")
-    
+
+    # PraisonAI Replay: record every run of this file (same as --save)
+    save_replay: Optional[bool] = Field(default=None, description="Record a replay trace for each run (praisonai replay)")
+
     @model_validator(mode='after')
     def validate_config_structure(self):
         """Validate overall configuration structure."""
