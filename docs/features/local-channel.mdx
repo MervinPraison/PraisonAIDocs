@@ -135,6 +135,86 @@ Yes, still here.
 
 ---
 
+## Testing / CI — Offline Harness
+
+The `local` channel doubles as a credential-free, network-free test harness for a full bot turn. Pass any file-like `stdin`/`stdout` to drive the real hook → command → session → send path and assert the reply.
+
+```python
+import asyncio
+import io
+from praisonaiagents import Agent
+from praisonai_bot.bots import LocalBot
+
+agent = Agent(name="assistant", instructions="Be helpful")
+
+out = io.StringIO()
+bot = LocalBot(
+    agent=agent,
+    stdin=io.StringIO("What's 2+2?\n"),  # one turn, then EOF
+    stdout=out,
+)
+
+asyncio.run(bot.start())           # returns at EOF
+assert "4" in out.getvalue()       # real reply, real pipeline
+```
+
+```mermaid
+sequenceDiagram
+    participant Test as 🧪 Test / CI
+    participant In as 📥 io.StringIO (stdin)
+    participant Bot as 💻 LocalBot
+    participant Session as 🧠 BotSessionManager
+    participant Agent as 🤖 Agent
+    participant Out as 📤 io.StringIO (stdout)
+
+    Test->>In: write "What's 2+2?\n"
+    In->>Bot: readline()
+    Bot->>Session: chat(local-operator, "What's 2+2?")
+    Session->>Agent: run turn (optionally ScriptedModel)
+    Agent-->>Session: "4"
+    Session-->>Bot: "4"
+    Bot->>Out: write("4\n")
+    Test->>Out: assert "4" in getvalue()
+    Note over Test,Out: sys.stdin / sys.stdout are not touched
+```
+
+What runs, end to end:
+
+- `MESSAGE_RECEIVED` hook
+- Built-in command dispatch (`/help`, `/status`, …)
+- `BotSessionManager.chat` — the shared session, identity resolver, and admission ladder
+- `MESSAGE_SENDING` / `MESSAGE_SENT` hooks
+- `send_message` → your `stdout`
+
+No channel token is needed, and `sys.stdin` / `sys.stdout` are never monkey-patched. The input prompt (`you> `) is written to the same `stdout`, so assert with `in` rather than equality.
+
+The agent still calls its own model. For a **fully offline** run, swap the LLM for `ScriptedModel` from [Offline Testing](/features/offline-testing) — the two features compose directly.
+
+```python
+import asyncio
+import io
+from praisonaiagents import Agent, ScriptedModel
+from praisonai_bot.bots import LocalBot
+
+model = ScriptedModel(["4"])
+agent = Agent(instructions="You are a math bot.", llm=model)
+
+out = io.StringIO()
+bot = LocalBot(agent=agent, stdin=io.StringIO("What's 2+2?\n"), stdout=out)
+asyncio.run(bot.start())
+assert "4" in out.getvalue()
+```
+
+### Which mode should I use?
+
+| Scenario | How to run `LocalBot` |
+|----------|----------------------|
+| Chatting at your own terminal | `BotOS(agent=agent, platforms=["local"]).run()` — defaults use `sys.stdin`/`sys.stdout` |
+| Scripted demo / recorded transcript | `LocalBot(agent=agent, stdin=io.StringIO("..."), stdout=open("transcript.txt", "w"))` |
+| Unit test / CI assertion | `LocalBot(agent=agent, stdin=io.StringIO("..."), stdout=io.StringIO())` + `ScriptedModel` for a fully offline run |
+
+---
+
 ## How It Works
 
 Each line of stdin becomes one agent turn through the shared `BotSessionManager`, and the reply is written to stdout.
@@ -187,7 +267,16 @@ The local channel is token-free and declares a single config field.
 |--------|------|---------|-------------|
 | `prompt` | `str` | `"you> "` | Terminal input prompt |
 
-Constructor kwargs on `LocalBot`: `token=""` (unused, kept for parity), `agent`, `config`, `prompt`.
+Constructor kwargs on `LocalBot`: `token=""` (unused, kept for parity), `agent`, `config`, `prompt`, `stdin`, `stdout`.
+
+Two of those are Python-constructor-only — they are **not** `gateway.yaml` fields:
+
+| Kwarg | Type | Default | Description |
+|-------|------|---------|-------------|
+| `stdin` | file-like | `None` → `sys.stdin` | Where the read loop reads lines from. Any object with a `.readline()` method works (`io.StringIO`, a `pytest` fixture, a pipe). |
+| `stdout` | file-like | `None` → `sys.stdout` | Where the prompt and outbound replies are written. Any object with `.write()` + `.flush()` works. |
+
+When left as `None`, the fallback to `sys.stdin` / `sys.stdout` is looked up on **each call**, not cached at construction — so swapping `sys.stdout` after building the bot is still picked up.
 
 <CardGroup cols={2}>
 <Card icon="code" href="/sdk/reference/python/classes/LocalBot">
@@ -281,6 +370,7 @@ await botos._delivery_router.deliver("local:local", "proactive-ping")
 2. **Single-user personal agent** on your own box — no bot registration.
 3. **Start-here, continue-there** — chat locally at your desk, keep the same session going from your phone via Telegram.
 4. **Proactive terminal notice** — a scheduled job that pings `deliver="local:local"` prints straight into the operator's terminal.
+5. **Offline harness in tests/CI** — assert that a real bot turn (hook → session → agent → send) produces the expected reply, with no token, no network, and no `sys` monkey-patching.
 
 ---
 
@@ -304,6 +394,10 @@ A TTY has no markdown rendering. If you also serve remote channels from the same
 The read loop is intentionally not supervised (`supervised_inbound = False`), so EOF ends cleanly and the process exits without a reconnect storm.
 </Accordion>
 
+<Accordion title="Prefer injected streams over monkey-patching sys">
+Tests that reassign `sys.stdin`/`sys.stdout` leak into the rest of the process (and other tests). The `stdin`/`stdout` kwargs give you the same reach into the read-and-write path without that cost — a cancelled test cannot leave the process in a half-swapped state.
+</Accordion>
+
 </AccordionGroup>
 
 ---
@@ -322,5 +416,8 @@ The read loop is intentionally not supervised (`supervised_inbound = False`), so
 </Card>
 <Card title="Bot Chat Commands" icon="terminal" href="/features/bot-commands">
   `/status`, `/new`, `/help`, `/stop`
+</Card>
+<Card title="Offline Testing (ScriptedModel)" icon="flask" href="/features/offline-testing">
+  Pair with `ScriptedModel` for a fully offline bot turn
 </Card>
 </CardGroup>

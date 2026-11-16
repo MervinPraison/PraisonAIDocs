@@ -306,7 +306,7 @@ graph TB
         S4 -->|match| OK
         S4 -->|miss| S5[5. block_anchor + similarity 0.7]
         S5 -->|match| OK
-        S5 -->|miss| ERR[⚠️ String not found]
+        S5 -->|miss| ERR[⚠️ String not found + closest-match hint]
         OK --> AMB{Single span?}
         AMB -->|yes| W[💾 Write + diff]
         AMB -->|no| AMBERR[⚠️ Ambiguous match]
@@ -350,6 +350,86 @@ edit_file(
 
 <Note>
 **Why this matters for coding agents:** LLM-generated `old_string` values routinely drift by whitespace, indentation, or line endings. The fuzzy ladder makes the first attempt succeed when the target is unambiguous, saving retry turns and tokens.
+</Note>
+
+---
+
+## Self-Correcting No-Match Hints
+
+When the fuzzy ladder finds nothing, the error shows the most similar lines of the file so the agent can fix `old_string` and retry without re-reading.
+
+```mermaid
+graph LR
+    subgraph "No-Match Hint Flow"
+        A[🤖 Agent old_string] --> F[🔎 Fuzzy ladder]
+        F -->|no match| C{📏 Similar region ≥ 0.6?}
+        C -->|yes| H[📍 Error + numbered lines]
+        C -->|no| E[⚠️ Plain not-found error]
+        H --> R[🤖 Agent retries]
+    end
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef step fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef check fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef ok fill:#10B981,stroke:#7C90A0,color:#fff
+    classDef warn fill:#F59E0B,stroke:#7C90A0,color:#fff
+
+    class A,R agent
+    class F step
+    class C check
+    class H ok
+    class E warn
+```
+
+### Agent Quick Start
+
+```python
+from praisonaiagents import Agent
+
+agent = Agent(
+    name="Self-Correcting Editor",
+    instructions=(
+        "Edit files precisely. If a 'String not found' error includes a "
+        "'Closest match in the file' block, copy old_string from those lines "
+        "and retry."
+    ),
+    tools=["read_file", "edit_file"],
+)
+
+agent.start("In src/compute.py, change `return x * 2` to `return x * 3`.")
+```
+
+How it plays out:
+
+1. The agent sends an `old_string` that is slightly off (for example `def compute(y):` instead of `def compute(x):`).
+2. `edit_file` fails and shows the closest lines with line numbers.
+3. The agent copies those lines into `old_string` and retries — no extra `read_file` call.
+
+### What the hint looks like
+
+```text
+Error: String not found in file: 'def compute(y):...'. Closest match in the file, lines 3-4:
+    3| def compute(x):
+    4|     total = x * 2
+Adjust old_string to match these lines exactly, or re-read the file if it changed.
+```
+
+`apply_patch` Update and Move hunks use the same hint after `Error: Hunk not found in '<path>': '<preview>'`.
+
+### When the hint appears
+
+| Condition | Hint shown? |
+|---|---|
+| A region of the file reaches similarity ≥ 0.6 | ✅ Yes |
+| Nothing in the file is similar enough | ❌ No — plain not-found error |
+| `old_string` longer than 2000 characters | ❌ No — skipped to keep it fast |
+| File longer than 20000 lines | ❌ No — skipped to keep it fast |
+| Search budget runs out | ✅ Best match found so far |
+
+The hint shows up to 10 lines (with `...` if the region is longer), and each line is cut to 200 characters with `... [truncated]`. Success and ambiguous-match messages are unchanged.
+
+<Note>
+**No "already applied" shortcut.** Similarity cannot prove *where* an earlier edit landed, so a fake success could silently drop an edit. The tool fails loudly and shows the current lines instead; `apply_patch` stays all-or-nothing.
 </Note>
 
 ---
@@ -565,7 +645,8 @@ sequenceDiagram
 | Delete target missing | `Error: Cannot delete '<path>': file not found` |
 | Update target missing | `Error: Cannot update '<path>': file not found` |
 | Empty hunk old-block | `Error: Empty hunk in update for '<path>'` |
-| Hunk not found | `Error: Hunk not found in '<path>': '<preview>'` |
+| Hunk not found (nothing similar) | `Error: Hunk not found in '<path>': '<preview>'` |
+| Hunk not found (close match exists) | `Error: Hunk not found in '<path>': '<preview>'. Closest match in the file, lines {start}-{end}:` + numbered lines + `Adjust old_string to match these lines exactly, or re-read the file if it changed.` |
 | Ambiguous hunk | `Error: Ambiguous hunk in '<path>': '<preview>' matches N locations` |
 | UTF-16 file | `Error: Cannot update '<path>': UTF-16 encoding is not supported. Please convert the file to UTF-8.` |
 | Automatic staleness — Update | `Error: Cannot update '{path}': file changed since it was read - re-read before editing (or pass force=True to override).` |
@@ -576,7 +657,8 @@ sequenceDiagram
 | Move source missing | `Error: Cannot move '<src>': file not found` |
 | Move destination already exists | `Error: Cannot move '<src>' to '<dst>': destination already exists` |
 | Empty hunk old-block in a Move | `Error: Empty hunk in move for '<src>'` |
-| Hunk not found in a Move | `Error: Hunk not found in '<src>': '<preview>'` |
+| Hunk not found in a Move (nothing similar) | `Error: Hunk not found in '<src>': '<preview>'` |
+| Hunk not found in a Move (close match exists) | `Error: Hunk not found in '<src>': '<preview>'. Closest match in the file, lines {start}-{end}:` + numbered lines + `Adjust old_string to match these lines exactly, or re-read the file if it changed.` |
 | Ambiguous hunk in a Move | `Error: Ambiguous hunk in '<src>': '<preview>' matches N locations` |
 | Cross-op conflict on same destination | `Error: Conflicting operations target the same path '<dst>' (also produced by '<earlier op display>')` |
 | Automatic staleness — Move | `Error: Cannot move '<src>': file changed since it was read - re-read before editing (or pass force=True to override).` |
@@ -856,7 +938,8 @@ edit_file("rollback.txt", "v2", "v1", force=True)
 | `write_file` stale refusal | (logger error; tool returns `False`) `Refusing to write {filepath}: file changed since it was read - re-read before writing (or pass force=True)` |
 | `write_file` verify-read failure | (logger error; tool returns `False`) `Refusing to write {filepath}: could not verify staleness: {err}` |
 | Empty `old_string` | `Error: old_string must be non-empty` |
-| String not found | `Error: String not found in file: '{preview}'` |
+| String not found (nothing similar) | `Error: String not found in file: '{preview}'` |
+| String not found (close match exists) | `Error: String not found in file: '{preview}'. Closest match in the file, lines {start}-{end}:` + numbered lines + `Adjust old_string to match these lines exactly, or re-read the file if it changed.` |
 | Ambiguous match | `Error: Ambiguous match - '{preview}' occurs {N} times. Please provide more surrounding context to make the match unique, or use replace_all=True to replace all occurrences.` |
 | Success | `Success: Made {N} replacement(s) in {filepath}\n\nDiff:\n{diff}` |
 
@@ -977,6 +1060,8 @@ Use `search_files` to locate patterns before editing so you know scope and can c
 
 <Accordion title="Make old_string unique">
 Include surrounding context so the match is unambiguous; use `replace_all=True` only when every occurrence should change.
+
+If the first attempt returns `String not found`, the error usually includes the closest lines with line numbers, so the next `old_string` is a small adjustment.
 </Accordion>
 
 <Accordion title="Line endings and BOM are preserved">
@@ -993,6 +1078,10 @@ Use `apply_patch` when changes span multiple files and must succeed/fail togethe
 
 <Accordion title="Patch hunk format is not unified diff">
 The patch hunk format uses `@@` to separate hunks and `===` to separate old from new — this is not unified diff format. Add/Delete sections must not contain `@@`/`===` markers.
+</Accordion>
+
+<Accordion title="Read the closest-match hint before re-reading the file">
+When `edit_file` returns `String not found` with a `Closest match in the file, lines X-Y:` block, those lines are the file's current contents. Adjust `old_string` to match and retry — use `read_file` only when the hint is missing or points at the wrong place.
 </Accordion>
 
 <Accordion title="Workspace Security">

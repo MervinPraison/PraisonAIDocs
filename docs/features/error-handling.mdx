@@ -22,27 +22,19 @@ The user runs the agent; failures raise typed `PraisonAIError` with category, me
 
 ```mermaid
 graph LR
-    subgraph "Error Hierarchy"
+    subgraph "praisonaiagents.PraisonAIError — one base for all"
         Base[🛡 PraisonAIError]
-        Base --> Tool[🔧 ToolExecutionError]
-        Base --> LLM[🤖 LLMError]
-        Base --> Val[📋 ValidationError]
-        Base --> Net[🌐 NetworkError]
+        Base --> Core[🧠 Core SDK errors<br/>ToolExecutionError<br/>LLMError<br/>ValidationError<br/>NetworkError]
+        Base --> Wrap[📦 Wrapper errors<br/>RecipeError, CLIExecutionError,<br/>JobQueueFull, ToolTimeoutError, …]
     end
 
     classDef base fill:#8B0000,stroke:#7C90A0,color:#fff
-    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
-    classDef err fill:#F59E0B,stroke:#7C90A0,color:#fff
-    classDef cfg fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef core fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef wrap fill:#F59E0B,stroke:#7C90A0,color:#fff
 
     class Base base
-    class Tool tool
-    class LLM,Net err
-    class Val cfg
-
-    classDef agent fill:#8B0000,color:#fff
-
-    classDef tool fill:#189AB4,color:#fff
+    class Core core
+    class Wrap wrap
 ```
 
 ## Quick Start
@@ -157,6 +149,70 @@ from praisonaiagents.llm import LLMResponseError
 
 ---
 
+## Wrapper exceptions (`praisonai.*`)
+
+`PraisonAIError` now catches every root exception in the `praisonai` wrapper too, so one `except` handler covers both tiers.
+
+```python
+from praisonaiagents import PraisonAIError
+from praisonai.recipe.registry import LocalRegistry
+
+try:
+    LocalRegistry().pull("missing-recipe")
+except PraisonAIError as e:
+    # Also catches RecipeError, CLIExecutionError, JobQueueFull, ToolTimeoutError, …
+    print(f"{type(e).__name__}: {e}")
+```
+
+Stdlib parents stay in place through multiple inheritance, so existing `except ValueError`, `except RuntimeError`, and `except TimeoutError` handlers keep matching. Keep importing the base from `praisonaiagents` — the wrapper adds no new public module.
+
+| Exception | Module | Stdlib parent (still matches) |
+|---|---|---|
+| `ToolTimeoutError` | `praisonai.agents_generator` | `TimeoutError` |
+| `AgentConfigError` | `praisonai.api.agent_invoke` | `ValueError` |
+| `MergeConflictError` | `praisonai.auto` | — |
+| `LangfuseAPIError` | `praisonai.cli.langfuse_client` | — |
+| `CLIExecutionError` | `praisonai.integrations.base` | `RuntimeError` |
+| `ManagedSandboxRequired` | `praisonai.integrations.managed_agents` | `RuntimeError` |
+| `JobQueueFull` | `praisonai.jobs.executor` | — |
+| `RecipeError` | `praisonai.recipe.exceptions` | — |
+| `RunHistoryError` | `praisonai.recipe.history` | — |
+| `PolicyError` | `praisonai.recipe.policy` | — |
+| `RegistryError` | `praisonai.recipe.registry` | — |
+| `SecurityError` | `praisonai.recipe.security` | — |
+| `RerunError` | `praisonai.replay.rerun` | `RuntimeError` |
+| `StrictModeError` | `praisonai.templates.dependency_checker` | — |
+| `SecurityError` | `praisonai.templates.tool_override` | — |
+
+Subclasses such as `RecipeNotFoundError`, `RunNotFoundError`, and `PolicyDeniedError` inherit the change automatically.
+
+<Note>
+Wrapper errors keep stdlib formatting: `str(e)` and `e.args` are exactly what was raised, so CLI output is unchanged. The core `[category] message (agent: …, run: …)` decoration applies only to core SDK errors.
+</Note>
+
+```mermaid
+graph TB
+    Start[🤔 What do you want to handle?]
+    Start --> One{Any PraisonAI<br/>failure at all?}
+    One -->|Yes| Base[except PraisonAIError]
+    One -->|No| Spec{Specific category?}
+    Spec -->|Tool call failed| Tool[except ToolExecutionError]
+    Spec -->|LLM failed| LLM[except LLMError or<br/>LLMResponseError]
+    Spec -->|CLI integration failed| CLI[except CLIExecutionError]
+    Spec -->|Recipe / registry / policy| Rec[except RecipeError /<br/>RegistryError / PolicyError]
+    Spec -->|Job queue saturated| JQ[except JobQueueFull]
+
+    classDef base fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef path fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef pick fill:#189AB4,stroke:#7C90A0,color:#fff
+
+    class Start base
+    class One,Spec path
+    class Base,Tool,LLM,CLI,Rec,JQ pick
+```
+
+---
+
 ## Observing a terminal LLM failure
 
 `chat()` / `achat()` return `None` on an unrecoverable LLM failure (a 500, a revoked key, a 429 after all retries). As of [PR #5764](https://github.com/MervinPraison/PraisonAI/pull/5764), `agent.last_stop_reason` is set to `"error"` in that same path, so callers that cannot catch the raised exception (web handlers, bots, batch jobs) can still tell "the model answered empty" from "the model never answered".
@@ -188,7 +244,7 @@ The reason is reset to `"completed"` at the start of every turn, so an `"error"`
 
 ## Tool Failure Behavior
 
-On the sync path, a tool failure resolves down one of three branches:
+On both `chat()` and `achat()`, a tool failure resolves down one of three branches:
 
 1. **Tool raises an exception** → the framework wraps it as `ToolExecutionError` and propagates it.
 2. **Tool returns `{"error": "..."}`** → the error dict is handed back to the LLM as a normal tool result, so the model can self-correct (new behavior since PR [#4462](https://github.com/MervinPraison/PraisonAI/pull/4462), confirmed in [#4470](https://github.com/MervinPraison/PraisonAI/pull/4470) which fixes issue [#4446](https://github.com/MervinPraison/PraisonAI/issues/4446). The generic-exception branch in `openai_client.py` behaves the same way.).
@@ -196,8 +252,8 @@ On the sync path, a tool failure resolves down one of three branches:
 
 ```mermaid
 graph TB
-    subgraph "Tool failure — sync path"
-        SReq[👤 chat request] --> SLLM[🤖 Model calls tool]
+    subgraph "Tool failure — sync (chat) and async (achat)"
+        SReq[👤 chat / achat request] --> SLLM[🤖 Model calls tool]
         SLLM --> STool{🔧 Tool result}
         STool -->|raises exception| SRaise[🛑 ToolExecutionError propagates]
         STool -->|returns error dict| SReturn[📄 Error dict returned to LLM<br/>LLM self-corrects]
@@ -224,9 +280,10 @@ Only three cases still raise / short-circuit on the sync path:
 - The dict is a **retryable transient** (`_outer_timeout` on an idempotent tool, `circuit_open`, or a `_praison_retryable` marker outside the tool's retry policy).
 </Note>
 
-Wrap sync `chat()` / `start()` calls in `try / except ToolExecutionError` to catch a **raised** tool exception:
+If your tool raises, your agent's turn ends — the same way whether you call `chat()` or `achat()`. Wrap both in `try / except ToolExecutionError`:
 
 ```python
+import asyncio
 from praisonaiagents import Agent, tool, ToolExecutionError
 
 @tool
@@ -238,6 +295,12 @@ agent = Agent(instructions="Use fetch.", tools=[fetch])
 
 try:
     agent.start("Fetch https://example.com")
+except ToolExecutionError as e:
+    print(f"Tool {e.tool_name} failed: {e.message}")
+
+# Async — raises the same ToolExecutionError
+try:
+    asyncio.run(agent.achat("Fetch https://example.com"))
 except ToolExecutionError as e:
     print(f"Tool {e.tool_name} failed: {e.message}")
 ```
@@ -264,7 +327,7 @@ agent.start("Fetch example.com and summarise.")
 **Behavior change (fix in PraisonAI PR #4252):** On the sync path, a tool that **raises** now raises `ToolExecutionError`. Previously the sync `Agent.chat()` silently returned `None` and, worse, the tool's error text was treated as an LLM error — so a tool message resembling a rate limit made the framework sleep and re-drive the model with no tool result, then return that hallucinated answer as a success. Callers checking `if agent.chat(...) is None:` should switch to catching the exception — `None` cannot distinguish a guardrail rejection from a tool failure anyway.
 </Warning>
 
-Sync and async paths are aligned for plain tool-returned `{"error": ...}` dicts — both hand the error back to the LLM so it can retry with corrected arguments. The two paths still differ for **raised** exceptions: sync `chat()` raises `ToolExecutionError`; async `achat()` returns an error dict. See [Async Tool Safety](/features/async-tool-safety).
+Sync and async paths are aligned ([PR #6109](https://github.com/MervinPraison/PraisonAI/pull/6109)). A tool that **raises** ends the turn with `ToolExecutionError` on both `chat()` and `achat()` — previously `achat()` handed the error to the model and returned its "the operation failed" reply as a success, so side-effecting tools (email, payments) could fail silently. A tool that **returns** `{"error": "..."}` is handed to the LLM as a normal tool result on both. See [Async Tool Safety](/features/async-tool-safety).
 
 ---
 
@@ -344,6 +407,9 @@ Loop-guard `HALT` raises `ToolExecutionError`. Combine with [Loop Guard](/featur
 <Accordion title="Treat an LLMResponseError as a real failure, not an empty answer">
 A failed tool-calling loop now raises `LLMResponseError` instead of returning `""`. Catch it explicitly (`from praisonaiagents.llm import LLMResponseError`) so retries and observability see the actual error rather than a silent empty string.
 </Accordion>
+<Accordion title="Use PraisonAIError as the top-level catch for the whole wrapper">
+Every `praisonai.*` root exception (`RecipeError`, `CLIExecutionError`, `JobQueueFull`, `ToolTimeoutError`, and the rest listed under [Wrapper exceptions](#wrapper-exceptions-praisonai)) inherits from `praisonaiagents.PraisonAIError`. One top-level `except PraisonAIError` works as a safety net — reserve specific types for branches that handle the failure differently.
+</Accordion>
 </AccordionGroup>
 
 ---
@@ -356,5 +422,8 @@ A failed tool-calling loop now raises `LLMResponseError` instead of returning `"
 </Card>
 <Card title="Non-Fatal Errors" icon="triangle-exclamation" href="/features/non-fatal-errors">
   Callback failures captured without crashing
+</Card>
+<Card title="PraisonAIError reference" icon="shield-halved" href="/docs/sdk/reference/praisonaiagents/classes/PraisonAIError">
+  Full attribute surface for the base exception
 </Card>
 </CardGroup>

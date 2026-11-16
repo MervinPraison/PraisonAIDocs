@@ -18,6 +18,18 @@ workflow.start("Same input each time")
 workflow.start("Same input each time")   # second call served from cache
 ```
 
+```python
+from praisonaiagents import Agent, AgentFlow
+from praisonaiagents.workflows.step_cache import FileStepCache
+
+formatter = Agent(name="Formatter", instructions="Format the text as clean JSON.")
+summariser = Agent(name="Summariser", instructions="Summarise in one sentence.")
+
+workflow = AgentFlow(steps=[formatter, summariser], cache=FileStepCache("run.json"))
+workflow.start("Same input each time")   # interrupted mid-flow
+workflow.start("Same input each time")   # new process: continues from where it stopped
+```
+
 ```mermaid
 graph LR
     subgraph "Step-Result Cache"
@@ -107,6 +119,127 @@ workflow.start("Same input each time")
 
 ---
 
+## Durable Resume (`FileStepCache`)
+
+`FileStepCache` is a drop-in durable replacement for `InMemoryStepCache` — it keeps cached step results in a JSON file so an interrupted flow resumes from where it stopped in a new process.
+
+```python
+from praisonaiagents import Agent, AgentFlow
+from praisonaiagents.workflows.step_cache import FileStepCache
+
+researcher = Agent(name="Researcher", instructions="Research the topic in depth.")
+writer     = Agent(name="Writer",     instructions="Write a one-page briefing from the research.")
+
+flow = AgentFlow(steps=[researcher, writer], cache=FileStepCache("briefing.json"))
+flow.start("quantum error correction")
+# Ctrl-C after Researcher finishes, before Writer finishes
+# ...in a new process, same path...
+flow.start("quantum error correction")   # Researcher served from briefing.json; Writer runs
+```
+
+<Note>
+`FileStepCache` is not re-exported at the top level. Import it from `praisonaiagents.workflows.step_cache`.
+</Note>
+
+<Steps>
+<Step title="Start a long flow">
+Pass `cache=FileStepCache("run.json")`. Each successful step's result is written atomically to `run.json`.
+</Step>
+<Step title="Get interrupted">
+A deploy, crash, Ctrl-C, OOM or a closed laptop stops the run part-way.
+</Step>
+<Step title="Re-run the same command">
+Completed steps are served from the file; the flow continues at the first unfinished step.
+</Step>
+<Step title="Edit a step and re-run">
+A step whose code or instructions changed — and every step after it — runs again automatically. No stale results are served.
+</Step>
+<Step title="Changed a tool? Clear first">
+Tool implementations are not fingerprinted, so call `FileStepCache("run.json").clear()` before re-running.
+</Step>
+</Steps>
+
+```mermaid
+sequenceDiagram
+    participant P1 as Process 1
+    participant File as run.json
+    participant P2 as Process 2
+    P1->>File: step 1 result
+    P1->>File: step 2 result
+    P1->>File: step 3 result
+    Note over P1: 💥 interrupted at step 4
+    P2->>File: read
+    File-->>P2: steps 1-3
+    P2->>P2: run step 4
+    P2->>File: step 4 result
+    P2->>P2: run step 5
+```
+
+### When to pick which
+
+Pick the lightest cache that covers where your results need to live.
+
+```mermaid
+graph TB
+    Start[🧩 Need a step cache] --> Q1{🔍 Resume across processes?}
+    Q1 -->|No| Q2{🔍 Tune size or share across flows?}
+    Q2 -->|No| True[✅ cache=True]
+    Q2 -->|Yes| Mem[✅ InMemoryStepCache]
+    Q1 -->|Yes| Q3{🔍 Share across hosts?}
+    Q3 -->|No| File[✅ FileStepCache]
+    Q3 -->|Yes| Own[✅ Bring your own e.g. Redis]
+
+    classDef start fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef decision fill:#F59E0B,stroke:#7C90A0,color:#fff
+    classDef good fill:#10B981,stroke:#7C90A0,color:#fff
+
+    class Start start
+    class Q1,Q2,Q3 decision
+    class True,Mem,File,Own good
+```
+
+### What invalidates a cached step
+
+Resume is content-addressed, not index-based, so a step re-runs whenever anything it depends on changes.
+
+| Change | Step re-runs? |
+|---|---|
+| The input changes | ✅ Yes |
+| An upstream step's output changes | ✅ Yes (downstream keys see a new previous output) |
+| A handler's code, or an immutable default / closure / `__kwdefaults__` value, changes — even under the same name | ✅ Yes |
+| A module-level helper function the handler calls is edited | ✅ Yes |
+| An agent's `role`, `goal`, `backstory`, `instructions`, `llm`, `action`, `description`, `expected_output` or tool names change | ✅ Yes |
+| A workflow variable (or its type) changes | ✅ Yes |
+
+| Not detected — call `clear()` after changing | Why |
+|---|---|
+| Mutable captured state (a list the handler appends to, a client in a closure) | Left out so the key does not drift during a run |
+| Methods the handler calls, or imported libraries' behaviour | Only module-level Python functions are fingerprinted |
+| A tool's underlying implementation | Only the tool's **name** is in the key |
+
+<Warning>
+- An **anonymous** step with no stable name never hits a durable cache in a new process — it re-runs.
+- Mutable captured state, imported libraries and tool implementations are **not** fingerprinted — after changing one, call `clear()` (or delete the file).
+- Values that don't JSON round-trip unchanged (tuples, int-keyed dicts, arbitrary objects) are **rejected** at `set()` time, not stored lossily. The workflow logs a warning and continues.
+- Pointing `FileStepCache` at an existing file that isn't a step-cache JSON object raises `ValueError` at construction — use a dedicated path.
+</Warning>
+
+### Crash-safety and concurrent writers
+
+Every `set()` is a locked, atomic read-modify-write of the file, so a crash mid-write keeps the last good file. Two caches on the same path — in one process or two — both add to the file; neither erases the other's entries. Only successful steps are cached, as with the in-memory cache.
+
+### `FileStepCache` Options
+
+| Option / method | Type | Default | Description |
+|---|---|---|---|
+| `path` | `str` | required | File path for the JSON store. `~` is expanded; an absolute path is used internally. The parent directory is created on first write. |
+| `get(key)` | method | — | Deep copy of the stored entry, or `None` on miss. |
+| `set(key, value)` | method | — | Atomic locked write. Raises `TypeError` if the value doesn't JSON round-trip unchanged. |
+| `clear()` | method | — | Removes all entries and deletes the file. |
+| `__len__()` | method | — | Number of cached entries. |
+
+---
+
 ## When to Cache
 
 Cache deterministic steps; skip steps that call tools with side effects, read a clock, or depend on randomness.
@@ -152,11 +285,12 @@ sequenceDiagram
     end
 ```
 
-The key is a stable SHA-256 (first 32 hex chars) built from four fields:
+The key is a stable SHA-256 (first 32 hex chars) built from five fields:
 
 | Field | What it captures |
 |-------|------------------|
 | Step identity | String steps use their text; other steps use `.name` / `.__name__`, else `type(step).__name__:id(step)` |
+| Step definition | A handler's code and immutable configuration, or an agent's role, instructions, model and tool names — so an edited step misses the cache |
 | Previous output | The output of the prior step |
 | Input text | The current step's rendered input |
 | Variables | The workflow's variables at that point, tagged with each value's **type** |
@@ -262,6 +396,7 @@ Accepted `cache=` values:
 | `None` / `False` | No caching |
 | `True` | Process-scoped `InMemoryStepCache()` (default `max_entries=128`) |
 | An `InMemoryStepCache` instance | Use the given cache — share across flows, tune size |
+| A `FileStepCache` instance | Durable JSON-backed cache — resume across processes |
 | Any object with `get()` and `set()` | Custom cache (Redis, disk, etc.) |
 | Anything else | `TypeError` at construction |
 
@@ -300,6 +435,15 @@ workflow.start("Same input each time")   # prints: ↩︎  cache hit: Formatter
   </Accordion>
   <Accordion title="Bound the cache to your working set">
     Set `max_entries` to the number of results you actually reuse; a larger cache only wastes memory.
+  </Accordion>
+  <Accordion title="Use FileStepCache for long runs and expensive steps">
+    Any flow that costs real money or minutes to re-run deserves durable resume. The overhead is one atomic JSON write per successful step.
+  </Accordion>
+  <Accordion title="Call clear() after editing a tool or a mutable dependency">
+    The fingerprint doesn't cross into tool implementations or mutable captured state.
+  </Accordion>
+  <Accordion title="Keep each run on its own path for strict isolation">
+    Or deliberately share a path to pool results across runs and processes — both writers add; neither erases.
   </Accordion>
 </AccordionGroup>
 

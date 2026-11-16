@@ -5,7 +5,7 @@ description: "Import praisonaiagents safely from pre-fork servers, subprocesses,
 icon: "shield-check"
 ---
 
-`import praisonaiagents` spawns no background thread, preserves host environment variables via `setdefault`, and leaves the host `asyncio` logger untouched — so it is safe to import at the parent of a pre-fork server before workers fork.
+`import praisonaiagents` spawns no background thread, leaves host environment variables alone, preserves host logging handlers, and never replaces `warnings.warn` — so it is safe to import inside an existing app or at the parent of a pre-fork server before workers fork.
 
 ```python
 from praisonaiagents import Agent
@@ -22,9 +22,13 @@ graph LR
     Import[📦 import praisonaiagents] --> NoThread[🧵 No thread spawned]
     Import --> EnvVars[🔧 Env vars via setdefault]
     Import --> Asyncio[📝 asyncio logger untouched]
+    Import --> Root[🪵 Root handlers preserved]
+    Import --> Warn[⚠️ warnings.warn untouched]
     NoThread --> Fork[✅ Safe fork / subprocess spawn]
     EnvVars --> Fork
     Asyncio --> Fork
+    Root --> Fork
+    Warn --> Fork
 
     classDef input fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef process fill:#189AB4,stroke:#7C90A0,color:#fff
@@ -33,11 +37,11 @@ graph LR
 
     class Import input
     class NoThread,EnvVars process
-    class Asyncio warn
+    class Asyncio,Root,Warn warn
     class Fork output
 ```
 
-Reference: [PraisonAI PR #5219](https://github.com/MervinPraison/PraisonAI/pull/5219), fixes [#5162](https://github.com/MervinPraison/PraisonAI/issues/5162). This is the Python companion to [JS Import Safety & Runtimes](/features/js-import-safety).
+Reference: [PraisonAI PR #5219](https://github.com/MervinPraison/PraisonAI/pull/5219) (fixes [#5162](https://github.com/MervinPraison/PraisonAI/issues/5162)) and [PR #6135](https://github.com/MervinPraison/PraisonAI/pull/6135) (fixes [#6134](https://github.com/MervinPraison/PraisonAI/issues/6134)). This is the Python companion to [JS Import Safety & Runtimes](/features/js-import-safety).
 
 ## What's safe on import (after PR #5219)
 
@@ -78,39 +82,49 @@ See [Runtime Resolution → Background cleanup thread](/features/runtime-resolut
 </Step>
 </Steps>
 
-## What is still not safe on import
+## Host logging, warnings, and env on import (PR #6135)
 
-PR #5219 intentionally kept two behaviours. Be honest with your host application about them.
+PR #6135 removed the last import-time changes to host process state.
 
-<AccordionGroup>
-<Accordion title="Root logger is still reconfigured (basicConfig force=True)" icon="scroll">
-`praisonaiagents` still calls `logging.basicConfig(force=True)` at import. If your host configured logging **before** importing PraisonAI, its handler is closed and replaced.
+<Steps>
+<Step title="Root logger is left alone if the host configured it">
+`logging.basicConfig(..., force=True)` is gone. If the root logger already has a handler, import leaves the root handler list and level unchanged. See [Logging Configuration → When the host has already configured logging](/features/logging-configuration#when-the-host-has-already-configured-logging).
+</Step>
 
-**Workaround:** import PraisonAI first, then configure your own logging — or accept the SDK's default config.
+<Step title="Host httpx / openai / pydantic loggers are kept">
+When the host has configured logging, import no longer clears handlers or `propagate` on `httpx`, `httpcore`, `openai.*`, `pydantic`, or `markdown_it` loggers.
+</Step>
+
+<Step title="warnings.warn is never replaced">
+`warnings.warn` and `warnings.warn_explicit` are no longer monkey-patched. Noisy third-party warnings are silenced with scoped `warnings.filterwarnings(...)` entries only, so `warnings.warn` is the same object before and after import.
+</Step>
+
+<Step title="Env defaults wait for the LLM layer">
+`LITELLM_*`, `HTTPX_*`, and `PYDANTIC_*` defaults are applied when `praisonaiagents.llm` is imported — not on `import praisonaiagents`. Subprocesses the host spawns before using the LLM path inherit an unchanged environment. Values are still applied with `setdefault`.
+</Step>
+</Steps>
+
+Verify the invariant yourself:
 
 ```python
-import praisonaiagents          # imports and runs basicConfig(force=True)
+import logging, warnings
 
-import logging                  # now configure your handlers, after the import
-logging.getLogger().addHandler(my_handler)
+class H(logging.Handler):
+    def emit(self, r): pass
+
+h = H()
+logging.getLogger().addHandler(h)
+logging.getLogger().setLevel(logging.INFO)
+warn_before = warnings.warn
+
+import praisonaiagents  # noqa
+
+assert logging.getLogger().handlers == [h]
+assert logging.getLogger().level == logging.INFO
+assert warnings.warn is warn_before
 ```
-</Accordion>
 
-<Accordion title="warnings.warn is still monkeypatched" icon="triangle-exclamation">
-`warnings.warn` and `warnings.warn_explicit` remain patched to suppress a hardcoded pattern list plus any `UserWarning` mentioning "pydantic". Your own warnings matching those patterns will be swallowed.
-
-**Workaround:** save the originals yourself before importing, or reinstate them from the module (verify the attribute name in `_warning_patch.py` at head — the originals are stored as `_original_warn` / `_original_warn_explicit`).
-
-```python
-import warnings
-_real_warn = warnings.warn            # save before importing PraisonAI
-
-import praisonaiagents               # patches warnings.warn
-
-warnings.warn = _real_warn           # restore if you need your own warnings
-```
-</Accordion>
-</AccordionGroup>
+The full assertion set lives in [`tests/unit/test_import_side_effects.py`](https://github.com/MervinPraison/PraisonAI/blob/main/src/praisonai-agents/tests/unit/test_import_side_effects.py).
 
 ## Fork-safety guide
 
@@ -185,8 +199,8 @@ Before PR #5219 the import-time cleanup thread was cloned into every child at `f
 Under a pre-fork server, keep `import praisonaiagents` in the master and let the first `agent.start()` / `resolve_runtime` happen inside each worker. The lazy cleanup daemon then starts per-worker, never in the master.
 </Accordion>
 
-<Accordion title="Configure host logging after importing PraisonAI" icon="scroll">
-`basicConfig(force=True)` still runs at import. Import the SDK first, then attach your own handlers so they survive.
+<Accordion title="Configure host logging before or after — both work" icon="scroll">
+If your app installs root handlers before importing PraisonAI, the SDK leaves them alone. If it imports PraisonAI first, attach your handlers afterwards as usual.
 </Accordion>
 
 <Accordion title="Set env vars before launch to keep them" icon="terminal">
@@ -205,7 +219,7 @@ Import no longer silences the asyncio logger. If you want the old quiet behaviou
     JavaScript companion — no dotenv side effects on import
   </Card>
   <Card title="Logging Configuration" icon="scroll" href="/features/logging-configuration">
-    setdefault env vars and the untouched asyncio logger
+    Host-configured logging is preserved on import
   </Card>
   <Card title="Runtime Resolution" icon="rotate" href="/features/runtime-resolution">
     Lazy cleanup-thread start and fork safety

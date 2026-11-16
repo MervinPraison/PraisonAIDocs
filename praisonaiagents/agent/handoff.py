@@ -190,6 +190,39 @@ def _get_handoff_depth() -> int:
     """Get current handoff depth."""
     return len(_get_handoff_chain())
 
+def _tool_pair_safe_tail(messages: List[Any], n: int) -> List[Any]:
+    """Return the last ``n`` messages without splitting tool_calls/tool pairs.
+
+    A count-based slice can cut between an assistant ``tool_calls`` message and
+    its ``tool`` responses; providers reject the resulting orphans. Drop tool
+    results whose call was cut off, and assistant tool_calls whose responses
+    are incomplete (together with their partial responses).
+    """
+    if n <= 0:
+        return []
+    tail = list(messages[-n:])
+
+    def _call_ids(msg: Any) -> set:
+        calls = msg.get('tool_calls') if isinstance(msg, dict) else None
+        return {c.get('id') if isinstance(c, dict) else getattr(c, 'id', None) for c in calls or ()}
+
+    def _is_tool(msg: Any) -> bool:
+        return isinstance(msg, dict) and msg.get('role') == 'tool'
+
+    response_ids = {m.get('tool_call_id') for m in tail if _is_tool(m)}
+    dropped: set = set()
+    kept = []
+    for msg in tail:
+        ids = _call_ids(msg)
+        if ids and not ids <= response_ids:
+            dropped |= ids
+            continue
+        kept.append(msg)
+    call_ids = set().union(*(_call_ids(m) for m in kept))
+    return [m for m in kept
+            if not (_is_tool(m) and (m.get('tool_call_id') in dropped
+                                     or m.get('tool_call_id') not in call_ids))]
+
 def _push_handoff(agent_name: str) -> None:
     """Push agent to handoff chain.
 
@@ -630,6 +663,27 @@ class Handoff:
                 None, lambda: self.agent.chat(prompt, tools=effective_tools)
             )
     
+    def _trace_handoff(self, source_agent: 'Agent', context: Optional[Dict[str, Any]], reason: Optional[str] = None) -> None:
+        """Record the hand-off on the replay trace (no-op when tracing is off)."""
+        from ..trace.context_events import get_context_emitter
+        emitter = get_context_emitter()
+        if not emitter._enabled:
+            return
+        context = dict(context or {})
+        if reason is None:
+            reason = context.get("reason") or context.get("task") or context.get("prompt")
+        policy = getattr(self.config, "context_policy", None)
+        emitter.agent_handoff(
+            getattr(source_agent, "name", None) or "agent",
+            getattr(self.agent, "name", None),
+            reason=emitter._preview(reason) if reason is not None else None,
+            context_passed={
+                "context_policy": getattr(policy, "value", policy),
+                "args": context,
+            },
+            kind="handoff",
+        )
+
     def _check_safety(self, source_agent: 'Agent') -> None:
         """
         Check safety constraints before handoff.
@@ -681,22 +735,22 @@ class Handoff:
         # Apply context policy
         if self.config.context_policy == ContextPolicy.NONE:
             filtered_messages = []
-        elif self.config.context_policy == ContextPolicy.LAST_N:
-            n = self.config.max_context_messages
+        elif self.config.context_policy in (ContextPolicy.LAST_N, ContextPolicy.SUMMARY):
             if self.config.preserve_system:
                 system_msgs = [m for m in messages if isinstance(m, dict) and m.get('role') == 'system']
-                other_msgs = [m for m in messages if not (isinstance(m, dict) and m.get('role') == 'system')]
-                filtered_messages = system_msgs + other_msgs[-n:]
+                base = [m for m in messages if not (isinstance(m, dict) and m.get('role') == 'system')]
             else:
-                filtered_messages = messages[-n:]
-        elif self.config.context_policy == ContextPolicy.SUMMARY:
-            # For summary, keep system + last few messages
-            if self.config.preserve_system:
-                system_msgs = [m for m in messages if isinstance(m, dict) and m.get('role') == 'system']
-                other_msgs = [m for m in messages if not (isinstance(m, dict) and m.get('role') == 'system')]
-                filtered_messages = system_msgs + other_msgs[-3:]  # Last 3 non-system
+                system_msgs, base = [], list(messages)
+            if self.config.context_policy == ContextPolicy.LAST_N:
+                tail = _tool_pair_safe_tail(base, self.config.max_context_messages)
             else:
-                filtered_messages = messages[-3:]
+                # SUMMARY: the first user message (the task goal) + last few
+                # messages. An LLM summary stays opt-in via ``input_filter``.
+                tail = _tool_pair_safe_tail(base, 3)
+                goal = next((m for m in base if isinstance(m, dict) and m.get('role') == 'user'), None)
+                if goal is not None and not any(m is goal for m in tail):
+                    tail = [goal] + tail
+            filtered_messages = system_msgs + tail
         else:  # FULL
             filtered_messages = messages[:]
         
@@ -778,6 +832,7 @@ class Handoff:
             # Track handoff chain
             _push_handoff(source_agent.name)
             pushed = True
+            self._trace_handoff(source_agent, kwargs, reason=prompt)
             
             # Execute on_handoff callback
             self._execute_callback(self.config.on_handoff or self.on_handoff, source_agent, kwargs)
@@ -888,6 +943,7 @@ class Handoff:
                 self._check_safety(source_agent)
                 _push_handoff(source_agent.name)
                 pushed = True
+                self._trace_handoff(source_agent, kwargs, reason=prompt)
                 
                 # Execute callback
                 self._execute_callback(self.config.on_handoff or self.on_handoff, source_agent, kwargs)
@@ -1016,6 +1072,7 @@ class Handoff:
                 # Track handoff chain
                 _push_handoff(source_agent.name)
                 pushed = True
+                self._trace_handoff(source_agent, kwargs, reason=None)
                 
                 # Execute on_handoff callback
                 self._execute_callback(self.config.on_handoff or self.on_handoff, source_agent, kwargs)
@@ -1632,6 +1689,7 @@ class TypedHandoff(Handoff, Generic[T]):
             # Track handoff chain
             _push_handoff(source_agent.name)
             pushed = True
+            self._trace_handoff(source_agent, kwargs, reason=None)
             
             # Execute on_handoff callback
             self._execute_callback(self.config.on_handoff or self.on_handoff, source_agent, kwargs)
@@ -1747,6 +1805,7 @@ class TypedHandoff(Handoff, Generic[T]):
                 self._check_safety(source_agent)
                 _push_handoff(source_agent.name)
                 pushed = True
+                self._trace_handoff(source_agent, kwargs, reason=None)
                 
                 # Execute callback
                 self._execute_callback(self.config.on_handoff or self.on_handoff, source_agent, kwargs)
