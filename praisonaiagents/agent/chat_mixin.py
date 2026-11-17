@@ -15,6 +15,7 @@ import time
 import json
 import threading
 import logging
+import warnings
 from praisonaiagents._logging import get_logger
 from ..errors import BudgetExceededError, ToolExecutionError
 from .tool_execution import _active_turn_cancel
@@ -82,6 +83,12 @@ def _current_turn_loop_guard(agent):
             from ..escalation.loop_guard import LoopGuard
             slot[1] = LoopGuard(agent._loop_guard.config)
         return slot[1]
+
+
+def _is_fatal_model_error(exc):
+    """Invalid model / bad request: re-raise instead of returning ``None`` (#5956)."""
+    from ..llm.error_classifier import _is_fatal_model_error as _fatal
+    return _fatal(exc)
 
 
 def _reset_loop_guard_for_turn(agent):
@@ -221,6 +228,34 @@ class _TurnCancelToken:
 class ChatMixin:
     """Mixin providing chat methods for the Agent class."""
 
+    # The exception behind the last turn that returned None (G-02); reset to
+    # None at the start of every chat()/achat() turn.
+    _last_error = None
+
+    def _none_after_failed_turn(self, exc):
+        """Return None for a failed turn (1.x contract), but say so and keep the error.
+
+        ``chat()``/``achat()``/``start()`` return None when the LLM call fails;
+        the cause used to be visible only in a printed panel. The exception is
+        kept on ``agent._last_error`` and a FutureWarning names the change, so
+        callers can detect the failure today. Raising instead is a 2.0 decision.
+        """
+        self._last_error = exc
+        # Stable text (no str(exc): request IDs/timestamps would defeat the
+        # default once-per-location filter). Under ``-W error`` the warning
+        # must not escape or replace the saved error: the contract is None.
+        try:
+            warnings.warn(
+                f"Agent {getattr(self, 'name', None)!r}: the LLM call failed "
+                f"({type(exc).__name__}); returning None. The exception is kept on "
+                "agent._last_error. A future major release may raise instead.",
+                FutureWarning,
+                stacklevel=3,
+            )
+        except FutureWarning:
+            pass
+        return None
+
     @property
     def last_durable_run_id(self) -> Optional[str]:
         """Identifier of the most recently started durable turn, if any."""
@@ -297,7 +332,7 @@ class ChatMixin:
                 success=success,
             )
         except Exception as callback_error:
-            logging.debug(f"tool_call callback failed for '{tool_name}': {callback_error}")
+            logger.debug(f"tool_call callback failed for '{tool_name}': {callback_error}")
 
     def _durable_sync_tool_executor(self, execute_tool_fn):
         """Wrap tool execution only while an opt-in durable run is active."""
@@ -502,7 +537,7 @@ class ChatMixin:
                     break
             return self._format_memory_prefetch(results, limit, budget)
         except Exception as exc:
-            logging.debug("Memory prefetch failed; continuing without recalled context: %s", exc)
+            logger.debug("Memory prefetch failed; continuing without recalled context: %s", exc)
             return ""
 
     async def _aprefetch_memory(self, prompt: Any) -> str:
@@ -532,7 +567,7 @@ class ChatMixin:
                     break
             return self._format_memory_prefetch(results, limit, budget)
         except Exception as exc:
-            logging.debug("Async memory prefetch failed; continuing without recalled context: %s", exc)
+            logger.debug("Async memory prefetch failed; continuing without recalled context: %s", exc)
             return ""
 
     def _resolve_max_steps(self, default: int = 10) -> int:
@@ -799,7 +834,7 @@ Your Role: {self.role}"""
         except Exception as e:
             # Log unexpected errors but continue
             import logging
-            logging.debug(f"Session context injection failed: {e}", exc_info=True)
+            logger.debug(f"Session context injection failed: {e}", exc_info=True)
             pass
         
         # Add tool usage instructions if tools are available
@@ -825,7 +860,7 @@ Your Role: {self.role}"""
                         elif isinstance(openai_tools, dict) and 'function' in openai_tools:
                             tool_names.append(openai_tools['function']['name'])
                 except (AttributeError, KeyError, TypeError) as e:
-                    logging.warning(f"Could not extract tool name from {tool}: {e}")
+                    logger.warning(f"Could not extract tool name from {tool}: {e}")
                     continue
             
             # Prune permission-denied tool names so the advertised surface in the
@@ -1032,6 +1067,37 @@ Your Role: {self.role}"""
         if is_replay_unsafe_chain(error):
             raise error
 
+    @staticmethod
+    def _assistant_reply_text(reply):
+        """Text form of a guardrail-approved reply for history/DB storage."""
+        if isinstance(reply, str):
+            return reply
+        if reply is None:
+            return ""
+        if hasattr(reply, "model_dump_json"):
+            return reply.model_dump_json()
+        if isinstance(reply, (dict, list)):
+            return json.dumps(reply, default=str)
+        return str(reply)
+
+    def _commit_assistant_reply(self, reply, persist=True):
+        """Record the *approved* assistant reply in chat history (and the DB).
+
+        Called only after guardrail validation so a rejected answer never
+        reaches history, the session store or the next turn's context.
+        """
+        text = self._assistant_reply_text(reply)
+        self._append_to_chat_history({"role": "assistant", "content": text})
+        if persist:
+            self._persist_message("assistant", text)
+
+    async def _acommit_assistant_reply(self, reply, persist=True):
+        """Async twin of :meth:`_commit_assistant_reply` (DB write off-loop)."""
+        text = self._assistant_reply_text(reply)
+        self._append_to_chat_history({"role": "assistant", "content": text})
+        if persist:
+            await self._apersist_message("assistant", text)
+
     def _structured_output_from_message(self, message, schema_model, response_text: str, original_text=None):
         """Resolve a Pydantic ``output_pydantic`` from an LLM message or JSON text.
 
@@ -1104,7 +1170,7 @@ Your Role: {self.role}"""
             except ValueError:
                 pass
 
-        logging.warning(
+        logger.warning(
             f"Agent {self.name}: output_pydantic={getattr(schema_model, '__name__', schema_model)} "
             f"was requested but the response could not be parsed into the model; "
             f"returning raw string."
@@ -1127,7 +1193,7 @@ Your Role: {self.role}"""
         try:
             return supports_structured_outputs(self.llm)
         except Exception as e:
-            logging.warning(
+            logger.warning(
                 "Structured output capability check failed for agent %s (model=%r); "
                 "falling back to prompt-based schema formatting. Check model capability "
                 "configuration and optional provider dependencies: %s",
@@ -1164,7 +1230,7 @@ Your Role: {self.role}"""
                 )
             return list(session_history) if session_history else []
         except Exception as e:
-            logging.debug(f"Failed to load session history: {e}")
+            logger.debug(f"Failed to load session history: {e}")
             return []
 
     def _build_messages(self, prompt, temperature=1.0, output_json=None, output_pydantic=None, tools=None, use_native_format=False, restore_durable=True, memory_prefetch_context: str = ""):
@@ -1303,7 +1369,7 @@ Your Role: {self.role}"""
                 if 'function' in tool and isinstance(tool['function'], dict) and 'name' in tool['function']:
                     formatted_tools.append(tool)
                 else:
-                    logging.warning(f"Skipping malformed OpenAI tool: missing function or name")
+                    logger.warning(f"Skipping malformed OpenAI tool: missing function or name")
             # Handle lists of tools
             elif isinstance(tool, list):
                 for subtool in tool:
@@ -1314,14 +1380,14 @@ Your Role: {self.role}"""
                         if 'function' in subtool and isinstance(subtool['function'], dict) and 'name' in subtool['function']:
                             formatted_tools.append(subtool)
                         else:
-                            logging.warning(f"Skipping malformed OpenAI tool in list: missing function or name")
+                            logger.warning(f"Skipping malformed OpenAI tool in list: missing function or name")
             # Handle string tool names
             elif isinstance(tool, str):
                 tool_def = self._generate_tool_definition(tool)
                 if tool_def:
                     formatted_tools.append(tool_def)
                 else:
-                    logging.warning(f"Could not generate definition for tool: {tool}")
+                    logger.warning(f"Could not generate definition for tool: {tool}")
             # Handle objects with to_openai_tool method (MCP tools)
             elif hasattr(tool, "to_openai_tool"):
                 openai_tools = tool.to_openai_tool()
@@ -1336,29 +1402,29 @@ Your Role: {self.role}"""
                 if tool_def:
                     formatted_tools.append(tool_def)
                 else:
-                    logging.warning(
+                    logger.warning(
                         "Could not generate definition for tool: %s", tool.name
                     )
             # Handle callable functions
             elif callable(tool):
                 fname = getattr(tool, "name", None) or getattr(tool, "__name__", None)
                 if not fname:
-                    logging.warning("Tool %r not recognized (no name)", tool)
+                    logger.warning("Tool %r not recognized (no name)", tool)
                     continue
                 tool_def = self._generate_tool_definition(fname)
                 if tool_def:
                     formatted_tools.append(tool_def)
                 else:
-                    logging.warning(f"Could not generate definition for tool: {fname}")
+                    logger.warning(f"Could not generate definition for tool: {fname}")
             else:
-                logging.warning(f"Tool {tool} not recognized")
+                logger.warning(f"Tool {tool} not recognized")
         
         # Validate JSON serialization before returning
         if formatted_tools:
             try:
                 json.dumps(formatted_tools)  # Validate serialization
             except (TypeError, ValueError) as e:
-                logging.error(f"Tools are not JSON serializable: {e}")
+                logger.error(f"Tools are not JSON serializable: {e}")
                 return []
         
         # Apply tool search assembly if enabled (after formatting, before caching)
@@ -1381,7 +1447,7 @@ Your Role: {self.role}"""
                 
             except ImportError:
                 # Tool search module not available, continue with original tools
-                logging.warning("Tool search requested but tool_search module not available")
+                logger.warning("Tool search requested but tool_search module not available")
         
         # Strip __praisonai_deferrable__ from provider-facing tool payloads
         # Keep the marker only for internal tool classification
@@ -1464,14 +1530,14 @@ Your Role: {self.role}"""
                      if r.output and getattr(r.output, "is_denied", lambda: False)()),
                     None,
                 ) or "Blocked by hook"
-                logging.warning(
+                logger.warning(
                     f"[before-tool-definitions] tool definitions blocked by hook: {_reason}"
                 )
                 return []
             # Adopt mutations, mirroring how BEFORE_LLM adopts its payload.
             return _inp.tool_definitions
         except Exception as _e:
-            logging.debug(f"[before-tool-definitions] hook skipped: {_e}")
+            logger.debug(f"[before-tool-definitions] hook skipped: {_e}")
             return formatted_tools
 
     async def _aapply_before_tool_definitions_hook(self, formatted_tools):
@@ -1495,13 +1561,13 @@ Your Role: {self.role}"""
                      if r.output and getattr(r.output, "is_denied", lambda: False)()),
                     None,
                 ) or "Blocked by hook"
-                logging.warning(
+                logger.warning(
                     f"[before-tool-definitions] tool definitions blocked by hook: {_reason}"
                 )
                 return []
             return _inp.tool_definitions
         except Exception as _e:
-            logging.debug(f"[before-tool-definitions] async hook skipped: {_e}")
+            logger.debug(f"[before-tool-definitions] async hook skipped: {_e}")
             return formatted_tools
 
     def _prune_denied_tools(self, formatted_tools):
@@ -1544,7 +1610,7 @@ Your Role: {self.role}"""
                 pruned.append(tool)
                 continue
             if not self._tool_name_allowed(name):
-                logging.debug("Pruning permission-denied tool from payload: %s", name)
+                logger.debug("Pruning permission-denied tool from payload: %s", name)
                 continue
             pruned.append(tool)
         return pruned
@@ -1577,7 +1643,7 @@ Your Role: {self.role}"""
                 if manager.is_denied(name, getattr(self, "name", None)):
                     return False
             except Exception as e:  # noqa: BLE001
-                logging.debug("permission manager is_denied failed for %s: %s", name, e)
+                logger.debug("permission manager is_denied failed for %s: %s", name, e)
         return True
 
     def _build_multimodal_prompt(
@@ -1654,7 +1720,7 @@ Your Role: {self.role}"""
                     finish_reason = getattr(choice, "finish_reason", None)
                     refusal = getattr(msg, "refusal", None)
                     if refusal or finish_reason not in (None, "stop"):
-                        logging.warning(
+                        logger.warning(
                             f"Agent {self.name}: model returned no content "
                             f"(finish_reason={finish_reason!r}, refused={bool(refusal)})"
                         )
@@ -1667,7 +1733,7 @@ Your Role: {self.role}"""
                             self._last_stop_reason = stop_reason
                     return ""
         except (AttributeError, IndexError, TypeError) as e:
-            logging.warning(
+            logger.warning(
                 f"Failed to extract LLM response content (falling back to str): {e}"
             )
             # Fallback to str(response) is still fine, but now it's visible
@@ -1726,7 +1792,7 @@ Your Role: {self.role}"""
         
         # Log budget analysis if enabled
         if getattr(self, '_verbose_context', False):
-            logging.info(
+            logger.info(
                 f"[context-budget] {self.name}: {budget_result.current_tokens} tokens, "
                 f"{budget_result.utilization:.1%} utilization, route: {budget_result.route.value}"
             )
@@ -1798,7 +1864,7 @@ Your Role: {self.role}"""
         try:
             self._hook_runner.execute_sync(_HookEvent.BEFORE_COMPACTION, None)
         except Exception as e:
-            logging.warning(f"BEFORE_COMPACTION hook failed: {e}")
+            logger.warning(f"BEFORE_COMPACTION hook failed: {e}")
             if getattr(self, '_strict_hooks', False):
                 raise
 
@@ -1808,7 +1874,7 @@ Your Role: {self.role}"""
         with protect_turn(getattr(self, 'interrupt_controller', None)):
             compacted_msgs, result = compactor.compact(messages)
         
-        logging.info(
+        logger.info(
             f"[proactive-compaction] {self.name}: {result.original_tokens}→{result.compacted_tokens} tokens "
             f"({result.messages_removed} messages removed, strategy: {policy.strategy.value})"
         )
@@ -1822,7 +1888,7 @@ Your Role: {self.role}"""
         try:
             self._hook_runner.execute_sync(_HookEvent.AFTER_COMPACTION, result)
         except Exception as e:
-            logging.warning(f"AFTER_COMPACTION hook failed: {e}")
+            logger.warning(f"AFTER_COMPACTION hook failed: {e}")
             if getattr(self, '_strict_hooks', False):
                 raise
         
@@ -1860,7 +1926,7 @@ Your Role: {self.role}"""
                 tokens_after=getattr(result, "compacted_tokens", 0) or 0,
             )
         except Exception as e:
-            logging.debug(f"Failed to persist compaction checkpoint: {e}")
+            logger.debug(f"Failed to persist compaction checkpoint: {e}")
 
     def _run_pre_compaction_memory_flush(self, messages, compactor):
         """Run the default-off sync flush at the compactor's older boundary."""
@@ -1872,7 +1938,7 @@ Your Role: {self.role}"""
 
             return run_pre_compaction_flush_sync(self, older_slice, setting)
         except Exception as exc:
-            logging.warning(
+            logger.warning(
                 "Pre-compaction memory flush failed; continuing compaction: %s",
                 exc,
             )
@@ -1888,7 +1954,7 @@ Your Role: {self.role}"""
 
             return await run_pre_compaction_flush(self, older_slice, setting)
         except Exception as exc:
-            logging.warning(
+            logger.warning(
                 "Async pre-compaction memory flush failed; continuing compaction: %s",
                 exc,
             )
@@ -1919,7 +1985,7 @@ Your Role: {self.role}"""
         original_tokens = compactor.count_total_tokens(messages)
         new_tokens = compactor.count_total_tokens(truncated_msgs)
         
-        logging.info(
+        logger.info(
             f"[{log_tag}] {self.name}: {original_tokens}→{new_tokens} tokens "
             f"(truncated large tool outputs)"
         )
@@ -1985,7 +2051,7 @@ Your Role: {self.role}"""
         try:
             await self._hook_runner.execute(_HookEvent.BEFORE_COMPACTION, None)
         except Exception as e:
-            logging.warning(f"BEFORE_COMPACTION hook failed: {e}")
+            logger.warning(f"BEFORE_COMPACTION hook failed: {e}")
             if getattr(self, '_strict_hooks', False):
                 raise
 
@@ -1995,7 +2061,7 @@ Your Role: {self.role}"""
         with protect_turn(getattr(self, 'interrupt_controller', None)):
             compacted_msgs, result = compactor.compact(messages)
         
-        logging.info(
+        logger.info(
             f"[proactive-compaction-async] {self.name}: {result.original_tokens}→{result.compacted_tokens} tokens "
             f"({result.messages_removed} messages removed, strategy: {policy.strategy.value})"
         )
@@ -2009,12 +2075,12 @@ Your Role: {self.role}"""
         try:
             await asyncio.to_thread(self._persist_compaction_checkpoint, result)
         except Exception as e:
-            logging.debug(f"Failed to persist compaction checkpoint (async): {e}")
+            logger.debug(f"Failed to persist compaction checkpoint (async): {e}")
 
         try:
             await self._hook_runner.execute(_HookEvent.AFTER_COMPACTION, result)
         except Exception as e:
-            logging.warning(f"AFTER_COMPACTION hook failed: {e}")
+            logger.warning(f"AFTER_COMPACTION hook failed: {e}")
             if getattr(self, '_strict_hooks', False):
                 raise
         
@@ -2093,7 +2159,7 @@ Your Role: {self.role}"""
         classification = classify_llm_error(error, provider=provider, model=model_name)
         if not classification.should_fallback_model:
             return None, None
-        logging.info(f"[{self.name}] {model_name} unavailable — falling back to {next_model}")
+        logger.info(f"[{self.name}] {model_name} unavailable — falling back to {next_model}")
         return next_model, classification.error_category
 
     @staticmethod
@@ -2169,7 +2235,7 @@ Your Role: {self.role}"""
                  if r.output and getattr(r.output, "is_denied", lambda: False)()),
                 None,
             ) or "Blocked by hook"
-            logging.warning(f"Agent {self.name} LLM request blocked by BEFORE_LLM hook: {reason}")
+            logger.warning(f"Agent {self.name} LLM request blocked by BEFORE_LLM hook: {reason}")
             return llm_kwargs, f"[LLM request blocked by hook: {reason}]"
         messages = list(before.messages or [])
         if messages and messages != self._custom_llm_hook_messages(llm_kwargs):
@@ -2181,7 +2247,7 @@ Your Role: {self.role}"""
             if not isinstance(last, dict) or last.get("role") != "user":
                 # ``LLM.get_response`` always sends the prompt as a user turn; fail closed
                 # rather than silently re-role a rewritten assistant/tool message.
-                logging.warning(f"Agent {self.name} BEFORE_LLM rewrite must end with a user message")
+                logger.warning(f"Agent {self.name} BEFORE_LLM rewrite must end with a user message")
                 return llm_kwargs, "[LLM request blocked by hook: rewritten messages must end with a user message]"
             llm_kwargs = {**llm_kwargs, 'system_prompt': system, 'chat_history': messages,
                           'prompt': last.get("content")}
@@ -2323,7 +2389,7 @@ Your Role: {self.role}"""
                     ),
                 )
         except Exception:  # observability must never break the fallback path
-            logging.debug("MODEL_FALLBACK hook failed", exc_info=True)
+            logger.debug("MODEL_FALLBACK hook failed", exc_info=True)
 
         self._emit_model_fallback_stream(
             from_model, to_model, reason_category, fallback_index, stream_callback
@@ -2350,7 +2416,7 @@ Your Role: {self.role}"""
                     ),
                 )
         except Exception:  # observability must never break the fallback path
-            logging.debug("MODEL_FALLBACK hook failed", exc_info=True)
+            logger.debug("MODEL_FALLBACK hook failed", exc_info=True)
 
         self._emit_model_fallback_stream(
             from_model, to_model, reason_category, fallback_index, stream_callback
@@ -2394,7 +2460,7 @@ Your Role: {self.role}"""
                 run_id=getattr(self, '_current_run_id', None),
             ))
         except Exception:
-            logging.debug("MODEL_FALLBACK stream event failed", exc_info=True)
+            logger.debug("MODEL_FALLBACK stream event failed", exc_info=True)
 
     def _shrink_after_context_overflow(self, messages, model_name):
         """Shrink ``messages`` after the provider rejected them as too long.
@@ -2411,9 +2477,26 @@ Your Role: {self.role}"""
             int(get_model_limit(model_name) * 0.7),  # 70% of limit for safety
             compactor.count_total_tokens(messages) // 2,
         )
+        # Remember the size so later turns shrink before sending instead of
+        # re-uploading the rejected request every turn (chat_history is kept).
+        self.__dict__.setdefault("_overflow_ceilings", {})[model_name] = target
         if self.context_manager:
             return self.context_manager.emergency_truncate(messages, target)
         return compactor.shrink_to_fit(messages, target)
+
+    def _fit_overflow_ceiling(self, messages, tools):
+        """Shrink to the size remembered from an earlier overflow, if over it."""
+        model_name = self.llm if isinstance(self.llm, str) else "unknown"
+        ceiling = self.__dict__.get("_overflow_ceilings", {}).get(model_name)
+        if not ceiling or not isinstance(messages, list) or not self._can_restart_after_overflow(tools):
+            return messages
+        from ..compaction import ContextCompactor
+        compactor = ContextCompactor()
+        if compactor.count_total_tokens(messages) <= ceiling:
+            return messages
+        if self.context_manager:
+            return self.context_manager.emergency_truncate(messages, ceiling)
+        return compactor.shrink_to_fit(messages, ceiling)
 
     def _can_restart_after_overflow(self, tools) -> bool:
         """Whether an overflow may restart the whole turn with shrunk messages.
@@ -2439,6 +2522,37 @@ Your Role: {self.role}"""
         if isinstance(max_retries, int) and max_retries >= 0:
             return max_retries
         return 2
+
+    def _retry_delay(self, exc, classification, retry_depth):
+        """The sync path's one retry layer (P-2/G-12): seconds to wait before
+        retrying ``exc``, or None.
+
+        The same rule as the async ``RetryBackoffConfig`` loop: an error the
+        classifier marks retryable, and no other recovery handled, is retried
+        ``retry.max_retries`` times with the configured jittered backoff, raised
+        to a server ``Retry-After``. ``retry=False`` turns retries off.
+        """
+        cfg = getattr(self, '_retry_config', None)
+        # A context overflow is only fixed by compression: resending the same
+        # messages fails the same way, so it is not retried here.
+        if (cfg is None or not classification.is_retryable or classification.should_compress_context
+                or retry_depth >= cfg.max_retries):
+            return None
+        from .retry_utils import jittered_backoff
+        from ..llm.error_classifier import extract_retry_after
+        delay = jittered_backoff(retry_depth, base_delay=cfg.base_delay, max_delay=cfg.max_delay,
+                                 jitter_ratio=cfg.jitter_ratio)
+        return max(delay, extract_retry_after(exc, cap_seconds=cfg.max_delay) or 0.0)
+
+    def _retry_hook_input(self, exc, retry_depth, delay, operation):
+        """``ON_RETRY`` hook input for a retry chosen by ``_retry_delay``."""
+        from ..hooks import HookEvent, OnRetryInput
+        return OnRetryInput(
+            session_id=getattr(self, '_session_id', 'default'), cwd=os.getcwd(),
+            event_name=HookEvent.ON_RETRY, timestamp=str(time.time()), agent_name=self.name,
+            retry_count=retry_depth + 1, max_retries=self._retry_config.max_retries,
+            error_message=str(exc), operation=operation, delay_seconds=delay, attempt=retry_depth,
+        )
 
     def _extract_llm_usage(self, response, model=None):
         """Return ``(prompt_tokens, completion_tokens, cost_usd)`` for one LLM response priced as ``model``."""
@@ -2478,7 +2592,7 @@ Your Role: {self.role}"""
                     agent_id=self.name
                 )
             elif self._on_budget_exceeded == "warn":
-                logging.warning(
+                logger.warning(
                     f"[budget] {self.name}: ${current_cost:.4f} exceeded "
                     f"${self._max_budget:.4f} budget"
                 )
@@ -2527,6 +2641,7 @@ Your Role: {self.role}"""
         # run (see ``_extract_llm_response_content``) never leaks into this one.
         # The LiteLLM path resets its own backend flag independently.
         self._last_stop_reason = "completed"
+        messages = self._fit_overflow_ceiling(messages, tools)
 
         # --- Proactive Context Budget Management (default-on) ---
         # Analyzes token budget BEFORE LLM call and applies appropriate strategy
@@ -2542,7 +2657,7 @@ Your Role: {self.role}"""
             # Fallback to original messages if proactive handling fails
             if getattr(self, '_strict_hooks', False):
                 raise
-            logging.debug(f"[proactive-context] fallback to original messages: {_ce}")
+            logger.debug(f"[proactive-context] fallback to original messages: {_ce}")
         
         # --- Context compaction (opt-in via ExecutionConfig.context_compaction) ---
         # Compacts message history before sending to LLM. Zero overhead when disabled.
@@ -2574,7 +2689,7 @@ Your Role: {self.role}"""
                      if r.output and getattr(r.output, "is_denied", lambda: False)()),
                     None,
                 ) or "Blocked by hook"
-                logging.warning(f"Agent {self.name} LLM request blocked by BEFORE_LLM hook: {_block_reason}")
+                logger.warning(f"Agent {self.name} LLM request blocked by BEFORE_LLM hook: {_block_reason}")
                 return f"[LLM request blocked by hook: {_block_reason}]"
             # C7 - honour any BEFORE_LLM hook that mutated the message stream
             # (e.g. PII redactor). The runner applies modified_input in-place on
@@ -2604,7 +2719,7 @@ Your Role: {self.role}"""
                     agent_id=self.name
                 )
 
-        logging.debug(f"{self.name} sending messages to LLM: {messages}")
+        logger.debug("%s sending messages to LLM: %s", self.name, messages)
         
         # Emit LLM request trace event (zero overhead when not set)
         from ..trace.context_events import get_context_emitter
@@ -2648,7 +2763,8 @@ Your Role: {self.role}"""
             except ValueError as e:
                 if "Streaming is not supported" in str(e):
                     # Fallback: retry with non-streaming for sync adapters
-                    logging.debug(f"{self.name}: Streaming not supported by adapter, falling back to non-streaming")
+                    logger.debug(f"{self.name}: Streaming not supported by adapter, falling back to non-streaming")
+                    self._emit_stream_unavailable()
                     stream = False  # Set for the main execution below
                 else:
                     raise  # Re-raise if it's a different ValueError
@@ -2665,7 +2781,7 @@ Your Role: {self.role}"""
                 # Never replay a tool turn after a post-dispatch failure (#3860)
                 self._raise_if_stream_replay_unsafe(e, formatted_tools)
                 # For any other exception, fall back to non-streaming
-                logging.debug(f"{self.name}: Streaming attempt failed, falling back to non-streaming")
+                logger.debug(f"{self.name}: Streaming attempt failed, falling back to non-streaming")
                 stream = False  # Set for the main execution below
         
         # If stream was explicitly set or fallback occurred, use the specified/fallback value
@@ -2698,7 +2814,8 @@ Your Role: {self.role}"""
                     # back to non-streaming so chat() still returns text, the
                     # same way the stream=None auto-detect path above does.
                     if stream and "Streaming is not supported" in str(e):
-                        logging.debug(f"{self.name}: Streaming not supported by adapter, falling back to non-streaming")
+                        logger.debug(f"{self.name}: Streaming not supported by adapter, falling back to non-streaming")
+                        self._emit_stream_unavailable()
                         final_response = self._chat_completion_with_retry(
                             cancel_token=cancel_token,
                             messages=messages,
@@ -2805,7 +2922,7 @@ Your Role: {self.role}"""
                 try:
                     truncated_messages = self._shrink_after_context_overflow(messages, model_name)
                     
-                    logging.info(f"[{self.name}] {classification.user_message}")
+                    logger.info(f"[{self.name}] {classification.user_message}")
                     
                     # Retry with compressed context (recursive call, bounded by configured policy)
                     if _retry_depth < self._max_retry_depth():
@@ -2817,11 +2934,12 @@ Your Role: {self.role}"""
                             cancel_token=cancel_token
                         )
                 except Exception as compression_error:
-                    logging.error(f"[{self.name}] Context compression failed: {compression_error}")
+                    logger.error(f"[{self.name}] Context compression failed: {compression_error}")
             
             if classification.should_rotate_credential:
                 # TODO: Implement credential rotation when available
-                logging.warning(f"[{self.name}] {classification.user_message} (credential rotation not yet implemented)")
+                if not self._credential_failover_active():
+                    logger.warning(f"[{self.name}] {classification.user_message} (credential rotation not yet implemented)")
                 # Don't retry without actual credential rotation
                 
             elif classification.should_fallback_model:
@@ -2829,7 +2947,7 @@ Your Role: {self.role}"""
                 next_model = self._get_next_fallback_model(_fallback_index)
                 if next_model:
                     current_model = self.llm if isinstance(self.llm, str) else str(self.llm)
-                    logging.info(f"[{self.name}] {current_model} unavailable — falling back to {next_model}")
+                    logger.info(f"[{self.name}] {current_model} unavailable — falling back to {next_model}")
 
                     # Surface the otherwise-silent switch as an observable event.
                     # Forward the active stream callback so streaming consumers
@@ -2874,27 +2992,34 @@ Your Role: {self.role}"""
                             self.llm = original_llm
                             self._unified_dispatcher = original_dispatcher  # Restore original dispatcher
                 else:
-                    logging.warning(f"[{self.name}] {classification.user_message} (no more fallback models available)")
+                    logger.warning(f"[{self.name}] {classification.user_message} (no more fallback models available)")
                     # Continue to error handling without retry
                 
-            elif classification.is_retryable and classification.backoff_seconds > 0:
-                if _retry_depth < self._max_retry_depth():  # Bounded by configured RetryBackoffConfig.max_retries
-                    logging.info(f"[{self.name}] {classification.user_message} (waiting {classification.backoff_seconds:.1f}s)")
-                    _sleep_unless_cancelled(
-                        classification.backoff_seconds,
-                        cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None),
-                    )
-                    return self._chat_completion(
-                        messages, temperature, tools, stream, 
-                        reasoning_steps, task_name, task_description, task_id, response_format, 
-                        _retry_depth=_retry_depth + 1,
-                        _fallback_index=_fallback_index,
-                        cancel_token=cancel_token
-                    )
+
+            # The one retry layer (P-2): also reached by a transient error whose
+            # fallback chain is empty, which used to give up without a retry.
+            _delay = self._retry_delay(e, classification, _retry_depth)
+            if _delay is not None:
+                from ..hooks import HookEvent
+                logger.info(f"[{self.name}] {type(e).__name__}: retrying in {_delay:.1f}s ({_retry_depth + 1}/{self._retry_config.max_retries})")
+                self._hook_runner.execute_sync(HookEvent.ON_RETRY, self._retry_hook_input(e, _retry_depth, _delay, "llm_request"))
+                self._emit_retry_stream_event(attempt=_retry_depth + 1, max_attempts=self._retry_config.max_retries + 1,
+                                              delay=_delay, reason=str(e))
+                _sleep_unless_cancelled(
+                    _delay,
+                    cancel_token if cancel_token is not None else getattr(self, "interrupt_controller", None),
+                )
+                return self._chat_completion(
+                    messages, temperature, tools, stream, 
+                    reasoning_steps, task_name, task_description, task_id, response_format, 
+                    _retry_depth=_retry_depth + 1,
+                    _fallback_index=_fallback_index,
+                    cancel_token=cancel_token
+                )
             
             # Include remediation hints for unimplemented recovery actions
             user_message = classification.user_message
-            if classification.should_rotate_credential:
+            if classification.should_rotate_credential and not self._credential_failover_active():
                 user_message += " Credential rotation is not yet implemented."
             if classification.should_fallback_model:
                 if not self.fallback_models:
@@ -2920,7 +3045,7 @@ Your Role: {self.role}"""
                 try:
                     self.on_error(error)
                 except Exception as hook_error:
-                    logging.debug(f"Error in on_error hook: {hook_error}")
+                    logger.debug(f"Error in on_error hook: {hook_error}")
             
             raise error from e
 
@@ -2985,7 +3110,7 @@ Your Role: {self.role}"""
             try:
                 truncated_messages = self._shrink_after_context_overflow(messages, model_name)
                 
-                logging.info(f"[{self.name}] {classification.user_message}")
+                logger.info(f"[{self.name}] {classification.user_message}")
                 
                 # Retry with compressed context (recursive call, bounded by configured policy)
                 if _retry_depth < self._max_retry_depth():
@@ -3004,11 +3129,12 @@ Your Role: {self.role}"""
                             cancel_token=cancel_token,
                         )
             except Exception as compression_error:
-                logging.error(f"[{self.name}] Context compression failed: {compression_error}")
+                logger.error(f"[{self.name}] Context compression failed: {compression_error}")
         
         if classification.should_rotate_credential:
             # TODO: Implement credential rotation when available
-            logging.warning(f"[{self.name}] {classification.user_message} (credential rotation not yet implemented)")
+            if not self._credential_failover_active():
+                logger.warning(f"[{self.name}] {classification.user_message} (credential rotation not yet implemented)")
             # Don't retry without actual credential rotation
             
         elif classification.should_fallback_model:
@@ -3016,7 +3142,7 @@ Your Role: {self.role}"""
             next_model = self._get_next_fallback_model(_fallback_index)
             if next_model:
                 current_model = self.llm if isinstance(self.llm, str) else str(self.llm)
-                logging.info(f"[{self.name}] {current_model} unavailable — falling back to {next_model}")
+                logger.info(f"[{self.name}] {current_model} unavailable — falling back to {next_model}")
 
                 # Surface the otherwise-silent switch as an observable event.
                 # Await the async emitter so MODEL_FALLBACK hooks run in the
@@ -3061,32 +3187,17 @@ Your Role: {self.role}"""
                         cancel_token=cancel_token,
                     )
             else:
-                logging.warning(f"[{self.name}] {classification.user_message} (no more fallback models available)")
+                logger.warning(f"[{self.name}] {classification.user_message} (no more fallback models available)")
                 # Continue to error handling without retry
             
-        elif classification.is_retryable and classification.backoff_seconds > 0:
-            if _retry_depth < self._max_retry_depth():  # Bounded by configured RetryBackoffConfig.max_retries
-                logging.info(f"[{self.name}] {classification.user_message} (waiting {classification.backoff_seconds:.1f}s)")
-                if not await _abackoff(self, classification.backoff_seconds, cancel_token):
-                    raise exc
-                # Need to call the full async method that includes error handling
-                try:
-                    return await self._execute_unified_achat_completion(
-                        messages, temperature, tools, stream, 
-                        reasoning_steps, task_name, task_description, task_id, response_format,
-                        stream_callback, emit_events, cancel_token=cancel_token,
-                    )
-                except Exception as retry_error:
-                    return await self._handle_async_llm_error(
-                        retry_error, messages, temperature, tools, stream,
-                        reasoning_steps, task_name, task_description, task_id, response_format,
-                        stream_callback, emit_events, _retry_depth + 1, _fallback_index,
-                        cancel_token=cancel_token,
-                    )
-        
+
+        # No retry here: the RetryBackoffConfig loop around this call is the one
+        # retry layer on the async path (P-2). Re-driving the call from here
+        # re-entered this handler at depth 0, so retries never ended.
+
         # Include remediation hints for unimplemented recovery actions
         user_message = classification.user_message
-        if classification.should_rotate_credential:
+        if classification.should_rotate_credential and not self._credential_failover_active():
             user_message += " Credential rotation is not yet implemented."
         if classification.should_fallback_model:
             if not self.fallback_models:
@@ -3099,7 +3210,9 @@ Your Role: {self.role}"""
             str(exc),
             model_name=model_name,
             agent_id=self.name,
-            is_retryable=classification.is_retryable,
+            # As on sync (``_retry_delay``): an overflow compression did not fix
+            # would fail the same way, so the retry loop must not resend it.
+            is_retryable=classification.is_retryable and not classification.should_compress_context,
             context={
                 "session_id": session_id,
                 "error_category": classification.error_category,
@@ -3114,10 +3227,10 @@ Your Role: {self.role}"""
                 # for backward compatibility with existing hook implementations
                 self.on_error(error)
             except Exception as hook_error:
-                logging.debug(f"Error in on_error hook: {hook_error}")
+                logger.debug(f"Error in on_error hook: {hook_error}")
         
-        # Raise the enriched error
-        raise error
+        # Raise the enriched error, keeping the provider error as its cause
+        raise error from exc
 
     def _native_reasoning_kwargs(self, model=None):
         """Provider-native reasoning effort for the direct OpenAI client path.
@@ -3217,7 +3330,8 @@ Your Role: {self.role}"""
             except ValueError as e:
                 if "Streaming is not supported" in str(e):
                     # Fallback: retry with non-streaming for sync adapters
-                    logging.debug(f"Agent: Streaming not supported by adapter, falling back to non-streaming")
+                    logger.debug(f"Agent: Streaming not supported by adapter, falling back to non-streaming")
+                    self._emit_stream_unavailable()
                     stream = False  # Set for the main execution below
                 else:
                     raise  # Re-raise if it's a different ValueError
@@ -3225,7 +3339,7 @@ Your Role: {self.role}"""
                 # Never replay a tool turn after a post-dispatch failure (#3860)
                 self._raise_if_stream_replay_unsafe(e, tools)
                 # For any other exception, fall back to non-streaming
-                logging.debug(f"Agent: Streaming attempt failed, falling back to non-streaming")
+                logger.debug(f"Agent: Streaming attempt failed, falling back to non-streaming")
                 stream = False  # Set for the main execution below
 
         # Execute unified dispatch with all necessary parameters
@@ -3279,7 +3393,7 @@ Your Role: {self.role}"""
             return final_response
             
         except Exception as e:
-            logging.error(f"Unified chat completion failed: {e}")
+            logger.error(f"Unified chat completion failed: {e}")
             raise
 
     async def _execute_unified_achat_completion(
@@ -3310,6 +3424,7 @@ Your Role: {self.role}"""
         the same Agent never observe another turn's fallback model.
         """
         from ..llm import create_llm_dispatcher
+        messages = self._fit_overflow_ceiling(messages, tools)
         
         # Resolve the dispatcher for THIS call. A caller-supplied dispatcher
         # (async model fallback) is used as-is and never cached onto the
@@ -3378,7 +3493,7 @@ Your Role: {self.role}"""
                      if r.output and getattr(r.output, "is_denied", lambda: False)()),
                     None,
                 ) or "Blocked by hook"
-                logging.warning(f"Agent {self.name} LLM request blocked by BEFORE_LLM hook: {_block_reason}")
+                logger.warning(f"Agent {self.name} LLM request blocked by BEFORE_LLM hook: {_block_reason}")
                 return f"[LLM request blocked by hook: {_block_reason}]"
             # Adopt any BEFORE_LLM hook mutations (e.g. PII redactor).
             messages = before_llm_input.messages
@@ -3587,9 +3702,9 @@ Your Role: {self.role}"""
                             summary = self._memory_instance.on_pre_compress(messages)
                     
                     if summary:
-                        logging.debug(f"[{self.name}] Memory provider extracted: {summary[:100]}...")
+                        logger.debug(f"[{self.name}] Memory provider extracted: {summary[:100]}...")
                 except Exception as e:
-                    logging.warning(f"[{self.name}] Memory on_pre_compress hook failed: {e}")
+                    logger.warning(f"[{self.name}] Memory on_pre_compress hook failed: {e}")
             
             # Process through context manager
             result = self.context_manager.process(
@@ -3603,7 +3718,7 @@ Your Role: {self.role}"""
             
             # Log if optimization occurred
             if result.get("optimized"):
-                logging.debug(
+                logger.debug(
                     f"[{self.name}] Context optimized: "
                     f"{result.get('tokens_before', 0)} -> {result.get('tokens_after', 0)} tokens "
                     f"(saved {result.get('tokens_saved', 0)})"
@@ -3624,7 +3739,7 @@ Your Role: {self.role}"""
                 
                 # If over 95% of limit, apply emergency truncation
                 if current_tokens > model_limit * 0.95:
-                    logging.warning(
+                    logger.warning(
                         f"[{self.name}] Context at {current_tokens} tokens (limit: {model_limit}), "
                         f"applying emergency truncation"
                     )
@@ -3635,7 +3750,7 @@ Your Role: {self.role}"""
                     result["emergency_truncated"] = True
                     result["tokens_after"] = estimate_messages_tokens(optimized) + overhead
             except Exception as e:
-                logging.debug(f"Hard limit check skipped: {e}")
+                logger.debug(f"Hard limit check skipped: {e}")
             
             return optimized, result
             
@@ -3644,7 +3759,7 @@ Your Role: {self.role}"""
             # returning the unchanged history disables the hard-limit truncation
             # too and sends an over-budget request. Fall back to emergency
             # truncation so we still fit within the model window.
-            logging.error(f"Context management failed: {e}")
+            logger.error(f"Context management failed: {e}")
             try:
                 from ..context.budgeter import get_model_limit
                 from ..context.tokens import estimate_messages_tokens
@@ -3660,7 +3775,7 @@ Your Role: {self.role}"""
                     truncated = self.context_manager.emergency_truncate(messages, target)
                     return truncated, {"emergency_truncated": True}
             except Exception as inner:
-                logging.debug(f"Emergency truncation fallback skipped: {inner}")
+                logger.debug(f"Emergency truncation fallback skipped: {inner}")
             return messages, None
 
     def _estimate_request_overhead_tokens(
@@ -3710,7 +3825,7 @@ Your Role: {self.role}"""
             run_id = getattr(self, '_current_run_id', None)
             return self.context_manager.truncate_tool_output(tool_name, output, tool_call_id, run_id)
         except Exception as e:
-            logging.warning(f"Tool output truncation error: {e}")
+            logger.warning(f"Tool output truncation error: {e}")
             return output
 
     def _resolve_skill_invocation(self, prompt):
@@ -3761,7 +3876,7 @@ Your Role: {self.role}"""
                         try:
                             registry.auto_approve_tool(_tn, agent_name=agent_name)
                         except Exception as exc:  # pragma: no cover - approval is optional
-                            logging.debug(
+                            logger.debug(
                                 "Failed to auto-approve skill tool '%s' for skill '%s' on agent '%s': %s. "
                                 "The skill will continue, but this tool may still require explicit approval.",
                                 _tn,
@@ -3771,7 +3886,7 @@ Your Role: {self.role}"""
                                 exc_info=True,
                             )
         except Exception as exc:  # pragma: no cover - approval is optional
-            logging.debug(
+            logger.debug(
                 "Failed to resolve allowed tools for skill '%s' on agent '%s': %s. "
                 "The skill will continue without pre-approving tools.",
                 name,
@@ -3822,7 +3937,7 @@ Your Role: {self.role}"""
         if hasattr(self, '_validate_input_with_guardrail'):
             _in_ok, _in_prompt, _in_err = self._validate_input_with_guardrail(prompt)
             if not _in_ok:
-                logging.warning(f"Agent {self.name}: input blocked by guardrail: {_in_err}")
+                logger.warning(f"Agent {self.name}: input blocked by guardrail: {_in_err}")
                 self._last_guardrail_error = _in_err
                 return self._guardrail_blocked_message(_in_err)
             prompt = _in_prompt
@@ -3896,7 +4011,11 @@ Your Role: {self.role}"""
             if self._db is not None:
                 self._init_db_session()
                 self._start_run(prompt if isinstance(prompt, str) else str(prompt))
-            result = self._chat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice, seed=seed, cancel_token=_cancel)
+            _scope_token = self._enter_turn_tool_scope(tools)
+            try:
+                result = self._chat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice, seed=seed, cancel_token=_cancel)
+            finally:
+                self._exit_turn_tool_scope(_scope_token)
             db_output = str(result) if result is not None else None
             # A guardrail-blocked turn returns a non-None refusal string; it must
             # be recorded as "error", not "completed" (the answer was rejected).
@@ -3955,6 +4074,7 @@ Your Role: {self.role}"""
         # across turns of a long-lived agent.
         _reset_loop_guard_for_turn(self)
         self._last_stop_reason = "completed"
+        self._last_error = None
         # Apply rate limiter if configured (before any LLM call)
         if self._rate_limiter is not None:
             self._rate_limiter.acquire()
@@ -4003,7 +4123,7 @@ Your Role: {self.role}"""
             )
             hook_results = self._hook_runner.execute_sync(HookEvent.BEFORE_AGENT, before_agent_input)
             if self._hook_runner.is_blocked(hook_results):
-                logging.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
+                logger.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
                 return None
 
             # Update prompt if modified by hooks
@@ -4032,7 +4152,7 @@ Your Role: {self.role}"""
                 "agent_role": self.role,
                 "agent_goal": self.goal
             }
-            logging.debug(f"Agent.chat parameters: {json.dumps(param_info, indent=2, default=str)}")
+            logger.debug(f"Agent.chat parameters: {json.dumps(param_info, indent=2, default=str)}")
         
         start_time = time.time()
         reasoning_steps = reasoning_steps or self.reasoning_steps
@@ -4128,14 +4248,11 @@ Your Role: {self.role}"""
                 
                 # Convert MCP tool objects to OpenAI format if needed
                 if tool_param is not None:
-                    MCP = None
-                    try:
-                        from ..mcp.mcp import MCP
-                    except ImportError:
-                        pass
+                    from .tool_execution import _loaded_mcp_class
+                    MCP = _loaded_mcp_class()
                     if MCP is not None and isinstance(tool_param, MCP) and hasattr(tool_param, 'to_openai_tool'):
                         # Single MCP instance
-                        logging.debug("Converting single MCP tool to OpenAI format")
+                        logger.debug("Converting single MCP tool to OpenAI format")
                         openai_tool = tool_param.to_openai_tool()
                         if openai_tool:
                             # Handle both single tool and list of tools
@@ -4143,13 +4260,13 @@ Your Role: {self.role}"""
                                 tool_param = openai_tool
                             else:
                                 tool_param = [openai_tool]
-                            logging.debug(f"Converted MCP tool: {tool_param}")
+                            logger.debug(f"Converted MCP tool: {tool_param}")
                     elif isinstance(tool_param, (list, tuple)):
                         # List that may contain MCP instances - convert each MCP to OpenAI format
                         converted_tools = []
                         for t in tool_param:
                             if MCP is not None and isinstance(t, MCP) and hasattr(t, 'to_openai_tool'):
-                                logging.debug("Converting MCP instance in list to OpenAI format")
+                                logger.debug("Converting MCP instance in list to OpenAI format")
                                 openai_tools = t.to_openai_tool()
                                 if isinstance(openai_tools, list):
                                     converted_tools.extend(openai_tools)
@@ -4159,7 +4276,7 @@ Your Role: {self.role}"""
                                 # Keep non-MCP tools as-is
                                 converted_tools.append(t)
                         tool_param = converted_tools
-                        logging.debug(f"Converted {len(converted_tools)} tools from list")
+                        logger.debug(f"Converted {len(converted_tools)} tools from list")
                 
                 # Store chat history length for potential rollback
                 chat_history_length = len(self.chat_history)
@@ -4195,7 +4312,7 @@ Your Role: {self.role}"""
                         # Fallback to original chat history if proactive handling fails
                         if getattr(self, '_strict_hooks', False):
                             raise
-                        logging.debug(f"[proactive-context-sync] fallback to original history: {_ce}")
+                        logger.debug(f"[proactive-context-sync] fallback to original history: {_ce}")
                         working_history = self.chat_history
                     
                     # Apply legacy context management on the (possibly compacted) history
@@ -4272,18 +4389,16 @@ Your Role: {self.role}"""
 
                     response_text = self._custom_llm_get_response(llm_kwargs)
 
-                    self._add_to_chat_history("assistant", response_text)
-                    # Persist assistant message to DB
-                    self._persist_message("assistant", response_text)
-
                     # Log completion time if in debug mode
                     if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
-                        logging.debug(f"Agent.chat completed in {total_time:.2f} seconds")
+                        logger.debug(f"Agent.chat completed in {total_time:.2f} seconds")
 
                     # Apply guardrail validation for custom LLM response
                     try:
                         validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=processed_history)
+                        # Commit only the approved reply (never the rejected one).
+                        self._commit_assistant_reply(validated_response)
                         # Coerce into the requested Pydantic model so callers
                         # get a validated instance, not a raw JSON string.
                         # Only output_pydantic changes the return type; output_json
@@ -4297,7 +4412,7 @@ Your Role: {self.role}"""
                         self._execute_callback_and_display(prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                         return self._trigger_after_agent_hook(prompt, validated_response, start_time)
                     except Exception as e:
-                        logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
+                        logger.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
                         # Rollback chat history on guardrail failure
                         self._rollback_chat_history_to(chat_history_length)
                         return self._guardrail_blocked_message(e)
@@ -4308,13 +4423,17 @@ Your Role: {self.role}"""
                     # Rollback chat history if LLM call fails
                     self._rollback_chat_history_to(chat_history_length)
                     _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
-                    return None
+                    if _is_fatal_model_error(e):
+                        raise
+                    return self._none_after_failed_turn(e)
             except (ToolExecutionError, BudgetExceededError):
                 raise
             except Exception as e:
                 self._last_stop_reason = "error"
                 _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
-                return None
+                if _is_fatal_model_error(e):
+                    raise
+                return self._none_after_failed_turn(e)
             finally:
                 self._end_turn_tracking(_turn_token)
         else:
@@ -4328,7 +4447,7 @@ Your Role: {self.role}"""
                 response_format = self._build_response_format(schema_model)
                 if response_format:
                     use_native_format = True
-                    logging.debug(f"Agent {self.name} using native structured output with response_format")
+                    logger.debug(f"Agent {self.name} using native structured output with response_format")
             
             # Use the new _build_messages helper method
             # Pass llm_prompt (which includes multimodal content if attachments present)
@@ -4433,14 +4552,11 @@ Your Role: {self.role}"""
 
                         # Handle output_json or output_pydantic if specified
                         if output_json or output_pydantic:
-                            # Add to chat history and return raw response
-                            # User message already added before LLM call via _build_messages
-                            self._append_to_chat_history({"role": "assistant", "content": response_text})
-                            # Persist assistant message to DB
-                            self._persist_message("assistant", response_text)
-                            # Apply guardrail validation even for JSON output
+                            # Apply guardrail validation even for JSON output; the
+                            # reply is committed to history/DB only once approved.
                             try:
-                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
+                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages, response_format=response_format)
+                                self._commit_assistant_reply(validated_response)
                                 # Coerce into the requested Pydantic model so callers
                                 # get a validated instance, not a raw JSON string.
                                 # output_json intentionally stays a string (backward compat).
@@ -4452,28 +4568,28 @@ Your Role: {self.role}"""
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                             except Exception as e:
-                                logging.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
+                                logger.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
                                 # Rollback chat history on guardrail failure
                                 self._rollback_chat_history_to(chat_history_length)
                                 return self._guardrail_blocked_message(e)
 
                         if not self.self_reflect:
-                            # User message already added before LLM call via _build_messages
-                            self._append_to_chat_history({"role": "assistant", "content": response_text})
-                            # Persist assistant message to DB (non-reflect path)
-                            self._persist_message("assistant", response_text)
+                            # The assistant reply is committed to history/DB only
+                            # after guardrail validation (below).
                             if self.verbose:
-                                logging.debug(f"Agent {self.name} final response: {response_text}")
+                                logger.debug(f"Agent {self.name} final response: {response_text}")
                             # Return only reasoning content if reasoning_steps is True
                             if reasoning_steps and hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                                 # Apply guardrail to reasoning content
                                 try:
                                     validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
+                                    # Commit the approved text, not the unchecked answer.
+                                    self._commit_assistant_reply(validated_reasoning)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_reasoning, time.time() - start_time, task_name, task_description, task_id)
                                     return self._trigger_after_agent_hook(original_prompt, validated_reasoning, start_time)
                                 except Exception as e:
-                                    logging.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
+                                    logger.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
                                     # Rollback chat history on guardrail failure.
                                     # The public chat()/achat() finalizer records the
                                     # blocked turn as "error" (see _guardrail_blocked_message),
@@ -4482,12 +4598,13 @@ Your Role: {self.role}"""
                                     return self._guardrail_blocked_message(e)
                             # Apply guardrail to regular response
                             try:
-                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
+                                validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages, response_format=response_format)
+                                self._commit_assistant_reply(validated_response)
                                 # Execute callback after validation
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                             except Exception as e:
-                                logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
+                                logger.error(f"Agent {self.name}: Guardrail validation failed: {e}")
                                 # Rollback chat history on guardrail failure
                                 self._rollback_chat_history_to(chat_history_length)
                                 return self._guardrail_blocked_message(e)
@@ -4498,7 +4615,7 @@ Reflect on your previous response: '{response_text}'.
 Provide a "satisfactory" status ('yes' or 'no').
 Output MUST be JSON with 'reflection' and 'satisfactory'.
                         """
-                        logging.debug(f"{self.name} reflection attempt {reflection_count+1}, sending prompt: {reflection_prompt}")
+                        logger.debug(f"{self.name} reflection attempt {reflection_count+1}, sending prompt: {reflection_prompt}")
                         messages.append({"role": "user", "content": reflection_prompt})
 
                         try:
@@ -4544,16 +4661,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             if reflection_output.satisfactory == "yes" and reflection_count >= self.min_reflect - 1:
                                 if self.verbose:
                                     _get_display_functions()['display_self_reflection']("Agent marked the response as satisfactory after meeting minimum reflections", console=self.console)
-                                # User message already added before LLM call via _build_messages
-                                self._append_to_chat_history({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after satisfactory reflection
                                 try:
                                     validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
+                                    self._commit_assistant_reply(validated_response, persist=False)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                                 except Exception as e:
-                                    logging.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
+                                    logger.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
                                     # Rollback chat history on guardrail failure
                                     self._rollback_chat_history_to(chat_history_length)
                                     return self._guardrail_blocked_message(e)
@@ -4562,22 +4678,21 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             if reflection_count >= self.max_reflect - 1:
                                 if self.verbose:
                                     _get_display_functions()['display_self_reflection']("Maximum reflection count reached, returning current response", console=self.console)
-                                # User message already added before LLM call via _build_messages
-                                self._append_to_chat_history({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after max reflections
                                 try:
                                     validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
+                                    self._commit_assistant_reply(validated_response, persist=False)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                                 except Exception as e:
-                                    logging.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
+                                    logger.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
                                     # Rollback chat history on guardrail failure
                                     self._rollback_chat_history_to(chat_history_length)
                                     return self._guardrail_blocked_message(e)
                             
                             # If not satisfactory and not at max reflections, continue with regeneration
-                            logging.debug(f"{self.name} reflection count {reflection_count + 1}, continuing reflection process")
+                            logger.debug(f"{self.name} reflection count {reflection_count + 1}, continuing reflection process")
                             messages.append({"role": "user", "content": "Now regenerate your response using the reflection you made"})
                             # For reflection, always use non-streaming to ensure compatibility with sync adapters
                             # and to avoid streaming complexity during regeneration process
@@ -4590,7 +4705,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
                         except Exception as e:
                                 _get_display_functions()['display_error'](f"Error in parsing self-reflection json {e}. Retrying", console=self.console)
-                                logging.error("Reflection parsing failed.", exc_info=True)
+                                logger.error("Reflection parsing failed.", exc_info=True)
                                 messages.append({"role": "assistant", "content": "Self Reflection failed."})
                                 reflection_count += 1
                                 if reflection_count >= self.max_reflect:
@@ -4600,13 +4715,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     # None) loops forever, two LLM calls at a time.
                                     if self.verbose:
                                         _get_display_functions()['display_self_reflection']("Maximum reflection count reached after repeated parse errors, returning current response", console=self.console)
-                                    self._append_to_chat_history({"role": "assistant", "content": response_text})
                                     try:
                                         validated_response = self._apply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, cancel_token=cancel_token, messages=messages)
+                                        self._commit_assistant_reply(validated_response, persist=False)
                                         self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                         return self._trigger_after_agent_hook(original_prompt, validated_response, start_time)
                                     except Exception as guard_e:
-                                        logging.error(f"Agent {self.name}: Guardrail validation failed after reflection error: {guard_e}")
+                                        logger.error(f"Agent {self.name}: Guardrail validation failed after reflection error: {guard_e}")
                                         self._rollback_chat_history_to(chat_history_length)
                                         return None
                                 continue  # Continue even after error to try again
@@ -4623,7 +4738,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 _get_display_functions()['display_error'](f"Unexpected error in chat: {e}", console=self.console)
                 # Rollback chat history
                 self._rollback_chat_history_to(chat_history_length)
-                return None
+                if _is_fatal_model_error(e):
+                    raise
+                return self._none_after_failed_turn(e)
             finally:
                 # End per-turn tracking after any rollback has run (rollback
                 # reads the ownership list, so this must come last).
@@ -4676,7 +4793,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     self._validate_input_with_guardrail, prompt
                 )
             if not _in_ok:
-                logging.warning(f"Agent {self.name}: input blocked by guardrail: {_in_err}")
+                logger.warning(f"Agent {self.name}: input blocked by guardrail: {_in_err}")
                 self._last_guardrail_error = _in_err
                 return self._guardrail_blocked_message(_in_err)
             prompt = _in_prompt
@@ -4742,15 +4859,19 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             if self._db is not None:
                 await self._ainit_db_session()
                 await self._astart_run(prompt if isinstance(prompt, str) else str(prompt))
-            result = await self._achat_impl(
-                prompt=prompt, temperature=temperature, tools=tools,
-                output_json=output_json, output_pydantic=output_pydantic,
-                reasoning_steps=reasoning_steps, stream=stream,
-                task_name=task_name, task_description=task_description, task_id=task_id,
-                config=config, force_retrieval=force_retrieval, skip_retrieval=skip_retrieval,
-                attachments=attachments, _trace_emitter=_trace_emitter, tool_choice=tool_choice,
-                seed=seed, cancel_token=_cancel
-            )
+            _scope_token = self._enter_turn_tool_scope(tools)
+            try:
+                result = await self._achat_impl(
+                    prompt=prompt, temperature=temperature, tools=tools,
+                    output_json=output_json, output_pydantic=output_pydantic,
+                    reasoning_steps=reasoning_steps, stream=stream,
+                    task_name=task_name, task_description=task_description, task_id=task_id,
+                    config=config, force_retrieval=force_retrieval, skip_retrieval=skip_retrieval,
+                    attachments=attachments, _trace_emitter=_trace_emitter, tool_choice=tool_choice,
+                    seed=seed, cancel_token=_cancel
+                )
+            finally:
+                self._exit_turn_tool_scope(_scope_token)
             db_output = str(result) if result is not None else None
             # A guardrail-blocked turn returns a non-None refusal string; record
             # it as "error", not "completed" (see sync chat()).
@@ -4813,6 +4934,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # across turns of a long-lived agent.
         _reset_loop_guard_for_turn(self)
         self._last_stop_reason = "completed"
+        self._last_error = None
         # Apply rate limiter if configured (before any LLM call) - async parity
         # with the sync path in _chat_impl; without this, async bursts (astart,
         # async_execution=True) would fire with zero throttling.
@@ -4846,7 +4968,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             )
             hook_results = await self._hook_runner.execute(HookEvent.BEFORE_AGENT, before_agent_input)
             if self._hook_runner.is_blocked(hook_results):
-                logging.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
+                logger.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
                 return None
 
             # Update prompt if modified by hooks
@@ -4875,7 +4997,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 "agent_role": self.role,
                 "agent_goal": self.goal
             }
-            logging.debug(f"Agent.achat parameters: {json.dumps(param_info, indent=2, default=str)}")
+            logger.debug(f"Agent.achat parameters: {json.dumps(param_info, indent=2, default=str)}")
         
         start_time = time.time()
         reasoning_steps = reasoning_steps or self.reasoning_steps
@@ -4938,7 +5060,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 except Exception as _ce:
                     if getattr(self, '_strict_hooks', False):
                         raise
-                    logging.debug(f"[proactive-context-async] fallback: {_ce}")
+                    logger.debug(f"[proactive-context-async] fallback: {_ce}")
                     effective_history = self.chat_history
                     
                 # --- Context compaction (async custom LLM path) ---
@@ -5015,15 +5137,15 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     if effective_history is not self.chat_history:
                         self._replace_chat_history(effective_history)
 
-                    self._append_to_chat_history({"role": "assistant", "content": response_text})
-
                     if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
-                        logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
+                        logger.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                     
                     # Apply guardrail validation for custom LLM response
                     try:
                         validated_response = await self._aapply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id, messages=effective_history)
+                        # Commit + persist only the approved reply (matches sync chat()).
+                        await self._acommit_assistant_reply(validated_response)
                         # Coerce into the requested Pydantic model so callers
                         # get a validated instance, not a raw JSON string.
                         # output_json intentionally stays a string (backward compat).
@@ -5033,7 +5155,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         self._execute_callback_and_display(normalized_content, validated_response, time.time() - start_time, task_name, task_description, task_id)
                         return await self._atrigger_after_agent_hook(prompt, validated_response, start_time)
                     except Exception as e:
-                        logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
+                        logger.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
                         # Rollback chat history on guardrail failure
                         self._rollback_chat_history_to(chat_history_length)
                         return self._guardrail_blocked_message(e)
@@ -5046,8 +5168,10 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
                     if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
-                        logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
-                    return None
+                        logger.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
+                    if _is_fatal_model_error(e):
+                        raise
+                    return self._none_after_failed_turn(e)
 
             # For OpenAI client
             # Use the new _build_messages helper method
@@ -5087,7 +5211,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             # unatomic read of chat_history[-1] followed by a separate append
             # lets a concurrent turn's user message be mistaken for this turn's
             # own duplicate, silently dropping this user turn from the record.
-            self._add_to_chat_history_if_not_duplicate("user", normalized_content)
+            if self._add_to_chat_history_if_not_duplicate("user", normalized_content):
+                # Persist user message to DB (matches sync chat())
+                await self._apersist_message("user", normalized_content)
 
             # --- Proactive Context Budget Management (async standard OpenAI path) ---
             try:
@@ -5100,7 +5226,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             except Exception as _ce2:
                 if getattr(self, '_strict_hooks', False):
                     raise
-                logging.debug(f"[proactive-context-async-standard] fallback: {_ce2}")
+                logger.debug(f"[proactive-context-async-standard] fallback: {_ce2}")
                 
             # --- Context compaction (async standard OpenAI path) ---
             from ..hooks import HookEvent as _HE2
@@ -5167,16 +5293,11 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
 
                         # Handle output_json or output_pydantic if specified
                         if output_json or output_pydantic:
-                            # Add to chat history and return raw response
-                            # User message already added before LLM call via _build_messages
-                            self._append_to_chat_history({"role": "assistant", "content": response_text})
-                            # Persist assistant message to DB (offloaded to a
-                            # worker thread so file-locked disk I/O doesn't
-                            # block the event loop on this async turn).
-                            await self._apersist_message("assistant", response_text)
-                            # Apply guardrail validation even for JSON output
+                            # Apply guardrail validation even for JSON output; the
+                            # reply is committed to history/DB only once approved.
                             try:
-                                validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
+                                validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages, response_format=response_format)
+                                await self._acommit_assistant_reply(validated_response)
                                 # Coerce into the requested Pydantic model so callers
                                 # get a validated instance, not a raw JSON string.
                                 # output_json intentionally stays a string (backward compat).
@@ -5186,42 +5307,42 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                 return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
                             except Exception as e:
-                                logging.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
+                                logger.error(f"Agent {self.name}: Guardrail validation failed for JSON output: {e}")
                                 # Rollback chat history on guardrail failure
                                 self._rollback_chat_history_to(chat_history_length)
                                 return self._guardrail_blocked_message(e)
 
                         # For regular responses (no self-reflection)
                         if not self.self_reflect:
-                            # User message already added before LLM call via _build_messages
-                            self._append_to_chat_history({"role": "assistant", "content": response_text})
-                            # Persist assistant message to DB (non-reflect path,
-                            # offloaded to a worker thread to avoid blocking the loop)
-                            await self._apersist_message("assistant", response_text)
+                            # The assistant reply is committed to history/DB only
+                            # after guardrail validation (below).
                             if self.verbose:
-                                logging.debug(f"Agent {self.name} final response: {response_text}")
+                                logger.debug(f"Agent {self.name} final response: {response_text}")
                             # Return only reasoning content if reasoning_steps is True
                             if reasoning_steps and hasattr(response, 'choices') and response.choices and hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                                 # Apply guardrail to reasoning content
                                 try:
                                     validated_reasoning = await self._aapply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
+                                    # Commit the approved text, not the unchecked answer.
+                                    await self._acommit_assistant_reply(validated_reasoning)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_reasoning, time.time() - start_time, task_name, task_description, task_id)
                                     return await self._atrigger_after_agent_hook(original_prompt, validated_reasoning, start_time)
                                 except Exception as e:
-                                    logging.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
+                                    logger.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
                                     # Rollback chat history on guardrail failure
                                     self._rollback_chat_history_to(chat_history_length)
                                     return self._guardrail_blocked_message(e)
                             else:
                                 # Apply guardrail to regular response content
                                 try:
-                                    validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
+                                    validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages, response_format=response_format)
+                                    await self._acommit_assistant_reply(validated_response)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                     return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
                                 except Exception as e:
-                                    logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
+                                    logger.error(f"Agent {self.name}: Guardrail validation failed: {e}")
                                     # Rollback chat history on guardrail failure
                                     self._rollback_chat_history_to(chat_history_length)
                                     return self._guardrail_blocked_message(e)
@@ -5252,16 +5373,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         if self.verbose:
                                             _get_display_functions()['display_self_reflection'](f"Agent {self.name}: Self-reflection with structured output is not supported for custom LLM providers. Skipping reflection.", console=self.console)
                                         # Return the original response without reflection
-                                        self._append_to_chat_history({"role": "assistant", "content": response_text})
-                                        # Persist assistant message to DB (offloaded to a worker thread)
-                                        await self._apersist_message("assistant", response_text)
                                         try:
                                             validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
+                                            await self._acommit_assistant_reply(validated_response)
                                             # Execute callback after validation
                                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
                                         except Exception as e:
-                                            logging.error(f"Agent {self.name}: Guardrail validation failed: {e}")
+                                            logger.error(f"Agent {self.name}: Guardrail validation failed: {e}")
                                             # Rollback chat history on guardrail failure
                                             self._rollback_chat_history_to(chat_history_length)
                                             return self._guardrail_blocked_message(e)
@@ -5286,16 +5405,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         if self.verbose:
                                             _get_display_functions()['display_self_reflection']("Agent marked the response as satisfactory after meeting minimum reflections", console=self.console)
                                         # Add to chat history and return
-                                        self._append_to_chat_history({"role": "assistant", "content": response_text})
-                                        # Persist assistant message to DB (offloaded to a worker thread)
-                                        await self._apersist_message("assistant", response_text)
                                         try:
                                             validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
+                                            await self._acommit_assistant_reply(validated_response)
                                             # Execute callback after validation
                                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
                                         except Exception as e:
-                                            logging.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
+                                            logger.error(f"Agent {self.name}: Guardrail validation failed after reflection: {e}")
                                             # Rollback chat history on guardrail failure
                                             self._rollback_chat_history_to(chat_history_length)
                                             return self._guardrail_blocked_message(e)
@@ -5305,16 +5422,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         if self.verbose:
                                             _get_display_functions()['display_self_reflection']("Maximum reflection count reached, returning current response", console=self.console)
                                         # Add to chat history and return
-                                        self._append_to_chat_history({"role": "assistant", "content": response_text})
-                                        # Persist assistant message to DB (offloaded to a worker thread)
-                                        await self._apersist_message("assistant", response_text)
                                         try:
                                             validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
+                                            await self._acommit_assistant_reply(validated_response)
                                             # Execute callback after validation
                                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
                                         except Exception as e:
-                                            logging.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
+                                            logger.error(f"Agent {self.name}: Guardrail validation failed after max reflections: {e}")
                                             # Rollback chat history on guardrail failure
                                             self._rollback_chat_history_to(chat_history_length)
                                             return self._guardrail_blocked_message(e)
@@ -5352,20 +5467,18 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 except Exception as e:
                                     if self.verbose:
                                         _get_display_functions()['display_error'](f"Error in parsing self-reflection json {e}. Retrying", console=self.console)
-                                    logging.error("Reflection parsing failed.", exc_info=True)
+                                    logger.error("Reflection parsing failed.", exc_info=True)
                                     reflection_count += 1
                                     if reflection_count >= self.max_reflect:
                                         # Return original response after max reflection attempts
-                                        self._append_to_chat_history({"role": "assistant", "content": response_text})
-                                        # Persist assistant message to DB (offloaded to a worker thread)
-                                        await self._apersist_message("assistant", response_text)
                                         try:
                                             validated_response = await self._aapply_guardrail_with_retry(response_text, original_prompt, temperature, tools, task_name, task_description, task_id, messages=messages)
+                                            await self._acommit_assistant_reply(validated_response)
                                             # Execute callback after validation
                                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
                                         except Exception as guard_e:
-                                            logging.error(f"Agent {self.name}: Guardrail validation failed after reflection error: {guard_e}")
+                                            logger.error(f"Agent {self.name}: Guardrail validation failed after reflection error: {guard_e}")
                                             # Rollback chat history on guardrail failure
                                             self._rollback_chat_history_to(chat_history_length)
                                             return self._guardrail_blocked_message(guard_e)
@@ -5373,7 +5486,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         # This should never be reached due to the returns above
                         # But adding as safety fallback
-                        logging.warning(f"Agent {self.name}: Unexpected code path reached in unified dispatch")
+                        logger.warning(f"Agent {self.name}: Unexpected code path reached in unified dispatch")
                         return None
                     else:
                         # LEGACY: Check if OpenAI client is available
@@ -5400,7 +5513,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             result = await self._achat_completion(response, tools, messages=messages)
                             if get_logger().getEffectiveLevel() == logging.DEBUG:
                                 total_time = time.time() - start_time
-                                logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
+                                logger.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                             # Execute callback after tool completion
                             self._execute_callback_and_display(original_prompt, result, time.time() - start_time, task_name, task_description, task_id)
                             return await self._atrigger_after_agent_hook(original_prompt, result, start_time)
@@ -5417,7 +5530,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             response_text = response.choices[0].message.content
                             if get_logger().getEffectiveLevel() == logging.DEBUG:
                                 total_time = time.time() - start_time
-                                logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
+                                logger.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                             # Coerce into the requested Pydantic model so callers
                             # get a validated instance, not a raw JSON string.
                             # output_json intentionally stays a string (backward compat).
@@ -5467,7 +5580,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         self._append_to_chat_history({"role": "assistant", "content": response_text})
                                         if get_logger().getEffectiveLevel() == logging.DEBUG:
                                             total_time = time.time() - start_time
-                                            logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
+                                            logger.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                                         return await self._atrigger_after_agent_hook(original_prompt, response_text, start_time)
                                     
                                     _areflection_kwargs = {}
@@ -5517,7 +5630,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 except Exception as e:
                                     if self.verbose:
                                         _get_display_functions()['display_error'](f"Error in parsing self-reflection json {e}. Retrying", console=self.console)
-                                    logging.error("Reflection parsing failed.", exc_info=True)
+                                    logger.error("Reflection parsing failed.", exc_info=True)
                                     reflection_count += 1
                                     if reflection_count >= self.max_reflect:
                                         break
@@ -5525,7 +5638,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         if get_logger().getEffectiveLevel() == logging.DEBUG:
                             total_time = time.time() - start_time
-                            logging.debug(f"Agent.achat completed in {total_time:.2f} seconds")
+                            logger.debug(f"Agent.achat completed in {total_time:.2f} seconds")
                         
                         # Apply guardrail validation for OpenAI client response
                         try:
@@ -5534,7 +5647,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self._execute_callback_and_display(original_prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
                             return await self._atrigger_after_agent_hook(original_prompt, validated_response, start_time)
                         except Exception as e:
-                            logging.error(f"Agent {self.name}: Guardrail validation failed for OpenAI client: {e}")
+                            logger.error(f"Agent {self.name}: Guardrail validation failed for OpenAI client: {e}")
                             # Rollback chat history on guardrail failure
                             self._rollback_chat_history_to(chat_history_length)
                             return self._guardrail_blocked_message(e)
@@ -5545,12 +5658,14 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     _get_display_functions()['display_error'](f"Error in chat completion: {e}")
                     if get_logger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
-                        logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
+                        logger.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
                     # Rollback chat history so a failed async turn does not leave
                     # a dangling, unanswered user message (mirrors the sync path
                     # and achat()'s own guardrail handler).
                     self._rollback_chat_history_to(chat_history_length)
-                    return None
+                    if _is_fatal_model_error(e):
+                        raise
+                    return self._none_after_failed_turn(e)
         except ToolExecutionError:
             raise
         except Exception as e:
@@ -5561,11 +5676,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             _get_display_functions()['display_error'](f"Error in achat: {e}")
             if get_logger().getEffectiveLevel() == logging.DEBUG:
                 total_time = time.time() - start_time
-                logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
+                logger.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
             # Rollback chat history so a failed async turn does not leave a
             # dangling, unanswered user message (mirrors the sync path).
             self._rollback_chat_history_to(chat_history_length)
-            return None
+            if _is_fatal_model_error(e):
+                raise
+            return self._none_after_failed_turn(e)
         finally:
             # Unregister this turn's ownership list from the process-wide
             # live-turn registry once the turn finishes (success or failure).
@@ -5608,7 +5725,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         # TypeError: a custom client can hand back a non-text
                         # argument value, which json.loads rejects. Treat it the
                         # same as malformed JSON (mirrors llm.py's parser).
-                        logging.error(f"Failed to parse tool arguments as JSON: {json_error}")
+                        logger.error(f"Failed to parse tool arguments as JSON: {json_error}")
                         arguments = _TOOL_ARGUMENTS_PARSE_FAILED
                     if tool_arguments_parse_failed(arguments):
                         # Report the failure to streaming observers before skipping
@@ -5819,7 +5936,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         if hasattr(self, '_validate_input_with_guardrail'):
             _in_ok, _in_prompt, _in_err = self._validate_input_with_guardrail(prompt)
             if not _in_ok:
-                logging.warning(f"Agent {getattr(self, 'name', '')}: input blocked by guardrail: {_in_err}")
+                logger.warning(f"Agent {getattr(self, 'name', '')}: input blocked by guardrail: {_in_err}")
                 self._last_guardrail_error = _in_err
                 yield self._guardrail_blocked_message(_in_err)
                 return "failed"
@@ -5842,7 +5959,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 tools_available=[t.__name__ if hasattr(t, '__name__') else str(t) for t in self.tools]
             ))
             if self._hook_runner.is_blocked(hook_results):
-                logging.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
+                logger.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
                 return "failed"
             for res in hook_results:
                 if res.output and res.output.modified_input and "prompt" in res.output.modified_input:
@@ -5884,7 +6001,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         # This lives here (the single common streaming path) so both
         # iter_stream() and start(stream=True) surface the bypass loudly.
         if getattr(self, 'guardrail', None) is not None:
-            logging.warning(
+            logger.warning(
                 f"Agent {getattr(self, 'name', '')}: output guardrail is not "
                 "applied to streamed responses (iter_stream / stream=True). "
                 "Use chat() for guardrail-validated output."
@@ -5943,11 +6060,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 
                 # Convert MCP tools if needed
                 if tool_param is not None:
-                    MCP = None
-                    try:
-                        from ..mcp.mcp import MCP
-                    except ImportError:
-                        pass
+                    from .tool_execution import _loaded_mcp_class
+                    MCP = _loaded_mcp_class()
                     if MCP is not None and isinstance(tool_param, MCP) and hasattr(tool_param, 'to_openai_tool'):
                         openai_tool = tool_param.to_openai_tool()
                         if openai_tool:
@@ -6074,7 +6188,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 except Exception as e:
                     # Rollback chat history on error
                     self._rollback_chat_history_to(chat_history_length)
-                    logging.error(f"Custom LLM streaming error: {e}")
+                    logger.error(f"Custom LLM streaming error: {e}")
                     raise
                     
             else:
@@ -6345,7 +6459,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     except (json.JSONDecodeError, TypeError) as json_error:
                                         # TypeError: a non-text argument value also
                                         # cannot be parsed; treat it as malformed.
-                                        logging.error(f"Failed to parse tool arguments as JSON: {json_error}")
+                                        logger.error(f"Failed to parse tool arguments as JSON: {json_error}")
                                         parsed_args = _TOOL_ARGUMENTS_PARSE_FAILED
                                     if tool_arguments_parse_failed(parsed_args):
                                         self._notify_tool_call(
@@ -6433,7 +6547,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 except ToolExecutionError:
                                     raise
                                 except Exception as tool_error:
-                                    logging.error(f"Tool execution error in streaming: {tool_error}")
+                                    logger.error(f"Tool execution error in streaming: {tool_error}")
                                     # Add error result to chat history
                                     self._append_to_chat_history({
                                         "role": "tool", 
@@ -6561,7 +6675,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 except Exception as e:
                     # Rollback chat history on error
                     self._rollback_chat_history_to(chat_history_length)
-                    logging.error(f"OpenAI streaming error: {e}")
+                    logger.error(f"OpenAI streaming error: {e}")
                     # Fall back to simulated streaming
                     response = self._stream_fallback_chat(prompt, kwargs, e)
                     if response:
@@ -6589,7 +6703,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 # error one level deeper; surface the chained failure as-is.
                 raise
             # Graceful fallback to non-streaming if streaming fails
-            logging.warning(f"Streaming failed, falling back to regular response: {e}")
+            logger.warning(f"Streaming failed, falling back to regular response: {e}")
             response = self._stream_fallback_chat(prompt, kwargs, e)
             if response:
                 yield response
@@ -6629,7 +6743,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             except Exception:  # noqa: BLE001 - never let classification break fallback
                 is_replay_unsafe_chain = None
             if is_replay_unsafe_chain is not None and is_replay_unsafe_chain(streaming_error):
-                logging.warning(
+                logger.warning(
                     "Not falling back to non-streaming chat() on a tool turn: the "
                     "streaming failure is replay-unsafe (post-dispatch); surfacing "
                     "the original error to avoid re-executing the turn."
@@ -6655,7 +6769,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         }
         dropped = sorted(set(kwargs) - set(fallback_kwargs))
         if dropped:
-            logging.debug(
+            logger.debug(
                 f"Streaming fallback: dropping kwargs chat() does not accept: {dropped}"
             )
         # The fallback is, by definition, the non-streaming path.
@@ -6670,7 +6784,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         try:
             return self.chat(prompt, **fallback_kwargs)
         except Exception as fallback_error:
-            logging.error(
+            logger.error(
                 f"Streaming failed ({streaming_error!r}) and the non-streaming "
                 f"fallback also failed ({fallback_error!r})"
             )
@@ -6711,7 +6825,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 return str(extracted).strip()
                     
             except Exception as e:
-                logging.warning(f"LLM summarization call failed: {e}")
+                logger.warning(f"LLM summarization call failed: {e}")
                 raise
         
         return llm_summarize_async
@@ -6766,7 +6880,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 try:
                     _llm_fn = self._create_llm_summarize_function()
                 except Exception as e:
-                    logging.warning(f"Failed to create LLM summarize function: {e}")
+                    logger.warning(f"Failed to create LLM summarize function: {e}")
             
             _compactor = ContextCompactor(
                 max_tokens=_max_tok,
@@ -6781,7 +6895,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             try:
                 self._hook_runner.execute_sync(hook_event_class.BEFORE_COMPACTION, None)
             except Exception as e:
-                logging.warning(f"BEFORE_COMPACTION hook failed: {e}")
+                logger.warning(f"BEFORE_COMPACTION hook failed: {e}")
                 if getattr(self, '_strict_hooks', False):
                     raise
 
@@ -6808,7 +6922,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     compacted_msgs, _cr = _compactor.compact(messages)
             
             messages[:] = compacted_msgs  # in-place update so callers see the change
-            logging.info(
+            logger.info(
                 f"[compaction] {self.name}: {_cr.original_tokens}→{_cr.compacted_tokens} tokens "
                 f"({_cr.messages_removed} messages removed, strategy={_cr.strategy_used.value})"
             )
@@ -6817,7 +6931,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             try:
                 self._hook_runner.execute_sync(hook_event_class.AFTER_COMPACTION, None)
             except Exception as e:
-                logging.warning(f"AFTER_COMPACTION hook failed: {e}")
+                logger.warning(f"AFTER_COMPACTION hook failed: {e}")
                 if getattr(self, '_strict_hooks', False):
                     raise
                     
@@ -6826,7 +6940,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         except Exception as _ce:
             if getattr(self, '_strict_hooks', False):
                 raise
-            logging.debug(f"[compaction] skipped (non-fatal): {_ce}")
+            logger.debug(f"[compaction] skipped (non-fatal): {_ce}")
             return False
 
     async def _apply_context_compaction_async(self, messages, hook_event_class):
@@ -6857,7 +6971,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 try:
                     _llm_fn = self._create_llm_summarize_function()
                 except Exception as e:
-                    logging.warning(f"Failed to create LLM summarize function: {e}")
+                    logger.warning(f"Failed to create LLM summarize function: {e}")
             
             _compactor = ContextCompactor(
                 max_tokens=_max_tok,
@@ -6872,7 +6986,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             try:
                 await self._hook_runner.execute(hook_event_class.BEFORE_COMPACTION, None)
             except Exception as e:
-                logging.warning(f"BEFORE_COMPACTION hook failed: {e}")
+                logger.warning(f"BEFORE_COMPACTION hook failed: {e}")
                 if getattr(self, '_strict_hooks', False):
                     raise
 
@@ -6891,7 +7005,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 self._replace_chat_history(compacted_msgs)
             else:
                 messages[:] = compacted_msgs
-            logging.info(
+            logger.info(
                 f"[compaction] {self.name}: {_cr.original_tokens}→{_cr.compacted_tokens} tokens "
                 f"({_cr.messages_removed} messages removed, strategy={_cr.strategy_used.value})"
             )
@@ -6900,7 +7014,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             try:
                 await self._hook_runner.execute(hook_event_class.AFTER_COMPACTION, None)
             except Exception as e:
-                logging.warning(f"AFTER_COMPACTION hook failed: {e}")
+                logger.warning(f"AFTER_COMPACTION hook failed: {e}")
                 if getattr(self, '_strict_hooks', False):
                     raise
                     
@@ -6909,8 +7023,27 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         except Exception as _ce:
             if getattr(self, '_strict_hooks', False):
                 raise
-            logging.debug(f"[compaction] skipped (non-fatal): {_ce}")
+            logger.debug(f"[compaction] skipped (non-fatal): {_ce}")
             return False
+
+    def _emit_stream_unavailable(self):
+        """Tell stream consumers this turn falls back to one whole answer (X-04).
+
+        Emitted where a sync adapter refuses to stream; a no-op when nothing is
+        listening, and never raises into the fallback.
+        """
+        emitter = getattr(self, 'stream_emitter', None)
+        if emitter is None or not getattr(emitter, 'has_callbacks', False):
+            return
+        try:
+            from ..streaming.events import StreamEvent, StreamEventType
+            emitter.emit(StreamEvent(
+                type=StreamEventType.STREAM_UNAVAILABLE,
+                content="Streaming is not supported here; the answer arrives in one piece.",
+                agent_id=getattr(self, 'name', None),
+            ))
+        except Exception as _e:
+            logger.debug(f"Failed to emit STREAM_UNAVAILABLE stream event: {_e}")
 
     def _emit_retry_stream_event(self, *, attempt, max_attempts, delay, reason):
         """Emit a ``StreamEventType.RETRY`` event during backoff.
@@ -7322,6 +7455,9 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     max_delay=retry_config.max_delay,
                     jitter_ratio=retry_config.jitter_ratio,
                 )
+                # Never sooner than the server asked (Retry-After), as on the sync path.
+                from ..llm.error_classifier import extract_retry_after
+                delay = max(delay, extract_retry_after(e.__cause__ or e, cap_seconds=retry_config.max_delay) or 0.0)
                 
                 # Fire OnRetry hook with delay information
                 retry_input = OnRetryInput(

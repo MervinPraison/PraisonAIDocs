@@ -6,6 +6,7 @@ cost tracking, and hook integration. Extracted from agent.py
 for maintainability.
 """
 
+import sys
 import os
 import dataclasses
 import typing
@@ -21,8 +22,19 @@ import random
 from typing import List, Optional, Any, Dict, Union, TYPE_CHECKING
 from ..errors import ToolExecutionError
 from ..config.feature_configs import DEFAULT_TOOL_OUTPUT_LIMIT
+from ..llm._helpers import tool_parse_error_message  # noqa: F401 - re-exported for chat_mixin
 
 logger = logging.getLogger(__name__)
+
+
+def _loaded_mcp_class():
+    """The ``MCP`` class if its module is already imported, else ``None`` (X-16).
+
+    No tool can be an ``MCP`` instance unless ``praisonaiagents.mcp.mcp`` was
+    imported, so an ``isinstance`` check needs no import; importing it pulls in
+    the ``mcp`` package (about 0.4 s) on runs that use no MCP tool at all.
+    """
+    return getattr(sys.modules.get("praisonaiagents.mcp.mcp"), "MCP", None)
 
 # Upper bound on how many timed-out (still-blocked) tool executors a single
 # agent may retire before it stops recycling and falls back to reusing the
@@ -38,6 +50,14 @@ _MAX_ORPHANED_TOOL_EXECUTORS = 4
 # own token. Set/reset by ``chat``/``achat``.
 _active_turn_cancel: "contextvars.ContextVar[Optional[tuple]]" = contextvars.ContextVar(
     "praisonai_active_turn_cancel", default=None
+)
+
+# Per-turn tool allow-set as ``(agent, frozenset_of_names)``. Set by
+# ``chat``/``achat`` only when the caller passed ``tools=[...]`` (e.g. a handoff
+# ``intersect`` policy) so the subset is enforced at dispatch, not only in the
+# schema sent to the model.
+_turn_tool_scope: "contextvars.ContextVar[Optional[tuple]]" = contextvars.ContextVar(
+    "praisonai_turn_tool_scope", default=None
 )
 
 # Exceptions a tool body raises about its *input* (bad value, missing key or
@@ -154,7 +174,7 @@ def _coerce_value(value, annotation):
     except (ValueError, TypeError):
         return original
     except Exception as e:  # e.g. pydantic.ValidationError, json.JSONDecodeError
-        logging.debug(f"Could not coerce tool argument to {annotation!r}: {e}")
+        logger.debug(f"Could not coerce tool argument to {annotation!r}: {e}")
         return original
 
 
@@ -212,24 +232,6 @@ class _CallableGuardrailAdapter:
 def tool_arguments_parse_failed(arguments) -> bool:
     """True when tool-call arguments could not be parsed (vs. legitimately empty)."""
     return arguments is _TOOL_ARGUMENTS_PARSE_FAILED
-
-
-def tool_parse_error_message(function_name: str, tool_call_id: str) -> Dict[str, str]:
-    """Build a tool-role message telling the model its arguments were lost.
-
-    Surfacing this instead of dispatching with {} converts a silent
-    wrong-action-reported-as-success into a visible, retryable error.
-    """
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call_id,
-        "content": (
-            f"Error: arguments for tool '{function_name}' could not be parsed "
-            f"(the argument string was invalid or truncated). "
-            f"The tool was NOT executed. Please re-emit the tool call with "
-            f"complete, valid JSON arguments."
-        ),
-    }
 
 
 if TYPE_CHECKING:
@@ -313,7 +315,7 @@ def _content_part_to_data_uri(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         mime = part.get("mime") or "image/png"
         if isinstance(data, (bytes, bytearray)):
             if len(data) > MULTIMODAL_IMAGE_BYTE_LIMIT:
-                logging.warning(
+                logger.warning(
                     "Multimodal image part (%d bytes) exceeds limit %d; skipping",
                     len(data), MULTIMODAL_IMAGE_BYTE_LIMIT,
                 )
@@ -325,7 +327,7 @@ def _content_part_to_data_uri(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             if encoded.startswith("data:"):
                 return {"type": "image_url", "image_url": {"url": encoded}}
             if len(encoded) > MULTIMODAL_IMAGE_BYTE_LIMIT * 2:
-                logging.warning(
+                logger.warning(
                     "Multimodal image part (encoded %d chars) exceeds limit; skipping",
                     len(encoded),
                 )
@@ -522,7 +524,7 @@ def try_append_multimodal_tool_result(
                 messages.append(followup_message)
             return True
     except Exception as e:
-        logging.debug(f"Multimodal tool result formatting skipped: {e}")
+        logger.debug(f"Multimodal tool result formatting skipped: {e}")
     return False
 
 
@@ -559,14 +561,19 @@ class ToolExecutionMixin:
             
             # Only add if not already present
             existing_tool_names = {getattr(t, '__name__', str(t)) for t in self.tools}
+            # Exempt from the per-turn ``tools=`` scope only the framework tools
+            # actually appended; a same-named user tool stays caller-scoped.
+            added = set(getattr(self, '_framework_tool_names', ()))
             for tool in tools_to_add:
                 tool_name = getattr(tool, '__name__', str(tool))
                 if tool_name not in existing_tool_names:
                     self.tools.append(tool)
+                    added.add(tool_name)
+            self._framework_tool_names = frozenset(added)
             
-            logging.debug("Registered artifact retrieval tools")
+            logger.debug("Registered artifact retrieval tools")
         except Exception as e:
-            logging.warning(f"Failed to register artifact tools: {e}")
+            logger.warning(f"Failed to register artifact tools: {e}")
 
     def _get_existing_stream_emitter(self):
         """Return an already-initialized stream emitter without creating one."""
@@ -659,7 +666,7 @@ class ToolExecutionMixin:
                     return True
             return False
         except Exception as exc:  # pragma: no cover - defensive plugin boundary
-            logging.warning("Failed to check plugin tool state: %s", exc)
+            logger.warning("Failed to check plugin tool state: %s", exc)
             return False
 
     def _merge_plugin_tools(self):
@@ -699,7 +706,7 @@ class ToolExecutionMixin:
             else:  # pragma: no cover - compatibility with custom managers
                 plugin_entries = [(None, tool) for tool in manager.get_all_tools()]
         except Exception as exc:  # pragma: no cover - defensive plugin boundary
-            logging.warning("Failed to attach plugin tools: %s", exc)
+            logger.warning("Failed to attach plugin tools: %s", exc)
             return
 
         current_tools = self.tools if isinstance(self.tools, list) else [self.tools]
@@ -746,7 +753,7 @@ class ToolExecutionMixin:
                 and isinstance(function.get("name"), str)
                 and function["name"]
             ):
-                logging.warning(
+                logger.warning(
                     "Skipping plugin function tool %r: function schemas are not "
                     "executable without a callable implementation",
                     name,
@@ -755,13 +762,13 @@ class ToolExecutionMixin:
             if not self._is_supported_plugin_tool(tool) or (
                 name is not None and not isinstance(name, str)
             ) or (callable(tool) and not name):
-                logging.warning(
+                logger.warning(
                     "Skipping plugin tool %r: expected a named callable or valid tool spec",
                     name or tool,
                 )
                 continue
             if name and name in existing_names:
-                logging.warning(
+                logger.warning(
                     "Skipping plugin tool %r because Agent already has a tool with that name",
                     name,
                 )
@@ -785,7 +792,7 @@ class ToolExecutionMixin:
             display_name = name
             if not display_name and isinstance(tool, dict):
                 display_name = tool.get("type", "spec")
-            logging.debug("Added plugin tool to Agent: %s", display_name or tool)
+            logger.debug("Added plugin tool to Agent: %s", display_name or tool)
 
     def _merge_plugin_subsystems(self):
         """Route enabled GUARDRAIL/POLICY/SKILL plugins into their subsystems.
@@ -821,7 +828,7 @@ class ToolExecutionMixin:
 
             manager = get_plugin_manager()
         except Exception as exc:  # pragma: no cover - defensive plugin boundary
-            logging.warning("Failed to access plugin manager for subsystems: %s", exc)
+            logger.warning("Failed to access plugin manager for subsystems: %s", exc)
             return
 
         # --- GUARDRAIL plugins -> self.guardrail (GuardrailChain) -------------
@@ -830,7 +837,7 @@ class ToolExecutionMixin:
             try:
                 plugin_guardrails = get_guardrails() or []
             except Exception as exc:  # pragma: no cover - defensive boundary
-                logging.warning("Failed to collect plugin guardrails: %s", exc)
+                logger.warning("Failed to collect plugin guardrails: %s", exc)
                 plugin_guardrails = []
             if plugin_guardrails:
                 try:
@@ -880,7 +887,7 @@ class ToolExecutionMixin:
                             self.guardrail = combined
                             self._guardrail_fn = combined
                 except Exception as exc:  # pragma: no cover - defensive boundary
-                    logging.warning("Failed to wire plugin guardrails: %s", exc)
+                    logger.warning("Failed to wire plugin guardrails: %s", exc)
 
         # --- POLICY plugins -> self._policy (PolicyEngine) -------------------
         get_policies = getattr(manager, "get_all_policies", None)
@@ -888,7 +895,7 @@ class ToolExecutionMixin:
             try:
                 plugin_policies = get_policies() or []
             except Exception as exc:  # pragma: no cover - defensive boundary
-                logging.warning("Failed to collect plugin policies: %s", exc)
+                logger.warning("Failed to collect plugin policies: %s", exc)
                 plugin_policies = []
             if plugin_policies:
                 try:
@@ -911,7 +918,7 @@ class ToolExecutionMixin:
                             if rule_name is not None and callable(get_policy):
                                 try:
                                     if get_policy(rule_name) is not None:
-                                        logging.warning(
+                                        logger.warning(
                                             "Skipping plugin policy %r: a policy "
                                             "with that name already exists.",
                                             rule_name,
@@ -920,7 +927,7 @@ class ToolExecutionMixin:
                                 except Exception:  # pragma: no cover
                                     pass
                             if rule_name is not None and rule_name in existing:
-                                logging.warning(
+                                logger.warning(
                                     "Skipping duplicate plugin policy %r.",
                                     rule_name,
                                 )
@@ -930,11 +937,11 @@ class ToolExecutionMixin:
                                 if rule_name is not None:
                                     existing.add(rule_name)
                             except Exception as exc:  # pragma: no cover
-                                logging.warning(
+                                logger.warning(
                                     "Failed to add plugin policy %r: %s", rule, exc
                                 )
                 except Exception as exc:  # pragma: no cover - defensive boundary
-                    logging.warning("Failed to wire plugin policies: %s", exc)
+                    logger.warning("Failed to wire plugin policies: %s", exc)
 
         # --- SKILL plugins -> self._skills (SkillManager discovers them) -----
         get_skills = getattr(manager, "get_all_skills", None)
@@ -942,7 +949,7 @@ class ToolExecutionMixin:
             try:
                 plugin_skills = get_skills() or []
             except Exception as exc:  # pragma: no cover - defensive boundary
-                logging.warning("Failed to collect plugin skills: %s", exc)
+                logger.warning("Failed to collect plugin skills: %s", exc)
                 plugin_skills = []
             if plugin_skills:
                 current = getattr(self, "_skills", None)
@@ -955,7 +962,7 @@ class ToolExecutionMixin:
                     # source object) would raise inside ``Path()``, so skip it
                     # with a clear warning rather than corrupt discovery.
                     if not isinstance(skill, str):
-                        logging.warning(
+                        logger.warning(
                             "Skipping plugin skill %r: get_skills() must return "
                             "filesystem path strings to skill directories.",
                             skill,
@@ -1015,7 +1022,7 @@ class ToolExecutionMixin:
             
             return casted_args
         except Exception as e:
-            logging.debug(f"Type casting failed for {getattr(func, '__name__', 'unknown function')}: {e}")
+            logger.debug(f"Type casting failed for {getattr(func, '__name__', 'unknown function')}: {e}")
             return arguments
 
     def _current_cancel_event(self):
@@ -1109,7 +1116,7 @@ class ToolExecutionMixin:
             tool_call_id: Optional ID from the LLM's tool_call (e.g., 'call_xxxxx')
                          Used for correlating TOOL_CALL_START/RESULT stream events
         """
-        logging.debug(f"{self.name} executing tool {function_name} with arguments: {arguments}")
+        logger.debug(f"{self.name} executing tool {function_name} with arguments: {arguments}")
         
         # Handle bridge tool unwrapping BEFORE trace/stream/hooks (design invariant #6)
         # Only intercept when tool_search is active; otherwise fall through to real tool execution
@@ -1323,6 +1330,145 @@ class ToolExecutionMixin:
             self._turn_tools_used = []
         return tools_used
 
+    def _truncate_tool_result(self, function_name, result, tool_call_id=None):
+        """Cap a tool result before it re-enters the model context.
+
+        Applies ``ToolConfig.output_max_lines``, the ``tool_output_limit`` char
+        limit (spilling the full output to the artifact store when one is
+        set) and context-aware ``_truncate_tool_output``. Shared by the sync
+        and async tool paths so both send the model the same bounded result.
+        Never raises: on any failure the result is returned unchanged.
+        """
+        try:
+            result_str = str(result)
+            
+            # Get configured limit
+            limit = getattr(self, 'tool_output_limit', DEFAULT_TOOL_OUTPUT_LIMIT)
+            
+            # Initialize artifact reference before limit check so downstream
+            # `if artifact_ref:` guards remain valid on short-result paths.
+            artifact_ref = None
+
+            # ToolConfig.output_max_lines caps lines first, then the
+            # char limit below applies; output_direction picks the end(s) kept.
+            _tool_cfg = getattr(self, '_tool_config', None)
+            direction = getattr(_tool_cfg, 'output_direction', 'both')
+            max_lines = getattr(_tool_cfg, 'output_max_lines', None)
+            capped_str = result_str
+            if max_lines:
+                lines = result_str.split("\n")
+                if len(lines) > max_lines:
+                    if direction == "head":
+                        kept_head, kept_tail = lines[:max_lines], []
+                    elif direction == "tail":
+                        kept_head, kept_tail = [], lines[-max_lines:]
+                    else:
+                        n_tail = max_lines // 2
+                        kept_head = lines[:max_lines - n_tail]
+                        kept_tail = lines[-n_tail:] if n_tail else []
+                    marker = f"...[{len(lines):,} lines total, showing {max_lines:,}]..."
+                    capped_str = "\n".join(kept_head + [marker] + kept_tail)
+
+            # Check if we need to spill to artifact store
+            if len(capped_str) > limit or capped_str is not result_str:
+                # Try to use artifact store if available
+                if hasattr(self, '_artifact_store') and self._artifact_store is not None:
+                    try:
+                        from ..context.artifacts import ArtifactMetadata
+                        
+                        # Create metadata for this artifact
+                        metadata = ArtifactMetadata(
+                            agent_id=self.name,
+                            run_id=getattr(self, '_current_run_id', 'unknown'),
+                            tool_name=function_name,
+                            turn_id=getattr(self, '_turn_counter', 0),
+                        )
+                        
+                        # Store the full output
+                        artifact_ref = self._artifact_store.store(result_str, metadata)
+                        logger.debug(f"Stored {function_name} output ({len(result_str)} bytes) as artifact {artifact_ref.artifact_id}")
+                        
+                        # Register artifact retrieval tools if not already registered
+                        if not hasattr(self, '_artifact_tools_registered'):
+                            self._register_artifact_tools()
+                            self._artifact_tools_registered = True
+                    except Exception as e:
+                        logger.debug(f"Failed to store artifact: {e}")
+                
+                if len(capped_str) <= limit:
+                    # Only the line cap applied
+                    truncated = capped_str
+                else:
+                    # Generate truncated preview
+                    if direction == "head":
+                        head, tail = capped_str[:limit], ""
+                    elif direction == "tail":
+                        head, tail = "", capped_str[-limit:]
+                    else:
+                        tail_size = min(limit // 5, 2000)
+                        head = capped_str[:limit - tail_size]
+                        tail = capped_str[-tail_size:] if tail_size > 0 else ""
+                    total = "chars total" if artifact_ref else "chars"
+                    truncated = f"{head}\n...[{len(result_str):,} {total}, showing first/last portions]...\n{tail}"
+
+                # If we stored an artifact, include reference in the output
+                if artifact_ref:
+                    truncated = f"{truncated}\n\n{artifact_ref.to_inline()}"
+            else:
+                truncated = result_str
+            
+            if self.context_manager and hasattr(self, '_truncate_tool_output'):
+                # Use context-aware truncation if available, but preserve artifact reference
+                if artifact_ref:
+                    # Extract the artifact reference from the truncated string
+                    artifact_inline = artifact_ref.to_inline()
+                    # Remove the artifact reference before context truncation
+                    truncated_without_ref = truncated.replace(artifact_inline, "").rstrip()
+                    # Apply context truncation
+                    truncated_without_ref = self._truncate_tool_output(function_name, truncated_without_ref, tool_call_id)
+                    # Re-append the artifact reference
+                    truncated = f"{truncated_without_ref}\n\n{artifact_inline}"
+                else:
+                    truncated = self._truncate_tool_output(function_name, truncated, tool_call_id)
+            
+            # A triggered line cap applies even when its marker makes the
+            # preview no shorter than the original (many short lines).
+            line_capped = capped_str is not result_str
+            if line_capped or len(truncated) < len(result_str):
+                logger.debug(f"Truncated {function_name} output from {len(result_str)} to {len(truncated)} chars")
+                # For dicts, truncate large string fields (e.g., raw_content from search).
+                # Field truncation keeps both ends, so a line cap or a head/tail
+                # direction uses the string preview instead.
+                if isinstance(result, dict) and direction == "both" and not line_capped:
+                    max_field_chars = getattr(self, 'tool_output_limit', DEFAULT_TOOL_OUTPUT_LIMIT) if not self.context_manager else None
+                    result = self._truncate_dict_fields(result, function_name, max_field_chars, tool_call_id)
+                    # Per-field truncation only shortens individual fields
+                    # that each exceed the field limit; a dict of many
+                    # medium-sized fields (e.g. 50 search snippets each
+                    # just under the limit) stays unbounded and can still
+                    # overflow the context. Enforce a total-size budget:
+                    # if the serialised dict is still over the limit, fall
+                    # back to the already-computed head/tail string (which
+                    # carries the artifact reference for full retrieval).
+                    if len(str(result)) > limit:
+                        if result.get("error"):
+                            # Keep an error dict a dict: retry, loop-guard and
+                            # breaker checks key off ``error`` and the flags.
+                            result = {
+                                **{k: v for k, v in result.items() if v is None or isinstance(v, (bool, int, float))},
+                                "error": truncated,
+                            }
+                        else:
+                            result = truncated
+                    elif artifact_ref:
+                        # Add artifact reference to dict result if available
+                        result["_artifact_ref"] = artifact_ref.to_dict()
+                else:
+                    result = truncated
+        except Exception as e:
+            logger.debug(f"Tool truncation skipped: {e}")
+        return result
+
     def _execute_tool_with_context(self, function_name, arguments, state, tool_call_id=None):
         """Execute tool within injection context, with optional output truncation.
         
@@ -1404,7 +1550,7 @@ class ToolExecutionMixin:
                 )
                 tool_hook_results = self._hook_runner.execute_sync(HookEvent.BEFORE_TOOL, before_tool_input, target=function_name)
                 if self._hook_runner.is_blocked(tool_hook_results):
-                    logging.warning(f"Tool {function_name} execution blocked by BEFORE_TOOL hook")
+                    logger.warning(f"Tool {function_name} execution blocked by BEFORE_TOOL hook")
                     return f"Execution of {function_name} was blocked by security policy."
                 
                 # Update arguments if modified by hooks
@@ -1420,10 +1566,10 @@ class ToolExecutionMixin:
                 
                 if decision.action == GuardAction.WARN:
                     # Inject warning into tool result so LLM sees guidance
-                    logging.warning(f"Loop guard warning for {function_name}: {decision.message}")
+                    logger.warning(f"Loop guard warning for {function_name}: {decision.message}")
                 elif decision.action == GuardAction.BLOCK:
                     # Block tool execution but continue through teardown path
-                    logging.warning(f"Loop guard blocked {function_name}: {decision.message}")
+                    logger.warning(f"Loop guard blocked {function_name}: {decision.message}")
                     # Set flag to use blocked result instead of executing tool
                     blocked_result = {"error": f"[loop-guard] {decision.message}", "loop_blocked": True}
                 elif decision.action == GuardAction.HALT:
@@ -1500,12 +1646,12 @@ class ToolExecutionMixin:
                     _vres = _validator.validate_args(function_name, arguments)
                     if _vres is not None and not getattr(_vres, 'valid', True):
                         _errs = "; ".join(getattr(_vres, 'errors', []) or ["validation failed"])
-                        logging.warning(
+                        logger.warning(
                             f"Tool {function_name} args rejected by validator: {_errs}"
                         )
                         return f"Tool arguments rejected: {_errs}"
                 except Exception as _ve:  # noqa: BLE001 — never break tool exec on validator bug
-                    logging.debug(f"Tool validator raised; skipping validation: {_ve}")
+                    logger.debug(f"Tool validator raised; skipping validation: {_ve}")
 
             # Check if loop guard blocked execution
             if blocked_result is not None:
@@ -1558,7 +1704,7 @@ class ToolExecutionMixin:
                                 # Use reusable executor to prevent resource leaks
                                 future, executor, orphaned = self._submit_to_tool_pool(ctx.run, execute_with_context)
                                 if future is None:
-                                    logging.warning(
+                                    logger.warning(
                                         f"Tool worker pool exhausted; refusing to queue '{function_name}' "
                                         f"behind {orphaned} hung tool call(s)."
                                     )
@@ -1584,7 +1730,7 @@ class ToolExecutionMixin:
                                     if _progress_active is not None:
                                         _progress_active.clear()
                                     future.cancel()
-                                    logging.warning(f"Tool {function_name} timed out after {tool_timeout}s")
+                                    logger.warning(f"Tool {function_name} timed out after {tool_timeout}s")
                                     # Tag as an OUTER wall-clock timeout: unlike an
                                     # inner-loop timeout (already retried to
                                     # exhaustion), the body ran once here and the
@@ -1701,7 +1847,7 @@ class ToolExecutionMixin:
 
                         # Calculate delay for exponential backoff (policy owns it)
                         delay = retry_policy.get_delay_ms(attempt - 1) / 1000.0
-                        logging.warning(
+                        logger.warning(
                             f"Tool {function_name} failed (attempt {attempt}/{max_attempts}): {e}. "
                             f"Retrying in {delay:.2f}s..."
                         )
@@ -1724,7 +1870,7 @@ class ToolExecutionMixin:
 
                         # Calculate delay for exponential backoff (policy owns it)
                         delay = retry_policy.get_delay_ms(attempt - 1) / 1000.0
-                        logging.warning(
+                        logger.warning(
                             f"Tool {function_name} failed (attempt {attempt}/{max_attempts}): {e}. "
                             f"Retrying in {delay:.2f}s..."
                         )
@@ -1820,126 +1966,7 @@ class ToolExecutionMixin:
             # Apply tool output truncation to prevent context overflow
             # Uses context manager budget if enabled, otherwise applies default limit
             if result and not _is_multimodal_result:
-                try:
-                    result_str = str(result)
-                    
-                    # Get configured limit
-                    limit = getattr(self, 'tool_output_limit', DEFAULT_TOOL_OUTPUT_LIMIT)
-                    
-                    # Initialize artifact reference before limit check so downstream
-                    # `if artifact_ref:` guards remain valid on short-result paths.
-                    artifact_ref = None
-
-                    # ToolConfig.output_max_lines caps lines first, then the
-                    # char limit below applies; output_direction picks the end(s) kept.
-                    _tool_cfg = getattr(self, '_tool_config', None)
-                    direction = getattr(_tool_cfg, 'output_direction', 'both')
-                    max_lines = getattr(_tool_cfg, 'output_max_lines', None)
-                    capped_str = result_str
-                    if max_lines:
-                        lines = result_str.split("\n")
-                        if len(lines) > max_lines:
-                            if direction == "head":
-                                kept_head, kept_tail = lines[:max_lines], []
-                            elif direction == "tail":
-                                kept_head, kept_tail = [], lines[-max_lines:]
-                            else:
-                                n_tail = max_lines // 2
-                                kept_head = lines[:max_lines - n_tail]
-                                kept_tail = lines[-n_tail:] if n_tail else []
-                            marker = f"...[{len(lines):,} lines total, showing {max_lines:,}]..."
-                            capped_str = "\n".join(kept_head + [marker] + kept_tail)
-
-                    # Check if we need to spill to artifact store
-                    if len(capped_str) > limit or capped_str is not result_str:
-                        # Try to use artifact store if available
-                        if hasattr(self, '_artifact_store') and self._artifact_store is not None:
-                            try:
-                                from ..context.artifacts import ArtifactMetadata
-                                
-                                # Create metadata for this artifact
-                                metadata = ArtifactMetadata(
-                                    agent_id=self.name,
-                                    run_id=getattr(self, '_current_run_id', 'unknown'),
-                                    tool_name=function_name,
-                                    turn_id=getattr(self, '_turn_counter', 0),
-                                )
-                                
-                                # Store the full output
-                                artifact_ref = self._artifact_store.store(result_str, metadata)
-                                logging.debug(f"Stored {function_name} output ({len(result_str)} bytes) as artifact {artifact_ref.artifact_id}")
-                                
-                                # Register artifact retrieval tools if not already registered
-                                if not hasattr(self, '_artifact_tools_registered'):
-                                    self._register_artifact_tools()
-                                    self._artifact_tools_registered = True
-                            except Exception as e:
-                                logging.debug(f"Failed to store artifact: {e}")
-                        
-                        if len(capped_str) <= limit:
-                            # Only the line cap applied
-                            truncated = capped_str
-                        else:
-                            # Generate truncated preview
-                            if direction == "head":
-                                head, tail = capped_str[:limit], ""
-                            elif direction == "tail":
-                                head, tail = "", capped_str[-limit:]
-                            else:
-                                tail_size = min(limit // 5, 2000)
-                                head = capped_str[:limit - tail_size]
-                                tail = capped_str[-tail_size:] if tail_size > 0 else ""
-                            total = "chars total" if artifact_ref else "chars"
-                            truncated = f"{head}\n...[{len(result_str):,} {total}, showing first/last portions]...\n{tail}"
-
-                        # If we stored an artifact, include reference in the output
-                        if artifact_ref:
-                            truncated = f"{truncated}\n\n{artifact_ref.to_inline()}"
-                    else:
-                        truncated = result_str
-                    
-                    if self.context_manager and hasattr(self, '_truncate_tool_output'):
-                        # Use context-aware truncation if available, but preserve artifact reference
-                        if artifact_ref:
-                            # Extract the artifact reference from the truncated string
-                            artifact_inline = artifact_ref.to_inline()
-                            # Remove the artifact reference before context truncation
-                            truncated_without_ref = truncated.replace(artifact_inline, "").rstrip()
-                            # Apply context truncation
-                            truncated_without_ref = self._truncate_tool_output(function_name, truncated_without_ref, tool_call_id)
-                            # Re-append the artifact reference
-                            truncated = f"{truncated_without_ref}\n\n{artifact_inline}"
-                        else:
-                            truncated = self._truncate_tool_output(function_name, truncated, tool_call_id)
-                    
-                    # A triggered line cap applies even when its marker makes the
-                    # preview no shorter than the original (many short lines).
-                    line_capped = capped_str is not result_str
-                    if line_capped or len(truncated) < len(result_str):
-                        logging.debug(f"Truncated {function_name} output from {len(result_str)} to {len(truncated)} chars")
-                        # For dicts, truncate large string fields (e.g., raw_content from search).
-                        # Field truncation keeps both ends, so a line cap or a head/tail
-                        # direction uses the string preview instead.
-                        if isinstance(result, dict) and direction == "both" and not line_capped:
-                            max_field_chars = getattr(self, 'tool_output_limit', DEFAULT_TOOL_OUTPUT_LIMIT) if not self.context_manager else None
-                            result = self._truncate_dict_fields(result, function_name, max_field_chars, tool_call_id)
-                            # Per-field truncation only shortens individual fields
-                            # that each exceed the field limit; a dict of many
-                            # medium-sized fields (e.g. 50 search snippets each
-                            # just under the limit) stays unbounded and can still
-                            # overflow the context. Enforce a total-size budget:
-                            # if the serialised dict is still over the limit, fall
-                            # back to the already-computed head/tail string (which
-                            # carries the artifact reference for full retrieval).
-                            if len(str(result)) > limit:
-                                result = truncated
-                            elif artifact_ref:
-                                # Add artifact reference to dict result if available
-                                result["_artifact_ref"] = artifact_ref.to_dict()
-                        else:
-                            result = truncated
-                except Exception as e:
-                    logging.debug(f"Tool truncation skipped: {e}")
+                result = self._truncate_tool_result(function_name, result, tool_call_id)
             
             # Emit tool call end event (truncation handled by context_events.py)
             # Only stringify the result if the emitter is actually enabled; the
@@ -2022,7 +2049,7 @@ class ToolExecutionMixin:
                 # reaches the model. Mirrors the BEFORE_TOOL block path above.
                 if self._hook_runner.is_blocked(after_tool_results):
                     reason = self._hook_runner.get_blocking_reason(after_tool_results)
-                    logging.warning(f"Tool {function_name} result blocked by AFTER_TOOL hook")
+                    logger.warning(f"Tool {function_name} result blocked by AFTER_TOOL hook")
                     return reason or f"Result of {function_name} was blocked by security policy."
 
                 # Read back any rewritten/redacted tool_output so a plugin can
@@ -2167,7 +2194,7 @@ class ToolExecutionMixin:
         """
         if self._hook_runner.is_blocked(results):
             reason = self._hook_runner.get_blocking_reason(results) or "Blocked by hook"
-            logging.warning(f"Agent {self.name} response blocked by AFTER_AGENT hook: {reason}")
+            logger.warning(f"Agent {self.name} response blocked by AFTER_AGENT hook: {reason}")
             final = f"[Response blocked by hook: {reason}]"
         elif isinstance(response, str) and isinstance(after_agent_input.response, str):
             final = after_agent_input.response
@@ -2447,12 +2474,12 @@ class ToolExecutionMixin:
                     metadata = store.store(f"{tool_name}.{key}", value, call_id=field_call_id)
                     if metadata:
                         truncated = store.format_reference(metadata, truncated)
-                        logging.debug(f"Stored full {tool_name}.{key} field ({len(value)} bytes) at {metadata.get('path')}")
+                        logger.debug(f"Stored full {tool_name}.{key} field ({len(value)} bytes) at {metadata.get('path')}")
                 except Exception as e:
-                    logging.debug(f"Failed to store dict field: {e}")
+                    logger.debug(f"Failed to store dict field: {e}")
                 
                 result[key] = truncated
-                logging.debug(f"Smart truncated field '{key}' from {len(value)} to ~{max_field_chars} chars")
+                logger.debug(f"Smart truncated field '{key}' from {len(value)} to ~{max_field_chars} chars")
             elif isinstance(value, dict):
                 result[key] = self._truncate_dict_fields(value, tool_name, max_field_chars, tool_call_id)
             elif isinstance(value, list):
@@ -2800,7 +2827,7 @@ class ToolExecutionMixin:
                     if action == PermissionAction.DENY:
                         return False
                 except Exception as e:  # noqa: BLE001
-                    logging.debug(
+                    logger.debug(
                         "doom_loop permission-manager resolve failed (%s); "
                         "falling through to backend", e,
                     )
@@ -2830,7 +2857,7 @@ class ToolExecutionMixin:
             )
             return bool(getattr(decision, "approved", False))
         except Exception as e:  # noqa: BLE001 — fail closed to the block path
-            logging.debug(
+            logger.debug(
                 "doom_loop approval routing failed for %s (%s); blocking",
                 function_name, e,
             )
@@ -2862,7 +2889,7 @@ class ToolExecutionMixin:
                     if action == PermissionAction.DENY:
                         return False
                 except Exception as e:  # noqa: BLE001
-                    logging.debug(
+                    logger.debug(
                         "doom_loop permission-manager resolve failed (%s); "
                         "falling through to backend", e,
                     )
@@ -2885,7 +2912,7 @@ class ToolExecutionMixin:
             )
             return bool(getattr(decision, "approved", False))
         except Exception as e:  # noqa: BLE001 — fail closed to the block path
-            logging.debug(
+            logger.debug(
                 "doom_loop async approval routing failed for %s (%s); blocking",
                 function_name, e,
             )
@@ -2919,7 +2946,7 @@ class ToolExecutionMixin:
             )
             return action == PermissionAction.ASK
         except Exception as e:  # noqa: BLE001
-            logging.debug(
+            logger.debug(
                 "permission manager resolve_tool_action failed for %s: %s",
                 function_name, e,
             )
@@ -3032,7 +3059,7 @@ class ToolExecutionMixin:
             if get_tool_registry().get_trust_level(function_name) == "external":
                 return True
         except Exception as e:  # noqa: BLE001
-            logging.debug("_tool_would_prompt failed for %s: %s", function_name, e)
+            logger.debug("_tool_would_prompt failed for %s: %s", function_name, e)
         return False
 
     @staticmethod
@@ -3110,7 +3137,7 @@ class ToolExecutionMixin:
                 if scoped_target and scoped_target != function_name:
                     targets.append(scoped_target)
             except Exception as e:  # noqa: BLE001
-                logging.debug(
+                logger.debug(
                     "could not build argument-scoped permission target for %s: %s",
                     function_name, e,
                 )
@@ -3122,7 +3149,7 @@ class ToolExecutionMixin:
                         "permission_denied": True,
                     }
             except Exception as e:
-                logging.debug("permission manager is_denied failed for %s: %s", target, e)
+                logger.debug("permission manager is_denied failed for %s: %s", target, e)
         return None
 
     def _check_permission_manager_doom_loop(self, function_name, arguments=None):
@@ -3158,7 +3185,7 @@ class ToolExecutionMixin:
                     "loop_blocked": True,
                 }
         except Exception as e:  # noqa: BLE001
-            logging.debug("permission manager doom-loop check failed for %s: %s", function_name, e)
+            logger.debug("permission manager doom-loop check failed for %s: %s", function_name, e)
         return None
 
     def _is_bypass_mode(self) -> bool:
@@ -3201,7 +3228,7 @@ class ToolExecutionMixin:
         
         if not decision.approved:
             error_msg = f"Tool execution denied: {decision.reason}"
-            logging.warning(error_msg)
+            logger.warning(error_msg)
             feedback = getattr(decision, "feedback", None)
             if feedback:
                 error_msg = (
@@ -3212,7 +3239,7 @@ class ToolExecutionMixin:
         
         if decision.modified_args:
             arguments = decision.modified_args
-            logging.info(f"Using modified arguments: {arguments}")
+            logger.info(f"Using modified arguments: {arguments}")
             # Re-authorize: an approval backend may have rewritten the arguments
             # into a command that an argument-scoped deny rule prohibits. The
             # earlier gate only saw the original args, so re-run it against the
@@ -3256,7 +3283,7 @@ class ToolExecutionMixin:
         
         if not decision.approved:
             error_msg = f"Tool execution denied: {decision.reason}"
-            logging.warning(error_msg)
+            logger.warning(error_msg)
             feedback = getattr(decision, "feedback", None)
             if feedback:
                 error_msg = (
@@ -3267,7 +3294,7 @@ class ToolExecutionMixin:
         
         if decision.modified_args:
             arguments = decision.modified_args
-            logging.info(f"Using modified arguments: {arguments}")
+            logger.info(f"Using modified arguments: {arguments}")
             # Re-authorize modified args against the deny gate — see the sync
             # path for rationale. BYPASS still opts out entirely.
             if not self._is_bypass_mode():
@@ -3527,7 +3554,7 @@ class ToolExecutionMixin:
             from ..tools.circuit_breaker import CircuitBreakerException, _NeutralOutcome
         except ImportError:
             # Circuit breaker not available - fallback to direct execution
-            logging.debug("Circuit breaker not available, falling back to direct tool execution")
+            logger.debug("Circuit breaker not available, falling back to direct tool execution")
             return self._execute_tool_impl(function_name, arguments)
 
         try:
@@ -3575,7 +3602,7 @@ class ToolExecutionMixin:
             
         except CircuitBreakerException as e:
             # Circuit breaker is open - return error dict instead of raising
-            logging.warning(f"Tool '{function_name}' circuit breaker open: {e}")
+            logger.warning(f"Tool '{function_name}' circuit breaker open: {e}")
             return self._circuit_breaker_open_result(function_name)
 
     def _find_declared_tool(self, function_name, tools=None):
@@ -3640,7 +3667,7 @@ class ToolExecutionMixin:
             # react (pick different arguments, choose another tool, explain to
             # the user). Raising here would abort the run and surface a stack
             # trace to the user for what is a normal, expected policy outcome.
-            logging.warning(
+            logger.warning(
                 f"Tool '{function_name}' blocked by its input guardrail: {processed}"
             )
             return {
@@ -3684,7 +3711,7 @@ class ToolExecutionMixin:
             return result
         is_valid, processed = chain.validate_tool_result(function_name, result)
         if not is_valid:
-            logging.warning(
+            logger.warning(
                 f"Tool '{function_name}' result blocked by its output guardrail: {processed}"
             )
             return {
@@ -3713,7 +3740,7 @@ class ToolExecutionMixin:
                 # Fail closed: an operator opted into policy enforcement, so a
                 # broken/misconfigured PolicyEngine must deny rather than let a
                 # protected tool run without a decision.
-                logging.warning(
+                logger.warning(
                     f"Tool '{function_name}' denied: policy check_tool raised: {e}"
                 )
                 return {
@@ -3722,7 +3749,7 @@ class ToolExecutionMixin:
                 }
             if not getattr(result, "allowed", True):
                 reason = getattr(result, "reason", "denied by policy")
-                logging.warning(
+                logger.warning(
                     f"Tool '{function_name}' denied by policy: {reason}"
                 )
                 return {
@@ -3740,7 +3767,7 @@ class ToolExecutionMixin:
                 # Fail closed: mirror the guardrail-chain default. A guardrail
                 # dependency/implementation error must block, not permit, the
                 # unchecked call.
-                logging.warning(
+                logger.warning(
                     f"Tool '{function_name}' denied: guardrail validate_tool_call raised: {e}"
                 )
                 return {
@@ -3748,7 +3775,7 @@ class ToolExecutionMixin:
                     "guardrail_denied": True,
                 }
             if not is_valid:
-                logging.warning(
+                logger.warning(
                     f"Tool '{function_name}' rejected by tool-call guardrail"
                 )
                 return {
@@ -3825,7 +3852,7 @@ class ToolExecutionMixin:
             except Exception as e:  # noqa: BLE001
                 # Fail closed: a guardrail dependency/implementation error must
                 # block, not deliver, the unchecked result.
-                logging.warning(
+                logger.warning(
                     f"Tool '{function_name}' result denied: guardrail validate_tool_result raised: {e}"
                 )
                 return {
@@ -3833,7 +3860,7 @@ class ToolExecutionMixin:
                     "guardrail_denied": True,
                 }
             if not is_valid:
-                logging.warning(
+                logger.warning(
                     f"Tool '{function_name}' result rejected by tool-result guardrail"
                 )
                 return {
@@ -3846,6 +3873,12 @@ class ToolExecutionMixin:
     def _execute_tool_impl(self, function_name, arguments):
         """Internal tool execution implementation."""
 
+        # Gate on the tool that will actually run, not the raw model-emitted name.
+        function_name = self._canonical_tool_name(function_name)
+        turn_denial = self._turn_tool_denial(function_name)
+        if turn_denial is not None:
+            return turn_denial
+
         # Check if approval is required for this tool (protocol-driven)
         try:
             result = self._check_tool_approval_sync(function_name, arguments)
@@ -3854,7 +3887,7 @@ class ToolExecutionMixin:
             _, arguments = result
         except Exception as e:
             error_msg = f"Error during approval process: {str(e)}"
-            logging.error(error_msg)
+            logger.error(error_msg)
             return {"error": error_msg, "approval_error": True}
 
         # Policy/guardrail gate (protocol-driven). Runs after approval so an
@@ -3959,8 +3992,12 @@ class ToolExecutionMixin:
                 from ..tools.base import BaseTool
                 if isinstance(func, BaseTool):
                     bind_target = func.run
-                    keyed_arguments = _with_durable_key(func.run, arguments)
-                    casted_arguments = self._cast_arguments(func.run, keyed_arguments)
+                    # Introspect the real parameters (e.g. the @tool-wrapped
+                    # function) so casting and durable-key injection match
+                    # plain functions instead of seeing run(**kwargs).
+                    sig_target = func._signature_target()
+                    keyed_arguments = _with_durable_key(sig_target, arguments)
+                    casted_arguments = self._cast_arguments(sig_target, keyed_arguments)
                     bind_arguments = casted_arguments
                     return _resolve_result(func.run(**casted_arguments))
                 
@@ -3973,6 +4010,8 @@ class ToolExecutionMixin:
                                   if k in inspect.signature(instance.run).parameters 
                                   and k != 'self'}
                     casted_params = self._cast_arguments(instance.run, run_params)
+                    from ..tools.injected import inject_into_plain_callable
+                    casted_params = inject_into_plain_callable(instance.run, casted_params)
                     bind_arguments = casted_params
                     return _resolve_result(instance.run(**casted_params))
 
@@ -3985,6 +4024,8 @@ class ToolExecutionMixin:
                                   if k in inspect.signature(instance._run).parameters 
                                   and k != 'self'}
                     casted_params = self._cast_arguments(instance._run, run_params)
+                    from ..tools.injected import inject_into_plain_callable
+                    casted_params = inject_into_plain_callable(instance._run, casted_params)
                     bind_arguments = casted_params
                     return _resolve_result(instance._run(**casted_params))
 
@@ -3993,11 +4034,13 @@ class ToolExecutionMixin:
                     bind_target = func
                     keyed_arguments = _with_durable_key(func, arguments)
                     casted_arguments = self._cast_arguments(func, keyed_arguments)
+                    from ..tools.injected import inject_into_plain_callable
+                    casted_arguments = inject_into_plain_callable(func, casted_arguments)
                     bind_arguments = casted_arguments
                     return _resolve_result(func(**casted_arguments))
             except Exception as e:
                 error_msg = str(e)
-                logging.error(f"Error executing tool {function_name}: {error_msg}")
+                logger.error(f"Error executing tool {function_name}: {error_msg}")
                 # Only echo the parameter schema when the failure is a genuine
                 # argument-binding error (wrong/missing/extra kwargs). A
                 # TypeError/ValueError raised *inside* a successfully-bound tool
@@ -4044,7 +4087,7 @@ class ToolExecutionMixin:
             f"Tool '{function_name}' not found.{hint} "
             f"Available tools: {available}"
         )
-        logging.error(error_msg)
+        logger.error(error_msg)
         return {"error": error_msg, "available_tools": available}
 
     def _get_tool_display_name(self, tool):
@@ -4097,7 +4140,7 @@ class ToolExecutionMixin:
                     try:
                         return hook(hook_input)
                     except Exception as e:
-                        logging.debug(
+                        logger.debug(
                             f"to_model_output hook failed for '{function_name}': {e}"
                         )
                 return None
@@ -4113,11 +4156,7 @@ class ToolExecutionMixin:
         in name repair and appear in the corrective inventory, rather than only
         exposing the opaque container.
         """
-        MCP = None
-        try:
-            from ..mcp.mcp import MCP
-        except ImportError:
-            pass
+        MCP = _loaded_mcp_class()
 
         def _expand(tool):
             if MCP is not None and isinstance(tool, MCP):
@@ -4184,10 +4223,8 @@ class ToolExecutionMixin:
         when no MCP tool matches. The ``result`` may be awaitable (the async
         caller awaits it); the sync caller normalizes/returns it directly.
         """
-        MCP = None
-        try:
-            from ..mcp.mcp import MCP
-        except ImportError:
+        MCP = _loaded_mcp_class()
+        if MCP is None:
             return False, None
 
         def _execute_mcp_tool(mcp_instance, func_name, args):
@@ -4231,6 +4268,15 @@ class ToolExecutionMixin:
         to the same key (e.g. 'WebSearch' -> 'web_search'), else ``None``.
         Shared by the sync and async tool-resolution paths.
         """
+        match = self._self_repair_tool_match(function_name)
+        if match is None:
+            return None
+        matched_name, tool = match
+        logger.debug(f"Self-repaired tool name {function_name!r} -> {matched_name!r}")
+        return tool
+
+    def _self_repair_tool_match(self, function_name):
+        """Return ``(canonical_name, tool)`` for a unique self-repair match, else ``None``."""
         def _norm(n):
             return str(n).lower().replace('_', '').replace('-', '').replace(' ', '')
 
@@ -4239,10 +4285,91 @@ class ToolExecutionMixin:
             normalised.setdefault(_norm(name), []).append((name, tool))
         match = normalised.get(_norm(function_name))
         if match and len(match) == 1:
-            matched_name, tool = match[0]
-            logging.debug(f"Self-repaired tool name {function_name!r} -> {matched_name!r}")
-            return tool
+            return match[0]
         return None
+
+    def _canonical_tool_name(self, function_name, tools=None):
+        """Resolve a model-emitted tool name to the name of the tool that will run.
+
+        Permission/approval/policy gates must see the same name dispatch uses,
+        otherwise a case/separator variant (``DeleteFile``) that self-repair maps
+        to ``delete_file`` would bypass a ``delete_file`` deny rule. ``tools`` is
+        an explicit lookup list (async ``tools_override``); dispatch then does
+        no self-repair, so only the ``__name__`` alias is mapped.
+        """
+        if not isinstance(function_name, str):
+            return function_name
+        if tools is not None:
+            for tool in tools if isinstance(tools, (list, tuple)) else [tools]:
+                name = self._get_tool_display_name(tool)
+                if name == function_name or (name and getattr(tool, '__name__', None) == function_name):
+                    return name
+            return function_name
+        # Dispatch also accepts a tool's ``__name__`` (e.g. ``@tool(name="delete_file")``
+        # on ``def remove_file``); map that alias to the declared name so gates see it.
+        for name, tool in self._iter_active_named_tools():
+            if name == function_name or getattr(tool, '__name__', None) == function_name:
+                return name
+        if getattr(self, '_allow_global_tools', False):
+            try:
+                from ..tools.registry import get_registry
+                if get_registry().get(function_name) is not None:
+                    return function_name
+            except ImportError:
+                pass
+        match = self._self_repair_tool_match(function_name)
+        return match[0] if match is not None else function_name
+
+    def _turn_tool_denial(self, function_name):
+        """Error dict when ``function_name`` is an agent tool outside this turn's ``tools=``."""
+        scope = _turn_tool_scope.get()
+        if scope is None or scope[0] is not self or function_name in scope[1]:
+            return None
+        # Framework tools added mid-turn (artifact retrieval) are not caller-scoped.
+        if function_name in getattr(self, '_framework_tool_names', ()):
+            return None
+        if not any(name == function_name for name, _t in self._iter_active_named_tools()):
+            return None
+        return {
+            "error": f"Tool '{function_name}' is not available in this turn",
+            "permission_denied": True,
+        }
+
+    def _enter_turn_tool_scope(self, tools):
+        """Bind the per-turn ``tools=`` allow-set for dispatch; ``None`` = inherit."""
+        if tools is None:
+            return None
+        return _turn_tool_scope.set((self, self._turn_tool_names(tools)))
+
+    @staticmethod
+    def _exit_turn_tool_scope(token):
+        if token is not None:
+            _turn_tool_scope.reset(token)
+
+    def _turn_tool_names(self, tools):
+        """Names of every tool in a per-turn ``tools=`` list (MCP containers expanded)."""
+        MCP = _loaded_mcp_class()
+        names = set()
+        for tool in tools if isinstance(tools, (list, tuple)) else [tools]:
+            if isinstance(tool, str):
+                names.add(tool)
+            elif isinstance(tool, dict):
+                fn = tool.get('function') if isinstance(tool.get('function'), dict) else tool
+                if isinstance(fn.get('name'), str):
+                    names.add(fn['name'])
+            elif MCP is not None and isinstance(tool, MCP):
+                try:
+                    for sub in tool:
+                        sub_name = self._get_tool_display_name(sub)
+                        if sub_name:
+                            names.add(sub_name)
+                except Exception:
+                    pass
+            else:
+                name = self._get_tool_display_name(tool)
+                if name:
+                    names.add(name)
+        return frozenset(names)
 
     def _resolve_callable_signature_target(self, func):
         """Return the callable whose signature describes ``func``'s arguments."""
@@ -4347,7 +4474,7 @@ class ToolExecutionMixin:
                 "arguments": frozen_args,
                 "request": request,
             }
-        logging.info(f"Approval request submitted: {tracking_id} for {function_name}")
+        logger.info(f"Approval request submitted: {tracking_id} for {function_name}")
         return tracking_id
 
     async def check_pending_approvals(self) -> Dict[str, Any]:
@@ -4472,7 +4599,7 @@ class ToolExecutionMixin:
             except ImportError:
                 return "Tool search module not available"
             except Exception as e:
-                logging.error(f"Error in tool_search: {e}")
+                logger.error(f"Error in tool_search: {e}")
                 return f"Error searching tools: {e}"
         
         elif function_name == "tool_describe":
@@ -4489,7 +4616,7 @@ class ToolExecutionMixin:
             except ImportError:
                 return "Tool search module not available"
             except Exception as e:
-                logging.error(f"Error in tool_describe: {e}")
+                logger.error(f"Error in tool_describe: {e}")
                 return f"Error describing tool: {e}"
         
         elif function_name == "tool_call":
@@ -4515,7 +4642,7 @@ class ToolExecutionMixin:
             except ImportError:
                 return "Tool search module not available"
             except Exception as e:
-                logging.error(f"Error in tool_call unwrap: {e}")
+                logger.error(f"Error in tool_call unwrap: {e}")
                 return f"Error executing tool: {e}"
         
         else:
@@ -4769,4 +4896,4 @@ class ToolExecutionMixin:
             
         except Exception as e:
             # Don't let hook failures break retry logic
-            logging.debug(f"Failed to emit retry hook: {e}")
+            logger.debug(f"Failed to emit retry hook: {e}")

@@ -12,6 +12,8 @@ from typing import Optional, List, Dict, Any
 from ..context.artifacts import ArtifactRef, GrepMatch
 from .decorator import tool
 
+logger = logging.getLogger(__name__)
+
 
 # Thread-local storage for per-agent artifact stores
 _artifact_stores = threading.local()
@@ -66,7 +68,7 @@ def artifact_head(
         ref = ArtifactRef(path=artifact_path, summary="", size_bytes=0, mime_type="text/plain")
         return _artifact_store.head(ref, lines=lines)
     except Exception as e:
-        logging.error(f"Failed to get artifact head: {e}")
+        logger.error(f"Failed to get artifact head: {e}")
         return f"Error reading artifact: {str(e)}"
 
 
@@ -93,7 +95,7 @@ def artifact_tail(
         ref = ArtifactRef(path=artifact_path, summary="", size_bytes=0, mime_type="text/plain")
         return _artifact_store.tail(ref, lines=lines)
     except Exception as e:
-        logging.error(f"Failed to get artifact tail: {e}")
+        logger.error(f"Failed to get artifact tail: {e}")
         return f"Error reading artifact: {str(e)}"
 
 
@@ -136,7 +138,7 @@ def artifact_grep(
         
         return result
     except Exception as e:
-        logging.error(f"Failed to grep artifact: {e}")
+        logger.error(f"Failed to grep artifact: {e}")
         return [{"error": f"Error searching artifact: {str(e)}"}]
 
 
@@ -165,7 +167,7 @@ def artifact_chunk(
         ref = ArtifactRef(path=artifact_path, summary="", size_bytes=0, mime_type="text/plain")
         return _artifact_store.chunk(ref, start_line=start_line, end_line=end_line)
     except Exception as e:
-        logging.error(f"Failed to get artifact chunk: {e}")
+        logger.error(f"Failed to get artifact chunk: {e}")
         return f"Error reading artifact: {str(e)}"
 
 
@@ -194,12 +196,16 @@ def artifact_load(
         import json
         from pathlib import Path
         
-        meta_path = artifact_path.replace(".artifact", ".meta.json")
+        # Confine the path to the store before reading its sidecar metadata.
+        p = Path(artifact_path)
+        validate = getattr(_artifact_store, "_validate_artifact_path", None)
+        if validate is not None:
+            p = validate(p)
         meta = {}
         try:
-            p = Path(meta_path)
-            if p.exists():
-                meta = json.loads(p.read_text())
+            meta_path = p.with_suffix(".meta.json")
+            if p.suffix == ".artifact" and meta_path.exists():
+                meta = json.loads(meta_path.read_text())
         except Exception:
             pass
         
@@ -218,7 +224,7 @@ def artifact_load(
         )
         return _artifact_store.load(ref)
     except Exception as e:
-        logging.error(f"Failed to load artifact: {e}")
+        logger.error(f"Failed to load artifact: {e}")
         return f"Error loading artifact: {str(e)}"
 
 
@@ -263,5 +269,5 @@ def artifact_list(
         
         return result
     except Exception as e:
-        logging.error(f"Failed to list artifacts: {e}")
+        logger.error(f"Failed to list artifacts: {e}")
         return [{"error": f"Error listing artifacts: {str(e)}"}]

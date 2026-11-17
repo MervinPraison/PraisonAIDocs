@@ -251,6 +251,8 @@ _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED = False
 class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, UnifiedExecutionMixin, ToolExecutionMixin, ChatHandlerMixin, SessionManagerMixin, ChatMixin, ExecutionMixin, MemoryMixin, AsyncMemoryMixin):
     # Class-level counter for generating unique display names for nameless agents
     _agent_counter = 0
+    # Partial result of the last cancelled run_autonomous_async(); None otherwise.
+    _last_autonomy_result = None
     _agent_counter_lock = threading.Lock()
     # Class-level cache for environment variables (avoid repeated os.environ.get)
     # Protected by _env_cache_lock for thread safety
@@ -440,7 +442,13 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         if self._llm_init_params:
             try:
                 from ..llm.llm import LLM
-                self._llm_instance = LLM(**self._llm_init_params)
+                # The manager stays off _llm_init_params: _fallback_llm_for()
+                # reuses them, and a profile's model would override the fallback's.
+                params = dict(self._llm_init_params)
+                failover_manager = getattr(self, "_failover_manager", None)
+                if failover_manager is not None:
+                    params["failover_manager"] = failover_manager
+                self._llm_instance = LLM(**params)
             except ImportError as e:
                 raise ImportError(
                     "LLM features requested but dependencies not installed. "
@@ -448,6 +456,13 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 ) from e
         self._wire_deferred_history_callback()
         return self._llm_instance
+
+    def _credential_failover_active(self) -> bool:
+        """True when credential rotation runs; the built LLM (e.g. after switch_model) is the truth."""
+        llm = getattr(self, "_llm_instance", None)
+        if llm is not None:
+            return getattr(llm, "_failover_manager", None) is not None
+        return getattr(self, "_failover_manager", None) is not None
 
     @property
     def llm_instance(self):
@@ -560,20 +575,20 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         """
         Generate a tool definition from a function name by inspecting the function.
         """
-        logging.debug(f"Attempting to generate tool definition for: {function_name}")
+        logger.debug(f"Attempting to generate tool definition for: {function_name}")
         
         # First try to get the tool definition if it exists
         tool_def_name = f"{function_name}_definition"
         tool_def = globals().get(tool_def_name)
-        logging.debug(f"Looking for {tool_def_name} in globals: {tool_def is not None}")
+        logger.debug(f"Looking for {tool_def_name} in globals: {tool_def is not None}")
         
         if not tool_def:
             import __main__
             tool_def = getattr(__main__, tool_def_name, None)
-            logging.debug(f"Looking for {tool_def_name} in __main__: {tool_def is not None}")
+            logger.debug(f"Looking for {tool_def_name} in __main__: {tool_def is not None}")
         
         if tool_def:
-            logging.debug(f"Found tool definition: {tool_def}")
+            logger.debug(f"Found tool definition: {tool_def}")
             return tool_def
 
         # Try to find the function in the agent's tools list first
@@ -583,20 +598,20 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 func = tool
                 break
         
-        logging.debug(f"Looking for {function_name} in agent tools: {func is not None}")
+        logger.debug(f"Looking for {function_name} in agent tools: {func is not None}")
         
         # If not found in tools, try globals and main
         if not func:
             func = globals().get(function_name)
-            logging.debug(f"Looking for {function_name} in globals: {func is not None}")
+            logger.debug(f"Looking for {function_name} in globals: {func is not None}")
             
             if not func:
                 import __main__
                 func = getattr(__main__, function_name, None)
-                logging.debug(f"Looking for {function_name} in __main__: {func is not None}")
+                logger.debug(f"Looking for {function_name} in __main__: {func is not None}")
 
         if not func or not callable(func):
-            logging.debug(f"Function {function_name} not found or not callable")
+            logger.debug(f"Function {function_name} not found or not callable")
             return None
 
         # Delegate signature introspection + schema generation to the shared
@@ -604,7 +619,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # (including array 'items' normalisation).
         from ..tools.schema import build_tool_definition
         tool_def = build_tool_definition(func, function_name)
-        logging.debug(f"Generated tool definition: {tool_def}")
+        logger.debug(f"Generated tool definition: {tool_def}")
         return tool_def
 
     @staticmethod
@@ -876,6 +891,9 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # LLMConfig(fallback_models=[...])), so accept it here without exposing
         # it in the signature and seed the local below.
         _cloned_fallback_models = legacy_kwargs.pop("fallback_models", None)
+        # Internal like fallback_models: clone_for_channel() forwards the shared
+        # FailoverManager. Not a public Agent(failover_manager=) param.
+        _cloned_failover_manager = legacy_kwargs.pop("failover_manager", None)
         # `thinking_budget` is a backward-compatible alias for `reasoning_effort`
         # (Issue #4452); accept it here (like fallback_models) without exposing
         # it in the signature so the unknown-kwarg guard below does not reject it.
@@ -1574,7 +1592,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     # Unknown string mode, disable learning
                     _learn_config = None
             else:
-                logging.warning(
+                logger.warning(
                     "Unsupported learn= value %r; expected bool, dict, or LearnConfig. "
                     "Learning disabled.", learn
                 )
@@ -1975,6 +1993,9 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # ─────────────────────────────────────────────────────────────────────
         # Resolve WEB param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
+        # ``web=True`` or a dict that does not mention fetch asks for defaults,
+        # not for fetch specifically (X-14); see the model check below.
+        _web_fetch_is_default = web is True or (isinstance(web, dict) and "fetch" not in web)
         # Fast path: None/False -> no web (skip resolve() call)
         if web is None or web is False:
             _web_config = None
@@ -1992,10 +2013,12 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 default=None,
             )
         
+        _search_provider = "duckduckgo"
         if _web_config is not None:
             if isinstance(_web_config, WebConfig):
                 web_search = _web_config.search
                 web_fetch = _web_config.fetch
+                _search_provider = str(getattr(_web_config.search_provider, "value", _web_config.search_provider) or "duckduckgo").lower()
             else:
                 web_search = bool(_web_config)
                 web_fetch = bool(_web_config)
@@ -2149,6 +2172,8 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         # Seed from clone_for_channel()'s forwarded list (if any); an explicit
         # LLMConfig(fallback_models=[...]) on llm=/model= still takes precedence.
         fallback_models = _cloned_fallback_models  # Initialize for internal use
+        # LLMConfig.auth_profiles wins over a manager forwarded by a clone.
+        _auth_profiles = None
 
         # One rule for the alias pair: passing both is refused, everywhere.
         from ..utils.model_alias import resolve_model_alias
@@ -2166,6 +2191,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 api_key = llm_config_obj.api_key
             if auth is None:
                 auth = llm_config_obj.auth
+            _auth_profiles = llm_config_obj.auth_profiles
         elif llm is not None and model is None:
             warn_deprecated_param(
                 "llm",
@@ -2189,8 +2215,16 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                     api_key = model.api_key
                 if auth is None:
                     auth = model.auth
+                if _auth_profiles is None:
+                    _auth_profiles = model.auth_profiles
             else:
                 llm = model  # model= takes precedence
+
+        if _auth_profiles is not None:
+            from ..llm.failover import manager_from_auth_profiles
+            _cloned_failover_manager = manager_from_auth_profiles(_auth_profiles)
+        if _cloned_failover_manager is not None:
+            self._failover_manager = _cloned_failover_manager
         
         # Resolve the subscription auth provider eagerly. `auth=` is opt-in, so
         # this costs nothing for everyone else, and a user who asked to be
@@ -2331,7 +2365,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                             retrieval_config, 'embedder_config', None) is None:
                         retrieval_config.embedder_config = embedder_config
                 else:
-                    logging.warning(
+                    logger.warning(
                         "llm=%r resolved a local model, but %s serves no embedding "
                         "model, so knowledge/memory would embed against a remote "
                         "provider -- sending your documents off this machine. "
@@ -2463,7 +2497,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             self.llm = llm
             
             if tools:
-                logging.debug(f"Tools passed to Agent with custom LLM: {tools}")
+                logger.debug(f"Tools passed to Agent with custom LLM: {tools}")
                 self.tools = tools
         # Otherwise, fall back to OpenAI environment/name (cached for performance)
         else:
@@ -2478,22 +2512,24 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             # Only fire when the resolved default really is the OpenAI default:
             # a provider credential (e.g. OLLAMA_HOST) resolves an
             # already-correct provider-prefixed model, so there is nothing to
-            # warn about. Read the endpoint in the order the OpenAI client uses
-            # (OPENAI_API_BASE before OPENAI_BASE_URL, see openai_client.py) so
-            # the message names the endpoint the request actually goes to.
+            # warn about. Read the endpoint the way the OpenAI client does
+            # (``_env_base_url``) so the message names where the request goes.
             if (
                 llm is None
                 and model_name == 'gpt-4o-mini'
                 and not os.getenv('OPENAI_MODEL_NAME')
+                # Guard keeps the default Agent() from eagerly importing openai_client.
+                and (os.getenv('OPENAI_BASE_URL') or os.getenv('OPENAI_API_BASE'))
             ):
-                _endpoint = os.getenv('OPENAI_API_BASE') or os.getenv('OPENAI_BASE_URL')
+                from ..llm.openai_client import _env_base_url
+                _endpoint = _env_base_url()
                 if _endpoint and 'api.openai.com' not in _endpoint:
                     global _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED
                     if not _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED:
                         with Agent._env_cache_lock:
                             if not _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED:
                                 _LOCAL_ENDPOINT_DEFAULT_MODEL_WARNED = True
-                                logging.warning(
+                                logger.warning(
                                     "No model specified, so the OpenAI default %r will be sent to %s. "
                                     "That endpoint probably does not serve it. Set OPENAI_MODEL_NAME "
                                     "to a model it does serve (e.g. OPENAI_MODEL_NAME=ollama/llama3.2), "
@@ -2509,7 +2545,8 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
             # client holding a model name OpenAI has never heard of. Re-check
             # the *resolved* name so `llm="ollama/x"` and OLLAMA_HOST agree.
             _has_provider_prefix = isinstance(model_name, str) and "/" in model_name
-            if auth or _has_provider_prefix:
+            # Auth profiles rotate inside LLM, so they force the custom-LLM path.
+            if auth or _has_provider_prefix or getattr(self, "_failover_manager", None) is not None:
                 # A subscription auth provider only takes effect inside LLM
                 # (which injects the resolved OAuth credentials), so a bare
                 # model name plus auth= must still build an LLM instance rather
@@ -2575,7 +2612,7 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
                 unique_tool_names = [name for name in toolset_tool_names if name not in existing_tool_names]
                 toolset_tools = self._resolve_tool_names(unique_tool_names)
                 self.tools.extend(toolset_tools)
-                logging.debug(f"Resolved toolsets {toolsets} to {len(toolset_tools)} tools: {[getattr(t, '__name__', str(t)) for t in toolset_tools]}")
+                logger.debug(f"Resolved toolsets {toolsets} to {len(toolset_tools)} tools: {[getattr(t, '__name__', str(t)) for t in toolset_tools]}")
             except ToolResolutionError:
                 # Preserve the typed error (with .unknown / .suggestions) so
                 # strict-mode callers get the same self-correcting contract as
@@ -2662,6 +2699,19 @@ class Agent(GoalLoopMixin, SteeringMixin, SandboxMixin, SkillReviewMixin, Unifie
         self.code_execution_mode = code_execution_mode
         # Store execution config for guardrail retry backoff
         self._execution_config = _exec_config
+        # Resolved feature configs, read back by clone_for_channel() so every
+        # channel clone keeps them (F-19; guardrails were fixed the same way in
+        # #4284). caching=False resolves to None, so keep the False itself; a
+        # default output mode is not stored, so the clone stays implicit too.
+        self._template_config = _template_config
+        self._caching_config = _caching_config if _caching_config is not None else caching
+        self._hooks_config = _hooks_config
+        self._skills_config = _skills_config
+        self._knowledge_config = _knowledge_config
+        self._planning_config = _planning_config
+        self._reflection_config = _reflection_config
+        self._web_config = _web_config
+        self._output_config = _output_config if _has_explicit_output else None
         self.embedder_config = embedder_config
         self.knowledge = knowledge
         self.use_system_prompt = use_system_prompt
@@ -2746,15 +2796,44 @@ Your Role: {self.role}
         
         # Handle web_search fallback: inject DuckDuckGo tool for unsupported models
         if web_search and not self._model_supports_web_search():
-            from ..tools.duckduckgo_tools import internet_search
-            # Check if internet_search is not already in tools
             tool_names = [getattr(t, '__name__', str(t)) for t in self.tools]
-            if 'internet_search' not in tool_names and 'duckduckgo' not in tool_names:
-                self.tools.append(internet_search)
-                logging.info("Model does not support native web search. Added DuckDuckGo fallback tool.")
+            # The preset's provider picks the tool (X-01). Only Tavily has a
+            # built-in tool besides DuckDuckGo; anything else keeps DuckDuckGo
+            # and says so, so a build that works today still works.
+            if _search_provider == "tavily":
+                from ..tools import tavily_tools
+                _ok, _why = tavily_tools._check_tavily_available()
+                if _ok:
+                    if 'tavily_search' not in tool_names:
+                        self.tools.append(tavily_tools.tavily_search)
+                    _search_provider = None
+                else:
+                    logger.warning(f"Agent {self.name!r}: web search provider 'tavily' is not usable ({_why}); using DuckDuckGo.")
+            elif _search_provider != "duckduckgo":
+                logger.warning(f"Agent {self.name!r}: web search provider {_search_provider!r} has no built-in "
+                                "search tool; using DuckDuckGo. Built-in providers: 'duckduckgo', 'tavily'.")
+            if _search_provider is not None:
+                from ..tools.duckduckgo_tools import internet_search
+                if 'internet_search' not in tool_names and 'duckduckgo' not in tool_names:
+                    self.tools.append(internet_search)
+                    logger.info("Model does not support native web search. Added DuckDuckGo fallback tool.")
         
         # Raise error if web_fetch is explicitly enabled but model doesn't support it
         # Web fetch is only supported by Anthropic/Claude models
+        if web_fetch and not self._model_supports_web_fetch() and _web_fetch_is_default:
+            # Defaults mean "what this model supports": keep search, leave fetch off.
+            web_fetch = self.web_fetch = False
+            # Every kwargs dict an LLM is (re)built from: default-model swap,
+            # fallback models and panels must not turn fetch back on.
+            for _kw in (self._llm_option_kwargs, self._llm_init_params, self._panel_llm_kwargs):
+                if _kw and "web_fetch" in _kw:
+                    _kw["web_fetch"] = False
+            if getattr(self._llm_instance, "web_fetch", None):
+                self._llm_instance.web_fetch = False
+            logger.info(
+                f"Agent {self.name!r}: web fetch is Claude-only, so it is off for model "
+                f"{self.llm!r}; web search stays on."
+            )
         if web_fetch and not self._model_supports_web_fetch():
             raise ValueError(
                 f"web_fetch is only supported on Anthropic/Claude models. "
@@ -2917,6 +2996,21 @@ Your Role: {self.role}
             self._approval_timeout = 0
             self._approval_permissions = None
         
+        # X-13: the caller turned code execution on, but the active tool-safety
+        # policy keeps execute_code from the model. The policy stays; say so once.
+        if allow_code_execution and "execute_code" in self._perm_deny:
+            import warnings
+            _policy = (f"approval={approval!r}" if isinstance(approval, str)
+                       else f"the {os.environ.get('PRAISONAI_TOOL_SAFETY') or 'default'!r} tool-safety preset")
+            warnings.warn(
+                f"Agent {self.name!r}: code execution is on, but {_policy} blocks "
+                "'execute_code', so the model is not offered it. To allow it pass "
+                "approval=True (auto-approve) or approval=\"full\", set "
+                "PRAISONAI_TOOL_SAFETY=off, or run in a terminal to be asked each time.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         # Per-agent autonomy→approval bridge (G-BRIDGE-1 fix)
         # If autonomy level is full_auto and no explicit approval was set,
         # auto-approve all tools for this agent (no global env var).
@@ -3291,8 +3385,14 @@ Your Role: {self.role}
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
+        rebuild_context_manager = False
         for k, v in self.__dict__.items():
-            if k in ("_db_run_context", "_db_session_init_lock"):
+            if k == "_context_manager" and v is not None and v is not self.__dict__.get("_context_param"):
+                # Built lazily from config on first tool call; holds locks. The
+                # clone rebuilds its own (a user-supplied manager is copied as before).
+                object.__setattr__(result, k, None)
+                rebuild_context_manager = True
+            elif k in ("_db_run_context", "_db_session_init_lock"):
                 # A clone starts outside the source agent's active DB turn.
                 continue
             elif k == "_tool_executor":
@@ -3309,6 +3409,8 @@ Your Role: {self.role}
                 object.__setattr__(result, k, asyncio.Lock())
             else:
                 object.__setattr__(result, k, copy.deepcopy(v, memo))
+        if rebuild_context_manager:
+            object.__setattr__(result, "_context_manager_initialized", False)
         return result
 
     def _isolated_memory_for_clone(self):
@@ -3346,7 +3448,7 @@ Your Role: {self.role}
                 return type(mem_inst)(cfg)
         except Exception:
             pass
-        logging.warning(
+        logger.warning(
             "clone_for_channel: could not isolate the live memory backend; clones "
             "will share it. Pass memory via MemoryConfig/db() for per-channel isolation."
         )
@@ -3361,6 +3463,19 @@ Your Role: {self.role}
                 if ref() is self:
                     return original_backstory
         return self.backstory
+
+    def _fork_history(self) -> "Agent":
+        """Shallow copy that shares all config, tools and memory but has its
+        own ``chat_history`` (seeded with the current one).
+
+        Used by concurrent workflow branches so one shared agent does not
+        leak sibling prompts between threads, without the config loss of
+        rebuilding it through the constructor.
+        """
+        import copy
+        fork = copy.copy(self)
+        fork.__chat_history_state = AsyncSafeState(list(self.chat_history))
+        return fork
 
     def clone_for_channel(self) -> "Agent":
         """Return a fully independent copy of this agent for a gateway channel.
@@ -3391,6 +3506,7 @@ Your Role: {self.role}
             # LLM configuration 
             'llm': self.llm,
             'fallback_models': list(self.fallback_models) if hasattr(self, 'fallback_models') and self.fallback_models else None,
+            'failover_manager': getattr(self, '_failover_manager', None),
             'base_url': getattr(self, 'base_url', None),
             'api_key': getattr(self, 'api_key', None),
             'auth': getattr(self, 'auth', None),
@@ -3425,8 +3541,14 @@ Your Role: {self.role}
             'reflection': getattr(self, '_reflection_config', None),
             'guardrails': getattr(self, '_guardrails_config', None),
             'web': getattr(self, '_web_config', None),
-            'context': getattr(self, '_context_config', None),
-            'autonomy': getattr(self, '_autonomy_config', None),
+            # A user-supplied ContextManager holds per-session state (ledger,
+            # history), so a clone gets a fresh one built from its config.
+            'context': (
+                self._context_param.config
+                if hasattr(getattr(self, '_context_param', None), 'process')
+                else getattr(self, '_context_param', None)
+            ),
+            'autonomy': getattr(self, '_autonomy_config_obj', None),
             'output': getattr(self, '_output_config', None),
             'execution': getattr(self, '_execution_config', None),
             'templates': getattr(self, '_template_config', None),
@@ -3844,7 +3966,7 @@ Your Role: {self.role}
                 else:
                     self._context_manager = None
             except Exception as e:
-                logging.debug(f"ContextConfig conversion failed: {e}")
+                logger.debug(f"ContextConfig conversion failed: {e}")
                 self._context_manager = None
         elif hasattr(self._context_param, 'process'):
             # Already a ContextManager instance
@@ -3868,7 +3990,7 @@ Your Role: {self.role}
                         llm_summarize_fn=None,
                     )
                 except Exception as e:
-                    logging.debug(f"Context preset conversion failed: {e}")
+                    logger.debug(f"Context preset conversion failed: {e}")
                     self._context_manager = None
             else:
                 # Unknown string preset, disable
@@ -3888,7 +4010,7 @@ Your Role: {self.role}
                     llm_summarize_fn=self._create_llm_summarize_fn() if llm_summarize_enabled else None,
                 )
             except Exception as e:
-                logging.debug(f"Context dict conversion failed: {e}")
+                logger.debug(f"Context dict conversion failed: {e}")
                 self._context_manager = None
         else:
             # Unknown type, disable
@@ -3901,6 +4023,9 @@ Your Role: {self.role}
     def context_manager(self, value):
         """Set context manager directly."""
         self._context_manager = value
+        # Record it as the user's own manager so ``__deepcopy__`` copies it
+        # rather than treating it as lazily built (and rebuilding).
+        self._context_param = value
         self._context_manager_initialized = True
 
     def _manager_config_from_context_config(self, cc: Any) -> Any:
@@ -3967,7 +4092,7 @@ Summary:"""
                 
                 return response.choices[0].message.content or "[Summary unavailable]"
             except Exception as e:
-                logging.debug(f"LLM summarization failed: {e}")
+                logger.debug(f"LLM summarization failed: {e}")
                 return f"[Previous conversation summary - {len(messages)} messages]"
         
         return llm_summarize
@@ -4005,7 +4130,7 @@ Summary:"""
                     include_defaults=auto_discover or not self._skills_dirs,
                 )
             except Exception as e:  # noqa: BLE001 - bundles are optional
-                logging.debug("Bundle discovery skipped: %s", e)
+                logger.debug("Bundle discovery skipped: %s", e)
 
             # Add explicit skill selectors. '@bundle' entries expand to their
             # member skill names (resolved by name against discovered skills);
@@ -4023,7 +4148,7 @@ Summary:"""
                                 include_defaults=auto_discover,
                             )
                             if loaded is None:
-                                logging.warning(
+                                logger.warning(
                                     "Skill bundle member '%s' (from '%s') not "
                                     "found; skipping.", member, selector,
                                 )
@@ -4060,7 +4185,7 @@ Summary:"""
         """
         import os as _os
         if _os.environ.get("PRAISONAI_DISABLE_SKILL_TOOLS") in ("1", "true", "True"):
-            logging.info("Skill helper tools disabled via PRAISONAI_DISABLE_SKILL_TOOLS")
+            logger.info("Skill helper tools disabled via PRAISONAI_DISABLE_SKILL_TOOLS")
             return
 
         # Check if tools already include required capabilities
@@ -4076,9 +4201,9 @@ Summary:"""
             try:
                 from ..tools import read_file
                 self.tools.append(read_file)
-                logging.debug("Added read_file tool for skill support")
+                logger.debug("Added read_file tool for skill support")
             except ImportError:
-                logging.warning("Could not import read_file tool for skills")
+                logger.warning("Could not import read_file tool for skills")
         
         # G-E fix: run_skill_script safer by default
         # Only add if explicitly enabled OR any skill declares it in allowed-tools
@@ -4087,7 +4212,7 @@ Summary:"""
         # Check explicit environment enable
         if _os.environ.get("PRAISONAI_ENABLE_SKILL_TOOLS") in ("1", "true", "True"):
             should_add_script_tool = True
-            logging.debug("run_skill_script enabled via PRAISONAI_ENABLE_SKILL_TOOLS")
+            logger.debug("run_skill_script enabled via PRAISONAI_ENABLE_SKILL_TOOLS")
         
         # Check if any loaded skill declares it in allowed-tools
         if self._skill_manager and not should_add_script_tool:
@@ -4095,7 +4220,7 @@ Summary:"""
                 allowed_tools = self._skill_manager.get_allowed_tools(skill.properties.name)
                 if "run_skill_script" in allowed_tools:
                     should_add_script_tool = True
-                    logging.debug(f"run_skill_script enabled by skill '{skill.properties.name}' allowed-tools")
+                    logger.debug(f"run_skill_script enabled by skill '{skill.properties.name}' allowed-tools")
                     break
         
         # Add run_skill_script if conditions are met
@@ -4105,9 +4230,9 @@ Summary:"""
                 # Create skill tools with current working directory
                 skill_tools = create_skill_tools()
                 self.tools.append(skill_tools.run_skill_script)
-                logging.debug("Added run_skill_script tool for skill support")
+                logger.debug("Added run_skill_script tool for skill support")
             except ImportError as e:
-                logging.warning(f"Could not import skill_tools: {e}")
+                logger.warning(f"Could not import skill_tools: {e}")
     
     def get_skills_prompt(self) -> str:
         """Get the XML prompt for available skills.
@@ -4777,19 +4902,8 @@ Summary:"""
                 "Create agent with autonomy=True or autonomy={...}"
             )
         
-        # Take initial snapshot before autonomous execution starts
-        # NOTE: Snapshot tracking is disabled by default for performance (G12 fix)
-        # FileSnapshot.track() walks entire project and is too slow for large codebases
-        # Enable with AutonomyConfig(snapshot=True) / autonomy={"snapshot": True}
-        if self._file_snapshot is not None and self.autonomy_config.get("snapshot", False):
-            try:
-                snap_info = self._file_snapshot.track(message="pre-autonomous")
-                with self._snapshot_lock:
-                    self._snapshot_stack.append(snap_info.commit_hash)
-                    self._redo_stack.clear()
-            except Exception as e:
-                logging.debug(f"Pre-autonomous snapshot failed: {e}")
-        
+        self._take_pre_autonomous_snapshot()
+
         start_time = time_module.time()
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         iterations = 0
@@ -5233,6 +5347,24 @@ Summary:"""
                 started_at=started_at,
             )
     
+    def _take_pre_autonomous_snapshot(self) -> None:
+        """Take the pre-run file snapshot for an autonomous run, if enabled.
+
+        Shared by run_autonomous and run_autonomous_async (the async path runs
+        it in a worker thread: track() walks the project).
+        NOTE: Snapshot tracking is disabled by default for performance (G12 fix)
+        FileSnapshot.track() walks entire project and is too slow for large codebases
+        Enable with AutonomyConfig(snapshot=True) / autonomy={"snapshot": True}
+        """
+        if self._file_snapshot is not None and self.autonomy_config.get("snapshot", False):
+            try:
+                snap_info = self._file_snapshot.track(message="pre-autonomous")
+                with self._snapshot_lock:
+                    self._snapshot_stack.append(snap_info.commit_hash)
+                    self._redo_stack.clear()
+            except Exception as e:
+                logger.debug(f"Pre-autonomous snapshot failed: {e}")
+
     async def run_autonomous_async(
         self,
         prompt: str,
@@ -5265,10 +5397,13 @@ Summary:"""
             
         Raises:
             ValueError: If autonomy is not enabled
-            
+            asyncio.CancelledError: If the task is cancelled (``task.cancel()``,
+                ``asyncio.wait_for`` timeout, TaskGroup). The partial result is
+                kept on ``agent._last_autonomy_result``.
+
         Example:
             import asyncio
-            
+
             async def main():
                 agent = Agent(instructions="...", autonomy=True)
                 result = await agent.run_autonomous_async(
@@ -5291,7 +5426,9 @@ Summary:"""
                 "Autonomy must be enabled to use run_autonomous_async(). "
                 "Create agent with autonomy=True or autonomy={...}"
             )
-        
+
+        # Drop a previous run's cancelled partial result so it can't go stale.
+        self._last_autonomy_result = None
         start_time = time_module.time()
         started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         iterations = 0
@@ -5327,10 +5464,24 @@ Summary:"""
         # Clear any stale loop-warning latch/nudge from a previous run.
         self._reset_loop_warnings()
         
+        # Autonomy callbacks for CLI/UI visibility, as run_autonomous emits them.
+        from ..main import execute_callback
+
+        async def _emit_complete(reason):
+            await execute_callback('autonomy_complete', completion_reason=reason,
+                                   iterations=iterations, duration_seconds=time_module.time() - start_time)
+
         try:
+            # Inside the try so cancelling during track() is handled like any
+            # other cancellation: the partial result is kept on the agent and
+            # CancelledError propagates.
+            await asyncio.to_thread(self._take_pre_autonomous_snapshot)
+
             # Execute the autonomous loop
             while iterations < effective_max_iter:
                 iterations += 1
+                await execute_callback('autonomy_iteration', iteration=iterations,
+                                       max_iterations=effective_max_iter, stage=stage)
                 
                 # Check timeout
                 _timed_out = _timeout_result(
@@ -5399,6 +5550,7 @@ Summary:"""
                     response_str, spend_baseline
                 )
                 if _budget_result is not None:
+                    await _emit_complete(_budget_result.completion_reason)
                     return _budget_result
                 
                 # Record response text for content streaming loop detection
@@ -5425,6 +5577,7 @@ Summary:"""
                 # of loop for correct detection timing).
                 if self._is_doom_loop():
                     recovery = self._get_doom_recovery()
+                    await execute_callback('autonomy_doom_loop', iteration=iterations, recovery_action=recovery)
                     obs = getattr(self, '_observability_hooks', None)
                     if obs is not None:
                         from ..escalation.observability import EventType as _EvtType
@@ -5545,6 +5698,7 @@ Summary:"""
                 # the task naturally (model stopped calling tools = done).
                 # ─────────────────────────────────────────────────────────────
                 if not effective_promise and self._autonomy_turn_tool_count > 0 and len(response_str) > 100:
+                    await _emit_complete("tool_completion")
                     return AutonomyResult(
                         success=True,
                         output=response_str,
@@ -5564,6 +5718,7 @@ Summary:"""
                     idx = stage_order.index(stage) if stage in stage_order else 0
                     if idx < len(stage_order) - 1:
                         stage = stage_order[idx + 1]
+                        await execute_callback('autonomy_stage_change', from_stage=stage_order[idx], to_stage=stage)
                         if obs is not None:
                             obs.emit(_EvtType.STAGE_ESCALATE, {"from": stage_order[idx], "to": stage})
                 
@@ -5572,6 +5727,7 @@ Summary:"""
                 if effective_promise:
                     promise_tag = f"<promise>{effective_promise}</promise>"
                     if promise_tag in response_str:
+                        await _emit_complete("promise")
                         return AutonomyResult(
                             success=True,
                             output=response_str,
@@ -5585,6 +5741,7 @@ Summary:"""
                 
                 # Check for keyword-based completion signals (word-boundary, G-COMPLETION-1 fix)
                 if not effective_promise and self._is_completion_signal(response_str):
+                    await _emit_complete("goal")
                     return AutonomyResult(
                         success=True,
                         output=response_str,
@@ -5598,6 +5755,7 @@ Summary:"""
                 
                 # For DIRECT stage, complete after first response
                 if not effective_promise and stage == "direct":
+                    await _emit_complete("goal")
                     return AutonomyResult(
                         success=True,
                         output=response_str,
@@ -5622,6 +5780,7 @@ Summary:"""
                         and not self._doom_recovery_active):
                     self._consecutive_no_tool_turns += 1
                     if self._consecutive_no_tool_turns >= 2:
+                        await _emit_complete("no_tool_calls")
                         return AutonomyResult(
                             success=True,
                             output=response_str,
@@ -5642,6 +5801,7 @@ Summary:"""
             await asyncio.to_thread(self._auto_save_session)
             
             # Max iterations reached
+            await _emit_complete("max_iterations")
             return AutonomyResult(
                 success=False,
                 output="Max iterations reached",
@@ -5653,8 +5813,8 @@ Summary:"""
                 started_at=started_at,
             )
         
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            return AutonomyResult(
+        except (KeyboardInterrupt, asyncio.CancelledError) as e:
+            result = AutonomyResult(
                 success=False,
                 output="Task cancelled",
                 completion_reason="cancelled",
@@ -5664,6 +5824,12 @@ Summary:"""
                 duration_seconds=time_module.time() - start_time,
                 started_at=started_at,
             )
+            if isinstance(e, asyncio.CancelledError):
+                # Re-raise so wait_for/TaskGroup/task.cancel() see the
+                # cancellation; keep the partial result reachable on the agent.
+                self._last_autonomy_result = result
+                raise
+            return result
         except Exception as e:
             return AutonomyResult(
                 success=False,
@@ -6121,7 +6287,7 @@ Summary:"""
         self._mcp_servers[name] = mcp
         self.tools.append(mcp)
         self.refresh_tools()
-        logging.debug(f"Attached MCP server '{name}' with runtime tools")
+        logger.debug(f"Attached MCP server '{name}' with runtime tools")
         return mcp
 
     def remove_mcp_server(self, name: str) -> bool:
@@ -6152,10 +6318,10 @@ Summary:"""
             if hasattr(mcp, "shutdown"):
                 mcp.shutdown()
         except Exception as e:
-            logging.warning(f"MCP server '{name}' shutdown failed: {e}")
+            logger.warning(f"MCP server '{name}' shutdown failed: {e}")
 
         self.refresh_tools()
-        logging.debug(f"Removed MCP server '{name}'")
+        logger.debug(f"Removed MCP server '{name}'")
         return True
 
     def refresh_tools(self) -> List[Any]:
@@ -6342,14 +6508,14 @@ Summary:"""
                 names = ", ".join(sorted({r.name for r in self._rules_manager.get_active_rules()}))
                 if names and names not in _RULES_NOTICE_SEEN:
                     _RULES_NOTICE_SEEN.add(names)
-                    logging.warning(f"Applied rules: {names} (pass rules=False to turn off)")
+                    logger.warning(f"Applied rules: {names} (pass rules=False to turn off)")
             elif not extra_files:
                 self._rules_manager = None
         except ImportError:
-            logging.debug("RulesManager not available")
+            logger.debug("RulesManager not available")
             self._rules_manager = None
         except Exception as e:
-            logging.debug(f"Could not initialize RulesManager: {e}")
+            logger.debug(f"Could not initialize RulesManager: {e}")
             self._rules_manager = None
     
     def get_rules_context(self, file_path: Optional[str] = None, include_manual: Optional[List[str]] = None) -> str:
@@ -6402,7 +6568,7 @@ Summary:"""
         if not mem_user_id:
             import uuid
             mem_user_id = f"agent-{uuid.uuid4().hex[:12]}"
-            logging.warning(
+            logger.warning(
                 "Agent memory enabled without an explicit user_id; using an "
                 "auto-generated, non-shared id (%s). Pass user_id=... explicitly "
                 "to persist/share memory across runs.", mem_user_id,
@@ -6433,7 +6599,7 @@ Summary:"""
                 config.setdefault("collection_name", f"memory_{mem_user_id}")
                 self._memory_instance = Memory(config)
             except ImportError:
-                logging.warning(f"Memory provider '{memory}' requires additional dependencies. Falling back to FileMemory.")
+                logger.warning(f"Memory provider '{memory}' requires additional dependencies. Falling back to FileMemory.")
                 from ..memory.file_memory import FileMemory
                 self._memory_instance = FileMemory(user_id=mem_user_id)
             except Exception as e:
@@ -6441,7 +6607,7 @@ Summary:"""
                 # (e.g. a SaaS backend like mem0 needs credentials/network).
                 # Honour the same "Falling back to FileMemory" contract used for
                 # missing dependencies so construction never hard-crashes.
-                logging.warning(f"Memory provider '{memory}' could not initialise ({e}). Falling back to FileMemory.")
+                logger.warning(f"Memory provider '{memory}' could not initialise ({e}). Falling back to FileMemory.")
                 from ..memory.file_memory import FileMemory
                 self._memory_instance = FileMemory(user_id=mem_user_id)
         elif isinstance(memory, dict):
@@ -6462,7 +6628,7 @@ Summary:"""
                     from ..memory.memory import Memory
                     self._memory_instance = Memory(scoped_memory)
                 except ImportError:
-                    logging.warning("Memory with learn requires additional dependencies. Falling back to FileMemory (learn disabled).")
+                    logger.warning("Memory with learn requires additional dependencies. Falling back to FileMemory (learn disabled).")
                     from ..memory.file_memory import FileMemory
                     self._memory_instance = FileMemory(user_id=memory.get("user_id", mem_user_id))
             elif provider == "file":
@@ -6476,12 +6642,12 @@ Summary:"""
                     from ..memory.memory import Memory
                     self._memory_instance = Memory(scoped_memory)
                 except ImportError:
-                    logging.warning("Full Memory class requires additional dependencies. Falling back to FileMemory.")
+                    logger.warning("Full Memory class requires additional dependencies. Falling back to FileMemory.")
                     from ..memory.file_memory import FileMemory
                     self._memory_instance = FileMemory(user_id=mem_user_id)
         elif isinstance(memory, str):
             # Unknown string backend - fall back to FileMemory with warning
-            logging.warning(f"Unknown memory backend '{memory}'. Falling back to FileMemory.")
+            logger.warning(f"Unknown memory backend '{memory}'. Falling back to FileMemory.")
             from ..memory.file_memory import FileMemory
             self._memory_instance = FileMemory(user_id=mem_user_id)
         else:
@@ -6590,7 +6756,7 @@ Summary:"""
                 raise ValueError(f"Memory provider does not support {memory_type} storage")
                 
         except Exception as e:
-            logging.warning(f"[{self.name}] Memory storage failed: {e}")
+            logger.warning(f"[{self.name}] Memory storage failed: {e}")
             raise
         
         # Only call on_memory_write hook AFTER successful storage
@@ -6613,7 +6779,7 @@ Summary:"""
                     if hasattr(self._memory_instance, 'on_memory_write'):
                         self._memory_instance.on_memory_write(action, memory_type, content, metadata)
             except Exception as e:
-                logging.warning(f"[{self.name}] Memory on_memory_write hook failed: {e}")
+                logger.warning(f"[{self.name}] Memory on_memory_write hook failed: {e}")
     
     def _display_memory_info(self):
         """Display memory information to user in a friendly format."""
@@ -6752,7 +6918,7 @@ Summary:"""
                         reranker=reranker,
                     )
                 except ImportError:
-                    logging.warning("RAG module not available. Install with: pip install 'praisonaiagents[rag]'")
+                    logger.warning("RAG module not available. Install with: pip install 'praisonaiagents[rag]'")
                     return None
         
         return self._rag_instance
@@ -6783,7 +6949,7 @@ Summary:"""
                 context_pack = self.rag.retrieve(query, user_id=self.user_id, agent_id=self.agent_id)
                 return context_pack.context, context_pack.citations
             except Exception as e:
-                logging.warning(f"RAG retrieve failed, falling back to basic retrieval: {e}")
+                logger.warning(f"RAG retrieve failed, falling back to basic retrieval: {e}")
         
         # Fallback: basic retrieval with token-aware formatting
         try:
@@ -7024,7 +7190,7 @@ Answer:"""
                 from urllib.parse import urlsplit
                 _parts = urlsplit(knowledge_item)
                 _safe_url = f"{_parts.scheme}://{_parts.hostname or ''}"
-                logging.warning(
+                logger.warning(
                     f"Knowledge source '{_safe_url}...' is a URL; URL knowledge "
                     "ingestion is not yet implemented in the core SDK. This source "
                     "will be skipped. Fetch and pass the content as text, or a local "
@@ -7034,7 +7200,7 @@ Answer:"""
                 # It's a string content
                 self.knowledge.store(knowledge_item, user_id=self.user_id, agent_id=self.agent_id)
         except Exception as e:
-            logging.error(f"Error processing knowledge item: {knowledge_item}, error: {e}")
+            logger.error(f"Error processing knowledge item: {knowledge_item}, error: {e}")
 
     @staticmethod
     def _is_interactive_session() -> bool:
@@ -7200,7 +7366,7 @@ Answer:"""
                         tool_func._praison_handoff_source = tool_item
                         self.tools[index] = tool_func
                     except Exception as e:
-                        logging.error(
+                        logger.error(
                             f"Failed to convert as_tool()/handoff {tool_item} "
                             f"passed in tools=: {e}"
                         )
@@ -7225,12 +7391,12 @@ Answer:"""
                     tool_func._praison_handoff_source = handoff_obj
                     self.tools.append(tool_func)
                 else:
-                    logging.warning(
+                    logger.warning(
                         f"Invalid handoff item type: {type(handoff_item)}. "
                         "Expected Agent or Handoff instance."
                     )
             except Exception as e:
-                logging.error(f"Failed to process handoff item {handoff_item}: {e}")
+                logger.error(f"Failed to process handoff item {handoff_item}: {e}")
 
     @property
     def guardrail_retry_count(self) -> int:
@@ -7265,7 +7431,7 @@ Answer:"""
         self._mark_db_run_error()
         reason = str(error) if error else getattr(self, "_last_guardrail_error", None)
         if reason:
-            logging.info(f"Agent {self.name}: guardrail block reason: {reason}")
+            logger.info(f"Agent {self.name}: guardrail block reason: {reason}")
         return "I'm sorry, but I can't share that response because it did not pass the safety guardrail."
 
     def _process_guardrail(self, task_output):
@@ -7302,11 +7468,11 @@ Answer:"""
             # author's wording verbatim - it is fed back into the conversation
             # by _apply_guardrail_with_retry - rather than wrapping it as an
             # internal validation *error*.
-            logging.warning(f"Agent {self.name}: Guardrail asked for a retry: {e.feedback}")
+            logger.warning(f"Agent {self.name}: Guardrail asked for a retry: {e.feedback}")
             return GuardrailResult(success=False, result=None, error=e.feedback)
 
         except Exception as e:
-            logging.error(f"Agent {self.name}: Error in guardrail validation: {e}")
+            logger.error(f"Agent {self.name}: Error in guardrail validation: {e}")
             # On error, return failure
             return GuardrailResult(
                 success=False,
@@ -7338,7 +7504,7 @@ Answer:"""
                 return True, (result if isinstance(result, str) else prompt), None
             return False, None, (result if isinstance(result, str) else "Input blocked by guardrail")
         except Exception as e:
-            logging.error(f"Agent {self.name}: Error in input guardrail validation: {e}")
+            logger.error(f"Agent {self.name}: Error in input guardrail validation: {e}")
             return False, None, f"Input guardrail validation error: {str(e)}"
 
     def _validate_with_guardrail(self, response_text):
@@ -7436,7 +7602,7 @@ Answer:"""
         # Fall back to simple backoff if no execution config
         return 1.0 * (2.0 ** (retry_count - 1))
 
-    def _apply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None, cancel_token=None, messages=None):
+    def _apply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None, cancel_token=None, messages=None, response_format=None):
         """Apply guardrail validation with retry logic (sync version).
 
         Args:
@@ -7450,6 +7616,9 @@ Answer:"""
                 message list the caller does not hold), the retry falls back to
                 re-asking the original prompt with the reason appended.
 
+            response_format: Structured-output contract of the original call,
+                kept on retries so ``output_pydantic``/``output_json`` survive.
+
         Bounded by ``max_guardrail_retries``; a validator that never passes
         raises rather than looping.
         """
@@ -7462,7 +7631,7 @@ Answer:"""
             success, result, error = self._validate_with_guardrail(current_response)
 
             if success:
-                logging.info(f"Agent {self.name}: Guardrail validation passed")
+                logger.info(f"Agent {self.name}: Guardrail validation passed")
                 return result
 
             # Guardrail failed
@@ -7473,13 +7642,13 @@ Answer:"""
                 )
 
             retry_count += 1
-            logging.warning(f"Agent {self.name}: Guardrail validation failed (retry {retry_count}/{self.max_guardrail_retries}): {error}")
+            logger.warning(f"Agent {self.name}: Guardrail validation failed (retry {retry_count}/{self.max_guardrail_retries}): {error}")
 
             # Add exponential backoff delay to avoid hammering the LLM
             total_delay = self._guardrail_retry_delay(retry_count)
             self._record_guardrail_retry(attempt=retry_count, error=error, delay=total_delay)
 
-            logging.info(f"Agent {self.name}: Waiting {total_delay:.2f}s before guardrail retry")
+            logger.info(f"Agent {self.name}: Waiting {total_delay:.2f}s before guardrail retry")
             time.sleep(total_delay)
 
             # Regenerate response for retry
@@ -7494,19 +7663,19 @@ Answer:"""
                 # stream=False: the retry reads a complete message and nothing
                 # consumes deltas, so streaming here only costs a failed
                 # sync-adapter attempt and an ERROR log before falling back.
-                response = self._chat_completion(list(retry_messages), temperature, tools, stream=False, task_name=task_name, task_description=task_description, task_id=task_id, cancel_token=cancel_token)
+                response = self._chat_completion(list(retry_messages), temperature, tools, stream=False, task_name=task_name, task_description=task_description, task_id=task_id, cancel_token=cancel_token, response_format=response_format)
                 if response and response.choices:
                     content = response.choices[0].message.content
                     current_response = content.strip() if content else ""
                 else:
                     raise Exception("Failed to generate retry response")
             except Exception as e:
-                logging.error(f"Agent {self.name}: Error during guardrail retry: {e}")
+                logger.error(f"Agent {self.name}: Error during guardrail retry: {e}")
                 raise Exception(f"Agent {self.name} guardrail retry failed: {e}")
 
         return current_response
 
-    async def _aapply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None, messages=None):
+    async def _aapply_guardrail_with_retry(self, response_text, prompt, temperature=1.0, tools=None, task_name=None, task_description=None, task_id=None, messages=None, response_format=None):
         """Apply guardrail validation with retry logic (async version).
 
         See ``_apply_guardrail_with_retry`` for the ``messages`` contract.
@@ -7536,7 +7705,7 @@ Answer:"""
             )
 
             if success:
-                logging.info(f"Agent {self.name}: Guardrail validation passed")
+                logger.info(f"Agent {self.name}: Guardrail validation passed")
                 return result
 
             # Guardrail failed
@@ -7547,13 +7716,13 @@ Answer:"""
                 )
 
             retry_count += 1
-            logging.warning(f"Agent {self.name}: Guardrail validation failed (retry {retry_count}/{self.max_guardrail_retries}): {error}")
+            logger.warning(f"Agent {self.name}: Guardrail validation failed (retry {retry_count}/{self.max_guardrail_retries}): {error}")
 
             # Add exponential backoff delay to avoid hammering the LLM
             total_delay = self._guardrail_retry_delay(retry_count)
             self._record_guardrail_retry(attempt=retry_count, error=error, delay=total_delay)
 
-            logging.info(f"Agent {self.name}: Waiting {total_delay:.2f}s before guardrail retry")
+            logger.info(f"Agent {self.name}: Waiting {total_delay:.2f}s before guardrail retry")
             await asyncio.sleep(total_delay)
 
             # Regenerate response for retry (async version)
@@ -7569,7 +7738,7 @@ Answer:"""
                 # helper's own default is stream=True regardless of the agent's
                 # setting, which would make the retry stream when nothing reads
                 # the deltas.
-                response = await self._execute_unified_achat_completion(list(retry_messages), temperature, tools, stream=False, task_name=task_name, task_description=task_description, task_id=task_id)
+                response = await self._execute_unified_achat_completion(list(retry_messages), temperature, tools, stream=False, task_name=task_name, task_description=task_description, task_id=task_id, response_format=response_format)
                 if response and hasattr(response, 'choices') and response.choices:
                     content = response.choices[0].message.content
                     current_response = content.strip() if content else ""
@@ -7578,42 +7747,15 @@ Answer:"""
                 else:
                     raise Exception("Failed to generate retry response")
             except Exception as e:
-                logging.error(f"Agent {self.name}: Error during guardrail retry: {e}")
+                logger.error(f"Agent {self.name}: Error during guardrail retry: {e}")
                 raise Exception(f"Agent {self.name} guardrail retry failed: {e}")
 
         return current_response
 
     def _get_tools_cache_key(self, tools):
-        """Generate a cache key for tools list."""
-        if tools is None:
-            return "none"
-        if not tools:
-            return "empty"
-        # Create a simple hash based on tool names
-        tool_names = []
-        try:
-            from ..tools.hosted import is_hosted_tool
-        except ImportError:
-            is_hosted_tool = lambda _tool: False
-
-        for tool in tools:
-            if callable(tool) and hasattr(tool, '__name__'):
-                tool_names.append(tool.__name__)
-            elif isinstance(tool, dict) and is_hosted_tool(tool):
-                try:
-                    hosted_key = json.dumps(tool, sort_keys=True)
-                except (TypeError, ValueError):
-                    hosted_key = str(id(tool))
-                tool_names.append(f"hosted:{hosted_key}")
-            elif (
-                isinstance(tool, dict)
-                and isinstance(tool.get('function'), dict)
-                and tool['function'].get('name')
-            ):
-                tool_names.append(tool['function']['name'])
-            elif isinstance(tool, str):
-                tool_names.append(tool)
-        return "|".join(sorted(tool_names))
+        """Generate a content-based cache key for a tools list."""
+        from ..tools.schema import tools_cache_key
+        return tools_cache_key(tools)
     
 
     # -------------------------------------------------------------------------
@@ -8041,7 +8183,7 @@ Answer:"""
                             "content": result.content
                         })
             except Exception as post_exc:
-                logging.warning(
+                logger.warning(
                     f"Post-execution bookkeeping failed after successful CLI "
                     f"backend turn (agent={self.display_name!r}, "
                     f"session_id={session_id!r}): {post_exc}"
@@ -8437,7 +8579,7 @@ Answer:"""
                     except Exception as e:
                         # Log the error for debugging but don't fail cleanup
                         import logging
-                        logging.debug(
+                        logging.getLogger(__name__).debug(
                             f"Failed to cleanup artifacts for agent {self.name}: {e}"
                         )
 

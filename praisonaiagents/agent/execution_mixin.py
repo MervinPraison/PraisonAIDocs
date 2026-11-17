@@ -12,6 +12,7 @@ import inspect
 import os
 
 import asyncio
+import contextvars
 import threading
 
 
@@ -19,6 +20,28 @@ import threading
 from ._lazy_display import _get_console, _get_live, _get_display_functions
 
 logger = logging.getLogger(__name__)
+
+# A tool's compact model-facing view (ToolResult.model_output / to_model_output),
+# resolved from the raw result in _execute_tool_async_impl and swapped in by
+# execute_tool_async after tracing, AFTER_TOOL hooks and loop detection saw the
+# full result: the sync path's order. A mutable holder, so it survives the
+# context copies of the tool-middleware worker thread.
+_model_facing_holder = contextvars.ContextVar("praisonai_model_facing", default=None)
+
+
+def _swap_in_model_facing(result, holder):
+    """Return the compact view (with model-facing annotations) if one was set."""
+    override = holder.get("override") if holder else None
+    if override is None:
+        return result
+    for annotation in holder.get("annotations", ()):
+        if isinstance(override, str):
+            override = f"{override}\n\n{annotation}"
+        elif isinstance(override, dict):
+            override.setdefault("_additional_context", annotation)
+        else:
+            override = {"value": override, "_additional_context": annotation}
+    return override
 
 from typing import List, Optional, Any, Dict, Union, Generator, TYPE_CHECKING
 
@@ -1000,6 +1023,13 @@ Write the complete compiled report:"""
                 result = self._start_with_planning(prompt, **kwargs)
             elif stream_requested:
                 # Return a generator for streaming response
+                if kwargs.get('output_pydantic') or kwargs.get('output_json'):
+                    import warnings
+                    warnings.warn(
+                        "start(stream=True) yields raw text chunks; output_pydantic/output_json "
+                        "is not applied. Use stream=False to get the parsed result.",
+                        UserWarning, stacklevel=2,
+                    )
                 kwargs['stream'] = True
                 result = self._start_stream(prompt, **kwargs)
             else:
@@ -1082,7 +1112,9 @@ Write the complete compiled report:"""
                                         del sync_display_callbacks['tool_call']
                     
                     # Start chat in background thread
-                    chat_thread = threading.Thread(target=run_chat)
+                    # daemon: a Ctrl-C in the display loop must not leave the
+                    # process waiting on an in-flight LLM call to exit.
+                    chat_thread = threading.Thread(target=run_chat, daemon=True)
                     chat_thread.start()
                     
                     from rich.panel import Panel
@@ -1141,7 +1173,9 @@ Write the complete compiled report:"""
                     ) as status:
                         last_status = current_status[0]
                         while chat_thread.is_alive():
-                            time_module.sleep(0.15)  # More responsive updates
+                            # Wait on the thread, not a fixed sleep: the loop
+                            # ends the moment the turn does (R-04, was +150 ms).
+                            chat_thread.join(0.15)
                             # Only update if status changed (reduces flicker)
                             if current_status[0] != last_status:
                                 last_status = current_status[0]
@@ -1397,6 +1431,20 @@ Write the complete compiled report:"""
     async def execute_tool_async(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
         """Async version of execute_tool with retry policy support.
 
+        The model receives the tool's compact view when it declares one, after
+        every hook and trace has seen the full result (as on the sync path).
+        """
+        holder = {}
+        token = _model_facing_holder.set(holder)
+        try:
+            result = await self._execute_tool_async_hooked(function_name, arguments, tool_call_id, tools_override)
+        finally:
+            _model_facing_holder.reset(token)
+        return _swap_in_model_facing(result, holder)
+
+    async def _execute_tool_async_hooked(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
+        """Body of ``execute_tool_async``: hooks, middleware and the retry loop.
+
         Routes through the user-supplied tool middleware (``Agent(hooks=[...])``)
         when present so ``before_tool``/``after_tool``/``wrap_tool_call`` gate
         async tool calls exactly as they do sync ones (security parity). The
@@ -1498,7 +1546,7 @@ Write the complete compiled report:"""
                     HookEvent.BEFORE_TOOL, before_tool_input, target=function_name
                 )
                 if hook_runner.is_blocked(before_results):
-                    logging.warning(f"Tool {function_name} execution blocked by BEFORE_TOOL hook")
+                    logger.warning(f"Tool {function_name} execution blocked by BEFORE_TOOL hook")
                     return f"Execution of {function_name} was blocked by security policy."
                 for res in before_results:
                     if res.output and res.output.modified_input:
@@ -1527,7 +1575,8 @@ Write the complete compiled report:"""
                 # reaches the model (mirrors the BEFORE_TOOL block path above).
                 if hook_runner.is_blocked(after_results):
                     reason = hook_runner.get_blocking_reason(after_results)
-                    logging.warning(f"Tool {function_name} result blocked by AFTER_TOOL hook")
+                    logger.warning(f"Tool {function_name} result blocked by AFTER_TOOL hook")
+                    (_model_facing_holder.get() or {}).clear()  # the block wins over the view
                     return _record_async_loop_outcome(
                         reason or f"Result of {function_name} was blocked by security policy."
                     )
@@ -1541,6 +1590,9 @@ Write the complete compiled report:"""
                         result = f"{result}\n\n{extra_context}"
                     elif isinstance(result, dict):
                         result.setdefault("_additional_context", extra_context)
+                    _holder = _model_facing_holder.get()
+                    if _holder is not None:
+                        _holder.setdefault("annotations", []).insert(0, extra_context)  # sync order: hook context first
             return _record_async_loop_outcome(result)
 
         return _record_async_loop_outcome(
@@ -1600,6 +1652,8 @@ Write the complete compiled report:"""
         tool_timeout = getattr(self, '_tool_timeout', None)
         worker_timeout = (tool_timeout + 1.0) if tool_timeout and tool_timeout > 0 else None
 
+        _handled = []  # what the innermost handler returned, to spot a middleware rewrite
+
         def _final_handler(req):
             import concurrent.futures
             future = asyncio.run_coroutine_threadsafe(
@@ -1630,6 +1684,7 @@ Write the complete compiled report:"""
                     "timeout": True,
                     "_praison_retryable": False,
                 }
+            _handled.append(result)
             return ToolResponse(tool_name=req.tool_name, result=result)
 
         def _run_chain():
@@ -1640,9 +1695,36 @@ Write the complete compiled report:"""
         # still see session identity, cancel state and the handoff chain.
         import contextvars
         response = await loop.run_in_executor(None, contextvars.copy_context().run, _run_chain)
-        return response.result if isinstance(response, ToolResponse) else response
+        final = response.result if isinstance(response, ToolResponse) else response
+        # On the sync path middleware wraps the swap, so it sees (and may redact)
+        # the compact view. Here it sees the full result: if it replaced that
+        # result, its replacement wins over the view.
+        holder = _model_facing_holder.get()
+        if holder and not (_handled and final is _handled[-1]):
+            holder.clear()
+        return final
 
     async def _execute_tool_async_with_retry(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
+        """Async tool execution with retry policy, framed by tool trace events.
+
+        Emits ``tool_call_start``/``tool_call_end`` once per tool call, as the
+        sync ``_execute_tool_with_context`` does. The default emitter is a
+        disabled NoOp, so this costs nothing unless tracing is on.
+        """
+        from ..trace.context_events import get_context_emitter
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.tool_call_start(self.name, function_name, arguments)
+        _tool_start_time = time.time()
+        try:
+            result = await self._execute_tool_async_retry_loop(function_name, arguments, tool_call_id, tools_override)
+        except BaseException as e:  # incl. asyncio.CancelledError, so the START is always closed
+            _trace_emitter.tool_call_end(self.name, function_name, None, (time.time() - _tool_start_time) * 1000, str(e) or type(e).__name__)
+            raise
+        if _trace_emitter.enabled:
+            _trace_emitter.tool_call_end(self.name, function_name, str(result) if result else None, (time.time() - _tool_start_time) * 1000)
+        return result
+
+    async def _execute_tool_async_retry_loop(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
         """Async tool execution with retry policy (middleware-agnostic core)."""
         from ..errors import ToolExecutionError
 
@@ -1773,9 +1855,21 @@ Write the complete compiled report:"""
         """Internal async tool execution implementation"""
         from ..errors import ToolExecutionError
         from .tool_execution import _CALLER_ERROR_TYPES
+        _holder = _model_facing_holder.get()
+        if _holder is not None:
+            _holder.clear()  # a retried attempt must not inherit an earlier view
+        _model_facing_override, _model_facing_annotations = None, []
         try:
-            logging.info(f"Executing async tool: {function_name} with arguments: {arguments}")
-            
+            logger.info(f"Executing async tool: {function_name} with arguments: {arguments}")
+
+            # Gate on the tool that will actually run (parity with the sync path).
+            if hasattr(self, "_canonical_tool_name"):
+                function_name = self._canonical_tool_name(function_name, tools_override)
+            if hasattr(self, "_turn_tool_denial"):
+                turn_denial = self._turn_tool_denial(function_name)
+                if turn_denial is not None:
+                    return turn_denial
+
             # Check if approval is required for this tool (protocol-driven)
             try:
                 result = await self._check_tool_approval_async(function_name, arguments)
@@ -1784,7 +1878,7 @@ Write the complete compiled report:"""
                 _, arguments = result
             except Exception as e:
                 error_msg = f"Error during approval process: {str(e)}"
-                logging.error(error_msg)
+                logger.error(error_msg)
                 return {"error": error_msg, "approval_error": True}
 
             # Policy/guardrail gate (protocol-driven). Mirrors the sync path in
@@ -1883,9 +1977,9 @@ Write the complete compiled report:"""
                         pass
                     hint = f" Did you mean '{suggestion}'?" if suggestion else ""
                     error_msg = f"Tool '{function_name}' not found.{hint} Available tools: {available}"
-                    logging.error(error_msg)
+                    logger.error(error_msg)
                     return {"error": error_msg, "available_tools": available}
-                logging.error(f"Function {function_name} not found in tools")
+                logger.error(f"Function {function_name} not found in tools")
                 return {"error": f"Function {function_name} not found in tools"}
 
             # Circuit breaker (pre-execution) — parity with the sync path
@@ -1911,7 +2005,7 @@ Write the complete compiled report:"""
                 from ..escalation.loop_guard import GuardAction
                 decision = loop_guard.check(function_name, arguments, is_pre_execution=True)
                 if decision.action == GuardAction.BLOCK:
-                    logging.warning(f"Loop guard blocked {function_name}: {decision.message}")
+                    logger.warning(f"Loop guard blocked {function_name}: {decision.message}")
                     return {"error": f"[loop-guard] {decision.message}", "loop_blocked": True}
                 elif decision.action == GuardAction.HALT:
                     raise ToolExecutionError(
@@ -1921,7 +2015,7 @@ Write the complete compiled report:"""
                         is_retryable=False,
                     )
                 elif decision.action == GuardAction.WARN:
-                    logging.warning(f"Loop guard warning for {function_name}: {decision.message}")
+                    logger.warning(f"Loop guard warning for {function_name}: {decision.message}")
 
             # Activate the tool-progress channel so tools running under the async
             # path can stream incremental output (emit_tool_progress) and the
@@ -1968,8 +2062,11 @@ Write the complete compiled report:"""
                 if hasattr(self, "_cast_arguments"):  # sync-path parity
                     call_arguments = self._cast_arguments(call_target, arguments)
                 if durable_key:
+                    sig_target = (
+                        func._signature_target() if isinstance(func, BaseTool) else call_target
+                    )
                     try:
-                        parameters = inspect.signature(call_target).parameters.values()
+                        parameters = inspect.signature(sig_target).parameters.values()
                     except (TypeError, ValueError):
                         parameters = ()
                     if any(
@@ -1993,19 +2090,22 @@ Write the complete compiled report:"""
                         _inject_state = self._build_agent_state()
                     except Exception:
                         _inject_state = None
+                if not isinstance(func, BaseTool):
+                    from ..tools.injected import inject_into_plain_callable
+                    call_arguments = inject_into_plain_callable(call_target, call_arguments, _inject_state)
 
                 async def _invoke():
                     # Set the tool-progress channel BEFORE dispatch so the sink
                     # propagates into the executor thread via contextvars, mirroring
                     # the sync execute_tool path.
                     if inspect.iscoroutinefunction(call_target):
-                        logging.debug(f"Executing async function: {function_name}")
+                        logger.debug(f"Executing async function: {function_name}")
                         if _inject_state is not None:
                             with with_injection_context(_inject_state), tool_progress_channel(_progress_sink):
                                 return await call_target(**call_arguments)
                         with tool_progress_channel(_progress_sink):
                             return await call_target(**call_arguments)
-                    logging.debug(f"Executing sync function in executor: {function_name}")
+                    logger.debug(f"Executing sync function in executor: {function_name}")
                     from ..trace.context_events import copy_context_to_callable
                     # copy_context_to_callable snapshots the CURRENT context (incl.
                     # the injection contextvar) into the executor thread, so setting
@@ -2029,7 +2129,7 @@ Write the complete compiled report:"""
                     # queueing into its timeout; refused once that cap is hit.
                     future, executor, orphaned = self._submit_to_tool_pool(fn, spill=True)
                     if future is None:
-                        logging.warning(
+                        logger.warning(
                             f"Tool worker pool exhausted; refusing to queue '{function_name}' "
                             f"behind {orphaned} hung tool call(s)."
                         )
@@ -2077,7 +2177,7 @@ Write the complete compiled report:"""
                         breaker = self._get_tool_circuit_breaker(function_name)
                 except ImportError:
                     # Circuit breaker not available - fall back to direct invocation.
-                    logging.debug("Circuit breaker not available on async path, executing directly")
+                    logger.debug("Circuit breaker not available on async path, executing directly")
 
                 # Sentinel used to register an error-dict result as a breaker
                 # failure without losing the dict, mirroring the sync path's
@@ -2148,10 +2248,10 @@ Write the complete compiled report:"""
                     try:
                         result = await asyncio.wait_for(_invoke_guarded(), timeout=tool_timeout)
                     except _CircuitBreakerException as cbe:
-                        logging.warning(f"Tool '{function_name}' circuit breaker open: {cbe}")
+                        logger.warning(f"Tool '{function_name}' circuit breaker open: {cbe}")
                         return _circuit_open_result()
                     except asyncio.TimeoutError:
-                        logging.warning(f"Tool {function_name} timed out after {tool_timeout}s")
+                        logger.warning(f"Tool {function_name} timed out after {tool_timeout}s")
                         # Mark as non-retryable: asyncio.wait_for cannot cancel a sync
                         # tool already running in the executor, so retrying would launch
                         # a duplicate invocation while the original keeps executing —
@@ -2174,7 +2274,7 @@ Write the complete compiled report:"""
                             try:
                                 breaker._on_failure()
                             except Exception:
-                                logging.debug(
+                                logger.debug(
                                     "Failed to record tool timeout on circuit breaker",
                                     exc_info=True,
                                 )
@@ -2187,7 +2287,7 @@ Write the complete compiled report:"""
                     try:
                         result = await _invoke_guarded()
                     except _CircuitBreakerException as cbe:
-                        logging.warning(f"Tool '{function_name}' circuit breaker open: {cbe}")
+                        logger.warning(f"Tool '{function_name}' circuit breaker open: {cbe}")
                         return _circuit_open_result()
 
                 # Circuit breaker (post-execution) — record the outcome so
@@ -2233,6 +2333,41 @@ Write the complete compiled report:"""
                         apply_result_guardrails, function_name, result, tools_override
                     )
 
+                # Prompt-injection fence for external tools — same place as the
+                # sync path: after the guardrails saw the raw result, before
+                # truncation. Zero-cost for trusted tools. Multimodal results
+                # pass through untouched (their text parts are fenced when the
+                # tool message is built).
+                from .tool_execution import _normalize_multimodal_result
+                _is_multimodal_result = _normalize_multimodal_result(result) is not None
+                _resolve_view = getattr(self, "_resolve_model_facing_result", None)
+                if not _is_multimodal_result and _resolve_view is not None:
+                    _model_facing_override = _resolve_view(function_name, result)
+                if not _is_multimodal_result:
+                    try:
+                        from ..tools.trust import wrap_if_external
+                        result = wrap_if_external(function_name, result)
+                        if _model_facing_override is not None:  # untrusted too: fence it
+                            _model_facing_override = wrap_if_external(function_name, _model_facing_override)
+                    except Exception:
+                        # Trust module unavailable (partial install) must not
+                        # abort tool execution; fall through with the raw result.
+                        pass
+
+                # Cap the result before it re-enters the context — the same
+                # helper and order as the sync path (after guardrails, before
+                # the loop guard). Multimodal results pass through untouched.
+                truncate_result = getattr(self, "_truncate_tool_result", None)
+                if truncate_result is not None and result and not _is_multimodal_result:
+                    if isinstance(result, dict) or getattr(self, "_artifact_store", None) is not None:
+                        # Spilling to the artifact store / tool-output store
+                        # (large dict fields) is file I/O; keep it off the loop.
+                        result = await asyncio.to_thread(
+                            truncate_result, function_name, result, tool_call_id
+                        )
+                    else:
+                        result = truncate_result(function_name, result, tool_call_id)
+
                 # Loop guard (post-execution) — record the outcome and surface a
                 # block/halt decision back to the model on this same turn, mirroring
                 # the sync path in tool_execution.py so repeated failures accumulate
@@ -2248,20 +2383,31 @@ Write the complete compiled report:"""
                             result["_loop_guard"] = {"message": decision.message, "action": decision.action.value}
                         else:
                             result = {"value": result, "_loop_guard": {"message": decision.message, "action": decision.action.value}}
+                        _model_facing_annotations.append(f"[loop-guard] {decision.message}")
+
+                # Hand the compact view to execute_tool_async, which swaps it in
+                # once hooks and tracing have seen the full result; direct
+                # callers of this method get it now.
+                if _model_facing_override is not None:
+                    if _holder is not None:
+                        _holder.update(override=_model_facing_override, annotations=_model_facing_annotations)
+                    else:
+                        return _swap_in_model_facing(
+                            result, {"override": _model_facing_override, "annotations": _model_facing_annotations})
 
                 # Ensure result is JSON serializable
-                logging.debug(f"Raw result from tool: {result}")
+                logger.debug("Raw result from tool: %s", result)
                 if result is None:
                     return {"result": None}
                 try:
                     json.dumps(result)  # Test serialization
                     return result
                 except TypeError:
-                    logging.warning(f"Result not JSON serializable, converting to string: {result}")
+                    logger.warning(f"Result not JSON serializable, converting to string: {result}")
                     return {"result": str(result)}
 
             except Exception as e:
-                logging.error(f"Error executing {function_name}: {str(e)}", exc_info=True)
+                logger.error(f"Error executing {function_name}: {str(e)}", exc_info=True)
                 # Circuit breaker (failure on raised exception) — a raised tool
                 # exception is a failure just like an error-dict result, and the
                 # sync path's ``breaker.call`` counts it. Approval/permission/
@@ -2315,7 +2461,7 @@ Write the complete compiled report:"""
             # path; do not swallow it into an error dict.
             raise
         except Exception as e:
-            logging.error(f"Error in execute_tool_async: {str(e)}", exc_info=True)
+            logger.error(f"Error in execute_tool_async: {str(e)}", exc_info=True)
             return {"error": f"Error in execute_tool_async: {str(e)}"}
 
     def launch(self, path: str = '/', port: int = 8000, host: str = '127.0.0.1', debug: bool = False, protocol: str = "http"):
@@ -2376,7 +2522,7 @@ Write the complete compiled report:"""
             # Check which specific module is missing
             missing_module = str(e).split("No module named '")[-1].rstrip("'")
             _get_display_functions()['display_error'](f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
-            logging.error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
+            logger.error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
             print(f"\nTo add API capabilities, install the required dependencies:")
             print(f"pip install {missing_module}")
             print("\nOr install all API dependencies with:")
@@ -2427,7 +2573,7 @@ Write the complete compiled report:"""
         # de-duplicated path so multiple agents can share a single port.
         path, original_path = _server_registry.reserve_route(port, path, self.agent_id)
         if original_path is not None:
-            logging.warning(f"Path '{original_path}' is already registered on port {port}.")
+            logger.warning(f"Path '{original_path}' is already registered on port {port}.")
             print(f"⚠️ Warning: Path '{original_path}' is already registered on port {port}.")
             print(f"🔄 Using '{path}' instead")
 
@@ -2464,7 +2610,7 @@ Write the complete compiled report:"""
 
                 return {"response": response}
             except Exception as e:
-                logging.error(f"Error processing query: {str(e)}", exc_info=True)
+                logger.error(f"Error processing query: {str(e)}", exc_info=True)
                 return JSONResponse(
                     status_code=500,
                     content={"error": f"Error processing query: {str(e)}"}
@@ -2571,5 +2717,5 @@ Write the complete compiled report:"""
             
         except Exception as e:
             # Don't let hook failures break retry logic
-            logging.debug(f"Failed to emit async retry hook: {e}")
+            logger.debug(f"Failed to emit async retry hook: {e}")
 

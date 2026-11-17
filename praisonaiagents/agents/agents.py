@@ -512,9 +512,21 @@ def _build_execution_context(agents_instance, task_id, skip_memory_init=False):
     if context_builder is not None:
         task._execution_context = context_builder(task)
         task._execution_context_builder = None
+    elif getattr(task, 'validation_feedback', None):
+        # Fresh guardrail/reviewer feedback set after the builder was consumed
+        # (any retry), or with no Process builder at all (sequential /
+        # hierarchical): fold the rejection reason into this attempt's prompt so
+        # the retry is not an identical re-ask (#6353). Kept local so it never
+        # leaks into later runs of the task.
+        fb = task.validation_feedback
+        context_text = f"Previous attempt failed validation with reason: {fb.get('validation_response')}"
+        if fb.get('rejected_output'):
+            context_text += f"\nRejected output: {fb['rejected_output']}"
+        context_text += "\nPlease try again, addressing this feedback."
+        task.validation_feedback = None
     extra_context = getattr(task, '_execution_context', None)
     if extra_context:
-        context_text = extra_context
+        context_text = f"{context_text}\n\n{extra_context}" if context_text else extra_context
         # NOTE: We intentionally do NOT clear _execution_context here. Task
         # retries (guardrail/completion failures) re-enter this helper via the
         # run_task/arun_task retry loops, and clearing would strip the upstream
@@ -577,6 +589,18 @@ def _process_task_result(agents_instance, context, agent_output):
     executor_agent = context.executor_agent
     llm = context.llm
     
+    # Agent.chat returns a model instance when output_pydantic is set; the
+    # task pipeline below (TaskOutput.raw, memory, JSON parsing) is string
+    # based, so serialise once and re-validate from JSON (#6353).
+    if agent_output is not None and not isinstance(agent_output, str):
+        if hasattr(agent_output, "model_dump_json"):
+            agent_output = agent_output.model_dump_json()
+        else:
+            try:
+                agent_output = json.dumps(agent_output)
+            except (TypeError, ValueError):
+                agent_output = str(agent_output)
+
     if agent_output:
         # Store the response in memory
         if task.memory:
@@ -616,6 +640,9 @@ def _process_task_result(agents_instance, context, agent_output):
         if task.output_json:
             try:
                 parsed = json.loads(cleaned)
+                # Enforce the schema when output_json is a Pydantic model.
+                if hasattr(task.output_json, "model_validate"):
+                    parsed = task.output_json.model_validate(parsed).model_dump(mode="json")
                 task_output.json_dict = parsed
                 task_output.output_format = "JSON"
             except Exception as e:
@@ -930,7 +957,7 @@ class AgentTeam(SpawnAnnounceProtocol):
         }
         _set = [k for k, v in _unwired.items() if v]
         if _set:
-            logging.warning(
+            logger.warning(
                 f"AgentTeam received {_set} but does not yet apply them at the team "
                 "level; pass these to individual Agent(...) instances instead."
             )
@@ -2812,7 +2839,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                     # Show working spinner
                     console.print(f"[bold yellow]Working...[/]  {agent_name} generating response...")
                 except Exception as e:
-                    logging.debug(f"Error in verbose task start callback: {e}")
+                    logger.debug(f"Error in verbose task start callback: {e}")
             
             def verbose_task_complete_callback(task, task_output):
                 try:
@@ -2834,7 +2861,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                         ))
                     console.print()
                 except Exception as e:
-                    logging.debug(f"Error in verbose task complete callback: {e}")
+                    logger.debug(f"Error in verbose task complete callback: {e}")
             
             # Set callbacks for verbose display (compose with existing callbacks)
             original_on_task_start = self.on_task_start
@@ -2844,23 +2871,23 @@ class AgentTeam(SpawnAnnounceProtocol):
                 try:
                     verbose_task_start_callback(task, task_id)
                 except Exception as e:
-                    logging.debug(f"Error in verbose task start callback: {e}")
+                    logger.debug(f"Error in verbose task start callback: {e}")
                 if original_on_task_start:
                     try:
                         original_on_task_start(task, task_id)
                     except Exception as e:
-                        logging.debug(f"Error in original task start callback: {e}")
+                        logger.debug(f"Error in original task start callback: {e}")
             
             def composed_on_task_complete(task, task_output):
                 try:
                     verbose_task_complete_callback(task, task_output)
                 except Exception as e:
-                    logging.debug(f"Error in verbose task complete callback: {e}")
+                    logger.debug(f"Error in verbose task complete callback: {e}")
                 if original_on_task_complete:
                     try:
                         original_on_task_complete(task, task_output)
                     except Exception as e:
-                        logging.debug(f"Error in original task complete callback: {e}")
+                        logger.debug(f"Error in original task complete callback: {e}")
             
             self.on_task_start = composed_on_task_start
             self.on_task_complete = composed_on_task_complete
@@ -2898,9 +2925,9 @@ class AgentTeam(SpawnAnnounceProtocol):
             try:
                 self.display_token_usage()
             except (ImportError, AttributeError) as e:
-                logging.debug(f"Could not auto-display token usage: {e}")
+                logger.debug(f"Could not auto-display token usage: {e}")
             except Exception as e:
-                logging.debug(f"Unexpected error in token metrics display: {e}")
+                logger.debug(f"Unexpected error in token metrics display: {e}")
         
         # When planning ran, results live in the executed plan-step tasks
         # (self.tasks is restored to the user's original set for reuse).
@@ -3459,7 +3486,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                     },
                 )
             except Exception as e:
-                logger.debug(f"Shared-memory session enrichment failed: {e}")
+                logger.warning("Shared-memory session enrichment failed for session %s: %s", session_id, e)
 
         return durable_saved
 
@@ -3490,7 +3517,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                         # and safe -- but task outputs are NOT, because matching
                         # them by position across a changed task set would skip
                         # the wrong work.
-                        logging.warning(
+                        logger.warning(
                             "Team session %s was saved against a different task set; "
                             "shared state restored but task outputs were not, so no "
                             "task will be wrongly skipped. Re-run from the start, or "
@@ -3768,7 +3795,7 @@ class AgentTeam(SpawnAnnounceProtocol):
             # Use centralized server registry
 
             if not self.agents:
-                logging.warning("No agents to launch for HTTP mode. Add agents to the Agents instance first.")
+                logger.warning("No agents to launch for HTTP mode. Add agents to the Agents instance first.")
                 return
                 
             # Try to import FastAPI dependencies - lazy loading
@@ -3789,7 +3816,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                 # Check which specific module is missing
                 missing_module = str(e).split("No module named '")[-1].rstrip("'")
                 display_error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
-                logging.error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
+                logger.error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
                 print(f"\nTo add API capabilities, install the required dependencies:")
                 print(f"pip install {missing_module}")
                 print("\nOr install all API dependencies with:")
@@ -3833,9 +3860,9 @@ class AgentTeam(SpawnAnnounceProtocol):
             endpoint_id = str(uuid.uuid4())
             path, original_path = _server_registry.reserve_route(port, path, endpoint_id)
             if original_path is not None:
-                logging.warning(f"Path '{original_path}' is already registered on port {port}. Please use a different path.")
+                logger.warning(f"Path '{original_path}' is already registered on port {port}. Please use a different path.")
                 print(f"⚠️ Warning: Path '{original_path}' is already registered on port {port}.")
-                logging.warning(f"Using '{path}' instead of '{original_path}'")
+                logger.warning(f"Using '{path}' instead of '{original_path}'")
                 print(f"🔄 Using '{path}' instead")
             
             # Define the endpoint handler
@@ -3887,7 +3914,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                             # Use this response as input to the next agent
                             current_input = response
                         except Exception as e:
-                            logging.error(f"Error with agent {agent_instance.display_name}: {str(e)}", exc_info=True)
+                            logger.error(f"Error with agent {agent_instance.display_name}: {str(e)}", exc_info=True)
                             results.append({
                                 "agent": agent_instance.display_name,
                                 "error": str(e)
@@ -3905,7 +3932,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                         "final_response": current_input
                     }
                 except Exception as e:
-                    logging.error(f"Error processing query: {str(e)}", exc_info=True)
+                    logger.error(f"Error processing query: {str(e)}", exc_info=True)
                     return JSONResponse(
                         status_code=500,
                         content={"error": f"Error processing query: {str(e)}"}
@@ -3963,7 +3990,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                                 "response": response
                             }
                         except Exception as e:
-                            logging.error(f"Error with agent {agent.display_name}: {str(e)}", exc_info=True)
+                            logger.error(f"Error with agent {agent.display_name}: {str(e)}", exc_info=True)
                             return JSONResponse(
                                 status_code=500,
                                 content={"error": f"Agent error: {str(e)}"}
@@ -3991,7 +4018,7 @@ class AgentTeam(SpawnAnnounceProtocol):
 
         elif protocol == "mcp":
             if not self.agents:
-                logging.warning("No agents to launch for MCP mode. Add agents to the Agents instance first.")
+                logger.warning("No agents to launch for MCP mode. Add agents to the Agents instance first.")
                 return
 
             # Delegate to the praisonai-mcp agent adapter so multi-agent MCP
@@ -4011,7 +4038,7 @@ class AgentTeam(SpawnAnnounceProtocol):
                 return serve_agents(self.agents, host=host, port=port)
             except ImportError:
                 display_error("MCP serving requires the 'praisonai-mcp' package.")
-                logging.error("MCP serving requires the 'praisonai-mcp' package.")
+                logger.error("MCP serving requires the 'praisonai-mcp' package.")
                 print("\nTo add MCP capabilities, install: pip install praisonai-mcp")
                 return None
         else:

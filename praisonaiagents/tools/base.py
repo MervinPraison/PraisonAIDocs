@@ -23,6 +23,8 @@ import copy
 
 from .schema import build_parameters_schema
 
+logger = logging.getLogger(__name__)
+
 
 class ToolValidationError(Exception):
     """Raised when a tool fails validation."""
@@ -250,7 +252,7 @@ class BaseTool(ABC):
             hints = get_type_hints(self.run) if hasattr(self.run, '__annotations__') else {}
         except (ValueError, NameError, Exception) as e:
             # Handle built-ins, forward references, and other signature/type issues
-            logging.debug(f"Could not generate schema for {self.name}: {e}")
+            logger.debug(f"Could not generate schema for {self.name}: {e}")
             return {"type": "object", "properties": {}, "required": []}
         
         # Use the new shared helper, skipping only 'self'
@@ -280,6 +282,14 @@ class BaseTool(ABC):
     def __call__(self, **kwargs) -> Any:
         """Allow tool to be called directly like a function."""
         return self.run(**kwargs)
+
+    def _signature_target(self) -> Callable:
+        """Callable whose signature describes ``run()``'s real parameters.
+
+        Used by the executor for argument casting and durable-key injection.
+        Wrappers whose ``run`` takes ``**kwargs`` override this.
+        """
+        return self.run
     
     def to_model_output(self, result: Any) -> Optional[Any]:
         """Optional hook returning a compact, model-facing view of ``result``.
@@ -304,7 +314,7 @@ class BaseTool(ABC):
         try:
             return self.to_model_output(output)
         except Exception as e:
-            logging.warning(f"to_model_output failed for tool '{self.name}': {e}")
+            logger.warning(f"to_model_output failed for tool '{self.name}': {e}")
             return None
 
     def safe_run(self, **kwargs) -> ToolResult:
@@ -321,7 +331,7 @@ class BaseTool(ABC):
                 model_output=self._safe_to_model_output(output),
             )
         except Exception as e:
-            logging.error(f"Tool {self.name} failed: {e}")
+            logger.error(f"Tool {self.name} failed: {e}")
             return ToolResult(
                 output=None,
                 success=False,
@@ -347,7 +357,7 @@ class BaseTool(ABC):
             try:
                 return self._schema_override(base_schema)
             except Exception as e:
-                logging.warning(f"Dynamic schema override failed for tool '{self.name}': {e}")
+                logger.warning(f"Dynamic schema override failed for tool '{self.name}': {e}")
                 return base_schema
         
         return base_schema

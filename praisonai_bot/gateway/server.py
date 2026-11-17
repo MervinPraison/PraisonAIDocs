@@ -259,6 +259,11 @@ _TURN_ERROR_MESSAGES = {
 }
 _RETRYABLE_TURN_ERRORS = frozenset({"rate_limit", "overloaded", "transient", "idle_timeout"})
 
+# Upper bound on a ``/hooks/<path>`` request body. A signed hook reads the body
+# before any credential is proven, so it must be bounded (GitHub caps webhook
+# payloads at 25 MB).
+_HOOK_MAX_BODY_BYTES = 25 * 1024 * 1024
+
 
 def _turn_error_payload(exc: BaseException) -> Dict[str, Any]:
     """Project a failed turn's exception onto a stable wire error envelope.
@@ -1829,6 +1834,10 @@ class WebSocketGateway:
             configured, this returns the raw socket peer — today's behaviour.
             """
             peer = peer_ip or "unknown"
+            return _attribute(peer, headers, _trusted_proxy_list())
+
+        def _trusted_proxy_list() -> list:
+            """Return the live declared trusted-proxy set (IPs / CIDRs)."""
             # Precedence (highest first) so a live config reload is honoured
             # and a removed proxy stops being trusted without a restart (#5312):
             #   1. CLI ``--trusted-proxy`` override — operator-pinned, wins always.
@@ -1852,6 +1861,9 @@ class WebSocketGateway:
                         for p in (getattr(self.config, "trusted_proxies", None) or [])
                         if str(p).strip()
                     ]
+            return trusted
+
+        def _attribute(peer, headers, trusted) -> str:
             if resolve_ingress_attribution is None or not trusted:
                 return peer
             attr = resolve_ingress_attribution(
@@ -1866,6 +1878,28 @@ class WebSocketGateway:
                 return f"proxy:{peer}"
             return attr.client_ip
 
+        def _trust_operator_header(request) -> bool:
+            """Whether ``X-Operator-Id`` may be trusted for this request.
+
+            Opt-in only (``gateway.trust_operator_header: true``, default off),
+            and only when the socket peer is a declared trusted proxy — the
+            proxy is then responsible for stamping (and overwriting) the header.
+            """
+            loaded = getattr(self, "_loaded_config", None) or {}
+            gw = loaded.get("gateway", {}) if isinstance(loaded, dict) else {}
+            if isinstance(gw, dict) and "trust_operator_header" in gw:
+                enabled = gw.get("trust_operator_header") is True
+            else:
+                enabled = getattr(self.config, "trust_operator_header", False) is True
+            if not enabled:
+                return False
+            peer = request.client.host if request.client else ""
+            try:
+                from praisonaiagents.gateway.protocols import _is_trusted_hop
+            except ImportError:
+                return False
+            return bool(peer) and _is_trusted_hop(peer, _trusted_proxy_list())
+
         def _resolve_operator_identity(request) -> str:
             """Derive a stable, non-secret operator identity for the audit trail.
 
@@ -1873,9 +1907,12 @@ class WebSocketGateway:
             deployments can attribute decisions to an *individual* rather than
             to a shared credential:
 
-            1. An explicit ``X-Operator-Id`` header (a non-secret, caller-supplied
-               operator handle). This distinguishes operators even when they
-               share a gateway token — a proxy/SSO layer can stamp it per user.
+            This identity is used for *authorization* (approval custody), so it
+            never comes from a header the caller controls by default:
+
+            1. ``X-Operator-Id`` — only when ``gateway.trust_operator_header``
+               is enabled *and* the request arrives from a declared trusted
+               proxy that stamps it per user (SSO layer). Otherwise ignored.
             2. A short digest of the operator token. The token is a secret and
                must never be logged, so we hash it; distinct tokens yield
                distinct identities. Holders of the *same* token collapse to one
@@ -1884,7 +1921,7 @@ class WebSocketGateway:
                (e.g. loopback bypass).
             """
             explicit = request.headers.get("x-operator-id", "").strip()
-            if explicit:
+            if explicit and _trust_operator_header(request):
                 # Bound + sanitised so a header value can't bloat or corrupt the
                 # audit row; it is a handle, not a secret.
                 return f"operator:{explicit[:64]}"
@@ -1953,7 +1990,13 @@ class WebSocketGateway:
             client_ip = _client_subject(peer_ip, websocket.headers)
 
             # Rate limiting for WebSocket upgrades (exempt loopback per acceptance criteria)
-            if not is_loopback(peer_ip) and not is_loopback(self._host):
+            # Only a *direct* local connection is exempt: a loopback peer that
+            # carries forwarding headers is a local proxy relaying remote
+            # clients (uvicorn proxy_headers is off, #6428).
+            _direct_local = is_loopback(peer_ip) and not (
+                "x-forwarded-for" in websocket.headers or "forwarded" in websocket.headers
+            )
+            if not _direct_local and not is_loopback(self._host):
                 if not _ws_upgrade_rate.allow("ws_upgrade", client_ip):
                     retry = _ws_upgrade_rate.time_until_allowed("ws_upgrade", client_ip)
                     await _reject_connection(
@@ -1974,7 +2017,7 @@ class WebSocketGateway:
             # once so a hostile client cannot park many half-open connections up
             # to max_connections. Loopback is exempt so local CLIs are never
             # locked out. The slot is released on auth-success or on close.
-            _ip_is_loopback = is_loopback(peer_ip) or is_loopback(self._host)
+            _ip_is_loopback = _direct_local or is_loopback(self._host)
             _released = {"done": False}
 
             def _release_budget():
@@ -2056,9 +2099,13 @@ class WebSocketGateway:
                 except ImportError:
                     pass
                 
-                # Fall back to query param token authentication
+                # Then ``Authorization: Bearer`` (bundled client, Issue #6307),
+                # falling back to the legacy ``?token=`` query param.
                 if not authenticated:
-                    ws_token = websocket.query_params.get("token", "")
+                    auth_header = websocket.headers.get("authorization", "")
+                    ws_token = (
+                        auth_header[7:] if auth_header.startswith("Bearer ") else ""
+                    ) or websocket.query_params.get("token", "")
                     if ws_token and secrets.compare_digest(ws_token, self.config.auth_token):
                         authenticated = True
                         operator_token = ws_token
@@ -2208,7 +2255,9 @@ class WebSocketGateway:
                 )
 
             return JSONResponse({
-                "pending": _approval_mgr.list_pending(),
+                "pending": _approval_mgr.list_pending(
+                    visible_to=_resolve_operator_identity(request),
+                ),
                 "allow_list": _approval_mgr.allowlist.list(),
             })
 
@@ -2383,7 +2432,9 @@ class WebSocketGateway:
                     status_code=401
                 )
             
-            client_ip = request.client.host if request.client else "unknown"
+            client_ip = _client_subject(
+                request.client.host if request.client else None, request.headers
+            )
             if not _magic_rate.allow("magic_link", client_ip):
                 retry = _magic_rate.time_until_allowed("magic_link", client_ip)
                 return JSONResponse(
@@ -2427,8 +2478,10 @@ class WebSocketGateway:
                 
                 # Redirect to remove the nonce from URL
                 from starlette.responses import RedirectResponse
+                # Relative redirect keeps the public scheme/host behind an
+                # HTTPS proxy (uvicorn proxy_headers is off, #6428).
                 response = RedirectResponse(
-                    url=str(request.url.replace(query="")),
+                    url=request.url.path or "/",
                     status_code=302
                 )
                 response.headers["Set-Cookie"] = cookie_header
@@ -2524,26 +2577,49 @@ class WebSocketGateway:
             if hook is None or not getattr(hook, "enabled", True):
                 return JSONResponse({"error": "hook not found"}, status_code=404)
 
-            auth_err = _check_hook_auth(request, hook)
-            if auth_err:
-                return auth_err
+            # Token auth (gateway ``auth_token`` or hook ``auth``) is required
+            # unless the hook explicitly opted into ``signature_only`` (#6034);
+            # ``HookConfig`` only allows that with a secret and a replay-bounded
+            # scheme. It runs before the body is read so unauthenticated
+            # requests fail early.
+            verify = getattr(hook, "verify_signature", None)
+            signed = callable(verify) and bool(getattr(hook, "secret", None))
+            signature_only = signed and getattr(hook, "signature_only", False) is True
+            if not signature_only or getattr(hook, "auth", None):
+                auth_err = _check_hook_auth(request, hook)
+                if auth_err:
+                    return auth_err
+            elif not request.headers.get(getattr(hook, "signature_header", None) or ""):
+                # Signature is the only credential: with no signature header the
+                # request cannot authenticate, so reject it before buffering.
+                return JSONResponse({"error": "invalid signature"}, status_code=401)
 
             import json
 
             # Read the raw body once so an HMAC signature can be verified over
-            # the exact bytes the provider signed, then parse it as JSON.
-            raw_body = await request.body()
+            # the exact bytes the provider signed, then parse it as JSON. The
+            # read is capped so an unauthenticated sender cannot exhaust memory.
+            too_large = JSONResponse({"error": "payload too large"}, status_code=413)
+            try:
+                if int(request.headers.get("content-length") or 0) > _HOOK_MAX_BODY_BYTES:
+                    return too_large
+            except ValueError:
+                return JSONResponse({"error": "invalid content-length"}, status_code=400)
+            chunks, size = [], 0
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > _HOOK_MAX_BODY_BYTES:
+                    return too_large
+                chunks.append(chunk)
+            raw_body = b"".join(chunks)
 
             # Provider signature verification (#3165). Fail-closed: when a
             # ``secret`` is configured, a missing/invalid signature is rejected
-            # with 401 before any agent runs. A hook without ``secret`` is
-            # unaffected (backward compatible).
-            verify = getattr(hook, "verify_signature", None)
-            if callable(verify) and getattr(hook, "secret", None):
-                if not verify(raw_body, dict(request.headers)):
-                    return JSONResponse(
-                        {"error": "invalid signature"}, status_code=401,
-                    )
+            # with 401 before any agent runs.
+            if signed and not verify(raw_body, dict(request.headers)):
+                return JSONResponse(
+                    {"error": "invalid signature"}, status_code=401,
+                )
 
             try:
                 payload = json.loads(raw_body) if raw_body else {}
@@ -2742,6 +2818,10 @@ class WebSocketGateway:
             host=self._host,
             port=self._port,
             log_level="warning",
+            # Keep ``request.client`` the raw socket peer. Forwarded headers are
+            # handled by the gateway's own ``trusted_proxies`` attribution;
+            # uvicorn's rewrite would let a caller forge the peer (#6428).
+            proxy_headers=False,
         )
         self._server = uvicorn.Server(config)
         

@@ -20,7 +20,11 @@ import dataclasses
 import enum
 import inspect
 import logging
+import types
+import weakref
 from typing import Any, Union, Literal, get_origin, get_args, get_type_hints, Callable, Dict, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def annotation_to_json_schema(annotation: Any) -> dict:
@@ -286,6 +290,38 @@ def get_parameter_requirements(sig: inspect.Signature, param_name: str) -> bool:
     return True
 
 
+_DEFAULT_TYPES = (bool, int, float, str, list, dict)
+_UNTYPED_WARNED: Set[str] = set()
+
+
+def _type_from_default(param: inspect.Parameter) -> Any:
+    """Schema type for an unannotated parameter, read from its default (D-14).
+
+    ``n=3`` is an integer, not a string. ``None`` or no default says nothing,
+    so the caller keeps its own fallback.
+    """
+    default = param.default
+    if default is inspect.Parameter.empty or default is None:
+        return None
+    kind = type(default)
+    if kind in _DEFAULT_TYPES:
+        return kind
+    return list if kind is tuple else None
+
+
+def _warn_if_untyped(function_name: str, sig: inspect.Signature, hints: Dict[str, Any]) -> None:
+    """Warn once per tool that has parameters but no type hints at all."""
+    if function_name in _UNTYPED_WARNED:
+        return
+    params = [p for n, p in sig.parameters.items() if n not in ("self", "cls")
+              and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)]
+    if params and not any(p.annotation is not inspect.Parameter.empty or p.name in hints for p in params):
+        _UNTYPED_WARNED.add(function_name)
+        logger.warning(
+            f"Tool {function_name!r} has no type hints: parameter types are taken from defaults "
+            "(string otherwise). Add type hints so the model gets an exact schema.")
+
+
 def build_parameters_schema(
     sig: inspect.Signature,
     hints: Dict[str, Any],
@@ -336,8 +372,8 @@ def build_parameters_schema(
         ):
             continue
 
-        # Get type hint
-        param_type = hints.get(param_name, Any)
+        # Get type hint (an untyped parameter takes its default's type)
+        param_type = hints.get(param_name) or _type_from_default(_param) or Any
         
         # Apply skip predicate if provided
         if skip_predicate and skip_predicate(param_name, param_type):
@@ -348,7 +384,7 @@ def build_parameters_schema(
             prop_schema = annotation_to_json_schema(param_type)
         except Exception as e:
             # Log but continue - allow partial schemas
-            logging.debug(f"Could not generate schema for {func_name}.{param_name}: {e}")
+            logger.debug(f"Could not generate schema for {func_name}.{param_name}: {e}")
             # Default to string type for parameters that fail schema generation
             prop_schema = {"type": "string"}
         
@@ -435,6 +471,10 @@ def build_tool_definition(
         "required": []
     }
 
+    from .injected import is_injected_type
+    injected_names = getattr(func, "injected_params", None) or {}
+
+    _warn_if_untyped(function_name, sig, hints)
     for name, param in sig.parameters.items():
         if name == "self":
             continue
@@ -443,12 +483,16 @@ def build_tool_definition(
 
         annotation = hints.get(
             name,
-            param.annotation if param.annotation != inspect.Parameter.empty else str
+            param.annotation if param.annotation != inspect.Parameter.empty
+            else (_type_from_default(param) or str)
         )
+        # Framework-injected state is filled at runtime; never expose it to the model.
+        if name in injected_names or is_injected_type(annotation):
+            continue
         try:
             prop_schema = annotation_to_json_schema(annotation)
         except Exception as e:
-            logging.warning(f"Could not generate schema for {function_name}.{name}: {e}")
+            logger.warning(f"Could not generate schema for {function_name}.{name}: {e}")
             prop_schema = {"type": "string"}
 
         if name in param_descriptions:
@@ -476,3 +520,61 @@ def build_tool_definition(
             "parameters": parameters
         }
     }
+
+
+def _tool_fingerprint(tool: Any) -> str:
+    """Content-based fingerprint for one tool entry (see ``tools_cache_key``)."""
+    if isinstance(tool, (dict, list)):
+        import hashlib
+        import json
+        try:
+            blob = json.dumps(tool, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            return f"o:{id(tool)}"
+        return "d:" + hashlib.sha1(blob.encode()).hexdigest()
+    if isinstance(tool, str):
+        return f"s:{tool}"
+    if isinstance(tool, types.FunctionType):
+        # Called every turn for every tool: reuse the fingerprint until the
+        # function's code, docstring, defaults or annotations are replaced.
+        stamp = tuple(getattr(tool, a, None) for a in _FUNCTION_STAMP_ATTRS)
+        cached = _function_fingerprints.get(tool)
+        if cached is not None and all(x is y for x, y in zip(cached[0], stamp)):
+            return cached[1]
+        fingerprint = _callable_fingerprint(tool)
+        _function_fingerprints[tool] = (stamp, fingerprint)
+        return fingerprint
+    if callable(tool):
+        return _callable_fingerprint(tool)
+    return f"o:{id(tool)}"
+
+
+_FUNCTION_STAMP_ATTRS = (
+    "__code__", "__doc__", "__defaults__", "__kwdefaults__",
+    "__annotations__", "__signature__", "__wrapped__", "__qualname__",
+)
+_function_fingerprints: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _callable_fingerprint(tool: Any) -> str:
+    try:
+        sig = str(inspect.signature(tool))
+    except (TypeError, ValueError):
+        sig = ""
+    name = getattr(tool, "__qualname__", None) or type(tool).__qualname__
+    doc = inspect.getdoc(tool) or ""
+    return f"c:{getattr(tool, '__module__', '')}.{name}:{id(tool)}:{sig}:{hash(doc)}"
+
+
+def tools_cache_key(tools: Any) -> str:
+    """Cache key for a tools list, keyed on tool *content*, not just name.
+
+    Two different tools sharing a name (factory closures, redefined or
+    hot-reloaded functions, MCP tools whose schema changed) must not share a
+    formatted-schema cache entry, or the model is sent the wrong schema.
+    """
+    if tools is None:
+        return "none"
+    if not tools:
+        return "empty"
+    return "|".join(sorted(_tool_fingerprint(t) for t in tools))

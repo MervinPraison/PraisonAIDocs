@@ -10,6 +10,7 @@ import base64
 import logging
 import mimetypes
 from praisonaiagents._logging import get_logger
+from ._helpers import inject_steering, usage_detail, usage_value
 import time
 import json
 import asyncio
@@ -23,6 +24,8 @@ from pathlib import Path
 from ..errors import ToolExecutionError
 from ..model_harness.guard import check_model_request
 from ..tools.call_executor import _durable_iteration_kwargs
+
+logger = logging.getLogger(__name__)
 
 # Graceful "wrap-up" instruction injected when the step budget is nearly
 # exhausted, so the model produces a coherent final answer instead of being
@@ -78,8 +81,42 @@ def _handle_native_deferred_result(
 
         resolver.register_if_absent(tool_result.handle_id, _reinject)
     except Exception as e:  # noqa: BLE001 — registration must never break the turn
-        logging.debug("Native deferred registration skipped (non-fatal): %s", e)
+        logger.debug("Native deferred registration skipped (non-fatal): %s", e)
     return tool_result.note
+
+_BOTH_BASE_URLS_WARNED = False
+
+
+def _env_base_url():
+    """The OpenAI base URL from the environment, or None (X-02).
+
+    ``OPENAI_BASE_URL`` (the openai SDK's name) first, then the legacy
+    ``OPENAI_API_BASE``. When both are set and differ, warns once naming both.
+    """
+    global _BOTH_BASE_URLS_WARNED
+    official, legacy = os.environ.get("OPENAI_BASE_URL"), os.environ.get("OPENAI_API_BASE")
+    if official and legacy and official != legacy and not _BOTH_BASE_URLS_WARNED:
+        _BOTH_BASE_URLS_WARNED = True
+        logger.warning(
+            "Both OPENAI_BASE_URL=%s and OPENAI_API_BASE=%s are set; using OPENAI_BASE_URL. "
+            "Unset OPENAI_API_BASE (the legacy name) to silence this.", official, legacy)
+    return official or legacy
+
+
+
+def _live_update(live, display_fn, text, start_time):
+    """Rebuild the streaming panel at most every 100 ms (R-01).
+
+    Each rebuild parses the whole answer so far as Markdown, so rebuilding on
+    every chunk made a long answer quadratic (2,000 chunks: 2-5 s vs 0.13 s
+    for the raw stream); the Live display redraws about ten times a second
+    anyway. The panel is transient, and the final answer is printed after it.
+    """
+    now = time.perf_counter()
+    last = getattr(live, "_praison_last_update", None)  # perf_counter's zero is undefined
+    if last is None or now - last >= 0.1:
+        live._praison_last_update = now
+        live.update(display_fn(text, start_time))
 
 # Lazy imports for optional dependencies
 _openai_module = None
@@ -284,7 +321,6 @@ def process_stream_chunks(chunks):
     
     try:
         first_chunk = chunks[0]
-        last_chunk = chunks[-1]
         
         # Basic metadata
         id = getattr(first_chunk, "id", None) 
@@ -300,8 +336,10 @@ def process_stream_chunks(chunks):
         
         content_list = []
         reasoning_list = []
-        tool_calls = []
-        current_tool_call = None
+        # Tool-call deltas accumulated by index across the whole stream
+        tool_calls_by_index = {}
+        index_alias = {}  # provider index -> slot, when a server reuses an index
+        finish_reason = None
 
         # First pass: Get initial tool call data
         for chunk in chunks:
@@ -322,7 +360,11 @@ def process_stream_chunks(chunks):
             if not hasattr(chunk, "choices") or not chunk.choices:
                 continue
             
-            delta = getattr(chunk.choices[0], "delta", None)
+            choice0 = chunk.choices[0]
+            if getattr(choice0, "finish_reason", None):
+                finish_reason = choice0.finish_reason
+
+            delta = getattr(choice0, "delta", None)
             if not delta:
                 continue
 
@@ -332,45 +374,48 @@ def process_stream_chunks(chunks):
             if hasattr(delta, "reasoning_content") and delta.reasoning_content:
                 reasoning_list.append(delta.reasoning_content)
             
-            # Handle tool calls
-            if hasattr(delta, "tool_calls") and delta.tool_calls:
-                for tool_call_delta in delta.tool_calls:
-                    fn = getattr(tool_call_delta, "function", None)
-                    args_part = getattr(fn, "arguments", None) or ""
-                    if tool_call_delta.index is not None and tool_call_delta.id:
-                        # Found the initial tool call. Many OpenAI-compatible
-                        # servers (vLLM, Ollama, Gemini, proxies) send the
-                        # whole arguments string in this same delta, so keep
-                        # it instead of starting from "".
-                        current_tool_call = {
-                            "id": tool_call_delta.id,
-                            "type": "function",
-                            "function": {
-                                "name": getattr(fn, "name", None),
-                                "arguments": args_part
-                            }
-                        }
-                        while len(tool_calls) <= tool_call_delta.index:
-                            tool_calls.append(None)
-                        tool_calls[tool_call_delta.index] = current_tool_call
-                    elif args_part:
-                        # Continuation delta: append to the call at its index
-                        # (parallel calls interleave), else to the last one.
-                        idx = tool_call_delta.index
-                        target = (
-                            tool_calls[idx]
-                            if idx is not None and 0 <= idx < len(tool_calls) and tool_calls[idx]
-                            else current_tool_call
-                        )
-                        if target is not None:
-                            target["function"]["arguments"] += args_part
+            # Handle tool calls: providers may send a full call in a single
+            # delta (Ollama/vLLM) or stream argument fragments addressed by
+            # index (parallel calls), so accumulate per index.
+            for tool_call_delta in (getattr(delta, "tool_calls", None) or []):
+                idx = getattr(tool_call_delta, "index", None)
+                tc_id = getattr(tool_call_delta, "id", None)
+                if idx is None:
+                    # No index: a new id opens a call, otherwise continue the last one
+                    if tc_id or not tool_calls_by_index:
+                        idx = max(tool_calls_by_index, default=-1) + 1
+                    else:
+                        idx = max(tool_calls_by_index)
+                else:
+                    raw_idx = idx
+                    idx = index_alias.get(raw_idx, raw_idx)
+                    existing = tool_calls_by_index.get(idx)
+                    if tc_id and existing and existing["id"] and existing["id"] != tc_id:
+                        # Some servers reuse index 0 for every call; a new id
+                        # at a filled index is a new call, not a fragment.
+                        idx = index_alias[raw_idx] = max(tool_calls_by_index) + 1
+                slot = tool_calls_by_index.setdefault(idx, {
+                    "id": None,
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                })
+                if tc_id:
+                    slot["id"] = tc_id
+                fn = getattr(tool_call_delta, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["function"]["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["function"]["arguments"] += fn.arguments
 
-        # Remove any None values and empty tool calls
-        tool_calls = [tc for tc in tool_calls if tc and tc["id"] and tc["function"]["name"]]
+        # Drop incomplete tool calls
+        tool_calls = [
+            tool_calls_by_index[i] for i in sorted(tool_calls_by_index)
+            if tool_calls_by_index[i]["id"] and tool_calls_by_index[i]["function"]["name"]
+        ]
 
         combined_content = "".join(content_list) if content_list else ""
         combined_reasoning = "".join(reasoning_list) if reasoning_list else None
-        finish_reason = getattr(last_chunk.choices[0], "finish_reason", None) if hasattr(last_chunk, "choices") and last_chunk.choices else None
 
         # Create ToolCall objects
         processed_tool_calls = []
@@ -397,7 +442,7 @@ def process_stream_chunks(chunks):
         )
         
         choice = Choice(
-            finish_reason=finish_reason or "tool_calls" if processed_tool_calls else None,
+            finish_reason=finish_reason or ("tool_calls" if processed_tool_calls else None),
             index=0,
             message=message
         )
@@ -447,7 +492,7 @@ class OpenAIClient:
         
         Args:
             api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
-            base_url: Custom base URL for API endpoints (defaults to OPENAI_API_BASE env var)
+            base_url: Custom base URL for API endpoints (defaults to OPENAI_BASE_URL, then the legacy OPENAI_API_BASE)
             max_retries: Number of automatic retries for transient errors (rate limits,
                 network blips) performed by the underlying OpenAI SDK, which honours
                 ``Retry-After`` and applies exponential backoff. Defaults to the
@@ -456,7 +501,7 @@ class OpenAIClient:
         """
         # Use provided values or fall back to environment variables
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
-        self.base_url = base_url or os.environ.get("OPENAI_API_BASE") or os.environ.get("OPENAI_BASE_URL")
+        self.base_url = base_url or _env_base_url()
 
         # Resolve retry configuration: explicit arg wins, else OPENAI_MAX_RETRIES env var.
         if max_retries is None:
@@ -476,7 +521,7 @@ class OpenAIClient:
         elif not self.api_key:
             raise ValueError(
                 "OPENAI_API_KEY environment variable is required for the default OpenAI service. "
-                "If you are targeting a local server (e.g., LM Studio), ensure OPENAI_API_BASE is set "
+                "If you are targeting a local server (e.g., LM Studio), ensure OPENAI_BASE_URL is set "
                 f"(e.g., 'http://localhost:1234/v1') and you can use a placeholder API key by setting OPENAI_API_KEY='{LOCAL_SERVER_API_KEY_PLACEHOLDER}'"
             )
         
@@ -695,33 +740,9 @@ class OpenAIClient:
         return fix_array_schemas(schema)
     
     def _get_tools_cache_key(self, tools: List[Any]) -> str:
-        """Generate a cache key for tools."""
-        parts = []
-        for tool in tools:
-            if isinstance(tool, dict):
-                # For dict tools, use sorted JSON representation
-                parts.append(json.dumps(tool, sort_keys=True))
-            elif callable(tool):
-                # For functions, use module.name
-                parts.append(f"{tool.__module__}.{tool.__name__}")
-            elif isinstance(tool, str):
-                # For string tools, use as-is
-                parts.append(tool)
-            elif isinstance(tool, list):
-                # For lists, recursively process
-                subparts = []
-                for subtool in tool:
-                    if isinstance(subtool, dict):
-                        subparts.append(json.dumps(subtool, sort_keys=True))
-                    elif callable(subtool):
-                        subparts.append(f"{subtool.__module__}.{subtool.__name__}")
-                    else:
-                        subparts.append(str(subtool))
-                parts.append(f"[{','.join(subparts)}]")
-            else:
-                # For other types, use string representation
-                parts.append(str(tool))
-        return "|".join(parts)
+        """Generate a content-based cache key for tools."""
+        from ..tools.schema import tools_cache_key
+        return tools_cache_key(tools)
     
     def format_tools(self, tools: Optional[List[Any]]) -> Optional[List[Dict]]:
         """
@@ -747,7 +768,14 @@ class OpenAIClient:
         # Check cache first
         cache_key = self._get_tools_cache_key(tools)
         if cache_key in self._formatted_tools_cache:
-            return self._formatted_tools_cache[cache_key]
+            # LRU: re-insert so the entry becomes most-recently-used.
+            # A concurrent eviction of the same key just falls through to a miss.
+            try:
+                cached = self._formatted_tools_cache.pop(cache_key)
+                self._formatted_tools_cache[cache_key] = cached
+                return cached
+            except KeyError:
+                pass
             
         from ..tools.hosted import is_hosted_tool
         formatted_tools = []
@@ -757,35 +785,35 @@ class OpenAIClient:
             # they carry no 'function' block. Forward them untouched, allowlisted
             # by type so a genuinely malformed tool is still dropped.
             if isinstance(tool, dict) and is_hosted_tool(tool):
-                logging.debug(f"Forwarding provider-hosted tool: {tool.get('type')}")
+                logger.debug(f"Forwarding provider-hosted tool: {tool.get('type')}")
                 formatted_tools.append(tool)
             # Check if the tool is already in OpenAI format
             elif isinstance(tool, dict) and 'type' in tool and tool['type'] == 'function':
                 if 'function' in tool and isinstance(tool['function'], dict) and 'name' in tool['function']:
-                    logging.debug(f"Using pre-formatted OpenAI tool: {tool['function']['name']}")
+                    logger.debug(f"Using pre-formatted OpenAI tool: {tool['function']['name']}")
                     # Fix array schemas in the tool parameters
                     fixed_tool = tool.copy()
                     if 'parameters' in fixed_tool['function']:
                         fixed_tool['function']['parameters'] = self._fix_array_schemas(fixed_tool['function']['parameters'])
                     formatted_tools.append(fixed_tool)
                 else:
-                    logging.debug("Skipping malformed OpenAI tool: missing function or name")
+                    logger.debug("Skipping malformed OpenAI tool: missing function or name")
             # Handle lists of tools
             elif isinstance(tool, list):
                 for subtool in tool:
                     if isinstance(subtool, dict) and is_hosted_tool(subtool):
-                        logging.debug(f"Forwarding provider-hosted tool from list: {subtool.get('type')}")
+                        logger.debug(f"Forwarding provider-hosted tool from list: {subtool.get('type')}")
                         formatted_tools.append(subtool)
                     elif isinstance(subtool, dict) and 'type' in subtool and subtool['type'] == 'function':
                         if 'function' in subtool and isinstance(subtool['function'], dict) and 'name' in subtool['function']:
-                            logging.debug(f"Using pre-formatted OpenAI tool from list: {subtool['function']['name']}")
+                            logger.debug(f"Using pre-formatted OpenAI tool from list: {subtool['function']['name']}")
                             # Fix array schemas in the tool parameters
                             fixed_tool = subtool.copy()
                             if 'parameters' in fixed_tool['function']:
                                 fixed_tool['function']['parameters'] = self._fix_array_schemas(fixed_tool['function']['parameters'])
                             formatted_tools.append(fixed_tool)
                         else:
-                            logging.debug("Skipping malformed OpenAI tool in list: missing function or name")
+                            logger.debug("Skipping malformed OpenAI tool in list: missing function or name")
             elif callable(tool):
                 tool_def = self._generate_tool_definition(tool)
                 if tool_def:
@@ -799,25 +827,30 @@ class OpenAIClient:
                 tool_name = next(iter(tool.keys()))
                 gemini_internal_tools = {'googleSearch', 'urlContext', 'codeExecution'}
                 if tool_name in gemini_internal_tools:
-                    logging.debug(f"Using Gemini internal tool: {tool_name}")
+                    logger.debug(f"Using Gemini internal tool: {tool_name}")
                     formatted_tools.append(tool)
                 else:
-                    logging.debug(f"Skipping unknown tool: {tool_name}")
+                    logger.debug(f"Skipping unknown tool: {tool_name}")
             else:
-                logging.debug(f"Skipping tool of unsupported type: {type(tool)}")
+                logger.debug(f"Skipping tool of unsupported type: {type(tool)}")
                 
         # Validate JSON serialization before returning
         if formatted_tools:
             try:
                 json.dumps(formatted_tools)  # Validate serialization
             except (TypeError, ValueError) as e:
-                logging.error(f"Tools are not JSON serializable: {e}")
+                logger.error(f"Tools are not JSON serializable: {e}")
                 return None
         
         # Cache the result
         result = formatted_tools if formatted_tools else None
-        if result is not None and len(self._formatted_tools_cache) < self._max_cache_size:
+        if result is not None:
             self._formatted_tools_cache[cache_key] = result
+            while len(self._formatted_tools_cache) > self._max_cache_size:
+                try:
+                    del self._formatted_tools_cache[next(iter(self._formatted_tools_cache))]
+                except (KeyError, StopIteration, RuntimeError):
+                    break
                 
         return result
     
@@ -1243,7 +1276,7 @@ class OpenAIClient:
             from ..tools.schema import build_tool_definition
             return build_tool_definition(func)
         except Exception as e:
-            logging.error(f"Error generating tool definition: {e}")
+            logger.error(f"Error generating tool definition: {e}")
             return None
     
     def _generate_tool_definition_from_name(self, function_name: str) -> Optional[Dict]:
@@ -1261,7 +1294,7 @@ class OpenAIClient:
             # key (alias-safe), then normalise array schemas for strict providers.
             tool_def = registry.get_tool_definition(function_name)
             if tool_def is None:
-                logging.debug(
+                logger.debug(
                     f"Tool '{function_name}' not found or unavailable in registry"
                 )
                 return None
@@ -1279,7 +1312,7 @@ class OpenAIClient:
         except Exception:
             # Keep the tool loop resilient (a single bad tool must not break the
             # whole request), but preserve the traceback for diagnosis.
-            logging.error(
+            logger.error(
                 f"Error generating tool definition from name '{function_name}'",
                 exc_info=True,
             )
@@ -1438,7 +1471,7 @@ class OpenAIClient:
                             # Log TTFT on first token
                             if not ttft_logged:
                                 ttft_ms = (last_content_time - request_start_perf) * 1000
-                                logging.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
+                                logger.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
                                 ttft_logged = True
                             
                             # Emit FIRST_TOKEN on first content
@@ -1457,7 +1490,7 @@ class OpenAIClient:
                                     content=content
                                 ))
                             
-                            live.update(display_fn(full_response_text, start_time))
+                            _live_update(live, display_fn, full_response_text, start_time)
                         
                         # Handle tool calls streaming
                         if _emit and chunk.choices and hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
@@ -1487,7 +1520,7 @@ class OpenAIClient:
                                 ))
                             if reasoning_steps:
                                 reasoning_content += rc
-                                live.update(display_fn(f"{full_response_text}\n[Reasoning: {reasoning_content}]", start_time))
+                                _live_update(live, display_fn, f"{full_response_text}\n[Reasoning: {reasoning_content}]", start_time)
                 
                 # Clear the last generating display with a blank line
                 console.print()
@@ -1512,7 +1545,7 @@ class OpenAIClient:
                         # Log TTFT on first token
                         if not ttft_logged:
                             ttft_ms = (last_content_time - request_start_perf) * 1000
-                            logging.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
+                            logger.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
                             ttft_logged = True
                         
                         if _emit and not first_token_emitted:
@@ -1562,7 +1595,8 @@ class OpenAIClient:
             
         except Exception as e:
             status = raw.get("status") if isinstance(raw, dict) else getattr(raw, "status", None)
-            if status == "failed":
+            from .error_classifier import _is_fatal_model_error
+            if status == "failed" or _is_fatal_model_error(e):
                 raise
             self.logger.error(f"Error in stream processing: {e}")
             return None
@@ -1748,7 +1782,7 @@ class OpenAIClient:
                                     content=content
                                 ))
                             
-                            live.update(display_fn(full_response_text, start_time))
+                            _live_update(live, display_fn, full_response_text, start_time)
                         
                         # Handle tool calls streaming
                         if _emit and chunk.choices and hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
@@ -1778,7 +1812,7 @@ class OpenAIClient:
                                 ))
                             if reasoning_steps:
                                 reasoning_content += rc
-                                live.update(display_fn(f"{full_response_text}\n[Reasoning: {reasoning_content}]", start_time))
+                                _live_update(live, display_fn, f"{full_response_text}\n[Reasoning: {reasoning_content}]", start_time)
                 
                 # Clear the last generating display with a blank line
                 console.print()
@@ -1845,7 +1879,8 @@ class OpenAIClient:
             
         except Exception as e:
             status = raw.get("status") if isinstance(raw, dict) else getattr(raw, "status", None)
-            if status == "failed":
+            from .error_classifier import _is_fatal_model_error
+            if status == "failed" or _is_fatal_model_error(e):
                 raise
             self.logger.error(f"Error in async stream processing: {e}")
             return None
@@ -1872,28 +1907,10 @@ class OpenAIClient:
                 return
 
             def _val(*names: str) -> int:
-                for name in names:
-                    value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
-                    if value is not None:
-                        return int(value or 0)
-                return 0
+                return usage_value(usage, *names)
 
             def _detail(detail_names: tuple, name: str) -> int:
-                for detail_name in detail_names:
-                    details = (
-                        usage.get(detail_name)
-                        if isinstance(usage, dict)
-                        else getattr(usage, detail_name, None)
-                    )
-                    if details:
-                        value = (
-                            details.get(name)
-                            if isinstance(details, dict)
-                            else getattr(details, name, None)
-                        )
-                        if value is not None:
-                            return int(value or 0)
-                return 0
+                return usage_detail(usage, detail_names, name)
 
             metrics = TokenMetrics(
                 input_tokens=_val("prompt_tokens", "input_tokens"),
@@ -2124,14 +2141,7 @@ class OpenAIClient:
             return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
 
         def _inject_steering(msgs) -> None:
-            if steering_drain is None:
-                return
-            try:
-                for note in (steering_drain() or []):
-                    if note:
-                        msgs.append({"role": "user", "content": f"[steering] {note}"})
-            except Exception:
-                pass
+            inject_steering(msgs, steering_drain)
 
         # Work on a local copy so the tool-loop mutations (assistant/tool
         # turns and the graceful wrap-up control message) never leak back into
@@ -2221,10 +2231,10 @@ class OpenAIClient:
                                     # Log TTFT on first token
                                     if not ttft_logged:
                                         ttft_ms = (time.perf_counter() - request_start_perf) * 1000
-                                        logging.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
+                                        logger.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
                                         ttft_logged = True
                                     full_response_text += chunk.choices[0].delta.content
-                                    live.update(display_fn(full_response_text, start_time))
+                                    _live_update(live, display_fn, full_response_text, start_time)
                             
                             # Process final response from chunks
                             final_response = process_stream_chunks(chunks)
@@ -2343,7 +2353,7 @@ class OpenAIClient:
                     # the whole run (matches chat_completion_with_tools_stream).
                     function_name, arguments, _tool_call_id, err = _extract_tool_call_name_and_args(tool_call)
                     if err is not None:
-                        logging.warning(f"Failed to parse tool call arguments: {err}")
+                        logger.warning(f"Failed to parse tool call arguments: {err}")
                         messages.append({
                             "role": "tool",
                             "tool_call_id": _tool_call_id,
@@ -2370,7 +2380,7 @@ class OpenAIClient:
                     except ToolExecutionError:
                         raise
                     except Exception as tool_error:
-                        logging.warning(f"Tool '{function_name}' failed: {tool_error}")
+                        logger.warning(f"Tool '{function_name}' failed: {tool_error}")
                         tool_result = {"error": str(tool_error)}
                     # Parity with the LiteLLM loop: register a deferred handle so
                     # its eventual background value is re-injected, not lost.
@@ -2492,14 +2502,7 @@ class OpenAIClient:
             return cancel_token is not None and getattr(cancel_token, "is_set", lambda: False)()
 
         def _inject_steering(msgs) -> None:
-            if steering_drain is None:
-                return
-            try:
-                for note in (steering_drain() or []):
-                    if note:
-                        msgs.append({"role": "user", "content": f"[steering] {note}"})
-            except Exception:
-                pass
+            inject_steering(msgs, steering_drain)
 
         # Work on a local copy so the tool-loop mutations (assistant/tool
         # turns and the graceful wrap-up control message) never leak back into
@@ -2588,7 +2591,7 @@ class OpenAIClient:
                                 chunks.append(chunk)
                                 if chunk.choices[0].delta.content:
                                     full_response_text += chunk.choices[0].delta.content
-                                    live.update(display_fn(full_response_text, start_time))
+                                    _live_update(live, display_fn, full_response_text, start_time)
                             
                             # Process final response from chunks
                             final_response = process_stream_chunks(chunks)
@@ -2739,7 +2742,7 @@ class OpenAIClient:
                     except ToolExecutionError:
                         raise
                     except Exception as tool_error:
-                        logging.warning(f"Tool '{name}' failed: {tool_error}")
+                        logger.warning(f"Tool '{name}' failed: {tool_error}")
                         return {"error": str(tool_error)}
 
                 if _native_batch_parallel_ok(parallel_tool_calls, _specs):
@@ -2763,7 +2766,7 @@ class OpenAIClient:
 
                 for tool_call, function_name, arguments, _tool_call_id, err in _parsed:
                     if err is not None:
-                        logging.warning(f"Failed to parse tool call arguments: {err}")
+                        logger.warning(f"Failed to parse tool call arguments: {err}")
                         messages.append({
                             "role": "tool",
                             "tool_call_id": _tool_call_id,
@@ -3176,9 +3179,7 @@ def get_openai_client(api_key: Optional[str] = None, base_url: Optional[str] = N
     # Normalize parameters for comparison, mirroring OpenAIClient.__init__ so that
     # an explicit argument matching the env-var fallback reuses the cached client.
     normalized_api_key = api_key or os.environ.get("OPENAI_API_KEY")
-    normalized_base_url = (
-        base_url or os.environ.get("OPENAI_API_BASE") or os.environ.get("OPENAI_BASE_URL")
-    )
+    normalized_base_url = base_url or _env_base_url()
     normalized_max_retries = max_retries
     if normalized_max_retries is None:
         _env_retries = os.environ.get("OPENAI_MAX_RETRIES")

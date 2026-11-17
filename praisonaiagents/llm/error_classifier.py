@@ -124,6 +124,28 @@ _ERROR_PATTERNS: Dict[ErrorCategory, List[str]] = {
 }
 
 
+def _is_connection_refused(exc: BaseException, _depth: int = 0) -> bool:
+    """True if nothing accepted the connection (``ConnectionRefusedError`` in the chain).
+
+    An async connect to a name with several addresses (``localhost``: IPv6 and
+    IPv4) reports an exception group; it counts when every attempt was refused.
+    """
+    seen = 0
+    while exc is not None and seen < 8 and _depth < 4:
+        if isinstance(exc, ConnectionRefusedError):
+            return True
+        # An error with a status code may be a server's answer (a proxy's 502
+        # "connection refused") or a wrapper around a real refusal (litellm):
+        # do not trust its text, keep walking to the cause.
+        if getattr(exc, "status_code", None) is None and "connection refused" in str(exc).lower():
+            return True
+        group = getattr(exc, "exceptions", None)
+        if isinstance(group, (list, tuple)) and group:
+            return all(_is_connection_refused(e, _depth + 1) for e in group)
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return False
+
+
 def classify_llm_error(
     exc: Exception,
     *,
@@ -153,7 +175,21 @@ def classify_llm_error(
     from .retry_utils import jittered_backoff
     
     error_str = str(exc).lower()
-    
+
+    # A refused connection means no server is listening: retrying the same
+    # endpoint only delays the error (P-2/G-12), so it is not retryable. A
+    # fallback to another model is still allowed.
+    if _is_connection_refused(exc):
+        return LLMErrorClassification(
+            error_category="overloaded",
+            is_retryable=False,
+            should_compress_context=False,
+            should_rotate_credential=False,
+            should_fallback_model=True,
+            backoff_seconds=0.0,
+            user_message=f"Could not connect to {provider}: connection refused. Is the server running and the base URL right?",
+        )
+
     # Use existing classification as base
     category = classify_error(exc)
     
@@ -359,6 +395,24 @@ def _extract_status_code(error: Exception) -> Optional[int]:
         if isinstance(status, int) and 100 <= status <= 599:
             return status
     return None
+
+
+def _is_fatal_model_error(error: BaseException) -> bool:
+    """True when ``error`` means the model doesn't exist (404 / model not found).
+
+    Such an error fails the same way on every call, so it must reach the caller
+    instead of being turned into a ``None`` reply (#5956). Other invalid
+    requests, auth, rate-limit and transient errors keep today's behaviour.
+    """
+    from ..errors import LLMError
+    if isinstance(error, LLMError) and not error.is_retryable and error.error_category == "model_not_found":
+        return True
+    if _extract_status_code(error) == 404 or any(
+        cls.__name__ == "NotFoundError" for cls in type(error).__mro__
+    ):
+        return True
+    # LLM.get_response wraps provider errors (``raise LLMResponseError(...) from e``)
+    return error.__cause__ is not None and _is_fatal_model_error(error.__cause__)
 
 
 # Status codes that some providers overload to encode a more specific

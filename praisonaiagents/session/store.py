@@ -7,6 +7,7 @@ Zero dependencies beyond stdlib.
 
 import copy
 import hashlib
+import itertools
 import json
 from praisonaiagents._logging import get_logger
 import os
@@ -54,6 +55,10 @@ def _safe_session_filename(session_id: str) -> str:
 
 # Module-level sentinel to track if we've warned about degraded locking
 _WARNED_NO_FCNTL = False
+
+# Orders spill files written by this process within the same millisecond;
+# ``next()`` on a count is atomic under the GIL.
+_SPILL_SEQ = itertools.count()
 
 # Default session directory (uses centralized paths - DRY).
 #
@@ -570,6 +575,7 @@ class _SessionMirrorWriter:
         self._max_retries = max_retries
         self._queue: "queue.Queue" = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
+        self._enqueue_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run, name="praisonai-session-mirror", daemon=True
         )
@@ -581,27 +587,23 @@ class _SessionMirrorWriter:
             return
         # After close() the draining thread has exited; queuing here would leave
         # records stranded with no consumer while the local write reports
-        # success. Drop-to-log instead so the gap is observable (and `session
-        # sync` can reconcile) rather than silently lost (Issue #3646).
-        if self._stop.is_set():
-            logger.warning(
-                "session mirror is closed; dropping %d record(s) for %s "
-                "(local write unaffected; run `session sync` to reconcile)",
-                len(records),
-                session_id,
-            )
-            return
-        try:
-            self._queue.put_nowait((session_id, records))
-        except queue.Full:
-            # Never block the turn on a slow mirror; the local write already
-            # succeeded and `session sync` can reconcile the gap later.
-            logger.warning(
-                "session mirror queue full; dropping %d record(s) for %s "
-                "(local write unaffected; run `session sync` to reconcile)",
-                len(records),
-                session_id,
-            )
+        # success. Drop-to-log instead so the gap remains observable (Issue #3646).
+        with self._enqueue_lock:
+            if self._stop.is_set():
+                reason = "is closed"
+            else:
+                try:
+                    self._queue.put_nowait((session_id, records))
+                    return
+                except queue.Full:
+                    reason = "queue full"
+        logger.warning(
+            "session mirror %s; dropping %d record(s) for %s "
+            "(local write unaffected; mirror reconciliation is not automatic)",
+            reason,
+            len(records),
+            session_id,
+        )
 
     def _run(self) -> None:
         while not self._stop.is_set() or not self._queue.empty():
@@ -654,9 +656,15 @@ class _SessionMirrorWriter:
             time.sleep(0.01)
 
     def close(self, timeout: float = 5.0) -> None:
-        """Stop the writer, draining any queued records first."""
-        self._stop.set()
+        """Stop the writer and wait up to timeout for queued records to drain."""
+        with self._enqueue_lock:
+            self._stop.set()
         self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.warning(
+                "session mirror is still draining after close timeout; "
+                "use flush_mirror to wait for processing before exiting"
+            )
 
 
 class DefaultSessionStore:
@@ -1140,8 +1148,13 @@ class DefaultSessionStore:
             self._fire_corruption_hook(session_id, str(error), None)
 
     def _dump_session_json(self, data: Any, stream) -> None:
-        """Write durable JSON; subclasses can format private storage records."""
-        json.dump(data, stream, indent=2, ensure_ascii=False)
+        """Write durable JSON; subclasses can format private storage records.
+
+        Encoded to one string first: ``json.dump`` streams one ``write()`` per
+        token, which dominated every ``add_message`` on a long session. Same
+        bytes on disk.
+        """
+        stream.write(json.JSONEncoder(indent=2, ensure_ascii=False).encode(data))
 
     def _atomic_write_json(self, filepath: str, data: Any) -> bool:
         """Atomically write JSON data to disk (temp file + os.replace)."""
@@ -1194,13 +1207,14 @@ class DefaultSessionStore:
             spill_dir = self._spill_dir()
             os.makedirs(spill_dir, exist_ok=True)
             safe_id = _safe_session_filename(session_id)
-            # A monotonic ms timestamp keeps files sortable/attributable, but a
-            # short random token guarantees uniqueness so consecutive failures
-            # within the same PID+millisecond never overwrite an earlier spill
-            # (each unpersisted turn keeps its own recoverable file).
+            # A ms timestamp keeps files sortable/attributable; the per-process
+            # sequence keeps spills from the same PID+millisecond in write
+            # order (re-ingest sorts by name), and a short random token
+            # guarantees uniqueness so no spill overwrites an earlier one.
             unique = os.urandom(4).hex()
             filename = (
-                f"{safe_id}.{int(time.time() * 1000)}.{os.getpid()}.{unique}.json"
+                f"{safe_id}.{int(time.time() * 1000)}.{os.getpid()}."
+                f"{next(_SPILL_SEQ):010d}.{unique}.json"
             )
             filepath = os.path.join(spill_dir, filename)
             payload = {
@@ -1590,11 +1604,12 @@ class DefaultSessionStore:
         writer.enqueue(session_id, records)
 
     def flush_mirror(self, timeout: Optional[float] = None) -> bool:
-        """Block until queued mirror records are flushed.
+        """Wait for queued mirror records to be processed.
 
-        Returns ``True`` immediately when no mirror is configured; otherwise
-        drains the background queue (bounded by ``timeout`` when given). Handy
-        for a future ``session sync`` and for deterministic tests.
+        Returns ``True`` when no mirror is configured or all queued records
+        have been processed, and ``False`` if the timeout expires first.
+        Processing includes exhausted retries: ``True`` does not guarantee
+        successful mirror delivery. Permanent sink failures are logged.
         """
         writer = self._mirror_writer
         if writer is None:
@@ -1602,7 +1617,12 @@ class DefaultSessionStore:
         return writer.flush(timeout)
 
     def close_mirror(self) -> None:
-        """Stop the background mirror writer, draining queued records first."""
+        """Stop the mirror writer and wait up to five seconds for it to drain.
+
+        A slow mirror may still be processing after this returns; use
+        ``flush_mirror(timeout=...)`` to wait for processing. Processing does
+        not guarantee delivery when the mirror fails.
+        """
         writer = self._mirror_writer
         if writer is not None:
             writer.close()
@@ -2044,11 +2064,12 @@ class DefaultSessionStore:
             return False
     
     def list_sessions(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """List all sessions with metadata."""
+        """List sessions with metadata; directory read errors propagate."""
         sessions = []
+        filenames = os.listdir(self.session_dir)
         
         try:
-            for filename in os.listdir(self.session_dir):
+            for filename in filenames:
                 if filename.endswith(".json"):
                     filepath = os.path.join(self.session_dir, filename)
                     try:
@@ -2104,9 +2125,10 @@ class DefaultSessionStore:
             List of session IDs belonging to the specified agent
         """
         session_ids = []
+        filenames = os.listdir(self.session_dir)
         
         try:
-            for filename in os.listdir(self.session_dir):
+            for filename in filenames:
                 if filename.endswith(".json"):
                     filepath = os.path.join(self.session_dir, filename)
                     try:
@@ -2214,8 +2236,9 @@ class DefaultSessionStore:
         Returns:
             SessionData if found, None otherwise
         """
+        filenames = os.listdir(self.session_dir)
         try:
-            for filename in os.listdir(self.session_dir):
+            for filename in filenames:
                 if filename.endswith(".json"):
                     filepath = os.path.join(self.session_dir, filename)
                     try:
@@ -2244,9 +2267,10 @@ class DefaultSessionStore:
             List of session IDs linked to the gateway agent
         """
         session_ids = []
+        filenames = os.listdir(self.session_dir)
         
         try:
-            for filename in os.listdir(self.session_dir):
+            for filename in filenames:
                 if filename.endswith(".json"):
                     filepath = os.path.join(self.session_dir, filename)
                     try:
@@ -2464,10 +2488,7 @@ class DefaultSessionStore:
         terms = [t for t in needle.split() if t]
         hits: List[tuple] = []
 
-        try:
-            filenames = os.listdir(self.session_dir)
-        except (IOError, OSError):
-            return []
+        filenames = os.listdir(self.session_dir)
 
         for filename in filenames:
             if not filename.endswith(".json"):
@@ -2606,7 +2627,7 @@ class DefaultSessionStore:
         summaries = [
             SessionSummary(
                 session_id=s.get("session_id", ""),
-                title=s.get("agent_name") or s.get("session_id", ""),
+                title=s.get("title") or s.get("agent_name") or s.get("session_id", ""),
                 when=s.get("updated_at") or s.get("created_at"),
                 message_count=s.get("message_count", 0),
             )
