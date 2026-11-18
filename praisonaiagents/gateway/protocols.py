@@ -11,6 +11,7 @@ The ``praisonai`` wrapper provides backward-compatible shims.
 
 from __future__ import annotations
 
+from ..errors import PraisonAIError
 import base64
 import hashlib
 import math
@@ -2694,7 +2695,7 @@ def resolve_auth_mode(bind_host: str, configured: Optional[AuthMode] = None) -> 
     return "local" if is_loopback(bind_host) else "token"
 
 
-class InsecureGatewayTransportError(ValueError):
+class InsecureGatewayTransportError(ValueError, PraisonAIError):
     """Raised when a gateway URL would send traffic in cleartext to a public host."""
 
 
@@ -2891,6 +2892,7 @@ def _is_trusted_hop(host: str, trusted_proxies: "Sequence[str]") -> bool:
         except ValueError:
             continue
     return False
+is_trusted_hop = _is_trusted_hop  # public name for other PraisonAI packages (G-22); the private name stays
 
 
 def resolve_ingress_attribution(
@@ -3324,7 +3326,7 @@ class DeliveryValidation:
     preview: str = ""
 
 
-class ScheduleTargetError(ValueError):
+class ScheduleTargetError(ValueError, PraisonAIError):
     """Raised when a scheduled/agent-initiated send has an unroutable target.
 
     Carries the structured :class:`DeliveryValidation` reason/hint so the

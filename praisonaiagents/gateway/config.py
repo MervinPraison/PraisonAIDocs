@@ -4,6 +4,7 @@ Gateway Configuration for PraisonAI Agents.
 Provides configuration dataclasses for gateway and session settings.
 """
 
+from ..errors import PraisonAIError
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -37,7 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import cost
 GATEWAY_CONFIG_VERSION = 1
 
 
-class ConfigVersionError(ValueError):
+class ConfigVersionError(ValueError, PraisonAIError):
     """Raised when a config carries a ``config_version`` this build can't handle.
 
     Two cases, both operator-actionable rather than silently corrupting data:
@@ -50,7 +51,7 @@ class ConfigVersionError(ValueError):
     """
 
 
-class ConfigValidationError(ValueError):
+class ConfigValidationError(ValueError, PraisonAIError):
     """Raised when gateway config contains an unknown/misspelled key.
 
     Carries the dotted ``path`` to the offending section plus the offending
@@ -176,6 +177,7 @@ def _parse_auth_scopes(gw_data: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
             for tok, grant in gw_data["auth_scopes"].items()
         }
     return None
+parse_auth_scopes = _parse_auth_scopes  # public name for other PraisonAI packages (G-22); the private name stays
 
 
 def _check_typo_keys(

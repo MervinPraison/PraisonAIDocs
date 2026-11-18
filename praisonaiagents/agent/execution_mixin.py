@@ -1038,7 +1038,7 @@ Write the complete compiled report:"""
                 
                 # Show animated status during LLM call if verbose
                 if self.verbose and is_tty:
-                    from ..main import PRAISON_COLORS, sync_display_callbacks, _callbacks_lock
+                    from ..main import PRAISON_COLORS
                     import time as time_module
                     
                     console = _get_console()()
@@ -1058,11 +1058,9 @@ Write the complete compiled report:"""
                             tools_called.append(tool_name)
                             current_status[0] = f"Calling tool: {tool_name}..."
                     
-                    # Store original callback and register ours (use the module's
-                    # own lock so this doesn't race concurrent verbose agents)
-                    with _callbacks_lock:
-                        original_tool_callback = sync_display_callbacks.get('tool_call')
-                        sync_display_callbacks['tool_call'] = status_tool_callback
+                    # Our status line takes tool_call for this run's thread only
+                    # (main._tool_call_override); the global registry is untouched.
+                    from ..main import _tool_call_override
                     
                     # Animation state
                     result_holder = [None]
@@ -1072,6 +1070,7 @@ Write the complete compiled report:"""
                     original_verbose_chat = self.verbose
                     
                     def run_chat():
+                        _override_token = _tool_call_override.set(status_tool_callback)
                         try:
                             # Suppress verbose during animation - we'll display result ourselves
                             self.verbose = False
@@ -1100,16 +1099,7 @@ Write the complete compiled report:"""
                             error_holder[0] = e
                         finally:
                             self.verbose = original_verbose_chat
-                            # Restore original callback under the lock. The identity
-                            # check guards the entire restore, so we only mutate the
-                            # entry while it's still ours and never clobber a callback
-                            # a concurrent verbose agent has since installed.
-                            with _callbacks_lock:
-                                if sync_display_callbacks.get('tool_call') is status_tool_callback:
-                                    if original_tool_callback:
-                                        sync_display_callbacks['tool_call'] = original_tool_callback
-                                    else:
-                                        del sync_display_callbacks['tool_call']
+                            _tool_call_override.reset(_override_token)
                     
                     # Start chat in background thread
                     # daemon: a Ctrl-C in the display loop must not leave the
@@ -1733,27 +1723,20 @@ Write the complete compiled report:"""
         
         last_exception = None
 
-        def _finish(result, raised, retryable_ok=True):
-            # Strip the private control-plane tag before it reaches the model. A
-            # tool that *raised* ends the turn with ToolExecutionError so the run
-            # is finalized failed — the same contract as the sync path
-            # (tool_execution.py, test_tool_failure_not_relabelled). A plain
-            # tool-returned {"error": ...} stays a recoverable model input.
-            retryable = result.pop("_praison_retryable", None) is True and retryable_ok
-            if raised:
-                raise ToolExecutionError(
-                    result.get("error", f"Tool '{function_name}' failed"),
-                    tool_name=function_name,
-                    agent_id=self.name,
-                    is_retryable=retryable,
-                )
+        def _finish(result):
+            # Strip the private control-plane tag before it reaches the model.
+            # D-03: a tool that *raised* is reported to the model once as its
+            # tool result, the same as the sync path, instead of ending the turn.
+            # Only transient errors were retried before reaching here.
+            result.pop("_praison_retryable", None)
             return result
 
         # Retry loop with exponential backoff
         for attempt in range(retry_policy.max_attempts):
             try:
                 result = await self._execute_tool_async_impl(function_name, arguments, tool_call_id, tools_override)
-                raised = isinstance(result, dict) and bool(result.pop("_praison_raised", False))
+                if isinstance(result, dict):
+                    result.pop("_praison_raised", None)
                 
                 # Check if result is an error that should be retried
                 if isinstance(result, dict) and result.get("error"):
@@ -1768,7 +1751,7 @@ Write the complete compiled report:"""
                         result.get("circuit_open") or
                         result.get("loop_blocked") or
                         result.get("_praison_retryable") is False):
-                        return _finish(result, raised)
+                        return _finish(result)
 
                     # The body already ran and may have completed its side effect
                     # before failing. Honour an explicit restart_safe=False /
@@ -1778,9 +1761,8 @@ Write the complete compiled report:"""
                     # up to max_attempts times -- charging a card three times for
                     # a tool the author marked "must never be silently re-executed".
                     if self._tool_declares_not_idempotent(function_name, tools_override):
-                        # Must not run again: report non-retryable so durable
-                        # runs are finalized failed (sync parity).
-                        return _finish(result, raised, retryable_ok=False)
+                        # Must not run again: report the error to the model once.
+                        return _finish(result)
 
                     # Determine error type for retry policy
                     error_type = self._classify_error_type(result, last_exception)
@@ -1798,11 +1780,11 @@ Write the complete compiled report:"""
                     # never steer our retry loop.
                     if (not retry_policy.should_retry(error_type, attempt)
                             and result.get("_praison_retryable") is not True):
-                        return _finish(result, raised)
+                        return _finish(result)
                     
                     # Don't retry on last attempt
                     if attempt == retry_policy.max_attempts - 1:
-                        return _finish(result, raised)
+                        return _finish(result)
                     
                     # Emit retry hook event  
                     delay_ms = retry_policy.get_delay_ms(attempt)
@@ -1854,7 +1836,7 @@ Write the complete compiled report:"""
     async def _execute_tool_async_impl(self, function_name: str, arguments: Dict[str, Any], tool_call_id: Optional[str] = None, tools_override: Optional[List] = None) -> Any:
         """Internal async tool execution implementation"""
         from ..errors import ToolExecutionError
-        from .tool_execution import _CALLER_ERROR_TYPES
+        from .tool_execution import _CALLER_ERROR_TYPES, _raised_retry_verdict
         _holder = _model_facing_holder.get()
         if _holder is not None:
             _holder.clear()  # a retried attempt must not inherit an earlier view
@@ -2399,6 +2381,9 @@ Write the complete compiled report:"""
                 logger.debug("Raw result from tool: %s", result)
                 if result is None:
                     return {"result": None}
+                from ..tools.call_executor import DeferredToolResult
+                if isinstance(result, DeferredToolResult):
+                    return result  # the loop registers it; as on the sync path (F-12)
                 try:
                     json.dumps(result)  # Test serialization
                     return result
@@ -2442,7 +2427,7 @@ Write the complete compiled report:"""
                 if isinstance(e, ToolExecutionError):
                     retryable = e.is_retryable
                 else:
-                    retryable = not isinstance(e, _CALLER_ERROR_TYPES)
+                    retryable = _raised_retry_verdict(e)
                 # Private control-plane key: a tool's own result may legitimately
                 # contain "retryable" (common for HTTP-API wrappers) and must not
                 # collide with the framework's verdict nor leak to the model.
