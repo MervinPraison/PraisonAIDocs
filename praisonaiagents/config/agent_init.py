@@ -6,19 +6,21 @@ infix because ``config.resolve_<param>`` already exists with different
 defaults (for example ``resolve_caching(None)`` returns ``None``).
 """
 
+import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from .._logging import get_logger
 from .feature_configs import (
-    CachingConfig, ExecutionConfig, GuardrailConfig, HooksConfig, KnowledgeConfig, LearnConfig, MemoryConfig,
-    OutputConfig, PlanningConfig, ReflectionConfig, SkillsConfig, TemplateConfig, WebConfig,
+    CachingConfig, ExecutionConfig, GuardrailConfig, HooksConfig, KnowledgeConfig, LearnConfig, LLMConfig,
+    MemoryConfig, OutputConfig, PlanningConfig, ReflectionConfig, SkillsConfig, TemplateConfig, WebConfig,
 )
-from .param_resolver import ArrayMode, resolve
+from .param_resolver import (
+    ArrayMode, resolve, resolve_caching, resolve_execution, resolve_memory, resolve_planning,
+    resolve_reflection, resolve_web,
+)
 from .parse_utils import canonical_preset_key
-from .presets import (
-    CACHING_PRESETS, DEFAULT_OUTPUT_MODE, EXECUTION_PRESETS, MEMORY_PRESETS, MEMORY_URL_SCHEMES,
-    OUTPUT_PRESETS, PLANNING_PRESETS, REFLECTION_PRESETS, WEB_PRESETS,
-)
+from .presets import DEFAULT_OUTPUT_MODE, EXECUTION_PRESETS, OUTPUT_PRESETS
 
 logger = get_logger(__name__)
 
@@ -36,13 +38,7 @@ def resolve_agent_caching(caching: Any) -> Tuple[Optional[CachingConfig], bool, 
     elif isinstance(caching, CachingConfig):
         config = caching
     else:
-        config = resolve(
-            value=caching,
-            param_name="caching",
-            config_class=CachingConfig,
-            presets=CACHING_PRESETS,
-            default=CachingConfig(),
-        )
+        config = resolve_caching(caching, CachingConfig, default=CachingConfig())
     if config:
         return config, config.enabled, config.prompt_caching
     if caching is False:
@@ -83,15 +79,7 @@ def resolve_agent_planning(planning: Any) -> Tuple[Optional[PlanningConfig], Dic
     elif isinstance(planning, PlanningConfig):
         config = planning
     else:
-        config = resolve(
-            value=planning,
-            param_name="planning",
-            config_class=PlanningConfig,
-            presets=PLANNING_PRESETS,
-            string_mode="llm_model",
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=None,
-        )
+        config = resolve_planning(planning, PlanningConfig)
     if config is not None:
         if isinstance(config, PlanningConfig):
             return config, {"planning": True, "planning_tools": config.tools,
@@ -114,14 +102,7 @@ def resolve_agent_reflection(reflection: Any) -> Tuple[Optional[ReflectionConfig
     elif isinstance(reflection, ReflectionConfig):
         config = reflection
     else:
-        config = resolve(
-            value=reflection,
-            param_name="reflection",
-            config_class=ReflectionConfig,
-            presets=REFLECTION_PRESETS,
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=None,
-        )
+        config = resolve_reflection(reflection, ReflectionConfig)
     if config is not None:
         if isinstance(config, ReflectionConfig):
             return config, {"self_reflect": True, "min_reflect": config.min_iterations,
@@ -199,14 +180,7 @@ def resolve_agent_web(web: Any, web_search: Optional[bool] = None,
     elif isinstance(web, WebConfig):
         _web_config = web
     else:
-        _web_config = resolve(
-            value=web,
-            param_name="web",
-            config_class=WebConfig,
-            presets=WEB_PRESETS,
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=None,
-        )
+        _web_config = resolve_web(web, WebConfig)
     
     _search_provider = "duckduckgo"
     if _web_config is not None:
@@ -244,14 +218,7 @@ def resolve_agent_execution(execution: Any) -> Optional[ExecutionConfig]:
         if preset_value is not None:
             return ExecutionConfig(**preset_value) if isinstance(preset_value, dict) else preset_value
         return ExecutionConfig()
-    return resolve(
-        value=execution,
-        param_name="execution",
-        config_class=ExecutionConfig,
-        presets=EXECUTION_PRESETS,
-        array_mode=ArrayMode.PRESET_OVERRIDE,
-        default=ExecutionConfig(),
-    )
+    return resolve_execution(execution, ExecutionConfig, default=ExecutionConfig())
 
 
 def resolve_agent_history(memory_config: Any, session_id: Optional[str], auto_save: Any,
@@ -432,16 +399,7 @@ def resolve_agent_memory(memory: Any) -> Any:
         return memory  # Memory instance passthrough
     if hasattr(memory, 'database_url'):
         return memory  # db() instance passthrough
-    return resolve(
-        value=memory,
-        param_name="memory",
-        config_class=MemoryConfig,
-        presets=MEMORY_PRESETS,
-        url_schemes=MEMORY_URL_SCHEMES,
-        instance_check=lambda v: (hasattr(v, 'search') and hasattr(v, 'add')) or hasattr(v, 'database_url'),
-        array_mode=ArrayMode.SINGLE_OR_LIST,
-        default=None,
-    )
+    return resolve_memory(memory, MemoryConfig)
 
 
 def resolve_agent_knowledge(knowledge: Any, user_retrieval_config: Any
@@ -755,6 +713,146 @@ def resolve_agent_guardrails(guardrails: Any, guardrail: Any, max_guardrail_retr
     return _guardrails_config, guardrail, max_guardrail_retries
 
 
+def resolve_agent_approval(approval: Any, is_interactive: Any, default_deny: Any
+                           ) -> Tuple[Any, bool, Any, Any, frozenset, Any]:
+    """``approval=`` -> ``(backend, all_tools, timeout, permissions, perm_deny, permission_mode)``.
+
+    True = AutoApproveBackend, False/None = registry fallback plus the
+    ``PRAISONAI_TOOL_SAFETY`` deny set, object = custom backend (dangerous tools
+    only), ApprovalConfig/dict = full control (all_tools, timeout, etc.),
+    str = permission preset ("safe", "read_only", "full") or PermissionMode.
+    ``is_interactive()`` and ``default_deny()`` are the agent's own hooks, called
+    only on the paths that need them.
+    """
+    from ..approval.protocols import ApprovalConfig
+    perm_deny = frozenset()  # Permission tier deny set (empty = no denials)
+    # Optional Claude-Code-parity PermissionMode (bypass/plan/dont_ask/…).
+    # None = normal rule flow. Consulted at tool-call approval time.
+    permission_mode = None
+    if isinstance(approval, str) and approval not in ('True', 'False'):
+        # One string entry point for "how much the agent may do":
+        #   • deny-set presets — "safe"/"read_only"/"full"/"off"/"default"
+        #   • PermissionMode presets — "plan"/"bypass"/"accept_edits"/
+        #     "dont_ask" (+ aliases like "yolo", "auto_edit", "reject").
+        # Deny-set presets are matched first so their exact behaviour is
+        # unchanged; anything else falls through to the canonical
+        # PermissionMode resolver, so all spellings share one model.
+        from ..approval.registry import PERMISSION_PRESETS
+        # Normalise -/_ too so "read-only" hits the deny-set preset instead
+        # of falling through to PermissionMode.resolve (which returns None
+        # for deny-set names), which would silently produce an EMPTY deny
+        # set — the exact read-only-sandbox bypass this validation prevents.
+        preset_deny = PERMISSION_PRESETS.get(
+            approval.strip().lower().replace("-", "_")
+        )
+        backend = None
+        all_tools = False
+        timeout = 0
+        permissions = None
+        if preset_deny is not None:
+            perm_deny = preset_deny
+        else:
+            # Not a deny-set preset — try the canonical PermissionMode
+            # presets (plan/bypass/accept_edits/dont_ask + aliases).
+            from ..permissions.rules import PermissionMode
+            permission_mode = PermissionMode.resolve(approval)
+            # Unknown string with no mode → treat as no approval.
+    elif approval is True:
+        from ..approval.backends import AutoApproveBackend
+        backend = AutoApproveBackend()
+        all_tools = False
+        timeout = 0  # 0 = use backend default
+        permissions = None
+    elif approval is False or approval is None:
+        backend = None
+        all_tools = False
+        timeout = 0
+        permissions = None
+        # No explicit approval kwarg — honour PRAISONAI_TOOL_SAFETY.
+        # Default preset "default" blocks only destructive ops
+        # (delete_*, execute_command, execute_code, kill_process, move/copy)
+        # while leaving read / create / edit tools fully auto-approved.
+        # Users who want the pre-4.6.27 "trust everything" behaviour
+        # export PRAISONAI_TOOL_SAFETY=off. This adds zero Agent kwargs.
+        _raw_safety_env = os.environ.get("PRAISONAI_TOOL_SAFETY")
+        _safety_env = (_raw_safety_env or "").strip().lower()
+        _bypass_safety = _safety_env in ("off", "full", "none", "0", "false")
+        if not _bypass_safety:
+            from ..approval.registry import PERMISSION_PRESETS
+            _resolved_safety_env = _safety_env or "default"
+            _preset_deny = PERMISSION_PRESETS.get(_resolved_safety_env)
+            if _preset_deny is None and _safety_env:
+                # Unknown env value - fall back to safe default and log warning
+                # (under the Agent module's logger name, where it has always been logged).
+                logging.getLogger("praisonaiagents.agent.agent").warning(
+                    "Unknown PRAISONAI_TOOL_SAFETY value %r; falling back to 'default' preset.",
+                    _raw_safety_env,
+                )
+                _resolved_safety_env = "default"
+                _preset_deny = PERMISSION_PRESETS.get(_resolved_safety_env)
+
+            # Safe-by-default ask: when no approval kwarg was supplied
+            # (``approval is None``) and we are attached to an interactive
+            # terminal, route dangerous built-in tools (shell exec, file
+            # writes, etc.) through an interactive approval prompt instead
+            # of silently hard-denying them. This makes a fresh, un-flagged
+            # agent safe *and* usable — the user is asked once per dangerous
+            # call and can allow/deny.
+            #
+            # In non-interactive contexts (pipes, CI) — or when the user
+            # explicitly passed ``approval=False`` to opt out of prompting —
+            # we keep the existing deny-by-default preset so dangerous tools
+            # never execute unattended without an explicit policy. The full
+            # bypass remains ``PRAISONAI_TOOL_SAFETY=off`` / ``approval="bypass"``.
+            if approval is None and is_interactive():
+                from ..approval.backends import ConsoleBackend
+                backend = ConsoleBackend()
+                # Leave _perm_deny empty so dangerous tools reach the backend
+                # (which classifies them via DEFAULT_DANGEROUS_TOOLS) and the
+                # user is prompted to allow/deny rather than auto-denied.
+            elif _preset_deny is not None:
+                perm_deny = _preset_deny
+    elif isinstance(approval, ApprovalConfig):
+        backend = approval.backend
+        all_tools = approval.all_tools
+        timeout = approval.timeout  # None = indefinite, 0 = backend default
+        # Store permissions if provided (for CI-safe declarative policies)
+        permissions = getattr(approval, 'permissions', None)
+        permission_mode = getattr(approval, 'permission_mode', None)
+        # Configuring approval must never be a WEAKER posture than passing
+        # nothing. When no declarative ``permissions`` policy is supplied,
+        # fall back to the same env-driven default deny set the bare
+        # ``approval is None`` path uses, so e.g. ``ApprovalConfig(timeout=30)``
+        # keeps the default denials (execute_command, delete_file, …) instead
+        # of silently dropping all of them. ``is None`` (not falsiness) so an
+        # explicit empty policy (``permissions={}``) is still an intentional
+        # policy that owns denial — only a genuinely absent policy inherits
+        # the env-driven default deny set.
+        if permissions is None:
+            perm_deny = default_deny()
+    elif isinstance(approval, dict):
+        # Dict config: convert to ApprovalConfig
+        approval_config = ApprovalConfig(**approval)
+        backend = approval_config.backend
+        all_tools = approval_config.all_tools
+        timeout = approval_config.timeout
+        permissions = getattr(approval_config, 'permissions', None)
+        permission_mode = getattr(approval_config, 'permission_mode', None)
+        # See the ApprovalConfig branch above: never weaken the default
+        # posture just because a config object was passed. ``is None`` so an
+        # explicit empty policy (``approval={"permissions": {}}``) still owns
+        # denial rather than inheriting the default deny set.
+        if permissions is None:
+            perm_deny = default_deny()
+    else:
+        # Plain backend object — dangerous tools only, backend default timeout
+        backend = approval
+        all_tools = False
+        timeout = 0
+        permissions = None
+    return backend, all_tools, timeout, permissions, perm_deny, permission_mode
+
+
 def resolve_agent_skills(skills: Any) -> Tuple[Any, Any, Any, bool]:
     """``skills=`` -> ``(config, paths, dirs, auto_discover)``.
 
@@ -790,3 +888,280 @@ def resolve_agent_skills(skills: Any) -> Tuple[Any, Any, Any, bool]:
         elif isinstance(_skills_config, list):
             _skills = _skills_config
     return _skills_config, _skills, skills_dirs, _skills_auto_discover
+
+
+def resolve_agent_model(
+    llm: Any, model: Any, base_url: Any, api_key: Any, auth: Any, fallback_models: Any, owner: str,
+) -> Tuple[Any, Any, Any, Any, Any, Any]:
+    """``llm=`` / ``model=`` -> ``(llm, fallback_models, base_url, api_key, auth, auth_profiles)``.
+
+    Passing both is refused. ``model=`` wins over ``llm=``. An ``LLMConfig`` on
+    either supplies the model and fills ``base_url``/``api_key``/``auth`` only
+    where the caller left them ``None``; on ``llm=`` its ``fallback_models``
+    always replace the incoming ones, on ``model=`` only fill a gap. A plain
+    ``llm=`` warns once (``DeprecationWarning`` at the caller of ``Agent(...)``).
+    """
+    from ..utils.model_alias import resolve_model_alias
+    resolve_model_alias(llm, model, owner)
+
+    auth_profiles = None
+    if isinstance(llm, LLMConfig):
+        llm_config_obj = llm
+        llm = llm_config_obj.model
+        fallback_models = llm_config_obj.fallback_models
+        if base_url is None:
+            base_url = llm_config_obj.base_url
+        if api_key is None:
+            api_key = llm_config_obj.api_key
+        if auth is None:
+            auth = llm_config_obj.auth
+        auth_profiles = llm_config_obj.auth_profiles
+    elif llm is not None and model is None:
+        from ..utils.deprecation import warn_deprecated_param
+        warn_deprecated_param(
+            "llm",
+            since="1.0.0",
+            removal="2.0.0",
+            alternative="use 'model' instead. Example: Agent(model='gpt-4o-mini')",
+            stacklevel=4,  # warn_deprecated_param -> here -> Agent.__init__ -> caller
+        )
+
+    if model is not None:
+        if isinstance(model, LLMConfig):
+            llm = model.model
+            if fallback_models is None:
+                fallback_models = model.fallback_models
+            if base_url is None:
+                base_url = model.base_url
+            if api_key is None:
+                api_key = model.api_key
+            if auth is None:
+                auth = model.auth
+            if auth_profiles is None:
+                auth_profiles = model.auth_profiles
+        else:
+            llm = model  # model= takes precedence
+    return llm, fallback_models, base_url, api_key, auth, auth_profiles
+
+
+def resolve_agent_llm_options(
+    retry: Any, reasoning_effort: Optional[str], **options: Any,
+) -> Dict[str, Any]:
+    """``retry=`` / ``reasoning_effort=`` -> the option kwargs every LLM construction forwards.
+
+    *options* plus ``max_retries`` for a ``RetryBackoffConfig``, a dict
+    (validated through ``RetryBackoffConfig``) or ``False`` (0), so the
+    custom-LLM path honours ``retry=`` instead of LLM's own default, plus
+    ``reasoning_effort`` only when given.
+    """
+    from ..agent.retry_utils import RetryBackoffConfig
+
+    retry_init_params: Dict[str, Any] = {}
+    if isinstance(retry, RetryBackoffConfig):
+        retry_init_params = {'max_retries': retry.max_retries}
+    elif isinstance(retry, dict):
+        retry_init_params = {'max_retries': RetryBackoffConfig(**retry).max_retries}
+    elif retry is False:
+        retry_init_params = {'max_retries': 0}
+
+    option_kwargs = {**options, **retry_init_params}
+    if reasoning_effort is not None:
+        option_kwargs['reasoning_effort'] = reasoning_effort
+    return option_kwargs
+
+
+def resolve_agent_local(
+    llm: str, base_url: Any, api_key: Any, retrieval_config: Any, embedder_config: Any,
+    memory: Any, discover: Any,
+) -> Tuple[str, Any, Any, Any, Any]:
+    """``llm="local"`` / ``"local:<engine>/<model>"`` ->
+    ``(llm, base_url, api_key, embedder_config, target)``.
+
+    Resolves the local target, fills ``base_url`` (Ollama takes the server
+    root; every other engine its OpenAI ``/v1`` URL) and ``api_key`` only where
+    the caller left them ``None``. When memory or knowledge will embed and no
+    embedder is set, picks an embedding model the server serves (via
+    ``discover(target)``) so documents stay on the machine, carries its vector
+    width, and sets it on ``retrieval_config`` (updated in place) too; if none
+    is served it warns instead. An explicit embedder always wins.
+    """
+    from ..local import LocalEngine, resolve as resolve_local
+
+    spec = llm[len("local:"):] if llm.startswith("local:") else None
+    target = resolve_local(spec or None)
+    llm = target.litellm_model
+    if base_url is None:
+        # Ollama's litellm provider builds its own /api paths from the server
+        # root. Every other local engine speaks OpenAI under /v1: the bare root
+        # sent chat to /chat/completions, which they answer with 404.
+        base_url = (target.base_url if target.engine is LocalEngine.OLLAMA
+                    else target.openai_base_url)
+    if api_key is None:
+        api_key = target.api_key
+
+    # Keep a local agent local end to end: without this, knowledge/memory
+    # embedded against OpenAI, sending documents and queries off the machine.
+    wants_embeddings = (retrieval_config is not None or embedder_config is not None
+                        or memory not in (None, False))
+    # retrieval_config may be a dict or a RetrievalConfig instance.
+    rc_embedder = (retrieval_config.get('embedder_config') if isinstance(retrieval_config, dict)
+                   else getattr(retrieval_config, 'embedder_config', None))
+    if wants_embeddings and not embedder_config and not rc_embedder:
+        from ..local import local_embedder_config, select_embedding_model
+        discovery = discover(target)
+        embed_model = select_embedding_model(
+            getattr(discovery, 'models', ()) if discovery else (),
+            getattr(discovery, 'model_meta', ()) if discovery else ())
+        if embed_model:
+            embedder_config = local_embedder_config(target.engine, target.base_url, embed_model)
+            # Carry the real vector width (local/ cannot import the dimension
+            # table). A width the server measured wins; the table only fills a
+            # gap, and never with the generic default: a guessed width is worse
+            # than letting the store infer one from the first vector.
+            cfg = embedder_config.setdefault("config", {})
+            if not cfg.get("embedding_dims"):
+                try:
+                    from ..embedding.dimensions import DEFAULT_DIMENSION, get_dimensions
+                    dims = get_dimensions(embed_model)
+                    if dims and dims != DEFAULT_DIMENSION:
+                        cfg["embedding_dims"] = dims
+                except Exception:  # noqa: BLE001 -- a missing width must not break setup
+                    logger.debug("No vector width for %r; the store infers it", embed_model,
+                                 exc_info=True)
+            if isinstance(retrieval_config, dict):
+                retrieval_config.setdefault('embedder_config', embedder_config)
+            elif retrieval_config is not None and getattr(
+                    retrieval_config, 'embedder_config', None) is None:
+                retrieval_config.embedder_config = embedder_config
+        else:
+            logger.warning(
+                "llm=%r resolved a local model, but %s serves no embedding "
+                "model, so knowledge/memory would embed against a remote "
+                "provider -- sending your documents off this machine. "
+                "Pull one (e.g. `ollama pull nomic-embed-text`) or set an "
+                "explicit embedder to silence this.",
+                llm, target.base_url)
+    return llm, base_url, api_key, embedder_config, target
+
+
+def provider_llm_params(model: str, api_key: Any, auth: Any, options: Dict[str, Any]) -> Dict[str, Any]:
+    """LLM settings for a provider-routed model: the model, ``api_key`` and
+    ``auth`` when set, and every option kwarg (``resolve_agent_llm_options``)."""
+    params: Dict[str, Any] = {'model': model}
+    if api_key:
+        params['api_key'] = api_key
+    if auth:
+        params['auth'] = auth
+    params.update(options)
+    return params
+
+
+def resolve_agent_llm_init_params(
+    llm: Any, base_url: Any, api_key: Any, auth: Any, options: Dict[str, Any], default_model: Any,
+) -> Optional[Tuple[str, Dict[str, Any]]]:
+    """``(model_name, llm_init_params)`` for the routes that build an LLM from
+    settings: ``base_url=`` set, a dict with ``"model"``, or ``"provider/model"``.
+    ``None`` for any other ``llm=`` (the caller's plain OpenAI default).
+
+    The routes differ on purpose: a dict is forwarded with only ``metrics`` and
+    ``max_iter`` added; with ``base_url=`` an explicit ``api_key`` replaces the
+    dict's own, without it the dict's own wins; ``retry=`` never overrides a
+    dict's ``max_retries``. *default_model* is called only when no model is named.
+    """
+    retry = {'max_retries': options['max_retries']} if 'max_retries' in options else {}
+
+    def _from_dict(config: Dict[str, Any]) -> Dict[str, Any]:
+        config['metrics'] = options['metrics']
+        config['max_iter'] = options['max_iter']
+        if retry and 'max_retries' not in config:
+            config.update(retry)
+        return config
+
+    if base_url:
+        if isinstance(llm, dict):
+            config = llm.copy()
+            config['base_url'] = base_url
+            if api_key:
+                config['api_key'] = api_key
+            if auth:
+                config['auth'] = auth
+            return llm.get('model', default_model()), _from_dict(config)
+        model_name = llm or default_model()
+        return model_name, {'model': model_name, 'base_url': base_url, 'api_key': api_key,
+                            'auth': auth, **options}
+    if isinstance(llm, dict) and "model" in llm:
+        config = llm.copy()
+        if api_key and 'api_key' not in config:
+            config['api_key'] = api_key
+        if auth and 'auth' not in config:
+            config['auth'] = auth
+        config = _from_dict(config)
+        return config.get('model', default_model()), config
+    if isinstance(llm, str) and "/" in llm:
+        return llm, provider_llm_params(llm, api_key, auth, options)
+    return None
+
+
+def resolve_agent_tools(
+    tools: Any, toolsets: Optional[List[str]], llm: Any, agent_name: str,
+    resolve_names: Any, resolve_list: Any,
+) -> Any:
+    """``tools=`` / ``toolsets=`` -> the agent's tool list.
+
+    A callable is wrapped in a list; a name string, or the name strings inside a
+    list/tuple (per element), resolve through *resolve_names* / *resolve_list*.
+    Named ``toolsets`` (ordered for the model family of *llm*) add the tools not
+    already present. A ``ToolResolutionError`` propagates unchanged; other
+    resolution or import failures are re-raised naming *agent_name*.
+    """
+    if callable(tools):
+        # If a single function/callable is passed, wrap it in a list
+        resolved = [tools]
+    elif isinstance(tools, str):
+        # Single tool name string - resolve from registry
+        resolved = resolve_names([tools])
+    elif isinstance(tools, (list, tuple)):
+        # Resolve tool-name strings PER ELEMENT. An all-or-nothing `all(...)`
+        # test silently left every name unresolved as soon as one callable
+        # was present, so `tools=[my_tool, 'read_file']` dropped 'read_file'.
+        resolved = resolve_list(tools)
+    else:
+        resolved = tools or []
+
+    if toolsets:
+        # Bound before the try: if the toolsets import fails, the except
+        # clauses below must still be able to name ToolResolutionError.
+        from ..tools.resolver import ToolResolutionError
+        try:
+            from ..toolsets import resolve_toolsets_for_model
+            # Advertise the model-family's preferred edit primitive first
+            # (e.g. apply_patch for Claude, edit_file for GPT). Unknown /
+            # non-string models fall back to the byte-for-byte default order.
+            model_id = llm if isinstance(llm, str) else None
+            toolset_tool_names = resolve_toolsets_for_model(toolsets, model_id)
+            # Remove duplicates with existing tools
+            existing_tool_names = set()
+            for tool in resolved:
+                name = getattr(tool, 'name', getattr(tool, '__name__', str(tool)))
+                existing_tool_names.add(name)
+
+            unique_tool_names = [name for name in toolset_tool_names if name not in existing_tool_names]
+            toolset_tools = resolve_names(unique_tool_names)
+            resolved.extend(toolset_tools)
+            logger.debug(f"Resolved toolsets {toolsets} to {len(toolset_tools)} tools: {[getattr(t, '__name__', str(t)) for t in toolset_tools]}")
+        except ToolResolutionError:
+            # Preserve the typed error (with .unknown / .suggestions) so
+            # strict-mode callers get the same self-correcting contract as
+            # the direct tools= path instead of a flattened ValueError.
+            raise
+        except (ValueError, KeyError) as e:
+            raise ValueError(
+                f"Agent '{agent_name}' failed to resolve toolsets {toolsets}: {e}. "
+                "Verify names with praisonaiagents.toolsets.list_toolsets()."
+            ) from e
+        except ImportError as e:
+            raise ImportError(
+                f"Agent '{agent_name}' failed to import toolsets module: {e}. "
+                "Ensure praisonaiagents is properly installed."
+            ) from e
+    return resolved

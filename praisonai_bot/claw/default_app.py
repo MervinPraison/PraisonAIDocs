@@ -80,7 +80,19 @@ configure_host(
     ],
     agents=_build_praison_agents(),
     modules=["jobs"],
+    # Chat + Canvas: tables and code the agents write open beside the chat.
+    # (`aiui run` alone opens the plain Chat layout.)
+    layout="chat-canvas",
 )
+
+
+# The greeting in the new-chat hero (aiui >= 0.3.170 shows it in every layout).
+@aiui.welcome
+async def _welcome():
+    await aiui.say(
+        "🦞 Welcome to PraisonAI Claw! Ask anything; the tables and code "
+        "your agents write open in the canvas."
+    )
 
 
 # ── Custom page: Feature Explorer ───────────────────────────

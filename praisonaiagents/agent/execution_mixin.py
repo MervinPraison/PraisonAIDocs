@@ -1915,7 +1915,14 @@ Write the complete compiled report:"""
             # aliased decorated tools), plain callable ``__name__``, or class name so async
             # dispatch matches the robust sync resolution in _execute_tool_impl.
             func = None
-            tools_to_search = tools_override if tools_override is not None else self.tools
+            if tools_override is not None:
+                tools_to_search = tools_override
+            elif getattr(self, "_turn_scope_tools", None) and self._turn_scope_tools():
+                # Per-turn ``tools=`` (e.g. ``Task(tools=...)``) are advertised,
+                # so they must be dispatchable too (parity with the sync path).
+                tools_to_search = self._dispatch_tools()
+            else:
+                tools_to_search = self.tools
             from ..tools.base import BaseTool
             plugin_owners = getattr(self, "_plugin_tool_owners", None)
             for tool in tools_to_search:
@@ -1956,7 +1963,10 @@ Write the complete compiled report:"""
                         near = difflib.get_close_matches(function_name, available, n=1, cutoff=0.5)
                         suggestion = near[0] if near else None
                     except Exception:
-                        pass
+                        logger.debug(
+                            "Could not compute a closest-match hint for tool %r",
+                            function_name, exc_info=True,
+                        )
                     hint = f" Did you mean '{suggestion}'?" if suggestion else ""
                     error_msg = f"Tool '{function_name}' not found.{hint} Available tools: {available}"
                     logger.error(error_msg)
@@ -2334,7 +2344,11 @@ Write the complete compiled report:"""
                     except Exception:
                         # Trust module unavailable (partial install) must not
                         # abort tool execution; fall through with the raw result.
-                        pass
+                        logger.debug(
+                            "Could not apply the external-content fence to tool %r; "
+                            "passing its result through unfenced",
+                            function_name, exc_info=True,
+                        )
 
                 # Cap the result before it re-enters the context — the same
                 # helper and order as the sync path (after guardrails, before
