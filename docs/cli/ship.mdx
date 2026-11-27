@@ -1,32 +1,40 @@
 ---
-title: "Ship"
+title: "Ship & Steward"
 sidebarTitle: "Ship"
-description: "Commit, push and open a draft pull request in one command. The agent never merges; you do."
+description: "Commit, push, open a draft pull request, self-review diffs, and watch PRs with Steward. The agent never merges; you do."
 icon: "rocket"
 ---
 
-`praisonai ship` takes the work on your branch to a **draft pull request**. It commits your changes, pushes the branch and opens the PR, then prints the link. You review the PR and you merge it. Ship never merges, approves or force-pushes.
+`praisonai ship` takes your branch to a **draft pull request** with an AI-written title/body and optional self-review, and `praisonai steward` watches the PR to fix merge conflicts, failing CI checks, and unanswered review comments. Neither command ever merges, approves, or force-pushes — you review and merge.
 
 ```mermaid
 graph LR
-    A[Your branch]:::agent --> B[Safety checks]:::tool
-    B --> C[Commit]:::tool
-    C --> D[Push]:::tool
-    D --> E[Draft PR]:::agent
-    E --> F[You merge]:::agent
+    A[Your branch]:::agent --> B[Safety checks & commit]:::tool
+    B --> C[Push & Draft PR]:::tool
+    C --> D[Self-review]:::tool
+    D --> E[Steward watch]:::config
+    E --> F[You merge]:::success
 
     classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
     classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+    classDef config fill:#6366F1,stroke:#7C90A0,color:#fff
+    classDef success fill:#10B981,stroke:#7C90A0,color:#fff
 ```
 
 ## Quick Start
 
 ```bash
-# See what ship would do. Nothing changes.
+# Preview what ship would do without changing anything
 praisonai ship --dry-run
 
-# Commit, push and open a draft PR
+# Commit, push, open a draft PR, and run self-review
 praisonai ship -m "fix: handle an empty input list"
+
+# Ship, post self-review findings, request a reviewer, and hand off to Steward
+praisonai ship +alice --post-review --watch
+
+# Review an existing PR directly
+praisonai ship 42 --effort high --post-review
 ```
 
 **Expected output:**
@@ -35,45 +43,269 @@ praisonai ship -m "fix: handle an empty input list"
 https://github.com/your-org/your-repo/pull/42
 ```
 
-## Options
+## `praisonai ship` Options
+
+```bash
+praisonai ship [TARGET] [OPTIONS]
+```
 
 | Option | Default | What it does |
 |---|---|---|
-| `-m`, `--message` | generated | The commit message. Without it, a short message is made from the diff. |
-| `--dry-run` | off | Shows the branch, the target branch and the files to commit. Changes nothing. |
+| `[TARGET]` | current branch | Optional positional argument: an existing PR number/URL (`42`, `#42`, or full URL) to review/watch directly, a review effort (`low`, `medium`, `high`, `xhigh`, `max`), or `+reviewer` (e.g. `+alice`) to request a reviewer. |
+| `-m`, `--message` | generated | Commit message. Generated from the diff when omitted. |
+| `--dry-run` | off | Shows the branch, base branch, files to commit, or planned actions on a target PR without changing anything. |
+| `--effort` | `high` | Self-review effort level: `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `--model` | unset | Model for PR text and self-review (for example `gpt-4o-mini` or `ollama/qwen3.5`). |
+| `--review` / `--no-review` | `--review` | Run self-review on the PR diff after opening or targeting the PR. |
+| `--post-review` | off | Post non-empty self-review findings as a Markdown comment on the PR. |
+| `--watch` | off | Hand off to `praisonai steward` to watch the PR after shipping. |
+| `--reviewer` | none | Request a GitHub reviewer (`gh pr edit --add-reviewer`). |
 
-## What ship does
+### What `praisonai ship` does
 
 <Steps>
-  <Step title="Checks before anything changes">
-    Ship stops with a message and exit code `1`, and changes nothing, when:
-    - you are on the default branch (for example `main`) or a detached HEAD;
-    - the repository is a fork, or it is not on GitHub, or `gh` is not logged in;
-    - a secret file would be committed, such as `.env`, `*.pem` or `id_rsa`. Example files like `.env.example` are allowed.
+  <Step title="Safety checks before anything changes">
+    Ship stops with exit code `1` and changes nothing when:
+    - you are on the default branch (such as `main`) or a detached HEAD;
+    - the repository is a fork, is not on GitHub, or `gh` is not authenticated;
+    - a secret file would be committed (`.env`, `*.pem`, `id_rsa`, etc.; example files like `.env.example` are allowed);
+    - ship is disabled via `PRAISONAI_DISABLE_SHIP=1` or `[ship] enabled = false`.
   </Step>
-  <Step title="Commits">
-    If there are changes, ship stages them all (`git add -A`) and commits them. A clean working tree skips this step.
+  <Step title="Commits and pushes">
+    Stages and commits local changes when dirty (`git add -A`), then pushes with `git push -u origin HEAD` (never force-pushes).
   </Step>
-  <Step title="Pushes">
-    Ship runs `git push -u origin HEAD`. It never force-pushes.
+  <Step title="Opens a draft PR with generated title & body">
+    Uses `write_pr_text` (with lockfile stripping and commit-list fallback) to generate an imperative title and concise summary, then opens a **draft** PR into the default branch. Reuses the existing PR if the branch already has one.
   </Step>
-  <Step title="Opens a draft PR">
-    Ship runs `gh pr create --draft` into the default branch. If the branch already has an open PR, ship prints that PR's link instead of opening a new one.
+  <Step title="Self-review and optional Steward hand-off">
+    Runs `review_diff` (unless `--no-review`), optionally comments findings with `--post-review`, requests any `--reviewer`, and starts `watch_pr` when `--watch` is passed.
   </Step>
 </Steps>
 
 <Warning>
-Ship opens **draft** pull requests only. If your repository auto-merges PRs that are ready for review, a draft stays put until you mark it ready.
+Ship opens **draft** pull requests only. A draft stays unmerged until you mark it ready and merge it yourself.
 </Warning>
+
+---
+
+## `praisonai steward` (PR Watch Loop)
+
+`praisonai steward` watches an open pull request and runs focused fix turns in a deterministic priority order until the PR is green or a stop condition triggers.
+
+```bash
+# Watch the current branch's PR continuously
+praisonai steward
+
+# Watch PR #42 with a 2-minute poll interval
+praisonai steward 42 --interval 120 --max-days 3
+
+# Run a single check/fix cycle and exit (ideal for CI)
+praisonai steward 42 --once
+```
+
+### Steward Options
+
+| Option | Default | What it does |
+|---|---|---|
+| `[PR]` | current branch PR | PR number (`42`, `#42`) or URL. Omit to target the current branch's open PR. |
+| `--interval` | `60.0` | Poll interval in seconds between watch cycles. |
+| `--max-days` | `7.0` | Maximum watch duration in days before stopping automatically. |
+| `--max-attempts` | `3` | Circuit breaker: maximum fix attempts per failing check, conflict, or review thread. |
+| `--once` | off | Run a single check/fix cycle and exit without sleeping (for CI or interactive sessions). |
+| `-m`, `--model` | unset | Model name for fix turns (for example `gpt-4o-mini` or `ollama/qwen3.5`). |
+
+### Deterministic Priority & Safety Guarantees
+
+1. **Merge conflicts** — merges the base branch and resolves conflicts first.
+2. **Failing CI checks** — inspects the failing check's CI log tail and pushes a targeted fix.
+3. **Unanswered review threads** — addresses open review comments and replies on the thread.
+
+- **3-attempt circuit breaker:** each distinct conflict, failing check, or thread is retried at most `--max-attempts` times (default `3`), preventing runaway loops.
+- **Clean stop conditions:** stops immediately when the PR is merged or closed, on `Ctrl+C`, when the local git branch switches (when watching the current branch without an explicit PR argument), after `--once`, or when `--max-days` is reached.
+- **Strict push verification:** Steward verifies that a new commit was actually pushed before posting a revert/status comment — it never posts a revert or "pushed" comment if nothing was pushed or a push failed.
+- **Never-merge guard:** every Steward agent runs with `register_never_merge` attached, blocking merge, approve, auto-merge, and force-push commands.
+
+---
+
+## Interactive Slash Commands
+
+Both `praisonai code` and `praisonai chat` include built-in `/ship` and `/steward` slash commands that delegate directly to the CLI (inheriting all flags, kill switches, and guards):
+
+```text
+/ship --dry-run
+/ship -m "feat: add retry backoff" --effort medium
+/steward
+/steward 42 --model ollama/qwen3.5
+```
+
+<Note>
+Inside interactive sessions, `/steward` automatically defaults to `--once` so the TUI or REPL never blocks on a continuous polling loop. To watch continuously, run `praisonai steward` in a terminal.
+</Note>
+
+---
+
+## Any LLM & Local Offline (Ollama)
+
+Both `ship` and `steward` work with any provider supported by `praisonaiagents`, including fully local models via Ollama:
+
+```bash
+# Draft PR + self-review with a local Ollama model
+praisonai ship --model ollama/qwen3.5
+
+# Run a single Steward check/fix turn locally with Ollama
+praisonai steward --model ollama/qwen3.5 --once
+```
+
+---
+
+## Free GitHub Actions CI Steward
+
+Run Steward automatically on labeled pull requests with GitHub Actions using `--once`. The workflow below skips forks and bot-authored PRs and triggers only when a maintainer adds the `steward` label:
+
+```yaml
+# .github/workflows/steward.yml
+name: PR Steward
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  steward:
+    if: >-
+      github.event.pull_request != null &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !endsWith(github.event.pull_request.user.login, '[bot]') &&
+      contains(github.event.pull_request.labels.*.name, 'steward')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install praisonai-code
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: praisonai steward ${{ github.event.pull_request.number }} --once
+```
+
+---
+
+## Kill Switch & Configuration
+
+Disable `ship` and `steward` globally or per-project at any time:
+
+- **Environment variable (highest precedence):**
+  ```bash
+  export PRAISONAI_DISABLE_SHIP=1
+  ```
+  Set `PRAISONAI_DISABLE_SHIP=0` (or `false`, `no`, `off`) to re-enable over a config file setting.
+- **Config file (`config.toml`):**
+  ```toml
+  [ship]
+  enabled = false
+  ```
+
+When disabled, both CLI commands and Python entry points refuse immediately before running any `git` or `gh` commands.
+
+---
+
+## Declarative PR Approvals (`.praisonai/approvals.yml`)
+
+Define path-based approval rules, protected files, reviewer seats, and required checks in `.praisonai/approvals.yml`:
+
+```yaml
+# .praisonai/approvals.yml
+mode: observe  # observe | enforce
+
+protected_paths:
+  - ".github/workflows/**"
+  - "src/praisonai-agents/praisonaiagents/approval/**"
+
+rules:
+  - name: core-sdk
+    paths:
+      - "src/praisonai-agents/**"
+    seats: 1
+    reviewers:
+      - "@maintainers"
+    checks:
+      - "unit-tests"
+      - "lint"
+
+  - name: security-sensitive
+    paths:
+      - "**/security/**"
+      - "**/*auth*.py"
+    seats: 2
+    reviewers:
+      - "@security-team"
+    checks:
+      - "security-scan"
+```
+
+Evaluate a pull request against the policy from the CLI or Python:
+
+```bash
+# Evaluate the current branch's PR (or pass a PR number)
+praisonai approvals
+praisonai approvals 42
+```
+
+```python
+from praisonai_code.ship.approvals import check_pr_policy
+
+report = check_pr_policy("42")
+print(report.passed, report.missing_reviewers, report.missing_checks)
+```
+
+---
 
 ## Requirements
 
 - `git` and the GitHub CLI `gh`, logged in with `gh auth login`.
 - A feature branch in a GitHub repository that is not a fork.
 
-## Use it from Python
+---
 
-The same step is one function:
+## Python API
+
+### Full Orchestration (`ship`)
+
+```python
+from praisonai_code.ship import ShipResult, ship
+from praisonai_code.ship.flow import ShipRefused
+
+try:
+    result: ShipResult = ship(
+        message="fix: handle an empty input list",
+        effort="high",
+        model="gpt-4o-mini",
+        review=True,
+        post_review=False,
+        watch=False,
+    )
+    print(result.pr_url, result.severity, len(result.findings))
+except ShipRefused as reason:
+    print(f"Not shipped: {reason}")
+```
+
+`ShipResult` fields: `pr_url`, `findings`, `severity`, `posted_review`, `watched`, `reviewer`, `dry_run_plan`.
+
+### Low-Level Helpers
+
+#### Draft PR flow (`ship_to_draft_pr`)
 
 ```python
 from praisonai_code.ship.flow import ShipRefused, ship_to_draft_pr
@@ -84,11 +316,11 @@ except ShipRefused as reason:
     print(f"Not shipped: {reason}")
 ```
 
-Pass `dry_run=True` to get the plan as text instead.
+Pass `dry_run=True` to return the plan as text instead.
 
-## Write the PR title and body
+#### PR title and body (`write_pr_text`)
 
-For a multi-commit branch, `gh pr create --fill` names the PR after the branch; `write_pr_text` asks a model to write a title and markdown body from the commits and diff instead.
+`write_pr_text` generates a `PRText` (`title: str` clipped to 72 chars, `body: str`) from commit subjects and the unified diff (stripping lockfiles, truncating at 20,000 characters, fencing as untrusted data, and falling back cleanly to `commits[0]` + a commit bullet list if the model fails):
 
 ```python
 from praisonai_code.ship.pr_text import write_pr_text
@@ -104,28 +336,50 @@ print(text.title)
 print(text.body)
 ```
 
-`write_pr_text` returns a `PRText` Pydantic model with `title: str` (one line, imperative, clipped to 72 characters) and `body: str` (short markdown summary).
-
 | Parameter | Type | Default | What it does |
 |---|---|---|---|
-| `commits` | `list[str]` | required | Commit subjects, oldest first. An empty list raises `ValueError`. |
-| `diff` | `str` | required | Unified diff text. Truncated at 20,000 characters and fenced as untrusted data. |
-| `agent` | `Agent \| None` | `None` | Your own writer `Agent`. Without it, a built-in `Agent(name="ship-pr-writer", ...)` is created. |
-| `llm` | `str \| None` | `None` | Model name passed to the built-in agent when `agent` is `None`. |
+| `commits` | `list[str]` | required | Commit subjects, oldest first. Empty list raises `ValueError`. |
+| `diff` | `str` | required | Unified diff text. Lockfiles stripped, truncated at 20,000 chars, fenced as untrusted data. |
+| `agent` | `Agent \| None` | `None` | Custom writer `Agent` (defaults to built-in `ship-pr-writer`). |
+| `llm` | `str \| None` | `None` | Model name when `agent` is `None`. |
 
-**Safe fallback:** If the model call raises, returns a non-`PRText` reply, or returns a blank title, `write_pr_text` falls back to `title = commits[0]` and `body` as a bullet list of every commit subject — so shipping never fails on a PR-description error and the branch name is never used as the title.
+#### Diff self-review (`review_diff`)
+
+```python
+from praisonai_code.ship.review import review_diff, review_severity
+
+diff = open("change.diff").read()
+findings = review_diff(diff, effort="high")
+for f in findings:
+    print(f.severity, f"{f.path}:{f.line}", f.title, "->", f.fix)
+print("overall:", review_severity(findings))
+```
+
+- `ReviewFinding` fields: `severity` (`important`, `nit`, `pre_existing`), `path`, `line`, `title`, `fix`.
+- `effort`: `low` (up to 3, important only), `medium` (5), `high` (10), `xhigh` (20), or `max` (all).
+- `review_severity(findings)` returns `"high"` (any `important`), `"minimal"` (only nits/pre-existing), or `"none"`.
 
 <Warning>
-The diff is untrusted input. `write_pr_text` truncates diffs longer than 20,000 characters, fences them in a `diff` block, and instructs the model not to follow instructions inside the diff.
+The diff is untrusted input. `review_diff` and `write_pr_text` fence diffs and instruct the model not to follow instructions inside them. Keep any custom reviewer `agent` tool-free.
 </Warning>
 
-<Note>
-`write_pr_text` is currently a Python helper in `praisonai_code.ship.pr_text` ([PraisonAI PR #6826](https://github.com/MervinPraison/PraisonAI/pull/6826)). The `praisonai ship` CLI still uses `gh pr create --draft --fill` until the follow-up wiring PR lands.
-</Note>
+#### PR state & watch loop (`watch_pr`, `read_pr_state`, `next_action`)
 
-## Keep an agent from merging
+```python
+from praisonai_code.ship.steward import next_action, read_pr_state
+from praisonai_code.ship.steward_loop import watch_pr
 
-When an agent works on your pull requests, add the never-merge guard. It is a hook that runs before every tool call. It refuses commands that merge, approve, turn on auto-merge or force-push, even if an earlier approval allowed `gh pr` commands.
+state = read_pr_state("42")
+print(state.state, state.mergeable, state.failing, [t.body for t in state.threads])
+print(next_action(state, attempts={}))
+
+summary = watch_pr("42", once=True, llm="gpt-4o-mini")
+print(summary.reason, summary.cycles, summary.turns)
+```
+
+#### Never-merge guard (`register_never_merge`)
+
+Attach the never-merge `BEFORE_TOOL` hook to any agent working on pull requests:
 
 ```python
 from praisonaiagents import Agent
@@ -149,82 +403,15 @@ agent.start("Fix the failing test and push the fix")
   <Accordion title="What the guard refuses">
     - `gh pr merge`, including `--auto`
     - `gh pr review --approve` (or `-a`)
-    - `gh api` calls that merge or approve, over REST (`.../merge`, `event=APPROVE`) or GraphQL (`mergePullRequest`, `enablePullRequestAutoMerge`, an approving `addPullRequestReview`), and GraphQL read from a file
-    - `git push --force`, `-f`, `--force-with-lease`, `--force-if-includes`, `--mirror` and `+branch` pushes
+    - `gh api` calls that merge or approve, over REST (`.../merge`, `event=APPROVE`) or GraphQL (`mergePullRequest`, `enablePullRequestAutoMerge`, an approving `addPullRequestReview`), including GraphQL read from a file
+    - `git push --force`, `-f`, `--force-with-lease`, `--force-if-includes`, `--mirror`, and `+branch` pushes
 
-    It also looks inside `cmd1 && cmd2`, `bash -c '...'`, full paths like `/usr/bin/gh` and `gh -R owner/repo ...`.
+    Inspects chained commands (`cmd1 && cmd2`), `bash -c '...'`, full paths like `/usr/bin/gh`, and `gh -R owner/repo ...`.
   </Accordion>
   <Accordion title="What the guard does not stop">
-    The guard reads command text. A command hidden inside another program, such as `python -c "os.system('gh pr merge 1')"`, gets through. It is a guard rail, not a security boundary. To be sure nothing merges, turn on branch protection or give the agent a token without merge rights.
+    The guard reads command text. A command hidden inside another program (such as `python -c "os.system('gh pr merge 1')"`) is outside its scope. Combine it with GitHub branch protection or a token without merge permissions for hard enforcement.
   </Accordion>
 </AccordionGroup>
-
-## Review a diff
-
-Ship's self-review returns findings as typed objects, so a script or an agent can act on them:
-
-```python
-from praisonai_code.ship.review import review_diff, review_severity
-
-diff = open("change.diff").read()
-findings = review_diff(diff, effort="high")
-for f in findings:
-    print(f.severity, f"{f.path}:{f.line}", f.title, "->", f.fix)
-print("overall:", review_severity(findings))
-```
-
-**Example output** (wording varies by model):
-
-```
-important calc.py:2 IndexError in last() -> return xs[-1]
-overall: high
-```
-
-| Field | Meaning |
-|---|---|
-| `severity` | `important` (a bug this change adds), `nit` (minor) or `pre_existing` (it was already there) |
-| `path`, `line` | Where the finding is, in the new file |
-| `title`, `fix` | What is wrong and how to fix it |
-
-`review_severity` sums them up: `high` if any finding is important, `minimal` if there are only nits or pre-existing ones, and `none` if there are no findings.
-
-| Parameter | Default | What it does |
-|---|---|---|
-| `diff` | required | Unified diff text. An empty diff returns `[]` without calling a model. |
-| `effort` | `"high"` | `low` (up to 3, important only), `medium` (5), `high` (10), `xhigh` (20) or `max` (all). Important findings come first. Any other value raises `ValueError`. |
-| `agent` | `None` | Your own reviewer `Agent`. Without it, a built-in reviewer is made from the `review` preset. |
-| `llm` | `None` | Model for the built-in reviewer, for example `"gpt-4o-mini"`. Ignored when `agent` is given. |
-
-The built-in reviewer has no tools: it reads only the diff you give it. If the model returns nothing, or a reply that is not a findings report, `review_diff` raises `ValueError`.
-
-Use it as a CI gate: fail only when a finding is important.
-
-```python
-from praisonai_code.ship.review import review_diff, review_severity
-
-diff = open("change.diff").read()
-findings = review_diff(diff, effort="low", llm="gpt-4o-mini")
-if review_severity(findings) == "high":
-    raise SystemExit("blocking bugs found in the diff")
-```
-
-<Warning>
-The diff is untrusted input. `review_diff` fences it and tells the model not to follow instructions inside it. If you pass your own `agent`, keep it tool-free so a crafted diff cannot trigger tool calls.
-</Warning>
-
-## Check a pull request's state
-
-`read_pr_state` reads a PR and `next_action` says what to do next. Both only read; they never change the PR.
-
-```python
-from praisonai_code.ship.steward import next_action, read_pr_state
-
-state = read_pr_state("42")
-print(state.state, state.mergeable, state.failing, [t.body for t in state.threads])
-print(next_action(state, attempts={}))
-```
-
-The order is: stop if the PR is merged or closed. Otherwise merge the base branch in on a conflict, then fix failing checks, then answer open review comments. Each item is tried at most 3 times, so a failure that cannot be fixed is not retried forever.
 
 ## Related
 
@@ -233,6 +420,12 @@ The order is: stop if the PR is merged or closed. Otherwise merge the base branc
     AI commit messages with a security scan
   </Card>
   <Card title="Git Integration" icon="code-branch" href="/cli/git-integration">
-    Git status, diff and history from the CLI
+    Git status, diff, and history from the CLI
+  </Card>
+  <Card title="Code CLI" icon="terminal" href="/cli/code">
+    Interactive coding session with `/ship` and `/steward`
+  </Card>
+  <Card title="Chat CLI" icon="comments" href="/cli/chat">
+    Interactive chat session with `/ship` and `/steward`
   </Card>
 </CardGroup>
