@@ -37,9 +37,11 @@ MDX_TAG_RE = re.compile(
     r"</?(Steps|Step|Card|CardGroup|Accordion|AccordionGroup|Tabs|Tab)\b[^>]*?/?>"
 )
 LINK_RE = re.compile(
-    r'(?:href|to)=["\'](/docs[^"\'#?]+)["\']|'
-    r'\[[^\]]+\]\((/docs[^)#?]+)\)'
+    r'(?:href|to)=["\'](/[^"\'#?]+)["\']|'
+    r'\[[^\]]+\]\((/[^)#?\s]+)\)'
 )
+ASSET_PREFIXES = ("//", "/images/", "/logo/", "/favicon", "/assets/", "/static/", "/api/v1")
+ASSET_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".json", ".yaml", ".yml", ".pdf", ".mp4")
 FENCE_RE = re.compile(r"^```.*$", re.MULTILINE)
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 
@@ -185,17 +187,35 @@ def sitemap_urls() -> list[str]:
     return sorted({el.text.strip() for el in locs if el.text})
 
 
+def redirect_sources() -> set[str]:
+    data = json.loads((ROOT / "docs" / "docs.json").read_text())
+    out: set[str] = set()
+    for item in data.get("redirects", []):
+        src = (item.get("source") or "").strip().rstrip("/")
+        if src:
+            out.add(src)
+    return out
+
+
 def local_links() -> list[tuple[str, str]]:
     broken: list[tuple[str, str]] = []
+    redirects = redirect_sources()
     for path in (ROOT / "docs").rglob("*.mdx"):
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        text = strip_fenced_blocks(path.read_text(encoding="utf-8", errors="ignore"))
         rel = str(path.relative_to(ROOT))
         for match in LINK_RE.finditer(text):
             href = match.group(1) or match.group(2)
             href = href.split("#")[0].split("?")[0].rstrip("/")
+            if not href or href == "/":
+                continue
+            if href.startswith(ASSET_PREFIXES) or href.lower().endswith(ASSET_EXTS):
+                continue
             if href.endswith(".md"):
                 href = href[:-3]
-            target = href.removeprefix("/docs/")
+            normalized = href.removeprefix("/docs") or "/"
+            if normalized in redirects or href in redirects:
+                continue
+            target = normalized.lstrip("/")
             if not target:
                 continue
             if resolve_page_file(target) is None:

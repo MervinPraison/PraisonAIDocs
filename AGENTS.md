@@ -173,12 +173,13 @@ This command:
 CRITICAL RULES FOR AI AGENTS:
 
 1. NEVER create or modify files in docs/concepts/ — this folder is HUMAN-APPROVED ONLY
-2. Place ALL new documentation pages in docs/features/ by default
-3. If a page logically belongs in docs/tools/ or docs/guides/, use those instead
-4. Update docs.json to add pages under "Features" group, NEVER under "Concepts"
+2. Place ALL new documentation pages in docs/features/ by default (or docs/tools/, docs/guides/, docs/cli/, docs/deploy/, docs/mcp/ when matching an existing folder)
+3. Prefer updating an existing parent feature page over creating single-PR bugfix micro-pages
+4. Update docs/docs.json to place new pages in the matching domain tab & subgroup (`Features`, `Agents & Tools`, `CLI & Code`, `UI & Apps`, `Gateway & Bots`, `Deploy & API`, `Examples & Learn`), NEVER under `Core Concepts` and NEVER dumping unrelated pages into a catch-all group
 5. If an issue mentions "concepts", still place the file in docs/features/
 6. Do NOT modify existing docs/concepts/ pages without explicit human instruction
 7. When reviewing PRs: flag any files in docs/concepts/ as violations
+8. Always use root-relative internal links WITHOUT the `/docs/` prefix (e.g., `/features/memory`, `/sdk/reference/...`) — never `/docs/...`
 ```
 
 ### 1.10 AI Agent Behavioral Rules
@@ -241,13 +242,13 @@ icon: "icon-name"
 ## Configuration Options
 
 {/* Link to auto-generated SDK reference - DO NOT duplicate SDK parameters here */}
-{/* TypeScript: /docs/sdk/reference/typescript/{classes,modules,functions}/ */}
-{/* Rust: /docs/sdk/reference/rust/{structs,modules,functions}/ */}
+{/* TypeScript: /sdk/reference/typescript/{classes,modules,functions}/ */}
+{/* Rust: /sdk/reference/rust/{classes,modules,functions}/ */}
 
-<Card title="[Feature] API Reference" icon="code" href="/docs/sdk/reference/typescript/classes/[FeatureConfig]">
+<Card title="[Feature] API Reference" icon="code" href="/sdk/reference/typescript/classes/[FeatureConfig]">
   TypeScript configuration options
 </Card>
-<Card title="[Feature] Rust Reference" icon="code" href="/docs/sdk/reference/rust/structs/[FeatureConfig]">
+<Card title="[Feature] Rust Reference" icon="code" href="/sdk/reference/rust/classes/[FeatureConfig]">
   Rust configuration options
 </Card>
 
