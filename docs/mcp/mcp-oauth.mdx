@@ -1,14 +1,14 @@
 ---
 title: "MCP OAuth Authentication"
 sidebarTitle: "OAuth Authentication"
-description: "Zero-config OAuth 2.1 for remote MCP servers — no client_id required"
+description: "OAuth 2.1 + PKCE client authentication for Streamable HTTP MCP servers with automatic Bearer attachment and 401 refresh"
 icon: "key"
 ---
 
-OAuth-protected remote MCP servers now Just Work — point at the URL, approve once in your browser, and tokens are cached and refreshed automatically.
+Connect agents to OAuth-protected remote MCP servers over **Streamable HTTP** — sign in once via the CLI or an interactive TTY, and PraisonAI attaches stored Bearer tokens and refreshes them automatically on HTTP `401`.
 
 <Note>
-No `client_id` is required. When a server exposes standard authorization-server metadata (RFC 8414) and dynamic client registration (RFC 7591), PraisonAI discovers the endpoints, registers a client, runs the PKCE flow, and refreshes tokens on its own.
+**Transport scope:** Automatic Bearer token attachment, `401` refresh-and-retry, and interactive TTY sign-in apply to **Streamable HTTP** transports (`HTTPStreamMCPClient`, `MCP(..., oauth=True, server_name=...)`, and `MCP.from_config({"url": ..., "oauth": True}, name=...)`). Legacy `/sse` and WebSocket transports do not auto-attach OAuth tokens yet — passing `oauth=True` with a legacy `/sse` URL logs a warning and skips OAuth.
 </Note>
 
 <Note>
@@ -17,10 +17,10 @@ This page covers PraisonAI acting as an **OAuth client** connecting to external 
 
 ```mermaid
 graph LR
-    subgraph "Zero-config OAuth"
-        A[🔗 MCP URL] --> B[🔎 Discover + Register]
-        B --> C[🔐 Authorize + Token]
-        C --> D[✅ Connected]
+    subgraph "Streamable HTTP OAuth 2.1 + PKCE"
+        A[MCP Streamable HTTP URL] --> B[Stored Token / Discover + Register]
+        B --> C[Attach Bearer + Refresh on 401]
+        C --> D[Connected]
     end
 
     classDef url fill:#6366F1,stroke:#7C90A0,color:#fff
@@ -34,128 +34,151 @@ graph LR
     class D done
 ```
 
-## Status
+## Supported Capabilities
 
 | Capability | Status |
 |---|---|
-| OAuth utilities (PKCE, state, callback) | ✅ |
-| Token storage (`~/.praisonai/mcp-auth.json`, 0600 perms) | ✅ |
+| OAuth 2.1 utilities (PKCE `S256`, `state`, loopback callback) | ✅ |
+| Token storage (`$PRAISONAI_HOME/mcp-auth.json`, mode `0600`) | ✅ |
 | Metadata discovery (RFC 8414 + OpenID fallback) | ✅ |
-| Dynamic Client Registration (RFC 7591) | ✅ |
-| PKCE authorize + token exchange | ✅ |
-| Transparent token refresh | ✅ |
-| Headless / CI signal (`InteractiveAuthRequired`) | ✅ |
-| `praisonai mcp auth` CLI flow | ✅ |
+| Dynamic Client Registration (RFC 7591, no `client_id` required when supported) | ✅ |
+| `praisonai mcp auth <name>` interactive CLI sign-in | ✅ |
+| Streamable HTTP automatic Bearer attachment (`MCP` / `MCP.from_config` / `HTTPStreamMCPClient`) | ✅ |
+| Serialized single-attempt refresh + retry on HTTP `401` | ✅ |
+| Headless / CI fail-closed signal (`InteractiveAuthRequired`, never opens a browser in CI) | ✅ |
+| Explicit `Authorization` header precedence (never overridden by OAuth) | ✅ |
+| Legacy `/sse` and WebSocket auto-attachment | Not yet supported |
 
 ## Quick Start
 
 <Steps>
-  <Step>
+  <Step title="Enable OAuth on a Streamable HTTP MCP client">
+    Pass `oauth=True` and `server_name` to `MCP(...)` (or use `MCP.from_config`):
+
     ```python
     from praisonaiagents import Agent, MCP
 
     agent = Agent(
         instructions="You help with GitHub tasks",
-        tools=MCP("https://api.githubcopilot.com/mcp/")
+        tools=MCP(
+            "https://api.githubcopilot.com/mcp/",
+            oauth=True,
+            server_name="github",
+        ),
     )
 
     agent.start("List my open pull requests")
     ```
-    The first call opens your browser once so you can approve access. Tokens are cached for future runs — no `client_id` or scopes to configure.
-  </Step>
-  <Step>
+
+    Or build from a config dict:
+
     ```python
-    agent.start("Close pull request 42")
+    from praisonaiagents import Agent, MCP
+
+    mcp = MCP.from_config(
+        {"url": "https://api.githubcopilot.com/mcp/", "oauth": True},
+        name="github",
+    )
+    agent = Agent(instructions="You help with GitHub tasks", tools=mcp)
+    agent.start("List my open pull requests")
     ```
-    Cached tokens are re-used, and expired ones are refreshed transparently.
+
+    In an interactive terminal (TTY, outside CI), an initial `401` triggers discovery, registration, and browser sign-in once. Tokens are cached under `$PRAISONAI_HOME/mcp-auth.json` (default `~/.praisonai/mcp-auth.json`, mode `0600`).
   </Step>
-  <Step title="Or pre-seed from the CLI">
+  <Step title="Pre-seed tokens from the CLI (recommended for CI / headless)">
     ```bash
-    # One-time interactive login; tokens cached at ~/.praisonai/mcp-auth.json
+    # One-time interactive OAuth 2.1 + PKCE sign-in
     praisonai mcp auth github
     ```
-    Run this once on a workstation, then copy `~/.praisonai/mcp-auth.json` to a CI runner for headless environments.
+
+    Once tokens are cached for a server URL, Streamable HTTP clients automatically attach `Authorization: Bearer <token>` on subsequent runs and refresh expired tokens on `401`.
   </Step>
 </Steps>
 
-## How Zero-config OAuth Works
+## How Streamable HTTP OAuth Works
 
-A `401` with a `WWW-Authenticate` challenge triggers discovery, registration, and the PKCE flow — all automatic.
+When a Streamable HTTP client has `oauth` enabled (or finds a stored token for the server URL) and no explicit `Authorization` header was supplied:
+
+1. **Attach Bearer token** — reads a valid token from `$PRAISONAI_HOME/mcp-auth.json` and sends `Authorization: Bearer <token>`. Explicit `Authorization` headers always take precedence and are never overwritten.
+2. **Refresh once on HTTP `401`** — if the server responds `401`, the client attempts a refresh-token grant **once** (serialized with an `asyncio.Lock` so concurrent requests do not race) and retries the request once with the new token.
+3. **Interactive TTY vs CI / headless** — if refresh is unavailable or fails:
+   - **Interactive TTY (non-CI):** runs the OAuth 2.1 + PKCE browser flow (discovery via `WWW-Authenticate` / RFC 8414, optional RFC 7591 client registration, loopback callback, token exchange) and retries with the new token.
+   - **Non-TTY or CI (`CI` / `GITHUB_ACTIONS` set):** never opens a browser; raises `InteractiveAuthRequired` with the exact command to run (`praisonai mcp auth <name>`).
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Agent
+    participant Client as Streamable HTTP Client
     participant MCP as MCP Server
     participant Auth as Auth Server
     participant Browser
 
-    User->>Agent: request
-    Agent->>MCP: call
-    MCP-->>Agent: 401 + WWW-Authenticate: Bearer resource_metadata="…"
-    Agent->>Auth: GET /.well-known/oauth-protected-resource
-    Agent->>Auth: GET /.well-known/oauth-authorization-server
-    Agent->>Auth: POST /register (RFC 7591, if no client stored)
-    Agent->>Browser: open authorize URL with PKCE
-    User->>Auth: sign in and approve
-    Auth-->>Agent: code (loopback callback)
-    Agent->>Auth: POST /token (code + verifier)
-    Agent->>Agent: persist tokens (0600)
-    Agent->>MCP: retry with Bearer token
-    MCP-->>Agent: 200
-
-    %%{init: {'theme':'base','themeVariables':{'actorBkg':'#6366F1','actorTextColor':'#fff','actorBorder':'#7C90A0'}}}%%
+    Client->>MCP: Request (with stored Bearer if present)
+    MCP-->>Client: 401 + WWW-Authenticate
+    Client->>Auth: Refresh token (once, under asyncio.Lock)
+    alt Refresh succeeds
+        Client->>MCP: Retry once with refreshed Bearer
+        MCP-->>Client: 200
+    else Refresh unavailable/fails & interactive TTY
+        Client->>Auth: Discover metadata (RFC 8414) + Register (RFC 7591)
+        Client->>Browser: Open authorize URL (PKCE S256 + state)
+        User->>Auth: Sign in and approve
+        Auth-->>Client: code (loopback callback)
+        Client->>Auth: POST /token (code + verifier)
+        Client->>Client: Persist tokens (0600 under PRAISONAI_HOME)
+        Client->>MCP: Retry with Bearer token
+        MCP-->>Client: 200
+    else Non-TTY or CI
+        Client-->>User: Raise InteractiveAuthRequired (run `praisonai mcp auth <name>`)
+    end
 ```
 
-| Step | What happens |
-|------|--------------|
-| Discovery | Parses the `WWW-Authenticate` challenge, fetches protected-resource + authorization-server metadata (RFC 8414, OpenID fallback). |
-| Registration | Registers a public client via RFC 7591 if none is stored. |
-| Authorize | Opens the browser with PKCE and a loopback callback. |
-| Token | Exchanges the code for tokens and persists them (0600). |
-| Refresh | Renews expired tokens automatically on the next request. |
-
-## Interactive vs Headless
-
-Interactive sessions open a browser; headless environments raise a single actionable exception.
+## Interactive vs Headless / CI
 
 <Tabs>
-  <Tab title="Interactive (default)">
+  <Tab title="Streamable HTTP via MCP (recommended)">
     ```python
-    from praisonaiagents.mcp import MCPOAuthProvider
+    from praisonaiagents import MCP
+    from praisonaiagents.mcp import InteractiveAuthRequired
 
-    provider = MCPOAuthProvider(
-        mcp_name="github",
-        server_url="https://api.githubcopilot.com/mcp/",
-    )
-    token = provider.ensure_authenticated()  # opens a browser the first time
+    try:
+        mcp = MCP(
+            "https://api.example.com/mcp",
+            oauth=True,
+            server_name="linear",
+        )
+    except InteractiveAuthRequired as exc:
+        # In non-TTY or CI, never opens a browser; message names `praisonai mcp auth linear`
+        print(exc)
     ```
   </Tab>
-  <Tab title="Headless / CI">
+  <Tab title="Direct MCPOAuthProvider">
     ```python
     from praisonaiagents.mcp import MCPOAuthProvider, InteractiveAuthRequired
 
     provider = MCPOAuthProvider(
         mcp_name="github",
         server_url="https://api.githubcopilot.com/mcp/",
-        open_browser=False,
+        open_browser=False,  # set True for interactive terminal flows
     )
 
     try:
         token = provider.ensure_authenticated()
     except InteractiveAuthRequired:
-        print("Seed ~/.praisonai/mcp-auth.json interactively first.")
+        print("Run `praisonai mcp auth github` interactively first.")
     ```
   </Tab>
 </Tabs>
 
 <Tip>
-For CI, run `praisonai mcp auth <server-name>` once interactively on a workstation to seed `~/.praisonai/mcp-auth.json`, then copy that file to the CI runner (or mount it as a secret). The CLI runs the exact same OAuth 2.1 flow as the Python client, so it's a valid way to satisfy the `InteractiveAuthRequired` prerequisite. With `open_browser=False`, a missing token raises `InteractiveAuthRequired` instead of hanging.
+For CI, run `praisonai mcp auth <name>` once interactively on a workstation to seed `$PRAISONAI_HOME/mcp-auth.json`, then mount or copy that file (keeping mode `0600`) into the CI runner. In non-TTY or CI environments (`CI` or `GITHUB_ACTIONS` set), Streamable HTTP clients never open a browser and raise `InteractiveAuthRequired` naming `praisonai mcp auth <name>`.
 </Tip>
 
 ## Configuration Schema
 
-The `oauth:` block is now **optional**. For servers that advertise standard metadata, just supply `type: remote` and `url`.
+### Streamable HTTP with OAuth
+
+In `MCP.from_config(...)` or your MCP configuration:
 
 ```yaml
 mcp:
@@ -163,9 +186,10 @@ mcp:
     github:
       type: remote
       url: https://api.githubcopilot.com/mcp/
+      oauth: true
 ```
 
-Keep the explicit block only as an escape hatch for servers without RFC 8414 metadata or dynamic registration:
+For servers without dynamic client registration (RFC 7591), pass explicit OAuth client fields:
 
 ```yaml
 mcp:
@@ -183,7 +207,9 @@ mcp:
           - write
 ```
 
-### Remote Server with API Key
+### Remote Server with Explicit `Authorization` Header
+
+When an explicit `Authorization` header is configured, it always takes precedence over OAuth:
 
 ```yaml
 mcp:
@@ -199,9 +225,46 @@ mcp:
 
 All OAuth helpers are lazy-loaded from `praisonaiagents.mcp`.
 
-### MCPOAuthProvider
+### `MCP` and `MCP.from_config`
 
-Orchestrates discovery, registration, the PKCE flow, and refresh for one server.
+```python
+from praisonaiagents import MCP
+
+# Direct Streamable HTTP client with OAuth
+client = MCP(
+    "https://api.example.com/mcp",
+    oauth=True,
+    server_name="linear",
+)
+
+# Config-dict builder
+client_from_cfg = MCP.from_config(
+    {"url": "https://api.example.com/mcp", "oauth": True},
+    name="linear",
+)
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `oauth` | `bool \| dict \| None` | `None` | `True` enables zero-config OAuth on Streamable HTTP; a dict supplies explicit `client_id`/`client_secret`/`scopes`; `False` disables OAuth even if a stored token exists. |
+| `server_name` | `str \| None` | `None` | Stable storage key matching `praisonai mcp auth <name>`. |
+
+### `HTTPStreamMCPClient`
+
+`MCP` forwards `oauth` and `server_name` (as `transport_options={"oauth": ..., "name": ...}`) to `HTTPStreamMCPClient`, which wires an `httpx.Auth` handler for Bearer attachment and `401` refresh.
+
+```python
+from praisonaiagents.mcp.mcp_http_stream import HTTPStreamMCPClient
+
+client = HTTPStreamMCPClient(
+    server_url="https://api.example.com/mcp",
+    transport_options={"oauth": True, "name": "linear"},
+)
+```
+
+### `MCPOAuthProvider`
+
+Orchestrates discovery, registration, the PKCE flow, and token refresh for one server:
 
 ```python
 from praisonaiagents.mcp import MCPOAuthProvider
@@ -210,20 +273,20 @@ provider = MCPOAuthProvider(
     mcp_name="github",
     server_url="https://api.githubcopilot.com/mcp/",
 )
-token = provider.ensure_authenticated()  # opens a browser the first time
+token = provider.ensure_authenticated()  # opens a browser when open_browser=True
 ```
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+|---|---|---|---|
 | `mcp_name` | `str` | — | Stable identifier used as the storage key. |
 | `server_url` | `str` | — | The MCP server URL. |
 | `storage` | `Any` | `None` | Optional pre-built `MCPAuthStorage` (created lazily otherwise). |
 | `open_browser` | `bool` | `True` | Set `False` for headless/CI to raise `InteractiveAuthRequired`. |
 
 | Method | Signature | Returns |
-|--------|-----------|---------|
+|---|---|---|
 | `get_valid_token` | `get_valid_token()` | `str \| None` — a non-expired token, refreshing if possible. |
-| `ensure_authenticated` | `ensure_authenticated(www_authenticate=None, timeout=10.0)` | `str` — a valid bearer token, running the full flow if needed. |
+| `ensure_authenticated` | `ensure_authenticated(www_authenticate=None, timeout=10.0)` | `str` — a valid Bearer token, running the full flow if needed. |
 
 ### Discovery and Registration Helpers
 
@@ -237,76 +300,47 @@ from praisonaiagents.mcp import (
 challenge = parse_www_authenticate(
     'Bearer resource_metadata="https://auth.example.com/.well-known/oauth-protected-resource"'
 )
-
 metadata = discover_oauth_metadata("https://api.githubcopilot.com/mcp/")
-# {authorization_endpoint, token_endpoint, registration_endpoint, scopes_supported, resource}
 ```
 
 | Function | Signature | Returns |
-|----------|-----------|---------|
+|---|---|---|
 | `discover_oauth_metadata` | `discover_oauth_metadata(server_url, www_authenticate=None, timeout=10.0)` | `dict \| None` |
 | `parse_www_authenticate` | `parse_www_authenticate(header)` | `dict` — `resource_metadata`, `scope`, `error`, etc. |
-| `register_client` | `register_client(registration_endpoint, redirect_uris, client_name="PraisonAI Agent", scope=None, timeout=10.0)` | `dict` — at least `{"client_id": …}` (RFC 7591). |
+| `register_client` | `register_client(registration_endpoint, redirect_uris, client_name="PraisonAI Agent", scope=None, timeout=10.0)` | `dict` — at least `{"client_id": ...}` (RFC 7591). |
 
-### InteractiveAuthRequired
+### `InteractiveAuthRequired`
 
-Raised by `ensure_authenticated()` when interactive auth is required but `open_browser=False`.
+Raised when interactive OAuth is required in a non-TTY/CI environment or when `open_browser=False`.
 
 ```python
 from praisonaiagents.mcp import InteractiveAuthRequired
 ```
 
-### Auth Storage
-
-```python
-from praisonaiagents.mcp import MCPAuthStorage
-
-storage = MCPAuthStorage()
-
-entry = storage.get("github")
-if entry and entry.get("tokens"):
-    print("Authenticated!")
-
-if storage.is_token_expired("github"):
-    print("Token expired, need to re-authenticate")
-```
-
-### PKCE Utilities
+### Auth Storage & PKCE Utilities
 
 ```python
 from praisonaiagents.mcp import (
+    MCPAuthStorage,
+    get_default_auth_filepath,
     generate_state,
     generate_code_verifier,
     generate_code_challenge,
     get_redirect_url,
+    OAuthCallbackHandler,
 )
+
+print("Auth file:", get_default_auth_filepath())  # $PRAISONAI_HOME/mcp-auth.json
+
+storage = MCPAuthStorage()
+entry = storage.get("github")
+if entry and entry.get("tokens") and not storage.is_token_expired("github"):
+    print("Authenticated!")
 
 state = generate_state()
 verifier = generate_code_verifier()
 challenge = generate_code_challenge(verifier)
-
-redirect_url = get_redirect_url()
-print(f"Redirect URL: {redirect_url}")
-# Output: http://127.0.0.1:19876/mcp/oauth/callback
-```
-
-### OAuth Callback Handler
-
-```python
-from praisonaiagents.mcp import OAuthCallbackHandler, generate_state
-import webbrowser
-
-handler = OAuthCallbackHandler()
-state = generate_state()
-
-auth_url = f"https://auth.example.com/authorize?state={state}&..."
-webbrowser.open(auth_url)
-
-try:
-    code = handler.wait_for_callback(state, timeout=300)
-    print(f"Received authorization code: {code[:20]}...")
-except TimeoutError:
-    print("OAuth flow timed out")
+redirect_url = get_redirect_url()  # http://127.0.0.1:19876/mcp/oauth/callback
 ```
 
 ## CLI Commands
@@ -314,62 +348,24 @@ except TimeoutError:
 ### Authenticate
 
 ```bash
-praisonai mcp auth <server-name>
+praisonai mcp auth <name> [--timeout 300]
 ```
 
-Runs the same OAuth 2.1 authorization-code flow (with PKCE) as the Python client. Use it to seed tokens ahead of time — for example, on a workstation before running your agent in CI.
+Runs the interactive OAuth 2.1 + PKCE authorization-code flow and exchanges the returned code for tokens at the discovered `token_endpoint`:
 
-```bash
-praisonai mcp auth github
-```
-
-The command:
-
-- Opens your browser and waits for the loopback callback.
-- Exchanges the code at the discovered `token_endpoint`.
-- Persists tokens (with `expires_at`) to `~/.praisonai/mcp-auth.json` (0600 permissions).
-- Clears any legacy placeholder entry (`oauth_<...>...`) from a previous CLI run before starting, so a prior failed login recovers automatically — no manual cleanup.
-- Reads `server.oauth.client_id`/`client_secret` from `~/.praisonai/config.toml` for servers without dynamic client registration, seeding them into storage before the flow runs.
-- Honors `--timeout` (default `300`s).
-
-On success, tokens are written with `access_token`, optional `refresh_token`, and `expires_at`. The Python client picks them up automatically on the next `Agent.start(...)`. On failure, the command exits `1`.
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant CLI as praisonai mcp auth
-    participant Browser
-    participant Auth as Auth Server
-    participant Storage as ~/.praisonai/mcp-auth.json
-
-    User->>CLI: praisonai mcp auth github
-    CLI->>Storage: purge legacy placeholder if present
-    CLI->>Auth: discover metadata (RFC 8414 / OpenID)
-    CLI->>Auth: register client if needed (RFC 7591)
-    CLI->>Browser: open authorize URL (PKCE + state)
-    User->>Auth: sign in and approve
-    Auth-->>CLI: code (loopback callback)
-    CLI->>Auth: POST /token (code + verifier)
-    Auth-->>CLI: access_token, refresh_token, expires_at
-    CLI->>Storage: persist (0600)
-    CLI-->>User: ✅ Successfully authenticated with github
-
-    %%{init: {'theme':'base','themeVariables':{'actorBkg':'#6366F1','actorTextColor':'#fff','actorBorder':'#7C90A0'}}}%%
-```
-
-<Warning>
-If you previously ran `praisonai mcp auth <name>` on an older release and saw the success message but the server still rejected your token, you were hit by a bug where the CLI stored a truncated authorization code instead of exchanging it for a real token. Re-running the command on the current release automatically clears the bad entry and completes a real flow — no manual cleanup of `~/.praisonai/mcp-auth.json` is needed.
-</Warning>
-
-{/* TODO: `praisonai mcp add` cannot yet create a remote server (writes no type/url), so auth requires hand-editing ~/.praisonai/config.toml. Document once that defect is fixed. */}
+- Opens your browser and waits on the loopback callback (`-t` / `--timeout`, default `300.0`s).
+- Persists `access_token`, optional `refresh_token`, and `expires_at` under `$PRAISONAI_HOME/mcp-auth.json` (mode `0600`).
+- Automatically clears any legacy placeholder entry from older releases before starting.
+- Reads explicit `oauth.client_id` / `client_secret` from config when the server does not support dynamic client registration.
+- Exits `1` on failure.
 
 ### Logout
 
 ```bash
-praisonai mcp logout <server-name>
+praisonai mcp logout <name> [--yes]
 ```
 
-Removes stored OAuth credentials for a server. Use `--yes` to skip the confirmation prompt.
+Removes stored OAuth tokens and client metadata for `<name>`. Pass `-y` / `--yes` to skip confirmation.
 
 ### List Servers
 
@@ -377,11 +373,11 @@ Removes stored OAuth credentials for a server. Use `--yes` to skip the confirmat
 praisonai mcp list
 ```
 
-Shows all configured servers with their type (local/remote) and status.
+Lists configured MCP servers with their type and status.
 
 ## Token Storage
 
-OAuth tokens are stored in `~/.praisonai/mcp-auth.json` with secure file permissions (0600).
+Tokens are persisted to `$PRAISONAI_HOME/mcp-auth.json` (defaulting to `~/.praisonai/mcp-auth.json`) with `0600` owner-only permissions. Tokens are never logged or embedded in URLs.
 
 ```json
 {
@@ -403,40 +399,38 @@ OAuth tokens are stored in `~/.praisonai/mcp-auth.json` with secure file permiss
 
 ## Security
 
-- **HTTPS-only** — every metadata, authorize, token, and registration URL must be HTTPS (loopback `http://127.0.0.1`, `localhost`, `::1` still allowed for testing).
-- **Internal-host guard** — on non-loopback hosts, every OAuth URL also passes the SDK's SSRF check (`is_safe_http_url`). An HTTPS endpoint on a private, link-local or cloud-metadata address (e.g. `https://169.254.169.254/`, `https://10.0.0.5/`, `https://[::ffff:169.254.169.254]/`, `https://0177.0.0.1/`) is refused before any request is sent — even when a compromised MCP server advertises it as `token_endpoint` or `registration_endpoint`.
-- **Pre-request redirect validation** — discovery follows redirects by hand (max 3 hops) and validates every hop **before** fetching it, so a redirect to an internal or plaintext endpoint never reaches the network.
-- **No redirects on credential POSTs** — code-exchange, refresh-token and registration POSTs never follow redirects, so a `307`/`308` can't re-send a refresh token or client secret to another host. A redirect is treated as a failure and saved tokens are preserved.
-- **Refresh re-check** — refresh-token grants re-validate the stored `token_endpoint` over HTTPS (defence in depth).
-- **Public client** — dynamic registration uses `token_endpoint_auth_method: "none"` and requests `grant_types: ["authorization_code", "refresh_token"]`.
-- **PKCE** — all flows use PKCE (`S256`) plus a random `state` for CSRF protection.
-- **File permissions** — token storage uses 0600 (owner read/write only).
+- **HTTPS-only** — metadata, authorize, token, and registration URLs must use HTTPS (loopback `http://127.0.0.1`, `localhost`, `::1` allowed for local testing).
+- **Internal-host guard** — non-loopback OAuth endpoints are checked against the SDK's SSRF guard (`is_safe_http_url`), refusing private, link-local, and cloud-metadata addresses before sending requests.
+- **Pre-request redirect validation** — discovery validates each redirect hop before following it (max 3 hops).
+- **No redirects on credential POSTs** — code-exchange, refresh-token, and registration POSTs never follow redirects so tokens and client secrets are never forwarded to another host.
+- **PKCE (`S256`) + random `state`** — enforced on all authorization flows.
+- **Owner-only storage (`0600`)** — stored under `PRAISONAI_HOME`, never logged or placed in query strings.
 
 ## Troubleshooting
 
 | Issue | Cause / fix |
-|-------|-------------|
-| `RuntimeError: Could not discover OAuth metadata for …` | Server doesn't advertise RFC 8414 / OpenID metadata. Supply `oauth.client_id` and `oauth.scopes` in config as a fallback. |
-| `RuntimeError: … does not support dynamic client registration` | No `registration_endpoint` in auth-server metadata. Register a client manually and supply `oauth.client_id`. |
-| `InteractiveAuthRequired` | Running headless / in CI. Seed `~/.praisonai/mcp-auth.json` from an interactive session first. |
-| `ValueError: Refusing OAuth request over insecure transport: …` | Auth server advertises `http://` endpoints. Refused by design — fix the server or use an HTTPS reverse proxy. |
-| `ValueError: Refusing OAuth request to a private/internal address: …` | Auth server advertises an HTTPS endpoint on a private / RFC1918 / link-local host (e.g. cloud metadata `169.254.169.254`). Refused by design — fix the server. |
-| `ValueError: Too many redirects fetching OAuth metadata: …` | Discovery hopped more than 3 times. Fix the server's redirect chain. |
-| `ValueError: Dynamic client registration response missing 'client_id'` | Malformed response from the auth server's `registration_endpoint`. |
+|---|---|
+| `InteractiveAuthRequired` | Running in a non-TTY or CI environment without a valid/refreshable token. Run `praisonai mcp auth <name>` from an interactive terminal and seed `$PRAISONAI_HOME/mcp-auth.json`. |
+| OAuth warning on `/sse` URL | OAuth auto-attachment currently applies to Streamable HTTP only, not legacy `/sse` or WebSocket transports. Switch to the server's Streamable HTTP endpoint or pass an explicit `Authorization` header. |
+| `RuntimeError: Could not discover OAuth metadata for ...` | Server does not expose RFC 8414 / OpenID metadata. Supply explicit `oauth.client_id` and `oauth.scopes` in config. |
+| `RuntimeError: ... does not support dynamic client registration` | No `registration_endpoint` in auth-server metadata. Register a client manually and supply `oauth.client_id`. |
+| `ValueError: Refusing OAuth request over insecure transport: ...` | Auth server advertises `http://` endpoints. Use HTTPS. |
+| `ValueError: Refusing OAuth request to a private/internal address: ...` | Auth server advertises a private/link-local/metadata host. Refused by design. |
+| `ValueError: Too many redirects fetching OAuth metadata: ...` | Discovery exceeded 3 redirect hops. |
 
 ## Related
 
 <CardGroup cols={2}>
-  <Card title="Remote MCP" icon="globe" href="./mcp-remote">
-    Connect to remote MCP servers via HTTP, SSE, or WebSocket.
+  <Card title="Remote MCP" icon="globe" href="/mcp/mcp-remote">
+    Connect to remote MCP servers via Streamable HTTP, SSE, or WebSocket.
   </Card>
-  <Card title="MCP Authentication" icon="shield-check" href="./mcp-auth">
+  <Card title="MCP Authentication" icon="shield-check" href="/mcp/mcp-auth">
     Server-side OAuth 2.1, OIDC, and API-key auth for `praisonai-mcp`.
   </Card>
-  <Card title="MCP Tools" icon="wrench" href="./mcp-tools">
+  <Card title="MCP Tools" icon="wrench" href="/mcp/mcp-tools">
     Using MCP tools with agents.
   </Card>
-  <Card title="MCP Server" icon="plug" href="./praisonai-mcp">
+  <Card title="MCP Server" icon="plug" href="/mcp/mcp-server">
     Deploy PraisonAI as an MCP server.
   </Card>
 </CardGroup>
