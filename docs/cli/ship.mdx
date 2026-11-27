@@ -1,0 +1,179 @@
+---
+title: "Ship"
+sidebarTitle: "Ship"
+description: "Commit, push and open a draft pull request in one command. The agent never merges; you do."
+icon: "rocket"
+---
+
+`praisonai ship` takes the work on your branch to a **draft pull request**. It commits your changes, pushes the branch and opens the PR, then prints the link. You review the PR and you merge it. Ship never merges, approves or force-pushes.
+
+```mermaid
+graph LR
+    A[Your branch]:::agent --> B[Safety checks]:::tool
+    B --> C[Commit]:::tool
+    C --> D[Push]:::tool
+    D --> E[Draft PR]:::agent
+    E --> F[You merge]:::agent
+
+    classDef agent fill:#8B0000,stroke:#7C90A0,color:#fff
+    classDef tool fill:#189AB4,stroke:#7C90A0,color:#fff
+```
+
+## Quick Start
+
+```bash
+# See what ship would do. Nothing changes.
+praisonai ship --dry-run
+
+# Commit, push and open a draft PR
+praisonai ship -m "fix: handle an empty input list"
+```
+
+**Expected output:**
+
+```
+https://github.com/your-org/your-repo/pull/42
+```
+
+## Options
+
+| Option | Default | What it does |
+|---|---|---|
+| `-m`, `--message` | generated | The commit message. Without it, a short message is made from the diff. |
+| `--dry-run` | off | Shows the branch, the target branch and the files to commit. Changes nothing. |
+
+## What ship does
+
+<Steps>
+  <Step title="Checks before anything changes">
+    Ship stops with a message and exit code `1`, and changes nothing, when:
+    - you are on the default branch (for example `main`) or a detached HEAD;
+    - the repository is a fork, or it is not on GitHub, or `gh` is not logged in;
+    - a secret file would be committed, such as `.env`, `*.pem` or `id_rsa`. Example files like `.env.example` are allowed.
+  </Step>
+  <Step title="Commits">
+    If there are changes, ship stages them all (`git add -A`) and commits them. A clean working tree skips this step.
+  </Step>
+  <Step title="Pushes">
+    Ship runs `git push -u origin HEAD`. It never force-pushes.
+  </Step>
+  <Step title="Opens a draft PR">
+    Ship runs `gh pr create --draft` into the default branch. If the branch already has an open PR, ship prints that PR's link instead of opening a new one.
+  </Step>
+</Steps>
+
+<Warning>
+Ship opens **draft** pull requests only. If your repository auto-merges PRs that are ready for review, a draft stays put until you mark it ready.
+</Warning>
+
+## Requirements
+
+- `git` and the GitHub CLI `gh`, logged in with `gh auth login`.
+- A feature branch in a GitHub repository that is not a fork.
+
+## Use it from Python
+
+The same step is one function:
+
+```python
+from praisonai_code.ship.flow import ShipRefused, ship_to_draft_pr
+
+try:
+    print(ship_to_draft_pr(message="fix: handle an empty input list"))
+except ShipRefused as reason:
+    print(f"Not shipped: {reason}")
+```
+
+Pass `dry_run=True` to get the plan as text instead.
+
+## Keep an agent from merging
+
+When an agent works on your pull requests, add the never-merge guard. It is a hook that runs before every tool call. It refuses commands that merge, approve, turn on auto-merge or force-push, even if an earlier approval allowed `gh pr` commands.
+
+```python
+from praisonaiagents import Agent
+from praisonaiagents.hooks import HookRegistry
+from praisonaiagents.tools import execute_command
+from praisonai_code.ship.guard import register_never_merge
+
+hooks = HookRegistry()
+register_never_merge(hooks)
+
+agent = Agent(
+    name="pr-helper",
+    instructions="Fix the failing test on this branch",
+    tools=[execute_command],
+    hooks=hooks,
+)
+agent.start("Fix the failing test and push the fix")
+```
+
+<AccordionGroup>
+  <Accordion title="What the guard refuses">
+    - `gh pr merge`, including `--auto`
+    - `gh pr review --approve` (or `-a`)
+    - `gh api` calls that merge or approve, over REST (`.../merge`, `event=APPROVE`) or GraphQL (`mergePullRequest`, `enablePullRequestAutoMerge`, an approving `addPullRequestReview`), and GraphQL read from a file
+    - `git push --force`, `-f`, `--force-with-lease`, `--force-if-includes`, `--mirror` and `+branch` pushes
+
+    It also looks inside `cmd1 && cmd2`, `bash -c '...'`, full paths like `/usr/bin/gh` and `gh -R owner/repo ...`.
+  </Accordion>
+  <Accordion title="What the guard does not stop">
+    The guard reads command text. A command hidden inside another program, such as `python -c "os.system('gh pr merge 1')"`, gets through. It is a guard rail, not a security boundary. To be sure nothing merges, turn on branch protection or give the agent a token without merge rights.
+  </Accordion>
+</AccordionGroup>
+
+## Review a diff
+
+Ship's self-review returns findings as typed objects, so a script or an agent can act on them:
+
+```python
+from praisonai_code.ship.review import review_diff, review_severity
+
+diff = open("change.diff").read()
+findings = review_diff(diff, effort="high")
+for f in findings:
+    print(f.severity, f"{f.path}:{f.line}", f.title, "->", f.fix)
+print("overall:", review_severity(findings))
+```
+
+**Example output** (wording varies by model):
+
+```
+important calc.py:2 IndexError in last() -> return xs[-1]
+overall: high
+```
+
+| Field | Meaning |
+|---|---|
+| `severity` | `important` (a bug this change adds), `nit` (minor) or `pre_existing` (it was already there) |
+| `path`, `line` | Where the finding is, in the new file |
+| `title`, `fix` | What is wrong and how to fix it |
+
+`review_severity` sums them up: `high` if any finding is important, `minimal` if there are only nits or pre-existing ones, and `none` if there are no findings.
+
+`effort` sets how many findings come back: `low` (up to 3, important only), `medium` (5), `high` (10, the default), `xhigh` (20) or `max` (all). The reviewer has no tools: it reads only the diff you give it.
+
+## Check a pull request's state
+
+`read_pr_state` reads a PR and `next_action` says what to do next. Both only read; they never change the PR.
+
+```python
+from praisonai_code.ship.steward import next_action, read_pr_state
+
+state = read_pr_state("42")
+print(state.state, state.mergeable, state.failing, [t.body for t in state.threads])
+print(next_action(state, attempts={}))
+```
+
+The order is: stop if the PR is merged or closed. Otherwise merge the base branch in on a conflict, then fix failing checks, then answer open review comments. Each item is tried at most 3 times, so a failure that cannot be fixed is not retried forever.
+
+## Related
+
+<CardGroup cols={2}>
+  <Card title="Commit" icon="code-commit" href="/cli/commit">
+    AI commit messages with a security scan
+  </Card>
+  <Card title="Git Integration" icon="code-branch" href="/cli/git-integration">
+    Git status, diff and history from the CLI
+  </Card>
+</CardGroup>
