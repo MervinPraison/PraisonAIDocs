@@ -228,6 +228,41 @@ No branch is left on the positional-rollback fallback — the default (OpenAI) p
 **Persistence ordering.** The sync path calls `_persist_message("user", normalized_content)` only when the helper actually appended (not a duplicate); the async native path calls the helper unconditionally, and the persistence line at that point is unchanged in PR #5121.
 </Note>
 
+#### What changed in PR #6788 — one turn at a time per Agent
+
+<Note>
+**Fix reference:** [PraisonAI PR #6788](https://github.com/MervinPraison/PraisonAI/pull/6788).
+</Note>
+
+The earlier fixes closed the rollback and TOCTOU races on the chat-history append path, but two threads (or two asyncio tasks) calling `chat()` / `achat()` on the **same** `Agent` could still interleave their *whole turns*. History ended up as `user, user, assistant, assistant` instead of `user, assistant, user, assistant`, so each call sent the other turn's unanswered question as context.
+
+PR #6788 serialises turns on one `Agent` automatically — no new parameter, no import:
+
+| Entry point | Lock held for the whole turn |
+|---|---|
+| `chat()` | Per-agent `threading.Lock` — concurrent sync callers queue |
+| `achat()` | Per-agent, per-event-loop `asyncio.Lock` — concurrent tasks on the same loop queue |
+| `start(stream=True)` | Same per-agent `threading.Lock`, taken on the first chunk and released when the stream ends, raises, or is closed (`.close()` or garbage collection) |
+
+```python
+import threading
+from praisonaiagents import Agent
+
+agent = Agent(name="Shared", instructions="Echo bot.")
+
+threads = [threading.Thread(target=agent.chat, args=(f"Question {i}",)) for i in range(8)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+# chat_history is paired: user, assistant, user, assistant, ...
+# (which question goes first is not deterministic)
+```
+
+- **Nested calls don't deadlock.** A tool or retry path that calls back into the same agent's `chat()` during its own turn skips the lock (tracked via the `praisonai_agent_turn_held` context variable).
+- **Separate agents still run in parallel.** The lock is per `Agent` instance; every clone from `clone_for_channel()` gets its own lock — see [Agent Cloning → What gets cloned vs. what's reset](/features/agent-cloning#what-gets-cloned-vs-whats-reset).
+- **Not covered:** a sync `chat()` and an async `achat()` on the same agent at the same moment use different locks and can still overlap. Use one style per agent, or clone the agent per caller.
+- **Tests that deliberately overlap turns** can bypass the lock by calling the undecorated method: `Agent.chat.__wrapped__(agent, "…")` / `await Agent.achat.__wrapped__(agent, "…")`.
+
 #### What changed in PR #1514
 
 <Note>
