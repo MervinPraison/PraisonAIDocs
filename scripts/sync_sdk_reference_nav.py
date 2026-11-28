@@ -65,9 +65,9 @@ def main() -> int:
     navigation = data.get("navigation", {})
     tabs = navigation.get("tabs", [])
 
-    sdk_tab = next((t for t in tabs if t.get("tab") == "SDK"), None)
+    sdk_tab = next((t for t in tabs if t.get("tab") in ("SDK Reference", "SDK")), None)
     if not sdk_tab:
-        print("SDK tab not found in docs.json", file=sys.stderr)
+        print("SDK / SDK Reference tab not found in docs.json", file=sys.stderr)
         return 1
 
     ref_group = next(

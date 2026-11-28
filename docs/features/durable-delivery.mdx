@@ -660,6 +660,128 @@ Introduced in [PraisonAI PR #4046](https://github.com/MervinPraison/PraisonAI/pu
 
 ---
 
+## Channel Support
+
+All six channels now share the same durable delivery path:
+
+| Channel | Retry + backoff | DLQ support | Notes |
+|---------|----------------|-------------|-------|
+| Telegram | ✅ | ✅ | Had this previously; unchanged |
+| Slack | ✅ | ✅ | New in PR #2484 |
+| Discord | ✅ | ✅ | New in PR #2484 |
+| WhatsApp | ✅ | ✅ | Previously swallowed errors silently — now fixed |
+| Email | ✅ | ✅ | New in PR #2484 |
+| Linear | ✅ | ✅ | New in PR #2484 |
+| AgentMail | ✅ | ✅ | New in PR #2484 |
+
+<Warning>
+WhatsApp previously swallowed permanent send errors silently. This was fixed: permanent failures now propagate, matching every other channel.
+</Warning>
+
+---
+
+## What Gets Retried
+
+| Error type | Retried? | Notes |
+|-----------|----------|-------|
+| HTTP 5xx | ✅ | Full backoff sequence |
+| HTTP 429 | ✅ | Waits for `Retry-After` header first |
+| Network blips / timeout | ✅ | Transient |
+| HTTP 401 Unauthorized | ❌ → DLQ | Token/account issue, not per-message |
+| HTTP 403 Forbidden | ❌ → DLQ | Permanent — bot kicked or blocked |
+| HTTP 404 Not Found | ❌ → DLQ | Chat deleted or not found |
+| HTTP 410 Gone | ❌ → DLQ | Permanently removed |
+| Platform patterns ("bot was kicked") | ❌ → DLQ | Platform-specific classification |
+
+---
+
+## Structured error classification
+
+Each failure is tagged with a machine-readable [`SendErrorKind`](/features/send-error-taxonomy) before the retry decision. Permanent kinds (`forbidden`, `target_not_found`, `auth_fatal`, `invalid_request`) **short-circuit immediately** rather than exhausting `max_retries` against a dead target; transient and rate-limited failures still retry with backoff.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Adapter
+    participant Channel
+
+    Agent->>Adapter: reply text
+    Adapter->>Channel: send (attempt 1)
+    Channel-->>Adapter: 403 Forbidden (bot kicked)
+    Note over Adapter: classify → forbidden (not retryable)
+    Adapter-->>Agent: short-circuit — no further attempts
+```
+
+See [Send Error Taxonomy](/features/send-error-taxonomy) for the full kind reference and how to classify your own adapter's native exceptions.
+
+---
+
+## Automatic crash-recovery on start
+
+Every gateway-managed channel redelivers any reply parked by a crash on a previous run — no operator step, symmetric with the inbound journal's `replay()` sweep.
+
+The gateway schedules `WebSocketGateway._replay_outbound_dlq(bot)` about 5 seconds after each channel task starts (a grace period for the transport to connect), then calls `OutboundDLQ.redeliver(send)` — draining parked replies oldest-first through the adapter's own `send_message`, so the platform's normal retry/backoff still applies. A redelivery that fails again is kept for the next boot, bounded by the DLQ's existing TTL / `max_size` / `attempts` invariants. Failure never blocks channel start.
+
+Users receive redelivered replies with a **visible duplicate marker**:
+
+> ♻️ Recovered after restart — this reply may be a duplicate.
+>
+> &lt;original reply text&gt;
+
+When something is recovered you'll see this line in the gateway log:
+
+```
+Outbound crash-recovery: redelivered N parked repl(y/ies) on start (marked as possible duplicates)
+```
+
+```mermaid
+sequenceDiagram
+    participant Boot as 🛠️ Gateway boot
+    participant Bot as 📡 Adapter
+    participant DLQ as 💾 OutboundDLQ
+    participant Platform as 📱 Platform API
+    participant User as 👤 User
+
+    Boot->>Bot: start_channels()
+    Note over Boot,Bot: 5s grace for transport connect
+    Boot->>DLQ: _replay_outbound_dlq(bot)
+    DLQ->>DLQ: redeliver(send) — oldest first
+    loop each parked reply
+        DLQ->>Bot: send_message(♻️ marker + text)
+        Bot->>Platform: send
+        alt success
+            Platform-->>Bot: 200 OK
+            Bot-->>User: recovered reply
+            DLQ->>DLQ: delete entry
+        else re-fails
+            Platform-->>Bot: transient error
+            DLQ->>DLQ: keep entry, attempts++
+        end
+    end
+```
+
+<Note>
+This section is shared with [Outbound Resilience → Automatic crash-recovery on start](/features/outbound-resilience#automatic-crash-recovery-on-start), the canonical page for the boot-time drainer.
+</Note>
+
+---
+
+## When Held Replies Drain
+
+The durable outbox re-attempts held replies on three triggers:
+
+1. **Adapter startup** — replays anything queued before the last crash.
+2. **Channel recovery** *(Issue #4043)* — when `ChannelSupervisor` sees a channel come back after a transient outage, it re-drains the outbox in the background so held replies go out promptly, without waiting for the next inbound turn.
+3. **Lazy on next inbound turn** — the next `chat()` turn also drains opportunistically.
+
+See [Durable Delivery → When the Outbox Drains](/features/durable-delivery#when-the-outbox-drains) for the full explanation and behavioural notes.
+
+<Note>
+**Deferred sends surface as `status == "queued"`.** When a reply routes through the outbox instead of landing inline, the adapter's [`SendResult`](/features/bot-platform-adapter#branching-on-delivery-outcome) reports `status == "queued"` — a caller can distinguish "will land later" from "landed now" without reading private outbox state. A crash-recovered re-drain that re-sends without positive reconciliation surfaces `status == "duplicate"`, the machine-readable form of the `♻️ Recovered after restart` marker above.
+</Note>
+
+---
+
 ## Best Practices
 
 <AccordionGroup>
