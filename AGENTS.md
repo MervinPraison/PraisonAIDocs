@@ -175,7 +175,7 @@ CRITICAL RULES FOR AI AGENTS:
 1. NEVER create or modify files in docs/concepts/ — this folder is HUMAN-APPROVED ONLY
 2. Place ALL new documentation pages in docs/features/ by default (or docs/tools/, docs/guides/, docs/cli/, docs/deploy/, docs/mcp/ when matching an existing folder)
 3. Prefer updating an existing parent feature page over creating single-PR bugfix micro-pages
-4. Update docs/docs.json to place new pages in the matching domain tab & subgroup (`Features`, `Agents & Tools`, `CLI & Code`, `UI & Apps`, `Gateway & Bots`, `Deploy & API`, `Examples & Learn`), NEVER under `Core Concepts` and NEVER dumping unrelated pages into a catch-all group
+4. Update docs/docs.json to place new pages in the matching domain tab & subgroup (`Features`, `Agents & Tools`, `CLI & Code`, `UI & Apps`, `Gateway & Bots`, `Deploy & API`, `Recipes & Examples`), NEVER under `Core Concepts` and NEVER dumping unrelated pages into a catch-all group
 5. If an issue mentions "concepts", still place the file in docs/features/
 6. Do NOT modify existing docs/concepts/ pages without explicit human instruction
 7. When reviewing PRs: flag any files in docs/concepts/ as violations
